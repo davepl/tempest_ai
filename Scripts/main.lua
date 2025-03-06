@@ -32,13 +32,13 @@
 math.randomseed(os.time())
 
 -- Access the main CPU and memory space
-local maincpu = manager.machine.devices[":maincpu"]
-if not maincpu then
+local mainCpu = manager.machine.devices[":maincpu"]
+if not mainCpu then
     print("Error: Main CPU not found")
     return
 end
 
-local mem = maincpu.spaces["program"]
+local mem = mainCpu.spaces["program"]
 if not mem then
     print("Error: Program memory space not found")
     return
@@ -51,11 +51,15 @@ GameState.__index = GameState
 function GameState:new()
     local self = setmetatable({}, GameState)
     self.credits = 0
+    self.p1_level = 0
+    self.p1_lives = 0
     return self
 end
 
 function GameState:update(mem)
     self.credits = mem:read_u8(0x0006)  -- Example address for credits
+    self.p1_level = mem:read_u8(0x00B9)  -- Player 1 level
+    self.p1_lives = mem:read_u8(0x00A1)  -- Player 1 lives
 end
 
 -- **LevelState Class**
@@ -80,6 +84,9 @@ function PlayerState:new()
     local self = setmetatable({}, PlayerState)
     self.position = 0
     self.alive = 0
+    self.score = 0
+    self.angle = 0
+    self.superzapper_available = 0
     return self
 end
 
@@ -87,6 +94,14 @@ function PlayerState:update(mem)
     self.position = mem:read_u8(0x0200)          -- Player position
     local status_flags = mem:read_u8(0x0005)     -- Status flags
     self.alive = (status_flags & 0x40) ~= 0 and 1 or 0  -- Bit 6 for alive status
+
+    local score_low = mem:read_u8(0x00AB)
+    local score_mid = mem:read_u8(0x00AC)
+    local score_high = mem:read_u8(0x00AD)
+    self.score = score_low + (score_mid << 8) + (score_high << 16)
+
+    self.angle = mem:read_u8(0x00B0)            -- Player angle/orientation
+    self.superzapper_available = mem:read_u8(0x00C0)  -- Superzapper availability
 end
 
 -- **EnemiesState Class**
@@ -173,11 +188,14 @@ local function frame_callback()
     local action = actions[math.random(#actions)]
 
     -- Print a terse line with key stats and the action
-    print(string.format("Credits: %d, Level: %d, Player Pos: %d, Alive: %d, Active Enemies: %d, Action: %s",
+    print(string.format("Credits: %d, Level: %d, Player Pos: %d, Alive: %d, Score: %d, Angle: %d, Superzapper: %d, Active Enemies: %d, Action: %s",
         game_state.credits,
         level_state.level_number,
         player_state.position,
         player_state.alive,
+        player_state.score,
+        player_state.angle,
+        player_state.superzapper_available,
         total_active_enemies,
         action
     ))
