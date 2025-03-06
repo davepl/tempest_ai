@@ -95,10 +95,14 @@ function PlayerState:update(mem)
     local status_flags = mem:read_u8(0x0005)     -- Status flags
     self.alive = (status_flags & 0x40) ~= 0 and 1 or 0  -- Bit 6 for alive status
 
-    local score_low = mem:read_u8(0x00AB)
-    local score_mid = mem:read_u8(0x00AC)
-    local score_high = mem:read_u8(0x00AD)
-    self.score = score_low + (score_mid << 8) + (score_high << 16)
+    local function bcd_to_decimal(bcd)
+        return ((bcd >> 4) * 10) + (bcd & 0x0F)
+    end
+
+    local score_low = bcd_to_decimal(mem:read_u8(0x0040))
+    local score_mid = bcd_to_decimal(mem:read_u8(0x0041))
+    local score_high = bcd_to_decimal(mem:read_u8(0x0042))
+    self.score = score_high * 10000 + score_mid * 100 + score_low
 
     self.angle = mem:read_u8(0x00B0)            -- Player angle/orientation
     self.superzapper_available = mem:read_u8(0x00C0)  -- Superzapper availability
