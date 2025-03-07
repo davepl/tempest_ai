@@ -28,6 +28,8 @@
     - Tempest ROM set loaded in MAME.
 --]]
 
+-- Add after the initial requires, before the GameState class
+
 -- Seed the random number generator once at script start
 math.randomseed(os.time())
 
@@ -44,6 +46,34 @@ if not mem then
     return
 end
 
+-- Helper function for calculating relative positions
+local function calculate_relative_position(player_pos, target_pos, is_open)
+    local direct_diff = target_pos - player_pos
+    
+    if is_open then
+        -- For open levels, just return the direct difference
+        return direct_diff
+    else
+        -- For closed levels, find the shortest path around the circle
+        -- Total segments is 16
+        local clockwise_diff = direct_diff
+        local counter_clockwise_diff = direct_diff
+        
+        if direct_diff > 8 then
+            clockwise_diff = direct_diff - 16
+        elseif direct_diff < -8 then
+            counter_clockwise_diff = direct_diff + 16
+        end
+        
+        -- Return the smallest absolute difference
+        if math.abs(clockwise_diff) < math.abs(counter_clockwise_diff) then
+            return clockwise_diff
+        else
+            return counter_clockwise_diff
+        end
+    end
+end
+
 -- **GameState Class**
 GameState = {}
 GameState.__index = GameState
@@ -58,8 +88,8 @@ end
 
 function GameState:update(mem)
     self.credits = mem:read_u8(0x0006)  -- Example address for credits
-    self.p1_level = mem:read_u8(0x00B9)  -- Player 1 level
-    self.p1_lives = mem:read_u8(0x00A1)  -- Player 1 lives
+    self.p1_level = mem:read_u8(0x0046)  -- Player 1 level
+    self.p1_lives = mem:read_u8(0x0048)  -- Player 1 lives
 end
 
 -- **LevelState Class**
@@ -69,11 +99,24 @@ LevelState.__index = LevelState
 function LevelState:new()
     local self = setmetatable({}, LevelState)
     self.level_number = 0
+    self.spike_heights = {}  -- Array of 16 spike heights
+    self.level_type = 0     -- 00 = closed, FF = open
     return self
 end
 
 function LevelState:update(mem)
-    self.level_number = mem:read_u8(0x0007)  -- Example address for level number
+    self.level_number = mem:read_u8(0x009F)  -- Example address for level number
+    self.level_type = mem:read_u8(0x0111)    -- Level type (00=closed, FF=open)
+    local player_pos = mem:read_u8(0x0200)   -- Player position
+    local is_open = self.level_type == 0xFF
+    
+    -- Read spike heights for all 16 segments and store them relative to player
+    self.spike_heights = {}
+    for i = 0, 15 do  -- Use 0-based indexing to match game's segment numbering
+        local height = mem:read_u8(0x03AC + i)
+        local rel_pos = calculate_relative_position(player_pos, i, is_open)
+        self.spike_heights[rel_pos] = height
+    end
 end
 
 -- **PlayerState Class**
@@ -87,6 +130,9 @@ function PlayerState:new()
     self.score = 0
     self.angle = 0
     self.superzapper_available = 0
+    self.superzapper_active = 0
+    self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot positions
+    self.shot_count = 0
     return self
 end
 
@@ -104,8 +150,15 @@ function PlayerState:update(mem)
     local score_high = bcd_to_decimal(mem:read_u8(0x0042))
     self.score = score_high * 10000 + score_mid * 100 + score_low
 
-    self.angle = mem:read_u8(0x00B0)            -- Player angle/orientation
-    self.superzapper_available = mem:read_u8(0x00C0)  -- Superzapper availability
+    self.angle = mem:read_u8(0x03EE)                        -- Player angle/orientation
+    self.superzapper_available = mem:read_u8(0x03AA)        -- Superzapper availability
+    self.superzapper_active = mem:read_u8(0x0125)           -- Superzapper active status
+    self.shot_count = mem:read_u8(0x0135)                   -- Number of active player shots
+
+    -- Read all 8 shot positions
+    for i = 1, 8 do
+        self.shot_positions[i] = mem:read_u8(0x02D3 + i - 1)
+    end
 end
 
 -- **EnemiesState Class**
@@ -114,20 +167,94 @@ EnemiesState.__index = EnemiesState
 
 function EnemiesState:new()
     local self = setmetatable({}, EnemiesState)
+    -- Active enemies (currently on screen)
     self.active_flippers = 0
     self.active_pulsars = 0
     self.active_tankers = 0
     self.active_spikers = 0
     self.active_fuseballs = 0
+    self.pulse_beat = 0    -- Add pulse beat counter
+    self.pulsing = 0      -- Add pulsing state
+    -- Available spawn slots (how many more can be created)
+    self.spawn_slots_flippers = 0
+    self.spawn_slots_pulsars = 0
+    self.spawn_slots_tankers = 0
+    self.spawn_slots_spikers = 0
+    self.spawn_slots_fuseballs = 0
+    -- Enemy info arrays
+    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- 7 enemy type slots
+    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
+    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
+    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
+    self.shot_positions = {0, 0, 0, 0}              -- 4 enemy shot positions
     return self
 end
 
 function EnemiesState:update(mem)
-    self.active_flippers = mem:read_u8(0x0142)   -- Example addresses for active enemies
-    self.active_pulsars = mem:read_u8(0x0143)
-    self.active_tankers = mem:read_u8(0x0144)
-    self.active_spikers = mem:read_u8(0x0145)
-    self.active_fuseballs = mem:read_u8(0x0146)
+    -- Read active enemies (currently on screen)
+    self.active_flippers = mem:read_u8(0x0142)   -- n_flippers - current active count
+    self.active_pulsars = mem:read_u8(0x0143)    -- n_pulsars
+    self.active_tankers = mem:read_u8(0x0144)    -- n_tankers
+    self.active_spikers = mem:read_u8(0x0145)    -- n_spikers
+    self.active_fuseballs = mem:read_u8(0x0146)  -- n_fuseballs
+    self.pulse_beat = mem:read_u8(0x0147)        -- pulse_beat counter
+    self.pulsing = mem:read_u8(0x0148)          -- pulsing state
+
+    -- Get player position and level type for relative calculations
+    local player_pos = mem:read_u8(0x0200)
+    local is_open = mem:read_u8(0x0111) == 0xFF
+
+    -- Read available spawn slots (how many more can be created)
+    self.spawn_slots_flippers = mem:read_u8(0x013D)   -- avl_flippers - spawn slots available
+    self.spawn_slots_pulsars = mem:read_u8(0x013E)    -- avl_pulsars
+    self.spawn_slots_tankers = mem:read_u8(0x013F)    -- avl_tankers
+    self.spawn_slots_spikers = mem:read_u8(0x0140)    -- avl_spikers
+    self.spawn_slots_fuseballs = mem:read_u8(0x0141)  -- avl_fuseballs
+
+    -- Read enemy type and state info
+    for i = 1, 7 do
+        self.enemy_type_info[i] = mem:read_u8(0x0283 + i - 1)    -- Enemy type info at $0283
+        self.active_enemy_info[i] = mem:read_u8(0x028A + i - 1)  -- Active enemy info at $028A
+        
+        -- Get absolute segment number and convert to relative
+        local abs_segment = mem:read_u8(0x0291 + i - 1) & 0x0F
+        self.enemy_segments[i] = calculate_relative_position(player_pos, abs_segment, is_open)
+        
+        -- Get main position value and LSB for more precision
+        local pos = mem:read_u8(0x02DF + i - 1)       -- enemy_along at $02DF - main position
+        local lsb = mem:read_u8(0x029F + i - 1)       -- enemy_along_lsb at $029F - fractional part
+        -- Store both values for display
+        self.enemy_depths[i] = {pos = pos, frac = lsb}
+    end
+
+    -- Read all 4 enemy shot positions
+    for i = 1, 4 do
+        self.shot_positions[i] = mem:read_u8(0x02DB + i - 1)     -- Enemy shot positions at $02DB
+    end
+end
+
+-- Helper function to decode enemy type info
+function EnemiesState:decode_enemy_type(type_byte)
+    local enemy_type = type_byte & 0x07
+    local between_segments = (type_byte & 0x80) ~= 0
+    local segment_increasing = (type_byte & 0x40) ~= 0
+    return string.format("%d%s%s", 
+        enemy_type,
+        between_segments and "B" or "-",
+        segment_increasing and "+" or "-"
+    )
+end
+
+-- Helper function to decode enemy state info
+function EnemiesState:decode_enemy_state(state_byte)
+    local split_behavior = state_byte & 0x03
+    local can_shoot = (state_byte & 0x40) ~= 0
+    local moving_away = (state_byte & 0x80) ~= 0
+    return string.format("%s%s%s",
+        moving_away and "A" or "T",
+        can_shoot and "S" or "-",
+        split_behavior
+    )
 end
 
 function EnemiesState:get_total_active()
@@ -176,7 +303,133 @@ local player_state = PlayerState:new()
 local enemies_state = EnemiesState:new()
 local controls = Controls:new()
 
--- Frame callback function
+-- Remove all ncurses-related code and replace with this display function
+local function format_section(title, metrics)
+    local width = 40
+    local separator = string.rep("-", width - 4)
+    local result = string.format("--[ %s ]%s\n", title, separator)
+    
+    -- Find the longest key for alignment
+    local max_key_length = 0
+    for key, _ in pairs(metrics) do
+        max_key_length = math.max(max_key_length, string.len(key))
+    end
+    
+    -- Format each metric
+    for key, value in pairs(metrics) do
+        result = result .. string.format("  %-" .. max_key_length .. "s : %s\n", key, tostring(value))
+    end
+    
+    return result .. "\n"
+end
+
+function update_display(game_state, level_state, player_state, enemies_state)
+    -- Clear screen with some newlines
+    print(string.rep("\n", 50))
+    
+    -- Format game state
+    local game_metrics = {
+        ["Credits"] = game_state.credits,
+        ["P1 Lives"] = game_state.p1_lives,
+        ["P1 Level"] = game_state.p1_level
+    }
+    print(format_section("Game State", game_metrics))
+    
+    -- Format player state
+    local player_metrics = {
+        ["Position"] = player_state.position,
+        ["Alive"] = player_state.alive,
+        ["Score"] = player_state.score,
+        ["Angle"] = player_state.angle,
+        ["Superzapper Available"] = player_state.superzapper_available,
+        ["Superzapper Active"] = player_state.superzapper_active,
+        ["Shot Count"] = player_state.shot_count,
+        ["Shot Positions"] = table.concat(player_state.shot_positions, ",")
+    }
+    print(format_section("Player State", player_metrics))
+    
+    -- Format level state with relative spike heights
+    local level_metrics = {
+        ["Level Number"] = level_state.level_number,
+        ["Level Type"] = level_state.level_type == 0xFF and "Open" or "Closed",
+        ["Spike Heights"] = (function()
+            local heights = {}
+            local positions = {}
+            -- Get all positions
+            for pos, height in pairs(level_state.spike_heights) do
+                table.insert(positions, pos)
+            end
+            -- Sort positions from negative to positive
+            table.sort(positions)
+            -- Format each height with its relative position
+            for _, pos in ipairs(positions) do
+                table.insert(heights, string.format("%+2d:%02X", pos, level_state.spike_heights[pos]))
+            end
+            return table.concat(heights, " ")
+        end)()
+    }
+    print(format_section("Level State", level_metrics))
+    
+    -- Format enemies state with decoded information
+    local enemy_types = {}
+    local enemy_states = {}
+    local enemy_segs = {}
+    local enemy_depths = {}
+    for i = 1, 7 do
+        enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
+        enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
+        enemy_segs[i] = string.format("%+3d", enemies_state.enemy_segments[i])  -- Show relative position with sign
+        enemy_depths[i] = string.format("%02X.%02X", enemies_state.enemy_depths[i].pos, enemies_state.enemy_depths[i].frac)
+    end
+
+    -- Create the enemies metrics table first
+    local enemies_metrics = {
+        -- Enemy counts first
+        ["Flippers"] = string.format("%d active, %d spawn slots", enemies_state.active_flippers, enemies_state.spawn_slots_flippers),
+        ["Pulsars"] = string.format("%d active, %d spawn slots", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars),
+        ["Tankers"] = string.format("%d active, %d spawn slots", enemies_state.active_tankers, enemies_state.spawn_slots_tankers),
+        ["Spikers"] = string.format("%d active, %d spawn slots", enemies_state.active_spikers, enemies_state.spawn_slots_spikers),
+        ["Fuseballs"] = string.format("%d active, %d spawn slots", enemies_state.active_fuseballs, enemies_state.spawn_slots_fuseballs),
+        ["Total"] = string.format("%d active, %d spawn slots", 
+            enemies_state:get_total_active(),
+            enemies_state.spawn_slots_flippers + enemies_state.spawn_slots_pulsars + 
+            enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
+            enemies_state.spawn_slots_fuseballs),
+        ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),  -- Show pulsing as progress to FF
+        ["Enemy Types"] = table.concat(enemy_types, " "),
+        ["Enemy States"] = table.concat(enemy_states, " "),
+        ["Enemy Segments"] = table.concat(enemy_segs, " "),
+        ["Enemy Depths"] = table.concat(enemy_depths, " "),
+        ["Shot Positions"] = table.concat(enemies_state.shot_positions, ",")
+    }
+
+    -- Use an ordered table to maintain display order
+    local ordered_keys = {
+        "Flippers", "Pulsars", "Tankers", "Spikers", "Fuseballs", "Total",
+        "Pulse State", "Enemy Types", "Enemy States", "Enemy Segments", "Enemy Depths", "Shot Positions"
+    }
+
+    -- Print the section with ordered keys
+    local width = 40
+    local separator = string.rep("-", width - 4)
+    local result = string.format("--[ %s ]%s\n", "Enemies State", separator)
+    
+    -- Find the longest key for alignment
+    local max_key_length = 0
+    for _, key in ipairs(ordered_keys) do
+        max_key_length = math.max(max_key_length, string.len(key))
+    end
+    
+    -- Format each metric in order
+    for _, key in ipairs(ordered_keys) do
+        result = result .. string.format("  %-" .. max_key_length .. "s : %s\n", 
+            key, tostring(enemies_metrics[key]))
+    end
+    
+    print(result)
+end
+
+-- Update the frame callback function
 local function frame_callback()
     -- Update all state objects
     game_state:update(mem)
@@ -184,25 +437,12 @@ local function frame_callback()
     player_state:update(mem)
     enemies_state:update(mem)
 
-    -- Calculate total active enemies
-    local total_active_enemies = enemies_state:get_total_active()
-
     -- Randomly select an action
     local actions = {"fire", "zap", "left", "right", "none"}
     local action = actions[math.random(#actions)]
 
-    -- Print a terse line with key stats and the action
-    print(string.format("Credits: %d, Level: %d, Player Pos: %d, Alive: %d, Score: %d, Angle: %d, Superzapper: %d, Active Enemies: %d, Action: %s",
-        game_state.credits,
-        level_state.level_number,
-        player_state.position,
-        player_state.alive,
-        player_state.score,
-        player_state.angle,
-        player_state.superzapper_available,
-        total_active_enemies,
-        action
-    ))
+    -- Update the display
+    update_display(game_state, level_state, player_state, enemies_state)
 
     -- Apply the action to MAME controls
     controls:apply_action(action)

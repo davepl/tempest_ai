@@ -1204,7 +1204,7 @@ HXA65 v0.201 Listing File - 6502 Instruction Set - Wed Mar 05 19:07:41 2025
  90E0  C9          loc90e0:                cmp     #$50                    
                    ; If highscore over 50,000, add level 13
  90E1  50
- 90E2  90                                  bcc     loc90e5
+ 90E2  90                           [LUA ERROR] in execute_function: /Users/dave/source/repos/tempest/Scripts/main.lua:357: attempt to index a nil value (global 'enemies_metrics')       bcc     loc90e5
  90E3  01
   [ =90E5 ]
  90E4  C8                                  iny
