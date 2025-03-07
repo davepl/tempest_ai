@@ -114,7 +114,8 @@ function LevelState:update(mem)
     self.spike_heights = {}
     for i = 0, 15 do  -- Use 0-based indexing to match game's segment numbering
         local height = mem:read_u8(0x03AC + i)
-        local rel_pos = calculate_relative_position(player_pos, i, is_open)
+        -- Adjust player_pos to 0-based indexing to match our loop
+        local rel_pos = calculate_relative_position(player_pos & 0x0F, i, is_open)
         self.spike_heights[rel_pos] = height
     end
 end
@@ -129,9 +130,10 @@ function PlayerState:new()
     self.alive = 0
     self.score = 0
     self.angle = 0
-    self.superzapper_available = 0
+    self.superzapper_uses = 0
     self.superzapper_active = 0
-    self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot positions
+    self.shot_segments = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot segments
+    self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot positions (depth)
     self.shot_count = 0
     return self
 end
@@ -151,13 +153,24 @@ function PlayerState:update(mem)
     self.score = score_high * 10000 + score_mid * 100 + score_low
 
     self.angle = mem:read_u8(0x03EE)                        -- Player angle/orientation
-    self.superzapper_available = mem:read_u8(0x03AA)        -- Superzapper availability
+    self.superzapper_uses = mem:read_u8(0x03AA)        -- Superzapper availability
     self.superzapper_active = mem:read_u8(0x0125)           -- Superzapper active status
     self.shot_count = mem:read_u8(0x0135)                   -- Number of active player shots
 
-    -- Read all 8 shot positions
+    -- Read all 8 shot positions and segments
+    local is_open = mem:read_u8(0x0111) == 0xFF
     for i = 1, 8 do
-        self.shot_positions[i] = mem:read_u8(0x02D3 + i - 1)
+        -- Read depth (position along the tube)
+        self.shot_positions[i] = mem:read_u8(0x02D3 + i - 1)  -- PlayerShotPositions
+        
+        -- Read segment and make it relative to player position only if shot is active
+        local abs_segment = mem:read_u8(0x02AD + i - 1)       -- PlayerShotSegments
+        if self.shot_positions[i] == 0 or abs_segment == 0 then
+            self.shot_segments[i] = 0  -- Shot not active
+        else
+            abs_segment = abs_segment & 0x0F  -- Mask to get valid segment
+            self.shot_segments[i] = calculate_relative_position(self.position, abs_segment, is_open)
+        end
     end
 end
 
@@ -186,7 +199,7 @@ function EnemiesState:new()
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
     self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
     self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
-    self.shot_positions = {0, 0, 0, 0}              -- 4 enemy shot positions
+    self.shot_positions = {}  -- Will store nil for inactive shots
     return self
 end
 
@@ -227,9 +240,15 @@ function EnemiesState:update(mem)
         self.enemy_depths[i] = {pos = pos, frac = lsb}
     end
 
-    -- Read all 4 enemy shot positions
+    -- Read all 4 enemy shot positions and convert to relative positions
     for i = 1, 4 do
-        self.shot_positions[i] = mem:read_u8(0x02DB + i - 1)     -- Enemy shot positions at $02DB
+        local raw_pos = mem:read_u8(0x02DB + i - 1)
+        if raw_pos == 0 then
+            self.shot_positions[i] = nil  -- Mark inactive shots as nil
+        else
+            local abs_pos = raw_pos & 0x0F
+            self.shot_positions[i] = calculate_relative_position(player_pos, abs_pos, is_open)
+        end
     end
 end
 
@@ -341,10 +360,19 @@ function update_display(game_state, level_state, player_state, enemies_state)
         ["Alive"] = player_state.alive,
         ["Score"] = player_state.score,
         ["Angle"] = player_state.angle,
-        ["Superzapper Available"] = player_state.superzapper_available,
+        ["Superzapper Uses"] = player_state.superzapper_uses,
         ["Superzapper Active"] = player_state.superzapper_active,
         ["Shot Count"] = player_state.shot_count,
-        ["Shot Positions"] = table.concat(player_state.shot_positions, ",")
+        ["Shot Positions"] = (function()
+            local shots = {}
+            for i = 1, 8 do
+                -- Always show all 8 slots in XX-YY format
+                -- XX is depth (position), YY is relative segment
+                local segment_str = string.format("%+02d", player_state.shot_segments[i])
+                shots[i] = string.format("%02X-%s", player_state.shot_positions[i], segment_str)
+            end
+            return table.concat(shots, " ")
+        end)()
     }
     print(format_section("Player State", player_metrics))
     
@@ -400,7 +428,15 @@ function update_display(game_state, level_state, player_state, enemies_state)
         ["Enemy States"] = table.concat(enemy_states, " "),
         ["Enemy Segments"] = table.concat(enemy_segs, " "),
         ["Enemy Depths"] = table.concat(enemy_depths, " "),
-        ["Shot Positions"] = table.concat(enemies_state.shot_positions, ",")
+        ["Shot Positions"] = (function()
+            local shots = {}
+            for i = 1, 4 do
+                if enemies_state.shot_positions[i] then  -- Only show non-nil shots
+                    table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
+                end
+            end
+            return #shots > 0 and table.concat(shots, " ") or "none"
+        end)()
     }
 
     -- Use an ordered table to maintain display order
