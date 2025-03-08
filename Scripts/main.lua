@@ -28,6 +28,19 @@
     - Tempest ROM set loaded in MAME.
 --]]
 
+
+-- Assuming MAME Lua has basic OS support or luaposix
+local function start_python_script()
+    print("Starting Python script")
+    -- Launch Python script in the background
+    os.execute("python /Users/dave/source/repos/tempest/Scripts/aimodel.py &")
+    -- Create named pipes (if not already created)
+    os.execute("mkfifo /tmp/lua_to_py >/dev/null 2>&1")
+    os.execute("mkfifo /tmp/py_to_lua >/dev/null 2>&1")
+end
+
+start_python_script()
+
 -- Add after the initial requires, before the GameState class
 
 -- Seed the random number generator once at script start
@@ -44,6 +57,26 @@ local mem = mainCpu.spaces["program"]
 if not mem then
     print("Error: Program memory space not found")
     return
+end
+
+-- Function to send parameters and get action each frame
+local function process_frame(params)
+    -- Open pipe to write parameters
+    local pipe_out = io.open("/tmp/lua_to_py", "w")
+    if pipe_out then
+        pipe_out:write(params .. "\n") -- Add newline as delimiter
+        pipe_out:flush()
+        pipe_out:close()
+    end
+
+    -- Open pipe to read action
+    local pipe_in = io.open("/tmp/py_to_lua", "r")
+    if pipe_in then
+        local action = pipe_in:read("*line")
+        pipe_in:close()
+        return action
+    end
+    return nil -- Fallback if pipe fails
 end
 
 -- Helper function for calculating relative positions
@@ -342,10 +375,10 @@ local function format_section(title, metrics)
     return result .. "\n"
 end
 
-function update_display(game_state, level_state, player_state, enemies_state)
+function update_display(status, game_state, level_state, player_state, enemies_state)
     -- Clear screen with some newlines
     print(string.rep("\n", 50))
-    
+    print(status)
     -- Format game state
     local game_metrics = {
         ["Credits"] = game_state.credits,
@@ -465,20 +498,31 @@ function update_display(game_state, level_state, player_state, enemies_state)
     print(result)
 end
 
+-- Function to move the cursor to the home position using ANSI escape codes
+local function move_cursor_home()
+    io.write("\027[H")
+end
+
 -- Update the frame callback function
 local function frame_callback()
+    -- Move the cursor to the home position at the start of each frame
+    move_cursor_home()
+
     -- Update all state objects
     game_state:update(mem)
     level_state:update(mem)
     player_state:update(mem)
     enemies_state:update(mem)
 
+    local result = process_frame("Hello World!")
+    print(result)
+
     -- Randomly select an action
     local actions = {"fire", "zap", "left", "right", "none"}
     local action = actions[math.random(#actions)]
 
     -- Update the display
-    update_display(game_state, level_state, player_state, enemies_state)
+    update_display(result, game_state, level_state, player_state, enemies_state)
 
     -- Apply the action to MAME controls
     controls:apply_action(action)
