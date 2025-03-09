@@ -32,14 +32,118 @@ local function clear_screen()
     io.write("\027[2J\027[H")
 end
 
--- Assuming MAME Lua has basic OS support or luaposix
+-- Global pipe variables
+local pipe_out = nil
+local pipe_in = nil
+
+-- Function to open pipes (called once at startup)
+local function open_pipes()
+    -- Close existing pipes if they're open
+    if pipe_out then pipe_out:close() end
+    if pipe_in then pipe_in:close() end
+    
+    -- Try to open the pipes in non-blocking mode
+    local success = true
+    
+    -- First check if the pipes exist
+    local pipe_out_exists = os.execute("test -p /tmp/lua_to_py") == 0
+    local pipe_in_exists = os.execute("test -p /tmp/py_to_lua") == 0
+    
+    if not pipe_out_exists or not pipe_in_exists then
+        print("Waiting for pipes to be created...")
+        return false
+    end
+    
+    -- Open output pipe first (this is the one Python should be reading from)
+    pipe_out = io.open("/tmp/lua_to_py", "wb")
+    if not pipe_out then
+        print("Failed to open output pipe")
+        success = false
+    end
+    
+    -- Then open input pipe (this is the one Python should be writing to)
+    pipe_in = io.open("/tmp/py_to_lua", "r")
+    if not pipe_in then
+        print("Failed to open input pipe")
+        success = false
+        -- Close output pipe if input pipe failed
+        if pipe_out then pipe_out:close(); pipe_out = nil end
+    end
+    
+    if not success then
+        print("Warning: Failed to open one or both pipes")
+        return false
+    end
+    
+    print("Successfully opened both pipes")
+    return true
+end
+
+-- Function to send parameters and get action each frame
+local function process_frame(params)
+    -- Check if pipes are open, try to reopen if not
+    if not pipe_out or not pipe_in then
+        if not open_pipes() then
+            return "pipe error"
+        end
+    end
+    
+    -- Try to write to pipe, handle errors
+    local success, err = pcall(function()
+        pipe_out:write(params)
+        pipe_out:flush()
+    end)
+    
+    if not success then
+        print("Error writing to pipe:", err)
+        open_pipes()  -- Try to recover
+        return "write error"
+    end
+    
+    -- Try to read from pipe, handle errors
+    local action = nil
+    success, err = pcall(function()
+        action = pipe_in:read("*line")
+    end)
+    
+    if not success then
+        print("Error reading from pipe:", err)
+        open_pipes()  -- Try to recover
+        return "read error"
+    end
+    
+    return action or "no response"
+end
+
+-- Call this during initialization
 local function start_python_script()
     print("Starting Python script")
-    -- Launch Python script in the background
-    os.execute("python /Users/dave/source/repos/tempest/Scripts/aimodel.py &")
-    -- Create named pipes (if not already created)
-    os.execute("mkfifo /tmp/lua_to_py >/dev/null 2>&1")
-    os.execute("mkfifo /tmp/py_to_lua >/dev/null 2>&1")
+    
+    -- Create named pipes first (if not already created)
+    os.execute("mkfifo /tmp/lua_to_py 2>/dev/null")
+    os.execute("mkfifo /tmp/py_to_lua 2>/dev/null")
+    
+    -- Check if Python script is already running
+    local python_running = os.execute("pgrep -f 'python.*aimodel.py' >/dev/null") == 0
+    
+    if not python_running then
+        -- Launch Python script in the background with proper error handling
+        local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
+        local result = os.execute(cmd)
+        
+        if result ~= 0 then
+            print("Warning: Failed to start Python script")
+            return false
+        end
+        
+        -- Give Python script a moment to start up
+        os.execute("sleep 1")
+    else
+        print("Python script already running")
+    end
+    
+    -- Don't try to open pipes immediately - let the frame callback handle it
+    return true
 end
 
 start_python_script()
@@ -61,25 +165,6 @@ local mem = mainCpu.spaces["program"]
 if not mem then
     print("Error: Program memory space not found")
     return
-end
-
--- Function to send parameters and get action each frame
-local function process_frame(params)
-    local pipe_out = io.open("/tmp/lua_to_py", "wb")  -- Open in binary mode
-    if pipe_out then
-        pipe_out:write(params)  -- Write data directly without newline
-        pipe_out:flush()
-        pipe_out:close()
-    end
-
-    -- Open pipe to read action
-    local pipe_in = io.open("/tmp/py_to_lua", "r")
-    if pipe_in then
-        local action = pipe_in:read("*line")
-        pipe_in:close()
-        return action
-    end
-    return nil -- Fallback if pipe fails
 end
 
 -- Helper function for calculating relative positions
@@ -137,6 +222,7 @@ function LevelState:new()
     self.level_number = 0
     self.spike_heights = {}  -- Array of 16 spike heights
     self.level_type = 0     -- 00 = closed, FF = open
+    self.level_angles = {}  -- Array of 16 tube angles
     return self
 end
 
@@ -153,6 +239,12 @@ function LevelState:update(mem)
         -- Adjust player_pos to 0-based indexing to match our loop
         local rel_pos = calculate_relative_position(player_pos & 0x0F, i, is_open)
         self.spike_heights[rel_pos] = height
+    end
+    
+    -- Read tube angles for all 16 segments
+    self.level_angles = {}
+    for i = 0, 15 do
+        self.level_angles[i] = mem:read_u8(0x03EE + i)
     end
 end
 
@@ -437,6 +529,13 @@ function update_display(status, game_state, level_state, player_state, enemies_s
                 table.insert(heights, string.format("%+2d:%02X", pos, level_state.spike_heights[pos]))
             end
             return table.concat(heights, " ")
+        end)(),
+        ["Level Angles"] = (function()
+            local angles = {}
+            for i = 0, 15 do
+                table.insert(angles, string.format("%02X", level_state.level_angles[i]))
+            end
+            return table.concat(angles, " ")
         end)()
     }
     print(format_section("Level State", level_metrics))
@@ -508,6 +607,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         level_number = level_state.level_number,
         level_type = level_state.level_type,
         spike_heights = level_state.spike_heights,
+        level_angles = level_state.level_angles,  -- Add level angles to the data
         active_flippers = enemies_state.active_flippers,
         active_pulsars = enemies_state.active_pulsars,
         active_tankers = enemies_state.active_tankers,
@@ -551,6 +651,22 @@ end
 
 -- Update the frame callback function
 local function frame_callback()
+    -- Check if pipes are open, try to reopen if not
+    if not pipe_out or not pipe_in then
+        if not open_pipes() then
+            -- If pipes aren't open yet, just update the display without sending data
+            -- Update all state objects
+            game_state:update(mem)
+            level_state:update(mem)
+            player_state:update(mem)
+            enemies_state:update(mem)
+            
+            -- Update the display
+            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state)
+            return
+        end
+    end
+    
     -- Clear the screen at the start of each frame
     move_cursor_home()
 
@@ -565,8 +681,7 @@ local function frame_callback()
 
     -- Send the serialized data to the Python script
     local result = process_frame(frame_data)
-    print(result)
-
+    
     -- Randomly select an action
     local actions = {"fire", "zap", "left", "right", "none"}
     local action = actions[math.random(#actions)]
@@ -578,6 +693,19 @@ local function frame_callback()
     controls:apply_action(action)
 end
 
+-- Start the Python script but don't wait for pipes to open
+start_python_script()
+clear_screen()
+
 -- Register the frame callback with MAME
 emu.register_frame(frame_callback)
+
+local function cleanup()
+    if pipe_out then pipe_out:close() end
+    if pipe_in then pipe_in:close() end
+    print("Pipes closed")
+end
+
+-- Register cleanup with MAME's exit handler if available
+emu.register_stop(cleanup)
 
