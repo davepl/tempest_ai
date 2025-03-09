@@ -39,54 +39,63 @@ local pipe_in = nil
 -- Function to open pipes (called once at startup)
 local function open_pipes()
     -- Close existing pipes if they're open
-    if pipe_out then pipe_out:close() end
-    if pipe_in then pipe_in:close() end
+    if pipe_out then pipe_out:close(); pipe_out = nil end
+    if pipe_in then pipe_in:close(); pipe_in = nil end
     
-    -- Try to open the pipes in non-blocking mode
-    local success = true
+    print("Attempting to open pipes...")
     
-    -- First check if the pipes exist
-    local pipe_out_exists = os.execute("test -p /tmp/lua_to_py") == 0
-    local pipe_in_exists = os.execute("test -p /tmp/py_to_lua") == 0
+    -- Try to open the pipes directly without checking existence first
+    -- First open the output pipe (this is the one Python should be reading from)
+    print("Opening output pipe (lua_to_py)...")
+    local open_success, err = pcall(function()
+        pipe_out = io.open("/tmp/lua_to_py", "wb")
+    end)
     
-    if not pipe_out_exists or not pipe_in_exists then
-        print("Waiting for pipes to be created...")
+    if not open_success or not pipe_out then
+        print("Failed to open output pipe: " .. tostring(err))
         return false
     end
-    
-    -- Open output pipe first (this is the one Python should be reading from)
-    pipe_out = io.open("/tmp/lua_to_py", "wb")
-    if not pipe_out then
-        print("Failed to open output pipe")
-        success = false
-    end
+    print("Output pipe opened successfully")
     
     -- Then open input pipe (this is the one Python should be writing to)
-    pipe_in = io.open("/tmp/py_to_lua", "r")
-    if not pipe_in then
-        print("Failed to open input pipe")
-        success = false
-        -- Close output pipe if input pipe failed
-        if pipe_out then pipe_out:close(); pipe_out = nil end
-    end
+    print("Opening input pipe (py_to_lua)...")
+    open_success, err = pcall(function()
+        pipe_in = io.open("/tmp/py_to_lua", "r")
+    end)
     
-    if not success then
-        print("Warning: Failed to open one or both pipes")
+    if not open_success or not pipe_in then
+        print("Failed to open input pipe: " .. tostring(err))
+        if pipe_out then pipe_out:close(); pipe_out = nil end
         return false
     end
+    print("Input pipe opened successfully")
     
     print("Successfully opened both pipes")
     return true
 end
 
+-- Create a variable to track pipe retry attempts
+local pipe_retry_count = 0
+
 -- Function to send parameters and get action each frame
 local function process_frame(params)
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
-        if not open_pipes() then
+        pipe_retry_count = pipe_retry_count + 1
+        
+        -- Only try to open pipes every 60 frames (about once per second)
+        if pipe_retry_count % 60 == 0 then
+            print("Attempt #" .. pipe_retry_count / 60 .. " to open pipes")
+            if not open_pipes() then
+                return "pipe error"
+            end
+        else
             return "pipe error"
         end
     end
+    
+    -- Reset retry count once pipes are open
+    pipe_retry_count = 0
     
     -- Try to write to pipe, handle errors
     local success, err = pcall(function()
@@ -119,30 +128,41 @@ end
 local function start_python_script()
     print("Starting Python script")
     
-    -- Create named pipes first (if not already created)
-    os.execute("mkfifo /tmp/lua_to_py 2>/dev/null")
-    os.execute("mkfifo /tmp/py_to_lua 2>/dev/null")
+    -- Kill any existing Python script instances
+    os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
     
-    -- Check if Python script is already running
-    local python_running = os.execute("pgrep -f 'python.*aimodel.py' >/dev/null") == 0
+    -- Remove existing pipes to ensure clean state
+    os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
     
-    if not python_running then
-        -- Launch Python script in the background with proper error handling
-        local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
-        local result = os.execute(cmd)
-        
-        if result ~= 0 then
-            print("Warning: Failed to start Python script")
-            return false
-        end
-        
-        -- Give Python script a moment to start up
-        os.execute("sleep 1")
-    else
-        print("Python script already running")
+    -- Launch Python script in the background with proper error handling
+    local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
+    local result = os.execute(cmd)
+    
+    if result ~= 0 then
+        print("Warning: Failed to start Python script")
+        return false
     end
     
-    -- Don't try to open pipes immediately - let the frame callback handle it
+    -- Give Python script a moment to start up and create pipes
+    print("Waiting for Python script to initialize and create pipes...")
+    os.execute("sleep 3")
+    
+    -- Check if Python script is running
+    local python_running = os.execute("pgrep -f 'python.*aimodel.py' >/dev/null") == 0
+    if not python_running then
+        print("Warning: Python script failed to start or terminated early")
+        print("Check /tmp/python_output.log for errors")
+        return false
+    end
+    
+    print("Python script started successfully")
+    
+    -- Try to open pipes immediately
+    local pipes_opened = open_pipes()
+    if not pipes_opened then
+        print("Initial pipe opening failed, will retry during frame callback")
+    end
+    
     return true
 end
 
@@ -475,7 +495,7 @@ local function move_cursor_to_row(row)
     io.write(string.format("\027[%d;0H", row))
 end
 
-function update_display(status, game_state, level_state, player_state, enemies_state)
+function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
     -- Clear screen
     -- clear_screen()
 
@@ -513,8 +533,19 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     }
     print(format_section("Player State", player_metrics))
 
-    -- Format and print level state at row 15
-    move_cursor_to_row(15)
+    -- Format and print player controls at row 13
+    move_cursor_to_row(13)
+    local controls_metrics = {
+        ["Current Action"] = current_action or "none",
+        ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
+        ["Superzapper"] = (current_action == "zap") and "ACTIVE" or "inactive",
+        ["Left"] = (current_action == "left") and "ACTIVE" or "inactive",
+        ["Right"] = (current_action == "right") and "ACTIVE" or "inactive"
+    }
+    print(format_section("Player Controls", controls_metrics))
+
+    -- Format and print level state at row 20
+    move_cursor_to_row(20)
     local level_metrics = {
         ["Level Number"] = level_state.level_number,
         ["Level Type"] = level_state.level_type == 0xFF and "Open" or "Closed",
@@ -540,8 +571,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     }
     print(format_section("Level State", level_metrics))
 
-    -- Format and print enemies state at row 25
-    move_cursor_to_row(25)
+    -- Format and print enemies state at row 30
+    move_cursor_to_row(30)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -661,8 +692,8 @@ local function frame_callback()
             player_state:update(mem)
             enemies_state:update(mem)
             
-            -- Update the display
-            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state)
+            -- Update the display with empty controls
+            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, "none")
             return
         end
     end
@@ -682,12 +713,16 @@ local function frame_callback()
     -- Send the serialized data to the Python script
     local result = process_frame(frame_data)
     
-    -- Randomly select an action
-    local actions = {"fire", "zap", "left", "right", "none"}
-    local action = actions[math.random(#actions)]
+    -- Use the action from Python if valid, otherwise use random
+    local action = result
+    if not (action == "fire" or action == "zap" or action == "left" or action == "right" or action == "none") then
+        -- If Python returns an invalid action or error, use random
+        local actions = {"fire", "zap", "left", "right", "none"}
+        action = actions[math.random(#actions)]
+    end
 
-    -- Update the display
-    update_display(result, game_state, level_state, player_state, enemies_state)
+    -- Update the display with the current action
+    update_display(result, game_state, level_state, player_state, enemies_state, action)
 
     -- Apply the action to MAME controls
     controls:apply_action(action)
