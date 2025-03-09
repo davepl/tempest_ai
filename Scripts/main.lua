@@ -28,6 +28,9 @@
     - Tempest ROM set loaded in MAME.
 --]]
 
+local function clear_screen()
+    io.write("\027[2J\027[H")
+end
 
 -- Assuming MAME Lua has basic OS support or luaposix
 local function start_python_script()
@@ -40,6 +43,7 @@ local function start_python_script()
 end
 
 start_python_script()
+clear_screen()
 
 -- Add after the initial requires, before the GameState class
 
@@ -61,10 +65,9 @@ end
 
 -- Function to send parameters and get action each frame
 local function process_frame(params)
-    -- Open pipe to write parameters
-    local pipe_out = io.open("/tmp/lua_to_py", "w")
+    local pipe_out = io.open("/tmp/lua_to_py", "wb")  -- Open in binary mode
     if pipe_out then
-        pipe_out:write(params .. "\n") -- Add newline as delimiter
+        pipe_out:write(params)  -- Write data directly without newline
         pipe_out:flush()
         pipe_out:close()
     end
@@ -375,19 +378,30 @@ local function format_section(title, metrics)
     return result .. "\n"
 end
 
+-- Function to move the cursor to a specific row
+local function move_cursor_to_row(row)
+    io.write(string.format("\027[%d;0H", row))
+end
+
 function update_display(status, game_state, level_state, player_state, enemies_state)
-    -- Clear screen with some newlines
-    print(string.rep("\n", 50))
+    -- Clear screen
+    -- clear_screen()
+
+    -- Move cursor to row 0 and print status
+    move_cursor_to_row(0)
     print(status)
-    -- Format game state
+
+    -- Format and print game state at row 1
+    move_cursor_to_row(1)
     local game_metrics = {
         ["Credits"] = game_state.credits,
         ["P1 Lives"] = game_state.p1_lives,
         ["P1 Level"] = game_state.p1_level
     }
     print(format_section("Game State", game_metrics))
-    
-    -- Format player state
+
+    -- Format and print player state at row 5
+    move_cursor_to_row(5)
     local player_metrics = {
         ["Position"] = player_state.position,
         ["Alive"] = player_state.alive,
@@ -399,8 +413,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         ["Shot Positions"] = (function()
             local shots = {}
             for i = 1, 8 do
-                -- Always show all 8 slots in XX-YY format
-                -- XX is depth (position), YY is relative segment
                 local segment_str = string.format("%+02d", player_state.shot_segments[i])
                 shots[i] = string.format("%02X-%s", player_state.shot_positions[i], segment_str)
             end
@@ -408,21 +420,19 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         end)()
     }
     print(format_section("Player State", player_metrics))
-    
-    -- Format level state with relative spike heights
+
+    -- Format and print level state at row 15
+    move_cursor_to_row(15)
     local level_metrics = {
         ["Level Number"] = level_state.level_number,
         ["Level Type"] = level_state.level_type == 0xFF and "Open" or "Closed",
         ["Spike Heights"] = (function()
             local heights = {}
             local positions = {}
-            -- Get all positions
             for pos, height in pairs(level_state.spike_heights) do
                 table.insert(positions, pos)
             end
-            -- Sort positions from negative to positive
             table.sort(positions)
-            -- Format each height with its relative position
             for _, pos in ipairs(positions) do
                 table.insert(heights, string.format("%+2d:%02X", pos, level_state.spike_heights[pos]))
             end
@@ -430,8 +440,9 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         end)()
     }
     print(format_section("Level State", level_metrics))
-    
-    -- Format enemies state with decoded information
+
+    -- Format and print enemies state at row 25
+    move_cursor_to_row(25)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -439,13 +450,11 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     for i = 1, 7 do
         enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
         enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
-        enemy_segs[i] = string.format("%+3d", enemies_state.enemy_segments[i])  -- Show relative position with sign
+        enemy_segs[i] = string.format("%+3d", enemies_state.enemy_segments[i])
         enemy_depths[i] = string.format("%02X.%02X", enemies_state.enemy_depths[i].pos, enemies_state.enemy_depths[i].frac)
     end
 
-    -- Create the enemies metrics table first
     local enemies_metrics = {
-        -- Enemy counts first
         ["Flippers"] = string.format("%d active, %d spawn slots", enemies_state.active_flippers, enemies_state.spawn_slots_flippers),
         ["Pulsars"] = string.format("%d active, %d spawn slots", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars),
         ["Tankers"] = string.format("%d active, %d spawn slots", enemies_state.active_tankers, enemies_state.spawn_slots_tankers),
@@ -456,7 +465,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
             enemies_state.spawn_slots_flippers + enemies_state.spawn_slots_pulsars + 
             enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
             enemies_state.spawn_slots_fuseballs),
-        ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),  -- Show pulsing as progress to FF
+        ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
         ["Enemy Types"] = table.concat(enemy_types, " "),
         ["Enemy States"] = table.concat(enemy_states, " "),
         ["Enemy Segments"] = table.concat(enemy_segs, " "),
@@ -464,7 +473,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         ["Shot Positions"] = (function()
             local shots = {}
             for i = 1, 4 do
-                if enemies_state.shot_positions[i] then  -- Only show non-nil shots
+                if enemies_state.shot_positions[i] then
                     table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
                 end
             end
@@ -472,30 +481,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         end)()
     }
 
-    -- Use an ordered table to maintain display order
-    local ordered_keys = {
-        "Flippers", "Pulsars", "Tankers", "Spikers", "Fuseballs", "Total",
-        "Pulse State", "Enemy Types", "Enemy States", "Enemy Segments", "Enemy Depths", "Shot Positions"
-    }
-
-    -- Print the section with ordered keys
-    local width = 40
-    local separator = string.rep("-", width - 4)
-    local result = string.format("--[ %s ]%s\n", "Enemies State", separator)
-    
-    -- Find the longest key for alignment
-    local max_key_length = 0
-    for _, key in ipairs(ordered_keys) do
-        max_key_length = math.max(max_key_length, string.len(key))
-    end
-    
-    -- Format each metric in order
-    for _, key in ipairs(ordered_keys) do
-        result = result .. string.format("  %-" .. max_key_length .. "s : %s\n", 
-            key, tostring(enemies_metrics[key]))
-    end
-    
-    print(result)
+    print(format_section("Enemies State", enemies_metrics))
 end
 
 -- Function to move the cursor to the home position using ANSI escape codes
@@ -503,9 +489,69 @@ local function move_cursor_home()
     io.write("\027[H")
 end
 
+-- Function to flatten and serialize the game state data to signed 16-bit integers
+local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+    local data = {
+        credits = game_state.credits,
+        p1_lives = game_state.p1_lives,
+        p1_level = game_state.p1_level,
+        player_position = player_state.position,
+        player_alive = player_state.alive,
+        score_low = player_state.score & 0xFFFF,  -- Lower 16 bits of score
+        score_high = (player_state.score >> 16) & 0xFFFF,  -- Upper 16 bits of score
+        player_angle = player_state.angle,
+        superzapper_uses = player_state.superzapper_uses,
+        superzapper_active = player_state.superzapper_active,
+        shot_count = player_state.shot_count,
+        shot_positions = player_state.shot_positions,
+        shot_segments = player_state.shot_segments,
+        level_number = level_state.level_number,
+        level_type = level_state.level_type,
+        spike_heights = level_state.spike_heights,
+        active_flippers = enemies_state.active_flippers,
+        active_pulsars = enemies_state.active_pulsars,
+        active_tankers = enemies_state.active_tankers,
+        active_spikers = enemies_state.active_spikers,
+        active_fuseballs = enemies_state.active_fuseballs,
+        spawn_slots_flippers = enemies_state.spawn_slots_flippers,
+        spawn_slots_pulsars = enemies_state.spawn_slots_pulsars,
+        spawn_slots_tankers = enemies_state.spawn_slots_tankers,
+        spawn_slots_spikers = enemies_state.spawn_slots_spikers,
+        spawn_slots_fuseballs = enemies_state.spawn_slots_fuseballs,
+        enemy_segments = enemies_state.enemy_segments,
+        shot_positions_enemy = enemies_state.shot_positions
+    }
+
+    -- Serialize the data to a binary string
+    local binary_data = ""
+    for name, value in pairs(data) do
+        if type(value) == "number" then
+            binary_data = binary_data .. string.pack(">i2", value)  -- Pack as signed 16-bit integer
+        elseif type(value) == "table" then
+            for i, v in ipairs(value) do
+                binary_data = binary_data .. string.pack(">i2", v)  -- Pack as signed 16-bit integer
+            end
+        else
+            print("Non-numeric value found:", name, "value:", value)  -- Debugging output
+        end
+    end
+
+    -- Handle enemy_depths separately as it contains nested tables
+    for i, depth in ipairs(enemies_state.enemy_depths) do
+        if type(depth) == "table" then
+            binary_data = binary_data .. string.pack(">i2", depth.pos)  -- Pack main position
+            binary_data = binary_data .. string.pack(">i2", depth.frac) -- Pack fractional part
+        else
+            print("Unexpected non-table value in enemy_depths:", depth)
+        end
+    end
+
+    return binary_data
+end
+
 -- Update the frame callback function
 local function frame_callback()
-    -- Move the cursor to the home position at the start of each frame
+    -- Clear the screen at the start of each frame
     move_cursor_home()
 
     -- Update all state objects
@@ -514,7 +560,11 @@ local function frame_callback()
     player_state:update(mem)
     enemies_state:update(mem)
 
-    local result = process_frame("Hello World!")
+    -- Flatten and serialize the game state data
+    local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+
+    -- Send the serialized data to the Python script
+    local result = process_frame(frame_data)
     print(result)
 
     -- Randomly select an action
@@ -530,3 +580,4 @@ end
 
 -- Register the frame callback with MAME
 emu.register_frame(frame_callback)
+
