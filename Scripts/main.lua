@@ -79,21 +79,17 @@ local pipe_retry_count = 0
 
 -- Function to send parameters and get action each frame
 local function process_frame(params)
+
     -- Check if pipes are open, try to reopen if not
-    if not pipe_out or not pipe_in then
+    while not pipe_out or not pipe_in do
+        sleep(0.01)
         pipe_retry_count = pipe_retry_count + 1
-        
-        -- Only try to open pipes every 60 frames (about once per second)
-        if pipe_retry_count % 60 == 0 then
-            print("Attempt #" .. pipe_retry_count / 60 .. " to open pipes")
-            if not open_pipes() then
-                return "pipe error"
-            end
-        else
-            return "pipe error"
-        end
     end
-    
+
+    if (not pipe_out or not pipe_in) then
+        return "pipe error"
+    end
+
     -- Reset retry count once pipes are open
     pipe_retry_count = 0
     
@@ -224,13 +220,19 @@ function GameState:new()
     self.credits = 0
     self.p1_level = 0
     self.p1_lives = 0
+    self.gamestate = 0    -- Game state from address 0
+    self.game_mode = 0    -- Game mode from address 5
+    self.countdown_timer = 0  -- Countdown timer from address 4
     return self
 end
 
 function GameState:update(mem)
-    self.credits = mem:read_u8(0x0006)  -- Example address for credits
-    self.p1_level = mem:read_u8(0x0046)  -- Player 1 level
-    self.p1_lives = mem:read_u8(0x0048)  -- Player 1 lives
+    self.gamestate = mem:read_u8(0x0000)  -- Game state at address 0
+    self.game_mode = mem:read_u8(0x0005)  -- Game mode at address 5
+    self.countdown_timer = mem:read_u8(0x0004)  -- Countdown timer at address 4
+    self.credits = mem:read_u8(0x0006)    -- Credits
+    self.p1_level = mem:read_u8(0x0046)   -- Player 1 level
+    self.p1_lives = mem:read_u8(0x0048)   -- Player 1 lives
 end
 
 -- **LevelState Class**
@@ -243,12 +245,14 @@ function LevelState:new()
     self.spike_heights = {}  -- Array of 16 spike heights
     self.level_type = 0     -- 00 = closed, FF = open
     self.level_angles = {}  -- Array of 16 tube angles
+    self.level_shape = 0    -- Level shape (level_number % 16)
     return self
 end
 
 function LevelState:update(mem)
     self.level_number = mem:read_u8(0x009F)  -- Example address for level number
     self.level_type = mem:read_u8(0x0111)    -- Level type (00=closed, FF=open)
+    self.level_shape = self.level_number % 16  -- Calculate level shape
     local player_pos = mem:read_u8(0x0200)   -- Player position
     local is_open = self.level_type == 0xFF
     
@@ -497,44 +501,92 @@ end
 
 function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
     -- Clear screen
-    -- clear_screen()
+    clear_screen()
 
     -- Move cursor to row 0 and print status
     move_cursor_to_row(0)
     print(status)
 
-    -- Format and print game state at row 1
+    -- Format and print game state in 3 columns at row 1
     move_cursor_to_row(1)
+    
+    -- Create game metrics in a more organized way for 3-column display
     local game_metrics = {
-        ["Credits"] = game_state.credits,
-        ["P1 Lives"] = game_state.p1_lives,
-        ["P1 Level"] = game_state.p1_level
+        {["Gamestate"] = string.format("0x%02X", game_state.gamestate)},
+        {["Game Mode"] = string.format("0x%02X", game_state.game_mode)},
+        {["Countdown"] = string.format("0x%02X", game_state.countdown_timer)},
+        {["Credits"] = game_state.credits},
+        {["P1 Lives"] = game_state.p1_lives},
+        {["P1 Level"] = game_state.p1_level}
     }
-    print(format_section("Game State", game_metrics))
-
-    -- Format and print player state at row 5
-    move_cursor_to_row(5)
-    local player_metrics = {
-        ["Position"] = player_state.position,
-        ["Alive"] = player_state.alive,
-        ["Score"] = player_state.score,
-        ["Angle"] = player_state.angle,
-        ["Superzapper Uses"] = player_state.superzapper_uses,
-        ["Superzapper Active"] = player_state.superzapper_active,
-        ["Shot Count"] = player_state.shot_count,
-        ["Shot Positions"] = (function()
-            local shots = {}
-            for i = 1, 8 do
-                local segment_str = string.format("%+02d", player_state.shot_segments[i])
-                shots[i] = string.format("%02X-%s", player_state.shot_positions[i], segment_str)
+    
+    -- Print game metrics in 3 columns
+    print("--[ Game State ]--------------------------------------")
+    local col_width = 25  -- Width for each column
+    
+    -- Calculate how many rows we need (ceiling of items/3)
+    local rows = math.ceil(#game_metrics / 3)
+    
+    for row = 1, rows do
+        local line = "  "
+        for col = 1, 3 do
+            local idx = (row - 1) * 3 + col
+            if idx <= #game_metrics then
+                for k, v in pairs(game_metrics[idx]) do
+                    -- Format each metric with fixed width
+                    line = line .. string.format("%-12s: %-" .. (col_width - 15) .. "s", k, tostring(v))
+                end
             end
-            return table.concat(shots, " ")
-        end)()
+        end
+        print(line)
+    end
+    print("")  -- Empty line after section
+
+    -- Format and print player state in 3 columns at row 5
+    move_cursor_to_row(5)
+    
+    -- Create player metrics in a more organized way for 3-column display
+    local player_metrics = {
+        {["Position"] = player_state.position},
+        {["Alive"] = player_state.alive},
+        {["Score"] = player_state.score},
+        {["Angle"] = player_state.angle},
+        {["Szapper Uses"] = player_state.superzapper_uses},
+        {["Szapper Active"] = player_state.superzapper_active},
+        {["Shot Count"] = player_state.shot_count}
     }
-    print(format_section("Player State", player_metrics))
+    
+    -- Print player metrics in 3 columns
+    print("--[ Player State ]------------------------------------")
+    
+    -- Calculate how many rows we need (ceiling of items/3)
+    local rows = math.ceil(#player_metrics / 3)
+    
+    for row = 1, rows do
+        local line = "  "
+        for col = 1, 3 do
+            local idx = (row - 1) * 3 + col
+            if idx <= #player_metrics then
+                for k, v in pairs(player_metrics[idx]) do
+                    -- Format each metric with fixed width
+                    line = line .. string.format("%-12s: %-" .. (col_width - 15) .. "s", k, tostring(v))
+                end
+            end
+        end
+        print(line)
+    end
+    
+    -- Add shot positions on its own line
+    local shots_str = ""
+    for i = 1, 8 do
+        local segment_str = string.format("%+02d", player_state.shot_segments[i])
+        shots_str = shots_str .. string.format("%02X-%s ", player_state.shot_positions[i], segment_str)
+    end
+    print("  Shot Positions: " .. shots_str)
+    print("")  -- Empty line after section
 
     -- Format and print player controls at row 13
-    move_cursor_to_row(13)
+    move_cursor_to_row(10)
     local controls_metrics = {
         ["Current Action"] = current_action or "none",
         ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
@@ -544,35 +596,58 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     }
     print(format_section("Player Controls", controls_metrics))
 
-    -- Format and print level state at row 20
-    move_cursor_to_row(20)
-    local level_metrics = {
-        ["Level Number"] = level_state.level_number,
-        ["Level Type"] = level_state.level_type == 0xFF and "Open" or "Closed",
-        ["Spike Heights"] = (function()
-            local heights = {}
-            local positions = {}
-            for pos, height in pairs(level_state.spike_heights) do
-                table.insert(positions, pos)
-            end
-            table.sort(positions)
-            for _, pos in ipairs(positions) do
-                table.insert(heights, string.format("%+2d:%02X", pos, level_state.spike_heights[pos]))
-            end
-            return table.concat(heights, " ")
-        end)(),
-        ["Level Angles"] = (function()
-            local angles = {}
-            for i = 0, 15 do
-                table.insert(angles, string.format("%02X", level_state.level_angles[i]))
-            end
-            return table.concat(angles, " ")
-        end)()
+    -- Format and print level state in 3 columns
+    move_cursor_to_row(16)
+    
+    -- Create level metrics in a more organized way for 3-column display
+    local level_metrics_list = {
+        {["Level Number"] = level_state.level_number},
+        {["Level Type"] = level_state.level_type == 0xFF and "Open" or "Closed"},
+        {["Level Shape"] = level_state.level_shape}
     }
-    print(format_section("Level State", level_metrics))
+    
+    -- Print level metrics in 3 columns
+    print("--[ Level State ]-------------------------------------")
+    
+    -- Calculate how many rows we need (ceiling of items/3)
+    local rows = math.ceil(#level_metrics_list / 3)
+    
+    for row = 1, rows do
+        local line = "  "
+        for col = 1, 3 do
+            local idx = (row - 1) * 3 + col
+            if idx <= #level_metrics_list then
+                for k, v in pairs(level_metrics_list[idx]) do
+                    -- Format each metric with fixed width
+                    line = line .. string.format("%-12s: %-" .. (col_width - 15) .. "s", k, tostring(v))
+                end
+            end
+        end
+        print(line)
+    end
+    
+    -- Add spike heights on its own line
+    local heights_str = ""
+    local positions = {}
+    for pos, height in pairs(level_state.spike_heights) do
+        table.insert(positions, pos)
+    end
+    table.sort(positions)
+    for _, pos in ipairs(positions) do
+        heights_str = heights_str .. string.format("%+2d:%02X ", pos, level_state.spike_heights[pos])
+    end
+    print("  Spike Heights: " .. heights_str)
+    
+    -- Add level angles on its own line
+    local angles_str = ""
+    for i = 0, 15 do
+        angles_str = angles_str .. string.format("%02X ", level_state.level_angles[i])
+    end
+    print("  Level Angles : " .. angles_str)
+    print("")  -- Empty line after section
 
     -- Format and print enemies state at row 30
-    move_cursor_to_row(30)
+    move_cursor_to_row(23)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -622,6 +697,9 @@ end
 -- Function to flatten and serialize the game state data to signed 16-bit integers
 local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
     local data = {
+        gamestate = game_state.gamestate,      -- Add gamestate
+        game_mode = game_state.game_mode,      -- Add game mode
+        countdown_timer = game_state.countdown_timer,  -- Add countdown timer
         credits = game_state.credits,
         p1_lives = game_state.p1_lives,
         p1_level = game_state.p1_level,
@@ -637,8 +715,9 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         shot_segments = player_state.shot_segments,
         level_number = level_state.level_number,
         level_type = level_state.level_type,
+        level_shape = level_state.level_shape,  -- Add level shape
         spike_heights = level_state.spike_heights,
-        level_angles = level_state.level_angles,  -- Add level angles to the data
+        level_angles = level_state.level_angles,
         active_flippers = enemies_state.active_flippers,
         active_pulsars = enemies_state.active_pulsars,
         active_tankers = enemies_state.active_tankers,
@@ -707,18 +786,31 @@ local function frame_callback()
     player_state:update(mem)
     enemies_state:update(mem)
 
-    -- Flatten and serialize the game state data
-    local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+    -- Massage game state to keep it out of the high score and banner modes
 
-    -- Send the serialized data to the Python script
-    local result = process_frame(frame_data)
+    if game_state.countdown_timer > 0 then
+        -- Write 0 to memory location 4
+        mem:write_u8(0x0004, 0)
+        game_state.countdown_timer = 0
+    end
+
+    -- We only control the game in regular play mode (04) and zooming down the tube (20)
+
+    if game_state.game_state == 0x04 or game_state.game_state == 0x20 then
     
-    -- Use the action from Python if valid, otherwise use random
-    local action = result
-    if not (action == "fire" or action == "zap" or action == "left" or action == "right" or action == "none") then
-        -- If Python returns an invalid action or error, use random
-        local actions = {"fire", "zap", "left", "right", "none"}
-        action = actions[math.random(#actions)]
+        -- Flatten and serialize the game state data
+        local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+
+        -- Send the serialized data to the Python script
+        local result = process_frame(frame_data)
+        
+        -- Use the action from Python if valid, otherwise use random
+        local action = result
+        if not (action == "fire" or action == "zap" or action == "left" or action == "right" or action == "none") then
+            -- If Python returns an invalid action or error, use random
+            local actions = {"fire", "zap", "left", "right", "none"}
+            action = actions[math.random(#actions)]
+        end
     end
 
     -- Update the display with the current action
