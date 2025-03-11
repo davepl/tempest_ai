@@ -43,15 +43,7 @@ local pipe_in = nil
 
 -- Function to open pipes (called once at startup)
 local function open_pipes()
-    -- Close existing pipes if they're open
-    if pipe_out then pipe_out:close(); pipe_out = nil end
-    if pipe_in then pipe_in:close(); pipe_in = nil end
-    
-    -- print("Attempting to open pipes...")
-    
-    -- Try to open the pipes directly without checking existence first
-    -- First open the output pipe (this is the one Python should be reading from)
-    -- print("Opening output pipe (lua_to_py)...")
+    -- Try to open the output pipe
     local open_success, err = pcall(function()
         pipe_out = io.open("/tmp/lua_to_py", "wb")
     end)
@@ -60,22 +52,18 @@ local function open_pipes()
         print("Failed to open output pipe: " .. tostring(err))
         return false
     end
-    -- print("Output pipe opened successfully")
     
-    -- Then open input pipe (this is the one Python should be writing to)
-    -- print("Opening input pipe (py_to_lua)...")
+    -- Try to open the input pipe
     open_success, err = pcall(function()
-        pipe_in = io.open("/tmp/py_to_lua", "r")
+        pipe_in = io.open("/tmp/py_to_lua", "rb")
     end)
     
     if not open_success or not pipe_in then
-        print("Failed to open input pipe: " .. tostring(err))
+        print("Failed to open input pipe: " .. (err or "Unknown error"))
         if pipe_out then pipe_out:close(); pipe_out = nil end
         return false
     end
-    -- print("Input pipe opened successfully")
     
-    -- print("Successfully opened both pipes")
     return true
 end
 
@@ -126,24 +114,10 @@ end
 local function process_frame(params)
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
-        pipe_retry_count = pipe_retry_count + 1
-        
-        -- Only try to open pipes every 60 frames (about once per second)
-        if pipe_retry_count % 60 == 0 then
-            -- print("Attempt #" .. pipe_retry_count / 60 .. " to open pipes")
-            if not open_pipes() then
-                return "pipe error"
-            end
-        else
+        if not open_pipes() then
             return "pipe error"
         end
     end
-    
-    -- Reset retry count once pipes are open
-    pipe_retry_count = 0
-    
-    -- Debug output for data size
-    -- print("Sending " .. #params .. " bytes to Python")
     
     -- Try to write to pipe, handle errors
     local success, err = pcall(function()
@@ -153,13 +127,15 @@ local function process_frame(params)
     
     if not success then
         print("Error writing to pipe:", err)
-        open_pipes()  -- Try to recover
+        -- Close and attempt to reopen pipes
+        if pipe_out then pipe_out:close(); pipe_out = nil end
+        if pipe_in then pipe_in:close(); pipe_in = nil end
+        open_pipes()
         return "write error"
     end
     
     -- Try to read from pipe, handle errors
     local action = nil
-    -- print("Waiting for response from Python...")
     success, err = pcall(function()
         -- Use a timeout to avoid hanging indefinitely
         local start_time = os.time()
@@ -169,7 +145,6 @@ local function process_frame(params)
             action = pipe_in:read("*line")
             if not action then
                 -- Sleep briefly to avoid busy-waiting
-                -- Use a very short sleep to not block the emulator
                 os.execute("sleep 0.01")
             end
         end
@@ -177,7 +152,10 @@ local function process_frame(params)
     
     if not success then
         print("Error reading from pipe:", err)
-        open_pipes()  -- Try to recover
+        -- Close and attempt to reopen pipes
+        if pipe_out then pipe_out:close(); pipe_out = nil end
+        if pipe_in then pipe_in:close(); pipe_in = nil end
+        open_pipes()
         return "read error"
     end
     
@@ -189,7 +167,6 @@ local function process_frame(params)
     -- Trim any whitespace from the action
     action = action:gsub("^%s*(.-)%s*$", "%1")
     
-    -- print("Received action from Python: '" .. action .. "'")
     return action
 end
 
@@ -720,8 +697,6 @@ local function frame_callback()
         end
     end
     
-    -- Clear the screen at the start of each frame
-    move_cursor_home()
 
     -- Update all state objects
     game_state:update(mem)
@@ -781,6 +756,7 @@ end
 
 -- Update the update_display function to show total bytes sent and FPS
 function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
+    clear_screen()
     move_cursor_to_row(1)
 
     -- Format and print game state in 3 columns at row 1
