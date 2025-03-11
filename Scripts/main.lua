@@ -79,19 +79,26 @@ local pipe_retry_count = 0
 
 -- Function to send parameters and get action each frame
 local function process_frame(params)
-
     -- Check if pipes are open, try to reopen if not
-    while not pipe_out or not pipe_in do
-        sleep(0.01)
+    if not pipe_out or not pipe_in then
         pipe_retry_count = pipe_retry_count + 1
+        
+        -- Only try to open pipes every 60 frames (about once per second)
+        if pipe_retry_count % 60 == 0 then
+            print("Attempt #" .. pipe_retry_count / 60 .. " to open pipes")
+            if not open_pipes() then
+                return "pipe error"
+            end
+        else
+            return "pipe error"
+        end
     end
-
-    if (not pipe_out or not pipe_in) then
-        return "pipe error"
-    end
-
+    
     -- Reset retry count once pipes are open
     pipe_retry_count = 0
+    
+    -- Debug output for data size
+    -- print("Sending " .. #params .. " bytes to Python")
     
     -- Try to write to pipe, handle errors
     local success, err = pcall(function()
@@ -107,8 +114,20 @@ local function process_frame(params)
     
     -- Try to read from pipe, handle errors
     local action = nil
+    -- print("Waiting for response from Python...")
     success, err = pcall(function()
-        action = pipe_in:read("*line")
+        -- Use a timeout to avoid hanging indefinitely
+        local start_time = os.time()
+        local timeout = 2  -- 2 second timeout
+        
+        while not action and os.time() - start_time < timeout do
+            action = pipe_in:read("*line")
+            if not action then
+                -- Sleep briefly to avoid busy-waiting
+                -- Use a very short sleep to not block the emulator
+                os.execute("sleep 0.01")
+            end
+        end
     end)
     
     if not success then
@@ -117,13 +136,24 @@ local function process_frame(params)
         return "read error"
     end
     
-    return action or "no response"
+    if not action then
+        print("Timeout waiting for Python response")
+        return "timeout"
+    end
+    
+    -- Trim any whitespace from the action
+    action = action:gsub("^%s*(.-)%s*$", "%1")
+    
+    print("Received action from Python: '" .. action .. "'")
+    return action
 end
 
 -- Call this during initialization
 local function start_python_script()
     print("Starting Python script")
     
+    -- Comment these out if you're trying to debug the Python side...
+
     -- Kill any existing Python script instances
     os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
     
@@ -223,16 +253,18 @@ function GameState:new()
     self.gamestate = 0    -- Game state from address 0
     self.game_mode = 0    -- Game mode from address 5
     self.countdown_timer = 0  -- Countdown timer from address 4
+    self.frame_counter = 0  -- Frame counter for tracking progress
     return self
 end
 
 function GameState:update(mem)
     self.gamestate = mem:read_u8(0x0000)  -- Game state at address 0
     self.game_mode = mem:read_u8(0x0005)  -- Game mode at address 5
-    self.countdown_timer = mem:read_u8(0x0004)  -- Countdown timer at address 4
+    self.countdown_timer = mem:read_u8(0x0004)  -- Countdown timer from address 4
     self.credits = mem:read_u8(0x0006)    -- Credits
     self.p1_level = mem:read_u8(0x0046)   -- Player 1 level
     self.p1_lives = mem:read_u8(0x0048)   -- Player 1 lives
+    self.frame_counter = self.frame_counter + 1  -- Increment frame counter
 end
 
 -- **LevelState Class**
@@ -500,15 +532,9 @@ local function move_cursor_to_row(row)
 end
 
 function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
-    -- Clear screen
+
     clear_screen()
-
-    -- Move cursor to row 0 and print status
-    move_cursor_to_row(0)
-    print(status)
-
     -- Format and print game state in 3 columns at row 1
-    move_cursor_to_row(1)
     
     -- Create game metrics in a more organized way for 3-column display
     local game_metrics = {
@@ -517,7 +543,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {["Countdown"] = string.format("0x%02X", game_state.countdown_timer)},
         {["Credits"] = game_state.credits},
         {["P1 Lives"] = game_state.p1_lives},
-        {["P1 Level"] = game_state.p1_level}
+        {["P1 Level"] = game_state.p1_level},
+        {["Frame"] = game_state.frame_counter}
     }
     
     -- Print game metrics in 3 columns
@@ -543,7 +570,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print player state in 3 columns at row 5
-    move_cursor_to_row(5)
+    move_cursor_to_row(6)
     
     -- Create player metrics in a more organized way for 3-column display
     local player_metrics = {
@@ -586,7 +613,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print player controls at row 13
-    move_cursor_to_row(10)
+    move_cursor_to_row(12)
     local controls_metrics = {
         ["Current Action"] = current_action or "none",
         ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
@@ -597,7 +624,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print(format_section("Player Controls", controls_metrics))
 
     -- Format and print level state in 3 columns
-    move_cursor_to_row(16)
+    move_cursor_to_row(19)
     
     -- Create level metrics in a more organized way for 3-column display
     local level_metrics_list = {
@@ -628,13 +655,13 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     
     -- Add spike heights on its own line
     local heights_str = ""
-    local positions = {}
-    for pos, height in pairs(level_state.spike_heights) do
-        table.insert(positions, pos)
-    end
-    table.sort(positions)
-    for _, pos in ipairs(positions) do
-        heights_str = heights_str .. string.format("%+2d:%02X ", pos, level_state.spike_heights[pos])
+    -- For open levels, show 0-15, for closed levels show -8 to +7 but just display the values
+    for i = -8, 7 do
+        if level_state.spike_heights[i] then
+            heights_str = heights_str .. string.format("%02X ", level_state.spike_heights[i])
+        else
+            heights_str = heights_str .. "-- "
+        end
     end
     print("  Spike Heights: " .. heights_str)
     
@@ -647,7 +674,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print enemies state at row 30
-    move_cursor_to_row(23)
+    move_cursor_to_row(25)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -672,21 +699,28 @@ function update_display(status, game_state, level_state, player_state, enemies_s
             enemies_state.spawn_slots_fuseballs),
         ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
         ["Enemy Types"] = table.concat(enemy_types, " "),
-        ["Enemy States"] = table.concat(enemy_states, " "),
-        ["Enemy Segments"] = table.concat(enemy_segs, " "),
-        ["Enemy Depths"] = table.concat(enemy_depths, " "),
-        ["Shot Positions"] = (function()
-            local shots = {}
-            for i = 1, 4 do
-                if enemies_state.shot_positions[i] then
-                    table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
-                end
-            end
-            return #shots > 0 and table.concat(shots, " ") or "none"
-        end)()
+        ["Enemy States"] = table.concat(enemy_states, " ")
     }
 
     print(format_section("Enemies State", enemies_metrics))
+    
+    -- Add enemy segments and depths on their own lines
+    print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
+    print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
+    
+    -- Add enemy shot positions on its own line
+    local shots_str = "none"
+    local shots = {}
+    for i = 1, 4 do
+        if enemies_state.shot_positions[i] then
+            table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
+        end
+    end
+    if #shots > 0 then
+        shots_str = table.concat(shots, " ")
+    end
+    print("  Shot Positions: " .. shots_str)
+    print("")  -- Empty line after section
 end
 
 -- Function to move the cursor to the home position using ANSI escape codes
@@ -694,69 +728,124 @@ local function move_cursor_home()
     io.write("\027[H")
 end
 
+-- Global frame counter for out-of-band information
+local frame_counter = 0
+
 -- Function to flatten and serialize the game state data to signed 16-bit integers
 local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
-    local data = {
-        gamestate = game_state.gamestate,      -- Add gamestate
-        game_mode = game_state.game_mode,      -- Add game mode
-        countdown_timer = game_state.countdown_timer,  -- Add countdown timer
-        credits = game_state.credits,
-        p1_lives = game_state.p1_lives,
-        p1_level = game_state.p1_level,
-        player_position = player_state.position,
-        player_alive = player_state.alive,
-        score_low = player_state.score & 0xFFFF,  -- Lower 16 bits of score
-        score_high = (player_state.score >> 16) & 0xFFFF,  -- Upper 16 bits of score
-        player_angle = player_state.angle,
-        superzapper_uses = player_state.superzapper_uses,
-        superzapper_active = player_state.superzapper_active,
-        shot_count = player_state.shot_count,
-        shot_positions = player_state.shot_positions,
-        shot_segments = player_state.shot_segments,
-        level_number = level_state.level_number,
-        level_type = level_state.level_type,
-        level_shape = level_state.level_shape,  -- Add level shape
-        spike_heights = level_state.spike_heights,
-        level_angles = level_state.level_angles,
-        active_flippers = enemies_state.active_flippers,
-        active_pulsars = enemies_state.active_pulsars,
-        active_tankers = enemies_state.active_tankers,
-        active_spikers = enemies_state.active_spikers,
-        active_fuseballs = enemies_state.active_fuseballs,
-        spawn_slots_flippers = enemies_state.spawn_slots_flippers,
-        spawn_slots_pulsars = enemies_state.spawn_slots_pulsars,
-        spawn_slots_tankers = enemies_state.spawn_slots_tankers,
-        spawn_slots_spikers = enemies_state.spawn_slots_spikers,
-        spawn_slots_fuseballs = enemies_state.spawn_slots_fuseballs,
-        enemy_segments = enemies_state.enemy_segments,
-        shot_positions_enemy = enemies_state.shot_positions
-    }
-
+    -- Create a consistent data structure with fixed sizes
+    local data = {}
+    
+    -- Game state (7 values, including frame counter)
+    table.insert(data, game_state.gamestate)
+    table.insert(data, game_state.game_mode)
+    table.insert(data, game_state.countdown_timer)
+    table.insert(data, game_state.credits)
+    table.insert(data, game_state.p1_lives)
+    table.insert(data, game_state.p1_level)
+    table.insert(data, game_state.frame_counter & 0xFFFF)  -- Lower 16 bits of frame counter
+    
+    -- Player state (5 values + arrays)
+    table.insert(data, player_state.position)
+    table.insert(data, player_state.alive)
+    table.insert(data, player_state.score & 0xFFFF)  -- Lower 16 bits of score
+    table.insert(data, (player_state.score >> 16) & 0xFFFF)  -- Upper 16 bits of score
+    table.insert(data, player_state.angle)
+    table.insert(data, player_state.superzapper_uses)
+    table.insert(data, player_state.superzapper_active)
+    table.insert(data, player_state.shot_count)
+    
+    -- Player shot positions (fixed size: 8)
+    for i = 1, 8 do
+        table.insert(data, player_state.shot_positions[i] or 0)
+    end
+    
+    -- Player shot segments (fixed size: 8)
+    for i = 1, 8 do
+        table.insert(data, player_state.shot_segments[i] or 0)
+    end
+    
+    -- Level state (3 values + arrays)
+    table.insert(data, level_state.level_number)
+    table.insert(data, level_state.level_type)
+    table.insert(data, level_state.level_shape)
+    
+    -- Spike heights (fixed size: 16)
+    for i = -8, 7 do  -- Relative positions from -8 to 7
+        table.insert(data, level_state.spike_heights[i] or 0)
+    end
+    
+    -- Level angles (fixed size: 16)
+    for i = 0, 15 do
+        table.insert(data, level_state.level_angles[i] or 0)
+    end
+    
+    -- Enemies state (counts: 10 values)
+    table.insert(data, enemies_state.active_flippers)
+    table.insert(data, enemies_state.active_pulsars)
+    table.insert(data, enemies_state.active_tankers)
+    table.insert(data, enemies_state.active_spikers)
+    table.insert(data, enemies_state.active_fuseballs)
+    table.insert(data, enemies_state.spawn_slots_flippers)
+    table.insert(data, enemies_state.spawn_slots_pulsars)
+    table.insert(data, enemies_state.spawn_slots_tankers)
+    table.insert(data, enemies_state.spawn_slots_spikers)
+    table.insert(data, enemies_state.spawn_slots_fuseballs)
+    
+    -- Enemy type info (fixed size: 7)
+    for i = 1, 7 do
+        table.insert(data, enemies_state.enemy_type_info[i] or 0)
+    end
+    
+    -- Active enemy info (fixed size: 7)
+    for i = 1, 7 do
+        table.insert(data, enemies_state.active_enemy_info[i] or 0)
+    end
+    
+    -- Enemy segments (fixed size: 7)
+    for i = 1, 7 do
+        table.insert(data, enemies_state.enemy_segments[i] or 0)
+    end
+    
+    -- Enemy depths (fixed size: 14 - 7 positions and 7 fractions)
+    for i = 1, 7 do
+        if type(enemies_state.enemy_depths[i]) == "table" then
+            table.insert(data, enemies_state.enemy_depths[i].pos or 0)
+            table.insert(data, enemies_state.enemy_depths[i].frac or 0)
+        else
+            table.insert(data, 0)  -- Position
+            table.insert(data, 0)  -- Fraction
+        end
+    end
+    
+    -- Enemy shot positions (fixed size: 4)
+    for i = 1, 4 do
+        table.insert(data, enemies_state.shot_positions[i] or 0)
+    end
+    
+    -- Additional game state (pulse beat, pulsing)
+    table.insert(data, enemies_state.pulse_beat or 0)
+    table.insert(data, enemies_state.pulsing or 0)
+    
     -- Serialize the data to a binary string
     local binary_data = ""
-    for name, value in pairs(data) do
-        if type(value) == "number" then
-            binary_data = binary_data .. string.pack(">i2", value)  -- Pack as signed 16-bit integer
-        elseif type(value) == "table" then
-            for i, v in ipairs(value) do
-                binary_data = binary_data .. string.pack(">i2", v)  -- Pack as signed 16-bit integer
-            end
-        else
-            print("Non-numeric value found:", name, "value:", value)  -- Debugging output
-        end
+    for _, value in ipairs(data) do
+        binary_data = binary_data .. string.pack(">i2", value)  -- Pack as signed 16-bit integer
     end
-
-    -- Handle enemy_depths separately as it contains nested tables
-    for i, depth in ipairs(enemies_state.enemy_depths) do
-        if type(depth) == "table" then
-            binary_data = binary_data .. string.pack(">i2", depth.pos)  -- Pack main position
-            binary_data = binary_data .. string.pack(">i2", depth.frac) -- Pack fractional part
-        else
-            print("Unexpected non-table value in enemy_depths:", depth)
-        end
-    end
-
-    return binary_data
+    
+    -- Create out-of-band context information structure
+    -- 1. Number of 32-bit values to follow (1 for now: just reward)
+    -- 2. Current reward (32-bit float, dummy value of 1.0 for now)
+    local oob_data = string.pack(">I4f", 1, 1.0)
+    
+    -- Combine out-of-band header with game state data
+    local final_data = oob_data .. binary_data
+    
+    -- Debug output
+    -- print(string.format("Serialized %d values (%d bytes) + OOB header (%d bytes), total: %d bytes", #data, #binary_data, #oob_data, #final_data))
+    --print(string.format("Frame counter: %d", game_state.frame_counter))
+    
+    return final_data
 end
 
 -- Update the frame callback function
@@ -786,8 +875,11 @@ local function frame_callback()
     player_state:update(mem)
     enemies_state:update(mem)
 
-    -- Massage game state to keep it out of the high score and banner modes
+    -- Initialize action to "none" as default
+    local action = "none"
+    local status_message = "No AI response"
 
+    -- Massage game state to keep it out of the high score and banner modes
     if game_state.countdown_timer > 0 then
         -- Write 0 to memory location 4
         mem:write_u8(0x0004, 0)
@@ -795,26 +887,29 @@ local function frame_callback()
     end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
-
-    if game_state.game_state == 0x04 or game_state.game_state == 0x20 then
-    
+    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
         -- Flatten and serialize the game state data
         local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
-        -- Send the serialized data to the Python script
+        -- Send the serialized data to the Python script and get the response
         local result = process_frame(frame_data)
+        status_message = "Python response: " .. result
         
-        -- Use the action from Python if valid, otherwise use random
-        local action = result
-        if not (action == "fire" or action == "zap" or action == "left" or action == "right" or action == "none") then
-            -- If Python returns an invalid action or error, use random
-            local actions = {"fire", "zap", "left", "right", "none"}
-            action = actions[math.random(#actions)]
+        -- Use the action from Python if valid, otherwise use none
+        if result == "fire" or result == "zap" or result == "left" or result == "right" or result == "none" then
+            action = result
+            status_message = "Using action: " .. action
+        else
+            -- If Python returns an invalid action or error, use none
+            action = "none"
+            status_message = "Invalid action from Python: " .. result .. " (using none)"
         end
+    else
+        status_message = "Game not in playable state (state: " .. string.format("0x%02X", game_state.gamestate) .. ")"
     end
 
     -- Update the display with the current action
-    update_display(result, game_state, level_state, player_state, enemies_state, action)
+    update_display(status_message, game_state, level_state, player_state, enemies_state, action)
 
     -- Apply the action to MAME controls
     controls:apply_action(action)

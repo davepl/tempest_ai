@@ -139,19 +139,45 @@ def process_frame_data(data):
     Process the binary frame data received from Lua.
     
     Args:
-        data (bytes): Binary data containing game state information
+        data (bytes): Binary data containing out-of-band header and game state information
         
     Returns:
-        numpy.ndarray: Processed game state as a normalized array
+        tuple: (processed_data, frame_counter, reward)
     """
-    # Calculate how many 16-bit integers we have
-    num_ints = len(data) // 2
+    if len(data) < 8:  # Minimum size for header (4 bytes) + reward (4 bytes)
+        print(f"Warning: Received data is too small ({len(data)} bytes)")
+        return None, 0, 0.0
+    
+    # Extract out-of-band information
+    # First 4 bytes: number of 32-bit values to follow
+    num_oob_values = struct.unpack(">I", data[0:4])[0]
+    
+    # Extract reward (next 4 bytes)
+    reward = struct.unpack(">f", data[4:8])[0]
+    
+    # Calculate total header size: 4 bytes for count + (num_oob_values * 4) bytes for values
+    header_size = 4 + (num_oob_values * 4)
+    
+    # Debug output for header information
+    print(f"OOB Header: {num_oob_values} values, Reward: {reward:.2f}")
+    
+    # Extract game state data (everything after the header)
+    game_data = data[header_size:]
+    
+    # Calculate how many 16-bit integers we have in the game data
+    num_ints = len(game_data) // 2
+    
+    # Debug output for data size
+    print(f"Received {len(data)} bytes total: {header_size} bytes header + {len(game_data)} bytes game data ({num_ints} values)")
     
     # Unpack the binary data into 16-bit signed integers (big-endian)
     unpacked_data = []
     for i in range(num_ints):
-        value = struct.unpack(">h", data[i*2:i*2+2])[0]
+        value = struct.unpack(">h", game_data[i*2:i*2+2])[0]
         unpacked_data.append(value)
+    
+    # Extract frame counter from the game state data (7th value in the game state)
+    frame_counter = unpacked_data[6] if len(unpacked_data) > 6 else 0
     
     # Normalize the data to -1 to 1 range for the neural network
     normalized_data = np.array([float(x) / 32767.0 if x > 0 else float(x) / 32768.0 for x in unpacked_data], dtype=np.float32)
@@ -167,17 +193,19 @@ def process_frame_data(data):
         # Truncate if the data is larger than expected
         normalized_data = normalized_data[:expected_size]
     
-    return normalized_data
+    return normalized_data, frame_counter, reward
 
 # Create a global environment instance
 env = TempestEnv()
 
-def ai_model(game_state):
+def ai_model(game_state, frame_counter, reward):
     """
     AI model that determines the action based on the game state using Gymnasium.
     
     Args:
         game_state (numpy.ndarray): Processed game state data
+        frame_counter (int): Current frame counter
+        reward (float): Current reward value
         
     Returns:
         str: Action to take (fire, zap, left, right, none)
@@ -185,12 +213,16 @@ def ai_model(game_state):
     # Update the environment state
     env.update_state(game_state)
     
+    # Update environment reward with the received reward
+    env.reward = reward
+    env.total_reward += reward
+    
     # For now, use a random policy
     # In a real RL implementation, you would use a trained policy here
     action = env.action_space.sample()
     
     # Take a step in the environment
-    _, reward, terminated, truncated, info = env.step(action)
+    _, _, terminated, truncated, info = env.step(action)
     
     # If the episode is done, reset the environment
     if terminated or truncated:
@@ -201,7 +233,7 @@ def ai_model(game_state):
     action_str = ACTION_MAP[action]
     
     # Log the action (for debugging)
-    print(f"AI choosing action: {action_str} (action_id: {action}, reward: {reward:.2f})")
+    print(f"Frame {frame_counter}: AI choosing action: {action_str} (action_id: {action}, reward: {reward:.2f})")
     
     return action_str
 
@@ -267,6 +299,8 @@ def main():
             
             try:
                 frame_count = 0
+                last_frame_counter = 0
+                
                 while True:
                     try:
                         # Try to read from the pipe (may return empty if no data available)
@@ -279,10 +313,20 @@ def main():
                             continue
                         
                         # Process the frame data
-                        processed_data = process_frame_data(data)
+                        processed_data, frame_counter, reward = process_frame_data(data)
+                        
+                        if processed_data is None:
+                            print("Error processing frame data, skipping frame")
+                            continue
+                        
+                        # Check for skipped frames
+                        if last_frame_counter > 0 and frame_counter > last_frame_counter + 1:
+                            print(f"Warning: Skipped {frame_counter - last_frame_counter - 1} frames")
+                        
+                        last_frame_counter = frame_counter
                         
                         # Get the action from the AI model
-                        action = ai_model(processed_data)
+                        action = ai_model(processed_data, frame_counter, reward)
                         
                         # Write the action back to Lua
                         py_to_lua.write(action + "\n")
