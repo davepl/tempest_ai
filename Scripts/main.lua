@@ -82,6 +82,46 @@ end
 -- Create a variable to track pipe retry attempts
 local pipe_retry_count = 0
 
+-- Declare global variables for reward calculation
+local previous_score = 0
+local previous_level = 0
+local avg_score_per_frame = 0
+local AGGRESSION_DECAY = 0.99
+
+-- Function to calculate reward for the current frame
+local function calculate_reward(game_state, level_state, player_state)
+    local reward = 0
+    
+    -- 1. Survival reward: 0.01 point per frame for staying alive
+    if player_state.alive == 1 then
+        reward = reward + 0.01
+    end
+    
+    -- 2. Score reward: Add the score delta from the last frame
+    local score_delta = player_state.score - previous_score
+    reward = reward + score_delta
+    
+    -- 3. Level completion reward: 1000 * new level number when level increases
+    if level_state.level_number ~= previous_level then
+        reward = reward + (1000 * level_state.level_number)
+    end
+    
+    -- 4. Aggression reward: Use weighted average of score per frame
+    -- Update the weighted average with the current score delta
+    -- Formula: new_avg = old_avg * decay + current_value * (1 - decay)
+    avg_score_per_frame = avg_score_per_frame * AGGRESSION_DECAY + score_delta * (1 - AGGRESSION_DECAY)
+    
+    -- Add aggression bonus (scaled to be meaningful but not dominant)
+    -- Multiply by 10 to make it more significant
+    reward = reward + (avg_score_per_frame * 10)
+    
+    -- Update previous values for next frame
+    previous_score = player_state.score
+    previous_level = level_state.level_number
+    
+    return reward
+end
+
 -- Function to send parameters and get action each frame
 local function process_frame(params)
     -- Check if pipes are open, try to reopen if not
@@ -536,202 +576,11 @@ local function move_cursor_to_row(row)
     io.write(string.format("\027[%d;0H", row))
 end
 
-function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
-
-    move_cursor_to_row(1)
-
-    -- Format and print game state in 3 columns at row 1
-    
-    -- Create game metrics in a more organized way for 3-column display
-    local game_metrics = {
-        {["Gamestate"] = string.format("0x%02X", game_state.gamestate)},
-        {["Game Mode"] = string.format("0x%02X", game_state.game_mode)},
-        {["Countdown"] = string.format("0x%02X", game_state.countdown_timer)},
-        {["Credits"] = game_state.credits},
-        {["P1 Lives"] = game_state.p1_lives},
-        {["P1 Level"] = game_state.p1_level},
-        {["Frame"] = game_state.frame_counter}
-    }
-    
-    -- Print game metrics in 3 columns
-    print("--[ Game State ]--------------------------------------")
-    local col_width = 25  -- Width for each column
-    
-    -- Calculate how many rows we need (ceiling of items/3)
-    local rows = math.ceil(#game_metrics / 3)
-    
-    for row = 1, rows do
-        local line = "  "
-        for col = 1, 3 do
-            local idx = (row - 1) * 3 + col
-            if idx <= #game_metrics then
-                for k, v in pairs(game_metrics[idx]) do
-                    -- Format each metric with fixed width
-                    line = line .. string.format("%-12s: %-" .. (col_width - 15) .. "s", k, tostring(v))
-                end
-            end
-        end
-        print(line)
-    end
-    print("")  -- Empty line after section
-
-    -- Format and print player state in 3 columns at row 5
-    move_cursor_to_row(6)
-    
-    -- Create player metrics in a more organized way for 3-column display
-    local player_metrics = {
-        {["Position"] = player_state.position},
-        {["Alive"] = player_state.alive},
-        {["Score"] = player_state.score},
-        {["Angle"] = player_state.angle},
-        {["Szapper Uses"] = player_state.superzapper_uses},
-        {["Szapper Active"] = player_state.superzapper_active},
-        {["Shot Count"] = player_state.shot_count}
-    }
-    
-    -- Print player metrics in 3 columns
-    print("--[ Player State ]------------------------------------")
-    
-    -- Calculate how many rows we need (ceiling of items/3)
-    local rows = math.ceil(#player_metrics / 3)
-    
-    for row = 1, rows do
-        local line = "  "
-        for col = 1, 3 do
-            local idx = (row - 1) * 3 + col
-            if idx <= #player_metrics then
-                for k, v in pairs(player_metrics[idx]) do
-                    -- Format each metric with fixed width
-                    line = line .. string.format("%-12s: %-" .. (col_width - 15) .. "s", k, tostring(v))
-                end
-            end
-        end
-        print(line)
-    end
-    
-    -- Add shot positions on its own line
-    local shots_str = ""
-    for i = 1, 8 do
-        local segment_str = string.format("%+02d", player_state.shot_segments[i])
-        shots_str = shots_str .. string.format("%02X-%s ", player_state.shot_positions[i], segment_str)
-    end
-    print("  Shot Positions: " .. shots_str)
-    print("")  -- Empty line after section
-
-    -- Format and print player controls at row 13
-    move_cursor_to_row(12)
-    local controls_metrics = {
-        ["Current Action"] = current_action or "none",
-        ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
-        ["Superzapper"] = (current_action == "zap") and "ACTIVE" or "inactive",
-        ["Left"] = (current_action == "left") and "ACTIVE" or "inactive",
-        ["Right"] = (current_action == "right") and "ACTIVE" or "inactive"
-    }
-    print(format_section("Player Controls", controls_metrics))
-
-    -- Format and print level state in 3 columns
-    move_cursor_to_row(19)
-    
-    -- Create level metrics in a more organized way for 3-column display
-    local level_metrics_list = {
-        {["Level Number"] = level_state.level_number},
-        {["Level Type"] = level_state.level_type == 0xFF and "Open" or "Closed"},
-        {["Level Shape"] = level_state.level_shape}
-    }
-    
-    -- Print level metrics in 3 columns
-    print("--[ Level State ]-------------------------------------")
-    
-    -- Calculate how many rows we need (ceiling of items/3)
-    local rows = math.ceil(#level_metrics_list / 3)
-    
-    for row = 1, rows do
-        local line = "  "
-        for col = 1, 3 do
-            local idx = (row - 1) * 3 + col
-            if idx <= #level_metrics_list then
-                for k, v in pairs(level_metrics_list[idx]) do
-                    -- Format each metric with fixed width
-                    line = line .. string.format("%-12s: %-" .. (col_width - 15) .. "s", k, tostring(v))
-                end
-            end
-        end
-        print(line)
-    end
-    
-    -- Add spike heights on its own line
-    local heights_str = ""
-    -- For open levels, show 0-15, for closed levels show -8 to +7 but just display the values
-    for i = -8, 7 do
-        if level_state.spike_heights[i] then
-            heights_str = heights_str .. string.format("%02X ", level_state.spike_heights[i])
-        else
-            heights_str = heights_str .. "-- "
-        end
-    end
-    print("  Spike Heights: " .. heights_str)
-    
-    -- Add level angles on its own line
-    local angles_str = ""
-    for i = 0, 15 do
-        angles_str = angles_str .. string.format("%02X ", level_state.level_angles[i])
-    end
-    print("  Level Angles : " .. angles_str)
-    print("")  -- Empty line after section
-
-    -- Format and print enemies state at row 30
-    move_cursor_to_row(25)
-    local enemy_types = {}
-    local enemy_states = {}
-    local enemy_segs = {}
-    local enemy_depths = {}
-    for i = 1, 7 do
-        enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
-        enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
-        enemy_segs[i] = string.format("%+3d", enemies_state.enemy_segments[i])
-        enemy_depths[i] = string.format("%02X.%02X", enemies_state.enemy_depths[i].pos, enemies_state.enemy_depths[i].frac)
-    end
-
-    local enemies_metrics = {
-        ["Flippers"] = string.format("%d active, %d spawn slots", enemies_state.active_flippers, enemies_state.spawn_slots_flippers),
-        ["Pulsars"] = string.format("%d active, %d spawn slots", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars),
-        ["Tankers"] = string.format("%d active, %d spawn slots", enemies_state.active_tankers, enemies_state.spawn_slots_tankers),
-        ["Spikers"] = string.format("%d active, %d spawn slots", enemies_state.active_spikers, enemies_state.spawn_slots_spikers),
-        ["Fuseballs"] = string.format("%d active, %d spawn slots", enemies_state.active_fuseballs, enemies_state.spawn_slots_fuseballs),
-        ["Total"] = string.format("%d active, %d spawn slots", 
-            enemies_state:get_total_active(),
-            enemies_state.spawn_slots_flippers + enemies_state.spawn_slots_pulsars + 
-            enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
-            enemies_state.spawn_slots_fuseballs),
-        ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
-        ["Enemy Types"] = table.concat(enemy_types, " "),
-        ["Enemy States"] = table.concat(enemy_states, " ")
-    }
-
-    print(format_section("Enemies State", enemies_metrics))
-    
-    -- Add enemy segments and depths on their own lines
-    print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
-    print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
-    
-    -- Add enemy shot positions on its own line
-    local shots_str = "none"
-    local shots = {}
-    for i = 1, 4 do
-        if enemies_state.shot_positions[i] then
-            table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
-        end
-    end
-    if #shots > 0 then
-        shots_str = table.concat(shots, " ")
-    end
-    print("  Shot Positions: " .. shots_str)
-    print("")  -- Empty line after section
-end
-
-
--- Global frame counter for out-of-band information
-local frame_counter = 0
+-- Global variables for tracking bytes sent and FPS
+local total_bytes_sent = 0
+local last_fps_time = os.time()
+local frame_count = 0
+local current_fps = 0
 
 -- Function to flatten and serialize the game state data to signed 16-bit integers
 local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
@@ -829,6 +678,9 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     table.insert(data, enemies_state.pulse_beat or 0)
     table.insert(data, enemies_state.pulsing or 0)
     
+    -- Calculate the reward for the current frame
+    local reward = calculate_reward(game_state, level_state, player_state)
+    
     -- Serialize the data to a binary string
     local binary_data = ""
     for _, value in ipairs(data) do
@@ -837,8 +689,8 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     
     -- Create out-of-band context information structure
     -- 1. Number of 32-bit values to follow (1 for now: just reward)
-    -- 2. Current reward (32-bit float, dummy value of 1.0 for now)
-    local oob_data = string.pack(">I4f", 1, 1.0)
+    -- 2. Current reward (64-bit double)
+    local oob_data = string.pack(">I4d", 1, reward)
     
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
@@ -850,7 +702,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     return final_data
 end
 
--- Update the frame callback function
+-- Update the frame_callback function to track bytes sent and calculate FPS
 local function frame_callback()
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
@@ -893,9 +745,15 @@ local function frame_callback()
         -- Flatten and serialize the game state data
         local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
+        -- Calculate the reward for the current frame
+        local reward = calculate_reward(game_state, level_state, player_state)
+
         -- Send the serialized data to the Python script and get the response
         local result = process_frame(frame_data)
-        
+
+        -- Update total bytes sent
+        total_bytes_sent = total_bytes_sent + #frame_data
+
         -- Use the action from Python if valid, otherwise use none
         if result == "fire" or result == "zap" or result == "left" or result == "right" or result == "none" then
             action = result
@@ -905,11 +763,212 @@ local function frame_callback()
         end
     end
 
-    -- Update the display with the current action
+    -- Calculate FPS
+    frame_count = frame_count + 1
+    local current_time = os.time()
+    if current_time > last_fps_time then
+        current_fps = frame_count / (current_time - last_fps_time)
+        frame_count = 0
+        last_fps_time = current_time
+    end
+
+    -- Update the display with the current action and metrics
     update_display(status_message, game_state, level_state, player_state, enemies_state, action)
 
     -- Apply the action to MAME controls
     controls:apply_action(action)
+end
+
+-- Update the update_display function to show total bytes sent and FPS
+function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
+    move_cursor_to_row(1)
+
+    -- Format and print game state in 3 columns at row 1
+    
+    -- Create game metrics in a more organized way for 3-column display
+    local game_metrics = {
+        {"Gamestate", string.format("0x%02X", game_state.gamestate)},
+        {"Game Mode", string.format("0x%02X", game_state.game_mode)},
+        {"Countdown", string.format("0x%02X", game_state.countdown_timer)},
+        {"Credits", game_state.credits},
+        {"P1 Lives", game_state.p1_lives},
+        {"P1 Level", game_state.p1_level},
+        {"Frame", game_state.frame_counter},
+        {"Bytes Sent", total_bytes_sent},
+        {"FPS", string.format("%.2f", current_fps)}
+    }
+    
+    -- Print game metrics in 3 columns
+    print("--[ Game State ]--------------------------------------")
+    local col_width = 25  -- Width for each column
+    
+    -- Calculate how many rows we need (ceiling of items/3)
+    local rows = math.ceil(#game_metrics / 3)
+    
+    for row = 1, rows do
+        local line = "  "
+        for col = 1, 3 do
+            local idx = (row - 1) * 3 + col
+            if idx <= #game_metrics then
+                local key, value = table.unpack(game_metrics[idx])
+                -- Format each metric with fixed width
+                line = line .. string.format("%-12s: %s ", key, value)
+            end
+        end
+        print(line)
+    end
+    print("")  -- Empty line after section
+
+    -- Format and print player state in 3 columns at row 5
+    move_cursor_to_row(6)
+    
+    -- Create player metrics in a more organized way for 3-column display
+    local player_metrics = {
+        {"Position", player_state.position},
+        {"Alive", player_state.alive},
+        {"Score", player_state.score},
+        {"Angle", player_state.angle},
+        {"Szapper Uses", player_state.superzapper_uses},
+        {"Szapper Active", player_state.superzapper_active},
+        {"Shot Count", player_state.shot_count}
+    }
+    
+    -- Print player metrics in 3 columns
+    print("--[ Player State ]------------------------------------")
+    
+    -- Calculate how many rows we need (ceiling of items/3)
+    local rows = math.ceil(#player_metrics / 3)
+    
+    for row = 1, rows do
+        local line = "  "
+        for col = 1, 3 do
+            local idx = (row - 1) * 3 + col
+            if idx <= #player_metrics then
+                local key, value = table.unpack(player_metrics[idx])
+                -- Format each metric with fixed width
+                line = line .. string.format("%-12s: %s", key, value)
+            end
+        end
+        print(line)
+    end
+    
+    -- Add shot positions on its own line
+    local shots_str = ""
+    for i = 1, 8 do
+        local segment_str = string.format("%+02d", player_state.shot_segments[i])
+        shots_str = shots_str .. string.format("%02X-%s ", player_state.shot_positions[i], segment_str)
+    end
+    print("  Shot Positions: " .. shots_str)
+    print("")  -- Empty line after section
+
+    -- Format and print player controls at row 13
+    move_cursor_to_row(12)
+    local controls_metrics = {
+        ["Current Action"] = current_action or "none",
+        ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
+        ["Superzapper"] = (current_action == "zap") and "ACTIVE" or "inactive",
+        ["Left"] = (current_action == "left") and "ACTIVE" or "inactive",
+        ["Right"] = (current_action == "right") and "ACTIVE" or "inactive"
+    }
+    print(format_section("Player Controls", controls_metrics))
+
+    -- Format and print level state in 3 columns
+    move_cursor_to_row(19)
+    
+    -- Create level metrics in a more organized way for 3-column display
+    local level_metrics_list = {
+        {"Level Number", level_state.level_number},
+        {"Level Type", level_state.level_type == 0xFF and "Open" or "Closed"},
+        {"Level Shape", level_state.level_shape}
+    }
+    
+    -- Print level metrics in 3 columns
+    print("--[ Level State ]-------------------------------------")
+    
+    -- Calculate how many rows we need (ceiling of items/3)
+    local rows = math.ceil(#level_metrics_list / 3)
+    
+    for row = 1, rows do
+        local line = "  "
+        for col = 1, 3 do
+            local idx = (row - 1) * 3 + col
+            if idx <= #level_metrics_list then
+                local key, value = table.unpack(level_metrics_list[idx])
+                -- Format each metric with fixed width
+                line = line .. string.format("%-12s: %s", key, value)
+            end
+        end
+        print(line)
+    end
+    
+    -- Add spike heights on its own line
+    local heights_str = ""
+    -- For open levels, show 0-15, for closed levels show -8 to +7 but just display the values
+    for i = -8, 7 do
+        if level_state.spike_heights[i] then
+            heights_str = heights_str .. string.format("%02X ", level_state.spike_heights[i])
+        else
+            heights_str = heights_str .. "-- "
+        end
+    end
+    print("  Spike Heights: " .. heights_str)
+    
+    -- Add level angles on its own line
+    local angles_str = ""
+    for i = 0, 15 do
+        angles_str = angles_str .. string.format("%02X ", level_state.level_angles[i])
+    end
+    print("  Level Angles : " .. angles_str)
+    print("")  -- Empty line after section
+
+    -- Format and print enemies state at row 30
+    move_cursor_to_row(25)
+    local enemy_types = {}
+    local enemy_states = {}
+    local enemy_segs = {}
+    local enemy_depths = {}
+    for i = 1, 7 do
+        enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
+        enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
+        enemy_segs[i] = string.format("%+3d", enemies_state.enemy_segments[i])
+        enemy_depths[i] = string.format("%02X.%02X", enemies_state.enemy_depths[i].pos, enemies_state.enemy_depths[i].frac)
+    end
+
+    local enemies_metrics = {
+        ["Flippers"] = string.format("%d active, %d spawn slots", enemies_state.active_flippers, enemies_state.spawn_slots_flippers),
+        ["Pulsars"] = string.format("%d active, %d spawn slots", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars),
+        ["Tankers"] = string.format("%d active, %d spawn slots", enemies_state.active_tankers, enemies_state.spawn_slots_tankers),
+        ["Spikers"] = string.format("%d active, %d spawn slots", enemies_state.active_spikers, enemies_state.spawn_slots_spikers),
+        ["Fuseballs"] = string.format("%d active, %d spawn slots", enemies_state.active_fuseballs, enemies_state.spawn_slots_fuseballs),
+        ["Total"] = string.format("%d active, %d spawn slots", 
+            enemies_state:get_total_active(),
+            enemies_state.spawn_slots_flippers + enemies_state.spawn_slots_pulsars + 
+            enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
+            enemies_state.spawn_slots_fuseballs),
+        ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
+        ["Enemy Types"] = table.concat(enemy_types, " "),
+        ["Enemy States"] = table.concat(enemy_states, " ")
+    }
+
+    print(format_section("Enemies State", enemies_metrics))
+    
+    -- Add enemy segments and depths on their own lines
+    print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
+    print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
+    
+    -- Add enemy shot positions on its own line
+    local shots_str = "none"
+    local shots = {}
+    for i = 1, 4 do
+        if enemies_state.shot_positions[i] then
+            table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
+        end
+    end
+    if #shots > 0 then
+        shots_str = table.concat(shots, " ")
+    end
+    print("  Shot Positions: " .. shots_str)
+    print("")  -- Empty line after section
 end
 
 -- Start the Python script but don't wait for pipes to open

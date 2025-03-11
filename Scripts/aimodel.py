@@ -144,7 +144,7 @@ def process_frame_data(data):
     Returns:
         tuple: (processed_data, frame_counter, reward)
     """
-    if len(data) < 8:  # Minimum size for header (4 bytes) + reward (4 bytes)
+    if len(data) < 12:  # Minimum size for header (4 bytes) + reward (8 bytes)
         print(f"Warning: Received data is too small ({len(data)} bytes)")
         return None, 0, 0.0
     
@@ -152,11 +152,11 @@ def process_frame_data(data):
     # First 4 bytes: number of 32-bit values to follow
     num_oob_values = struct.unpack(">I", data[0:4])[0]
     
-    # Extract reward (next 4 bytes)
-    reward = struct.unpack(">f", data[4:8])[0]
+    # Extract reward (next 8 bytes as 64-bit double)
+    reward = struct.unpack(">d", data[4:12])[0]
     
-    # Calculate total header size: 4 bytes for count + (num_oob_values * 4) bytes for values
-    header_size = 4 + (num_oob_values * 4)
+    # Calculate total header size: 4 bytes for count + (num_oob_values * 8) bytes for values
+    header_size = 4 + (num_oob_values * 8)
     
     # Debug output for header information
     print(f"OOB Header: {num_oob_values} values, Reward: {reward:.2f}")
