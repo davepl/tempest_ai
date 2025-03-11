@@ -32,6 +32,11 @@ local function clear_screen()
     io.write("\027[2J\027[H")
 end
 
+-- Function to move the cursor to the home position using ANSI escape codes
+local function move_cursor_home()
+    io.write("\027[H")
+end
+
 -- Global pipe variables
 local pipe_out = nil
 local pipe_in = nil
@@ -42,11 +47,11 @@ local function open_pipes()
     if pipe_out then pipe_out:close(); pipe_out = nil end
     if pipe_in then pipe_in:close(); pipe_in = nil end
     
-    print("Attempting to open pipes...")
+    -- print("Attempting to open pipes...")
     
     -- Try to open the pipes directly without checking existence first
     -- First open the output pipe (this is the one Python should be reading from)
-    print("Opening output pipe (lua_to_py)...")
+    -- print("Opening output pipe (lua_to_py)...")
     local open_success, err = pcall(function()
         pipe_out = io.open("/tmp/lua_to_py", "wb")
     end)
@@ -55,10 +60,10 @@ local function open_pipes()
         print("Failed to open output pipe: " .. tostring(err))
         return false
     end
-    print("Output pipe opened successfully")
+    -- print("Output pipe opened successfully")
     
     -- Then open input pipe (this is the one Python should be writing to)
-    print("Opening input pipe (py_to_lua)...")
+    -- print("Opening input pipe (py_to_lua)...")
     open_success, err = pcall(function()
         pipe_in = io.open("/tmp/py_to_lua", "r")
     end)
@@ -68,9 +73,9 @@ local function open_pipes()
         if pipe_out then pipe_out:close(); pipe_out = nil end
         return false
     end
-    print("Input pipe opened successfully")
+    -- print("Input pipe opened successfully")
     
-    print("Successfully opened both pipes")
+    -- print("Successfully opened both pipes")
     return true
 end
 
@@ -85,7 +90,7 @@ local function process_frame(params)
         
         -- Only try to open pipes every 60 frames (about once per second)
         if pipe_retry_count % 60 == 0 then
-            print("Attempt #" .. pipe_retry_count / 60 .. " to open pipes")
+            -- print("Attempt #" .. pipe_retry_count / 60 .. " to open pipes")
             if not open_pipes() then
                 return "pipe error"
             end
@@ -144,13 +149,13 @@ local function process_frame(params)
     -- Trim any whitespace from the action
     action = action:gsub("^%s*(.-)%s*$", "%1")
     
-    print("Received action from Python: '" .. action .. "'")
+    -- print("Received action from Python: '" .. action .. "'")
     return action
 end
 
 -- Call this during initialization
 local function start_python_script()
-    print("Starting Python script")
+    -- print("Starting Python script")
     
     -- Comment these out if you're trying to debug the Python side...
 
@@ -170,7 +175,7 @@ local function start_python_script()
     end
     
     -- Give Python script a moment to start up and create pipes
-    print("Waiting for Python script to initialize and create pipes...")
+    -- print("Waiting for Python script to initialize and create pipes...")
     os.execute("sleep 3")
     
     -- Check if Python script is running
@@ -181,7 +186,7 @@ local function start_python_script()
         return false
     end
     
-    print("Python script started successfully")
+    -- print("Python script started successfully")
     
     -- Try to open pipes immediately
     local pipes_opened = open_pipes()
@@ -533,7 +538,8 @@ end
 
 function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
 
-    clear_screen()
+    move_cursor_to_row(1)
+
     -- Format and print game state in 3 columns at row 1
     
     -- Create game metrics in a more organized way for 3-column display
@@ -723,10 +729,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 end
 
--- Function to move the cursor to the home position using ANSI escape codes
-local function move_cursor_home()
-    io.write("\027[H")
-end
 
 -- Global frame counter for out-of-band information
 local frame_counter = 0
@@ -877,7 +879,7 @@ local function frame_callback()
 
     -- Initialize action to "none" as default
     local action = "none"
-    local status_message = "No AI response"
+    local status_message = ""
 
     -- Massage game state to keep it out of the high score and banner modes
     if game_state.countdown_timer > 0 then
@@ -893,19 +895,14 @@ local function frame_callback()
 
         -- Send the serialized data to the Python script and get the response
         local result = process_frame(frame_data)
-        status_message = "Python response: " .. result
         
         -- Use the action from Python if valid, otherwise use none
         if result == "fire" or result == "zap" or result == "left" or result == "right" or result == "none" then
             action = result
-            status_message = "Using action: " .. action
-        else
-            -- If Python returns an invalid action or error, use none
+        elseif result ~= "pipe error" and result ~= "write error" and result ~= "read error" and result ~= "timeout" then
+            -- If Python returns an invalid action, use none
             action = "none"
-            status_message = "Invalid action from Python: " .. result .. " (using none)"
         end
-    else
-        status_message = "Game not in playable state (state: " .. string.format("0x%02X", game_state.gamestate) .. ")"
     end
 
     -- Update the display with the current action
