@@ -1,1 +1,4 @@
 /.DS_Store
+Scripts/models/model_load_diagnostics.txt
+Scripts/models/model_metadata.txt
+Scripts/models/tempest_model_latest.zip.temp
