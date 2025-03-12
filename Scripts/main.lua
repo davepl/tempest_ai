@@ -352,7 +352,6 @@ function PlayerState:new()
     self.position = 0
     self.alive = 0
     self.score = 0
-    self.angle = 0
     self.superzapper_uses = 0
     self.superzapper_active = 0
     self.player_depth = 0     -- New field for player depth along the tube
@@ -379,7 +378,6 @@ function PlayerState:update(mem)
     local score_high = bcd_to_decimal(mem:read_u8(0x0042))
     self.score = score_high * 10000 + score_mid * 100 + score_low
 
-    self.angle = mem:read_u8(0x03EE)                        -- Player angle/orientation
     self.superzapper_uses = mem:read_u8(0x03AA)        -- Superzapper availability
     self.superzapper_active = mem:read_u8(0x0125)           -- Superzapper active status
     self.shot_count = mem:read_u8(0x0135)                   -- Number of active player shots
@@ -399,6 +397,10 @@ function PlayerState:update(mem)
             self.shot_segments[i] = calculate_relative_position(self.position, abs_segment, is_open)
         end
     end
+
+    -- Update SpinnerAccum and SpinnerDelta from memory
+    self.SpinnerAccum = mem:read_u8(0x0051)
+    self.SpinnerDelta = mem:read_u8(0x0050)
 end
 
 -- **EnemiesState Class**
@@ -596,7 +598,6 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Player state (5 values + arrays, score is now in OOB data)
     table.insert(data, player_state.position)
     table.insert(data, player_state.alive)
-    table.insert(data, player_state.angle)
     table.insert(data, player_state.player_state)  -- Add player state to serialized data 
     table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
     table.insert(data, player_state.superzapper_uses)
@@ -898,10 +899,11 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Depth", player_state.player_depth .. " "},  -- Add player depth to display
         {"Alive", player_state.alive .. " "},
         {"Score", player_state.score .. " "},
-        {"Angle", player_state.angle .. " "},
         {"Szapper Uses", player_state.superzapper_uses .. " "},
         {"Szapper Active", player_state.superzapper_active .. " "},
-        {"Shot Count", player_state.shot_count .. " "}
+        {"Shot Count", player_state.shot_count .. " "},
+        {"SpinnerAccum", player_state.SpinnerAccum .. " "},
+        {"SpinnerDelta", player_state.SpinnerDelta .. " "}
     }
     
     -- Print player metrics in 3 columns
