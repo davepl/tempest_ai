@@ -61,17 +61,17 @@ class TempestEnv(gym.Env):
         
         # Define observation space
         # This is a placeholder - adjust the shape based on your actual state representation
-        self.observation_space = spaces.Box(low=-1, high=1, shape=(200,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(117,), dtype=np.float32)
         
         # Initialize state
-        self.state = np.zeros(200, dtype=np.float32)
+        self.state = np.zeros(117, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.info = {}
         self.episode_step = 0
         self.total_reward = 0
-        self.level_shape = 0    # Level shape (level_number % 16)
-        
+        self.level_shape = 0
+
         print("Tempest Gymnasium environment initialized")
     
     def reset(self, seed=None, options=None):

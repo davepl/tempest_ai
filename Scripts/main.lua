@@ -661,7 +661,11 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Serialize the data to a binary string
     local binary_data = ""
     for _, value in ipairs(data) do
-        binary_data = binary_data .. string.pack(">i2", value)  -- Pack as signed 16-bit integer
+        -- Apply offset encoding to handle negative values
+        local encoded_value = value + 32768
+        -- Assert that the encoded value is within the valid range for unsigned 16-bit integers
+        assert(encoded_value >= 0 and encoded_value <= 65535, "Encoded value out of range for unsigned 16-bit integer: " .. tostring(encoded_value))
+        binary_data = binary_data .. string.pack(">I2", encoded_value)  -- Pack as unsigned 16-bit integer
     end
     
     -- Create out-of-band context information structure
@@ -676,11 +680,14 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- print(string.format("Serialized %d values (%d bytes) + OOB header (%d bytes), total: %d bytes", #data, #binary_data, #oob_data, #final_data))
     --print(string.format("Frame counter: %d", game_state.frame_counter))
     
-    return final_data
+    return final_data, #data  -- Return the number of 16-bit integers
 end
 
 -- Update the frame_callback function to track bytes sent and calculate FPS
 local function frame_callback()
+    -- Declare num_values at the start of the function
+    local num_values = 0
+
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
         if not open_pipes() then
@@ -692,12 +699,11 @@ local function frame_callback()
             enemies_state:update(mem)
             
             -- Update the display with empty controls
-            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, "none")
+            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, "none", num_values)
             return
         end
     end
     
-
     -- Update all state objects
     game_state:update(mem)
     level_state:update(mem)
@@ -717,8 +723,13 @@ local function frame_callback()
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
+
+        mem:write_direct_u8(0xCA6F, 0xEA)
+        mem:write_direct_u8(0xCA70, 0xEA)
+
         -- Flatten and serialize the game state data
-        local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+        local frame_data
+        frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
         -- Calculate the reward for the current frame
         local reward = calculate_reward(game_state, level_state, player_state)
@@ -748,14 +759,14 @@ local function frame_callback()
     end
 
     -- Update the display with the current action and metrics
-    update_display(status_message, game_state, level_state, player_state, enemies_state, action)
+    update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
 
     -- Apply the action to MAME controls
     controls:apply_action(action)
 end
 
 -- Update the update_display function to show total bytes sent and FPS
-function update_display(status, game_state, level_state, player_state, enemies_state, current_action)
+function update_display(status, game_state, level_state, player_state, enemies_state, current_action, num_values, reward)
     clear_screen()
     move_cursor_to_row(1)
 
@@ -771,7 +782,9 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"P1 Level", game_state.p1_level},
         {"Frame", game_state.frame_counter},
         {"Bytes Sent", total_bytes_sent},
-        {"FPS", string.format("%.2f", current_fps)}
+        {"FPS", string.format("%.2f", current_fps)},
+        {"Payload Size", num_values},
+        {"Reward", string.format("%.2f", reward or 0)}  -- Add reward to game metrics
     }
     
     -- Print game metrics in 3 columns
@@ -795,18 +808,18 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     end
     print("")  -- Empty line after section
 
-    -- Format and print player state in 3 columns at row 5
-    move_cursor_to_row(6)
+    -- Format and print player state in 3 columns at row 6
+    move_cursor_to_row(7)
     
     -- Create player metrics in a more organized way for 3-column display
     local player_metrics = {
-        {"Position", player_state.position},
-        {"Alive", player_state.alive},
-        {"Score", player_state.score},
-        {"Angle", player_state.angle},
-        {"Szapper Uses", player_state.superzapper_uses},
-        {"Szapper Active", player_state.superzapper_active},
-        {"Shot Count", player_state.shot_count}
+        {"Position", player_state.position .. " "},
+        {"Alive", player_state.alive .. " "},
+        {"Score", player_state.score .. " "},
+        {"Angle", player_state.angle .. " "},
+        {"Szapper Uses", player_state.superzapper_uses .. " "},
+        {"Szapper Active", player_state.superzapper_active .. " "},
+        {"Shot Count", player_state.shot_count .. " "}
     }
     
     -- Print player metrics in 3 columns
@@ -837,8 +850,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("  Shot Positions: " .. shots_str)
     print("")  -- Empty line after section
 
-    -- Format and print player controls at row 13
-    move_cursor_to_row(12)
+    -- Format and print player controls at row 14
+    move_cursor_to_row(13)
     local controls_metrics = {
         ["Current Action"] = current_action or "none",
         ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
@@ -849,17 +862,17 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print(format_section("Player Controls", controls_metrics))
 
     -- Format and print level state in 3 columns
-    move_cursor_to_row(19)
+    move_cursor_to_row(34)
     
+    -- Print level metrics in 3 columns
+    print("--[ Level State ]-------------------------------------")
+
     -- Create level metrics in a more organized way for 3-column display
     local level_metrics_list = {
         {"Level Number", level_state.level_number},
         {"Level Type", level_state.level_type == 0xFF and "Open" or "Closed"},
         {"Level Shape", level_state.level_shape}
     }
-    
-    -- Print level metrics in 3 columns
-    print("--[ Level State ]-------------------------------------")
     
     -- Calculate how many rows we need (ceiling of items/3)
     local rows = math.ceil(#level_metrics_list / 3)
@@ -897,8 +910,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("  Level Angles : " .. angles_str)
     print("")  -- Empty line after section
 
-    -- Format and print enemies state at row 30
-    move_cursor_to_row(25)
+    -- Format and print enemies state at row 31
+    move_cursor_to_row(20)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -927,7 +940,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     }
 
     print(format_section("Enemies State", enemies_metrics))
-    
+
+    move_cursor_to_row(30)  -- Move Enemy Segments display up one line   
     -- Add enemy segments and depths on their own lines
     print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
