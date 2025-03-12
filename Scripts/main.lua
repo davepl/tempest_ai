@@ -189,10 +189,10 @@ local function start_python_script()
     -- Comment these out if you're trying to debug the Python side...
 
     -- Kill any existing Python script instances
-    os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
+    -- os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
     
     -- Remove existing pipes to ensure clean state
-    os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
+    -- os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
     
     -- Launch Python script in the background with proper error handling
     local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
@@ -667,9 +667,6 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     table.insert(data, enemies_state.pulse_beat or 0)
     table.insert(data, enemies_state.pulsing or 0)
     
-    -- Use LastRewardState which was already calculated in frame_callback
-    -- Don't calculate reward here again
-    
     -- Serialize the data to a binary string
     local binary_data = ""
     for i, value in ipairs(data) do
@@ -704,17 +701,32 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         end
     end
     
+    -- Get current game action based on the active player control
+    local game_action = 4  -- Default to "none"
+    if controls and controls.fire_field and controls.fire_field.pressed then
+        game_action = 0  -- "fire"
+    elseif controls and controls.zap_field and controls.zap_field.pressed then
+        game_action = 1  -- "zap"
+    elseif controls and controls.left_field and controls.left_field.pressed then
+        game_action = 2  -- "left"
+    elseif controls and controls.right_field and controls.right_field.pressed then
+        game_action = 3  -- "right"
+    end
+    
+    -- Debug output for game mode value occasionally
+    if game_state.frame_counter % 60 == 0 then
+        print(string.format("Game Mode: 0x%02X, Is Attract Mode: %s", 
+            game_state.game_mode, 
+            (game_state.game_mode & 0x80) == 0 and "true" or "false"))
+    end
+    
     -- Create out-of-band context information structure
-    -- 1. Number of 32-bit values to follow (1 for now: just reward)
-    -- 2. Current reward (64-bit double)
-    local oob_data = string.pack(">I4d", 1, LastRewardState)
+    -- Pack: reward (double), game_action (byte), game_mode (byte), done flag (byte)
+    local is_done = 0  -- We don't currently track if the game is done
+    local oob_data = string.pack(">IdBBB", 1, LastRewardState, game_action, game_state.game_mode, is_done)
     
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
-    
-    -- Debug output
-    -- print(string.format("Serialized %d values (%d bytes) + OOB header (%d bytes), total: %d bytes", #data, #binary_data, #oob_data, #final_data))
-    --print(string.format("Frame counter: %d", game_state.frame_counter))
     
     return final_data, #data  -- Return the number of 16-bit integers
 end
