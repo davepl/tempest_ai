@@ -79,6 +79,9 @@ local AGGRESSION_DECAY = 0.99
 -- Declare a global variable to store the last reward state
 local LastRewardState = 0
 
+-- Add this at the top of the file, near other global variables
+local shutdown_requested = false
+
 -- Function to calculate reward for the current frame
 local function calculate_reward(game_state, level_state, player_state)
     local reward = 0
@@ -288,6 +291,8 @@ function GameState:new()
     self.game_mode = 0    -- Game mode from address 5
     self.countdown_timer = 0  -- Countdown timer from address 4
     self.frame_counter = 0  -- Frame counter for tracking progress
+    self.last_save_time = os.time()  -- Track when we last sent save signal
+    self.save_interval = 300  -- Send save signal every 5 minutes (300 seconds)
     return self
 end
 
@@ -698,6 +703,22 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         game_action = 3  -- "right"
     end
     
+    -- Check if it's time to send a save signal
+    local current_time = os.time()
+    local save_signal = 0
+    
+    -- Send save signal every N seconds or when exiting play mode or when shutdown requested
+    if current_time - game_state.last_save_time >= game_state.save_interval or shutdown_requested then
+        save_signal = 1
+        game_state.last_save_time = current_time
+        print("Sending save signal to Python script")
+        
+        -- If this is a shutdown save, add extra debug info
+        if shutdown_requested then
+            print("SHUTDOWN SAVE: Final save before MAME exits")
+        end
+    end
+    
     -- Debug output for game mode value occasionally
     if game_state.frame_counter % 60 == 0 then
         print(string.format("Game Mode: 0x%02X, Is Attract Mode: %s", 
@@ -707,10 +728,10 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     
     -- Create out-of-band context information structure
     -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
-    -- done flag (byte), frame_counter (uint32), score (uint32)
+    -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte)
     local is_done = 0  -- We don't currently track if the game is done
-    local oob_data = string.pack(">IdBBBII", 1, LastRewardState, game_action, game_state.game_mode, 
-                                is_done, game_state.frame_counter, player_state.score)
+    local oob_data = string.pack(">IdBBBIIB", 1, LastRewardState, game_action, game_state.game_mode, 
+                                is_done, game_state.frame_counter, player_state.score, save_signal)
     
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
@@ -764,6 +785,30 @@ local function frame_callback()
 
         -- Calculate the reward for the current frame - do this ONCE per frame
         local reward = calculate_reward(game_state, level_state, player_state)
+        
+        -- Add periodic save mechanism based on frame counter instead of key press
+        -- This will trigger a save every 30,000 frames (approximately 8 minutes at 60fps)
+        if game_state.frame_counter % 30000 == 0 then
+            print("Frame counter triggered save at frame " .. game_state.frame_counter)
+            game_state.last_save_time = 0  -- Force save on next frame
+        end
+        
+        -- Try to detect ESC key press using a more reliable method
+        -- Check for ESC key in all available ports
+        local esc_pressed = false
+        for port_name, port in pairs(manager.machine.ioport.ports) do
+            for field_name, field in pairs(port.fields) do
+                if field_name:find("ESC") or field_name:find("Escape") then
+                    if field.pressed then
+                        print("ESC key detected - Triggering save")
+                        game_state.last_save_time = 0  -- Force save on next frame
+                        esc_pressed = true
+                        break
+                    end
+                end
+            end
+            if esc_pressed then break end
+        end
         
         -- Flatten and serialize the game state data
         local frame_data
@@ -998,6 +1043,35 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 end
 
+-- Function to be called when MAME is shutting down
+local function on_mame_exit()
+    print("MAME is shutting down - Sending final save signal")
+    
+    -- Set shutdown flag to trigger save in next frame
+    shutdown_requested = true
+    
+    -- Force one more frame update to ensure save
+    -- We can use the existing objects since they should still be valid
+    if game_state and level_state and player_state and enemies_state then
+        -- Calculate reward one more time
+        local reward = calculate_reward(game_state, level_state, player_state)
+        
+        -- Get final frame data with save signal
+        local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+        
+        -- Send one last time
+        if pipe_out and pipe_in then
+            local result = process_frame(frame_data)
+            print("Final save complete, response: " .. (result or "none"))
+        end
+    end
+    
+    -- Close pipes as in the existing cleanup function
+    if pipe_out then pipe_out:close() end
+    if pipe_in then pipe_in:close() end
+    print("Pipes closed during MAME shutdown")
+end
+
 -- Start the Python script but don't wait for pipes to open
 start_python_script()
 clear_screen()
@@ -1005,12 +1079,6 @@ clear_screen()
 -- Register the frame callback with MAME
 emu.register_frame(frame_callback)
 
-local function cleanup()
-    if pipe_out then pipe_out:close() end
-    if pipe_in then pipe_in:close() end
-    print("Pipes closed")
-end
-
--- Register cleanup with MAME's exit handler if available
-emu.register_stop(cleanup)
+-- Register the shutdown callback
+emu.register_stop(on_mame_exit)
 

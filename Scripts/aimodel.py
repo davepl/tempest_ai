@@ -23,6 +23,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
+# Add imports for Stable Baselines3
+from stable_baselines3 import DQN
+from stable_baselines3.common.buffers import ReplayBuffer as SB3ReplayBuffer
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
+import datetime
+
+# Define global shutdown tracking variable
+shutdown_requested = False
 
 # Define the paths to the named pipes
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
@@ -37,6 +46,79 @@ ACTION_MAP = {
     4: "none"
 }
 
+# Create a directory for model checkpoints
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+if not os.path.exists(MODEL_DIR):
+    try:
+        os.makedirs(MODEL_DIR)
+        print(f"Created model directory at {MODEL_DIR}")
+    except Exception as e:
+        print(f"Warning: Could not create models directory: {e}")
+        # Fall back to using a directory in the user's home folder
+        MODEL_DIR = os.path.expanduser("~/tempest_models")
+        if not os.path.exists(MODEL_DIR):
+            try:
+                os.makedirs(MODEL_DIR)
+                print(f"Created fallback model directory at {MODEL_DIR}")
+            except Exception as e2:
+                print(f"Critical error: Could not create fallback directory: {e2}")
+                # Last resort - use /tmp which should be writable
+                MODEL_DIR = "/tmp/tempest_models"
+                if not os.path.exists(MODEL_DIR):
+                    os.makedirs(MODEL_DIR)
+                print(f"Using temporary directory for models: {MODEL_DIR}")
+
+# Define paths for latest models and checkpoints
+LATEST_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_model_latest.zip")
+BC_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_bc_model.pt")
+
+# Add model versioning to track compatibility
+MODEL_VERSION = "1.0.0"
+
+# Add diagnostic filenames for troubleshooting
+MODEL_LOAD_DIAGNOSTICS = os.path.join(MODEL_DIR, "model_load_diagnostics.txt")
+
+# Print model paths for debugging
+print(f"Model paths:\n  RL: {LATEST_MODEL_PATH}\n  BC: {BC_MODEL_PATH}")
+
+# Function to write diagnostic information for troubleshooting
+def write_diagnostic_info(message, error=None, model_path=None):
+    """Write detailed diagnostic information to help troubleshoot model loading issues"""
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(MODEL_LOAD_DIAGNOSTICS, "a") as f:
+            f.write(f"\n\n=== {timestamp} ===\n")
+            f.write(f"{message}\n")
+            
+            if error:
+                f.write(f"Error: {str(error)}\n")
+                if hasattr(error, "__traceback__"):
+                    import traceback
+                    tb_str = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                    f.write(f"Traceback:\n{tb_str}\n")
+            
+            if model_path and os.path.exists(model_path):
+                file_size = os.path.getsize(model_path)
+                file_time = datetime.datetime.fromtimestamp(os.path.getmtime(model_path))
+                f.write(f"Model file: {model_path}\n")
+                f.write(f"  - Size: {file_size} bytes\n")
+                f.write(f"  - Modified: {file_time}\n")
+                
+                # For zip files, try to list contents
+                if model_path.endswith(".zip"):
+                    try:
+                        import zipfile
+                        with zipfile.ZipFile(model_path, 'r') as zip_ref:
+                            f.write("  - Contents:\n")
+                            for info in zip_ref.infolist():
+                                f.write(f"    - {info.filename} ({info.file_size} bytes)\n")
+                    except Exception as zip_error:
+                        f.write(f"  - Error reading zip contents: {zip_error}\n")
+        
+        print(f"Diagnostic information written to {MODEL_LOAD_DIAGNOSTICS}")
+    except Exception as diag_error:
+        print(f"Error writing diagnostics: {diag_error}")
+
 class TempestEnv(gym.Env):
     """
     Custom Gymnasium environment for Tempest arcade game.
@@ -49,11 +131,11 @@ class TempestEnv(gym.Env):
         # Define action space: fire, zap, left, right, none
         self.action_space = spaces.Discrete(5)
         
-        # Define observation space - 117 features based on game state
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(117,), dtype=np.float32)
+        # Define observation space - 116 features based on game state
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(116,), dtype=np.float32)
         
         # Initialize state
-        self.state = np.zeros(117, dtype=np.float32)
+        self.state = np.zeros(116, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.info = {}
@@ -68,7 +150,7 @@ class TempestEnv(gym.Env):
         """Reset the environment to start a new episode."""
         super().reset(seed=seed)
         
-        self.state = np.zeros(117, dtype=np.float32)
+        self.state = np.zeros(116, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.episode_step = 0
@@ -108,63 +190,250 @@ class TempestEnv(gym.Env):
             self.info["game_action"] = game_action
         return self.state
 
-class ReplayBuffer:
+class CustomReplayBuffer:
+    """Custom replay buffer that can handle both BC and RL transitions"""
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
+        self.bc_buffer = deque(maxlen=capacity // 2)  # Separate buffer for BC samples
     
-    def add(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def add(self, state, action, reward, next_state, done, is_bc=False):
+        # Store in appropriate buffer
+        if is_bc:
+            self.bc_buffer.append((state, action, reward, next_state, done))
+        else:
+            self.buffer.append((state, action, reward, next_state, done))
     
-    def sample(self, batch_size):
-        states, actions, rewards, next_states, dones = zip(*random.sample(self.buffer, batch_size))
+    def sample(self, batch_size, bc_ratio=0.3):
+        """Sample from both buffers with a given BC ratio"""
+        if len(self.bc_buffer) < batch_size * bc_ratio or len(self.buffer) < batch_size * (1 - bc_ratio):
+            # Not enough samples in one of the buffers, sample from what's available
+            all_samples = list(self.buffer) + list(self.bc_buffer)
+            if len(all_samples) < batch_size:
+                return None  # Not enough samples total
+            samples = random.sample(all_samples, batch_size)
+        else:
+            # Sample from both buffers according to the ratio
+            bc_samples = random.sample(list(self.bc_buffer), int(batch_size * bc_ratio))
+            rl_samples = random.sample(list(self.buffer), batch_size - len(bc_samples))
+            samples = bc_samples + rl_samples
+        
+        states, actions, rewards, next_states, dones = zip(*samples)
         return (np.array(states), np.array(actions), np.array(rewards, dtype=np.float32),
                 np.array(next_states), np.array(dones, dtype=np.float32))
     
     def __len__(self):
-        return len(self.buffer)
+        return len(self.buffer) + len(self.bc_buffer)
 
-class UnifiedModel(nn.Module):
-    """
-    A neural network model that can be used for both Behavioral Cloning and RL
-    """
+# Custom feature extractor for Stable Baselines3
+class TempestFeaturesExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=128):
+        super().__init__(observation_space, features_dim)
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(observation_space.shape[0], 256),
+            nn.ReLU(),
+            nn.Linear(256, features_dim),
+            nn.ReLU()
+        )
+    
+    def forward(self, observations):
+        return self.feature_extractor(observations)
+
+# Custom BC model
+class BCModel(nn.Module):
     def __init__(self, input_size, output_size):
         super().__init__()
-        
-        # Define a shared feature extractor
-        self.feature_extractor = nn.Sequential(
+        self.model = nn.Sequential(
             nn.Linear(input_size, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Linear(128, output_size)
         )
-        
-        # Define policy head
-        self.policy_head = nn.Linear(128, output_size)
-        
-        # Define value head for RL
-        self.value_head = nn.Linear(128, output_size)
     
     def forward(self, x):
-        # Extract features
-        features = self.feature_extractor(x)
-        
-        # Get policy and value outputs
-        policy_output = self.policy_head(features)
-        value_output = self.value_head(features)
-        
-        return policy_output, value_output
+        return self.model(x)
     
     def act(self, state, epsilon=0.1):
-        """
-        Select an action using epsilon-greedy policy
-        """
+        """Select an action using epsilon-greedy policy"""
         if random.random() < epsilon:
             return random.randint(0, 4)
         else:
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
             with torch.no_grad():
-                policy_output, _ = self.forward(state_tensor)
-                return torch.argmax(policy_output, dim=1).item()
+                logits = self.forward(state_tensor)
+                return torch.argmax(logits, dim=1).item()
+
+# Custom callback for saving the model
+class SaveOnSignalCallback(BaseCallback):
+    def __init__(self, save_path, bc_model=None, verbose=1):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.bc_model = bc_model
+        self.force_save = False
+        self.model = None  # Will be set when callback is initialized
+    
+    def _on_step(self):
+        if self.force_save:
+            self._save_models()
+            self.force_save = False
+        return True
+    
+    def _save_models(self):
+        """Internal method to actually save the models"""
+        print("\n" + "=" * 50)
+        print("SAVE OPERATION STARTING")
+        print(f"RL model path: {self.save_path}")
+        print(f"BC model path: {BC_MODEL_PATH}")
+        print(f"Models directory: {MODEL_DIR}")
+        print("=" * 50 + "\n")
+        
+        # Check if directory exists and is writable
+        if not os.path.exists(MODEL_DIR):
+            print(f"ERROR: Model directory {MODEL_DIR} does not exist!")
+            try:
+                os.makedirs(MODEL_DIR, exist_ok=True)
+                print(f"Created directory {MODEL_DIR}")
+            except Exception as e:
+                print(f"ERROR: Could not create directory: {e}")
+        
+        if not os.access(MODEL_DIR, os.W_OK):
+            print(f"ERROR: Model directory {MODEL_DIR} is not writable!")
+        
+        try:
+            # Save RL model
+            print("Attempting to save RL model...")
+            
+            # Verify model is valid before saving
+            if self.model is None:
+                raise ValueError("Model reference is None - cannot save")
+            
+            # Add version metadata before saving
+            if not hasattr(self.model, 'model_version'):
+                self.model.model_version = MODEL_VERSION
+            if not hasattr(self.model, 'model_timestamp'):
+                self.model.model_timestamp = datetime.datetime.now().isoformat()
+            
+            # Create a temporary file first to avoid corrupting existing model
+            temp_path = f"{self.save_path}.temp"
+            self.model.save(temp_path)
+            
+            # Verify the temporary file
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                raise ValueError(f"Failed to create valid temporary model file at {temp_path}")
+            
+            # Now safely move it to the real location
+            import shutil
+            shutil.move(temp_path, self.save_path)
+            
+            print(f"RL model saved to {self.save_path}")
+            
+            # Verify RL model was saved
+            if os.path.exists(self.save_path):
+                print(f"VERIFIED: RL model file exists at {self.save_path}")
+                print(f"File size: {os.path.getsize(self.save_path)} bytes")
+            else:
+                print(f"ERROR: RL model file does not exist after save attempt!")
+            
+            # Also save a timestamped backup
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{self.save_path.replace('.zip', '')}_{timestamp}.zip"
+            
+            # Use direct copy for backup to avoid potential model corruption
+            shutil.copy2(self.save_path, backup_path)
+            print(f"RL model backup saved to {backup_path}")
+            
+            # Save BC model if provided
+            if self.bc_model is not None:
+                print("Attempting to save BC model...")
+                bc_path = BC_MODEL_PATH
+                try:
+                    # Save to temporary file first
+                    temp_bc_path = f"{bc_path}.temp"
+                    torch.save(self.bc_model.state_dict(), temp_bc_path)
+                    
+                    # Verify temp file is valid
+                    if not os.path.exists(temp_bc_path) or os.path.getsize(temp_bc_path) == 0:
+                        raise ValueError(f"Failed to create valid temporary BC model file")
+                    
+                    # Move to final location
+                    shutil.move(temp_bc_path, bc_path)
+                    print(f"BC model saved to {bc_path}")
+                    
+                    # Verify BC model was saved
+                    if os.path.exists(bc_path):
+                        print(f"VERIFIED: BC model file exists at {bc_path}")
+                        print(f"File size: {os.path.getsize(bc_path)} bytes")
+                    else:
+                        print(f"ERROR: BC model file does not exist after save attempt!")
+                    
+                    # Also save a timestamped backup for BC model
+                    bc_backup_path = f"{bc_path.replace('.pt', '')}_{timestamp}.pt"
+                    shutil.copy2(bc_path, bc_backup_path)
+                    print(f"BC model backup saved to {bc_backup_path}")
+                except Exception as bc_error:
+                    print(f"ERROR saving BC model: {bc_error}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Write a marker file to confirm saving worked and include model version info
+            marker_file = os.path.join(MODEL_DIR, f"save_confirmed_{timestamp}.txt")
+            try:
+                with open(marker_file, "w") as f:
+                    f.write(f"Models saved successfully at {datetime.datetime.now().isoformat()}\n")
+                    f.write(f"Model Version: {MODEL_VERSION}\n")
+                    f.write(f"RL Model: {self.save_path}\n")
+                    f.write(f"RL File Size: {os.path.getsize(self.save_path)} bytes\n")
+                    if self.bc_model is not None:
+                        f.write(f"BC Model: {bc_path}\n")
+                        f.write(f"BC File Size: {os.path.getsize(bc_path)} bytes\n")
+                print(f"Confirmation file written to {marker_file}")
+            except Exception as marker_error:
+                print(f"ERROR writing confirmation file: {marker_error}")
+            
+            # List all files in the models directory
+            print("\nCurrent files in models directory:")
+            try:
+                files = os.listdir(MODEL_DIR)
+                for file in files:
+                    file_path = os.path.join(MODEL_DIR, file)
+                    file_size = os.path.getsize(file_path)
+                    print(f"  - {file} ({file_size} bytes)")
+            except Exception as e:
+                print(f"ERROR listing directory contents: {e}")
+            
+            print("\nSAVE COMPLETED SUCCESSFULLY")
+        except Exception as e:
+            print(f"ERROR saving models: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Record diagnostic information about the failed save
+            write_diagnostic_info("Failed to save models", error=e)
+            
+            # Try an alternative save location
+            alt_dir = os.path.expanduser("~/tempest_models_fallback")
+            print(f"\nAttempting emergency save to alternative location: {alt_dir}")
+            try:
+                os.makedirs(alt_dir, exist_ok=True)
+                alt_rl_path = os.path.join(alt_dir, "tempest_model_emergency.zip")
+                alt_bc_path = os.path.join(alt_dir, "tempest_bc_model_emergency.pt")
+                
+                if self.model is not None:
+                    self.model.save(alt_rl_path)
+                if self.bc_model is not None:
+                    torch.save(self.bc_model.state_dict(), alt_bc_path)
+                
+                print(f"Emergency save successful to {alt_dir}")
+                print(f"  - RL model: {alt_rl_path}")
+                print(f"  - BC model: {alt_bc_path}")
+            except Exception as alt_error:
+                print(f"ERROR during emergency save: {alt_error}")
+    
+    def signal_save(self):
+        """Signal that models should be saved - now saves immediately"""
+        print("Save signal received - saving models immediately")
+        self._save_models()  # Save immediately instead of waiting for next step
+        self.force_save = False  # Just in case _on_step is called
 
 def process_frame_data(data):
     """
@@ -174,11 +443,13 @@ def process_frame_data(data):
         data (bytes): Binary data containing OOB header and game state information
         
     Returns:
-        tuple: (processed_data, frame_counter, reward, game_action, is_attract, done)
+        tuple: (processed_data, frame_counter, reward, game_action, is_attract, done, save_signal)
     """
-    if len(data) < 23:  # Header (4+8) + action (1) + mode (1) + done (1) + frame_counter (4) + score (4)
+    global shutdown_requested
+    
+    if len(data) < 24:  # Header (4+8) + action (1) + mode (1) + done (1) + frame_counter (4) + score (4) + save_signal (1)
         print(f"Warning: Data too small ({len(data)} bytes)")
-        return None, 0, 0.0, None, False, False
+        return None, 0, 0.0, None, False, False, False
     
     try:
         # Extract out-of-band information
@@ -189,15 +460,27 @@ def process_frame_data(data):
         done = struct.unpack(">B", data[14:15])[0] != 0
         frame_counter = struct.unpack(">I", data[15:19])[0]  # Extract 32-bit frame counter
         score = struct.unpack(">I", data[19:23])[0]  # Extract 32-bit score
+        save_signal = struct.unpack(">B", data[23:24])[0] != 0  # Read dedicated save signal byte
         
         # Debug output for game mode occasionally
-        if random.random() < 0.01:  # Show debug info about 1% of the time
-            print(f"Game Mode: 0x{game_mode:02X}, Is Attract Mode: {(game_mode & 0x80) == 0}")
+        if random.random() < 0.01 or save_signal:  # Show debug info about 1% of the time or if save signal
+            print(f"Game Mode: 0x{game_mode:02X}, Is Attract Mode: {(game_mode & 0x80) == 0}, Save Signal: {save_signal}")
             print(f"OOB Data: values={num_oob_values}, reward={reward:.2f}, action={game_action}, done={done}")
             print(f"Frame Counter: {frame_counter}, Score: {score}")
         
-        # Calculate header size: 4 bytes for count + (num_oob_values * 8) bytes for values + 3 bytes for extra data + 8 bytes for frame_counter and score
-        header_size = 4 + (num_oob_values * 8) + 3 + 8
+        # Make save signal very visible when it happens
+        if save_signal:
+            print("\n" + "!" * 50)
+            print("!!! SAVE SIGNAL RECEIVED FROM LUA !!!")
+            print("!" * 50 + "\n")
+            
+            # If this save signal is from an on_mame_exit callback, mark it as a shutdown request
+            if done or frame_counter % 100 == 99:  # Simple heuristic to detect shutdown saves (done or certain frame patterns)
+                shutdown_requested = True
+                print("DETECTED POSSIBLE SHUTDOWN - Models will be saved immediately")
+        
+        # Calculate header size: 4 bytes for count + (num_oob_values * 8) bytes for values + 3 bytes for extra data + 8 bytes for frame_counter and score + 1 byte for save signal
+        header_size = 4 + (num_oob_values * 8) + 3 + 8 + 1
         
         # Extract game state data (everything after the header)
         game_data = data[header_size:]
@@ -229,7 +512,7 @@ def process_frame_data(data):
         process_frame_data.last_attract_mode = is_attract
         
         # Pad or truncate to match the expected observation space size
-        expected_size = 117
+        expected_size = 116
         if len(normalized_data) < expected_size:
             padded_data = np.zeros(expected_size, dtype=np.float32)
             padded_data[:len(normalized_data)] = normalized_data
@@ -237,234 +520,308 @@ def process_frame_data(data):
         elif len(normalized_data) > expected_size:
             normalized_data = normalized_data[:expected_size]
         
-        return normalized_data, frame_counter, reward, game_action, is_attract, done
+        return normalized_data, frame_counter, reward, game_action, is_attract, done, save_signal
     
     except Exception as e:
         print(f"Error processing frame data: {e}")
         import traceback
         traceback.print_exc()
-        return None, 0, 0.0, None, False, False
+        return None, 0, 0.0, None, False, False, False
 
 # Initialize static variable for process_frame_data
 process_frame_data.last_attract_mode = True
 
-# Create a global environment instance
-env = TempestEnv()
-
-# Create a unified model instance
-model = UnifiedModel(117, 5)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-replay_buffer = ReplayBuffer(10000)
-batch_size = 32
-gamma = 0.99  # Discount factor
-epsilon = 0.5  # Starting exploration rate
-epsilon_decay = 0.995  # Exploration decay rate
-min_epsilon = 0.1  # Minimum exploration rate
-
-# Loss functions
-bc_loss_fn = nn.CrossEntropyLoss()
-rl_loss_fn = nn.MSELoss()
-
-# Training stats
-bc_episodes = 0
-rl_episodes = 0
-bc_losses = []
-rl_losses = []
-rewards_history = []
-
-# Track mode transitions for logging
-last_mode_was_attract = True
-mode_transitions = 0
-
-def train_bc(state, action):
-    """Train the model using Behavioral Cloning"""
+def train_bc(model, state, action):
+    """Train the BC model using demonstration data"""
     state_tensor = torch.FloatTensor(state).unsqueeze(0)
     action_tensor = torch.LongTensor([action])
     
     # Forward pass
-    policy_output, _ = model(state_tensor)
+    logits = model(state_tensor)
     
     # Calculate loss
-    loss = bc_loss_fn(policy_output, action_tensor)
+    loss_fn = nn.CrossEntropyLoss()
+    loss = loss_fn(logits, action_tensor)
     
     # Backpropagation
-    optimizer.zero_grad()
+    model.optimizer.zero_grad()
     loss.backward()
-    optimizer.step()
+    model.optimizer.step()
     
     return loss.item()
 
-def train_rl(batch_size):
-    """Train the model using Reinforcement Learning (DQN)"""
-    if len(replay_buffer) < batch_size:
-        return 0.0
+def initialize_models():
+    """Initialize both BC and RL models with robust error handling and diagnostics"""
+    # Create the environment
+    env = TempestEnv()
     
-    # Sample from replay buffer
-    states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+    print("\n===== MODEL INITIALIZATION =====")
+    print(f"Model version: {MODEL_VERSION}")
+    print(f"Models directory: {MODEL_DIR}")
     
-    # Convert to tensors
-    states_tensor = torch.FloatTensor(states)
-    actions_tensor = torch.LongTensor(actions)
-    rewards_tensor = torch.FloatTensor(rewards)
-    next_states_tensor = torch.FloatTensor(next_states)
-    dones_tensor = torch.FloatTensor(dones)
+    # Save backup of any existing models before loading
+    backup_existing_models = False  # Set to True if you want automatic backups before loading
+    if backup_existing_models:
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            if os.path.exists(LATEST_MODEL_PATH):
+                backup_rl = f"{LATEST_MODEL_PATH}.bak_{timestamp}"
+                import shutil
+                shutil.copy2(LATEST_MODEL_PATH, backup_rl)
+                print(f"Backed up RL model to {backup_rl}")
+            if os.path.exists(BC_MODEL_PATH):
+                backup_bc = f"{BC_MODEL_PATH}.bak_{timestamp}"
+                shutil.copy2(BC_MODEL_PATH, backup_bc)
+                print(f"Backed up BC model to {backup_bc}")
+        except Exception as backup_error:
+            print(f"Warning: Could not create backups: {backup_error}")
     
-    # Get current Q values
-    current_q_values = model(states_tensor)[1].gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+    # Initialize the BC model
+    bc_model = BCModel(116, 5)
+    bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
+    bc_loaded_successfully = False
     
-    # Get next Q values (target network)
-    with torch.no_grad():
-        next_q_values = model(next_states_tensor)[1].max(1)[0]
-        target_q_values = rewards_tensor + gamma * next_q_values * (1 - dones_tensor)
-    
-    # Calculate loss
-    loss = rl_loss_fn(current_q_values, target_q_values)
-    
-    # Backpropagation
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    
-    return loss.item()
-
-def ai_model(game_state, frame_counter, reward, game_action, is_attract, done):
-    """
-    AI model that determines the action based on the game state.
-    Uses Behavioral Cloning in attract mode, RL in normal play.
-    Implements bidirectional knowledge transfer between modes.
-    
-    Args:
-        game_state (numpy.ndarray): Processed game state data
-        frame_counter (int): Current frame counter
-        reward (float): Current reward value
-        game_action (int): Action from the game
-        is_attract (bool): Whether we're in attract mode
-        done (bool): Whether the episode is done
-        
-    Returns:
-        str: Action to take (fire, zap, left, right, none)
-    """
-    global epsilon, bc_episodes, rl_episodes, last_mode_was_attract, mode_transitions
-    
-    # Detect mode transition
-    if is_attract != last_mode_was_attract:
-        mode_transitions += 1
-        print(f"\n*** MODE TRANSITION #{mode_transitions}: {'Attract → Play' if not is_attract else 'Play → Attract'} ***")
-        print(f"Frame: {frame_counter}, Is Attract: {is_attract}, Game Action: {game_action}")
-        last_mode_was_attract = is_attract
-    
-    # Update environment
-    env.update_state(game_state, reward, game_action, done)
-    env.is_attract_mode = is_attract
-    
-    # Store transition in replay buffer (if we have a previous state)
-    if env.prev_state is not None:
-        # For replay buffer, use game_action in attract mode, model action in play mode
-        if is_attract:
-            # In attract mode, we use the game's action for learning (BC)
-            if game_action is not None and game_action < 5:  # Ensure it's a valid action
-                replay_buffer.add(env.prev_state, game_action, reward, game_state, done)
-                if frame_counter % 100 == 0:
-                    print(f"Added attract mode transition to buffer: action={ACTION_MAP[game_action]}")
-        else:
-            # In play mode, we use the model's action (RL)
-            model_action = model.act(env.prev_state)
-            replay_buffer.add(env.prev_state, model_action, reward, game_state, done)
-            if frame_counter % 100 == 0:
-                print(f"Added play mode transition to buffer: action={ACTION_MAP[model_action]}")
-    
-    # Different behavior based on mode
-    if is_attract:
-        # Behavioral Cloning mode
-        # Log the attract mode state occasionally
-        if frame_counter % 300 == 0:
-            print(f"In ATTRACT mode - Frame {frame_counter}, Buffer size: {len(replay_buffer)}")
-        
-        # Ensure we have a valid game action
-        if game_action is not None and game_action < 5:
-            # Learn from the game's action using BC
-            loss = train_bc(game_state, game_action)
-            bc_losses.append(loss)
+    # Try to load existing BC model
+    if os.path.exists(BC_MODEL_PATH):
+        print(f"Found BC model file at {BC_MODEL_PATH} - Attempting to load...")
+        try:
+            # First verify file integrity
+            if os.path.getsize(BC_MODEL_PATH) == 0:
+                raise ValueError("BC model file is empty (0 bytes)")
             
-            # Log progress occasionally
-            if frame_counter % 100 == 0:
-                print(f"BC training - Frame {frame_counter}, Action: {ACTION_MAP[game_action]}, Loss: {loss:.6f}")
+            # Record file stats for diagnostics
+            file_stats = f"File size: {os.path.getsize(BC_MODEL_PATH)} bytes, " \
+                        f"Modified: {datetime.datetime.fromtimestamp(os.path.getmtime(BC_MODEL_PATH))}"
+            print(f"BC model file stats: {file_stats}")
             
-            # In attract mode, just return the game's action
-            action = game_action
-        else:
-            # If we don't have a valid game_action, choose a random one
-            action = random.randint(0, 4)
-            print(f"Warning: Invalid game_action {game_action} in attract mode, using random action")
-        
-        # Track BC episodes
-        if done:
-            bc_episodes += 1
-            avg_loss = np.mean(bc_losses[-100:]) if bc_losses else 0
-            print(f"BC Episode {bc_episodes} completed, avg loss: {avg_loss:.6f}")
+            # Attempt to load model with error handling
+            start_time = time.time()
+            state_dict = torch.load(BC_MODEL_PATH)
+            
+            # Optional: Validate state dict structure to prevent partial loads
+            expected_keys = {'model.0.weight', 'model.0.bias', 'model.2.weight', 'model.2.bias', 
+                            'model.4.weight', 'model.4.bias'}
+            missing_keys = expected_keys - set(state_dict.keys())
+            
+            if missing_keys:
+                raise ValueError(f"BC model is missing expected keys: {missing_keys}")
+            
+            # Apply state dict to model
+            bc_model.load_state_dict(state_dict)
+            load_time = time.time() - start_time
+            
+            print(f"Successfully loaded BC model from {BC_MODEL_PATH} in {load_time:.2f} seconds")
+            
+            # Additional validation - perform a test forward pass
+            test_input = torch.zeros(1, 116, dtype=torch.float32)
+            with torch.no_grad():
+                test_output = bc_model(test_input)
+                if test_output.shape != (1, 5):
+                    raise ValueError(f"Model produced incorrect output shape: {test_output.shape}, expected (1, 5)")
+            
+            bc_loaded_successfully = True
+            write_diagnostic_info(f"BC model loaded successfully", model_path=BC_MODEL_PATH)
+            
+        except Exception as e:
+            print(f"ERROR loading BC model: {e}")
+            import traceback
+            traceback.print_exc()
+            write_diagnostic_info("Failed to load BC model", error=e, model_path=BC_MODEL_PATH)
+            print("Initializing fresh BC model due to loading error")
+            # Reinitialize the model since loading failed
+            bc_model = BCModel(116, 5)
+            bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     else:
-        # Reinforcement Learning mode
-        # Log the play mode state occasionally
-        if frame_counter % 300 == 0:
-            print(f"In PLAY mode - Frame {frame_counter}, Buffer size: {len(replay_buffer)}")
-        
-        # Decay exploration rate - we decay more slowly if we've had more mode transitions
-        # This ensures that after returning from BC, we still explore a bit
-        decay_factor = epsilon_decay * (0.95 + 0.05 * min(mode_transitions, 10))
-        epsilon = max(min_epsilon, epsilon * decay_factor)
-        
-        # Choose an action using the model with epsilon-greedy
-        action = model.act(game_state, epsilon)
-        
-        # Train the model with RL if we have enough samples
-        if len(replay_buffer) > batch_size:
-            rl_loss = train_rl(batch_size)
-            rl_losses.append(rl_loss)
+        print(f"No existing BC model found at {BC_MODEL_PATH}, starting fresh")
+        write_diagnostic_info("No BC model file found - starting with new model")
+    
+    # Initialize the RL model with Stable Baselines3
+    policy_kwargs = dict(
+        features_extractor_class=TempestFeaturesExtractor,
+        features_extractor_kwargs=dict(features_dim=128),
+        net_arch=[128, 64]
+    )
+    
+    # Create checkpoint callback for regular saving
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000,  # Save every 10000 steps
+        save_path=os.path.join(MODEL_DIR, "checkpoints"),
+        name_prefix="tempest_dqn"
+    )
+    
+    # Create our custom save-on-signal callback with BC model reference
+    save_signal_callback = SaveOnSignalCallback(save_path=LATEST_MODEL_PATH, bc_model=bc_model)
+    
+    # Create initial DQN model
+    rl_model = DQN(
+        "MlpPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=0.0001,
+        buffer_size=100000,
+        learning_starts=1000,
+        batch_size=64,
+        gamma=0.99,
+        train_freq=4,
+        gradient_steps=1,
+        target_update_interval=1000,
+        exploration_fraction=0.5,
+        exploration_initial_eps=0.5,
+        exploration_final_eps=0.1,
+        tensorboard_log=os.path.join(MODEL_DIR, "tensorboard_logs"),
+        verbose=1
+    )
+    
+    # Store the model parameters before loading for comparison
+    rl_model_init_params = str(rl_model.policy)
+    rl_loaded_successfully = False
+    
+    # Try to load existing RL model
+    if os.path.exists(LATEST_MODEL_PATH):
+        print(f"Found RL model file at {LATEST_MODEL_PATH} - Attempting to load...")
+        try:
+            # Verify file integrity
+            if os.path.getsize(LATEST_MODEL_PATH) == 0:
+                raise ValueError("RL model file is empty (0 bytes)")
             
-            # Log progress occasionally
-            if frame_counter % 100 == 0:
-                print(f"RL training - Frame {frame_counter}, Epsilon: {epsilon:.4f}, Loss: {rl_loss:.6f}")
-        
-        # Track RL episodes and save model periodically
-        if done:
-            rl_episodes += 1
-            rewards_history.append(env.total_reward)
-            avg_reward = np.mean(rewards_history[-10:]) if rewards_history else 0
-            print(f"RL Episode {rl_episodes} completed, reward: {env.total_reward:.2f}, avg reward: {avg_reward:.2f}")
+            # Record file stats for diagnostics
+            file_stats = f"File size: {os.path.getsize(LATEST_MODEL_PATH)} bytes, " \
+                        f"Modified: {datetime.datetime.fromtimestamp(os.path.getmtime(LATEST_MODEL_PATH))}"
+            print(f"RL model file stats: {file_stats}")
             
-            # Save model periodically
-            if rl_episodes % 10 == 0:
-                torch.save(model.state_dict(), f"tempest_model_ep{rl_episodes}.pt")
+            # Try to load the zip file contents for diagnostics
+            try:
+                import zipfile
+                with zipfile.ZipFile(LATEST_MODEL_PATH, 'r') as zip_ref:
+                    print(f"RL model zip contents: {', '.join(zip_ref.namelist())}")
+            except Exception as zip_error:
+                print(f"Warning: Could not inspect zip contents: {zip_error}")
+            
+            # Attempt to load model with error handling
+            start_time = time.time()
+            loaded_model = DQN.load(LATEST_MODEL_PATH, env=env)
+            
+            # Validate the loaded model by checking a few expected attributes
+            expected_attrs = ['policy', 'replay_buffer', 'observation_space', 'action_space']
+            for attr in expected_attrs:
+                if not hasattr(loaded_model, attr):
+                    raise ValueError(f"Loaded model missing expected attribute: {attr}")
+            
+            load_time = time.time() - start_time
+            print(f"Successfully loaded RL model from {LATEST_MODEL_PATH} in {load_time:.2f} seconds")
+            
+            # Replace our model with the loaded one
+            rl_model = loaded_model
+            
+            # Compare model architecture before and after loading
+            rl_model_loaded_params = str(rl_model.policy)
+            is_architecture_same = rl_model_init_params.split('\n')[0] == rl_model_loaded_params.split('\n')[0]
+            print(f"Model architecture unchanged: {is_architecture_same}")
+            
+            rl_loaded_successfully = True
+            write_diagnostic_info("RL model loaded successfully", model_path=LATEST_MODEL_PATH)
+            
+        except Exception as e:
+            print(f"ERROR loading RL model: {e}")
+            import traceback
+            traceback.print_exc()
+            write_diagnostic_info("Failed to load RL model", error=e, model_path=LATEST_MODEL_PATH)
+            print("Using fresh RL model due to loading error")
+            # Continue with the initial model
+    else:
+        print(f"No existing RL model found at {LATEST_MODEL_PATH}, starting fresh")
+        write_diagnostic_info("No RL model file found - starting with new model")
     
-    # Map the action to a string command
-    action_str = ACTION_MAP[action]
+    # Set up callbacks
+    rl_model.set_env(env)
+    callbacks = [checkpoint_callback, save_signal_callback]
     
-    # Log the action (for debugging) - simplified to reduce console spam
-    if frame_counter % 30 == 0:
-        mode_str = "Attract (BC)" if is_attract else "Play (RL)"
-        print(f"Frame {frame_counter}: [{mode_str}] Action: {action_str}, Reward: {reward:.2f}")
+    # Add a version timestamp to the model to track when it was initialized/loaded
+    save_signal_callback.model = rl_model
+    rl_model.model_version = MODEL_VERSION
+    rl_model.model_timestamp = datetime.datetime.now().isoformat()
     
-    return action_str
+    # Save metadata for debugging - create a readable file with model info
+    try:
+        metadata_file = os.path.join(MODEL_DIR, "model_metadata.txt")
+        with open(metadata_file, "w") as f:
+            f.write(f"Model Metadata - Generated: {datetime.datetime.now().isoformat()}\n")
+            f.write(f"Model Version: {MODEL_VERSION}\n")
+            f.write(f"RL Model Path: {LATEST_MODEL_PATH}\n")
+            f.write(f"BC Model Path: {BC_MODEL_PATH}\n")
+            f.write(f"RL Model Loaded Successfully: {rl_loaded_successfully}\n")
+            f.write(f"BC Model Loaded Successfully: {bc_loaded_successfully}\n")
+            f.write(f"RL Policy: {str(rl_model.policy)}\n")
+            f.write(f"BC Model: {str(bc_model)}\n")
+        print(f"Model metadata written to {metadata_file}")
+    except Exception as metadata_error:
+        print(f"Warning: Could not write model metadata: {metadata_error}")
+    
+    # Final status summary
+    print("\n===== MODEL STATUS SUMMARY =====")
+    print(f"BC Model: {'Loaded from file' if bc_loaded_successfully else 'New instance'}")
+    print(f"RL Model: {'Loaded from file' if rl_loaded_successfully else 'New instance'}")
+    print("===============================\n")
+    
+    return env, bc_model, rl_model, save_signal_callback
 
 def main():
     """
     Main function that handles the communication with Lua and processes game frames.
     """
-    print("Python AI model starting with bidirectional BC/RL knowledge transfer...")
+    global shutdown_requested
     
-    # Initialize the environment
-    env.reset()
+    print("Python AI model starting with bidirectional BC/RL knowledge transfer using Stable Baselines3...")
+    print(f"Models will be saved to directory: {MODEL_DIR}")
     
-    # Load a previously saved model if it exists
-    model_path = "tempest_model_final.pt"
-    if os.path.exists(model_path):
-        try:
-            model.load_state_dict(torch.load(model_path))
-            print(f"Loaded existing model from {model_path}")
-        except Exception as e:
-            print(f"Failed to load model: {e}")
+    # Print information about directory access
+    try:
+        if os.path.exists(MODEL_DIR):
+            print(f"Model directory exists: {MODEL_DIR}")
+            
+            # Check if directory is writable
+            if os.access(MODEL_DIR, os.W_OK):
+                print("Model directory is writable")
+                
+                # Try creating a test file
+                test_file = os.path.join(MODEL_DIR, "write_test.txt")
+                try:
+                    with open(test_file, "w") as f:
+                        f.write("Write test")
+                    print(f"Successfully created test file: {test_file}")
+                    os.remove(test_file)
+                    print("Successfully removed test file")
+                except Exception as e:
+                    print(f"ERROR: Could not write test file: {e}")
+            else:
+                print("WARNING: Model directory is NOT writable!")
+        else:
+            print(f"WARNING: Model directory does not exist: {MODEL_DIR}")
+            try:
+                os.makedirs(MODEL_DIR, exist_ok=True)
+                print(f"Created directory: {MODEL_DIR}")
+            except Exception as e:
+                print(f"ERROR: Could not create model directory: {e}")
+    except Exception as e:
+        print(f"ERROR checking directory access: {e}")
+
+    # Initialize models and environment
+    env, bc_model, rl_model, save_signal_callback = initialize_models()
     
-    # Create the pipes (same as before)
+    # Create a custom replay buffer for mixed BC and RL transitions
+    custom_buffer = CustomReplayBuffer(capacity=100000)
+    
+    # Stats tracking
+    bc_episodes = 0
+    rl_episodes = 0
+    bc_losses = []
+    rewards_history = []
+    
+    # Track mode transitions for logging
+    last_mode_was_attract = True
+    mode_transitions = 0
+    
+    # Create the pipes
     for pipe_path in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
         try:
             if os.path.exists(pipe_path):
@@ -493,8 +850,10 @@ def main():
                 frame_count = 0
                 last_frame_time = time.time()
                 fps = 0
+                last_save_time = time.time()
+                save_interval = 300  # Save every 5 minutes
 
-while True:
+                while True:
                     try:
                         # Read from pipe
                         data = lua_to_py.read()
@@ -509,13 +868,107 @@ while True:
                             print("Error processing frame data, skipping frame")
                             continue
                         
-                        processed_data, frame_counter, reward, game_action, is_attract, done = result
+                        processed_data, frame_counter, reward, game_action, is_attract, done, save_signal = result
                         
-                        # Get the action from the AI model
-                        action = ai_model(processed_data, frame_counter, reward, game_action, is_attract, done)
+                        # Update the environment state
+                        env.update_state(processed_data, reward, game_action, done)
+                        env.is_attract_mode = is_attract
+                        
+                        # Detect mode transition
+                        if is_attract != last_mode_was_attract:
+                            mode_transitions += 1
+                            print(f"\n*** MODE TRANSITION #{mode_transitions}: {'Attract → Play' if not is_attract else 'Play → Attract'} ***")
+                            print(f"Frame: {frame_counter}, Is Attract: {is_attract}, Game Action: {game_action}")
+                            last_mode_was_attract = is_attract
+                        
+                        # Process save signal
+                        if save_signal:
+                            print("\n" + "!" * 50)
+                            print("!!! SAVE SIGNAL RECEIVED FROM LUA !!!")
+                            print("!" * 50 + "\n")
+                            
+                            # If this is a shutdown signal, set the flag
+                            if done or frame_counter % 100 == 99:  # Simple heuristic to detect shutdown
+                                shutdown_requested = True
+                                print("DETECTED POSSIBLE SHUTDOWN")
+                            
+                            # Set model reference on the callback if not already set
+                            if save_signal_callback.model is None:
+                                save_signal_callback.model = rl_model
+                            
+                            # Signal immediate save
+                            save_signal_callback.signal_save()
+                        
+                        # Different behavior based on mode
+                        if is_attract:
+                            # Behavioral Cloning mode
+                            if game_action is not None and game_action < 5:
+                                # Store transition for future mixed batches
+                                if env.prev_state is not None:
+                                    custom_buffer.add(env.prev_state, game_action, reward, processed_data, done, is_bc=True)
+                                
+                                # Learn from the game's action using BC
+                                loss = train_bc(bc_model, processed_data, game_action)
+                                bc_losses.append(loss)
+                                
+                                # Log progress occasionally
+                                if frame_count % 100 == 0:
+                                    print(f"BC training - Frame {frame_counter}, Action: {ACTION_MAP[game_action]}, Loss: {loss:.6f}")
+                                
+                                # In attract mode, use the game's action
+                                action = game_action
+                            else:
+                                action = random.randint(0, 4)
+                            
+                            # Track BC episodes
+                            if done:
+                                bc_episodes += 1
+                                avg_loss = np.mean(bc_losses[-100:]) if bc_losses else 0
+                                print(f"BC Episode {bc_episodes} completed, avg loss: {avg_loss:.6f}")
+                        else:
+                            # Reinforcement Learning mode
+                            # Add to SB3's replay buffer if we have a previous state
+                            if env.prev_state is not None:
+                                # Get action from policy
+                                action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
+                                action = action_tensor
+                                
+                                # Add to custom buffer for mixed learning
+                                custom_buffer.add(env.prev_state, action, reward, processed_data, done, is_bc=False)
+                                
+                                # Also add directly to SB3's buffer
+                                rl_model.replay_buffer.add(
+                                    np.array([env.prev_state]),
+                                    np.array([processed_data]),
+                                    np.array([[action]]),
+                                    np.array([reward]),
+                                    np.array([float(done)])
+                                )
+                            else:
+                                # First frame or after reset, get action from policy
+                                action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
+                                action = action_tensor
+                            
+                            # Train the model
+                            if len(rl_model.replay_buffer) > rl_model.learning_starts:
+                                rl_model._n_updates += 1
+                                # Train for a single gradient step
+                                rl_model.train(gradient_steps=1, batch_size=rl_model.batch_size)
+                            
+                            # Track RL episodes
+                            if done:
+                                rl_episodes += 1
+                                rewards_history.append(env.total_reward)
+                                avg_reward = np.mean(rewards_history[-10:]) if rewards_history else 0
+                                print(f"RL Episode {rl_episodes} completed, reward: {env.total_reward:.2f}, avg reward: {avg_reward:.2f}")
+                        
+                        # Convert action to string for sending back to Lua
+                        if isinstance(action, np.ndarray):
+                            action = action.item()
+                        action_str = ACTION_MAP[action]
                         
                         # Write the action back to Lua
-                        py_to_lua.write(action + "\n")
+                        py_to_lua.write(action_str + "\n")
                         py_to_lua.flush()
                         
                         # Calculate and display FPS occasionally
@@ -527,32 +980,64 @@ while True:
                             
                             # Log overall statistics
                             bc_loss = np.mean(bc_losses[-100:]) if bc_losses else 0
-                            rl_loss = np.mean(rl_losses[-100:]) if rl_losses else 0
                             print(f"Stats: {frame_count} frames, {fps:.1f} FPS, Mode transitions: {mode_transitions}")
                             print(f"       BC episodes: {bc_episodes}, BC loss: {bc_loss:.6f}")
-                            print(f"       RL episodes: {rl_episodes}, RL loss: {rl_loss:.6f}")
+                            print(f"       RL episodes: {rl_episodes}, Buffer size: {len(custom_buffer)}")
+                            print(f"       Model save locations: {MODEL_DIR}")
                     
                     except BlockingIOError:
                         # Expected in non-blocking mode
                         time.sleep(0.01)
-            continue
-
+                    
+                    except Exception as e:
+                        print(f"Error during frame processing: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
             finally:
+                print("Pipe connection ended - Performing emergency save before exit")
+                try:
+                    # Emergency save before exit
+                    rl_model.save(LATEST_MODEL_PATH)
+                    torch.save(bc_model.state_dict(), BC_MODEL_PATH)
+                    print(f"Emergency save completed to {MODEL_DIR}")
+                    
+                    # Write confirmation
+                    with open(os.path.join(MODEL_DIR, "emergency_save_confirmed.txt"), "w") as f:
+                        f.write(f"Emergency save completed at {datetime.datetime.now().isoformat()}")
+                except Exception as e:
+                    print(f"Failed emergency save: {e}")
+                
                 lua_to_py.close()
                 py_to_lua.close()
                 print("Pipes closed, reconnecting...")
         
         except KeyboardInterrupt:
             print("Interrupted by user")
+            # Final save before exit
+            try:
+                save_signal_callback.force_save = True
+                save_signal_callback._on_step()  # Force immediate save
+                print("Final keyboard interrupt save complete")
+            except Exception as e:
+                print(f"Error during keyboard interrupt save: {e}")
+                # Direct emergency save
+                rl_model.save(LATEST_MODEL_PATH.replace(".zip", "_error.zip"))
+                torch.save(bc_model.state_dict(), BC_MODEL_PATH.replace(".pt", "_error.pt"))
             break
         
         except Exception as e:
             print(f"Error: {e}")
+            # Try emergency save on unexpected error
+            try:
+                rl_model.save(LATEST_MODEL_PATH.replace(".zip", "_error.zip"))
+                torch.save(bc_model.state_dict(), BC_MODEL_PATH.replace(".pt", "_error.pt"))
+                print("Emergency save on error completed")
+            except Exception as save_error:
+                print(f"Emergency save failed: {save_error}")
             time.sleep(5)
     
     print("Python AI model shutting down")
-    # Save final model
-    torch.save(model.state_dict(), "tempest_model_final.pt")
 
 if __name__ == "__main__":
     # Set seed for reproducibility
