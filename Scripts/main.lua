@@ -76,6 +76,9 @@ local previous_level = 0
 local avg_score_per_frame = 0
 local AGGRESSION_DECAY = 0.99
 
+-- Declare a global variable to store the last reward state
+local LastRewardState = 0
+
 -- Function to calculate reward for the current frame
 local function calculate_reward(game_state, level_state, player_state)
     local reward = 0
@@ -87,6 +90,12 @@ local function calculate_reward(game_state, level_state, player_state)
     
     -- 2. Score reward: Add the score delta from the last frame
     local score_delta = player_state.score - previous_score
+    -- Debug output if score changes
+    if score_delta > 0 then
+        print("Score delta: " .. score_delta)
+    end
+    
+    -- Add score delta to reward
     reward = reward + score_delta
     
     -- 3. Level completion reward: 1000 * new level number when level increases
@@ -100,12 +109,15 @@ local function calculate_reward(game_state, level_state, player_state)
     avg_score_per_frame = avg_score_per_frame * AGGRESSION_DECAY + score_delta * (1 - AGGRESSION_DECAY)
     
     -- Add aggression bonus (scaled to be meaningful but not dominant)
-    -- Multiply by 10 to make it more significant
-    reward = reward + (avg_score_per_frame * 10)
+    -- You could multiply by 10 to make it more significant
+    reward = reward + (avg_score_per_frame)
     
     -- Update previous values for next frame
     previous_score = player_state.score
     previous_level = level_state.level_number
+    
+    -- Update the LastRewardState with the current reward
+    LastRewardState = reward
     
     return reward
 end
@@ -655,23 +667,47 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     table.insert(data, enemies_state.pulse_beat or 0)
     table.insert(data, enemies_state.pulsing or 0)
     
-    -- Calculate the reward for the current frame
-    local reward = calculate_reward(game_state, level_state, player_state)
+    -- Use LastRewardState which was already calculated in frame_callback
+    -- Don't calculate reward here again
     
     -- Serialize the data to a binary string
     local binary_data = ""
-    for _, value in ipairs(data) do
-        -- Apply offset encoding to handle negative values
-        local encoded_value = value + 32768
-        -- Assert that the encoded value is within the valid range for unsigned 16-bit integers
-        assert(encoded_value >= 0 and encoded_value <= 65535, "Encoded value out of range for unsigned 16-bit integer: " .. tostring(encoded_value))
-        binary_data = binary_data .. string.pack(">I2", encoded_value)  -- Pack as unsigned 16-bit integer
+    for i, value in ipairs(data) do
+        -- Special handling for score and other potentially large values
+        -- These values are already in the correct 16-bit range and don't need the offset
+        local score_indices = {9, 10} -- Indices of player score components
+        
+        -- Check if current index is one of the score indices
+        local is_score_index = false
+        for _, score_idx in ipairs(score_indices) do
+            if i == score_idx then
+                is_score_index = true
+                break
+            end
+        end
+        
+        if is_score_index then
+            -- For score components, don't add the offset - they're already proper 16-bit values
+            binary_data = binary_data .. string.pack(">I2", value)
+        else
+            -- For other values, apply offset encoding to handle negative values
+            local encoded_value = value + 32768
+            -- Check if the encoded value would overflow
+            if encoded_value > 65535 then
+                print("Warning: Value at index " .. i .. " is too large: " .. value)
+                encoded_value = 65535
+            elseif encoded_value < 0 then
+                print("Warning: Value at index " .. i .. " is too negative: " .. value)
+                encoded_value = 0
+            end
+            binary_data = binary_data .. string.pack(">I2", encoded_value)
+        end
     end
     
     -- Create out-of-band context information structure
     -- 1. Number of 32-bit values to follow (1 for now: just reward)
     -- 2. Current reward (64-bit double)
-    local oob_data = string.pack(">I4d", 1, reward)
+    local oob_data = string.pack(">I4d", 1, LastRewardState)
     
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
@@ -727,12 +763,12 @@ local function frame_callback()
         mem:write_direct_u8(0xCA6F, 0xEA)
         mem:write_direct_u8(0xCA70, 0xEA)
 
+        -- Calculate the reward for the current frame - do this ONCE per frame
+        local reward = calculate_reward(game_state, level_state, player_state)
+        
         -- Flatten and serialize the game state data
         local frame_data
         frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
-
-        -- Calculate the reward for the current frame
-        local reward = calculate_reward(game_state, level_state, player_state)
 
         -- Send the serialized data to the Python script and get the response
         local result = process_frame(frame_data)
@@ -784,7 +820,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Bytes Sent", total_bytes_sent},
         {"FPS", string.format("%.2f", current_fps)},
         {"Payload Size", num_values},
-        {"Reward", string.format("%.2f", reward or 0)}  -- Add reward to game metrics
+        {"Last Reward", string.format("%.2f", LastRewardState)}  -- Add last reward to game metrics
     }
     
     -- Print game metrics in 3 columns
