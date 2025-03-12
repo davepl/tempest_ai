@@ -350,6 +350,8 @@ function PlayerState:new()
     self.angle = 0
     self.superzapper_uses = 0
     self.superzapper_active = 0
+    self.player_depth = 0     -- New field for player depth along the tube
+    self.player_state = 0     -- New field for player state from $201
     self.shot_segments = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot segments
     self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot positions (depth)
     self.shot_count = 0
@@ -358,6 +360,8 @@ end
 
 function PlayerState:update(mem)
     self.position = mem:read_u8(0x0200)          -- Player position
+    self.player_state = mem:read_u8(0x0201)      -- Player state value at $201
+    self.player_depth = mem:read_u8(0x0202)      -- Player depth along the tube
     local status_flags = mem:read_u8(0x0005)     -- Status flags
     self.alive = (status_flags & 0x40) ~= 0 and 1 or 0  -- Bit 6 for alive status
 
@@ -576,21 +580,20 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Create a consistent data structure with fixed sizes
     local data = {}
     
-    -- Game state (7 values, including frame counter)
+    -- Game state (5 values, frame counter is now in OOB data)
     table.insert(data, game_state.gamestate)
     table.insert(data, game_state.game_mode)
     table.insert(data, game_state.countdown_timer)
     table.insert(data, game_state.credits)
     table.insert(data, game_state.p1_lives)
     table.insert(data, game_state.p1_level)
-    table.insert(data, game_state.frame_counter & 0xFFFF)  -- Lower 16 bits of frame counter
     
-    -- Player state (5 values + arrays)
+    -- Player state (5 values + arrays, score is now in OOB data)
     table.insert(data, player_state.position)
     table.insert(data, player_state.alive)
-    table.insert(data, player_state.score & 0xFFFF)  -- Lower 16 bits of score
-    table.insert(data, (player_state.score >> 16) & 0xFFFF)  -- Upper 16 bits of score
     table.insert(data, player_state.angle)
+    table.insert(data, player_state.player_state)  -- Add player state to serialized data 
+    table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
     table.insert(data, player_state.superzapper_uses)
     table.insert(data, player_state.superzapper_active)
     table.insert(data, player_state.shot_count)
@@ -670,35 +673,17 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Serialize the data to a binary string
     local binary_data = ""
     for i, value in ipairs(data) do
-        -- Special handling for score and other potentially large values
-        -- These values are already in the correct 16-bit range and don't need the offset
-        local score_indices = {9, 10} -- Indices of player score components
-        
-        -- Check if current index is one of the score indices
-        local is_score_index = false
-        for _, score_idx in ipairs(score_indices) do
-            if i == score_idx then
-                is_score_index = true
-                break
-            end
+        -- Apply offset encoding to handle negative values
+        local encoded_value = value + 32768
+        -- Check if the encoded value would overflow
+        if encoded_value > 65535 then
+            print("Warning: Value at index " .. i .. " is too large: " .. value)
+            encoded_value = 65535
+        elseif encoded_value < 0 then
+            print("Warning: Value at index " .. i .. " is too negative: " .. value)
+            encoded_value = 0
         end
-        
-        if is_score_index then
-            -- For score components, don't add the offset - they're already proper 16-bit values
-            binary_data = binary_data .. string.pack(">I2", value)
-        else
-            -- For other values, apply offset encoding to handle negative values
-            local encoded_value = value + 32768
-            -- Check if the encoded value would overflow
-            if encoded_value > 65535 then
-                print("Warning: Value at index " .. i .. " is too large: " .. value)
-                encoded_value = 65535
-            elseif encoded_value < 0 then
-                print("Warning: Value at index " .. i .. " is too negative: " .. value)
-                encoded_value = 0
-            end
-            binary_data = binary_data .. string.pack(">I2", encoded_value)
-        end
+        binary_data = binary_data .. string.pack(">I2", encoded_value)
     end
     
     -- Get current game action based on the active player control
@@ -721,9 +706,11 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     end
     
     -- Create out-of-band context information structure
-    -- Pack: reward (double), game_action (byte), game_mode (byte), done flag (byte)
+    -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
+    -- done flag (byte), frame_counter (uint32), score (uint32)
     local is_done = 0  -- We don't currently track if the game is done
-    local oob_data = string.pack(">IdBBB", 1, LastRewardState, game_action, game_state.game_mode, is_done)
+    local oob_data = string.pack(">IdBBBII", 1, LastRewardState, game_action, game_state.game_mode, 
+                                is_done, game_state.frame_counter, player_state.score)
     
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
@@ -862,6 +849,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Create player metrics in a more organized way for 3-column display
     local player_metrics = {
         {"Position", player_state.position .. " "},
+        {"State", string.format("0x%02X", player_state.player_state) .. " "},  -- Add player state to display with hex formatting
+        {"Depth", player_state.player_depth .. " "},  -- Add player depth to display
         {"Alive", player_state.alive .. " "},
         {"Score", player_state.score .. " "},
         {"Angle", player_state.angle .. " "},

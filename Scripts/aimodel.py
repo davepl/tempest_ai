@@ -176,7 +176,7 @@ def process_frame_data(data):
     Returns:
         tuple: (processed_data, frame_counter, reward, game_action, is_attract, done)
     """
-    if len(data) < 15:  # Header (4+8) + action (1) + mode (1) + done (1)
+    if len(data) < 23:  # Header (4+8) + action (1) + mode (1) + done (1) + frame_counter (4) + score (4)
         print(f"Warning: Data too small ({len(data)} bytes)")
         return None, 0, 0.0, None, False, False
     
@@ -187,14 +187,17 @@ def process_frame_data(data):
         game_action = struct.unpack(">B", data[12:13])[0]
         game_mode = struct.unpack(">B", data[13:14])[0]
         done = struct.unpack(">B", data[14:15])[0] != 0
+        frame_counter = struct.unpack(">I", data[15:19])[0]  # Extract 32-bit frame counter
+        score = struct.unpack(">I", data[19:23])[0]  # Extract 32-bit score
         
         # Debug output for game mode occasionally
         if random.random() < 0.01:  # Show debug info about 1% of the time
             print(f"Game Mode: 0x{game_mode:02X}, Is Attract Mode: {(game_mode & 0x80) == 0}")
             print(f"OOB Data: values={num_oob_values}, reward={reward:.2f}, action={game_action}, done={done}")
+            print(f"Frame Counter: {frame_counter}, Score: {score}")
         
-        # Calculate header size: 4 bytes for count + (num_oob_values * 8) bytes for values + 3 bytes for extra data
-        header_size = 4 + (num_oob_values * 8) + 3
+        # Calculate header size: 4 bytes for count + (num_oob_values * 8) bytes for values + 3 bytes for extra data + 8 bytes for frame_counter and score
+        header_size = 4 + (num_oob_values * 8) + 3 + 8
         
         # Extract game state data (everything after the header)
         game_data = data[header_size:]
@@ -210,9 +213,6 @@ def process_frame_data(data):
             value = value - 32768
             unpacked_data.append(value)
         
-        # Extract frame counter from the game state data
-        frame_counter = unpacked_data[6] if len(unpacked_data) > 6 else 0
-        
         # Normalize the data to -1 to 1 range for the neural network
         normalized_data = np.array([float(x) / 32767.0 if x > 0 else float(x) / 32768.0 for x in unpacked_data], dtype=np.float32)
         
@@ -223,6 +223,7 @@ def process_frame_data(data):
         if hasattr(process_frame_data, 'last_attract_mode') and process_frame_data.last_attract_mode != is_attract:
             print(f"ATTRACT MODE TRANSITION: {'Attract → Play' if not is_attract else 'Play → Attract'}")
             print(f"Game Mode: 0x{game_mode:02X}, Is Attract: {is_attract}")
+            print(f"Frame: {frame_counter}, Score: {score}")
         
         # Store for next comparison
         process_frame_data.last_attract_mode = is_attract
@@ -240,6 +241,8 @@ def process_frame_data(data):
     
     except Exception as e:
         print(f"Error processing frame data: {e}")
+        import traceback
+        traceback.print_exc()
         return None, 0, 0.0, None, False, False
 
 # Initialize static variable for process_frame_data
@@ -490,8 +493,8 @@ def main():
                 frame_count = 0
                 last_frame_time = time.time()
                 fps = 0
-                
-                while True:
+
+while True:
                     try:
                         # Read from pipe
                         data = lua_to_py.read()
@@ -532,8 +535,8 @@ def main():
                     except BlockingIOError:
                         # Expected in non-blocking mode
                         time.sleep(0.01)
-                        continue
-            
+            continue
+
             finally:
                 lua_to_py.close()
                 py_to_lua.close()
@@ -542,6 +545,7 @@ def main():
         except KeyboardInterrupt:
             print("Interrupted by user")
             break
+        
         except Exception as e:
             print(f"Error: {e}")
             time.sleep(5)
