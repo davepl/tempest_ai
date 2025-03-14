@@ -28,6 +28,11 @@
     - Tempest ROM set loaded in MAME.
 --]]
 
+-- Add the Scripts directory to Lua's package path
+package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
+-- Now require the module by name only (without path or extension)
+local update = require("update")
+
 local function clear_screen()
     io.write("\027[2J\027[H")
 end
