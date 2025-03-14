@@ -92,8 +92,15 @@ local function calculate_reward(game_state, level_state, player_state)
     local reward = 0
     
     -- 1. Survival reward: 0.01 point per frame for staying alive
+    -- 2. Death penalty: -100 points for dying (last multiple frames)
+    -- 3. Score reward: Add the score delta from the last frame
+    -- 4. Level completion reward: 1000 * new level number when level increases
+    -- 5. Aggression reward: Use weighted average of score per frame
+
     if player_state.alive == 1 then
         reward = reward + 0.01
+    else
+        reward = reward - 100
     end
     
     -- 2. Score reward: Add the score delta from the last frame
@@ -371,18 +378,17 @@ function PlayerState:new()
     self.SpinnerDelta = 0
     self.prevSpinnerAccum = 0
     self.inferredSpinnerDelta = 0
-    self.zap_fire_starts = 0
-    self.ZapFireNew = 0
     return self
 end
 
 function PlayerState:update(mem)
-   
     self.position = mem:read_u8(0x0200)          -- Player position
     self.player_state = mem:read_u8(0x0201)      -- Player state value at $201
     self.player_depth = mem:read_u8(0x0202)      -- Player depth along the tube
-    local status_flags = mem:read_u8(0x0005)     -- Status flags
-    self.alive = (status_flags & 0x40) ~= 0 and 1 or 0  -- Bit 6 for alive status
+    
+    -- Check if player state doesn't have the high bit set
+    -- When high bit is set (0x80), player is dead
+    self.alive = ((self.player_state & 0x80) == 0) and 1 or 0
 
     local function bcd_to_decimal(bcd)
         return ((bcd >> 4) * 10) + (bcd & 0x0F)
@@ -437,10 +443,6 @@ function PlayerState:update(mem)
     self.inferredSpinnerDelta = rawDelta
     self.SpinnerAccum = currentSpinnerAccum
     self.prevSpinnerAccum = currentSpinnerAccum
-    
-    -- Read other player state variables
-    self.zap_fire_starts = mem:read_u8(0x60D8)
-    self.ZapFireNew = mem:read_u8(0x004E)
 end
 
 -- **EnemiesState Class**
@@ -559,44 +561,66 @@ function Controls:new()
     self.port = manager.machine.ioport.ports[":IN0"]
     self.fire_field = self.port and self.port.fields["Fire"] or nil
     self.zap_field = self.port and self.port.fields["Superzapper"] or nil
-    self.left_field = self.port and self.port.fields["Left"] or nil
-    self.right_field = self.port and self.port.fields["Right"] or nil
-    -- Only track commanded states
+    -- Remove left_field and right_field
+    
+    -- Only track commanded states for fire and zap
     self.fire_commanded = 0
     self.zap_commanded = 0
-    self.left_commanded = 0
-    self.right_commanded = 0
+    -- Remove left_commanded and right_commanded
+    
+    -- Add spinner value to track 
+    self.spinner_delta = 0
     return self
 end
 
-function Controls:apply_action(action)
-    -- Reset all controls to 0
+function Controls:apply_action(action, game_state, player_state)
+    -- Reset all physical controls to 0
     if self.fire_field then self.fire_field:set_value(0) end
     if self.zap_field then self.zap_field:set_value(0) end
-    if self.left_field then self.left_field:set_value(0) end
-    if self.right_field then self.right_field:set_value(0) end
 
     -- Reset commanded states
     self.fire_commanded = 0
     self.zap_commanded = 0
-    self.left_commanded = 0
-    self.right_commanded = 0
 
-    -- Apply the selected action
-    if action == "fire" and self.fire_field then
-        self.fire_field:set_value(1)
-        self.fire_commanded = 1
-    elseif action == "zap" and self.zap_field then
-        self.zap_field:set_value(1)
-        self.zap_commanded = 1
-    elseif action == "left" and self.left_field then
-        self.left_field:set_value(1)
-        self.left_commanded = 1
-    elseif action == "right" and self.right_field then
-        self.right_field:set_value(1)
-        self.right_commanded = 1
+    -- Fix the attract mode check - bit 0x80 being CLEAR indicates attract mode
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    
+    if is_attract_mode then
+        -- In attract mode:
+        -- 1. Fire is always true
+        if self.fire_field then 
+            self.fire_field:set_value(1)
+            self.fire_commanded = 1
+            -- Debug output
+            if game_state.frame_counter % 60 == 0 then
+                print("Setting fire to true in attract mode")
+            end
+        end
+        
+        -- 2. Zap is always false (already set to 0 above)
+        
+        -- 3. Use inferred spinner delta
+        self.spinner_delta = player_state.inferredSpinnerDelta
+    else
+        -- In actual gameplay, reflect the actual player state
+        self.fire_commanded = player_state.fire_detected
+        self.zap_commanded = player_state.zap_detected
+        
+        -- For spinner, use the actual SpinnerDelta from memory
+        self.spinner_delta = player_state.SpinnerDelta
+        
+        -- Apply these values to the physical controls 
+        if self.fire_field then self.fire_field:set_value(self.fire_commanded) end
+        if self.zap_field then self.zap_field:set_value(self.zap_commanded) end
+        
+        -- In actual gameplay, we still want to apply the action from Python
+        -- This will override what we set above
+        if action == "fire" and self.fire_field then
+            self.fire_field:set_value(1)
+        elseif action == "zap" and self.zap_field then
+            self.zap_field:set_value(1)
+        end
     end
-    -- "none" results in no inputs being set to 1
 end
 
 -- Instantiate state objects
@@ -747,17 +771,14 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         binary_data = binary_data .. string.pack(">I2", encoded_value)
     end
     
-    -- Get current game action based on the active player control
+    -- Get current game action based on the active player control (remove left/right)
     local game_action = 4  -- Default to "none"
     if controls.fire_commanded == 1 then
         game_action = 0  -- "fire"
     elseif controls.zap_commanded == 1 then
         game_action = 1  -- "zap"
-    elseif controls.left_commanded == 1 then
-        game_action = 2  -- "left"
-    elseif controls.right_commanded == 1 then
-        game_action = 3  -- "right"
     end
+    -- Remove the left/right cases since we're using spinner delta directly
     
     -- Check if it's time to send a save signal
     local current_time = os.time()
@@ -813,7 +834,7 @@ local function frame_callback()
             enemies_state:update(mem)
             
             -- Update the display with empty controls
-            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, "none", num_values)
+            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, num_values)
             return true
         end
     end
@@ -891,7 +912,7 @@ local function frame_callback()
         total_bytes_sent = total_bytes_sent + #frame_data
 
         -- Use the action from Python if valid, otherwise use none
-        if result == "fire" or result == "zap" or result == "left" or result == "right" or result == "none" then
+        if result == "fire" or result == "zap" or result == "none" then
             action = result
         elseif result ~= "pipe error" and result ~= "write error" and result ~= "read error" and result ~= "timeout" then
             -- If Python returns an invalid action, use none
@@ -909,10 +930,10 @@ local function frame_callback()
     end
 
     -- Update the display with the current action and metrics
-    update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
+    update_display(status_message, game_state, level_state, player_state, enemies_state, nil, num_values, reward)
 
     -- Apply the action to MAME controls
-    controls:apply_action(action)
+    controls:apply_action(action, game_state, player_state)
 
     return true
 end
@@ -978,9 +999,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Zap Detected", player_state.zap_detected .. " "},
         {"SpinnerAccum", player_state.SpinnerAccum .. " "},
         {"SpinnerDelta", player_state.SpinnerDelta .. " "},
-        {"InferredDelta", player_state.inferredSpinnerDelta .. " "},
-        {"ZapFireNew", player_state.ZapFireNew .. " "},
-        {"ZapFireStarts", player_state.zap_fire_starts .. " "}
+        {"InferredDelta", player_state.inferredSpinnerDelta .. " "}
     }
     
     -- Print player metrics in 3 columns
@@ -1013,12 +1032,13 @@ function update_display(status, game_state, level_state, player_state, enemies_s
 
     -- Format and print player controls at row 14
     move_cursor_to_row(16)
+    -- Fix the attract mode check to match the one in Controls:apply_action
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
     local controls_metrics = {
         ["Fire"] = controls.fire_commanded,
         ["Superzapper"] = controls.zap_commanded,
-        ["Left"] = controls.left_commanded,
-        ["Right"] = controls.right_commanded,
-        ["Current Action"] = current_action or "none"
+        ["Spinner Delta"] = controls.spinner_delta,
+        ["Attract Mode"] = is_attract_mode and "Active" or "Inactive"
     }
     print(format_section("Player Controls", controls_metrics))
 
