@@ -1909,71 +1909,75 @@ loc9748:                rts
 
 ; handles player movement
 
-move_player:            lda     player_state
-                        bpl     loc974f
-                        rts
+move_player:            lda     player_state ; Check player's state (movement active or not)
+                        bpl     stillalive   ; If player_state >= 0 (active), proceed to movement
+                        rts                 ; If player_state < 0 (inactive, e.g. dying), exit (no movement)
 
-loc974f:                ldx     #$00
-                        lda     game_mode
-                        bmi     loc975b
-                        jsr     loc97c5
-                        clv
-                        bvc     loc9770
-loc975b:                lda     $50
-                        bpl     loc9768
-                        cmp     #-31
-                        bcs     loc9765
-                        lda     #-31
-loc9765:                clv
-                        bvc     loc976e
-loc9768:                cmp     #31
-                        bcc     loc976e
-                        lda     #31
-loc976e:                stx     $50
-loc9770:                sta     $2b
-                        eor     #$ff
-                        sec
-                        adc     $51
-                        sta     $2c
-                        ldx     open_level
-                        beq     loc979d
-                        cmp     #$f0
-                        bcc     loc9786
-                        lda     #$ef
-                        sta     $2c
-loc9786:                eor     $2b
-                        bpl     loc979d
-                        lda     $2c
-                        eor     $51
-                        bpl     loc979d
-                        lda     $51
-                        bmi     loc9799
-                        lda     #$00
-                        clv
-                        bvc     loc979b
-loc9799:                lda     #$ef
-loc979b:                sta     $2c
-loc979d:                lda     $2c
-                        lsr     a
-                        lsr     a
-                        lsr     a
-                        lsr     a
-                        sta     $2a
-                        clc
-                        adc     #$01
-                        and     #$0f
-                        sta     $2b
-                        lda     $2a
-                        cmp     player_seg
-                        beq     loc97b6
-                        jsr     locccb5
-loc97b6:                lda     $2a
-                        sta     player_seg
-                        lda     $2b
-                        sta     player_state
-                        lda     $2c
-                        sta     $51
-                        rts
+stillalive:             ldx     #$00        ; Clear index X (set to 0, used as a default value)
+                        lda     game_mode   ; Load current game mode (bit7 = attract mode flag)
+                        bmi     notattract   ; If attract mode (demo, bit7 set), skip direct input handling
+                        jsr     demoplay     ; Else (normal play), read and process player spinner input
+                        clv                 ; Clear overflow flag (prepare for consistent branching)
+                        bvc     applymove   ; Always branch (V=0) to apply movement (skip manual input section)
+
+notattract:             lda     $50         ; Load spinner movement delta (low byte at $50, signed)
+                        bpl     loc9768     ; If delta >= 0, skip negative clamping
+                        cmp     #-31        ; Compare delta with -31 (limit for max left turn speed)
+                        bcs     loc9765     ; If delta >= -31, within allowed range (no clamp needed)
+                        lda     #-31        ; If delta < -31, clamp delta to -31 (limit turn speed leftward)
+loc9765:                clv                 ; Clear overflow flag (for predictable branching)
+                        bvc     loc976e     ; Always branch (continue after handling negative clamp)
+loc9768:                cmp     #31         ; Compare delta with +31 (limit for max right turn speed)
+                        bcc     loc976e     ; If delta <= 30, within allowed range (no clamp needed)
+                        lda     #31         ; If delta > 30, clamp delta to +31 (limit turn speed rightward)
+loc976e:                stx     $50         ; Reset spinner delta ($50) to 0 now that we've captured it
+
+applymove:              sta     $2b         ; Save (clamped) delta into $2B (temp movement accumulator)
+                        eor     #$ff        ; A = A XOR $FF (invert delta bits to prepare for subtraction)
+                        sec                 ; Set carry (for two's complement addition of negative delta)
+                        adc     $51         ; Add previous position ($51) to -delta (effectively $51 - delta)
+                        sta     $2c         ; Store new player position into $2C (accumulated rotation value)
+                        ldx     open_level  ; Load open_level flag (non-zero if level has open ends)
+                        beq     loc979d     ; If level is closed (open_level = 0), skip open-end boundary checks
+                        cmp     #$f0        ; Compare new position to $F0 (240 dec, beyond max for open level)
+                        bcc     loc9786     ; If position < $F0, within allowed range (no upper clamp needed)
+                        lda     #$ef        ; If position >= $F0, clamp to $EF (239, max allowed on open level)
+                        sta     $2c         ; Store the clamped position back to $2C
+loc9786:                eor     $2b         ; XOR new position with delta to check for crossing end boundaries
+                        bpl     loc979d     ; If result >= 0, no wrap-around across ends; skip adjustment
+                        lda     $2c         ; Otherwise, prepare to adjust for boundary crossing
+                        eor     $51         ; XOR new position with old position to detect end-to-end wrap
+                        bpl     loc979d     ; If result >= 0, no end-to-end crossing; skip further adjustment
+                        lda     $51         ; Load old position again to determine crossing direction
+                        bmi     loc9799     ; If old position was >= $80, crossed high->low end
+                        lda     #$00        ; Else old position was < $80, crossed low->high end; set pos to 0
+                        clv                 ; Clear overflow flag
+                        bvc     loc979b     ; Always branch (continue to set final boundary position)
+loc9799:                lda     #$ef        ; Crossing from high end to low end: set position to $EF (max)
+loc979b:                sta     $2c         ; Store adjusted position after open-end wrap-around correction
+
+loc979d:                lda     $2c         ; Load final position value
+                        lsr     a           ; Shift right (divide position by 2)
+                        lsr     a           ; Shift right (divide by 4)
+                        lsr     a           ; Shift right (divide by 8)
+                        lsr     a           ; Shift right (divide by 16) (now A = base segment index)
+                        sta     $2a         ; Store base segment index (0-15) into $2A
+                        clc                 ; Clear carry for next addition
+                        adc     #$01        ; Add 1 to segment index (offset by one for internal use)
+                        and     #$0f        ; Mask to 0x0F (wrap within 0-15 range)
+                        sta     $2b         ; Store adjusted segment index into $2B (new player state)
+                        lda     $2a         ; Load base segment index
+                        cmp     player_seg  ; Compare with current player segment
+                        beq     loc97b6     ; If segment hasn't changed, skip visual update
+                        jsr     locccb5     ; If segment changed, update player orientation/graphics
+loc97b6:                lda     $2a         ; Load new segment index
+                        sta     player_seg  ; Update player's current segment
+                        lda     $2b         ; Load new player state (segment offset)
+                        sta     player_state ; Update player_state for next frame
+                        lda     $2c         ; Load new position accumulator
+                        sta     $51         ; Update saved spinner position ($51) for next movement
+                        rts                 ; Return from move_player (movement processing complete)
+
 
 ; Find extant enemy which is highest up the tube.  Return -9 or 9 depending
 ; on which way we need to go to get to it, or -1 if there is no such enemy,
@@ -1982,7 +1986,7 @@ loc97b6:                lda     $2a
 ; Likely important for attact mode where the automated shooter always 
 ; moves to shoot the enemy furthest up the tube
 
-loc97c5:                lda     #$ff
+demoplay:               lda     #$ff
                         sta     $29
                         sta     $2a
                         ldx     MaxActiveEnemies
@@ -8575,7 +8579,7 @@ locc901:                lda     zap_fire_new
                         and     #$80
                         beq     locc90b
                         lda     #$00
-                        sta     zap_fire_new
+                        sta     zap_fire_new  ; Clear zap_fire_new
 locc90b:                rts
 
 State_GameStartup:      jsr     maybe_init_hs

@@ -359,10 +359,14 @@ function PlayerState:new()
     self.shot_segments = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot segments
     self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot positions (depth)
     self.shot_count = 0
+    self.debounce = 0
+    self.spinnerPos = 0
+    self.spinnerCurrent = 0
     return self
 end
 
 function PlayerState:update(mem)
+   
     self.position = mem:read_u8(0x0200)          -- Player position
     self.player_state = mem:read_u8(0x0201)      -- Player state value at $201
     self.player_depth = mem:read_u8(0x0202)      -- Player depth along the tube
@@ -373,6 +377,8 @@ function PlayerState:update(mem)
         return ((bcd >> 4) * 10) + (bcd & 0x0F)
     end
 
+    -- Extract the score from the BCD value in memory
+    
     local score_low = bcd_to_decimal(mem:read_u8(0x0040))
     local score_mid = bcd_to_decimal(mem:read_u8(0x0041))
     local score_high = bcd_to_decimal(mem:read_u8(0x0042))
@@ -401,6 +407,11 @@ function PlayerState:update(mem)
     -- Update SpinnerAccum and SpinnerDelta from memory
     self.SpinnerAccum = mem:read_u8(0x0051)
     self.SpinnerDelta = mem:read_u8(0x0050)
+
+    -- Read new fields
+    self.debounce = mem:read_u8(0x004D)
+    self.spinnerPos = mem:read_u8(0x0050)
+    self.spinnerCurrent = mem:read_u8(0x0051)
 end
 
 -- **EnemiesState Class**
@@ -741,6 +752,8 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
 end
 
 -- Update the frame_callback function to track bytes sent and calculate FPS
+local frame_counter = 0
+
 local function frame_callback()
     -- Declare num_values at the start of the function
     local num_values = 0
@@ -757,9 +770,16 @@ local function frame_callback()
             
             -- Update the display with empty controls
             update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, "none", num_values)
-            return
+            return true
         end
     end
+
+    -- Reset the countdown timer to zero all the time
+    mem:write_u8(0x0004, 0)
+
+    -- NOP out the jump that skips scoring in attract mode
+    mem:write_direct_u8(0xCA6F, 0xEA)
+    mem:write_direct_u8(0xCA70, 0xEA)
     
     -- Update all state objects
     game_state:update(mem)
@@ -781,9 +801,14 @@ local function frame_callback()
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
 
+        -- NOP out the jump that skips scoring in attract mode
         mem:write_direct_u8(0xCA6F, 0xEA)
         mem:write_direct_u8(0xCA70, 0xEA)
 
+        -- NOP out the clearing of zap_fire_new
+        mem:write_direct_u8(0x976E, 0x00)
+        mem:write_direct_u8(0x976F, 0x00)
+        
         -- Calculate the reward for the current frame - do this ONCE per frame
         local reward = calculate_reward(game_state, level_state, player_state)
         
@@ -844,6 +869,8 @@ local function frame_callback()
 
     -- Apply the action to MAME controls
     controls:apply_action(action)
+
+    return true
 end
 
 -- Update the update_display function to show total bytes sent and FPS
@@ -895,15 +922,14 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Create player metrics in a more organized way for 3-column display
     local player_metrics = {
         {"Position", player_state.position .. " "},
-        {"State", string.format("0x%02X", player_state.player_state) .. " "},  -- Add player state to display with hex formatting
-        {"Depth", player_state.player_depth .. " "},  -- Add player depth to display
+        {"State", string.format("0x%02X", player_state.player_state) .. " "},
+        {"Depth", player_state.player_depth .. " "},
         {"Alive", player_state.alive .. " "},
         {"Score", player_state.score .. " "},
         {"Szapper Uses", player_state.superzapper_uses .. " "},
         {"Szapper Active", player_state.superzapper_active .. " "},
         {"Shot Count", player_state.shot_count .. " "},
-        {"SpinnerAccum", player_state.SpinnerAccum .. " "},
-        {"SpinnerDelta", player_state.SpinnerDelta .. " "}
+        {"Debounce", player_state.debounce .. " "}
     }
     
     -- Print player metrics in 3 columns
@@ -937,11 +963,13 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Format and print player controls at row 14
     move_cursor_to_row(13)
     local controls_metrics = {
-        ["Current Action"] = current_action or "none",
-        ["Fire"] = (current_action == "fire") and "ACTIVE" or "inactive",
-        ["Superzapper"] = (current_action == "zap") and "ACTIVE" or "inactive",
-        ["Left"] = (current_action == "left") and "ACTIVE" or "inactive",
-        ["Right"] = (current_action == "right") and "ACTIVE" or "inactive"
+        ["Debounce"] = player_state.debounce,
+        ["Fire"] = (player_state.debounce & 0x10) ~= 0 and "1" or "0",
+        ["Superzapper"] = (player_state.debounce & 0x08) ~= 0 and "1" or "0",
+        ["Spinner Position"] = player_state.spinnerPos,
+        ["Spinner Current"] = player_state.spinnerCurrent,
+        ["Spinner Accum"] = player_state.SpinnerAccum,
+        ["Spinner Delta"] = player_state.SpinnerDelta
     }
     print(format_section("Player Controls", controls_metrics))
 
@@ -1078,8 +1106,8 @@ end
 start_python_script()
 clear_screen()
 
--- Register the frame callback with MAME
-emu.register_frame(frame_callback)
+-- Register the frame callback with MAME.  Keep a reference to the callback or it will be garbage collected
+callback_ref = emu.add_machine_frame_notifier(frame_callback)
 
 -- Register the shutdown callback
 emu.register_stop(on_mame_exit)
