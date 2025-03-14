@@ -95,7 +95,7 @@ local function calculate_reward(game_state, level_state, player_state)
     local score_delta = player_state.score - previous_score
     -- Debug output if score changes
     if score_delta > 0 then
-        print("Score delta: " .. score_delta)
+        -- print("Score delta: " .. score_delta)
     end
     
     -- Add score delta to reward
@@ -360,8 +360,14 @@ function PlayerState:new()
     self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}  -- 8 shot positions (depth)
     self.shot_count = 0
     self.debounce = 0
-    self.spinnerPos = 0
-    self.spinnerCurrent = 0
+    self.fire_detected = 0
+    self.zap_detected = 0
+    self.SpinnerAccum = 0
+    self.SpinnerDelta = 0
+    self.prevSpinnerAccum = 0
+    self.inferredSpinnerDelta = 0
+    self.zap_fire_starts = 0
+    self.ZapFireNew = 0
     return self
 end
 
@@ -404,14 +410,32 @@ function PlayerState:update(mem)
         end
     end
 
-    -- Update SpinnerAccum and SpinnerDelta from memory
-    self.SpinnerAccum = mem:read_u8(0x0051)
-    self.SpinnerDelta = mem:read_u8(0x0050)
-
-    -- Read new fields
+    -- Update detected input states
     self.debounce = mem:read_u8(0x004D)
-    self.spinnerPos = mem:read_u8(0x0050)
-    self.spinnerCurrent = mem:read_u8(0x0051)
+    self.fire_detected = (self.debounce & 0x10) ~= 0 and 1 or 0
+    self.zap_detected = (self.debounce & 0x08) ~= 0 and 1 or 0
+    
+    -- Store previous spinner position
+    local currentSpinnerAccum = mem:read_u8(0x0051)
+    self.SpinnerDelta = mem:read_u8(0x0050)
+    
+    -- Calculate inferred delta by comparing with previous position
+    local rawDelta = currentSpinnerAccum - self.prevSpinnerAccum
+    
+    -- Handle 8-bit wrap-around
+    if rawDelta > 127 then
+        rawDelta = rawDelta - 256
+    elseif rawDelta < -128 then
+        rawDelta = rawDelta + 256
+    end
+    
+    self.inferredSpinnerDelta = rawDelta
+    self.SpinnerAccum = currentSpinnerAccum
+    self.prevSpinnerAccum = currentSpinnerAccum
+    
+    -- Read other player state variables
+    self.zap_fire_starts = mem:read_u8(0x60D8)
+    self.ZapFireNew = mem:read_u8(0x004E)
 end
 
 -- **EnemiesState Class**
@@ -532,6 +556,11 @@ function Controls:new()
     self.zap_field = self.port and self.port.fields["Superzapper"] or nil
     self.left_field = self.port and self.port.fields["Left"] or nil
     self.right_field = self.port and self.port.fields["Right"] or nil
+    -- Only track commanded states
+    self.fire_commanded = 0
+    self.zap_commanded = 0
+    self.left_commanded = 0
+    self.right_commanded = 0
     return self
 end
 
@@ -542,15 +571,25 @@ function Controls:apply_action(action)
     if self.left_field then self.left_field:set_value(0) end
     if self.right_field then self.right_field:set_value(0) end
 
+    -- Reset commanded states
+    self.fire_commanded = 0
+    self.zap_commanded = 0
+    self.left_commanded = 0
+    self.right_commanded = 0
+
     -- Apply the selected action
     if action == "fire" and self.fire_field then
         self.fire_field:set_value(1)
+        self.fire_commanded = 1
     elseif action == "zap" and self.zap_field then
         self.zap_field:set_value(1)
+        self.zap_commanded = 1
     elseif action == "left" and self.left_field then
         self.left_field:set_value(1)
+        self.left_commanded = 1
     elseif action == "right" and self.right_field then
         self.right_field:set_value(1)
+        self.right_commanded = 1
     end
     -- "none" results in no inputs being set to 1
 end
@@ -705,13 +744,13 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     
     -- Get current game action based on the active player control
     local game_action = 4  -- Default to "none"
-    if controls and controls.fire_field and controls.fire_field.pressed then
+    if controls.fire_commanded == 1 then
         game_action = 0  -- "fire"
-    elseif controls and controls.zap_field and controls.zap_field.pressed then
+    elseif controls.zap_commanded == 1 then
         game_action = 1  -- "zap"
-    elseif controls and controls.left_field and controls.left_field.pressed then
+    elseif controls.left_commanded == 1 then
         game_action = 2  -- "left"
-    elseif controls and controls.right_field and controls.right_field.pressed then
+    elseif controls.right_commanded == 1 then
         game_action = 3  -- "right"
     end
     
@@ -897,7 +936,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     
     -- Print game metrics in 3 columns
     print("--[ Game State ]--------------------------------------")
-    local col_width = 25  -- Width for each column
+    local col_width = 35  -- Width for each column
     
     -- Calculate how many rows we need (ceiling of items/3)
     local rows = math.ceil(#game_metrics / 3)
@@ -929,7 +968,14 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Szapper Uses", player_state.superzapper_uses .. " "},
         {"Szapper Active", player_state.superzapper_active .. " "},
         {"Shot Count", player_state.shot_count .. " "},
-        {"Debounce", player_state.debounce .. " "}
+        {"Debounce", player_state.debounce .. " "},
+        {"Fire Detected", player_state.fire_detected .. " "},
+        {"Zap Detected", player_state.zap_detected .. " "},
+        {"SpinnerAccum", player_state.SpinnerAccum .. " "},
+        {"SpinnerDelta", player_state.SpinnerDelta .. " "},
+        {"InferredDelta", player_state.inferredSpinnerDelta .. " "},
+        {"ZapFireNew", player_state.ZapFireNew .. " "},
+        {"ZapFireStarts", player_state.zap_fire_starts .. " "}
     }
     
     -- Print player metrics in 3 columns
@@ -961,20 +1007,18 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print player controls at row 14
-    move_cursor_to_row(13)
+    move_cursor_to_row(16)
     local controls_metrics = {
-        ["Debounce"] = player_state.debounce,
-        ["Fire"] = (player_state.debounce & 0x10) ~= 0 and "1" or "0",
-        ["Superzapper"] = (player_state.debounce & 0x08) ~= 0 and "1" or "0",
-        ["Spinner Position"] = player_state.spinnerPos,
-        ["Spinner Current"] = player_state.spinnerCurrent,
-        ["Spinner Accum"] = player_state.SpinnerAccum,
-        ["Spinner Delta"] = player_state.SpinnerDelta
+        ["Fire"] = controls.fire_commanded,
+        ["Superzapper"] = controls.zap_commanded,
+        ["Left"] = controls.left_commanded,
+        ["Right"] = controls.right_commanded,
+        ["Current Action"] = current_action or "none"
     }
     print(format_section("Player Controls", controls_metrics))
 
     -- Format and print level state in 3 columns
-    move_cursor_to_row(34)
+    move_cursor_to_row(23)
     
     -- Print level metrics in 3 columns
     print("--[ Level State ]-------------------------------------")
@@ -1023,7 +1067,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print enemies state at row 31
-    move_cursor_to_row(20)
+    move_cursor_to_row(28)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -1053,7 +1097,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
 
     print(format_section("Enemies State", enemies_metrics))
 
-    move_cursor_to_row(30)  -- Move Enemy Segments display up one line   
+    -- move_cursor_to_row(40)  -- Move Enemy Segments display up one line   
     -- Add enemy segments and depths on their own lines
     print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
