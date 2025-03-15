@@ -893,6 +893,10 @@ local function frame_callback()
     mem:write_direct_u8(0xCA6F, 0xEA)
     mem:write_direct_u8(0xCA70, 0xEA)
     
+    -- Increase the maximum level for demo mode
+    mem:write_direct_u8(0x9196, 0x3F)
+
+
     -- Update all state objects
     game_state:update(mem)
     level_state:update(mem)
@@ -908,6 +912,12 @@ local function frame_callback()
         -- Write 0 to memory location 4
         mem:write_u8(0x0004, 0)
         game_state.countdown_timer = 0
+    end
+
+    -- When the game zooms down the tube, reset lives to 5
+
+    if game_state.gamestate == 0x20 then
+        mem:write_direct_u8(0x0048, 0x05)
     end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
