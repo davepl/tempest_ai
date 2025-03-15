@@ -601,8 +601,11 @@ def initialize_models():
         except Exception as backup_error:
             print(f"Warning: Could not create backups: {backup_error}")
     
-    # Initialize the BC model
-    bc_model = BCModel(input_size=246)
+    # Check if MPS is available and set the device
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    print(f"Using device: {device}")
+    # Initialize the BC model and move it to the device
+    bc_model = BCModel(input_size=246).to(device)
     bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     bc_loaded_successfully = False
     
@@ -1236,6 +1239,10 @@ if __name__ == "__main__":
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
+    if torch.backends.mps.is_available():
+        print("MPS is available")
+    else:
+        print("MPS is not available")
     main()
         
 

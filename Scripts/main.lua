@@ -204,10 +204,10 @@ local function start_python_script()
     -- Comment these out if you're trying to debug the Python side...
 
     -- Kill any existing Python script instances
-    -- os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
+    os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
     
     -- Remove existing pipes to ensure clean state
-    -- os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
+    os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
     
     -- Launch Python script in the background with proper error handling
     local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
@@ -917,7 +917,7 @@ local function frame_callback()
     -- When the game zooms down the tube, reset lives to 5
 
     if game_state.gamestate == 0x20 then
-        mem:write_direct_u8(0x0048, 0x05)
+        -- mem:write_direct_u8(0x0048, 0x05)
     end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
