@@ -923,6 +923,9 @@ local function frame_callback()
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
 
+        -- Set lives to an eternal 5
+        mem:write_direct_u8(0x0048, 0x05)
+
         -- NOP out the jump that skips scoring in attract mode
         mem:write_direct_u8(0xCA6F, 0xEA)
         mem:write_direct_u8(0xCA70, 0xEA)
