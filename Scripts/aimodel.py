@@ -29,6 +29,7 @@ from stable_baselines3.common.buffers import ReplayBuffer as SB3ReplayBuffer
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 import datetime
+import torch.nn.functional as F
 
 # Define global shutdown tracking variable
 shutdown_requested = False
@@ -37,14 +38,6 @@ shutdown_requested = False
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
 
-# Define action mapping
-ACTION_MAP = {
-    0: "fire",
-    1: "zap",
-    2: "left",
-    3: "right",
-    4: "none"
-}
 
 # Create a directory for model checkpoints
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -256,25 +249,16 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
 device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 class BCModel(nn.Module):
-    def __init__(self, input_size=246, output_size=1024):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, output_size)
-        ).to(device)  # Move the entire model to the device
-    
+    def __init__(self, input_size=246, output_size=3):
+        super(BCModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, output_size)
+
     def forward(self, x):
-        return self.model(x)
-    
-    def predict(self, state):
-        with torch.no_grad():
-            logits = self.forward(torch.FloatTensor(state).to(device))
-            return logits.argmax().item()
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
 
 # Custom callback for saving the model with compatibility patches
 class SaveOnSignalCallback(BaseCallback):
@@ -648,8 +632,8 @@ def initialize_models():
             test_input = torch.zeros(1, 246, dtype=torch.float32)
             with torch.no_grad():
                 test_output = bc_model(test_input)
-                if test_output.shape != (1, 1024):
-                    raise ValueError(f"Model produced incorrect output shape: {test_output.shape}, expected (1, 1024)")
+                if test_output.shape != (1, 3):
+                    raise ValueError(f"Model produced incorrect output shape: {test_output.shape}, expected (1, 3)")
             
             bc_loaded_successfully = True
             write_diagnostic_info(f"BC model loaded successfully", model_path=BC_MODEL_PATH)
