@@ -128,14 +128,15 @@ class TempestEnv(gym.Env):
     def __init__(self):
         super().__init__()
         
-        # Define action space: fire, zap, left, right, none
-        self.action_space = spaces.Discrete(5)
+        # Update action space to be a single Discrete space
+        # two bits for fire and zap and 8 bits for spinner delta, 10 bits, 1024 possible values
+        self.action_space = spaces.Discrete(1024)  # 2 * 2 * 256 = 1024 possible actions
         
-        # Define observation space - 243 features based on game state
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(243,), dtype=np.float32)
+        # Define observation space - 243 features based on game state + 3 for player inputs
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(246,), dtype=np.float32)
         
         # Initialize state
-        self.state = np.zeros(243, dtype=np.float32)
+        self.state = np.zeros(246, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.info = {}
@@ -150,7 +151,7 @@ class TempestEnv(gym.Env):
         """Reset the environment to start a new episode."""
         super().reset(seed=seed)
         
-        self.state = np.zeros(243, dtype=np.float32)
+        self.state = np.zeros(246, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.episode_step = 0
@@ -163,6 +164,12 @@ class TempestEnv(gym.Env):
         """
         Take a step in the environment using the given action.
         """
+        # Decode the action
+        fire, zap, spinner_delta = decode_action(action)
+        
+        # Use the decoded actions as needed
+        # For example, update the environment state or perform actions in the game
+        
         self.episode_step += 1
         self.total_reward += self.reward
         
@@ -170,7 +177,7 @@ class TempestEnv(gym.Env):
         truncated = self.episode_step >= 10000  # Episode too long
         
         self.info = {
-            "action_taken": ACTION_MAP[action],
+            "action_taken": (fire, zap, spinner_delta),
             "episode_step": self.episode_step,
             "total_reward": self.total_reward,
             "attract_mode": self.is_attract_mode
@@ -183,7 +190,14 @@ class TempestEnv(gym.Env):
         Update the environment state with new data from the game.
         """
         self.prev_state = self.state.copy() if self.state is not None else None
-        self.state = new_state
+        
+        # Ensure new_state only contains the game state part
+        self.state[:243] = new_state[:243]  # Update only the game state part
+        
+        # Update player inputs separately
+        if game_action is not None:
+            self.state[243:] = [game_action[0], game_action[1], game_action[2]]  # Update player inputs
+        
         self.reward = reward
         self.done = done
         if game_action is not None:
@@ -240,7 +254,7 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
 
 # Custom BC model
 class BCModel(nn.Module):
-    def __init__(self, input_size=243, output_size=5):
+    def __init__(self, input_size=246, output_size=1024):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(input_size, 256),
@@ -527,7 +541,11 @@ def process_frame_data(data):
         elif len(normalized_data) > expected_size:
             normalized_data = normalized_data[:expected_size]
         
-        return normalized_data, frame_counter, reward, game_action, is_attract, is_done, save_signal
+        # Add player inputs to the observation
+        player_inputs = np.array([fire_commanded, zap_commanded, spinner_delta], dtype=np.float32)
+        full_observation = np.concatenate((normalized_data, player_inputs))
+        
+        return full_observation, frame_counter, reward, (fire_commanded, zap_commanded, spinner_delta), is_attract, is_done, save_signal
     
     except Exception as e:
         print(f"Error processing frame data: {e}")
@@ -584,7 +602,7 @@ def initialize_models():
             print(f"Warning: Could not create backups: {backup_error}")
     
     # Initialize the BC model
-    bc_model = BCModel(input_size=243)
+    bc_model = BCModel(input_size=246)
     bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     bc_loaded_successfully = False
     
@@ -620,11 +638,11 @@ def initialize_models():
             print(f"Successfully loaded BC model from {BC_MODEL_PATH} in {load_time:.2f} seconds")
             
             # Additional validation - perform a test forward pass
-            test_input = torch.zeros(1, 243, dtype=torch.float32)
+            test_input = torch.zeros(1, 246, dtype=torch.float32)
             with torch.no_grad():
                 test_output = bc_model(test_input)
-                if test_output.shape != (1, 5):
-                    raise ValueError(f"Model produced incorrect output shape: {test_output.shape}, expected (1, 5)")
+                if test_output.shape != (1, 1024):
+                    raise ValueError(f"Model produced incorrect output shape: {test_output.shape}, expected (1, 1024)")
             
             bc_loaded_successfully = True
             write_diagnostic_info(f"BC model loaded successfully", model_path=BC_MODEL_PATH)
@@ -636,7 +654,7 @@ def initialize_models():
             write_diagnostic_info("Failed to load BC model", error=e, model_path=BC_MODEL_PATH)
             print("Initializing fresh BC model due to loading error")
             # Reinitialize the model since loading failed
-            bc_model = BCModel(input_size=243)
+            bc_model = BCModel(input_size=246)
             bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     else:
         print(f"No existing BC model found at {BC_MODEL_PATH}, starting fresh")
@@ -961,23 +979,26 @@ def main():
                         # Different behavior based on mode
                         if is_attract:
                             # Behavioral Cloning mode
-                            if game_action is not None and game_action < 5:
+                            if game_action is not None:
+                                # Encode the action before using it
+                                encoded_action = encode_action(*game_action)
+                                
                                 # Store transition for future mixed batches
                                 if env.prev_state is not None:
-                                    custom_buffer.add(env.prev_state, game_action, reward, processed_data, done, is_bc=True)
+                                    custom_buffer.add(env.prev_state, encoded_action, reward, processed_data, done, is_bc=True)
                                 
                                 # Learn from the game's action using BC
-                                loss = train_bc(bc_model, processed_data, game_action)
+                                loss = train_bc(bc_model, processed_data, encoded_action)
                                 bc_losses.append(loss)
                                 
                                 # Log progress occasionally
                                 if frame_count % 100 == 0:
-                                    print(f"BC training - Frame {frame_counter}, Action: {ACTION_MAP[game_action]}, Loss: {loss:.6f}")
+                                    print(f"BC training - Frame {frame_counter}, Action: {game_action}, Loss: {loss:.6f}")
                                 
                                 # In attract mode, use the game's action
-                                action = game_action
+                                action = encoded_action
                             else:
-                                action = random.randint(0, 4)
+                                action = random.randint(0, 1023)  # Random action in the encoded space
                             
                             # Track BC episodes
                             if done:
@@ -988,9 +1009,15 @@ def main():
                             # Reinforcement Learning mode
                             # Add to SB3's replay buffer if we have a previous state
                             if env.prev_state is not None:
-                                # Get action from policy
+                                # Encode the action before sending it to the model
+                                encoded_action = encode_action(*game_action)
+                                
+                                # Use the encoded action in the model
                                 action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
                                 action = action_tensor
+                                
+                                # Decode the action for use in the environment
+                                fire, zap, spinner_delta = decode_action(action)
                                 
                                 # Add to custom buffer for mixed learning
                                 custom_buffer.add(env.prev_state, action, reward, processed_data, done, is_bc=False)
@@ -1119,9 +1146,7 @@ def main():
                                     rl_model._n_updates += 1
                         
                         # Convert action to string for sending back to Lua
-                        if isinstance(action, np.ndarray):
-                            action = action.item()
-                        action_str = ACTION_MAP[action]
+                        action_str = f"{game_action[0]} {game_action[1]} {game_action[2]}"
                         
                         # Write the action back to Lua
                         py_to_lua.write(action_str + "\n")
@@ -1194,6 +1219,17 @@ def main():
             time.sleep(5)
     
     print("Python AI model shutting down")
+
+def encode_action(fire, zap, spinner_delta):
+    """Encode the three actions into a single integer."""
+    return fire * 512 + zap * 256 + (spinner_delta + 128)
+
+def decode_action(action):
+    """Decode a single integer into the three actions."""
+    fire = action // 512
+    zap = (action % 512) // 256
+    spinner_delta = (action % 256) - 128
+    return fire, zap, spinner_delta
 
 if __name__ == "__main__":
     # Set seed for reproducibility
