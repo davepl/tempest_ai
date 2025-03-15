@@ -461,20 +461,18 @@ def process_frame_data(data):
         return None, 0, 0.0, None, False, False, False
     
     try:
-        # Extract out-of-band information
-        num_oob_values = struct.unpack(">I", data[0:4])[0]
-        reward = struct.unpack(">d", data[4:12])[0]
-        game_action = struct.unpack(">B", data[12:13])[0]
-        game_mode = struct.unpack(">B", data[13:14])[0]
-        done = struct.unpack(">B", data[14:15])[0] != 0
-        frame_counter = struct.unpack(">I", data[15:19])[0]  # Extract 32-bit frame counter
-        score = struct.unpack(">I", data[19:23])[0]  # Extract 32-bit score
-        save_signal = struct.unpack(">B", data[23:24])[0] != 0  # Read dedicated save signal byte
+        # Unpack the out-of-band data structure
+        header_fmt = ">IdBBBIIBBBh"
+        header_size = struct.calcsize(header_fmt)
+        
+        (num_values, reward, game_action, game_mode, 
+         is_done, frame_counter, score, save_signal,
+         fire_commanded, zap_commanded, spinner_delta) = struct.unpack(header_fmt, data[:header_size])
         
         # Debug output for game mode occasionally
         if random.random() < 0.01 or save_signal:  # Show debug info about 1% of the time or if save signal
             print(f"Game Mode: 0x{game_mode:02X}, Is Attract Mode: {(game_mode & 0x80) == 0}, Save Signal: {save_signal}")
-            print(f"OOB Data: values={num_oob_values}, reward={reward:.2f}, action={game_action}, done={done}")
+            print(f"OOB Data: values={num_values}, reward={reward:.2f}, action={game_action}, done={is_done}")
             print(f"Frame Counter: {frame_counter}, Score: {score}")
         
         # Make save signal very visible when it happens
@@ -484,12 +482,12 @@ def process_frame_data(data):
             print("!" * 50 + "\n")
             
             # If this save signal is from an on_mame_exit callback, mark it as a shutdown request
-            if done or frame_counter % 100 == 99:  # Simple heuristic to detect shutdown saves (done or certain frame patterns)
+            if is_done or frame_counter % 100 == 99:  # Simple heuristic to detect shutdown saves (done or certain frame patterns)
                 shutdown_requested = True
                 print("DETECTED POSSIBLE SHUTDOWN - Models will be saved immediately")
         
         # Calculate header size: 4 bytes for count + (num_oob_values * 8) bytes for values + 3 bytes for extra data + 8 bytes for frame_counter and score + 1 byte for save signal
-        header_size = 4 + (num_oob_values * 8) + 3 + 8 + 1
+        header_size = 4 + (num_values * 8) + 3 + 8 + 1
         
         # Extract game state data (everything after the header)
         game_data = data[header_size:]
@@ -529,7 +527,7 @@ def process_frame_data(data):
         elif len(normalized_data) > expected_size:
             normalized_data = normalized_data[:expected_size]
         
-        return normalized_data, frame_counter, reward, game_action, is_attract, done, save_signal
+        return normalized_data, frame_counter, reward, game_action, is_attract, is_done, save_signal
     
     except Exception as e:
         print(f"Error processing frame data: {e}")
