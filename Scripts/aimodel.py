@@ -556,10 +556,14 @@ def process_frame_data(data):
 # Initialize static variable for process_frame_data
 process_frame_data.last_attract_mode = True
 
+# Define the device globally
+device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+
 def train_bc(model, state, action):
     """Train the BC model using demonstration data"""
-    state_tensor = torch.FloatTensor(state).unsqueeze(0)
-    action_tensor = torch.LongTensor([action])
+    # Move the state tensor to the correct device
+    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    action_tensor = torch.LongTensor([action]).to(device)
     
     # Forward pass
     logits = model(state_tensor)
@@ -604,6 +608,7 @@ def initialize_models():
     # Check if MPS is available and set the device
     device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
     print(f"Using device: {device}")
+    
     # Initialize the BC model and move it to the device
     bc_model = BCModel(input_size=246).to(device)
     bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
