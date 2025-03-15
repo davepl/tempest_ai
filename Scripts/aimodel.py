@@ -131,11 +131,11 @@ class TempestEnv(gym.Env):
         # Define action space: fire, zap, left, right, none
         self.action_space = spaces.Discrete(5)
         
-        # Define observation space - 116 features based on game state
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(116,), dtype=np.float32)
+        # Define observation space - 243 features based on game state
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(243,), dtype=np.float32)
         
         # Initialize state
-        self.state = np.zeros(116, dtype=np.float32)
+        self.state = np.zeros(243, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.info = {}
@@ -150,7 +150,7 @@ class TempestEnv(gym.Env):
         """Reset the environment to start a new episode."""
         super().reset(seed=seed)
         
-        self.state = np.zeros(116, dtype=np.float32)
+        self.state = np.zeros(243, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.episode_step = 0
@@ -240,28 +240,25 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
 
 # Custom BC model
 class BCModel(nn.Module):
-    def __init__(self, input_size, output_size):
+    def __init__(self, input_size=243, output_size=5):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(input_size, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, output_size)
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_size)
         )
     
     def forward(self, x):
         return self.model(x)
     
-    def act(self, state, epsilon=0.1):
-        """Select an action using epsilon-greedy policy"""
-        if random.random() < epsilon:
-            return random.randint(0, 4)
-        else:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            with torch.no_grad():
-                logits = self.forward(state_tensor)
-                return torch.argmax(logits, dim=1).item()
+    def predict(self, state):
+        with torch.no_grad():
+            logits = self.forward(torch.FloatTensor(state))
+            return logits.argmax().item()
 
 # Custom callback for saving the model with compatibility patches
 class SaveOnSignalCallback(BaseCallback):
@@ -524,7 +521,7 @@ def process_frame_data(data):
         process_frame_data.last_attract_mode = is_attract
         
         # Pad or truncate to match the expected observation space size
-        expected_size = 116
+        expected_size = 243  # Updated to match new state size
         if len(normalized_data) < expected_size:
             padded_data = np.zeros(expected_size, dtype=np.float32)
             padded_data[:len(normalized_data)] = normalized_data
@@ -589,7 +586,7 @@ def initialize_models():
             print(f"Warning: Could not create backups: {backup_error}")
     
     # Initialize the BC model
-    bc_model = BCModel(116, 5)
+    bc_model = BCModel(input_size=243)
     bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     bc_loaded_successfully = False
     
@@ -625,7 +622,7 @@ def initialize_models():
             print(f"Successfully loaded BC model from {BC_MODEL_PATH} in {load_time:.2f} seconds")
             
             # Additional validation - perform a test forward pass
-            test_input = torch.zeros(1, 116, dtype=torch.float32)
+            test_input = torch.zeros(1, 243, dtype=torch.float32)
             with torch.no_grad():
                 test_output = bc_model(test_input)
                 if test_output.shape != (1, 5):
@@ -641,7 +638,7 @@ def initialize_models():
             write_diagnostic_info("Failed to load BC model", error=e, model_path=BC_MODEL_PATH)
             print("Initializing fresh BC model due to loading error")
             # Reinitialize the model since loading failed
-            bc_model = BCModel(116, 5)
+            bc_model = BCModel(input_size=243)
             bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     else:
         print(f"No existing BC model found at {BC_MODEL_PATH}, starting fresh")

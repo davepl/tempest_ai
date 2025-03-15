@@ -471,6 +471,8 @@ function EnemiesState:new()
     self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
     self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
     self.shot_positions = {}  -- Will store nil for inactive shots
+    self.pending_vid = {}  -- 64-byte table
+    self.pending_seg = {}  -- 64-byte table
     return self
 end
 
@@ -521,6 +523,16 @@ function EnemiesState:update(mem)
             self.shot_positions[i] = calculate_relative_position(player_pos, abs_pos, is_open)
         end
     end
+
+    -- Read pending_seg (64 bytes starting at 0x0203)
+    for i = 1, 64 do
+        self.pending_seg[i] = mem:read_u8(0x0203 + i - 1)
+    end
+
+    -- Read pending_vid (64 bytes starting at 0x0243)
+    for i = 1, 64 do
+        self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
+    end
 end
 
 -- Helper function to decode enemy type info
@@ -559,6 +571,13 @@ Controls.__index = Controls
 function Controls:new()
     local self = setmetatable({}, Controls)
     self.port = manager.machine.ioport.ports[":IN0"]
+    print("Input port found: " .. (self.port and "Yes" or "No"))
+    if self.port then
+        print("Fire field found: " .. (self.port.fields["Fire"] and "Yes" or "No"))
+        if self.port.fields["Fire"] then
+            print("Fire field type: " .. type(self.port.fields["Fire"]))
+        end
+    end
     self.fire_field = self.port and self.port.fields["Fire"] or nil
     self.zap_field = self.port and self.port.fields["Superzapper"] or nil
     -- Remove left_field and right_field
@@ -587,13 +606,20 @@ function Controls:apply_action(action, game_state, player_state)
     
     if is_attract_mode then
         -- In attract mode:
-        -- 1. Fire is always true
+        -- 1. Fire is always true regardless of physical control existence
+        self.fire_commanded = 1  -- Set this first, unconditionally
+        
+        -- Now set the physical control if it exists
         if self.fire_field then 
             self.fire_field:set_value(1)
-            self.fire_commanded = 1
             -- Debug output
             if game_state.frame_counter % 60 == 0 then
                 print("Setting fire to true in attract mode")
+            end
+        else
+            -- Add debug to check if fire_field is missing
+            if game_state.frame_counter % 300 == 0 then
+                print("WARNING: fire_field is nil, but fire_commanded is still set to 1 in attract mode")
             end
         end
         
@@ -755,6 +781,16 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     table.insert(data, enemies_state.pulse_beat or 0)
     table.insert(data, enemies_state.pulsing or 0)
     
+    -- Add pending_vid (64 bytes)
+    for i = 1, 64 do
+        table.insert(data, enemies_state.pending_vid[i] or 0)
+    end
+    
+    -- Add pending_seg (64 bytes)
+    for i = 1, 64 do
+        table.insert(data, enemies_state.pending_seg[i] or 0)
+    end
+    
     -- Serialize the data to a binary string
     local binary_data = ""
     for i, value in ipairs(data) do
@@ -778,7 +814,6 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     elseif controls.zap_commanded == 1 then
         game_action = 1  -- "zap"
     end
-    -- Remove the left/right cases since we're using spinner delta directly
     
     -- Check if it's time to send a save signal
     local current_time = os.time()
@@ -805,10 +840,22 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     
     -- Create out-of-band context information structure
     -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
-    -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte)
+    -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte),
+    -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8)
     local is_done = 0  -- We don't currently track if the game is done
-    local oob_data = string.pack(">IdBBBIIB", 1, LastRewardState, game_action, game_state.game_mode, 
-                                is_done, game_state.frame_counter, player_state.score, save_signal)
+    local oob_data = string.pack(">IdBBBIIBBBh", 
+        1,                    -- num_values
+        LastRewardState,      -- reward
+        game_action,          -- game_action
+        game_state.game_mode, -- game_mode
+        is_done,              -- done flag
+        game_state.frame_counter, -- frame_counter
+        player_state.score,   -- score
+        save_signal,          -- save_signal
+        controls.fire_commanded, -- fire_commanded (added)
+        controls.zap_commanded,  -- zap_commanded (added)
+        controls.spinner_delta   -- spinner_delta (added)
+    )
     
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
@@ -1140,6 +1187,22 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     end
     print("  Shot Positions: " .. shots_str)
     print("")  -- Empty line after section
+
+    -- Display pending_vid (64 bytes)
+    local pending_vid_str = ""
+    for i = 1, 64 do
+        pending_vid_str = pending_vid_str .. string.format("%02X ", enemies_state.pending_vid[i])
+        if i % 16 == 0 then pending_vid_str = pending_vid_str .. "\n  " end
+    end
+    print("  Pending VID   : " .. pending_vid_str)
+
+    -- Display pending_seg similarly
+    local pending_seg_str = ""
+    for i = 1, 64 do
+        pending_seg_str = pending_seg_str .. string.format("%02X ", enemies_state.pending_seg[i])
+        if i % 16 == 0 then pending_seg_str = pending_seg_str .. "\n  " end
+    end
+    print("  Pending SEG   : " .. pending_seg_str)
 end
 
 -- Function to be called when MAME is shutting down
