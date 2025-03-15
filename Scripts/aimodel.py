@@ -883,7 +883,6 @@ def main():
     bc_episodes = 0
     rl_episodes = 0
     bc_losses = []
-    rewards_history = []
     
     # Track mode transitions for logging
     last_mode_was_attract = True

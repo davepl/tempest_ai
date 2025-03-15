@@ -169,8 +169,14 @@ local function process_frame(params)
         local timeout = 2  -- 2 second timeout
         
         while not action and os.time() - start_time < timeout do
-            action = pipe_in:read("*line")
-            if not action then
+            -- Read exactly 3 bytes for the three i8 values
+            local action_bytes = pipe_in:read(3)
+            
+            if action_bytes and #action_bytes == 3 then
+                -- Unpack the three signed 8-bit integers
+                fire, zap, spinner_delta = string.unpack("bbb", action_bytes)
+                break  -- Exit the loop once we've successfully read and unpacked the data
+            else
                 -- Sleep briefly to avoid busy-waiting
                 os.execute("sleep 0.01")
             end
