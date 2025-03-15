@@ -247,12 +247,14 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Linear(256, features_dim),
             nn.ReLU()
-        )
+        ).to(device)
     
     def forward(self, observations):
         return self.feature_extractor(observations)
 
-# Custom BC model
+# Define the device globally
+device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+
 class BCModel(nn.Module):
     def __init__(self, input_size=246, output_size=1024):
         super().__init__()
@@ -264,14 +266,14 @@ class BCModel(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, output_size)
-        )
+        ).to(device)  # Move the entire model to the device
     
     def forward(self, x):
         return self.model(x)
     
     def predict(self, state):
         with torch.no_grad():
-            logits = self.forward(torch.FloatTensor(state))
+            logits = self.forward(torch.FloatTensor(state).to(device))
             return logits.argmax().item()
 
 # Custom callback for saving the model with compatibility patches
@@ -555,9 +557,6 @@ def process_frame_data(data):
 
 # Initialize static variable for process_frame_data
 process_frame_data.last_attract_mode = True
-
-# Define the device globally
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 def train_bc(model, state, action):
     """Train the BC model using demonstration data"""
