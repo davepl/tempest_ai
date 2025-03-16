@@ -31,7 +31,6 @@
 -- Add the Scripts directory to Lua's package path
 package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
-local update = require("update")
 
 local function clear_screen()
     io.write("\027[2J\027[H")
@@ -86,6 +85,11 @@ local LastRewardState = 0
 
 -- Add this at the top of the file, near other global variables
 local shutdown_requested = false
+
+-- Add these global variables near the top of the script with other globals
+local model_fire = 0
+local model_zap = 0
+local model_spinner = 0
 
 -- Function to calculate reward for the current frame
 local function calculate_reward(game_state, level_state, player_state)
@@ -174,7 +178,22 @@ local function process_frame(params)
             
             if action_bytes and #action_bytes == 3 then
                 -- Unpack the three signed 8-bit integers
-                fire, zap, spinner_delta = string.unpack("bbb", action_bytes)
+                local f, z, s = string.unpack("bbb", action_bytes)
+                
+                -- Store the values globally for display
+                model_fire = f
+                model_zap = z  
+                model_spinner = s
+                
+                -- Set action based on model response
+                if f == 1 then
+                    action = "fire"
+                elseif z == 1 then
+                    action = "zap"
+                else
+                    action = "none"
+                end
+                
                 break  -- Exit the loop once we've successfully read and unpacked the data
             else
                 -- Sleep briefly to avoid busy-waiting
@@ -1097,8 +1116,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print player controls at row 14
-    move_cursor_to_row(16)
-    -- Fix the attract mode check to match the one in Controls:apply_action
+    move_cursor_to_row(15)
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     local controls_metrics = {
         ["Fire"] = controls.fire_commanded,
@@ -1108,8 +1126,17 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     }
     print(format_section("Player Controls", controls_metrics))
 
-    -- Format and print level state in 3 columns
-    move_cursor_to_row(23)
+    -- Add new Model State section
+    move_cursor_to_row(21)
+    local model_metrics = {
+        ["Model Fire"] = model_fire,
+        ["Model Zap"] = model_zap,
+        ["Model Spinner"] = model_spinner
+    }
+    print(format_section("Model State", model_metrics))
+
+    -- Format and print level state in 3 columns (adjust row number)
+    move_cursor_to_row(26)  -- Changed from 23 to make room for Model State
     
     -- Print level metrics in 3 columns
     print("--[ Level State ]-------------------------------------")
@@ -1158,7 +1185,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("")  -- Empty line after section
 
     -- Format and print enemies state at row 31
-    move_cursor_to_row(28)
+    move_cursor_to_row(31)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
