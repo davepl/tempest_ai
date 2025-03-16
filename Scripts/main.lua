@@ -234,6 +234,8 @@ local function start_python_script()
     -- Remove existing pipes to ensure clean state
     -- os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
     
+    os.execute("rm -f /Users/dave/source/repos/tempest/Scripts/models/*")
+
     -- Launch Python script in the background with proper error handling
     local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
     local result = os.execute(cmd)
@@ -858,9 +860,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     
     -- Debug output for game mode value occasionally
     if game_state.frame_counter % 60 == 0 then
-        print(string.format("Game Mode: 0x%02X, Is Attract Mode: %s", 
-            game_state.game_mode, 
-            (game_state.game_mode & 0x80) == 0 and "true" or "false"))
+--        print(string.format("Game Mode: 0x%02X, Is Attract Mode: %s", game_state.game_mode, (game_state.game_mode & 0x80) == 0 and "true" or "false"))
     end
     
     -- Create out-of-band context information structure
@@ -918,6 +918,10 @@ local function frame_callback()
     mem:write_direct_u8(0xCA6F, 0xEA)
     mem:write_direct_u8(0xCA70, 0xEA)
     
+    -- NOP out the damage the copy protection code does to memory when it detects a bad checksum
+    mem:write_direct_u8(0xA591, 0xEA)
+    mem:write_direct_u8(0xA592, 0xEA)
+
     -- Increase the maximum level for demo mode
     mem:write_direct_u8(0x9196, 0x3F)
 
@@ -949,7 +953,7 @@ local function frame_callback()
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
 
         -- Set lives to an eternal 5
-        mem:write_direct_u8(0x0048, 0x05)
+        -- mem:write_direct_u8(0x0048, 0x05)
 
         -- NOP out the jump that skips scoring in attract mode
         mem:write_direct_u8(0xCA6F, 0xEA)

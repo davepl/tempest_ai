@@ -126,10 +126,11 @@ class TempestEnv(gym.Env):
         self.action_space = spaces.Discrete(1024)  # 2 * 2 * 256 = 1024 possible actions
         
         # Define observation space - 243 features based on game state + 3 for player inputs
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(246,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(243,), dtype=np.float32)
         
         # Initialize state
-        self.state = np.zeros(246, dtype=np.float32)
+        self.state = np.zeros(243, dtype=np.float32)
+        self.player_inputs = np.zeros(3, dtype=np.float32)  # fire, zap, spinner_delta
         self.reward = 0
         self.done = False
         self.info = {}
@@ -144,7 +145,8 @@ class TempestEnv(gym.Env):
         """Reset the environment to start a new episode."""
         super().reset(seed=seed)
         
-        self.state = np.zeros(246, dtype=np.float32)
+        self.state = np.zeros(243, dtype=np.float32)
+        self.player_inputs = np.zeros(3, dtype=np.float32)
         self.reward = 0
         self.done = False
         self.episode_step = 0
@@ -160,8 +162,8 @@ class TempestEnv(gym.Env):
         # Decode the action
         fire, zap, spinner_delta = decode_action(action)
         
-        # Use the decoded actions as needed
-        # For example, update the environment state or perform actions in the game
+        # Store player inputs separately
+        self.player_inputs = np.array([fire, zap, spinner_delta], dtype=np.float32)
         
         self.episode_step += 1
         self.total_reward += self.reward
@@ -173,28 +175,30 @@ class TempestEnv(gym.Env):
             "action_taken": (fire, zap, spinner_delta),
             "episode_step": self.episode_step,
             "total_reward": self.total_reward,
-            "attract_mode": self.is_attract_mode
+            "attract_mode": self.is_attract_mode,
+            "player_inputs": self.player_inputs
         }
         
         return self.state, self.reward, terminated, truncated, self.info
     
-    def update_state(self, new_state, reward, game_action=None, done=False):
+    def update_state(self, game_state, reward, game_action=None, done=False):
         """
         Update the environment state with new data from the game.
         """
         self.prev_state = self.state.copy() if self.state is not None else None
         
-        # Ensure new_state only contains the game state part
-        self.state[:243] = new_state[:243]  # Update only the game state part
+        # Update game state
+        self.state = game_state
         
         # Update player inputs separately
         if game_action is not None:
-            self.state[243:] = [game_action[0], game_action[1], game_action[2]]  # Update player inputs
+            self.player_inputs = np.array([game_action[0], game_action[1], game_action[2]], dtype=np.float32)
         
         self.reward = reward
         self.done = done
         if game_action is not None:
             self.info["game_action"] = game_action
+            self.info["player_inputs"] = self.player_inputs
         return self.state
 
 class CustomReplayBuffer:
@@ -249,16 +253,23 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
 device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 class BCModel(nn.Module):
-    def __init__(self, input_size=246, output_size=3):
+    def __init__(self, input_size=243):
         super(BCModel, self).__init__()
+        # Shared layers
         self.fc1 = nn.Linear(input_size, 128)
         self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, output_size)
+        # Separate output heads
+        self.fire_output = nn.Linear(64, 1)    # Output for fire probability
+        self.zap_output = nn.Linear(64, 1)     # Output for zap probability
+        self.spinner_output = nn.Linear(64, 1) # Output for spinner delta (continuous)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        fire = torch.sigmoid(self.fire_output(x))  # Probability for fire
+        zap = torch.sigmoid(self.zap_output(x))    # Probability for zap
+        spinner = self.spinner_output(x)           # Continuous value for spinner delta
+        return fire, zap, spinner
 
 # Custom callback for saving the model with compatibility patches
 class SaveOnSignalCallback(BaseCallback):
@@ -452,7 +463,7 @@ def process_frame_data(data):
         data (bytes): Binary data containing OOB header and game state information
         
     Returns:
-        tuple: (processed_data, frame_counter, reward, game_action, is_attract, done, save_signal)
+        tuple: (game_state, frame_counter, reward, game_action, is_attract, done, save_signal)
     """
     global shutdown_requested
     
@@ -519,7 +530,7 @@ def process_frame_data(data):
         process_frame_data.last_attract_mode = is_attract
         
         # Pad or truncate to match the expected observation space size
-        expected_size = 243  # Updated to match new state size
+        expected_size = 243  # Game state only, no player inputs
         if len(normalized_data) < expected_size:
             padded_data = np.zeros(expected_size, dtype=np.float32)
             padded_data[:len(normalized_data)] = normalized_data
@@ -527,11 +538,8 @@ def process_frame_data(data):
         elif len(normalized_data) > expected_size:
             normalized_data = normalized_data[:expected_size]
         
-        # Add player inputs to the observation
-        player_inputs = np.array([fire_commanded, zap_commanded, spinner_delta], dtype=np.float32)
-        full_observation = np.concatenate((normalized_data, player_inputs))
-        
-        return full_observation, frame_counter, reward, (fire_commanded, zap_commanded, spinner_delta), is_attract, is_done, save_signal
+        # Return game state and player inputs separately
+        return normalized_data, frame_counter, reward, (fire_commanded, zap_commanded, spinner_delta), is_attract, is_done, save_signal
     
     except Exception as e:
         print(f"Error processing frame data: {e}")
@@ -542,25 +550,40 @@ def process_frame_data(data):
 # Initialize static variable for process_frame_data
 process_frame_data.last_attract_mode = True
 
-def train_bc(model, state, action):
-    """Train the BC model using demonstration data"""
-    # Move the state tensor to the correct device
+def train_bc(model, state, fire_target, zap_target, spinner_target):
+    """Train the BC model using demonstration data with separate outputs"""
+    # Convert inputs to tensors
     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-    action_tensor = torch.LongTensor([action]).to(device)
+    
+    # Shape the targets to match the model outputs [1, 1]
+    fire_target = torch.FloatTensor([fire_target]).unsqueeze(1).to(device)    # Shape: [1, 1]
+    zap_target = torch.FloatTensor([zap_target]).unsqueeze(1).to(device)      # Shape: [1, 1]
+    
+    # Normalize spinner_target from [-128, 127] to [-1, 1]
+    spinner_target_normalized = spinner_target / 128.0
+    spinner_target_tensor = torch.FloatTensor([spinner_target_normalized]).unsqueeze(1).to(device)  # Shape: [1, 1]
     
     # Forward pass
-    logits = model(state_tensor)
+    fire_pred, zap_pred, spinner_pred = model(state_tensor)
     
-    # Calculate loss
-    loss_fn = nn.CrossEntropyLoss()
-    loss = loss_fn(logits, action_tensor)
+    # Define loss functions
+    bce_loss = nn.BCELoss()
+    mse_loss = nn.MSELoss()
+    
+    # Compute individual losses
+    fire_loss = bce_loss(fire_pred, fire_target)
+    zap_loss = bce_loss(zap_pred, zap_target)
+    spinner_loss = mse_loss(spinner_pred, spinner_target_tensor)
+    
+    # Combine losses (equal weighting; adjust if needed)
+    total_loss = fire_loss + zap_loss + spinner_loss
     
     # Backpropagation
     model.optimizer.zero_grad()
-    loss.backward()
+    total_loss.backward()
     model.optimizer.step()
     
-    return loss.item()
+    return total_loss.item()
 
 def initialize_models():
     """Initialize both BC and RL models with robust error handling and diagnostics"""
@@ -593,7 +616,7 @@ def initialize_models():
     print(f"Using device: {device}")
     
     # Initialize the BC model and move it to the device
-    bc_model = BCModel(input_size=246).to(device)
+    bc_model = BCModel(input_size=243).to(device)
     bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     bc_loaded_successfully = False
     
@@ -629,7 +652,7 @@ def initialize_models():
             print(f"Successfully loaded BC model from {BC_MODEL_PATH} in {load_time:.2f} seconds")
             
             # Additional validation - perform a test forward pass
-            test_input = torch.zeros(1, 246, dtype=torch.float32)
+            test_input = torch.zeros(1, 243, dtype=torch.float32)
             with torch.no_grad():
                 test_output = bc_model(test_input)
                 if test_output.shape != (1, 3):
@@ -645,7 +668,7 @@ def initialize_models():
             write_diagnostic_info("Failed to load BC model", error=e, model_path=BC_MODEL_PATH)
             print("Initializing fresh BC model due to loading error")
             # Reinitialize the model since loading failed
-            bc_model = BCModel(input_size=246)
+            bc_model = BCModel(input_size=243)
             bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.001)
     else:
         print(f"No existing BC model found at {BC_MODEL_PATH}, starting fresh")
@@ -970,23 +993,22 @@ def main():
                         if is_attract:
                             # Behavioral Cloning mode
                             if game_action is not None:
-                                # Encode the action before using it
-                                encoded_action = encode_action(*game_action)
+                                # Extract game state (just the 243 elements)
+                                game_state = processed_data
                                 
-                                # Store transition for future mixed batches
-                                if env.prev_state is not None:
-                                    custom_buffer.add(env.prev_state, encoded_action, reward, processed_data, done, is_bc=True)
+                                # Unpack the action tuple
+                                fire_target, zap_target, spinner_delta = game_action
                                 
-                                # Learn from the game's action using BC
-                                loss = train_bc(bc_model, processed_data, encoded_action)
+                                # Train the BC model with separate components
+                                loss = train_bc(bc_model, game_state, fire_target, zap_target, spinner_delta)
                                 bc_losses.append(loss)
                                 
                                 # Log progress occasionally
                                 if frame_count % 100 == 0:
                                     print(f"BC training - Frame {frame_counter}, Action: {game_action}, Loss: {loss:.6f}")
                                 
-                                # In attract mode, use the game's action
-                                action = encoded_action
+                                # Generate action for this frame (using game's action in attract mode)
+                                action = encode_action(*game_action)
                             else:
                                 action = random.randint(0, 1023)  # Random action in the encoded space
                             
@@ -997,143 +1019,69 @@ def main():
                                 print(f"BC Episode {bc_episodes} completed, avg loss: {avg_loss:.6f}")
                         else:
                             # Reinforcement Learning mode
-                            # Add to SB3's replay buffer if we have a previous state
-                            if env.prev_state is not None:
-                                # Encode the action before sending it to the model
-                                encoded_action = encode_action(*game_action)
+                            # Use epsilon-greedy exploration with BC guidance
+                            epsilon = rl_model.exploration_schedule(rl_model._current_progress_remaining) if hasattr(rl_model, 'exploration_schedule') else 0.1
+                            
+                            # Occasionally use BC model for guided exploration
+                            if random.random() < epsilon / 2:  # Use BC for half of exploration steps
+                                # BC-guided exploration
+                                game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
+                                with torch.no_grad():
+                                    fire_pred, zap_pred, spinner_pred = bc_model(game_state)
                                 
-                                # Use the encoded action in the model
+                                # Convert predictions to actions
+                                fire = 1 if fire_pred.item() > 0.5 else 0
+                                zap = 1 if zap_pred.item() > 0.5 else 0
+                                spinner_delta = int(round(spinner_pred.item() * 128.0))  # Un-normalize from [-1, 1] to [-128, 127]
+                                
+                                # Clamp to valid range
+                                spinner_delta = max(-128, min(127, spinner_delta))
+                                
+                                # Set game_action for RL replay buffer and output
+                                game_action = (fire, zap, spinner_delta)
+                                
+                                # Encode to action index for RL model
+                                action = encode_action(fire, zap, spinner_delta)
+                            else:
+                                # Standard RL prediction
                                 action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
                                 action = action_tensor
+                            
+                            # Decode for use in environment and pipe
+                            fire, zap, spinner_delta = decode_action(action)
+                            game_action = (fire, zap, spinner_delta)
+                            
+                            # Add to custom buffer for mixed learning
+                            custom_buffer.add(env.prev_state, action, reward, processed_data, done, is_bc=False)
+                            
+                            # Also add directly to SB3's buffer
+                            try:
+                                # Create info dict for compatibility with newer SB3 versions
+                                info_dict = [{"terminal_observation": processed_data if done else None}]
                                 
-                                # Decode the action for use in the environment
-                                fire, zap, spinner_delta = decode_action(action)
-                                
-                                # Add to custom buffer for mixed learning
-                                custom_buffer.add(env.prev_state, action, reward, processed_data, done, is_bc=False)
-                                
-                                # Also add directly to SB3's buffer
-                                try:
-                                    # Create info dict for compatibility with newer SB3 versions
-                                    info_dict = [{"terminal_observation": processed_data if done else None}]
-                                    
-                                    # Try with the new API that requires infos
+                                # Try with the new API that requires infos
+                                rl_model.replay_buffer.add(
+                                    np.array([env.prev_state]),
+                                    np.array([processed_data]),
+                                    np.array([[action]]),
+                                    np.array([reward]),
+                                    np.array([float(done)]),
+                                    info_dict
+                                )
+                            except TypeError as e:
+                                if "missing 1 required positional argument: 'infos'" in str(e):
+                                    print("Detected older SB3 version, adjusting API call")
+                                    # Fallback for older SB3 versions that don't use infos
                                     rl_model.replay_buffer.add(
                                         np.array([env.prev_state]),
                                         np.array([processed_data]),
                                         np.array([[action]]),
                                         np.array([reward]),
-                                        np.array([float(done)]),
-                                        info_dict
+                                        np.array([float(done)])
                                     )
-                                except TypeError as e:
-                                    if "missing 1 required positional argument: 'infos'" in str(e):
-                                        print("Detected older SB3 version, adjusting API call")
-                                        # Fallback for older SB3 versions that don't use infos
-                                        rl_model.replay_buffer.add(
-                                            np.array([env.prev_state]),
-                                            np.array([processed_data]),
-                                            np.array([[action]]),
-                                            np.array([reward]),
-                                            np.array([float(done)])
-                                        )
-                                    else:
-                                        # Some other TypeError occurred, re-raise it
-                                        raise
-                            else:
-                                # First frame or after reset, get action from policy
-                                action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
-                            
-                            # Train the model - check replay buffer size with compatibility for different SB3 versions
-                            try:
-                                # Try the standard length check first
-                                buffer_size = len(rl_model.replay_buffer)
-                            except (TypeError, AttributeError):
-                                try:
-                                    # Next try the size() method if available
-                                    buffer_size = rl_model.replay_buffer.size()
-                                except (TypeError, AttributeError):
-                                    try:
-                                        # Try accessing the pos attribute (index of the next element to insert)
-                                        buffer_size = rl_model.replay_buffer.pos
-                                    except (TypeError, AttributeError):
-                                        # Fallback: assume buffer has data if we've added anything
-                                        print("Warning: Could not determine replay buffer size, assuming it's ready for training")
-                                        buffer_size = rl_model.learning_starts + 1
-                            
-                            # Only train if we have enough data
-                            if buffer_size > rl_model.learning_starts:
-                                rl_model._n_updates += 1
-                                # Train for a single gradient step with error handling for different SB3 versions
-                                try:
-                                    # Standard training call
-                                    rl_model.train(gradient_steps=1, batch_size=rl_model.batch_size)
-                                except AttributeError as e:
-                                    if "'DQN' object has no attribute '_logger'" in str(e):
-                                        # Fix for logger attribute mismatch between SB3 versions
-                                        print("Detected missing _logger attribute, applying fix...")
-                                        
-                                        try:
-                                            # If logger exists, monkey patch _logger
-                                            if hasattr(rl_model, 'logger'):
-                                                print("Using existing logger")
-                                                # Using __dict__ instead of direct assignment to bypass property restrictions
-                                                rl_model.__dict__['_logger'] = rl_model.logger
-                                            else:
-                                                # Create a minimal dummy logger
-                                                print("Creating dummy logger")
-                                                from stable_baselines3.common.logger import Logger
-                                                rl_model.__dict__['_logger'] = Logger(folder=None, output_formats=[])
-                                            
-                                            # Try training again with patched _logger
-                                            rl_model.train(gradient_steps=1, batch_size=rl_model.batch_size)
-                                        except Exception as logger_fix_error:
-                                            print(f"WARNING: Logger fix failed: {logger_fix_error}")
-                                            # Create dummy train method as absolute fallback
-                                            print("Using fallback minimal training (update counter only)")
-                                            # Just increment the update counter without actual training
-                                            rl_model._n_updates += 1
-                                    elif "property 'logger' of 'DQN' object has no setter" in str(e):
-                                        print("Detected read-only logger property, applying alternative fix...")
-                                        try:
-                                            # Only create _logger without touching logger property
-                                            if not hasattr(rl_model, '_logger'):
-                                                print("Creating _logger without modifying logger property")
-                                                from stable_baselines3.common.logger import Logger
-                                                # Use __dict__ to bypass property restrictions
-                                                rl_model.__dict__['_logger'] = Logger(folder=None, output_formats=[])
-                                            
-                                            # Try monkey patching the _update_learning_rate method to avoid logger usage
-                                            original_update_lr = rl_model._update_learning_rate
-                                            def patched_update_lr(optimizer):
-                                                # Simple implementation that skips logger.record calls
-                                                if hasattr(rl_model, 'lr_schedule') and callable(rl_model.lr_schedule):
-                                                    new_lr = rl_model.lr_schedule(rl_model._current_progress_remaining)
-                                                    for param_group in optimizer.param_groups:
-                                                        param_group['lr'] = new_lr
-                                                return
-                                            
-                                            # Replace the method temporarily
-                                            rl_model._update_learning_rate = patched_update_lr
-                                            
-                                            # Try training again with the patched method
-                                            rl_model.train(gradient_steps=1, batch_size=rl_model.batch_size)
-                                            
-                                            # Restore original method after training
-                                            rl_model._update_learning_rate = original_update_lr
-                                        except Exception as alt_fix_error:
-                                            print(f"WARNING: Alternative logger fix failed: {alt_fix_error}")
-                                            # Just increment the update counter without actual training
-                                            print("Using fallback minimal training (update counter only)")
-                                            rl_model._n_updates += 1
-                                    else:
-                                        # Some other AttributeError, re-raise
-                                        raise
-                                except Exception as train_error:
-                                    print(f"Error during training: {train_error}")
-                                    print("Using minimal fallback (incrementing counters only)")
-                                    # Increment counter but don't perform actual training
-                                    rl_model._n_updates += 1
+                                else:
+                                    # Some other TypeError occurred, re-raise it
+                                    raise
                         
                         # Decode the action into fire, zap, spinner_delta values
                         fire_value, zap_value, spinner_delta = decode_action(action)
