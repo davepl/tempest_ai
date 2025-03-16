@@ -100,13 +100,21 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 3. Score reward: Add the score delta from the last frame
     -- 4. Level completion reward: 1000 * new level number when level increases
     -- 5. Aggression reward: Use weighted average of score per frame
+    -- 6. Stasis reward: 0.01 points per frame for staying in the same state
 
     if player_state.alive == 1 then
-        reward = reward + 0.01
+        reward = reward + 0.05
     else
         reward = reward - 100
     end
     
+    if player_state.SpinnerDelta < 10 then
+        reward = reward + 0.01
+    end
+    if player_state.SpinnerDelta == 0 then
+        reward = reward + 0.02
+    end
+
     -- 2. Score reward: Add the score delta from the last frame
     local score_delta = player_state.score - previous_score
     -- Debug output if score changes
@@ -669,7 +677,7 @@ function Controls:apply_action(fire, zap, spinner, game_state, player_state)
         -- self.spinner_delta is already set
         
         -- Apply these values to the physical controls 
-        print("Applying action to physical controls: ", fire, zap, spinner)
+        -- print("Applying action to physical controls: ", fire, zap, spinner)
         
         self.fire_commanded = fire
         self.zap_commanded = zap
@@ -942,17 +950,22 @@ local function frame_callback()
         game_state.countdown_timer = 0
     end
 
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+
     -- When the game zooms down the tube, reset lives to 5
 
+
     if game_state.gamestate == 0x20 then
-        -- mem:write_direct_u8(0x0048, 0x05)
+        mem:write_direct_u8(0x0048, 0x05)
+    end
+
+    if is_attract_mode then
+        mem:write_direct_u8(0x0048, 0x03)
     end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
 
-        -- Set lives to an eternal 5
-        -- mem:write_direct_u8(0x0048, 0x05)
 
         -- NOP out the jump that skips scoring in attract mode
         mem:write_direct_u8(0xCA6F, 0xEA)

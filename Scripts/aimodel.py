@@ -11,6 +11,8 @@ This script implements a hybrid AI model for the Tempest arcade game that:
 """
 
 import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import sys
 import time
 import struct
@@ -24,12 +26,13 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 # Add imports for Stable Baselines3
-from stable_baselines3 import DQN
+from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.buffers import ReplayBuffer as SB3ReplayBuffer
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 import datetime
 import torch.nn.functional as F
+import threading
 
 # Define global shutdown tracking variable
 shutdown_requested = False
@@ -121,9 +124,14 @@ class TempestEnv(gym.Env):
     def __init__(self):
         super().__init__()
         
-        # Update action space to be a single Discrete space
-        # two bits for fire and zap and 8 bits for spinner delta, 10 bits, 1024 possible values
-        self.action_space = spaces.Discrete(1024)  # 2 * 2 * 256 = 1024 possible actions
+        # Use a Box action space with 3 dimensions
+        # [fire, zap, spinner]
+        self.action_space = spaces.Box(
+            low=np.array([0.0, 0.0, -1.0]),
+            high=np.array([1.0, 1.0, 1.0]),
+            shape=(3,),
+            dtype=np.float32
+        )
         
         # Define observation space - 243 features based on game state + 3 for player inputs
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(243,), dtype=np.float32)
@@ -159,8 +167,11 @@ class TempestEnv(gym.Env):
         """
         Take a step in the environment using the given action.
         """
-        # Decode the action
-        fire, zap, spinner_delta = decode_action(action)
+        # Convert Box action to fire, zap, spinner_delta
+        fire = 1 if action[0] > 0.5 else 0
+        zap = 1 if action[1] > 0.5 else 0
+        spinner_delta = int(round(action[2] * 128.0))  # Scale from [-1, 1] to [-128, 127]
+        spinner_delta = max(-128, min(127, spinner_delta))  # Clamp to valid range
         
         # Store player inputs separately
         self.player_inputs = np.array([fire, zap, spinner_delta], dtype=np.float32)
@@ -597,7 +608,7 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
 
 def initialize_models():
     """Initialize both BC and RL models with robust error handling and diagnostics"""
-    # Create the environment
+    # Create the environment with a modified action space
     env = TempestEnv()
     
     print("\n===== MODEL INITIALIZATION =====")
@@ -703,24 +714,13 @@ def initialize_models():
     # Create our custom save-on-signal callback with BC model reference
     save_signal_callback = SaveOnSignalCallback(save_path=LATEST_MODEL_PATH, bc_model=bc_model)
     
-    # Create initial DQN model
-    rl_model = DQN(
+    # Create PPO model
+    rl_model = PPO(
         "MlpPolicy",
         env,
         policy_kwargs=policy_kwargs,
         learning_rate=0.0001,
-        buffer_size=100000,
-        learning_starts=1000,
-        batch_size=64,
-        gamma=0.99,
-        train_freq=4,
-        gradient_steps=1,
-        target_update_interval=1000,
-        exploration_fraction=0.5,
-        exploration_initial_eps=0.5,
-        exploration_final_eps=0.1,
-        tensorboard_log=os.path.join(MODEL_DIR, "tensorboard_logs"),
-        verbose=1
+        # Other PPO parameters...
     )
     
     # Store the model parameters before loading for comparison
@@ -750,7 +750,19 @@ def initialize_models():
             
             # Attempt to load model with error handling
             start_time = time.time()
-            loaded_model = DQN.load(LATEST_MODEL_PATH, env=env)
+            try:
+                # Try loading as PPO first
+                loaded_model = PPO.load(LATEST_MODEL_PATH, env=env)
+            except Exception as ppo_error:
+                print(f"Could not load as PPO, trying DQN: {ppo_error}")
+                # If that fails, try loading as DQN (for backward compatibility)
+                loaded_model = DQN.load(LATEST_MODEL_PATH, env=env)
+                print("Successfully loaded DQN model, converting to PPO...")
+                # Create a new PPO model and potentially transfer some weights
+                # This is complex and might require custom code to transfer knowledge
+                # For now, we'll just use the fresh PPO model
+                print("Warning: Using fresh PPO model instead of loaded DQN model")
+                loaded_model = rl_model  # Use the fresh PPO model
             
             # Validate the loaded model by checking a few expected attributes
             expected_attrs = ['policy', 'replay_buffer', 'observation_space', 'action_space']
@@ -955,6 +967,18 @@ def main():
                 last_save_time = time.time()
                 save_interval = 300  # Save every 5 minutes
 
+                # At the beginning of your script
+                training_lock = threading.Lock()
+                is_training = False
+                
+                # Define a training function
+                def train_model_background(model, timesteps):
+                    global is_training
+                    with training_lock:
+                        is_training = True
+                        model.learn(total_timesteps=timesteps, reset_num_timesteps=False)
+                        is_training = False
+                
                 while True:
                     try:
                         # Read from pipe
@@ -1039,7 +1063,7 @@ def main():
                             epsilon = rl_model.exploration_schedule(rl_model._current_progress_remaining) if hasattr(rl_model, 'exploration_schedule') else 0.1
                             
                             # Occasionally use BC model for guided exploration
-                            if random.random() < epsilon * 0.9:  # Use BC for 90% of exploration steps. 10% is random.
+                            if random.random() < epsilon * 4: 
                                 # BC-guided exploration
                                 game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
                                 with torch.no_grad():
@@ -1062,8 +1086,28 @@ def main():
                                 action = encode_action(*game_action)
                             else:
                                 # Standard RL prediction
-                                action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
-                                action = action_tensor
+                                try:
+                                    # Add batch dimension to processed_data
+                                    batched_data = np.expand_dims(processed_data, axis=0)
+                                    action_tensor, _ = rl_model.predict(batched_data, deterministic=False)
+                                    # Remove batch dimension from output
+                                    action = action_tensor.flatten() if hasattr(action_tensor, 'flatten') else action_tensor
+                                except Exception as predict_error:
+                                    print(f"Error during prediction: {predict_error}")
+                                    # Fallback to BC model if prediction fails
+                                    game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
+                                    with torch.no_grad():
+                                        bc_model = bc_model.to(device)
+                                        fire_pred, zap_pred, spinner_pred = bc_model(game_state)
+                                    
+                                    fire = 1 if fire_pred.item() > 0.5 else 0
+                                    zap = 1 if zap_pred.item() > 0.5 else 0
+                                    spinner_delta = int(round(spinner_pred.item() * 128.0))
+                                    spinner_delta = max(-128, min(127, spinner_delta))
+                                    
+                                    game_action = (fire, zap, spinner_delta)
+                                    action = encode_action(*game_action)
+                                    print("Used BC model as fallback due to prediction error")
                             
                             # Decode for use in environment and pipe
                             fire, zap, spinner_delta = decode_action(action)
@@ -1072,34 +1116,16 @@ def main():
                             # Add to custom buffer for mixed learning
                             custom_buffer.add(env.prev_state, action, reward, processed_data, done, is_bc=False)
                             
-                            # Also add directly to SB3's buffer
-                            try:
-                                # Create info dict for compatibility with newer SB3 versions
-                                info_dict = [{"terminal_observation": processed_data if done else None}]
-                                
-                                # Try with the new API that requires infos
-                                rl_model.replay_buffer.add(
-                                    np.array([env.prev_state]),
-                                    np.array([processed_data]),
-                                    np.array([[action]]),
-                                    np.array([reward]),
-                                    np.array([float(done)]),
-                                    info_dict
+                            # PPO doesn't use a replay buffer like DQN
+                            # Instead, we'll collect experiences and train periodically
+                            if frame_count % 512 == 0 and not is_attract and not is_training:
+                                # Start training in a background thread
+                                training_thread = threading.Thread(
+                                    target=train_model_background, 
+                                    args=(rl_model, 1)
                                 )
-                            except TypeError as e:
-                                if "missing 1 required positional argument: 'infos'" in str(e):
-                                    print("Detected older SB3 version, adjusting API call")
-                                    # Fallback for older SB3 versions that don't use infos
-                                    rl_model.replay_buffer.add(
-                                        np.array([env.prev_state]),
-                                        np.array([processed_data]),
-                                        np.array([[action]]),
-                                        np.array([reward]),
-                                        np.array([float(done)])
-                                    )
-                                else:
-                                    # Some other TypeError occurred, re-raise it
-                                    raise
+                                training_thread.daemon = True  # Make thread exit when main program exits
+                                training_thread.start()
                         
                         # Decode the action into fire, zap, spinner_delta values
                         fire_value, zap_value, spinner_delta = decode_action(action)
@@ -1184,14 +1210,27 @@ def main():
     print("Python AI model shutting down")
 
 def encode_action(fire, zap, spinner_delta):
-    """Encode the three actions into a single integer."""
-    return fire * 512 + zap * 256 + (spinner_delta + 128)
+    """Convert discrete actions to Box action space format."""
+    # Convert fire and zap to float values (0.0 or 1.0)
+    fire_float = float(fire)
+    zap_float = float(zap)
+    
+    # Normalize spinner_delta from [-128, 127] to [-1, 1]
+    spinner_float = spinner_delta / 128.0
+    
+    # Return as numpy array for Box action space
+    return np.array([fire_float, zap_float, spinner_float], dtype=np.float32)
 
 def decode_action(action):
-    """Decode a single integer into the three actions."""
-    fire = action // 512
-    zap = (action % 512) // 256
-    spinner_delta = (action % 256) - 128
+    """Decode Box action space to discrete actions."""
+    # Convert float values to discrete
+    fire = 1 if action[0] > 0.5 else 0
+    zap = 1 if action[1] > 0.5 else 0
+    
+    # Convert normalized spinner value back to integer range
+    spinner_delta = int(round(action[2] * 128.0))
+    spinner_delta = max(-128, min(127, spinner_delta))  # Clamp to valid range
+    
     return fire, zap, spinner_delta
 
 if __name__ == "__main__":
