@@ -586,7 +586,14 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
     total_loss.backward()
     model.optimizer.step()
     
-    return total_loss.item()
+    # Convert predictions to actions
+    fire_action = 1 if fire_pred.item() > 0.5 else 0
+    zap_action = 1 if zap_pred.item() > 0.5 else 0
+    spinner_action = int(round(spinner_pred.item() * 128.0))  # Un-normalize from [-1, 1] to [-128, 127]
+    spinner_action = max(-128, min(127, spinner_action))  # Clamp to valid range
+    
+    # Return both the loss and the predicted actions
+    return total_loss.item(), (fire_action, zap_action, spinner_action)
 
 def initialize_models():
     """Initialize both BC and RL models with robust error handling and diagnostics"""
@@ -1003,18 +1010,22 @@ def main():
                                 # Unpack the action tuple
                                 fire_target, zap_target, spinner_delta = game_action
                                 
-                                # Train the BC model with separate components
-                                loss = train_bc(bc_model, game_state, fire_target, zap_target, spinner_delta)
+                                # Train the BC model and get its predictions
+                                loss, bc_predicted_action = train_bc(bc_model, game_state, fire_target, zap_target, spinner_delta)
                                 bc_losses.append(loss)
                                 
                                 # Log progress occasionally
                                 if frame_count % 100 == 0:
                                     print(f"BC training - Frame {frame_counter}, Action: {game_action}, Loss: {loss:.6f}")
+                                    print(f"BC predicted: {bc_predicted_action}, Actual: {game_action}")
                                 
-                                # Generate action for this frame (using game's action in attract mode)
+                                # Use the BC model's prediction as the action to return to Lua
+                                game_action = bc_predicted_action
                                 action = encode_action(*game_action)
                             else:
-                                action = random.randint(0, 1023)  # Random action in the encoded space
+                                # If no game action, return zeros instead of random values
+                                game_action = (0, 0, 0)
+                                action = 0  # Encoded action for all zeros
                             
                             # Track BC episodes
                             if done:
@@ -1031,6 +1042,8 @@ def main():
                                 # BC-guided exploration
                                 game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
                                 with torch.no_grad():
+                                    # Ensure BC model is on the right device
+                                    bc_model = bc_model.to(device)
                                     fire_pred, zap_pred, spinner_pred = bc_model(game_state)
                                 
                                 # Convert predictions to actions
@@ -1045,7 +1058,7 @@ def main():
                                 game_action = (fire, zap, spinner_delta)
                                 
                                 # Encode to action index for RL model
-                                action = encode_action(fire, zap, spinner_delta)
+                                action = encode_action(*game_action)
                             else:
                                 # Standard RL prediction
                                 action_tensor, _ = rl_model.predict(processed_data, deterministic=False)
