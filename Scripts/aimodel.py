@@ -552,7 +552,10 @@ process_frame_data.last_attract_mode = True
 
 def train_bc(model, state, fire_target, zap_target, spinner_target):
     """Train the BC model using demonstration data with separate outputs"""
-    # Convert inputs to tensors
+    # Ensure model is on the correct device
+    model = model.to(device)
+    
+    # Convert inputs to tensors and ensure they're on the right device
     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
     
     # Shape the targets to match the model outputs [1, 1]
@@ -635,15 +638,16 @@ def initialize_models():
             
             # Attempt to load model with error handling
             start_time = time.time()
-            state_dict = torch.load(BC_MODEL_PATH)
+            state_dict = torch.load(BC_MODEL_PATH, map_location=device)
             
             # Optional: Validate state dict structure to prevent partial loads
-            expected_keys = {'model.0.weight', 'model.0.bias', 'model.2.weight', 'model.2.bias', 
-                            'model.4.weight', 'model.4.bias'}
-            missing_keys = expected_keys - set(state_dict.keys())
-            
-            if missing_keys:
-                raise ValueError(f"BC model is missing expected keys: {missing_keys}")
+            # expected_keys = {'fc1.weight', 'fc1.bias', 'fc2.weight', 'fc2.bias', 
+            #                 'fire_output.weight', 'fire_output.bias', 'zap_output.weight', 
+            #                 'zap_output.bias', 'spinner_output.weight', 'spinner_output.bias'}
+            # missing_keys = expected_keys - set(state_dict.keys())
+            # 
+            # if missing_keys:
+            #     raise ValueError(f"BC model is missing expected keys: {missing_keys}")
             
             # Apply state dict to model
             bc_model.load_state_dict(state_dict)
@@ -652,7 +656,7 @@ def initialize_models():
             print(f"Successfully loaded BC model from {BC_MODEL_PATH} in {load_time:.2f} seconds")
             
             # Additional validation - perform a test forward pass
-            test_input = torch.zeros(1, 243, dtype=torch.float32)
+            test_input = torch.zeros(1, 243, dtype=torch.float32).to(device)
             with torch.no_grad():
                 test_output = bc_model(test_input)
                 if test_output.shape != (1, 3):
