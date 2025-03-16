@@ -146,7 +146,7 @@ local function process_frame(params)
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
         if not open_pipes() then
-            return "pipe error"
+            return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on pipe error
         end
     end
     
@@ -162,37 +162,28 @@ local function process_frame(params)
         if pipe_out then pipe_out:close(); pipe_out = nil end
         if pipe_in then pipe_in:close(); pipe_in = nil end
         open_pipes()
-        return "write error"
+        return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on write error
     end
     
     -- Try to read from pipe, handle errors
-    local action = nil
+    local fire, zap, spinner = 0, 0, 0  -- Default values
     success, err = pcall(function()
         -- Use a timeout to avoid hanging indefinitely
         local start_time = os.time()
         local timeout = 2  -- 2 second timeout
         
-        while not action and os.time() - start_time < timeout do
+        while os.time() - start_time < timeout do
             -- Read exactly 3 bytes for the three i8 values
             local action_bytes = pipe_in:read(3)
             
             if action_bytes and #action_bytes == 3 then
                 -- Unpack the three signed 8-bit integers
-                local f, z, s = string.unpack("bbb", action_bytes)
+                fire, zap, spinner = string.unpack("bbb", action_bytes)
                 
                 -- Store the values globally for display
-                model_fire = f
-                model_zap = z  
-                model_spinner = s
-                
-                -- Set action based on model response
-                if f == 1 then
-                    action = "fire"
-                elseif z == 1 then
-                    action = "zap"
-                else
-                    action = "none"
-                end
+                model_fire = fire
+                model_zap = zap  
+                model_spinner = spinner
                 
                 break  -- Exit the loop once we've successfully read and unpacked the data
             else
@@ -208,18 +199,11 @@ local function process_frame(params)
         if pipe_out then pipe_out:close(); pipe_out = nil end
         if pipe_in then pipe_in:close(); pipe_in = nil end
         open_pipes()
-        return "read error"
+        return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on read error
     end
     
-    if not action then
-        print("Timeout waiting for Python response")
-        return "timeout"
-    end
-    
-    -- Trim any whitespace from the action
-    action = action:gsub("^%s*(.-)%s*$", "%1")
-    
-    return action
+    -- Return the three components directly
+    return fire, zap, spinner
 end
 
 -- Call this during initialization
@@ -597,37 +581,52 @@ Controls.__index = Controls
 
 function Controls:new()
     local self = setmetatable({}, Controls)
-    self.port = manager.machine.ioport.ports[":IN0"]
-    print("Input port found: " .. (self.port and "Yes" or "No"))
-    if self.port then
-        print("Fire field found: " .. (self.port.fields["Fire"] and "Yes" or "No"))
-        if self.port.fields["Fire"] then
-            print("Fire field type: " .. type(self.port.fields["Fire"]))
+
+    -- Debug: List all available ports and fields
+    for port_tag, port in pairs(manager.machine.ioport.ports) do
+        print("Port: " .. port_tag)
+        for field_name, field in pairs(port.fields) do
+            print("  Field: " .. field_name)
         end
     end
-    self.fire_field = self.port and self.port.fields["Fire"] or nil
-    self.zap_field = self.port and self.port.fields["Superzapper"] or nil
-    -- Remove left_field and right_field
+
+    -- Get button ports
+    self.button_port = manager.machine.ioport.ports[":BUTTONSP1"]
+    print("Button port found: " .. (self.button_port and "Yes" or "No"))
+    if self.button_port then
+        print("Fire field found: " .. (self.button_port.fields["P1 Button 1"] and "Yes" or "No"))
+        if self.button_port.fields["P1 Button 1"] then
+            print("Fire field type: " .. type(self.button_port.fields["P1 Button 1"]))
+        end
+    end
     
-    -- Only track commanded states for fire and zap
+    -- Get spinner/dial port
+    self.spinner_port = manager.machine.ioport.ports[":KNOBP1"]
+    print("Spinner port found: " .. (self.spinner_port and "Yes" or "No"))
+    if self.spinner_port then
+        print("Dial field found: " .. (self.spinner_port.fields["Dial"] and "Yes" or "No"))
+        if self.spinner_port.fields["Dial"] then
+            print("Dial field type: " .. type(self.spinner_port.fields["Dial"]))
+        end
+    end
+    
+    -- Set up button fields
+    self.fire_field = self.button_port and self.button_port.fields["P1 Button 1"] or nil
+    self.zap_field = self.button_port and self.button_port.fields["P1 Button 2"] or nil
+    
+    -- Set up spinner field
+    self.spinner_field = self.spinner_port and self.spinner_port.fields["Dial"] or nil
+    
+    -- Track commanded states
     self.fire_commanded = 0
     self.zap_commanded = 0
-    -- Remove left_commanded and right_commanded
-    
-    -- Add spinner value to track 
     self.spinner_delta = 0
+    
     return self
 end
 
-function Controls:apply_action(action, game_state, player_state)
-    -- Reset all physical controls to 0
-    if self.fire_field then self.fire_field:set_value(0) end
-    if self.zap_field then self.zap_field:set_value(0) end
-
-    -- Reset commanded states
-    self.fire_commanded = 0
-    self.zap_commanded = 0
-
+function Controls:apply_action(fire, zap, spinner, game_state, player_state)
+    
     -- Fix the attract mode check - bit 0x80 being CLEAR indicates attract mode
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     
@@ -654,25 +653,33 @@ function Controls:apply_action(action, game_state, player_state)
         
         -- 3. Use inferred spinner delta
         self.spinner_delta = player_state.inferredSpinnerDelta
+        
+        -- Apply spinner delta to the spinner field if it exists
+        if self.spinner_field then
+            -- The spinner field might expect a different format/scale
+            -- Adjust the value as needed for your specific game
+            self.spinner_field:set_value(50)
+        end
     else
         -- In actual gameplay, reflect the actual player state
-        self.fire_commanded = player_state.fire_detected
-        self.zap_commanded = player_state.zap_detected
+        -- self.fire_commanded = player_state.fire_detected
+        -- self.zap_commanded = player_state.zap_detected
         
-        -- For spinner, use the actual SpinnerDelta from memory
-        self.spinner_delta = player_state.SpinnerDelta
+        -- For spinner, use the model's spinner value (already set in frame_callback)
+        -- self.spinner_delta is already set
         
         -- Apply these values to the physical controls 
-        if self.fire_field then self.fire_field:set_value(self.fire_commanded) end
-        if self.zap_field then self.zap_field:set_value(self.zap_commanded) end
+        print("Applying action to physical controls: ", fire, zap, spinner)
         
-        -- In actual gameplay, we still want to apply the action from Python
-        -- This will override what we set above
-        if action == "fire" and self.fire_field then
-            self.fire_field:set_value(1)
-        elseif action == "zap" and self.zap_field then
-            self.zap_field:set_value(1)
-        end
+        self.fire_commanded = fire
+        self.zap_commanded = zap
+        self.spinner_delta = spinner
+
+        if self.fire_field then self.fire_field:set_value(fire) end
+        if self.zap_field then self.zap_field:set_value(zap) end
+        
+        mem:write_u8(0x0050, spinner)
+
     end
 end
 
@@ -833,15 +840,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         end
         binary_data = binary_data .. string.pack(">I2", encoded_value)
     end
-    
-    -- Get current game action based on the active player control (remove left/right)
-    local game_action = 4  -- Default to "none"
-    if controls.fire_commanded == 1 then
-        game_action = 0  -- "fire"
-    elseif controls.zap_commanded == 1 then
-        game_action = 1  -- "zap"
-    end
-    
+  
     -- Check if it's time to send a save signal
     local current_time = os.time()
     local save_signal = 0
@@ -871,7 +870,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     local oob_data = string.pack(">IdBBBIIBBBh", 
         1,                    -- num_values
         LastRewardState,      -- reward
-        game_action,          -- game_action
+        0,                    -- game_action
         game_state.game_mode, -- game_mode
         is_done,              -- done flag
         game_state.frame_counter, -- frame_counter
@@ -994,35 +993,33 @@ local function frame_callback()
         local frame_data
         frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
-        -- Send the serialized data to the Python script and get the response
-        local result = process_frame(frame_data)
+        -- Send the serialized data to the Python script and get the components
+        local fire, zap, spinner = process_frame(frame_data)
 
         -- Update total bytes sent
         total_bytes_sent = total_bytes_sent + #frame_data
 
-        -- Use the action from Python if valid, otherwise use none
-        if result == "fire" or result == "zap" or result == "none" then
-            action = result
-        elseif result ~= "pipe error" and result ~= "write error" and result ~= "read error" and result ~= "timeout" then
-            -- If Python returns an invalid action, use none
-            action = "none"
+       
+        -- Store spinner value for use in controls
+        controls.spinner_delta = spinner
+
+        -- Calculate FPS
+        frame_count = frame_count + 1
+        local current_time = os.time()
+        if current_time > last_fps_time then
+            current_fps = frame_count / (current_time - last_fps_time)
+            frame_count = 0
+            last_fps_time = current_time
         end
+
+        -- Update the display with the current action and metrics
+        update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
+
+        -- Apply the action to MAME controls
+        controls:apply_action(fire, zap, spinner, game_state, player_state)
     end
 
-    -- Calculate FPS
-    frame_count = frame_count + 1
-    local current_time = os.time()
-    if current_time > last_fps_time then
-        current_fps = frame_count / (current_time - last_fps_time)
-        frame_count = 0
-        last_fps_time = current_time
-    end
-
-    -- Update the display with the current action and metrics
-    update_display(status_message, game_state, level_state, player_state, enemies_state, nil, num_values, reward)
-
-    -- Apply the action to MAME controls
-    controls:apply_action(action, game_state, player_state)
+    
 
     return true
 end
