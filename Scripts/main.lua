@@ -108,13 +108,6 @@ local function calculate_reward(game_state, level_state, player_state)
         reward = reward - 100
     end
     
-    if player_state.SpinnerDelta < 10 then
-        reward = reward + 0.01
-    end
-    if player_state.SpinnerDelta == 0 then
-        reward = reward + 0.02
-    end
-
     -- 2. Score reward: Add the score delta from the last frame
     local score_delta = player_state.score - previous_score
     -- Debug output if score changes
@@ -139,6 +132,16 @@ local function calculate_reward(game_state, level_state, player_state)
     -- You could multiply by 10 to make it more significant
     reward = reward + (avg_score_per_frame)
     
+    -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 10
+
+    local spinner_abs = math.abs(player_state.SpinnerDelta)
+    local spinner_reward = 128 - spinner_abs;
+    if (game_state.game_mode == 0x20) then
+        reward = reward + spinner_reward 
+    else
+        reward = reward + spinner_reward / 10
+    end
+
     -- Update previous values for next frame
     previous_score = player_state.score
     previous_level = level_state.level_number

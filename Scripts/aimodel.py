@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 # Add imports for Stable Baselines3
-from stable_baselines3 import DQN, PPO
+from stable_baselines3 import DQN, PPO, SAC
 from stable_baselines3.common.buffers import ReplayBuffer as SB3ReplayBuffer
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
@@ -170,8 +170,8 @@ class TempestEnv(gym.Env):
         # Convert Box action to fire, zap, spinner_delta
         fire = 1 if action[0] > 0.5 else 0
         zap = 1 if action[1] > 0.5 else 0
-        spinner_delta = int(round(action[2] * 128.0))  # Scale from [-1, 1] to [-128, 127]
-        spinner_delta = max(-128, min(127, spinner_delta))  # Clamp to valid range
+        spinner_delta = int(round(action[2] * 64.0))  # Scale from [-1, 1] to [-64, 64]
+        spinner_delta = max(-64, min(64, spinner_delta))  # Clamp to valid range
         
         # Store player inputs separately
         self.player_inputs = np.array([fire, zap, spinner_delta], dtype=np.float32)
@@ -205,46 +205,25 @@ class TempestEnv(gym.Env):
         if game_action is not None:
             self.player_inputs = np.array([game_action[0], game_action[1], game_action[2]], dtype=np.float32)
         
-        self.reward = reward
+        # Add movement penalty to reward for large spinner movements
+        if game_action is not None:
+            spinner_delta = game_action[2]
+            # Penalize large movements (adjust the scaling factor as needed)
+            movement_penalty = abs(spinner_delta) * 0.001
+            original_reward = reward
+            self.reward = reward - movement_penalty
+            
+            # Log the reward modification occasionally
+            if random.random() < 0.01:  # Log 1% of the time
+                print(f"Reward modified: {original_reward:.4f} -> {self.reward:.4f} (penalty: {movement_penalty:.4f})")
+        else:
+            self.reward = reward
+        
         self.done = done
         if game_action is not None:
             self.info["game_action"] = game_action
             self.info["player_inputs"] = self.player_inputs
         return self.state
-
-class CustomReplayBuffer:
-    """Custom replay buffer that can handle both BC and RL transitions"""
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-        self.bc_buffer = deque(maxlen=capacity // 2)  # Separate buffer for BC samples
-    
-    def add(self, state, action, reward, next_state, done, is_bc=False):
-        # Store in appropriate buffer
-        if is_bc:
-            self.bc_buffer.append((state, action, reward, next_state, done))
-        else:
-            self.buffer.append((state, action, reward, next_state, done))
-    
-    def sample(self, batch_size, bc_ratio=0.3):
-        """Sample from both buffers with a given BC ratio"""
-        if len(self.bc_buffer) < batch_size * bc_ratio or len(self.buffer) < batch_size * (1 - bc_ratio):
-            # Not enough samples in one of the buffers, sample from what's available
-            all_samples = list(self.buffer) + list(self.bc_buffer)
-            if len(all_samples) < batch_size:
-                return None  # Not enough samples total
-            samples = random.sample(all_samples, batch_size)
-        else:
-            # Sample from both buffers according to the ratio
-            bc_samples = random.sample(list(self.bc_buffer), int(batch_size * bc_ratio))
-            rl_samples = random.sample(list(self.buffer), batch_size - len(bc_samples))
-            samples = bc_samples + rl_samples
-        
-        states, actions, rewards, next_states, dones = zip(*samples)
-        return (np.array(states), np.array(actions), np.array(rewards, dtype=np.float32),
-                np.array(next_states), np.array(dones, dtype=np.float32))
-    
-    def __len__(self):
-        return len(self.buffer) + len(self.bc_buffer)
 
 # Custom feature extractor for Stable Baselines3
 class TempestFeaturesExtractor(BaseFeaturesExtractor):
@@ -273,6 +252,17 @@ class BCModel(nn.Module):
         self.fire_output = nn.Linear(64, 1)    # Output for fire probability
         self.zap_output = nn.Linear(64, 1)     # Output for zap probability
         self.spinner_output = nn.Linear(64, 1) # Output for spinner delta (continuous)
+        
+        # Initialize with some randomness to ensure predictions differ from targets initially
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights with some randomness"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.01)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -573,11 +563,11 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
     fire_target = torch.FloatTensor([fire_target]).unsqueeze(1).to(device)    # Shape: [1, 1]
     zap_target = torch.FloatTensor([zap_target]).unsqueeze(1).to(device)      # Shape: [1, 1]
     
-    # Normalize spinner_target from [-128, 127] to [-1, 1]
-    spinner_target_normalized = spinner_target / 128.0
+    # Normalize spinner_target from [-64, 63] to [-1, 1]
+    spinner_target_normalized = spinner_target / 64.0
     spinner_target_tensor = torch.FloatTensor([spinner_target_normalized]).unsqueeze(1).to(device)  # Shape: [1, 1]
     
-    # Forward pass
+    # Forward pass to get predictions
     fire_pred, zap_pred, spinner_pred = model(state_tensor)
     
     # Define loss functions
@@ -598,10 +588,23 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
     model.optimizer.step()
     
     # Convert predictions to actions
-    fire_action = 1 if fire_pred.item() > 0.5 else 0
-    zap_action = 1 if zap_pred.item() > 0.5 else 0
-    spinner_action = int(round(spinner_pred.item() * 128.0))  # Un-normalize from [-1, 1] to [-128, 127]
-    spinner_action = max(-128, min(127, spinner_action))  # Clamp to valid range
+    # Add some randomness to ensure predictions can differ from targets
+    fire_prob = fire_pred.item()
+    zap_prob = zap_pred.item()
+    
+    # Use probabilities directly for binary actions
+    fire_action = 1 if fire_prob > 0.5 else 0
+    zap_action = 1 if zap_prob > 0.5 else 0
+    
+    # For spinner, use the raw prediction with some noise during training
+    spinner_value = spinner_pred.item()
+    spinner_action = int(round(spinner_value * 64.0))  # Un-normalize from [-1, 1] to [-64, 63]
+    spinner_action = max(-64, min(63, spinner_action))  # Clamp to valid range
+    
+    # Print raw prediction values occasionally for debugging
+    if random.random() < 0.01:  # 1% of the time
+        print(f"BC raw predictions - Fire: {fire_prob:.4f}, Zap: {zap_prob:.4f}, Spinner: {spinner_value:.4f}")
+        print(f"Target values - Fire: {fire_target.item():.4f}, Zap: {zap_target.item():.4f}, Spinner: {spinner_target_normalized:.4f}")
     
     # Return both the loss and the predicted actions
     return total_loss.item(), (fire_action, zap_action, spinner_action)
@@ -708,20 +711,31 @@ def initialize_models():
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,  # Save every 10000 steps
         save_path=os.path.join(MODEL_DIR, "checkpoints"),
-        name_prefix="tempest_dqn"
+        name_prefix="tempest_sac"
     )
     
     # Create our custom save-on-signal callback with BC model reference
     save_signal_callback = SaveOnSignalCallback(save_path=LATEST_MODEL_PATH, bc_model=bc_model)
     
-    # Create PPO model
-    rl_model = PPO(
+    # Create SAC model instead of PPO
+    rl_model = SAC(
         "MlpPolicy",
         env,
         policy_kwargs=policy_kwargs,
         learning_rate=0.0001,
-        # Other PPO parameters...
+        buffer_size=100000,
+        learning_starts=1000,
+        batch_size=64,  # Reduced batch size to avoid shape mismatch errors
+        tau=0.005,
+        gamma=0.99,
+        train_freq=1,
+        gradient_steps=1,
+        verbose=0,
+        device=device  # Explicitly set device
     )
+    
+    # Inspect the SAC policy to understand its structure
+    inspect_sac_policy(rl_model)
     
     # Store the model parameters before loading for comparison
     rl_model_init_params = str(rl_model.policy)
@@ -751,18 +765,28 @@ def initialize_models():
             # Attempt to load model with error handling
             start_time = time.time()
             try:
-                # Try loading as PPO first
-                loaded_model = PPO.load(LATEST_MODEL_PATH, env=env)
-            except Exception as ppo_error:
-                print(f"Could not load as PPO, trying DQN: {ppo_error}")
-                # If that fails, try loading as DQN (for backward compatibility)
-                loaded_model = DQN.load(LATEST_MODEL_PATH, env=env)
-                print("Successfully loaded DQN model, converting to PPO...")
-                # Create a new PPO model and potentially transfer some weights
-                # This is complex and might require custom code to transfer knowledge
-                # For now, we'll just use the fresh PPO model
-                print("Warning: Using fresh PPO model instead of loaded DQN model")
-                loaded_model = rl_model  # Use the fresh PPO model
+                # Try loading as SAC first
+                loaded_model = SAC.load(LATEST_MODEL_PATH, env=env)
+            except Exception as sac_error:
+                print(f"Could not load as SAC, trying PPO: {sac_error}")
+                try:
+                    # If that fails, try loading as PPO (for backward compatibility)
+                    loaded_model = PPO.load(LATEST_MODEL_PATH, env=env)
+                    print("Successfully loaded PPO model, but we're using SAC now...")
+                    print("Warning: Using fresh SAC model instead of loaded PPO model")
+                    loaded_model = rl_model  # Use the fresh SAC model
+                except Exception as ppo_error:
+                    print(f"Could not load as PPO either, trying DQN: {ppo_error}")
+                    try:
+                        # If that fails, try loading as DQN (for backward compatibility)
+                        loaded_model = DQN.load(LATEST_MODEL_PATH, env=env)
+                        print("Successfully loaded DQN model, but we're using SAC now...")
+                        print("Warning: Using fresh SAC model instead of loaded DQN model")
+                        loaded_model = rl_model  # Use the fresh SAC model
+                    except Exception as dqn_error:
+                        print(f"Could not load as DQN either: {dqn_error}")
+                        print("Using fresh SAC model due to loading errors")
+                        loaded_model = rl_model  # Use the fresh SAC model
             
             # Validate the loaded model by checking a few expected attributes
             expected_attrs = ['policy', 'replay_buffer', 'observation_space', 'action_space']
@@ -775,6 +799,10 @@ def initialize_models():
             
             # Replace our model with the loaded one
             rl_model = loaded_model
+            
+            # Inspect the loaded model's policy
+            print("\nInspecting loaded model's policy:")
+            inspect_sac_policy(rl_model)
             
             # Compare model architecture before and after loading
             rl_model_loaded_params = str(rl_model.policy)
@@ -878,6 +906,9 @@ def initialize_models():
         import traceback
         traceback.print_exc()
     
+    # Verify SAC model is properly initialized
+    check_sac_model(rl_model)
+    
     return env, bc_model, rl_model, save_signal_callback
 
 def main():
@@ -923,8 +954,8 @@ def main():
     # Initialize models and environment
     env, bc_model, rl_model, save_signal_callback = initialize_models()
     
-    # Create a custom replay buffer for mixed BC and RL transitions
-    custom_buffer = CustomReplayBuffer(capacity=100000)
+    # Verify SAC model is properly initialized
+    check_sac_model(rl_model)
     
     # Stats tracking
     bc_episodes = 0
@@ -971,13 +1002,40 @@ def main():
                 training_lock = threading.Lock()
                 is_training = False
                 
-                # Define a training function
-                def train_model_background(model, timesteps):
+                # Define a training function for background training if needed
+                def train_model_background(model, gradient_steps, batch_size):
                     global is_training
                     with training_lock:
                         is_training = True
-                        model.learn(total_timesteps=timesteps, reset_num_timesteps=False)
-                        is_training = False
+                        try:
+                            start_time = time.time()
+                            
+                            # Check if we have enough samples in the buffer
+                            buffer_size = get_buffer_size(model.replay_buffer)
+                            if buffer_size < batch_size:
+                                print(f"Not enough samples in buffer (has {buffer_size}, needs {batch_size}). Skipping training.")
+                                return
+                                
+                            # Train the SAC model with error handling
+                            try:
+                                model.train(gradient_steps=gradient_steps, batch_size=batch_size)
+                            except RuntimeError as e:
+                                if "output with shape" in str(e) and "doesn't match the broadcast shape" in str(e):
+                                    print("Caught shape mismatch error in SAC training. This is likely due to batch size issues.")
+                                    print("Trying with a smaller batch size...")
+                                    # Try with a smaller batch size
+                                    smaller_batch = min(32, buffer_size)
+                                    model.train(gradient_steps=gradient_steps, batch_size=smaller_batch)
+                                else:
+                                    raise  # Re-raise if it's not the specific error we're handling
+                            train_time = time.time() - start_time
+                            print(f"Training completed in {train_time:.4f} seconds")
+                        except Exception as e:
+                            print(f"Error during training: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        finally:
+                            is_training = False
                 
                 while True:
                     try:
@@ -1035,16 +1093,37 @@ def main():
                                 # Unpack the action tuple
                                 fire_target, zap_target, spinner_delta = game_action
                                 
+                                # Occasionally get predictions without training for comparison
+                                if frame_count % 50 == 0:
+                                    # Get predictions without training
+                                    pred_without_training = get_bc_predictions(bc_model, game_state)
+                                    print(f"BC predictions without training: {pred_without_training}")
+                                
                                 # Train the BC model and get its predictions
                                 loss, bc_predicted_action = train_bc(bc_model, game_state, fire_target, zap_target, spinner_delta)
                                 bc_losses.append(loss)
                                 
-                                # Log progress occasionally
-                                if frame_count % 100 == 0:
-                                    print(f"BC training - Frame {frame_counter}, Action: {game_action}, Loss: {loss:.6f}")
-                                    print(f"BC predicted: {bc_predicted_action}, Actual: {game_action}")
+                                # Log progress more frequently to see if predictions match
+                                if frame_count % 20 == 0:  # Increased logging frequency
+                                    print(f"BC training - Frame {frame_counter}")
+                                    print(f"  Actual action: {game_action}")
+                                    print(f"  BC predicted:  {bc_predicted_action}")
+                                    print(f"  Loss: {loss:.6f}")
+                                    
+                                    # Check if they match and log it
+                                    match = (game_action == bc_predicted_action)
+                                    print(f"  Actions match: {match}")
+                                    
+                                    # If predictions match the target too often, add some exploration
+                                    if match and random.random() < 0.2:  # 20% chance to add exploration
+                                        print("  Adding exploration to BC predictions")
+                                        # Modify spinner delta slightly to encourage exploration
+                                        spinner_noise = random.randint(-10, 10)
+                                        new_spinner = max(-64, min(63, bc_predicted_action[2] + spinner_noise))
+                                        bc_predicted_action = (bc_predicted_action[0], bc_predicted_action[1], new_spinner)
                                 
                                 # Use the BC model's prediction as the action to return to Lua
+                                # This is the key part - we're using the model's predictions
                                 game_action = bc_predicted_action
                                 action = encode_action(*game_action)
                             else:
@@ -1059,102 +1138,143 @@ def main():
                                 print(f"BC Episode {bc_episodes} completed, avg loss: {avg_loss:.6f}")
                         else:
                             # Reinforcement Learning mode
-                            # Use epsilon-greedy exploration with BC guidance
-                            epsilon = rl_model.exploration_schedule(rl_model._current_progress_remaining) if hasattr(rl_model, 'exploration_schedule') else 0.1
-                            
-                            # Occasionally use BC model for guided exploration
-                            if random.random() < epsilon * 4: 
-                                # BC-guided exploration
+                            # Predict action using SAC
+                            try:
+                                # Add batch dimension to processed_data
+                                batched_data = np.expand_dims(processed_data, axis=0)
+                                action_tensor, _ = rl_model.predict(batched_data, deterministic=False)
+                                
+                                # Debug the action tensor
+                                if frame_count % 100 == 0 or (hasattr(action_tensor, 'shape') and action_tensor.size != 3):
+                                    print(f"Raw action tensor from predict: type={type(action_tensor)}, ", end="")
+                                    if hasattr(action_tensor, 'shape'):
+                                        print(f"shape={action_tensor.shape}, size={action_tensor.size}")
+                                    else:
+                                        print(f"value={action_tensor}")
+                                
+                                # Remove batch dimension from output
+                                action = action_tensor.flatten() if hasattr(action_tensor, 'flatten') else action_tensor
+                                
+                                # Debug the flattened action
+                                if frame_count % 100 == 0 or (hasattr(action, 'size') and action.size != 3):
+                                    print(f"Flattened action: type={type(action)}, ", end="")
+                                    if hasattr(action, 'shape'):
+                                        print(f"shape={action.shape}, size={action.size}")
+                                    else:
+                                        print(f"value={action}")
+                            except Exception as predict_error:
+                                print(f"Error during prediction: {predict_error}")
+                                # Fallback to BC model if prediction fails
                                 game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
                                 with torch.no_grad():
-                                    # Ensure BC model is on the right device
                                     bc_model = bc_model.to(device)
                                     fire_pred, zap_pred, spinner_pred = bc_model(game_state)
                                 
-                                # Convert predictions to actions
                                 fire = 1 if fire_pred.item() > 0.5 else 0
                                 zap = 1 if zap_pred.item() > 0.5 else 0
-                                spinner_delta = int(round(spinner_pred.item() * 128.0))  # Un-normalize from [-1, 1] to [-128, 127]
+                                spinner_delta = int(round(spinner_pred.item() * 64.0))
+                                spinner_delta = max(-64, min(63, spinner_delta))
                                 
-                                # Clamp to valid range
-                                spinner_delta = max(-128, min(127, spinner_delta))
-                                
-                                # Set game_action for RL replay buffer and output
                                 game_action = (fire, zap, spinner_delta)
-                                
-                                # Encode to action index for RL model
                                 action = encode_action(*game_action)
-                            else:
-                                # Standard RL prediction
-                                try:
-                                    # Add batch dimension to processed_data
-                                    batched_data = np.expand_dims(processed_data, axis=0)
-                                    action_tensor, _ = rl_model.predict(batched_data, deterministic=False)
-                                    # Remove batch dimension from output
-                                    action = action_tensor.flatten() if hasattr(action_tensor, 'flatten') else action_tensor
-                                except Exception as predict_error:
-                                    print(f"Error during prediction: {predict_error}")
-                                    # Fallback to BC model if prediction fails
-                                    game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
-                                    with torch.no_grad():
-                                        bc_model = bc_model.to(device)
-                                        fire_pred, zap_pred, spinner_pred = bc_model(game_state)
-                                    
-                                    fire = 1 if fire_pred.item() > 0.5 else 0
-                                    zap = 1 if zap_pred.item() > 0.5 else 0
-                                    spinner_delta = int(round(spinner_pred.item() * 128.0))
-                                    spinner_delta = max(-128, min(127, spinner_delta))
-                                    
-                                    game_action = (fire, zap, spinner_delta)
-                                    action = encode_action(*game_action)
-                                    print("Used BC model as fallback due to prediction error")
+                                print("Used BC model as fallback due to prediction error")
                             
-                            # Decode for use in environment and pipe
+                            # Decode for game
                             fire, zap, spinner_delta = decode_action(action)
                             game_action = (fire, zap, spinner_delta)
                             
-                            # Add to custom buffer for mixed learning
-                            custom_buffer.add(env.prev_state, action, reward, processed_data, done, is_bc=False)
+                            # Optionally use BC-guided exploration
+                            epsilon = 0.1  # Adjust as needed
+                            if random.random() < epsilon * 6:  # Increased from 4 to 6 for more BC guidance
+                                game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
+                                with torch.no_grad():
+                                    fire_pred, zap_pred, spinner_pred = bc_model(game_state)
+                                fire = 1 if fire_pred.item() > 0.5 else 0
+                                zap = 1 if zap_pred.item() > 0.5 else 0
+                                spinner_delta = int(round(spinner_pred.item() * 64.0))
+                                spinner_delta = max(-64, min(63, spinner_delta))
+                                game_action = (fire, zap, spinner_delta)
+                                action = encode_action(*game_action)
                             
-                            # PPO doesn't use a replay buffer like DQN
-                            # Instead, we'll collect experiences and train periodically
-                            if frame_count % 512 == 0 and not is_attract and not is_training:
+                            # Add to SAC's replay buffer if we have previous state
+                            if env.prev_state is not None:
+                                try:
+                                    # Process the action to ensure it has the correct shape
+                                    processed_action = process_action_for_buffer(action, game_action)
+                                    
+                                    # Debug the processed action
+                                    if frame_count % 500 == 0:
+                                        print(f"Processed action for buffer: shape={processed_action.shape}, values={processed_action}")
+                                    
+                                    # Ensure states have the right shape
+                                    prev_state = env.prev_state.reshape(env.observation_space.shape)
+                                    curr_state = processed_data.reshape(env.observation_space.shape)
+                                    
+                                    # Add to SAC's replay buffer directly
+                                    rl_model.replay_buffer.add(
+                                        obs=prev_state,
+                                        next_obs=curr_state,
+                                        action=processed_action,
+                                        reward=env.reward,
+                                        done=done,
+                                        infos=[{"terminal_observation": curr_state if done else None}]
+                                    )
+                                    
+                                    # Log occasionally to verify experiences are being added
+                                    if frame_count % 500 == 0:
+                                        buffer_size = get_buffer_size(rl_model.replay_buffer)
+                                        print(f"Added experience to SAC buffer. Size: {buffer_size}")
+                                        print(f"Action: {game_action}, Reward: {env.reward:.4f}")
+                                except Exception as buffer_error:
+                                    print(f"Error adding to replay buffer: {buffer_error}")
+                                    import traceback
+                                    traceback.print_exc()
+                            
+                            # Train SAC if we have enough experiences and not currently training
+                            buffer_size = get_buffer_size(rl_model.replay_buffer)
+                            if (buffer_size > rl_model.learning_starts and 
+                                frame_count % 10 == 0 and not is_training):
                                 # Start training in a background thread
                                 training_thread = threading.Thread(
                                     target=train_model_background, 
-                                    args=(rl_model, 1)
+                                    args=(rl_model, 10, 64)  # Use smaller batch size (64) to avoid shape errors
                                 )
-                                training_thread.daemon = True  # Make thread exit when main program exits
+                                training_thread.daemon = True
                                 training_thread.start()
+                            
+                            # Log occasionally
+                            if frame_count % 100 == 0:
+                                current_time = time.time()
+                                fps = 100 / (current_time - last_frame_time)
+                                last_frame_time = current_time
+                                
+                                # Get buffer size safely
+                                buffer_size = get_buffer_size(rl_model.replay_buffer)
+                                
+                                # Log overall statistics
+                                bc_loss = np.mean(bc_losses[-100:]) if bc_losses else 0
+                                print(f"Stats: {frame_count} frames, {fps:.1f} FPS, Mode transitions: {mode_transitions}")
+                                print(f"       BC episodes: {bc_episodes}, BC loss: {bc_loss:.6f}")
+                                print(f"       RL episodes: {rl_episodes}, Buffer size: {buffer_size}")
+                                print(f"       Model save locations: {MODEL_DIR}")
                         
                         # Decode the action into fire, zap, spinner_delta values
-                        fire_value, zap_value, spinner_delta = decode_action(action)
+                        fire_value, zap_value, spinner_delta = game_action
                         
                         # Pack the three values into binary format (3 signed bytes)
                         # Using struct.pack with 'bbb' format (3 signed 8-bit integers)
                         binary_action = struct.pack("bbb", 
                                                    int(fire_value),      # 0 or 1 for fire
                                                    int(zap_value),       # 0 or 1 for zap
-                                                   int(spinner_delta))   # -128 to 127 for spinner delta
+                                                   int(spinner_delta))   # -64 to 64 for spinner delta
                         
                         # Write the binary data to the pipe
                         py_to_lua.write(binary_action)
                         py_to_lua.flush()  # Make sure data is sent immediately
                         
-                        # Calculate and display FPS occasionally
+                        # Increment frame counter
                         frame_count += 1
-                        if frame_count % 100 == 0:
-                            current_time = time.time()
-                            fps = 100 / (current_time - last_frame_time)
-                            last_frame_time = current_time
-                            
-                            # Log overall statistics
-                            bc_loss = np.mean(bc_losses[-100:]) if bc_losses else 0
-                            print(f"Stats: {frame_count} frames, {fps:.1f} FPS, Mode transitions: {mode_transitions}")
-                            print(f"       BC episodes: {bc_episodes}, BC loss: {bc_loss:.6f}")
-                            print(f"       RL episodes: {rl_episodes}, Buffer size: {len(custom_buffer)}")
-                            print(f"       Model save locations: {MODEL_DIR}")
-                    
+                        
                     except BlockingIOError:
                         # Expected in non-blocking mode
                         time.sleep(0.01)
@@ -1215,8 +1335,10 @@ def encode_action(fire, zap, spinner_delta):
     fire_float = float(fire)
     zap_float = float(zap)
     
-    # Normalize spinner_delta from [-128, 127] to [-1, 1]
-    spinner_float = spinner_delta / 128.0
+    # Normalize spinner_delta using the same reduced range as in decode_action
+    reduced_range = 64  # Must match the value in decode_action
+    spinner_float = spinner_delta / reduced_range
+    spinner_float = max(-1.0, min(1.0, spinner_float))  # Ensure it's within [-1, 1]
     
     # Return as numpy array for Box action space
     return np.array([fire_float, zap_float, spinner_float], dtype=np.float32)
@@ -1227,11 +1349,222 @@ def decode_action(action):
     fire = 1 if action[0] > 0.5 else 0
     zap = 1 if action[1] > 0.5 else 0
     
-    # Convert normalized spinner value back to integer range
-    spinner_delta = int(round(action[2] * 128.0))
-    spinner_delta = max(-128, min(127, spinner_delta))  # Clamp to valid range
+    # Reduce the effective range by scaling down
+    reduced_range = 64  # Instead of 128, use half the range
+    spinner_delta = int(round(action[2] * reduced_range))
+    spinner_delta = max(-reduced_range, min(reduced_range, spinner_delta))
     
     return fire, zap, spinner_delta
+
+def get_buffer_size(buffer):
+    """Safely get the size of a replay buffer with different SB3 versions"""
+    if buffer is None:
+        return 0
+    
+    # Try different methods to get buffer size
+    try:
+        if hasattr(buffer, 'size'):
+            return buffer.size()
+        elif hasattr(buffer, '__len__'):
+            return len(buffer)
+        elif hasattr(buffer, 'buffer_size'):
+            return buffer.buffer_size
+        elif hasattr(buffer, 'pos'):
+            # Some buffers use a position counter
+            return buffer.pos
+        else:
+            # Last resort - check if it's a dict with keys
+            if isinstance(buffer, dict) and 'observations' in buffer:
+                return len(buffer['observations'])
+            return 0
+    except Exception as e:
+        print(f"Error getting buffer size: {e}")
+        return 0
+
+def check_sac_model(model):
+    """Check if the SAC model is properly initialized and fix any issues"""
+    try:
+        # Check if the model has the necessary attributes
+        if not hasattr(model, 'replay_buffer'):
+            print("WARNING: SAC model missing replay buffer - creating one")
+            from stable_baselines3.common.buffers import ReplayBuffer
+            model.replay_buffer = ReplayBuffer(
+                buffer_size=model.buffer_size,
+                observation_space=model.observation_space,
+                action_space=model.action_space,
+                device=model.device,
+                n_envs=1,
+                optimize_memory_usage=False
+            )
+        
+        # Check if actor and critic networks are on the correct device
+        if hasattr(model, 'actor') and hasattr(model.actor, 'to'):
+            model.actor.to(model.device)
+        if hasattr(model, 'critic') and hasattr(model.critic, 'to'):
+            model.critic.to(model.device)
+        if hasattr(model, 'critic_target') and hasattr(model.critic_target, 'to'):
+            model.critic_target.to(model.device)
+        
+        # Check action space dimensions
+        if hasattr(model, 'action_space'):
+            action_shape = model.action_space.shape
+            print(f"SAC model action space shape: {action_shape}")
+            
+            # Check if action space is Box type
+            if not isinstance(model.action_space, spaces.Box):
+                print(f"WARNING: SAC model action space is not Box type: {type(model.action_space)}")
+            
+            # Check if action space has 3 dimensions
+            if action_shape != (3,):
+                print(f"WARNING: SAC model action space shape {action_shape} doesn't match expected (3,)")
+                
+                # Try to fix the action space if possible
+                try:
+                    print("Attempting to fix action space...")
+                    # Create a new action space with the correct shape
+                    model.action_space = spaces.Box(
+                        low=np.array([0.0, 0.0, -1.0]),
+                        high=np.array([1.0, 1.0, 1.0]),
+                        shape=(3,),
+                        dtype=np.float32
+                    )
+                    print(f"Fixed action space to shape {model.action_space.shape}")
+                except Exception as fix_error:
+                    print(f"Failed to fix action space: {fix_error}")
+            
+        print(f"SAC model check complete - using device: {model.device}")
+        return True
+    except Exception as e:
+        print(f"Error checking SAC model: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def get_bc_predictions(model, state):
+    """Get predictions from the BC model without training"""
+    # Ensure model is on the correct device and in eval mode
+    model = model.to(device)
+    model.eval()
+    
+    # Convert input to tensor and ensure it's on the right device
+    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    
+    # Get predictions
+    with torch.no_grad():
+        fire_pred, zap_pred, spinner_pred = model(state_tensor)
+    
+    # Convert predictions to actions
+    fire_action = 1 if fire_pred.item() > 0.5 else 0
+    zap_action = 1 if zap_pred.item() > 0.5 else 0
+    spinner_action = int(round(spinner_pred.item() * 64.0))
+    spinner_action = max(-64, min(63, spinner_action))
+    
+    # Return the predicted actions
+    return (fire_action, zap_action, spinner_action)
+
+def process_action_for_buffer(action, game_action=None):
+    """
+    Process an action to ensure it has the correct shape (3,) for the replay buffer.
+    
+    Args:
+        action: The action to process
+        game_action: Optional fallback game action tuple (fire, zap, spinner_delta)
+        
+    Returns:
+        np.ndarray: Action with shape (3,)
+    """
+    try:
+        # Convert to numpy array if it's not already
+        if not isinstance(action, np.ndarray):
+            action = np.array(action, dtype=np.float32)
+        
+        # Check if action has the correct size
+        if action.size == 3:
+            # Just ensure it has shape (3,)
+            return action.reshape(3)
+        
+        # Handle incorrect sizes
+        if action.size > 3:
+            print(f"WARNING: Action size too large ({action.size}), truncating to first 3 elements")
+            return action[:3].reshape(3)
+        elif action.size < 3:
+            print(f"WARNING: Action size too small ({action.size})")
+            if game_action is not None:
+                print("Using game_action as fallback")
+                return encode_action(*game_action)
+            else:
+                print("Creating default action [0, 0, 0]")
+                return np.zeros(3, dtype=np.float32)
+        
+    except Exception as e:
+        print(f"Error processing action: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Return a safe default action
+        if game_action is not None:
+            return encode_action(*game_action)
+        return np.zeros(3, dtype=np.float32)
+
+def inspect_sac_policy(model):
+    """
+    Inspect the SAC model's policy network to understand its structure and output dimensions.
+    
+    Args:
+        model: The SAC model to inspect
+        
+    Returns:
+        dict: Information about the policy network
+    """
+    info = {
+        "policy_type": None,
+        "action_dim": None,
+        "observation_dim": None,
+        "network_structure": None,
+        "output_layer_shape": None
+    }
+    
+    try:
+        # Get policy type
+        if hasattr(model, 'policy'):
+            info["policy_type"] = type(model.policy).__name__
+            
+            # Get action dimension
+            if hasattr(model, 'action_space'):
+                info["action_dim"] = model.action_space.shape
+            
+            # Get observation dimension
+            if hasattr(model, 'observation_space'):
+                info["observation_dim"] = model.observation_space.shape
+            
+            # Inspect network structure
+            if hasattr(model.policy, 'actor'):
+                actor = model.policy.actor
+                info["network_structure"] = str(actor)
+                
+                # Try to get output layer shape
+                if hasattr(actor, 'mu'):
+                    # For continuous actions, the mu layer gives the mean of the action distribution
+                    info["output_layer_shape"] = actor.mu.out_features
+                    
+                    # Check if this matches our expected action dimension
+                    if info["action_dim"] and info["output_layer_shape"] != info["action_dim"][0]:
+                        print(f"WARNING: Policy output dimension ({info['output_layer_shape']}) " 
+                              f"doesn't match action space dimension ({info['action_dim'][0]})")
+        
+        # Print the information
+        print("\n===== SAC POLICY INSPECTION =====")
+        for key, value in info.items():
+            print(f"{key}: {value}")
+        print("=================================\n")
+        
+        return info
+    
+    except Exception as e:
+        print(f"Error inspecting SAC policy: {e}")
+        import traceback
+        traceback.print_exc()
+        return info
 
 if __name__ == "__main__":
     # Set seed for reproducibility
