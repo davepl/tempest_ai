@@ -910,7 +910,7 @@ def main():
             lua_to_py = os.fdopen(fd, "rb")
             print("Input pipe opened successfully")
             
-            py_to_lua = open(PY_TO_LUA_PIPE, "w")
+            py_to_lua = open(PY_TO_LUA_PIPE, "wb")
             print("Output pipe opened successfully")
             
             try:
@@ -1136,11 +1136,14 @@ def main():
                                     rl_model._n_updates += 1
                         
                         # Convert action to string for sending back to Lua
-                        action_str = f"{game_action[0]} {game_action[1]} {game_action[2]}"
+                        binary_action = struct.pack("bbb", 
+                                                   int(game_action[0]),
+                                                   int(game_action[1]), 
+                                                   int(game_action[2]))
                         
-                        # Write the action back to Lua
-                        py_to_lua.write(action_str + "\n")
-                        py_to_lua.flush()
+                        # Write the binary action back to Lua through the pipe
+                        py_to_lua.write(binary_action)
+                        py_to_lua.flush()  # Ensure data is sent immed
                         
                         # Calculate and display FPS occasionally
                         frame_count += 1
