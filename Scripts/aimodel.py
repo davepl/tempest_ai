@@ -647,15 +647,6 @@ def initialize_models():
             start_time = time.time()
             state_dict = torch.load(BC_MODEL_PATH, map_location=device)
             
-            # Optional: Validate state dict structure to prevent partial loads
-            # expected_keys = {'fc1.weight', 'fc1.bias', 'fc2.weight', 'fc2.bias', 
-            #                 'fire_output.weight', 'fire_output.bias', 'zap_output.weight', 
-            #                 'zap_output.bias', 'spinner_output.weight', 'spinner_output.bias'}
-            # missing_keys = expected_keys - set(state_dict.keys())
-            # 
-            # if missing_keys:
-            #     raise ValueError(f"BC model is missing expected keys: {missing_keys}")
-            
             # Apply state dict to model
             bc_model.load_state_dict(state_dict)
             load_time = time.time() - start_time
@@ -666,6 +657,16 @@ def initialize_models():
             test_input = torch.zeros(1, 243, dtype=torch.float32).to(device)
             with torch.no_grad():
                 test_output = bc_model(test_input)
+                
+                # Handle the tuple output from BC model
+                if isinstance(test_output, tuple) and len(test_output) == 3:
+                    # Extract the individual outputs
+                    fire_pred, zap_pred, spinner_pred = test_output
+                    
+                    # Concatenate them into a single tensor for shape checking
+                    test_output = torch.cat([fire_pred, zap_pred, spinner_pred], dim=1)
+                
+                # Now we can safely check the shape
                 if test_output.shape != (1, 3):
                     raise ValueError(f"Model produced incorrect output shape: {test_output.shape}, expected (1, 3)")
             
@@ -1038,7 +1039,7 @@ def main():
                             epsilon = rl_model.exploration_schedule(rl_model._current_progress_remaining) if hasattr(rl_model, 'exploration_schedule') else 0.1
                             
                             # Occasionally use BC model for guided exploration
-                            if random.random() < epsilon / 2:  # Use BC for half of exploration steps
+                            if random.random() < epsilon * 0.9:  # Use BC for 90% of exploration steps. 10% is random.
                                 # BC-guided exploration
                                 game_state = torch.FloatTensor(processed_data).unsqueeze(0).to(device)
                                 with torch.no_grad():
