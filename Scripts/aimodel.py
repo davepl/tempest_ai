@@ -1135,15 +1135,19 @@ def main():
                                     # Increment counter but don't perform actual training
                                     rl_model._n_updates += 1
                         
-                        # Convert action to string for sending back to Lua
-                        binary_action = struct.pack("bbb", 
-                                                   int(game_action[0]),
-                                                   int(game_action[1]), 
-                                                   int(game_action[2]))
+                        # Decode the action into fire, zap, spinner_delta values
+                        fire_value, zap_value, spinner_delta = decode_action(action)
                         
-                        # Write the binary action back to Lua through the pipe
+                        # Pack the three values into binary format (3 signed bytes)
+                        # Using struct.pack with 'bbb' format (3 signed 8-bit integers)
+                        binary_action = struct.pack("bbb", 
+                                                   int(fire_value),      # 0 or 1 for fire
+                                                   int(zap_value),       # 0 or 1 for zap
+                                                   int(spinner_delta))   # -128 to 127 for spinner delta
+                        
+                        # Write the binary data to the pipe
                         py_to_lua.write(binary_action)
-                        py_to_lua.flush()  # Ensure data is sent immed
+                        py_to_lua.flush()  # Make sure data is sent immediately
                         
                         # Calculate and display FPS occasionally
                         frame_count += 1
