@@ -55,10 +55,10 @@ class TempestEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=np.float32(-1.0),
             high=np.float32(1.0),
-            shape=(243,),
+            shape=(247,),
             dtype=np.float32
         )
-        self.state = np.zeros(243, dtype=np.float32)
+        self.state = np.zeros(247, dtype=np.float32)
         self.reward = 0.0
         self.done = False
         self.is_attract_mode = False
@@ -66,7 +66,7 @@ class TempestEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.state = np.zeros(243, dtype=np.float32)
+        self.state = np.zeros(247, dtype=np.float32)
         self.reward = 0.0
         self.done = False
         self.prev_state = None
@@ -103,7 +103,7 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
         return self.feature_extractor(observations)
 
 class BCModel(nn.Module):
-    def __init__(self, input_size=243):
+    def __init__(self, input_size=247):
         super().__init__()
         self.fc1 = nn.Linear(input_size, 128)
         self.fc2 = nn.Linear(128, 64)
@@ -138,8 +138,8 @@ def process_frame_data(data):
         num_ints = len(game_data) // 2
         unpacked_data = [struct.unpack(">H", game_data[i*2:i*2+2])[0] - 32768 for i in range(num_ints)]
         normalized_data = np.array([float(x) / (32767.0 if x > 0 else 32768.0) for x in unpacked_data], dtype=np.float32)
-        if len(normalized_data) != 243:
-            normalized_data = np.pad(normalized_data, (0, 243 - len(normalized_data)), 'constant')[:243]
+        if len(normalized_data) != 247:
+            normalized_data = np.pad(normalized_data, (0, 247 - len(normalized_data)), 'constant')[:247]
         is_attract = (game_mode & 0x80) == 0
         return normalized_data, frame_counter, reward, (fire, zap, spinner), is_attract, is_done, save_signal
     except Exception as e:
@@ -169,7 +169,7 @@ def safe_add_to_buffer(buffer, obs, next_obs, action, reward, done):
         obs = np.asarray(obs).flatten()
         next_obs = np.asarray(next_obs).flatten()
         action = np.asarray(action).flatten()
-        if obs.shape != (243,) or next_obs.shape != (243,) or action.shape != (3,):
+        if obs.shape != (247,) or next_obs.shape != (247,) or action.shape != (3,):
             raise ValueError(f"Invalid shapes - obs: {obs.shape}, next_obs: {next_obs.shape}, action: {action.shape}")
         reward = float(reward)
         done = float(done)

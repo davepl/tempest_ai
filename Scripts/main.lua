@@ -492,6 +492,13 @@ function EnemiesState:new()
     self.shot_positions = {}  -- Will store nil for inactive shots
     self.pending_vid = {}  -- 64-byte table
     self.pending_seg = {}  -- 64-byte table
+    -- Enemy shot segments parameters extracted from memory address 02B5
+    self.enemy_shot_segments = {
+        { address = 0x02B5, value = 0 },
+        { address = 0x02B6, value = 0 },
+        { address = 0x02B7, value = 0 },
+        { address = 0x02B8, value = 0 }
+    }
     return self
 end
 
@@ -504,6 +511,11 @@ function EnemiesState:update(mem)
     self.active_fuseballs = mem:read_u8(0x0146)  -- n_fuseballs
     self.pulse_beat = mem:read_u8(0x0147)        -- pulse_beat counter
     self.pulsing = mem:read_u8(0x0148)          -- pulsing state
+
+    -- Update enemy shot segments from memory
+    for i = 1, 4 do
+        self.enemy_shot_segments[i].value = mem:read_u8(self.enemy_shot_segments[i].address)
+    end
 
     -- Get player position and level type for relative calculations
     local player_pos = mem:read_u8(0x0200)
@@ -796,6 +808,11 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Enemy shot positions (fixed size: 4)
     for i = 1, 4 do
         table.insert(data, enemies_state.shot_positions[i] or 0)
+    end
+    
+    -- Enemy shot segments (fixed size: 4)
+    for i = 1, 4 do
+        table.insert(data, enemies_state.enemy_shot_segments[i].value)
     end
     
     -- Additional game state (pulse beat, pulsing)
@@ -1094,6 +1111,14 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         shots_str = shots_str .. string.format("%02X-%s ", player_state.shot_positions[i], segment_str)
     end
     print("  Shot Positions: " .. shots_str)
+    
+    -- Display enemy shot segments
+    local shot_segments_str = ""
+    for i = 1, 4 do
+        shot_segments_str = shot_segments_str .. string.format("%02X ", enemies_state.enemy_shot_segments[i].value)
+    end
+    print("  Shot Segments : " .. shot_segments_str)
+    
     print("")  -- Empty line after section
 
     -- Format and print player controls at row 14
@@ -1201,18 +1226,23 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
     
-    -- Add enemy shot positions on its own line
-    local shots_str = "none"
-    local shots = {}
+    -- Add enemy shot positions in a simple fixed format
+    local shot_positions_str = ""
     for i = 1, 4 do
-        if enemies_state.shot_positions[i] then
-            table.insert(shots, string.format("%+d", enemies_state.shot_positions[i]))
-        end
+        local pos_value = enemies_state.shot_positions[i] or 0
+        -- Mask to 8 bits (0-255) to display only one byte
+        pos_value = pos_value & 0xFF
+        shot_positions_str = shot_positions_str .. string.format("%02X ", pos_value)
     end
-    if #shots > 0 then
-        shots_str = table.concat(shots, " ")
+    print("  Shot Positions: " .. shot_positions_str)
+    
+    -- Display enemy shot segments
+    local shot_segments_str = ""
+    for i = 1, 4 do
+        shot_segments_str = shot_segments_str .. string.format("%02X ", enemies_state.enemy_shot_segments[i].value)
     end
-    print("  Shot Positions: " .. shots_str)
+    print("  Shot Segments : " .. shot_segments_str)
+    
     print("")  -- Empty line after section
 
     -- Display pending_vid (64 bytes)
