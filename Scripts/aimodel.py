@@ -95,8 +95,8 @@ class TempestEnv(gym.Env):
     def step(self, action):
         fire = 1 if action[0] > 0.5 else 0
         zap = 1 if action[1] > 0.5 else 0
-        spinner_delta = int(round(action[2] * 64.0))
-        spinner_delta = max(-64, min(64, spinner_delta))
+        spinner_delta = int(round(action[2] * 128.0))
+        spinner_delta = max(-128, min(127, spinner_delta))
         self.player_inputs = np.array([fire, zap, spinner_delta], dtype=np.float32)
         self.episode_step += 1
         self.total_reward += self.reward
@@ -684,8 +684,7 @@ def initialize_models():
 
 def patch_critic_network(model):
     """
-    Patch the critic network to handle array indexing issues.
-    This is a direct fix for the "too many indices for array" error.
+    Simplified patch for the critic network to handle array indexing issues.
     """
     if model is None or not hasattr(model, 'critic') or not hasattr(model.critic, 'forward'):
         return False
@@ -697,23 +696,16 @@ def patch_critic_network(model):
         # Define a safe forward method
         def safe_forward(obs, actions):
             try:
-                # Ensure inputs have the right shape
-                if len(obs.shape) > 2:
-                    obs = obs.reshape(obs.shape[0], -1)
-                if len(actions.shape) > 2:
-                    actions = actions.reshape(actions.shape[0], -1)
-                
                 # Call the original forward method
                 return original_forward(obs, actions)
             except IndexError as e:
                 if "too many indices for array" in str(e):
                     print("Handling array indexing issue in critic network...")
-                    # Try to reshape the inputs more aggressively
+                    # Only reshape if absolutely necessary
                     if len(obs.shape) > 2:
-                        obs = obs.reshape(-1, model.observation_space.shape[0])
+                        obs = obs.reshape(obs.shape[0], -1)
                     if len(actions.shape) > 2:
-                        actions = actions.reshape(-1, model.action_space.shape[0])
-                    
+                        actions = actions.reshape(actions.shape[0], -1)
                     # Try again with reshaped inputs
                     return original_forward(obs, actions)
                 else:
@@ -721,34 +713,6 @@ def patch_critic_network(model):
         
         # Replace the forward method
         model.critic.forward = safe_forward
-        
-        # Also patch the qf1 and qf2 networks if they exist
-        for qf_name in ['qf1', 'qf2']:
-            if hasattr(model.critic, qf_name) and hasattr(getattr(model.critic, qf_name), 'forward'):
-                qf = getattr(model.critic, qf_name)
-                original_qf_forward = qf.forward
-                
-                def safe_qf_forward(x):
-                    try:
-                        # Ensure input has the right shape
-                        if len(x.shape) > 2:
-                            x = x.reshape(x.shape[0], -1)
-                        
-                        # Call the original forward method
-                        return original_qf_forward(x)
-                    except IndexError as e:
-                        if "too many indices for array" in str(e):
-                            print(f"Handling array indexing issue in {qf_name}...")
-                            # Try to reshape the input more aggressively
-                            x = x.reshape(-1, x.shape[-1])
-                            
-                            # Try again with reshaped input
-                            return original_qf_forward(x)
-                        else:
-                            raise
-                
-                # Replace the forward method
-                qf.forward = safe_qf_forward
         
         print("Successfully patched critic network")
         return True
@@ -906,6 +870,7 @@ def main():
         os.mkfifo(pipe_path)
         os.chmod(pipe_path, 0o666)
     print("Pipes created successfully. Waiting for Lua connection...")
+
     
     # Connection retry loop
     while True:
@@ -913,7 +878,10 @@ def main():
             fd = os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK)
             lua_to_py = os.fdopen(fd, "rb")
             py_to_lua = open(PY_TO_LUA_PIPE, "wb")
-            
+
+            # Add a debug message with a checkmark when Lua connects
+            print("✔️ Lua has connected successfully.")
+
             try:
                 frame_count = 0
                 last_frame_time = time.time()

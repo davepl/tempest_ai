@@ -135,11 +135,8 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 10
 
     local spinner_abs = math.abs(player_state.SpinnerDelta)
-    local spinner_reward = 128 - spinner_abs;
-    if (game_state.game_mode == 0x20) then
-        reward = reward + spinner_reward 
-    else
-        reward = reward + spinner_reward / 10
+    if (spinner_abs < 9) then
+        reward = reward + 10
     end
 
     -- Update previous values for next frame
@@ -187,16 +184,23 @@ local function process_frame(params)
             -- Read exactly 3 bytes for the three i8 values
             local action_bytes = pipe_in:read(3)
             
-            if action_bytes and #action_bytes == 3 then
-                -- Unpack the three signed 8-bit integers
-                fire, zap, spinner = string.unpack("bbb", action_bytes)
-                
-                -- Store the values globally for display
-                model_fire = fire
-                model_zap = zap  
-                model_spinner = spinner
-                
-                break  -- Exit the loop once we've successfully read and unpacked the data
+            if action_bytes then
+                -- Check if we got all 3 bytes
+                if #action_bytes == 3 then
+                    -- Unpack the three signed 8-bit integers
+                    fire, zap, spinner = string.unpack("bbb", action_bytes)
+                    
+                    -- Store the values globally for display
+                    model_fire = fire
+                    model_zap = zap  
+                    model_spinner = spinner
+                    
+                    break  -- Exit the loop once we've successfully read and unpacked the data
+                else
+                    print("Warning: Received incomplete data: " .. #action_bytes .. " bytes instead of 3")
+                    -- Use default values (already set above)
+                    break
+                end
             else
                 -- Sleep briefly to avoid busy-waiting
                 os.execute("sleep 0.01")
@@ -229,7 +233,7 @@ local function start_python_script()
     -- Remove existing pipes to ensure clean state
     -- os.execute("rm -f /tmp/lua_to_py /tmp/py_to_lua")
     
-    os.execute("rm -f /Users/dave/source/repos/tempest/Scripts/models/*")
+    -- os.execute("rm -f /Users/dave/source/repos/tempest/Scripts/models/*")
 
     -- Launch Python script in the background with proper error handling
     local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
@@ -637,7 +641,6 @@ function Controls:new()
 end
 
 function Controls:apply_action(fire, zap, spinner, game_state, player_state)
-    
     -- Fix the attract mode check - bit 0x80 being CLEAR indicates attract mode
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     
@@ -649,15 +652,6 @@ function Controls:apply_action(fire, zap, spinner, game_state, player_state)
         -- Now set the physical control if it exists
         if self.fire_field then 
             self.fire_field:set_value(1)
-            -- Debug output
-            if game_state.frame_counter % 60 == 0 then
-                print("Setting fire to true in attract mode")
-            end
-        else
-            -- Add debug to check if fire_field is missing
-            if game_state.frame_counter % 300 == 0 then
-                print("WARNING: fire_field is nil, but fire_commanded is still set to 1 in attract mode")
-            end
         end
         
         -- 2. Zap is always false (already set to 0 above)
@@ -921,7 +915,7 @@ local function frame_callback()
     mem:write_direct_u8(0xA592, 0xEA)
 
     -- Increase the maximum level for demo mode
-    mem:write_direct_u8(0x9196, 0x3F)
+    mem:write_direct_u8(0x9196, 0x0F)
 
 
     -- Update all state objects
@@ -943,16 +937,8 @@ local function frame_callback()
 
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
-    -- When the game zooms down the tube, reset lives to 5
-
-
-    if game_state.gamestate == 0x20 then
-        mem:write_direct_u8(0x0048, 0x05)
-    end
-
-    if is_attract_mode then
-        mem:write_direct_u8(0x0048, 0x03)
-    end
+    -- Four lives at all times
+    mem:write_direct_u8(0x0048, 0x04)
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
