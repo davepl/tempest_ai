@@ -238,8 +238,7 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
     model.optimizer.step()
     fire_action = 1 if fire_pred.item() > 0.5 else 0
     zap_action = 1 if zap_pred.item() > 0.5 else 0
-    spinner_action = int(round(spinner_pred.item() * 64.0))
-    spinner_action = max(-64, min(63, spinner_action))
+    spinner_action = int(round(spinner_pred.item() * 128.0))
     return total_loss.item(), (fire_action, zap_action, spinner_action)
 
 def get_buffer_size(buffer):
