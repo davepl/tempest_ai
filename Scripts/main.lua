@@ -32,6 +32,9 @@
 package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
+-- Check command line arguments for -logonly mode
+local LOG_ONLY_MODE = true
+
 local function clear_screen()
     io.write("\027[2J\027[H")
 end
@@ -44,6 +47,8 @@ end
 -- Global pipe variables
 local pipe_out = nil
 local pipe_in = nil
+-- Log file for storing frame data
+local log_file = nil
 
 -- Function to open pipes (called once at startup)
 local function open_pipes()
@@ -68,6 +73,19 @@ local function open_pipes()
         return false
     end
     
+    -- Open log file for appending in binary mode
+    if not log_file then
+        local log_success, log_err = pcall(function()
+            log_file = io.open("tempest.log", "ab")
+        end)
+        
+        if not log_success or not log_file then
+            print("Warning: Failed to open log file: " .. tostring(log_err))
+        else
+            print("Opened log file for frame data recording")
+        end
+    end
+    
     return true
 end
 
@@ -90,6 +108,8 @@ local shutdown_requested = false
 local model_fire = 0
 local model_zap = 0
 local model_spinner = 0
+local last_display_update = 0  -- Timestamp of last display update
+local DISPLAY_UPDATE_INTERVAL = 0.1  -- Update display every 0.1 seconds (10 times per second)
 
 -- Function to calculate reward for the current frame
 local function calculate_reward(game_state, level_state, player_state)
@@ -151,11 +171,55 @@ end
 
 -- Function to send parameters and get action each frame
 local function process_frame(params)
+    -- In log-only mode, we only write to the log file and don't communicate with Python
+    if LOG_ONLY_MODE then
+        -- Log the frame data to file
+        if log_file then
+            pcall(function()
+                -- Get the size of the header in bytes (fixed at 8 bytes for now)
+                local header_size = 8
+                -- Get the size of the payload in bytes
+                local payload_size = #params
+                
+                -- Write 32-bit header size
+                log_file:write(string.pack(">I4", header_size))
+                -- Write 32-bit count of bytes to follow
+                log_file:write(string.pack(">I4", payload_size))
+                -- Write the raw data
+                log_file:write(params)
+                -- Flush to ensure it's written
+                log_file:flush()
+            end)
+        end
+        
+        -- Return default actions in log-only mode (typically no actions)
+        return 0, 0, 0
+    end
+    
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
         if not open_pipes() then
             return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on pipe error
         end
+    end
+    
+    -- Log the frame data to file before sending
+    if log_file then
+        pcall(function()
+            -- Get the size of the header in bytes (fixed at 8 bytes for now)
+            local header_size = 8
+            -- Get the size of the payload in bytes
+            local payload_size = #params
+            
+            -- Write 32-bit header size
+            log_file:write(string.pack(">I4", header_size))
+            -- Write 32-bit count of bytes to follow
+            log_file:write(string.pack(">I4", payload_size))
+            -- Write the raw data
+            log_file:write(params)
+            -- Flush to ensure it's written
+            log_file:flush()
+        end)
     end
     
     -- Try to write to pipe, handle errors
@@ -216,6 +280,24 @@ end
 
 -- Call this during initialization
 local function start_python_script()
+    -- In log-only mode, we don't need to start the Python script
+    if LOG_ONLY_MODE then
+        print("Log-only mode: Skipping Python script startup")
+        
+        -- Still open the log file
+        local log_success, log_err = pcall(function()
+            log_file = io.open("tempest.log", "ab")
+        end)
+        
+        if not log_success or not log_file then
+            print("Warning: Failed to open log file: " .. tostring(log_err))
+        else
+            print("Opened log file for frame data recording")
+        end
+        
+        return true  -- Return success
+    end
+    
     -- print("Starting Python script")
     
     -- Comment these out if you're trying to debug the Python side...
@@ -949,7 +1031,17 @@ local function frame_callback()
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
     -- Four lives at all times
-    mem:write_direct_u8(0x0048, 0x04)
+    -- mem:write_direct_u8(0x0048, 0x04)
+
+    -- In attract mode, zero the score if we're dead or zooming down the tube
+    
+    if is_attract_mode then
+        if game_state.gamestate == 0x06 or game_state.gamestate == 0x20 then
+            mem:write_direct_u8(0x0040, 0x00)
+            mem:write_direct_u8(0x0041, 0x00)
+            mem:write_direct_u8(0x0042, 0x00)
+        end
+    end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
@@ -1009,8 +1101,16 @@ local function frame_callback()
             last_fps_time = current_time
         end
 
-        -- Update the display with the current action and metrics
-        update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
+        -- In LOG_ONLY_MODE, limit display updates to 10 times per second
+        local current_time_high_res = os.clock()
+        local should_update_display = not LOG_ONLY_MODE or 
+                                     (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
+
+        if should_update_display then
+            -- Update the display with the current action and metrics
+            update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
+            last_display_update = current_time_high_res
+        end
 
         -- Apply the action to MAME controls
         controls:apply_action(fire, zap, spinner, game_state, player_state)
@@ -1040,7 +1140,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Bytes Sent", total_bytes_sent},
         {"FPS", string.format("%.2f", current_fps)},
         {"Payload Size", num_values},
-        {"Last Reward", string.format("%.2f", LastRewardState)}  -- Add last reward to game metrics
+        {"Last Reward", string.format("%.2f", LastRewardState)},  -- Add last reward to game metrics
+        {"Log Only Mode", LOG_ONLY_MODE and "ENABLED" or "OFF"}   -- Show log-only mode status
     }
     
     -- Print game metrics in 3 columns
@@ -1289,6 +1390,13 @@ local function on_mame_exit()
     if pipe_out then pipe_out:close() end
     if pipe_in then pipe_in:close() end
     print("Pipes closed during MAME shutdown")
+    
+    -- Close log file
+    if log_file then
+        log_file:close()
+        log_file = nil
+        print("Log file closed during MAME shutdown")
+    end
 end
 
 -- Start the Python script but don't wait for pipes to open

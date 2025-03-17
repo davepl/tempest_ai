@@ -9,4 +9,4 @@ Adjust the path on this command line, and in the main.lua code that launches pyt
 
 Example command line to run mame.  Assumes you're in the mame folder and that roms is a subdir of current:
 
-mame tempest1 -autoboot_script ~/source/repos/tempest/Scripts/main.lua -skip_gameinfo -nothrottle -sound none
+mame tempest1 -skip_gameinfo -nothrottle -sound none -autoboot_script ~/source/repos/tempest/Scripts/main.lua
