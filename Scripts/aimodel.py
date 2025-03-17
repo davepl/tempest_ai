@@ -2,13 +2,16 @@
 """
 Tempest AI Model with BC-to-RL Transition
 Author: Dave Plummer (davepl) and various AI assists
-Date: 2023-03-06 (Updated)
+Date: 2025-03-06 (Updated)
 
 This script implements a hybrid AI model for Tempest:
 1. Uses Behavioral Cloning (BC) during attract mode to learn from the game's AI
 2. Switches to Reinforcement Learning (RL) during gameplay
 """
 
+### Imports and Environment Setup
+# Imports libraries for math, file I/O, RL, and neural networks; sets up PyTorch device and file paths.
+# Essential for enabling the hybrid BC-RL approach and communication with the game via pipes.
 import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import sys
@@ -38,6 +41,8 @@ BC_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_bc_model.pt")
 device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 ### Environment Definition
+# Defines a custom Gym environment for Tempest with action/observation spaces.
+# Necessary to interface the game with RL algorithms and handle state transitions.
 class TempestEnv(gym.Env):
     def __init__(self):
         super().__init__()
@@ -82,6 +87,8 @@ class TempestEnv(gym.Env):
         return self.state
 
 ### Feature Extractor and Models
+# Custom feature extractor and BC model for processing game states and cloning AI behavior.
+# Supports RL feature extraction and BC learning from attract mode demonstrations.
 class TempestFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=128):
         super().__init__(observation_space, features_dim)
@@ -118,6 +125,8 @@ class BCModel(nn.Module):
         return fire, zap, spinner
 
 ### Utility Functions
+# Helper functions for data processing, BC training, buffer management, and model compatibility.
+# Ensures smooth data flow between Lua and Python, and robust model training.
 def process_frame_data(data):
     if len(data) < 24:
         return None, 0, 0.0, None, False, False
@@ -140,7 +149,6 @@ def process_frame_data(data):
 def train_bc(model, state, fire_target, zap_target, spinner_target):
     model = model.to(device)
     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-    # Fix target shapes to (1, 1) to match model output
     fire_target = torch.tensor([[float(fire_target)]], dtype=torch.float32).to(device)
     zap_target = torch.tensor([[float(zap_target)]], dtype=torch.float32).to(device)
     spinner_target = torch.tensor([[float(spinner_target) / 64.0]], dtype=torch.float32).to(device)
@@ -194,6 +202,8 @@ def apply_minimal_compatibility_patches(model):
         print(f"Warning: Failed to apply compatibility patches: {e}")
 
 ### Initialization and Main Loop
+# Sets up models, runs the main training/inference loop, and handles I/O with the game.
+# Orchestrates the hybrid BC-RL logic and ensures persistent model state.
 def initialize_models():
     env = TempestEnv()
     bc_model = BCModel().to(device)
@@ -271,6 +281,7 @@ def main():
                     else:
                         try:
                             action, _ = rl_model.predict(processed_data, deterministic=False)
+                            action = action.flatten()
                         except Exception as e:
                             print(f"Prediction error: {e}")
                             fire, zap, spinner = bc_model(torch.FloatTensor(processed_data).unsqueeze(0).to(device))
