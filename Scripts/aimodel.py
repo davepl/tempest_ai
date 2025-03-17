@@ -214,14 +214,16 @@ def process_frame_data(data):
             normalized_data = padded_data
         elif len(normalized_data) > expected_size:
             normalized_data = normalized_data[:expected_size]
-        return normalized_data, frame_counter, reward, (fire_commanded, zap_commanded, spinner_delta), is_attract, is_done, save_signal
+        # Ensure observation has correct shape (243,)
+        return normalized_data.reshape(243), frame_counter, reward, (fire_commanded, zap_commanded, spinner_delta), is_attract, is_done, save_signal
     except Exception as e:
         print(f"Error processing frame data: {e}")
         return None, 0, 0.0, None, False, False, False
 
 def train_bc(model, state, fire_target, zap_target, spinner_target):
     model = model.to(device)
-    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    # Ensure state has correct shape (243,)
+    state_tensor = torch.FloatTensor(state.reshape(243)).unsqueeze(0).to(device)
     fire_target = torch.FloatTensor([fire_target]).unsqueeze(1).to(device)
     zap_target = torch.FloatTensor([zap_target]).unsqueeze(1).to(device)
     spinner_target_normalized = spinner_target / 64.0
@@ -263,16 +265,8 @@ def get_buffer_size(buffer):
         print(f"Error getting buffer size: {e}")
         return 0
 
-def process_action_for_buffer(action, game_action=None):
-    """Process action to ensure it has the correct shape for the replay buffer
-    
-    Args:
-        action: The action to process
-        game_action: Optional game action tuple (fire, zap, spinner) to use as reference
-        
-    Returns:
-        Processed action with shape (3,)
-    """
+def normalize_action(action, game_action=None):
+    """Normalize action to ensure it has shape (3,) regardless of input format"""
     # If action is already a numpy array with the right shape, return it
     if isinstance(action, np.ndarray) and action.shape == (3,):
         return action
@@ -289,335 +283,67 @@ def process_action_for_buffer(action, game_action=None):
     if game_action is not None and len(game_action) == 3:
         return np.array(game_action, dtype=np.float32)
     
-    # If action is a numpy array with wrong size
-    if isinstance(action, np.ndarray):
-        # Create a new array with the right shape
-        result = np.zeros(3, dtype=np.float32)
-        # Copy as many elements as possible
-        size = min(action.size, 3)
-        result[:size] = action.flatten()[:size]
-        return result
-    
-    # Default: return zeros
-    print(f"Warning: Could not process action {action}, returning zeros")
+    # Default: return zeros and log warning
+    print(f"Warning: Could not normalize action {action}, returning zeros")
     return np.zeros(3, dtype=np.float32)
 
-def ensure_correct_array_dimensions(buffer):
+def ensure_buffer_consistency(buffer):
     """
-    Ensure all arrays in the replay buffer have the correct dimensions.
-    This helps prevent "too many indices for array" errors during training.
+    Ensure replay buffer arrays have consistent dimensions.
+    Only called once during initialization, not repeatedly.
     """
-    if buffer is None:
+    if buffer is None or not hasattr(buffer, 'observations'):
         return
     
     try:
-        # Check if buffer has the necessary attributes
-        required_attrs = ['observations', 'actions', 'next_observations', 'rewards', 'dones']
-        for attr in required_attrs:
-            if not hasattr(buffer, attr):
-                print(f"Buffer missing attribute: {attr}")
-                return
-        
         buffer_size = len(buffer.observations)
-        print(f"Checking replay buffer dimensions. Size: {buffer_size}")
         
-        # Fix observations
-        if len(buffer.observations.shape) != 2 or buffer.observations.shape[1] != 243:
-            print(f"Fixing observations shape: {buffer.observations.shape}")
-            fixed_obs = np.zeros((buffer_size, 243), dtype=np.float32)
-            for i in range(buffer_size):
-                if i < len(buffer.observations):
-                    obs = buffer.observations[i]
-                    if obs.size == 243:
-                        fixed_obs[i] = obs.flatten()
-                    else:
-                        # Pad or truncate
-                        fixed_obs[i, :min(obs.size, 243)] = obs.flatten()[:min(obs.size, 243)]
-            buffer.observations = fixed_obs
+        # Only log and fix if actually needed
+        needs_fix = False
         
-        # Fix next_observations
-        if len(buffer.next_observations.shape) != 2 or buffer.next_observations.shape[1] != 243:
-            print(f"Fixing next_observations shape: {buffer.next_observations.shape}")
-            fixed_next_obs = np.zeros((buffer_size, 243), dtype=np.float32)
-            for i in range(buffer_size):
-                if i < len(buffer.next_observations):
-                    next_obs = buffer.next_observations[i]
-                    if next_obs.size == 243:
-                        fixed_next_obs[i] = next_obs.flatten()
-                    else:
-                        # Pad or truncate
-                        fixed_next_obs[i, :min(next_obs.size, 243)] = next_obs.flatten()[:min(next_obs.size, 243)]
-            buffer.next_observations = fixed_next_obs
+        # Check observations shape
+        if hasattr(buffer, 'observations') and (len(buffer.observations.shape) != 2 or buffer.observations.shape[1] != 243):
+            needs_fix = True
         
-        # Fix actions
-        if len(buffer.actions.shape) != 2 or buffer.actions.shape[1] != 3:
-            print(f"Fixing actions shape: {buffer.actions.shape}")
-            fixed_actions = np.zeros((buffer_size, 3), dtype=np.float32)
-            for i in range(buffer_size):
-                if i < len(buffer.actions):
-                    action = buffer.actions[i]
-                    if action.size == 3:
-                        fixed_actions[i] = action.flatten()
-                    else:
-                        # Pad or truncate
-                        fixed_actions[i, :min(action.size, 3)] = action.flatten()[:min(action.size, 3)]
-            buffer.actions = fixed_actions
+        # Check actions shape
+        if hasattr(buffer, 'actions') and (len(buffer.actions.shape) != 2 or buffer.actions.shape[1] != 3):
+            needs_fix = True
         
-        # Fix rewards
-        if len(buffer.rewards.shape) != 1 or buffer.rewards.shape[0] != buffer_size:
-            print(f"Fixing rewards shape: {buffer.rewards.shape}")
-            fixed_rewards = np.zeros(buffer_size, dtype=np.float32)
-            for i in range(min(buffer_size, len(buffer.rewards))):
-                # Ensure we're getting a scalar value
-                reward_value = buffer.rewards[i]
-                if hasattr(reward_value, 'item'):
-                    reward_value = reward_value.item()
-                elif hasattr(reward_value, 'size') and reward_value.size > 1:
-                    reward_value = reward_value.flatten()[0]
-                fixed_rewards[i] = reward_value
-            buffer.rewards = fixed_rewards
+        if needs_fix:
+            print(f"Fixing replay buffer dimensions. Size: {buffer_size}")
+            
+            # Fix observations
+            if hasattr(buffer, 'observations') and (len(buffer.observations.shape) != 2 or buffer.observations.shape[1] != 243):
+                fixed_obs = np.zeros((buffer_size, 243), dtype=np.float32)
+                for i in range(buffer_size):
+                    if i < len(buffer.observations):
+                        obs = buffer.observations[i]
+                        fixed_obs[i] = obs.flatten()[:243] if obs.size >= 243 else np.pad(obs.flatten(), (0, 243 - min(obs.size, 243)))
+                buffer.observations = fixed_obs
+            
+            # Fix next_observations
+            if hasattr(buffer, 'next_observations') and (len(buffer.next_observations.shape) != 2 or buffer.next_observations.shape[1] != 243):
+                fixed_next_obs = np.zeros((buffer_size, 243), dtype=np.float32)
+                for i in range(buffer_size):
+                    if i < len(buffer.next_observations):
+                        next_obs = buffer.next_observations[i]
+                        fixed_next_obs[i] = next_obs.flatten()[:243] if next_obs.size >= 243 else np.pad(next_obs.flatten(), (0, 243 - min(next_obs.size, 243)))
+                buffer.next_observations = fixed_next_obs
+            
+            # Fix actions
+            if hasattr(buffer, 'actions') and (len(buffer.actions.shape) != 2 or buffer.actions.shape[1] != 3):
+                fixed_actions = np.zeros((buffer_size, 3), dtype=np.float32)
+                for i in range(buffer_size):
+                    if i < len(buffer.actions):
+                        action = buffer.actions[i]
+                        # Normalize action to shape (3,)
+                        fixed_actions[i] = normalize_action(action).flatten()[:3]
+                buffer.actions = fixed_actions
+            
+            print("Replay buffer dimensions fixed")
         
-        # Fix dones
-        if len(buffer.dones.shape) != 1 or buffer.dones.shape[0] != buffer_size:
-            print(f"Fixing dones shape: {buffer.dones.shape}")
-            fixed_dones = np.zeros(buffer_size, dtype=np.float32)
-            for i in range(min(buffer_size, len(buffer.dones))):
-                # Ensure we're getting a scalar value
-                done_value = buffer.dones[i]
-                if hasattr(done_value, 'item'):
-                    done_value = done_value.item()
-                elif hasattr(done_value, 'size') and done_value.size > 1:
-                    done_value = done_value.flatten()[0]
-                fixed_dones[i] = done_value
-            buffer.dones = fixed_dones
-        
-        print("Replay buffer dimensions fixed")
     except Exception as e:
         print(f"Error fixing buffer dimensions: {e}")
-
-def fix_replay_buffer_shapes(buffer):
-    """Fix inconsistent action shapes in the replay buffer"""
-    if buffer is None or not hasattr(buffer, 'actions') or len(buffer.actions) == 0:
-        return
-    
-    # First ensure all arrays have correct dimensions
-    ensure_correct_array_dimensions(buffer)
-    
-    # Check if we need to fix shapes
-    need_fixing = False
-    expected_shape = (3,)  # Expected shape for our action space
-    
-    # Sample some actions to check their shapes
-    sample_indices = np.random.choice(len(buffer.actions), min(100, len(buffer.actions)), replace=False)
-    for idx in sample_indices:
-        action = buffer.actions[idx]
-        if len(action.shape) != 1 or action.shape[0] != 3:
-            need_fixing = True
-            break
-    
-    if need_fixing:
-        print(f"Fixing replay buffer action shapes. Buffer size: {len(buffer.actions)}")
-        fixed_actions = []
-        
-        for i in range(len(buffer.actions)):
-            action = buffer.actions[i]
-            
-            # Process the action to ensure correct shape
-            if len(action.shape) != 1 or action.shape[0] != 3:
-                if action.size == 3:
-                    # Reshape to (3,)
-                    fixed_action = action.flatten()
-                elif action.size > 3:
-                    # Take first 3 elements
-                    fixed_action = action.flatten()[:3]
-                else:
-                    # Pad with zeros
-                    fixed_action = np.zeros(3, dtype=np.float32)
-                    fixed_action[:action.size] = action.flatten()
-            else:
-                fixed_action = action
-            
-            fixed_actions.append(fixed_action)
-        
-        # Replace the actions in the buffer
-        buffer.actions = np.array(fixed_actions)
-        print(f"Fixed {len(fixed_actions)} actions in replay buffer")
-
-def convert_buffer_to_compatible_format(model):
-    """
-    Convert the replay buffer to a compatible format if needed.
-    This is useful when loading a model trained with a different version of SB3.
-    """
-    if model is None or not hasattr(model, 'replay_buffer'):
-        return
-    
-    buffer = model.replay_buffer
-    
-    try:
-        # Check if we need to convert the buffer
-        if not hasattr(buffer, 'observations') or not hasattr(buffer, 'actions'):
-            print("Replay buffer format not recognized, skipping conversion")
-            return
-        
-        # Get buffer size
-        buffer_size = get_buffer_size(buffer)
-        if buffer_size == 0:
-            print("Empty replay buffer, nothing to convert")
-            return
-        
-        print(f"Converting replay buffer with {buffer_size} experiences to compatible format")
-        
-        # Create a new buffer with the same parameters
-        from stable_baselines3.common.buffers import ReplayBuffer
-        
-        # Get the observation and action space from the model
-        observation_space = model.observation_space
-        action_space = model.action_space
-        
-        # Create a new buffer
-        new_buffer = ReplayBuffer(
-            buffer_size=buffer.buffer_size if hasattr(buffer, 'buffer_size') else buffer_size,
-            observation_space=observation_space,
-            action_space=action_space,
-            device=model.device if hasattr(model, 'device') else 'cpu',
-            n_envs=1,
-            optimize_memory_usage=False
-        )
-        
-        # Copy data from old buffer to new buffer
-        for i in range(buffer_size):
-            # Get data from old buffer
-            obs = buffer.observations[i].reshape(observation_space.shape)
-            next_obs = buffer.next_observations[i].reshape(observation_space.shape)
-            
-            # Process action to ensure correct shape
-            action = buffer.actions[i]
-            if len(action.shape) != 1 or action.shape[0] != action_space.shape[0]:
-                action = action.flatten()[:action_space.shape[0]]
-            
-            # Get reward and done
-            reward = buffer.rewards[i]
-            if hasattr(reward, 'item'):
-                reward = reward.item()
-            
-            done = buffer.dones[i]
-            if hasattr(done, 'item'):
-                done = done.item()
-            
-            # Add to new buffer
-            safe_add_to_buffer(new_buffer, obs, next_obs, action, reward, done)
-        
-        # Replace old buffer with new buffer
-        model.replay_buffer = new_buffer
-        print("Replay buffer successfully converted")
-        
-    except Exception as e:
-        print(f"Error converting replay buffer: {e}")
-
-def create_clean_replay_buffer(model):
-    """
-    Create a new clean replay buffer and safely transfer data from the old one.
-    This is a more aggressive approach to fixing replay buffer issues.
-    """
-    if model is None or not hasattr(model, 'replay_buffer'):
-        return
-    
-    try:
-        old_buffer = model.replay_buffer
-        buffer_size = get_buffer_size(old_buffer)
-        
-        if buffer_size == 0:
-            print("Empty replay buffer, no need to create a new one")
-            return
-        
-        print(f"Creating a new clean replay buffer and transferring {buffer_size} experiences")
-        
-        # Create a new buffer with the same parameters
-        from stable_baselines3.common.buffers import ReplayBuffer
-        
-        # Get the observation and action space from the model
-        observation_space = model.observation_space
-        action_space = model.action_space
-        
-        # Create a new buffer with a smaller size to avoid memory issues
-        new_buffer_size = min(buffer_size, 10000)  # Limit to 10,000 experiences
-        
-        new_buffer = ReplayBuffer(
-            buffer_size=new_buffer_size,
-            observation_space=observation_space,
-            action_space=action_space,
-            device=model.device if hasattr(model, 'device') else 'cpu',
-            n_envs=1,
-            optimize_memory_usage=False
-        )
-        
-        # Sample a subset of experiences to transfer
-        transfer_size = min(buffer_size, new_buffer_size)
-        indices = np.random.choice(buffer_size, transfer_size, replace=False)
-        
-        # Transfer experiences one by one
-        transfer_count = 0
-        for i in indices:
-            try:
-                # Get data from old buffer
-                if not hasattr(old_buffer, 'observations') or i >= len(old_buffer.observations):
-                    continue
-                
-                obs = old_buffer.observations[i]
-                if obs.shape != observation_space.shape:
-                    obs = obs.reshape(observation_space.shape)
-                
-                if not hasattr(old_buffer, 'next_observations') or i >= len(old_buffer.next_observations):
-                    continue
-                
-                next_obs = old_buffer.next_observations[i]
-                if next_obs.shape != observation_space.shape:
-                    next_obs = next_obs.reshape(observation_space.shape)
-                
-                if not hasattr(old_buffer, 'actions') or i >= len(old_buffer.actions):
-                    continue
-                
-                action = old_buffer.actions[i]
-                if len(action.shape) != 1 or action.shape[0] != action_space.shape[0]:
-                    action = action.flatten()[:action_space.shape[0]]
-                
-                if not hasattr(old_buffer, 'rewards') or i >= len(old_buffer.rewards):
-                    continue
-                
-                reward = old_buffer.rewards[i]
-                if hasattr(reward, 'item'):
-                    reward = reward.item()
-                elif hasattr(reward, 'size') and reward.size > 1:
-                    reward = float(reward.flatten()[0])
-                else:
-                    reward = float(reward)
-                
-                if not hasattr(old_buffer, 'dones') or i >= len(old_buffer.dones):
-                    continue
-                
-                done = old_buffer.dones[i]
-                if hasattr(done, 'item'):
-                    done = done.item()
-                elif hasattr(done, 'size') and done.size > 1:
-                    done = bool(done.flatten()[0])
-                else:
-                    done = bool(done)
-                
-                # Add to new buffer
-                if safe_add_to_buffer(new_buffer, obs, next_obs, action, reward, done):
-                    transfer_count += 1
-            except Exception as e:
-                print(f"Error transferring experience {i}: {e}")
-        
-        print(f"Successfully transferred {transfer_count} experiences to new buffer")
-        
-        # Replace old buffer with new buffer
-        model.replay_buffer = new_buffer
-        
-        return True
-    except Exception as e:
-        print(f"Error creating clean replay buffer: {e}")
-        return False
 
 def initialize_models():
     env = TempestEnv()
@@ -630,16 +356,20 @@ def initialize_models():
             print(f"Successfully loaded BC model from {BC_MODEL_PATH}")
         except Exception as e:
             print(f"ERROR loading BC model: {e}")
+    
+    # Policy network setup with explicit output dimension
     policy_kwargs = dict(
         features_extractor_class=TempestFeaturesExtractor,
         features_extractor_kwargs=dict(features_dim=128),
-        net_arch=[128, 64]
+        net_arch=[128, 64, dict(pi=[32], vf=[32])]  # Ensure policy outputs 3D vector
     )
+    
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=os.path.join(MODEL_DIR, "checkpoints"),
         name_prefix="tempest_sac"
     )
+    
     rl_model = SAC(
         "MlpPolicy",
         env,
@@ -655,6 +385,7 @@ def initialize_models():
         verbose=0,
         device=device
     )
+    
     if os.path.exists(LATEST_MODEL_PATH):
         try:
             rl_model = SAC.load(LATEST_MODEL_PATH, env=env)
@@ -662,21 +393,12 @@ def initialize_models():
         except Exception as e:
             print(f"ERROR loading RL model: {e}")
     
-    # Apply compatibility patches for different SB3 versions
-    apply_sb3_compatibility_patches(rl_model)
+    # Apply minimal compatibility patches
+    apply_minimal_compatibility_patches(rl_model)
     
-    # Try to create a clean replay buffer (more aggressive approach)
-    if not create_clean_replay_buffer(rl_model):
-        # If that fails, try the regular conversion
-        convert_buffer_to_compatible_format(rl_model)
-    
-    # Fix any shape issues in the replay buffer
+    # Ensure buffer consistency once during initialization
     if hasattr(rl_model, 'replay_buffer') and rl_model.replay_buffer is not None:
-        print("Fixing replay buffer shapes during initialization")
-        # First ensure all dimensions are correct
-        ensure_correct_array_dimensions(rl_model.replay_buffer)
-        # Then fix any remaining shape issues
-        fix_replay_buffer_shapes(rl_model.replay_buffer)
+        ensure_buffer_consistency(rl_model.replay_buffer)
     
     save_signal_callback = SaveOnSignalCallback(save_path=LATEST_MODEL_PATH, bc_model=bc_model)
     save_signal_callback.model = rl_model
@@ -684,7 +406,8 @@ def initialize_models():
 
 def patch_critic_network(model):
     """
-    Simplified patch for the critic network to handle array indexing issues.
+    Minimal patch for the critic network to handle array indexing issues.
+    Only addresses the specific 'too many indices' error.
     """
     if model is None or not hasattr(model, 'critic') or not hasattr(model.critic, 'forward'):
         return False
@@ -693,7 +416,7 @@ def patch_critic_network(model):
         # Get the original forward method
         original_forward = model.critic.forward
         
-        # Define a safe forward method
+        # Define a safe forward method that only reshapes on error
         def safe_forward(obs, actions):
             try:
                 # Call the original forward method
@@ -701,12 +424,12 @@ def patch_critic_network(model):
             except IndexError as e:
                 if "too many indices for array" in str(e):
                     print("Handling array indexing issue in critic network...")
-                    # Only reshape if absolutely necessary
+                    # Only reshape if absolutely necessary and preserve batch dimension
                     if len(obs.shape) > 2:
                         obs = obs.reshape(obs.shape[0], -1)
                     if len(actions.shape) > 2:
                         actions = actions.reshape(actions.shape[0], -1)
-                    # Try again with reshaped inputs
+                    # Try again with correctly shaped inputs
                     return original_forward(obs, actions)
                 else:
                     raise
@@ -714,144 +437,155 @@ def patch_critic_network(model):
         # Replace the forward method
         model.critic.forward = safe_forward
         
-        print("Successfully patched critic network")
+        print("Applied minimal critic network patch")
         return True
     except Exception as e:
         print(f"Error patching critic network: {e}")
         return False
 
-def apply_sb3_compatibility_patches(model):
-    """Apply compatibility patches for different versions of Stable Baselines3"""
+def apply_minimal_compatibility_patches(model):
+    """
+    Apply only the essential compatibility patches required for functionality.
+    Focuses on ensuring correct shapes and handling the specific error.
+    """
     try:
-        # Check if the model has a logger
-        has_logger = '_logger' in model.__dict__ or hasattr(model, 'logger')
-        
-        if not has_logger:
-            # Create a minimal logger implementation
+        # Fix missing logger (required by SB3)
+        if not ('_logger' in model.__dict__ or hasattr(model, 'logger')):
             from stable_baselines3.common.logger import Logger
-            dummy_logger = Logger(folder=None, output_formats=[])
+            model.__dict__['_logger'] = Logger(folder=None, output_formats=[])
+        
+        # Ensure action and observation spaces have correct dtype
+        if hasattr(model, 'action_space') and isinstance(model.action_space, spaces.Box):
+            model.action_space.low = model.action_space.low.astype(np.float32)
+            model.action_space.high = model.action_space.high.astype(np.float32)
             
-            # Add logger attribute to model
-            model.__dict__['_logger'] = dummy_logger
-            print("Applied logger compatibility patch")
+        if hasattr(model, 'observation_space') and isinstance(model.observation_space, spaces.Box):
+            model.observation_space.low = model.observation_space.low.astype(np.float32)
+            model.observation_space.high = model.observation_space.high.astype(np.float32)
         
-        # Ensure action space has correct dtype
-        if hasattr(model, 'action_space'):
-            if isinstance(model.action_space, spaces.Box):
-                # Ensure low and high have correct dtype
-                if model.action_space.low.dtype != np.float32:
-                    model.action_space.low = model.action_space.low.astype(np.float32)
-                if model.action_space.high.dtype != np.float32:
-                    model.action_space.high = model.action_space.high.astype(np.float32)
-                print("Fixed action space dtype")
-        
-        # Ensure observation space has correct dtype
-        if hasattr(model, 'observation_space'):
-            if isinstance(model.observation_space, spaces.Box):
-                # Ensure low and high have correct dtype
-                if model.observation_space.low.dtype != np.float32:
-                    model.observation_space.low = model.observation_space.low.astype(np.float32)
-                if model.observation_space.high.dtype != np.float32:
-                    model.observation_space.high = model.observation_space.high.astype(np.float32)
-                print("Fixed observation space dtype")
-        
-        # Patch the critic network to handle array indexing issues
+        # Apply minimal critic network patch
         patch_critic_network(model)
         
-        # Monkey patch the train method to handle missing logger
-        original_train = model.train
-        
-        def safe_train(*args, **kwargs):
-            try:
-                return original_train(*args, **kwargs)
-            except AttributeError as e:
-                if "'SAC' object has no attribute '_logger'" in str(e):
-                    # Add logger if it's missing
-                    from stable_baselines3.common.logger import Logger
-                    model.__dict__['_logger'] = Logger(folder=None, output_formats=[])
-                    # Try again with the logger added
-                    return original_train(*args, **kwargs)
-                else:
-                    raise
-        
-        # Replace the train method with our safe version
-        model.train = safe_train
-        
-        # Fix for _update_learning_rate method
-        if hasattr(model, '_update_learning_rate'):
-            original_update_lr = model._update_learning_rate
-            
-            def safe_update_lr(optimizer):
-                try:
-                    return original_update_lr(optimizer)
-                except AttributeError as e:
-                    if "'SAC' object has no attribute '_logger'" in str(e):
-                        # Add logger if it's missing
-                        from stable_baselines3.common.logger import Logger
-                        model.__dict__['_logger'] = Logger(folder=None, output_formats=[])
-                        return original_update_lr(optimizer)
-                    else:
-                        # Fallback implementation if original fails
-                        if hasattr(model, 'lr_schedule') and callable(model.lr_schedule):
-                            new_lr = model.lr_schedule(model._current_progress_remaining 
-                                                     if hasattr(model, '_current_progress_remaining') else 1.0)
-                            for param_group in optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                        return
-            
-            # Replace the method with our safe version
-            model._update_learning_rate = safe_update_lr
-        
-        # Patch the replay buffer's sample method to handle array indexing issues
+        # Patch replay buffer's sample method to handle indexing errors
         if hasattr(model, 'replay_buffer') and hasattr(model.replay_buffer, 'sample'):
             original_sample = model.replay_buffer.sample
             
             def safe_sample(*args, **kwargs):
                 try:
+                    # Try original sample
                     return original_sample(*args, **kwargs)
                 except IndexError as e:
                     if "too many indices for array" in str(e):
-                        print("Fixing replay buffer before sampling...")
-                        fix_replay_buffer_shapes(model.replay_buffer)
+                        print("Fixing buffer before sampling...")
+                        ensure_buffer_consistency(model.replay_buffer)
                         # Try again after fixing
                         return original_sample(*args, **kwargs)
                     else:
                         raise
             
-            # Replace the sample method with our safe version
+            # Replace the sample method with the safe version
             model.replay_buffer.sample = safe_sample
         
-        # Patch the _sample_action method to handle array indexing issues
-        if hasattr(model, 'policy') and hasattr(model.policy, '_sample_action'):
-            original_sample_action = model.policy._sample_action
-            
-            def safe_sample_action(*args, **kwargs):
-                try:
-                    return original_sample_action(*args, **kwargs)
-                except IndexError as e:
-                    if "too many indices for array" in str(e):
-                        print("Handling array indexing issue in _sample_action...")
-                        # Get the arguments
-                        mean_actions = args[0]
-                        log_std = args[1]
-                        
-                        # Ensure they have the right shape
-                        if len(mean_actions.shape) > 2:
-                            mean_actions = mean_actions.reshape(mean_actions.shape[0], -1)
-                        if len(log_std.shape) > 2:
-                            log_std = log_std.reshape(log_std.shape[0], -1)
-                        
-                        # Call the original function with fixed arguments
-                        return original_sample_action(mean_actions, log_std, *args[2:], **kwargs)
-                    else:
-                        raise
-            
-            # Replace the _sample_action method with our safe version
-            model.policy._sample_action = safe_sample_action
-        
-        print("Applied SB3 compatibility patches")
+        print("Applied minimal compatibility patches")
     except Exception as e:
         print(f"Warning: Failed to apply compatibility patches: {e}")
+
+def encode_action(fire, zap, spinner_delta):
+    """Convert discrete actions to Box action space format."""
+    fire_float = float(fire)
+    zap_float = float(zap)
+    reduced_range = 64
+    spinner_float = spinner_delta / reduced_range
+    spinner_float = max(-1.0, min(1.0, spinner_float))
+    return np.array([fire_float, zap_float, spinner_float], dtype=np.float32)
+
+def decode_action(action):
+    """Decode Box action space to discrete actions."""
+    # Ensure action has shape (3,)
+    action = normalize_action(action)
+    fire = 1 if action[0] > 0.5 else 0
+    zap = 1 if action[1] > 0.5 else 0
+    reduced_range = 64
+    spinner_delta = int(round(action[2] * reduced_range))
+    spinner_delta = max(-reduced_range, min(reduced_range, spinner_delta))
+    return fire, zap, spinner_delta
+
+def safe_add_to_buffer(buffer, obs, next_obs, action, reward, done):
+    """
+    Safely add an experience to the replay buffer with consistent shapes.
+    """
+    if buffer is None:
+        return False
+    
+    try:
+        # Ensure consistent shapes
+        obs = obs.reshape(243)
+        next_obs = next_obs.reshape(243)
+        action = normalize_action(action)
+        
+        # Ensure reward and done are scalars
+        reward = float(reward) if hasattr(reward, 'item') else reward
+        done = bool(done) if hasattr(done, 'item') else done
+        
+        # Add to buffer based on SB3 version
+        if hasattr(buffer, 'handle_timeout_termination'):
+            buffer.add(
+                obs=obs,
+                next_obs=next_obs,
+                action=action,
+                reward=reward,
+                done=done,
+                infos=[{}]
+            )
+        else:
+            buffer.add(
+                obs=obs,
+                next_obs=next_obs,
+                action=action,
+                reward=reward,
+                done=done
+            )
+        return True
+    except Exception as e:
+        print(f"Error adding to replay buffer: {e}")
+        return False
+
+def train_model_safely(model, gradient_steps, batch_size):
+    """Train the model with error handling and minimal reshaping"""
+    if model is None:
+        return
+    
+    try:
+        # Try training with the specified batch size
+        model.train(gradient_steps=gradient_steps, batch_size=batch_size)
+        
+        # If training successful, log completion and buffer size
+        buffer_size = get_buffer_size(model.replay_buffer)
+        print(f"Model trained successfully. Buffer size: {buffer_size}")
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Training error: {error_msg}")
+        
+        # Handle dimension mismatch errors
+        if ("doesn't match the broadcast shape" in error_msg or 
+            "too many indices for array" in error_msg):
+            
+            # Try with reduced batch size as last resort
+            try:
+                reduced_batch_size = max(1, batch_size // 4)
+                print(f"Retrying with batch_size={reduced_batch_size}")
+                model.train(gradient_steps=1, batch_size=reduced_batch_size)
+            except Exception as inner_e:
+                print(f"Failed to train even with reduced parameters: {inner_e}")
+        else:
+            # Log other errors
+            print(f"Unhandled training error: {e}")
+
+# In main(), replace the train_model_background function with this simplified version
+def train_model_background(model, gradient_steps, batch_size):
+    """Simplified training function for background thread"""
+    train_model_safely(model, gradient_steps, batch_size)
 
 def main():
     global shutdown_requested
@@ -892,77 +626,8 @@ def main():
                 
                 # Define a training function for background training
                 def train_model_background(model, gradient_steps, batch_size):
-                    """Train the model in the background with error handling"""
-                    if model is None:
-                        return
-                    
-                    try:
-                        # Fix replay buffer shapes before training
-                        if hasattr(model, 'replay_buffer'):
-                            fix_replay_buffer_shapes(model.replay_buffer)
-                        
-                        # Check if model has _logger attribute
-                        if not hasattr(model, '_logger'):
-                            try:
-                                # Try to add a logger
-                                from stable_baselines3.common.logger import Logger
-                                model.__dict__['_logger'] = Logger(folder=None, output_formats=[])
-                                print("Added missing logger to model")
-                            except Exception as e:
-                                print(f"Error adding logger: {e}")
-                        
-                        # Try training with the specified batch size
-                        try:
-                            with np.errstate(all='raise'):  # This will raise exceptions for numpy warnings
-                                model.train(gradient_steps=gradient_steps, batch_size=batch_size)
-                        except (RuntimeError, IndexError, FloatingPointError, DeprecationWarning, FutureWarning) as e:
-                            error_msg = str(e)
-                            print(f"Training error: {error_msg}")
-                            
-                            # Handle various error types
-                            if ("doesn't match the broadcast shape" in error_msg or 
-                                "too many indices for array" in error_msg or
-                                "Conversion of an array with ndim > 0 to a scalar is deprecated" in error_msg):
-                                
-                                # Try creating a clean replay buffer as a more aggressive fix
-                                print("Attempting to create a clean replay buffer to fix training issues...")
-                                if create_clean_replay_buffer(model):
-                                    print("Successfully created a clean replay buffer, retrying training...")
-                                    try:
-                                        # Try training with reduced parameters
-                                        model.train(gradient_steps=1, batch_size=16)
-                                        return
-                                    except Exception as clean_buffer_error:
-                                        print(f"Still having issues after creating clean buffer: {clean_buffer_error}")
-                                
-                                # If clean buffer approach fails, try with a smaller batch size
-                                reduced_batch_size = max(1, batch_size // 4)  # More aggressive reduction
-                                print(f"Shape/indexing/deprecation error. Retrying with batch_size={reduced_batch_size}")
-                                
-                                # Fix replay buffer again to be sure
-                                if hasattr(model, 'replay_buffer'):
-                                    ensure_correct_array_dimensions(model.replay_buffer)
-                                    fix_replay_buffer_shapes(model.replay_buffer)
-                                
-                                try:
-                                    # Try training with reduced batch size and gradient steps
-                                    model.train(gradient_steps=1, batch_size=reduced_batch_size)
-                                except Exception as inner_e:
-                                    print(f"Still having issues with reduced batch size: {inner_e}")
-                                    # Try with minimal parameters as a last resort
-                                    try:
-                                        model.train(gradient_steps=1, batch_size=1)
-                                    except Exception as final_e:
-                                        print(f"Failed even with minimal training parameters: {final_e}")
-                                        print("Skipping training for this frame to avoid further errors")
-                            else:
-                                # Re-raise other runtime errors
-                                raise
-                    except Exception as e:
-                        print(f"Error during training: {e}")
-                        # Reset training state if needed
-                        if hasattr(model, 'policy') and hasattr(model.policy, 'set_training_mode'):
-                            model.policy.set_training_mode(False)
+                    """Simplified training function for background thread"""
+                    train_model_safely(model, gradient_steps, batch_size)
                 
                 while True:
                     try:
@@ -1062,7 +727,7 @@ def main():
                             if rl_model is not None and rl_model.replay_buffer is not None:
                                 try:
                                     # Process the action to ensure correct shape
-                                    processed_action = process_action_for_buffer(action, game_action)
+                                    processed_action = normalize_action(action, game_action)
                                     
                                     # Ensure states have the right shape
                                     prev_state = env.prev_state.reshape(env.observation_space.shape)
@@ -1134,81 +799,6 @@ def main():
             time.sleep(5)
     
     print("Python AI model shutting down")
-
-def encode_action(fire, zap, spinner_delta):
-    """Convert discrete actions to Box action space format."""
-    fire_float = float(fire)
-    zap_float = float(zap)
-    reduced_range = 64
-    spinner_float = spinner_delta / reduced_range
-    spinner_float = max(-1.0, min(1.0, spinner_float))
-    return np.array([fire_float, zap_float, spinner_float], dtype=np.float32)
-
-def decode_action(action):
-    """Decode Box action space to discrete actions."""
-    fire = 1 if action[0] > 0.5 else 0
-    zap = 1 if action[1] > 0.5 else 0
-    reduced_range = 64
-    spinner_delta = int(round(action[2] * reduced_range))
-    spinner_delta = max(-reduced_range, min(reduced_range, spinner_delta))
-    return fire, zap, spinner_delta
-
-def safe_add_to_buffer(buffer, obs, next_obs, action, reward, done):
-    """
-    Safely add an experience to the replay buffer, handling any potential errors.
-    
-    Args:
-        buffer: The replay buffer to add the experience to
-        obs: The observation
-        next_obs: The next observation
-        action: The action
-        reward: The reward
-        done: Whether the episode is done
-    """
-    if buffer is None:
-        return False
-    
-    try:
-        # Ensure action has the right shape (should be 1D)
-        if len(action.shape) != 1:
-            action = action.flatten()
-        
-        # Ensure reward is a scalar
-        if hasattr(reward, 'item'):
-            reward = reward.item()
-        elif hasattr(reward, 'size') and reward.size > 1:
-            reward = reward.flatten()[0]
-        
-        # Ensure done is a scalar
-        if hasattr(done, 'item'):
-            done = done.item()
-        elif hasattr(done, 'size') and done.size > 1:
-            done = done.flatten()[0]
-        
-        # Check if the buffer has the handle_timeout_termination attribute
-        # This is present in newer versions of SB3
-        if hasattr(buffer, 'handle_timeout_termination'):
-            buffer.add(
-                obs=obs,
-                next_obs=next_obs,
-                action=action,
-                reward=reward,
-                done=done,
-                infos=[{}]
-            )
-        else:
-            # Older versions of SB3 don't have the infos parameter
-            buffer.add(
-                obs=obs,
-                next_obs=next_obs,
-                action=action,
-                reward=reward,
-                done=done
-            )
-        return True
-    except Exception as e:
-        print(f"Error adding to replay buffer: {e}")
-        return False
 
 if __name__ == "__main__":
     random.seed(42)
