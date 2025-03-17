@@ -33,7 +33,7 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
 -- Check command line arguments for -logonly mode
-local LOG_ONLY_MODE = true
+local LOG_ONLY_MODE = false
 
 local function clear_screen()
     io.write("\027[2J\027[H")
@@ -1030,17 +1030,17 @@ local function frame_callback()
 
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
-    -- Four lives at all times
-    -- mem:write_direct_u8(0x0048, 0x04)
-
     -- In attract mode, zero the score if we're dead or zooming down the tube
-    
+
     if is_attract_mode then
         if game_state.gamestate == 0x06 or game_state.gamestate == 0x20 then
             mem:write_direct_u8(0x0040, 0x00)
             mem:write_direct_u8(0x0041, 0x00)
             mem:write_direct_u8(0x0042, 0x00)
         end
+    else
+        -- Four lives at all times
+        mem:write_direct_u8(0x0048, 0x04)
     end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)

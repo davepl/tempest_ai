@@ -18,6 +18,7 @@ import sys
 import time
 import struct
 import random
+import argparse
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -36,6 +37,11 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 LATEST_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_model_latest.zip")
 BC_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_bc_model.pt")
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Tempest AI Model')
+parser.add_argument('--replay', type=str, help='Path to a log file to replay for BC training')
+args = parser.parse_args()
 
 # Device setup
 device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
@@ -151,7 +157,7 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
     fire_target = torch.tensor([[float(fire_target)]], dtype=torch.float32).to(device)
     zap_target = torch.tensor([[float(zap_target)]], dtype=torch.float32).to(device)
-    spinner_target = torch.tensor([[float(spinner_target) / 64.0]], dtype=torch.float32).to(device)
+    spinner_target = torch.tensor([[float(spinner_target) / 128.0]], dtype=torch.float32).to(device)
     fire_pred, zap_pred, spinner_pred = model(state_tensor)
     loss = nn.BCELoss()(fire_pred, fire_target) + nn.BCELoss()(zap_pred, zap_target) + nn.MSELoss()(spinner_pred, spinner_target)
     model.optimizer.zero_grad()
@@ -201,6 +207,72 @@ def apply_minimal_compatibility_patches(model):
     except Exception as e:
         print(f"Warning: Failed to apply compatibility patches: {e}")
 
+### Log File Replay Function
+def replay_log_file(log_file_path, bc_model):
+    """
+    Replay a log file to train the BC model
+    Format: each record has:
+    - 4-byte header size (uint32)
+    - 4-byte payload size (uint32)
+    - Raw payload data
+    """
+    if not os.path.exists(log_file_path):
+        print(f"Error: Log file {log_file_path} not found")
+        return False
+    
+    try:
+        print(f"Replaying log file: {log_file_path}")
+        frame_count = 0
+        bc_loss_sum = 0.0
+        
+        with open(log_file_path, 'rb') as log_file:
+            while True:
+                # Read header size (uint32)
+                header_size_bytes = log_file.read(4)
+                if not header_size_bytes or len(header_size_bytes) < 4:
+                    break  # End of file
+                
+                header_size = struct.unpack(">I", header_size_bytes)[0]
+                
+                # Read payload size (uint32)
+                payload_size_bytes = log_file.read(4)
+                if not payload_size_bytes or len(payload_size_bytes) < 4:
+                    break  # Incomplete record
+                
+                payload_size = struct.unpack(">I", payload_size_bytes)[0]
+                
+                # Read payload data
+                payload_data = log_file.read(payload_size)
+                if not payload_data or len(payload_data) < payload_size:
+                    break  # Incomplete record
+                
+                # Process the frame data
+                processed_data, _, reward, game_action, is_attract, done, save_signal = process_frame_data(payload_data)
+                
+                if processed_data is not None and game_action:
+                    # Train the BC model
+                    loss, _ = train_bc(bc_model, processed_data, *game_action)
+                    bc_loss_sum += loss
+                    frame_count += 1
+                    
+                    # Print progress every 1,000 frames
+                    if frame_count % 1000 == 0:
+                        print(f"Processed {frame_count} frames, average BC loss: {bc_loss_sum / 1000:.6f}")
+                        bc_loss_sum = 0.0
+        
+        print(f"Replay complete. Processed {frame_count} frames from log file.")
+        if frame_count > 0 and bc_loss_sum > 0:
+            print(f"Final average BC loss: {bc_loss_sum / (frame_count % 10000 or 1):.6f}")
+        
+        # Save the trained BC model
+        torch.save(bc_model.state_dict(), BC_MODEL_PATH)
+        print(f"BC model saved to {BC_MODEL_PATH}")
+        return True
+    
+    except Exception as e:
+        print(f"Error replaying log file: {e}")
+        return False
+
 ### Initialization and Main Loop
 # Sets up models, runs the main training/inference loop, and handles I/O with the game.
 # Orchestrates the hybrid BC-RL logic and ensures persistent model state.
@@ -243,6 +315,16 @@ def train_model_background(model):
 def main():
     print("Starting Tempest AI...")
     env, bc_model, rl_model = initialize_models()
+    
+    # args.replay = "/Users/dave/mame/tempest.log"
+    # If a replay file is specified, replay it first
+    if args.replay:
+        replay_log_file(args.replay, bc_model)
+        # Exit if we're only replaying
+        if not os.path.exists(LUA_TO_PY_PIPE):
+            print("Replay complete. Exiting.")
+            return
+    
     for pipe in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
         if os.path.exists(pipe):
             os.unlink(pipe)
@@ -286,11 +368,14 @@ def main():
                             print(f"Prediction error: {e}")
                             fire, zap, spinner = bc_model(torch.FloatTensor(processed_data).unsqueeze(0).to(device))
                             action = encode_action(1 if fire.item() > 0.5 else 0, 1 if zap.item() > 0.5 else 0, int(round(spinner.item() * 64.0)))
-                        if random.random() < 0.6:
+
+                        if random.random() < 0.2:
                             fire, zap, spinner = bc_model(torch.FloatTensor(processed_data).unsqueeze(0).to(device))
                             action = encode_action(1 if fire.item() > 0.5 else 0, 1 if zap.item() > 0.5 else 0, int(round(spinner.item() * 64.0)))
+
                         if env.prev_state is not None:
                             safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, action, env.reward, env.done)
+
                         if frame_count % 50 == 0 and rl_model.replay_buffer.pos > rl_model.learning_starts:
                             threading.Thread(target=train_model_background, args=(rl_model,), daemon=True).start()
 
