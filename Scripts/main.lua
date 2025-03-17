@@ -665,32 +665,20 @@ function Controls:apply_action(fire, zap, spinner, game_state, player_state)
         -- 3. Use inferred spinner delta
         self.spinner_delta = player_state.inferredSpinnerDelta
         
-        -- Apply spinner delta to the spinner field if it exists
-        if self.spinner_field then
-            -- The spinner field might expect a different format/scale
-            -- Adjust the value as needed for your specific game
-            self.spinner_field:set_value(50)
-        end
     else
-        -- In actual gameplay, reflect the actual player state
-        -- self.fire_commanded = player_state.fire_detected
-        -- self.zap_commanded = player_state.zap_detected
+        -- In actual gameplay:
+        -- Always use the inferred spinner delta for display
+        self.spinner_delta = player_state.inferredSpinnerDelta
         
-        -- For spinner, use the model's spinner value (already set in frame_callback)
-        -- self.spinner_delta is already set
-        
-        -- Apply these values to the physical controls 
-        -- print("Applying action to physical controls: ", fire, zap, spinner)
-        
+        -- But apply the model's fire, zap, and spinner values to the physical controls
         self.fire_commanded = fire
         self.zap_commanded = zap
-        self.spinner_delta = spinner
 
         if self.fire_field then self.fire_field:set_value(fire) end
         if self.zap_field then self.zap_field:set_value(zap) end
         
+        -- Apply the model's spinner value to the game
         mem:write_u8(0x0050, spinner)
-
     end
 end
 
@@ -1015,10 +1003,6 @@ local function frame_callback()
         -- Update total bytes sent
         total_bytes_sent = total_bytes_sent + #frame_data
 
-       
-        -- Store spinner value for use in controls
-        controls.spinner_delta = spinner
-
         -- Calculate FPS
         frame_count = frame_count + 1
         local current_time = os.time()
@@ -1136,12 +1120,12 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     move_cursor_to_row(15)
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     local controls_metrics = {
-        ["Fire"] = controls.fire_commanded,
-        ["Superzapper"] = controls.zap_commanded,
-        ["Spinner Delta"] = controls.spinner_delta,
+        ["Fire (Inferred)"] = controls.fire_commanded,
+        ["Superzapper (Inferred)"] = controls.zap_commanded,
+        ["Spinner Delta (Inferred)"] = controls.spinner_delta,
         ["Attract Mode"] = is_attract_mode and "Active" or "Inactive"
     }
-    print(format_section("Player Controls", controls_metrics))
+    print(format_section("Player Controls (Game Inferred Values)", controls_metrics))
 
     -- Add new Model State section
     move_cursor_to_row(21)
@@ -1150,7 +1134,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         ["Model Zap"] = model_zap,
         ["Model Spinner"] = model_spinner
     }
-    print(format_section("Model State", model_metrics))
+    print(format_section("Model Output", model_metrics))
 
     -- Format and print level state in 3 columns (adjust row number)
     move_cursor_to_row(26)  -- Changed from 23 to make room for Model State
