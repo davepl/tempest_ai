@@ -135,7 +135,7 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 10
 
     local spinner_abs = math.abs(player_state.SpinnerDelta)
-    if (spinner_abs < 9) then
+    if (spinner_abs < 5) then
         reward = reward + 10
     end
 
@@ -184,23 +184,16 @@ local function process_frame(params)
             -- Read exactly 3 bytes for the three i8 values
             local action_bytes = pipe_in:read(3)
             
-            if action_bytes then
-                -- Check if we got all 3 bytes
-                if #action_bytes == 3 then
-                    -- Unpack the three signed 8-bit integers
-                    fire, zap, spinner = string.unpack("bbb", action_bytes)
-                    
-                    -- Store the values globally for display
-                    model_fire = fire
-                    model_zap = zap  
-                    model_spinner = spinner
-                    
-                    break  -- Exit the loop once we've successfully read and unpacked the data
-                else
-                    print("Warning: Received incomplete data: " .. #action_bytes .. " bytes instead of 3")
-                    -- Use default values (already set above)
-                    break
-                end
+            if action_bytes and #action_bytes == 3 then
+                -- Unpack the three signed 8-bit integers
+                fire, zap, spinner = string.unpack("bbb", action_bytes)
+                
+                -- Store the values globally for display
+                model_fire = fire
+                model_zap = zap  
+                model_spinner = spinner
+                
+                break  -- Exit the loop once we've successfully read and unpacked the data
             else
                 -- Sleep briefly to avoid busy-waiting
                 os.execute("sleep 0.01")
@@ -672,6 +665,7 @@ function Controls:apply_action(fire, zap, spinner, game_state, player_state)
         if self.zap_field then self.zap_field:set_value(zap) end
         
         -- Apply the model's spinner value to the game
+
         mem:write_u8(0x0050, spinner)
     end
 end
