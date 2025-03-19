@@ -123,40 +123,41 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 6. Stasis reward: 0.01 points per frame for staying in the same state
 
     if player_state.alive == 1 then
-        reward = reward + 0.05
+        reward = reward + 1
     else
-        reward = reward - 100
+        reward = reward - 10
     end
     
     -- 2. Score reward: Add the score delta from the last frame
     local score_delta = player_state.score - previous_score
     -- Debug output if score changes
     if score_delta > 0 then
-        -- print("Score delta: " .. score_delta)
+        reward = reward + score_delta
     end
-    
-    -- Add score delta to reward
-    reward = reward + score_delta
     
     -- 3. Level completion reward: 1000 * new level number when level increases
     if level_state.level_number ~= previous_level then
-        reward = reward + (1000 * level_state.level_number)
+        reward = reward + (1000 * previous_level)
     end
     
     -- 4. Aggression reward: Use weighted average of score per frame
     -- Update the weighted average with the current score delta
     -- Formula: new_avg = old_avg * decay + current_value * (1 - decay)
+
     avg_score_per_frame = avg_score_per_frame * AGGRESSION_DECAY + score_delta * (1 - AGGRESSION_DECAY)
     
     -- Add aggression bonus (scaled to be meaningful but not dominant)
     -- You could multiply by 10 to make it more significant
-    reward = reward + (avg_score_per_frame)
+    -- reward = reward + (avg_score_per_frame)
     
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 10
 
     local spinner_abs = math.abs(player_state.SpinnerDelta)
-    if (spinner_abs < 5) then
-        reward = reward + 10
+    if (spinner_abs < 9) then
+        reward = reward + 5
+        if game_state.gamestate == 0x20 then
+            reward = reward + 25
+        end
     end
 
     -- Update previous values for next frame
