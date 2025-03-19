@@ -5,15 +5,13 @@ Author: Dave Plummer (davepl) and various AI assists
 Date: 2025-03-06 (Updated)
 
 This script implements a hybrid AI model for Tempest:
-1. Uses Behavioral Cloning (BC) during attract mode to learn from the game's AI
-2. Switches to Reinforcement Learning (RL) during gameplay
+1. Uses Behavioral Cloning (BC) during attract mode to mimic the game's AI
+2. Transitions to Reinforcement Learning (RL) during gameplay
 """
 
 ### Imports and Environment Setup
-# Imports libraries for math, file I/O, RL, and neural networks; sets up PyTorch device and file paths.
-# Essential for enabling the hybrid BC-RL approach and communication with the game via pipes.
 import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"  # Enable fallback for PyTorch on Apple Silicon
 import sys
 import time
 import struct
@@ -30,9 +28,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn.functional as F
 import threading
 
-NumberOfParams = 247
+# Constants
+NumberOfParams = 247  # Number of parameters in the observation space
 
-# Pipe and model paths
+# File paths for pipes and model storage
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -40,32 +39,25 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 LATEST_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_model_latest.zip")
 BC_MODEL_PATH = os.path.join(MODEL_DIR, "tempest_bc_model.pt")
 
-# Parse command line arguments
+# Command-line argument parsing
 parser = argparse.ArgumentParser(description='Tempest AI Model')
 parser.add_argument('--replay', type=str, help='Path to a log file to replay for BC training')
 args = parser.parse_args()
 
-# Device setup
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+# Device configuration: Prefer MPS (Apple Silicon) if available, else CPU
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 ### Environment Definition
-# Defines a custom Gym environment for Tempest with action/observation spaces.
-# Necessary to interface the game with RL algorithms and handle state transitions.
 class TempestEnv(gym.Env):
+    """
+    Custom Gym environment for Tempest.
+    - Action space: 3D box (fire, zap, spinner_delta) in [0,1], [-1,1] ranges
+    - Observation space: 247D box normalized to [-1, 1]
+    """
     def __init__(self):
         super().__init__()
-        self.action_space = spaces.Box(
-            low=np.array([0.0, 0.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-            shape=(3,),
-            dtype=np.float32
-        )
-        self.observation_space = spaces.Box(
-            low=np.float32(-1.0),
-            high=np.float32(1.0),
-            shape=(NumberOfParams,),
-            dtype=np.float32
-        )
+        self.action_space = spaces.Box(low=np.array([0.0, 0.0, -1.0]), high=np.array([1.0, 1.0, 1.0]), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(NumberOfParams,), dtype=np.float32)
         self.state = np.zeros(NumberOfParams, dtype=np.float32)
         self.reward = 0.0
         self.done = False
@@ -73,6 +65,7 @@ class TempestEnv(gym.Env):
         self.prev_state = None
 
     def reset(self, seed=None, options=None):
+        """Reset environment to initial state."""
         super().reset(seed=seed)
         self.state = np.zeros(NumberOfParams, dtype=np.float32)
         self.reward = 0.0
@@ -81,24 +74,24 @@ class TempestEnv(gym.Env):
         return self.state, {}
 
     def step(self, action):
+        """Execute an action and return the next state, reward, and done flag."""
         fire = 1 if action[0] > 0.5 else 0
         zap = 1 if action[1] > 0.5 else 0
-        spinner_delta = int(round(action[2] * 128.0))
+        spinner_delta = int(round(action[2] * 127.0))
         spinner_delta = max(-128, min(128, spinner_delta))
         return self.state, self.reward, self.done, False, {"action_taken": (fire, zap, spinner_delta)}
 
     def update_state(self, game_state, reward, game_action=None, done=False):
+        """Update environment with new game state and reward."""
         self.prev_state = self.state.copy()
         self.state = game_state
         self.reward = reward
         self.done = done
         return self.state
 
-### Feature Extractor and Models
-# Custom feature extractor and BC model for processing game states and cloning AI behavior.
-# Supports RL feature extraction and BC learning from attract mode demonstrations.
-
+### Neural Network Models
 class TempestFeaturesExtractor(BaseFeaturesExtractor):
+    """Feature extractor for RL model, transforming observations into a lower-dimensional space."""
     def __init__(self, observation_space, features_dim=128):
         super().__init__(observation_space, features_dim)
         self.feature_extractor = nn.Sequential(
@@ -112,6 +105,7 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
         return self.feature_extractor(observations)
 
 class BCModel(nn.Module):
+    """Behavioral Cloning model for learning from attract mode demonstrations."""
     def __init__(self, input_size=NumberOfParams):
         super().__init__()
         self.fc1 = nn.Linear(input_size, 128)
@@ -119,6 +113,7 @@ class BCModel(nn.Module):
         self.fire_output = nn.Linear(64, 1)
         self.zap_output = nn.Linear(64, 1)
         self.spinner_output = nn.Linear(64, 1)
+        # Xavier initialization for better convergence
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.xavier_uniform_(self.fire_output.weight)
@@ -134,39 +129,44 @@ class BCModel(nn.Module):
         return fire, zap, spinner
 
 ### Utility Functions
-# Helper functions for data processing, BC training, buffer management, and model compatibility.
-# Ensures smooth data flow between Lua and Python, and robust model training.
-
 def process_frame_data(data):
-
-    
-
+    """
+    Process incoming frame data from the game.
+    - Unpacks header and game state
+    - Normalizes data to [-1, 1]
+    """
     try:
         header_fmt = ">IdBBBIIBBBh"
         header_size = struct.calcsize(header_fmt)
         num_values, reward, game_action, game_mode, is_done, frame_counter, score, save_signal, fire, zap, spinner = struct.unpack(header_fmt, data[:header_size])
         game_data = data[header_size:]
-        num_ints = len(game_data) // 2
-        unpacked_data = [struct.unpack(">H", game_data[i*2:i*2+2])[0] - 32768 for i in range(num_ints)]
-        normalized_data = np.array([float(x) / (32767.0 if x > 0 else 32768.0) for x in unpacked_data], dtype=np.float32)
-        assert len(normalized_data) == NumberOfParams, f"Data length is not correct: {len(normalized_data)}"
+        unpacked_data = np.frombuffer(game_data, dtype=np.uint16).astype(np.float32) - 32768.0
+        normalized_data = unpacked_data / np.where(unpacked_data > 0, 32767.0, 32768.0)
+        if len(normalized_data) != NumberOfParams:
+            normalized_data = np.pad(normalized_data, (0, NumberOfParams - len(normalized_data)), 'constant')[:NumberOfParams]
         is_attract = (game_mode & 0x80) == 0
         return normalized_data, frame_counter, reward, (fire, zap, spinner), is_attract, is_done, save_signal
     except Exception as e:
         print(f"Error processing frame data: {e}")
-        return None, 0, 0.0, None, False, False
+        return None, 0, 0.0, None, False, False, 0
 
 def train_bc(model, state, fire_target, zap_target, spinner_target):
-    model          = model.to(device)
-    state_tensor   = torch.FloatTensor(state).unsqueeze(0).to(device)
-    fire_target    = torch.tensor([[float(fire_target)]], dtype=torch.float32).to(device)
-    zap_target     = torch.tensor([[float(zap_target)]], dtype=torch.float32).to(device)
+    """Train the BC model on a single frame of demonstration data."""
+    model = model.to(device)
+    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    fire_target = torch.tensor([[float(fire_target)]], dtype=torch.float32).to(device)
+    zap_target = torch.tensor([[float(zap_target)]], dtype=torch.float32).to(device)
     spinner_target = torch.tensor([[float(spinner_target) / 128.0]], dtype=torch.float32).to(device)
+    
     fire_pred, zap_pred, spinner_pred = model(state_tensor)
-    loss = nn.BCELoss()(fire_pred, fire_target) + nn.BCELoss()(zap_pred, zap_target) + nn.MSELoss()(spinner_pred, spinner_target)
+    loss = (nn.BCELoss()(fire_pred, fire_target) + 
+            nn.BCELoss()(zap_pred, zap_target) + 
+            nn.MSELoss()(spinner_pred, spinner_target))
+    
     model.optimizer.zero_grad()
     loss.backward()
     model.optimizer.step()
+    
     fire_action = 1 if fire_pred.item() > 0.5 else 0
     zap_action = 1 if zap_pred.item() > 0.5 else 0
     spinner_action = int(round(spinner_pred.item() * 128.0))
@@ -174,62 +174,36 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
 
 def normalize_reward(reward):
     """
-    Normalize rewards by clamping to +/-4096 and scaling to 0-1 range.
-    
-    Args:
-        reward (float): Raw reward value
-        
-    Returns:
-        float: Normalized reward in 0-1 range
+    Normalize reward to [0, 1] range.
+    - Clamps to [-32768, 32768]
     """
-    # Clamp to +/-4096 range
-    clamped_reward = max(-4096.0, min(4096.0, reward))
-    
-    # Map from [-4096, 4096] to [0, 1]
-    normalized_reward = (clamped_reward + 4096.0) / 8192.0
-    
-    # Log large rewards for debugging
-    if abs(reward) > 1000:
-        print(f"Large reward: {reward:.1f} → clamped: {clamped_reward:.1f} → normalized: {normalized_reward:.4f}")
-    
+    clamped_reward = max(-32768.0, min(32767.0, reward))
+    normalized_reward = (clamped_reward + 32767.0) / 65536.0
     return float(normalized_reward)
 
 def safe_add_to_buffer(buffer, obs, next_obs, action, reward, done):
+    """Safely add experience to the RL replay buffer with shape validation."""
     if buffer is None:
         return False
     try:
-        # Ensure all inputs are properly shaped numpy arrays
         obs = np.asarray(obs, dtype=np.float32).flatten()
         next_obs = np.asarray(next_obs, dtype=np.float32).flatten()
         action = np.asarray(action, dtype=np.float32).flatten()
-        
-        # Validate shapes before adding to buffer
         if obs.shape != (NumberOfParams,) or next_obs.shape != (NumberOfParams,) or action.shape != (3,):
             raise ValueError(f"Invalid shapes - obs: {obs.shape}, next_obs: {next_obs.shape}, action: {action.shape}")
-        
-        # Apply reward normalization (clamp to +/-4096 and scale to 0-1)
-        raw_reward = float(reward)
-        normalized_reward = normalize_reward(raw_reward)
-        
-        # Important: Make sure reward is a scalar value, not an array
-        if isinstance(normalized_reward, np.ndarray):
-            normalized_reward = float(normalized_reward.item())
-        
-        # Ensure done is also a scalar boolean value
+        normalized_reward = normalize_reward(float(reward))
         done = bool(done)
-        
-        # Add to buffer using correct API based on SB3 version
-        if hasattr(buffer, 'handle_timeout_termination'):
-            buffer.add(obs, next_obs, action, normalized_reward, done, [{}])
-        else:
-            buffer.add(obs, next_obs, action, normalized_reward, done)
-        
+        buffer.add(obs, next_obs, action, normalized_reward, done, [{}] if hasattr(buffer, 'handle_timeout_termination') else None)
         return True
     except Exception as e:
         print(f"Error adding to replay buffer: {e}")
         return False
 
 def apply_minimal_compatibility_patches(model):
+    """
+    Apply compatibility patches for Stable Baselines3.
+    - BUGBUG: Review necessity with current SB3 version; may be removable
+    """
     try:
         if not hasattr(model, '_logger'):
             from stable_baselines3.common.logger import Logger
@@ -238,161 +212,72 @@ def apply_minimal_compatibility_patches(model):
         model.action_space.high = model.action_space.high.astype(np.float32)
         model.observation_space.low = model.observation_space.low.astype(np.float32)
         model.observation_space.high = model.observation_space.high.astype(np.float32)
-        
-        # Fix for critic network
-        if hasattr(model, 'critic') and hasattr(model.critic, 'forward'):
-            original_forward = model.critic.forward
-            def safe_forward(obs, actions):
-                try:
-                    return original_forward(obs, actions)
-                except IndexError as e:
-                    if "too many indices" in str(e):
-                        return original_forward(obs.reshape(obs.shape[0], -1), actions.reshape(actions.shape[0], -1))
-                    raise
-            model.critic.forward = safe_forward
-            
-        # Fix for actor network
-        if hasattr(model, 'actor') and hasattr(model.actor, 'forward'):
-            original_actor_forward = model.actor.forward
-            def safe_actor_forward(obs, *args, **kwargs):
-                try:
-                    # Support both one-arg and two-arg calls
-                    if args or kwargs:
-                        return original_actor_forward(obs, *args, **kwargs)
-                    else:
-                        return original_actor_forward(obs)
-                except Exception as e:
-                    print(f"Actor forward error: {e}")
-                    # Return a reasonable default if possible
-                    if hasattr(model.action_space, 'sample'):
-                        return torch.tensor(model.action_space.sample()).to(device).unsqueeze(0)
-                    raise
-                    
-            # Apply the patched forward to actor
-            model.actor.forward = safe_actor_forward
-            
     except Exception as e:
         print(f"Warning: Failed to apply compatibility patches: {e}")
-        import traceback
-        traceback.print_exc()
 
-### Log File Replay Function
+### Replay Functionality
 def replay_log_file(log_file_path, bc_model):
-    """
-    Replay a log file to train the BC model
-    Format: each record has:
-    - 4-byte header size (uint32)
-    - 4-byte payload size (uint32)
-    - Raw payload data
-    """
+    """Replay a log file to train the BC model."""
     if not os.path.exists(log_file_path):
         print(f"Error: Log file {log_file_path} not found")
         return False
-    
     try:
         print(f"Replaying log file: {log_file_path}")
         frame_count = 0
-        bc_loss_sum = 0.0
-        
         with open(log_file_path, 'rb') as log_file:
             while True:
-                # Read header size (uint32)
                 header_size_bytes = log_file.read(4)
-                if not header_size_bytes or len(header_size_bytes) < 4:
-                    break  # End of file
-                
+                if len(header_size_bytes) < 4:
+                    break
                 header_size = struct.unpack(">I", header_size_bytes)[0]
-                
-                # Read payload size (uint32)
                 payload_size_bytes = log_file.read(4)
-                if not payload_size_bytes or len(payload_size_bytes) < 4:
-                    break  # Incomplete record
-                
+                if len(payload_size_bytes) < 4:
+                    break
                 payload_size = struct.unpack(">I", payload_size_bytes)[0]
-                
-                # Read payload data
                 payload_data = log_file.read(payload_size)
-                if not payload_data or len(payload_data) < payload_size:
-                    break  # Incomplete record
-                
-                # Process the frame data
-                processed_data, _, reward, game_action, is_attract, done, save_signal = process_frame_data(payload_data)
-                
+                if len(payload_data) < payload_size:
+                    break
+                processed_data, _, reward, game_action, is_attract, done, _ = process_frame_data(payload_data)
                 if processed_data is not None and game_action:
-                    # Train the BC model
-                    loss, _ = train_bc(bc_model, processed_data, *game_action)
-                    bc_loss_sum += loss
+                    train_bc(bc_model, processed_data, *game_action)
                     frame_count += 1
-                    
-                    # Print progress every 1,000 frames
                     if frame_count % 1000 == 0:
-                        print(f"Processed {frame_count} frames, average BC loss: {bc_loss_sum / 1000:.6f}")
-                        bc_loss_sum = 0.0
-        
-        print(f"Replay complete. Processed {frame_count} frames from log file.")
-        if frame_count > 0 and bc_loss_sum > 0:
-            print(f"Final average BC loss: {bc_loss_sum / (frame_count % 10000 or 1):.6f}")
-        
-        # Save the trained BC model
+                        print(f"Processed {frame_count} frames")
+        print(f"Replay complete. Processed {frame_count} frames.")
         torch.save(bc_model.state_dict(), BC_MODEL_PATH)
-        print(f"BC model saved to {BC_MODEL_PATH}")
         return True
-    
     except Exception as e:
         print(f"Error replaying log file: {e}")
         return False
 
-### Initialization and Main Loop
-# Sets up models, runs the main training/inference loop, and handles I/O with the game.
-# Orchestrates the hybrid BC-RL logic and ensures persistent model state.
-
+### Core Functions
 def initialize_models():
+    """Initialize environment and models, loading saved states if available."""
     env = TempestEnv()
     bc_model = BCModel().to(device)
     bc_model.optimizer = optim.Adam(bc_model.parameters(), lr=0.005)
     if os.path.exists(BC_MODEL_PATH):
-        try:
-            bc_model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=device))
-            print(f"Loaded BC model from {BC_MODEL_PATH}")
-        except Exception as e:
-            print(f"Error loading BC model: {e}")
-            
-    # Configure SAC with parameters for numerical stability
+        bc_model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=device))
+        print(f"Loaded BC model from {BC_MODEL_PATH}")
+
     policy_kwargs = {
-        "features_extractor_class": TempestFeaturesExtractor, 
-        "features_extractor_kwargs": {"features_dim": 128}, 
-        "net_arch": [128, 64],
-        # Add optimizer_kwargs for more stability
-        "optimizer_kwargs": {"eps": 1e-5}
+        "features_extractor_class": TempestFeaturesExtractor,
+        "features_extractor_kwargs": {"features_dim": 128},
+        "net_arch": [128, 64]
     }
-    
-    # Create SAC model with more stable parameters
     rl_model = SAC(
-        "MlpPolicy", 
-        env, 
-        policy_kwargs=policy_kwargs, 
-        learning_rate=0.0001,
-        buffer_size=100000, 
-        learning_starts=1000, 
-        batch_size=64,
-        device=device,
-        train_freq=1,  # More frequent but smaller updates
-        gradient_steps=1,  # Do just 1 gradient step per update for stability
-        target_update_interval=1000,  # Less frequent target updates
-        verbose=1  # More verbose logging
+        "MlpPolicy", env, policy_kwargs=policy_kwargs, learning_rate=0.0001,
+        buffer_size=100000, learning_starts=1000, batch_size=64,
+        train_freq=1, gradient_steps=10, device=device  # Increased gradient_steps
     )
-    
     if os.path.exists(LATEST_MODEL_PATH):
-        try:
-            rl_model = SAC.load(LATEST_MODEL_PATH, env=env)
-            print(f"Loaded RL model from {LATEST_MODEL_PATH}")
-        except Exception as e:
-            print(f"Error loading RL model: {e}")
-            
+        rl_model = SAC.load(LATEST_MODEL_PATH, env=env)
+        print(f"Loaded RL model from {LATEST_MODEL_PATH}")
     apply_minimal_compatibility_patches(rl_model)
     return env, bc_model, rl_model
 
 def save_models(rl_model, bc_model):
+    """Save RL and BC models to disk."""
     try:
         rl_model.save(LATEST_MODEL_PATH)
         torch.save(bc_model.state_dict(), BC_MODEL_PATH)
@@ -401,67 +286,34 @@ def save_models(rl_model, bc_model):
         print(f"Error saving models: {e}")
 
 def train_model_background(model):
+    """Background RL training with increased gradient steps for CPU efficiency."""
     if model and model.replay_buffer.pos > model.learning_starts:
         try:
-            # Get a small sample to check shapes before training
-            if model.replay_buffer.pos > 1:
-                # Sample a single experience to inspect
-                sample = model.replay_buffer.sample(1)
-                # Debug output for shape inspection
-                # print(f"Debug - Sample shapes: obs={sample.observations.shape}, actions={sample.actions.shape}, rewards={sample.rewards.shape}")
-                
-                # Validate that rewards are properly shaped for batch training
-                if len(sample.rewards.shape) < 1 or sample.rewards.shape[0] != 1:
-                    print(f"Warning: Rewards have unexpected shape: {sample.rewards.shape}, reshaping...")
-                    # The reshaping will happen below, this is just for diagnostics
-
-            # Set explicit batch size to avoid broadcasting issues
-            batch_size = min(64, model.replay_buffer.pos)
-            
-            # Use a smaller gradient_steps to reduce chances of error
-            gradient_steps = 1
-            
-            try:
-                # Train with explicitly controlled batch size
-                model.train(gradient_steps=gradient_steps, batch_size=batch_size)
-            except ValueError as ve:
-                if "doesn't match the broadcast shape" in str(ve):
-                    print(f"Caught broadcasting error: {ve}")
-                    print("Trying with smaller batch size...")
-                    # Try again with a very small batch size as a fallback
-                    model.train(gradient_steps=1, batch_size=4)
-                else:
-                    raise
-                    
+            model.train(gradient_steps=10, batch_size=64)  # More work per call
         except Exception as e:
             print(f"Training error: {e}")
-            import traceback
-            traceback.print_exc()
 
 def main():
-    print("Starting Tempest AI...")
+    """Main loop to handle game interaction and model training."""
     env, bc_model, rl_model = initialize_models()
-    
-    # args.replay = "/Users/dave/mame/tempest.log"
-    # If a replay file is specified, replay it first
-    
+
     if args.replay:
         replay_log_file(args.replay, bc_model)
-        # Exit if we're only replaying
         if not os.path.exists(LUA_TO_PY_PIPE):
-            print("Replay complete. Exiting.")
             return
-    
+
+    # Setup pipes
     for pipe in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
         if os.path.exists(pipe):
             os.unlink(pipe)
         os.mkfifo(pipe)
         os.chmod(pipe, 0o666)
-    print("Pipes created. Waiting for Lua...")
 
+    print("Pipes created. Waiting for Lua...")
     while True:
         try:
-            with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
+            with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, \
+                 open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
                 print("✔️ Lua connected.")
                 frame_count = 0
                 while True:
@@ -481,28 +333,13 @@ def main():
                     if is_attract:
                         if game_action:
                             _, bc_action = train_bc(bc_model, processed_data, *game_action)
-                            if random.random() < 0.2:
-                                spinner = max(-64, min(63, bc_action[2] + random.randint(-10, 10)))
-                                bc_action = (bc_action[0], bc_action[1], spinner)
                             action = encode_action(*bc_action)
                         else:
                             action = encode_action(0, 0, 0)
                     else:
-                        try:
-                            action, _ = rl_model.predict(processed_data, deterministic=False)
-                            action = action.flatten()
-                        except Exception as e:
-                            print(f"Prediction error: {e}")
-                            fire, zap, spinner = bc_model(torch.FloatTensor(processed_data).unsqueeze(0).to(device))
-                            action = encode_action(1 if fire.item() > 0.5 else 0, 1 if zap.item() > 0.5 else 0, int(round(spinner.item() * 128.0)))
-
-                        if random.random() < 0.2:
-                            fire, zap, spinner = bc_model(torch.FloatTensor(processed_data).unsqueeze(0).to(device))
-                            action = encode_action(1 if fire.item() > 0.5 else 0, 1 if zap.item() > 0.5 else 0, int(round(spinner.item() * 128.0)))
-
+                        action, _ = rl_model.predict(processed_data, deterministic=False)
                         if env.prev_state is not None:
                             safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, action, env.reward, env.done)
-
                         if frame_count % 50 == 0 and rl_model.replay_buffer.pos > rl_model.learning_starts:
                             threading.Thread(target=train_model_background, args=(rl_model,), daemon=True).start()
 
@@ -518,13 +355,13 @@ def main():
             print(f"Error: {e}")
             time.sleep(5)
 
-    print("Shutting down...")
-
 def encode_action(fire, zap, spinner_delta):
-    return np.array([float(fire), float(zap), max(-1.0, min(1.0, spinner_delta / 64.0))], dtype=np.float32)
+    """Convert discrete actions to continuous RL action space."""
+    return np.array([float(fire), float(zap), max(-1.0, min(1.0, spinner_delta / 128.0))], dtype=np.float32)
 
 def decode_action(action):
-    return 1 if action[0] > 0.5 else 0, 1 if action[1] > 0.5 else 0, int(round(action[2] * 64.0))
+    """Convert RL actions to discrete game inputs."""
+    return 1 if action[0] > 0.5 else 0, 1 if action[1] > 0.5 else 0, int(round(action[2] * 127.0))
 
 if __name__ == "__main__":
     random.seed(42)
