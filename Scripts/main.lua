@@ -125,7 +125,7 @@ local function calculate_reward(game_state, level_state, player_state)
     if player_state.alive == 1 then
         reward = reward + 1
     else
-        reward = reward - 10
+        reward = reward - 100
     end
     
     -- 2. Score reward: Add the score delta from the last frame
@@ -150,15 +150,10 @@ local function calculate_reward(game_state, level_state, player_state)
     -- You could multiply by 10 to make it more significant
     -- reward = reward + (avg_score_per_frame)
     
-    -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 10
+    -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 50
 
     local spinner_abs = math.abs(player_state.SpinnerDelta)
-    if (spinner_abs < 9) then
-        reward = reward + 5
-        if game_state.gamestate == 0x20 then
-            reward = reward + 25
-        end
-    end
+    reward = reward + ((128 - spinner_abs) / 50)
 
     -- Update previous values for next frame
     previous_score = player_state.score
@@ -260,6 +255,7 @@ local function process_frame(params)
                 
                 break  -- Exit the loop once we've successfully read and unpacked the data
             else
+                print("Sleeping...")
                 -- Sleep briefly to avoid busy-waiting
                 os.execute("sleep 0.01")
             end
