@@ -97,6 +97,7 @@ local previous_score = 0
 local previous_level = 0
 local avg_score_per_frame = 0
 local AGGRESSION_DECAY = 0.99
+local previous_alive_state = 1  -- Track previous alive state, initialize as alive
 
 -- Declare a global variable to store the last reward state
 local LastRewardState = 0
@@ -115,17 +116,19 @@ local DISPLAY_UPDATE_INTERVAL = 0.1  -- Update display every 0.1 seconds (10 tim
 local function calculate_reward(game_state, level_state, player_state)
     local reward = 0
     
-    -- 1. Survival reward: 0.01 point per frame for staying alive
-    -- 2. Death penalty: -100 points for dying (last multiple frames)
-    -- 3. Score reward: Add the score delta from the last frame
-    -- 4. Level completion reward: 1000 * new level number when level increases
-    -- 5. Aggression reward: Use weighted average of score per frame
-    -- 6. Stasis reward: 0.01 points per frame for staying in the same state
-
+    -- 1. Survival reward: 1 point per frame for staying alive
+    -- 2. Death penalty: -10 points only when transitioning from alive to dead
     if player_state.alive == 1 then
+        -- Player is alive
         reward = reward + 1
     else
-        reward = reward - 100
+        -- Player is dead, but only apply penalty on transition
+        if previous_alive_state == 1 then
+            -- Just died - apply death penalty once
+            reward = reward - 10
+            print("Death penalty applied: -10")
+        end
+        -- No penalty on subsequent dead frames
     end
     
     -- 2. Score reward: Add the score delta from the last frame
@@ -158,7 +161,8 @@ local function calculate_reward(game_state, level_state, player_state)
     -- Update previous values for next frame
     previous_score = player_state.score
     previous_level = level_state.level_number
-    
+    previous_alive_state = player_state.alive  -- Update previous alive state
+
     -- Update the LastRewardState with the current reward
     LastRewardState = reward
     
