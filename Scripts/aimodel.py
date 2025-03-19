@@ -26,6 +26,10 @@ import queue
 from collections import deque
 
 # Constants
+ShouldReplayLog = True
+LogFile = "/Users/dave/mame/tempest.log"
+MaxLogFrames = 10000
+
 NumberOfParams = 247
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
@@ -282,7 +286,7 @@ def replay_log_file(log_file_path, bc_model):
     print(f"Replaying {log_file_path}")
     frame_count = 0
     with open(log_file_path, 'rb') as f:
-        while frame_count < 10000:  # Limit replay frames
+        while frame_count < MaxLogFrames:  # Limit replay frames
             header_size_bytes = f.read(4)
             if not header_size_bytes or len(header_size_bytes) < 4:
                 break
@@ -363,6 +367,185 @@ def main():
     """Main execution loop for Tempest AI."""
     env = TempestEnv()
     bc_model, rl_model = initialize_models(env)
+    threading.Thread(target=background_train, args=(rl_model,), daemon=True).start()
+
+    if ShouldReplayLog:
+        args.replay = LogFile
+
+    if args.replay:
+        replay_log_file(args.replay, bc_model)
+        if not os.path.exists(LUA_TO_PY_PIPE):
+            return
+
+    for pipe in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
+        if os.path.exists(pipe): os.unlink(pipe)
+        os.mkfifo(pipe)
+        os.chmod(pipe, 0o666)
+
+    print("Pipes created. Waiting for Lua...")
+    frame_count = 0
+    
+    # Track game and model performance over time
+    episode_rewards = deque(maxlen=5)
+    total_episode_reward = 0
+    
+    with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, \
+         open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
+        print("✔️ Lua connected.")
+        
+        # Track spinner movements for analytics
+        spinner_history = deque(maxlen=100)
+        positive_spinners = 0
+        negative_spinners = 0
+        
+        # Exploration annealing
+        initial_exploration_ratio = 1.0
+        min_exploration_ratio = 0.05
+        exploration_decay = 0.9999  # Slow decay
+        current_exploration_ratio = initial_exploration_ratio
+        
+        # For debugging directional bias
+        directional_balance_history = deque(maxlen=20)
+        
+        while True:
+            try:
+                data = lua_to_py.read()
+                if not data:
+                    time.sleep(0.01)
+                    continue
+                state, _, reward, game_action, is_attract, done, save_signal = process_frame_data(data)
+                if state is None:
+                    continue
+
+                env.update_state(state, reward, game_action, done)
+                total_episode_reward += reward
+                
+                if done:
+                    # End of episode tracking
+                    episode_rewards.append(total_episode_reward)
+                    print(f"Episode finished! Reward: {total_episode_reward:.2f}, "
+                          f"Avg Episode Reward: {np.mean(episode_rewards):.2f}")
+                    env.reset()
+                    frame_count = 0
+                    total_episode_reward = 0
+                    # Reset bias tracking
+                    positive_spinners = 0
+                    negative_spinners = 0
+
+                # Add to replay buffer with careful device handling
+                if not is_attract and env.prev_state is not None and env.prev_action is not None:
+                    safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, env.prev_action, reward, done)
+
+                if is_attract:
+                    action = train_bc(bc_model, state, *game_action)[1] if game_action else encode_action(0, 0, 0)
+                else:
+                    # Anneal exploration over time
+                    if frame_count % 1000 == 0 and current_exploration_ratio > min_exploration_ratio:
+                        current_exploration_ratio *= exploration_decay
+                    
+                    # Get BC or RL prediction with balanced exploration
+                    if random.random() < current_exploration_ratio:
+                        # BC action for exploration
+                        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+                        bc_action = bc_model(state_tensor).detach().cpu().numpy()[0]
+                        
+                        # Use BC prediction but add small noise to avoid getting stuck
+                        fire_noise = 0 if random.random() < 0.9 else (1 if bc_action[0] < 0.5 else 0) 
+                        zap_noise = 0 if random.random() < 0.9 else (1 if bc_action[1] < 0.5 else 0)
+                        
+                        # Small directional noise for spinner with bias correction
+                        # Check recent directional balance and add noise in opposite direction
+                        spinner_bias_correction = 0
+                        if len(directional_balance_history) > 10:
+                            positive_ratio = sum(1 for d in directional_balance_history if d > 0) / len(directional_balance_history)
+                            if positive_ratio > 0.7:  # Too many positive values
+                                spinner_bias_correction = -0.05  # Encourage negative
+                            elif positive_ratio < 0.3:  # Too many negative values
+                                spinner_bias_correction = 0.05   # Encourage positive
+                        
+                        # Add spinner balance correction to the action
+                        spinner_noise = np.random.normal(0, 0.05) + spinner_bias_correction
+                        bc_action[2] = np.clip(bc_action[2] + spinner_noise, -1.0, 1.0)
+                        
+                        action = bc_action
+                    else:
+                        # RL action with exploration noise biased towards smaller spinner deltas
+                        state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
+                        deterministic = frame_count > 10000 or random.random() < 0.7  # Increase deterministic actions
+                        raw_action = rl_model.predict(state_tensor, deterministic=deterministic)[0].flatten()
+                        
+                        # Apply directional bias correction if needed
+                        if not deterministic and len(directional_balance_history) > 10:
+                            positive_ratio = sum(1 for d in directional_balance_history if d > 0) / len(directional_balance_history)
+                            if positive_ratio > 0.7:  # Too many positive values
+                                # Encourage negative spinner values
+                                if raw_action[2] > 0:
+                                    raw_action[2] *= 0.5  # Reduce positive values
+                            elif positive_ratio < 0.3:  # Too many negative values
+                                # Encourage positive spinner values
+                                if raw_action[2] < 0:
+                                    raw_action[2] *= 0.5  # Reduce negative values
+                                    
+                        action = raw_action
+
+                env.step(action)
+                fire, zap, spinner = env.decode_action(action)
+                
+                # Track spinner actions for analytics and bias correction
+                spinner_history.append(spinner)
+                if spinner > 0:
+                    positive_spinners += 1
+                elif spinner < 0:
+                    negative_spinners += 1
+                
+                # Track directional balance for later correction
+                directional_balance_history.append(spinner)
+                
+                py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
+                py_to_lua.flush()
+
+                if frame_count % 10 == 0 and rl_model.replay_buffer.pos > rl_model.learning_starts:
+                    training_queue.put(True)
+                    mean_rewards.append(reward)
+
+                if frame_count % 100 == 0:
+                    print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, Buffer Size: {rl_model.replay_buffer.pos}")
+                    actor_loss_mean = np.nanmean(actor_losses) if actor_losses else np.nan
+                    critic_loss_mean = np.nanmean(critic_losses) if critic_losses else np.nan
+                    ent_coef_mean = np.nanmean(ent_coefs) if ent_coefs else np.nan
+                    reward_mean = np.nanmean(mean_rewards) if mean_rewards else np.nan
+                    
+                    # Report spinner statistics with directional bias info
+                    if spinner_history:
+                        spinner_abs = [abs(s) for s in spinner_history]
+                        spinner_avg = np.mean(spinner_abs)
+                        spinner_max = np.max(spinner_abs)
+                        total_spinners = positive_spinners + negative_spinners
+                        dir_ratio = 0.5
+                        if total_spinners > 0:
+                            dir_ratio = positive_spinners / total_spinners
+                        
+                        print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
+                              f"% small (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%, "
+                              f"Dir bias: {dir_ratio:.2f} (+/-)")
+                    
+                    print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
+                          f"Entropy Coef: {ent_coef_mean:.6f}, Mean Reward: {reward_mean:.2f}, "
+                          f"Expl: {current_exploration_ratio:.3f}")
+
+                if save_signal:
+                    save_models(rl_model, bc_model)
+                    # Also reset exploration temporarily to try new strategies after save
+                    current_exploration_ratio = min(0.1, current_exploration_ratio * 2.0)
+                frame_count += 1
+
+            except KeyboardInterrupt:
+                save_models(rl_model, bc_model)
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+                time.sleep(5) 
+                initialize_models(env)
     threading.Thread(target=background_train, args=(rl_model,), daemon=True).start()
 
     if args.replay:
@@ -476,17 +659,38 @@ def initialize_models(env):
         bc_model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=device))
         print(f"Loaded BC model from {BC_MODEL_PATH}")
 
-    # Set replay buffer's device during initialization
+    # Use a lower learning rate and smaller batch size to improve stability
+    # Set entropy target to a smaller value to reduce exploration
     rl_model = SAC("MlpPolicy", env, policy_kwargs={
         "features_extractor_class": TempestFeaturesExtractor,
         "features_extractor_kwargs": {"features_dim": 128},
         "net_arch": dict(pi=[256, 128], qf=[256, 128])
-    }, learning_rate=0.001, buffer_size=100000, learning_starts=1000, batch_size=64,
-                   train_freq=(10, "step"), gradient_steps=10, device=device, verbose=1, tau=0.005)
+    }, learning_rate=0.0005,  # Reduced from 0.001
+       buffer_size=100000, 
+       learning_starts=1000,
+       batch_size=32,       # Reduced from 64 
+       train_freq=(10, "step"),
+       gradient_steps=5,    # Reduced from 10
+       ent_coef="auto",     # Auto entropy adjustment
+       target_entropy=-1.5, # Set a specific target entropy value
+       tau=0.005,          # Soft update coefficient
+       gamma=0.99,         # Discount factor
+       device=device,
+       verbose=1)
     
     if os.path.exists(LATEST_MODEL_PATH):
         rl_model = SAC.load(LATEST_MODEL_PATH, env=env, device=device)
         print(f"Loaded RL model from {LATEST_MODEL_PATH}")
+    
+    # Fix target entropy to be a scalar
+    if hasattr(rl_model, 'target_entropy'):
+        # Check if it's a tensor and convert to scalar if needed
+        if isinstance(rl_model.target_entropy, torch.Tensor):
+            rl_model.target_entropy = float(rl_model.target_entropy.item())
+        # Set a reasonable target entropy
+        action_dim = env.action_space.shape[0]
+        rl_model.target_entropy = -0.5 * action_dim
+        print(f"Set target entropy to {rl_model.target_entropy}")
     
     # Make sure the model is properly set up with consistent device placement
     apply_minimal_compatibility_patches(rl_model)
@@ -504,11 +708,37 @@ def save_models(rl_model, bc_model):
         print(f"Error saving models: {e}")
 
 def encode_action(fire, zap, spinner_delta):
-    """Encode actions for RL model consistency with easing function for spinner values."""
-    # Apply an easing function to encourage smaller spinner deltas
-    # Use tanh to squash large values while preserving sign
-    normalized_spinner = np.tanh(spinner_delta / 20.0) * 127.0
-    return np.array([float(fire), float(zap), max(-1.0, min(1.0, normalized_spinner / 127.0))], dtype=np.float32)
+    """Encode actions for RL model consistency with easing function for spinner values.
+    
+    Args:
+        fire (int): 0 or 1 for fire action
+        zap (int): 0 or 1 for zap action
+        spinner_delta (int): Value between -127 and 127 for spinner movement
+        
+    Returns:
+        numpy.ndarray: Normalized action vector [fire, zap, spinner] in range [0,1,[-1,1]]
+    """
+    # Convert to float values first
+    fire_val = float(fire)
+    zap_val = float(zap)
+    
+    # Apply stronger squashing for large spinner values
+    # Use custom sigmoid-based function to ensure balanced positive/negative distribution
+    if abs(spinner_delta) < 10:
+        # Small deltas pass through with minimal transformation
+        normalized_spinner = spinner_delta / 127.0
+    else:
+        # Larger deltas get increasingly squashed - sign preserved
+        sign = np.sign(spinner_delta)
+        magnitude = abs(spinner_delta)
+        # Apply stronger squashing to large values
+        squashed = 10.0 + (magnitude - 10.0) * (1.0 / (1.0 + (magnitude - 10.0) / 20.0))
+        normalized_spinner = sign * min(squashed / 127.0, 1.0)
+    
+    # Verify the value is in range before returning
+    spinner_val = max(-1.0, min(1.0, normalized_spinner))
+    
+    return np.array([fire_val, zap_val, spinner_val], dtype=np.float32)
 
 if __name__ == "__main__":
     random.seed(42)

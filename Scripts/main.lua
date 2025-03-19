@@ -155,8 +155,8 @@ local function calculate_reward(game_state, level_state, player_state)
     
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 50
 
-    local spinner_abs = math.abs(player_state.SpinnerDelta)
-    reward = reward + ((128 - spinner_abs) / 50)
+    local spinner_abs = math.min(127, math.abs(player_state.SpinnerDelta))
+    reward = reward + ((128 - spinner_abs) / 100)
 
     -- Update previous values for next frame
     previous_score = player_state.score
