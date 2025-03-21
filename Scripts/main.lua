@@ -142,13 +142,8 @@ local previous_alive_state = 1  -- Track previous alive state, initialize as ali
 -- Declare a global variable to store the last reward state
 local LastRewardState = 0
 
--- Add this at the top of the file, near other global variables
 local shutdown_requested = false
 
--- Add these global variables near the top of the script with other globals
-local model_fire = 0
-local model_zap = 0
-local model_spinner = 0
 local last_display_update = 0  -- Timestamp of last display update
 local DISPLAY_UPDATE_INTERVAL = 0.1  -- Update display every 0.1 seconds (10 times per second)
 
@@ -1145,6 +1140,10 @@ local function frame_callback()
         -- Send the serialized data to the Python script and get the components
         local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone)
 
+        player_state.fire_commanded = fire
+        player_state.zap_commanded = zap
+        player_state.SpinnerDelta = spinner
+
         -- Update total bytes sent
         total_bytes_sent = total_bytes_sent + #frame_data
 
@@ -1292,9 +1291,9 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Add new Model State section
     move_cursor_to_row(21)
     local model_metrics = {
-        ["Model Fire"] = model_fire,
-        ["Model Zap"] = model_zap,
-        ["Model Spinner"] = model_spinner
+        ["Model Fire"] = player_state.fire_commanded,
+        ["Model Zap"] = player_state.zap_commanded,
+        ["Model Spinner"] = player_state.SpinnerDelta
     }
     print(format_section("Model Output", model_metrics))
 
