@@ -24,11 +24,14 @@ from gymnasium import spaces
 import threading
 import queue
 from collections import deque
+import concurrent.futures
+from threading import Lock
+import traceback
 
 # Constants
-ShouldReplayLog = True
-LogFile = "/Users/dave/mame/tempest.log"
-MaxLogFrames = 10000
+ShouldReplayLog = False
+LogFile = "/Users/dave/mame/big.log"
+MaxLogFrames = 100000
 
 NumberOfParams = 247
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
@@ -115,45 +118,180 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
             observations = observations.to(device)
         return self.feature_extractor(observations)
 
+class ResidualBlock(nn.Module):
+    """Residual block with layer normalization for better gradient flow."""
+    def __init__(self, dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim)
+        )
+        self.relu = nn.ReLU()
+        
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
 class BCModel(nn.Module):
-    """BC model to mimic game AI actions in attract mode."""
+    """Enhanced BC model with deeper architecture and residual connections."""
     def __init__(self, input_size=NumberOfParams):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_size, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU()
+        
+        # Feature extraction layers
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_size, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
         )
-        self.fire_output = nn.Linear(64, 1)
-        self.zap_output = nn.Linear(64, 1)
-        self.spinner_output = nn.Linear(64, 1)
-        for layer in [self.net[0], self.net[2], self.fire_output, self.zap_output, self.spinner_output]:
-            nn.init.xavier_uniform_(layer.weight)
-        self.optimizer = optim.Adam(self.parameters(), lr=0.001)
+        
+        # Deeper processing with residual connections
+        self.deep_processing = nn.Sequential(
+            ResidualBlock(512),
+            nn.Dropout(0.2),
+            ResidualBlock(512),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            ResidualBlock(256),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU()
+        )
+        
+        # Separate action heads with their own processing
+        self.fire_path = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        self.zap_path = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        self.spinner_path = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        # Better initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Learning rate scheduler and optimizer with HIGHER learning rate
+        self.optimizer = optim.AdamW(self.parameters(), lr=0.003, weight_decay=1e-5)
+        
+        # More conservative scheduler - much higher patience, smaller factor
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.7, patience=50, 
+            verbose=True, min_lr=1e-5
+        )
+        
+        # Track loss history for further diagnostics
+        self.loss_history = []
+        
         self.to(device)
+        self.train()
 
     def forward(self, x):
-        # Ensure input is on the correct device
         if x.device != device:
             x = x.to(device)
-        h = self.net(x)
-        return torch.cat([
-            torch.sigmoid(self.fire_output(h)),
-            torch.sigmoid(self.zap_output(h)),
-            torch.tanh(self.spinner_output(h))
-        ], dim=1)
+        
+        # Extract features
+        features = self.feature_extractor(x)
+        
+        # Deep processing
+        processed = self.deep_processing(features)
+        
+        # Get action outputs
+        fire_out = torch.sigmoid(self.fire_path(processed))
+        zap_out = torch.sigmoid(self.zap_path(processed))
+        spinner_out = torch.tanh(self.spinner_path(processed))
+        
+        return torch.cat([fire_out, zap_out, spinner_out], dim=1)
 
 def process_frame_data(data):
-    """Unpack and normalize game frame data from Lua."""
+    """Unpack and normalize game frame data from Lua with same format for pipe/log."""
     try:
-        header = struct.unpack(">IdBBBIIBBBh", data[:struct.calcsize(">IdBBBIIBBBh")])
-        num_values, reward, game_action, game_mode, is_done, frame_counter, score, save_signal, fire, zap, spinner = header
-        game_data = np.frombuffer(data[struct.calcsize(">IdBBBIIBBBh"):], dtype=np.uint16).astype(np.float32) - 32768.0
+        # Default values
+        save_signal = 0
+        is_done = False
+        frame_counter = 0
+        game_mode = 0
+        
+        # Get start position in the binary data
+        pos = 0
+        
+        # Read header size (should be 15)
+        if len(data) < pos + 4:
+            raise ValueError(f"Data too short for header size: {len(data)} bytes")
+        header_size = struct.unpack(">I", data[pos:pos+4])[0]
+        pos += 4
+        
+        if header_size != 15:
+            print(f"Warning: Unexpected header size {header_size}, expected 15")
+        
+        # Read payload size
+        if len(data) < pos + 4:
+            raise ValueError(f"Data too short for payload size: {len(data)} bytes")
+        payload_size = struct.unpack(">I", data[pos:pos+4])[0]
+        pos += 4
+        
+        # Read header content (reward, zap, fire, spinner) - 7 bytes total
+        if len(data) < pos + 7:
+            raise ValueError(f"Data too short for header content: {len(data)} bytes")
+        
+        # Parse header components exactly like the log file
+        reward_int = struct.unpack(">i", data[pos:pos+4])[0]  # Signed 32-bit integer
+        reward = reward_int / 1000.0  # Divide by 1000 to get float
+        pos += 4
+        
+        zap = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
+        pos += 1
+        
+        fire = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
+        pos += 1
+        
+        spinner = struct.unpack(">b", bytes([data[pos]]))[0]  # Signed byte
+        pos += 1
+        
+        # print(f"PIPE DEBUG - Decoded header: Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}")
+        
+        # Read game state data
+        if len(data) < pos + payload_size:
+            raise ValueError(f"Data too short for payload: expected {payload_size}, got {len(data) - pos}")
+        
+        game_data = np.frombuffer(data[pos:pos+payload_size], dtype=np.uint16)
+                   
+        # Convert from uint16 to normalized float32 in range [-1, 1]
+        game_data = game_data.astype(np.float32) - 32768.0
         state = game_data / np.where(game_data > 0, 32767.0, 32768.0).astype(np.float32)
-        if len(state) != NumberOfParams:
-            state = np.pad(state, (0, NumberOfParams - len(state)), 'constant').astype(np.float32)[:NumberOfParams]
-        return state, frame_counter, float(reward), (fire, zap, spinner), not (game_mode & 0x80), is_done, save_signal
+        
+        # Important: Always maintain consistent size with NumberOfParams
+        if len(state) > NumberOfParams:
+            state = state[:NumberOfParams]  # Truncate if too long
+        elif len(state) < NumberOfParams:
+            state = np.pad(state, (0, NumberOfParams - len(state)), 'constant')  # Pad if too short
+            
+        # Return with all the necessary values
+        return state, frame_counter, float(reward), (fire, zap, spinner), True, is_done, save_signal
     except Exception as e:
         print(f"Error processing frame data: {e}")
+        traceback.print_exc()
         return None, 0, 0.0, None, False, False, 0
 
 def train_bc(model, state, fire_target, zap_target, spinner_target):
@@ -283,30 +421,190 @@ def replay_log_file(log_file_path, bc_model):
     if not os.path.exists(log_file_path):
         print(f"Error: Log file {log_file_path} not found")
         return False
+    
     print(f"Replaying {log_file_path}")
+    
     frame_count = 0
-    with open(log_file_path, 'rb') as f:
-        while frame_count < MaxLogFrames:  # Limit replay frames
-            header_size_bytes = f.read(4)
-            if not header_size_bytes or len(header_size_bytes) < 4:
-                break
-            header_size = struct.unpack(">I", header_size_bytes)[0]
-            payload_size_bytes = f.read(4)
-            if not payload_size_bytes or len(payload_size_bytes) < 4:
-                break
-            payload_size = struct.unpack(">I", payload_size_bytes)[0]
-            payload = f.read(payload_size)
-            if len(payload) < payload_size:
-                break
-            state, _, _, game_action, _, _, _ = process_frame_data(payload)
-            if state is not None and game_action:
-                loss, _ = train_bc(bc_model, state, *game_action)
-                frame_count += 1
-                if frame_count % 1000 == 0:
-                    print(f"Processed {frame_count} frames, BC Loss: {loss:.6f}")
-    print(f"Replay complete: {frame_count} frames")
-    torch.save(bc_model.state_dict(), BC_MODEL_PATH)
-    return True
+    batch_size = 64
+    training_data = []
+    batch_loss = 0
+    
+    # Stats tracking
+    total_fire = 0
+    total_zap = 0
+    total_reward = 0
+    total_spinner = 0
+    
+    try:
+        with open(log_file_path, 'rb') as f:
+            file_size = os.path.getsize(log_file_path)
+            print(f"Log file size: {file_size} bytes")
+            
+            frames_processed = 0
+            while frame_count < MaxLogFrames:
+                # Read header size (should be 15)
+                header_size_bytes = f.read(4)
+                if not header_size_bytes or len(header_size_bytes) < 4:
+                    print(f"End of file reached after {frames_processed} frames")
+                    break
+                
+                header_size = struct.unpack(">I", header_size_bytes)[0]
+                if header_size != 15:
+                    print(f"Warning: Expected header size of 15 bytes, got {header_size}")
+                    exit
+
+                # Read payload size
+                payload_size_bytes = f.read(4)
+                if not payload_size_bytes or len(payload_size_bytes) < 4:
+                    print(f"Failed to read payload size after {frames_processed} frames")
+                    break
+                
+                payload_size = struct.unpack(">I", payload_size_bytes)[0]
+                
+                # Read header content (reward, zap, fire, spinner)
+                header_data = f.read(7)  # 4+1+1+1 bytes
+                if len(header_data) < 7:
+                    print(f"Short read on header data: got {len(header_data)}, expected 7")
+                    break
+                
+                # Parse header components EXACTLY as they're encoded in Lua
+                reward_int = struct.unpack(">i", header_data[0:4])[0]  # Signed int (lowercase i)
+                reward = reward_int / 1000.0  # Divide by 1000 to get float
+                
+                # Use struct.unpack for all values to match Lua encoding
+                zap = struct.unpack(">B", bytes([header_data[4]]))[0]  # Unsigned byte
+                fire = struct.unpack(">B", bytes([header_data[5]]))[0]  # Unsigned byte
+                spinner = struct.unpack(">b", bytes([header_data[6]]))[0]  # Signed byte
+                
+                print(f"LOG DEBUG - Decoded: Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}")
+
+                # Read game state data
+                game_data_bytes = f.read(payload_size)
+                if len(game_data_bytes) < payload_size:
+                    print(f"Short read on game data: got {len(game_data_bytes)}, expected {payload_size}")
+                    break
+                
+                # Convert to state array - match format in Lua params
+                game_data = np.frombuffer(game_data_bytes, dtype=np.uint16)
+                
+                # Convert from uint16 to normalized float32 in range [-1, 1]
+                game_data = game_data.astype(np.float32) - 32768.0
+                state = game_data / np.where(game_data > 0, 32767.0, 32768.0).astype(np.float32)
+                
+                # Ensure consistent size
+                if len(state) > NumberOfParams:
+                    state = state[:NumberOfParams]  # Truncate if too long
+                elif len(state) < NumberOfParams:
+                    state = np.pad(state, (0, NumberOfParams - len(state)), 'constant')  # Pad if too short
+                
+                frames_processed += 1
+                
+                # Update stats
+                total_fire += fire
+                total_zap += zap
+                total_reward += reward
+                total_spinner += spinner
+                
+                # Print occasional debug info
+                if frames_processed <= 10 or frames_processed % 1000 == 0:
+                    print(f"Frame {frames_processed}: Reward={reward:.3f}, Fire={fire}, Zap={zap}, Spinner={spinner}")
+                    print(f"Game data shape: {state.shape}, Payload size: {payload_size}")
+                
+                # Add to training data
+                action = (fire, zap, spinner)
+                training_data.append((state, action, reward))
+                
+                # Train in batches
+                if len(training_data) >= batch_size:
+                    batch_loss = train_model_with_batch(bc_model, training_data[:batch_size])
+                    if frame_count % 100 == 0:
+                        print(f"Trained batch - loss: {batch_loss:.6f}")
+                    training_data = training_data[batch_size:]
+                    frame_count += batch_size
+            
+            # Train any remaining data
+            if training_data:
+                batch_loss = train_model_with_batch(bc_model, training_data)
+                print(f"Trained final batch - loss: {batch_loss:.6f}")
+                frame_count += len(training_data)
+            
+            print(f"Replay complete: {frame_count} frames added from {frames_processed} processed")
+            if frames_processed > 0:
+                print(f"FINAL STATS - Avg Fire: {total_fire/frames_processed:.4f}, " +
+                      f"Avg Zap: {total_zap/frames_processed:.4f}, Avg Reward: {total_reward/frames_processed:.4f}")
+            
+            torch.save(bc_model.state_dict(), BC_MODEL_PATH)
+            return True
+            
+    except Exception as e:
+        print(f"Error during replay: {e}")
+        traceback.print_exc()
+        if frame_count > 0:
+            print(f"Saving partial model after {frame_count} frames")
+            torch.save(bc_model.state_dict(), BC_MODEL_PATH)
+        return False
+
+def train_model_with_batch(model, batch):
+    """Train model with a batch of data and reward information."""
+    model.train()
+    
+    # Create tensors for batch training
+    states = []
+    fire_targets = []
+    zap_targets = []
+    spinner_targets = []
+    rewards = []  # Now tracking rewards
+    
+    for state, game_action, reward in batch:
+        fire, zap, spinner = game_action
+        # Normalize spinner to [-1, 1]
+        normalized_spinner = max(-127, min(127, spinner)) / 127.0
+        
+        states.append(state)
+        fire_targets.append(float(fire))
+        zap_targets.append(float(zap))
+        spinner_targets.append(normalized_spinner)
+        rewards.append(float(reward))
+    
+    # Convert to tensors
+    state_tensor = torch.FloatTensor(np.array(states)).to(device)
+    targets = torch.FloatTensor([
+        [fire, zap, spinner] for fire, zap, spinner in 
+        zip(fire_targets, zap_targets, spinner_targets)
+    ]).to(device)
+    reward_tensor = torch.FloatTensor(rewards).to(device)
+    
+    # Training step
+    model.optimizer.zero_grad()
+    preds = model(state_tensor)
+    
+    # Weight the loss by reward - actions with higher rewards matter more
+    # Add small constant to avoid zero rewards
+    reward_weights = torch.clamp(reward_tensor, min=0.1) / torch.clamp(reward_tensor, min=0.1).mean()
+    reward_weights = reward_weights.unsqueeze(1)
+    
+    # Balanced loss components with reward weighting
+    fire_zap_loss = F.binary_cross_entropy(preds[:, :2], targets[:, :2], reduction='none') * reward_weights
+    fire_zap_loss = fire_zap_loss.mean()
+    
+    spinner_loss = F.mse_loss(preds[:, 2:], targets[:, 2:], reduction='none') * reward_weights * 1.5
+    spinner_loss = spinner_loss.mean()
+    
+    loss = fire_zap_loss + spinner_loss
+    
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    model.optimizer.step()
+    
+    # Update learning rate based on loss
+    if hasattr(model, 'scheduler') and hasattr(model, 'loss_history'):
+        model.loss_history.append(loss.item())
+        if len(model.loss_history) >= 10:
+            avg_loss = sum(model.loss_history) / len(model.loss_history)
+            model.scheduler.step(avg_loss)
+            model.loss_history = []
+    
+    return loss.item()
 
 def background_train(rl_model):
     """Background RL training thread with queue-based triggering."""
@@ -413,7 +711,7 @@ def main():
                 if not data:
                     time.sleep(0.01)
                     continue
-                state, _, reward, game_action, is_attract, done, save_signal = process_frame_data(data)
+                state, frame_counter, reward, game_action, is_attract, done, save_signal = process_frame_data(data)
                 if state is None:
                     continue
 
@@ -509,12 +807,12 @@ def main():
                     mean_rewards.append(reward)
 
                 if frame_count % 100 == 0:
-                    print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, Buffer Size: {rl_model.replay_buffer.pos}")
                     actor_loss_mean = np.nanmean(actor_losses) if actor_losses else np.nan
                     critic_loss_mean = np.nanmean(critic_losses) if critic_losses else np.nan
                     ent_coef_mean = np.nanmean(ent_coefs) if ent_coefs else np.nan
                     reward_mean = np.nanmean(mean_rewards) if mean_rewards else np.nan
-                    
+                    print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, Buffer Size: {rl_model.replay_buffer.pos} Losses: Actor: ", actor_loss_mean, "Critic: ", critic_loss_mean, "Entropy: ", ent_coef_mean)
+
                     # Report spinner statistics with directional bias info
                     if spinner_history:
                         spinner_abs = [abs(s) for s in spinner_history]
@@ -529,8 +827,9 @@ def main():
                               f"% small (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%, "
                               f"Dir bias: {dir_ratio:.2f} (+/-)")
                     
-                    print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
-                          f"Entropy Coef: {ent_coef_mean:.6f}, Mean Reward: {reward_mean:.2f}, "
+                    if not is_attract:
+                        print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
+                              f"Entropy Coef: {ent_coef_mean:.6f}, Mean Reward: {reward_mean:.2f}, "
                           f"Expl: {current_exploration_ratio:.3f}")
 
                 if save_signal:
@@ -573,7 +872,7 @@ def main():
                 if not data:
                     time.sleep(0.01)
                     continue
-                state, _, reward, game_action, is_attract, done, save_signal = process_frame_data(data)
+                state, frame_counter, reward, game_action, is_attract, done, save_signal = process_frame_data(data)
                 if state is None:
                     continue
 

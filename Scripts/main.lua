@@ -48,10 +48,50 @@ end
 local pipe_out = nil
 local pipe_in = nil
 -- Log file for storing frame data
-local log_file = nil
+local log_file = nil  -- Will hold the file handle, not the path
+local log_file_path = "/Users/dave/mame/tempest.log"  -- Store the path separately
+local log_file_opened = false  -- Track if we've already opened the file
 
--- Function to open pipes (called once at startup)
+-- Add this near the top of the file with other global variables
+local frame_count = 0  -- Initialize frame counter
+
+-- Function to open pipes 
 local function open_pipes()
+    if (LOG_ONLY_MODE) then
+
+        -- Only open the log file once to prevent truncation!
+        if log_file_opened then
+            return true
+        end
+        
+        -- Ensure log file is opened properly in binary mode
+        local log_success, log_err = pcall(function()
+            -- Close the log file if it's already open
+            if log_file then
+                log_file:close()
+                log_file = nil
+            end
+            
+            -- Open log file in binary mode, with explicit path - ONLY ONCE
+            log_file = io.open(log_file_path, "wb")
+            
+            if not log_file then
+                print("Failed to open log file: file handle is nil")
+                return false
+            end
+            
+            print("Successfully opened log file for writing")
+            log_file_opened = true  -- Mark as opened so we don't reopen
+        end)
+        
+        if not log_success then
+            print("Error opening log file: " .. tostring(log_err))
+            return false
+        end
+        
+        return true
+    end
+
     -- Try to open the output pipe
     local open_success, err = pcall(function()
         pipe_out = io.open("/tmp/lua_to_py", "wb")
@@ -170,30 +210,56 @@ local function calculate_reward(game_state, level_state, player_state)
 end
 
 -- Function to send parameters and get action each frame
-local function process_frame(params)
+local function process_frame(params, player_state, controls, reward)
     -- In log-only mode, we only write to the log file and don't communicate with Python
+
+    -- Get the size of the header in bytes 
+    local header_size = 4 + 4 + 4 + 1 + 1 + 1
+    -- Get the size of the payload in bytes
+    local payload_size = #params
+
     if LOG_ONLY_MODE then
         -- Log the frame data to file
         if log_file then
-            pcall(function()
-                -- Get the size of the header in bytes (fixed at 8 bytes for now)
-                local header_size = 8
-                -- Get the size of the payload in bytes
-                local payload_size = #params
+            local success, err = pcall(function()
+                -- Convert reward to integer with 3 decimal precision
+                local int_reward = math.floor((reward or 0) * 1000)
                 
-                -- Write 32-bit header size
-                log_file:write(string.pack(">I4", header_size))
-                -- Write 32-bit count of bytes to follow
-                log_file:write(string.pack(">I4", payload_size))
-                -- Write the raw data
+                -- Print debugging output every 100 frames to avoid spam
+                if frame_count % 100 == 0 then
+                    print(string.format("Writing frame %d - Header size: %d, Payload size: %d, Reward: %d/1000", 
+                          frame_count, header_size, payload_size, int_reward))
+                end
+                
+                assert(controls.spinner_delta > -127 and controls.spinner_delta < 128)
+                
+                -- Preamble - header and payload sizes
+                log_file:write(string.pack(">I4", header_size))                 -- Write 32-bit header size
+                log_file:write(string.pack(">I4", payload_size))                -- Write 32-bit payload size
+                -- Header
+                log_file:write(string.pack(">i4", int_reward))                  -- Write 32-bit reward (multiplied by 1000)
+                log_file:write(string.pack(">I1", controls.zap_commanded))      -- Write 8-bit zap
+                log_file:write(string.pack(">I1", controls.fire_commanded))     -- Write 8-bit fire
+                log_file:write(string.pack(">i1", controls.spinner_delta))  -- Write 8-bit SIGNED spinner (lowercase i)
+                -- Write the raw data   
                 log_file:write(params)
-                -- Flush to ensure it's written
-                log_file:flush()
+
+                log_file:flush()  -- Ensure data is written to disk
             end)
+            
+            if not success then
+                print("ERROR writing to log file: " .. tostring(err))
+            end
+        else
+            -- Log file not open, attempting to open it
+            print("Log file not open, attempting to reopen")
+            open_pipes()
         end
         
-        -- Return default actions in log-only mode (typically no actions)
-        return 0, 0, 0
+        -- Increment frame count after processing
+        frame_count = frame_count + 1
+        
+        return controls.zap_commanded, controls.fire_commanded, controls.spinner_delta
     end
     
     -- Check if pipes are open, try to reopen if not
@@ -202,26 +268,18 @@ local function process_frame(params)
             return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on pipe error
         end
     end
-    
-    -- Log the frame data to file before sending
-    if log_file then
-        pcall(function()
-            -- Get the size of the header in bytes (fixed at 8 bytes for now)
-            local header_size = 8
-            -- Get the size of the payload in bytes
-            local payload_size = #params
-            
-            -- Write 32-bit header size
-            log_file:write(string.pack(">I4", header_size))
-            -- Write 32-bit count of bytes to follow
-            log_file:write(string.pack(">I4", payload_size))
-            -- Write the raw data
-            log_file:write(params)
-            -- Flush to ensure it's written
-            log_file:flush()
-        end)
-    end
-    
+  
+    -- Send data to Python
+
+    local int_reward = math.floor((reward or 0) * 1000)
+
+    pipe_out:write(string.pack(">I4", header_size))                         -- Write 32-bit header size    
+    pipe_out:write(string.pack(">I4", payload_size))                        -- Write 32-bit payload size
+    pipe_out:write(string.pack(">I4", int_reward))                              -- Write 32-bit reward 
+    pipe_out:write(string.pack(">I1", controls.zap_commanded))              -- Write 8-bit zap
+    pipe_out:write(string.pack(">I1", controls.fire_commanded))             -- Write 8-bit fire
+    pipe_out:write(string.pack(">i1", controls.spinner_delta))          -- Write 8-bit SIGNED spinner (lowercase i)
+
     -- Try to write to pipe, handle errors
     local success, err = pcall(function()
         pipe_out:write(params)
@@ -800,7 +858,6 @@ end
 -- Global variables for tracking bytes sent and FPS
 local total_bytes_sent = 0
 local last_fps_time = os.time()
-local frame_count = 0
 local current_fps = 0
 
 -- Function to flatten and serialize the game state data to signed 16-bit integers
@@ -1088,7 +1145,7 @@ local function frame_callback()
         frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
         -- Send the serialized data to the Python script and get the components
-        local fire, zap, spinner = process_frame(frame_data)
+        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward)
 
         -- Update total bytes sent
         total_bytes_sent = total_bytes_sent + #frame_data
@@ -1382,7 +1439,7 @@ local function on_mame_exit()
         
         -- Send one last time
         if pipe_out and pipe_in then
-            local result = process_frame(frame_data)
+            local result = process_frame(frame_data, player_state, controls, reward)
             print("Final save complete, response: " .. (result or "none"))
         end
     end
