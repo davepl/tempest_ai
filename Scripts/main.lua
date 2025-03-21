@@ -309,29 +309,15 @@ local function process_frame(params, player_state, controls, reward, bDone)
     -- Try to read from pipe, handle errors
     local fire, zap, spinner = 0, 0, 0  -- Default values
     success, err = pcall(function()
-        -- Use a timeout to avoid hanging indefinitely
-        local start_time = os.time()
-        local timeout = 2  -- 2 second timeout
+        -- Read exactly 3 bytes for the three i8 values, with minimal timeout
+        local action_bytes = pipe_in:read(3)
         
-        while os.time() - start_time < timeout do
-            -- Read exactly 3 bytes for the three i8 values
-            local action_bytes = pipe_in:read(3)
-            
-            if action_bytes and #action_bytes == 3 then
-                -- Unpack the three signed 8-bit integers
-                fire, zap, spinner = string.unpack("bbb", action_bytes)
-                
-                -- Store the values globally for display
-                model_fire = fire
-                model_zap = zap  
-                model_spinner = spinner
-                
-                break  -- Exit the loop once we've successfully read and unpacked the data
-            else
-                print("Sleeping...")
-                -- Sleep briefly to avoid busy-waiting
-                os.execute("sleep 0.01")
-            end
+        if action_bytes and #action_bytes == 3 then
+            -- Unpack the three signed 8-bit integers
+            fire, zap, spinner = string.unpack("bbb", action_bytes)
+        else
+            -- Default action if read fails
+            fire, zap, spinner = 0, 0, 0
         end
     end)
     

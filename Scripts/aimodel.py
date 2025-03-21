@@ -27,6 +27,7 @@ from collections import deque
 import concurrent.futures
 from threading import Lock
 import traceback
+import select
 
 # Constants
 ShouldReplayLog = False
@@ -224,7 +225,7 @@ class BCModel(nn.Module):
         
         return torch.cat([fire_out, zap_out, spinner_out], dim=1)
 
-def process_frame_data(data):
+def process_frame_data(data, header_data=None):
     """Unpack and normalize game frame data from Lua with same format for pipe/log."""
     try:
         # Default values
@@ -233,52 +234,53 @@ def process_frame_data(data):
         frame_counter = 0
         game_mode = 0
         
-        # Get start position in the binary data
-        pos = 0
-        
-        # Read header size (should be 15)
-        if len(data) < pos + 4:
-            raise ValueError(f"Data too short for header size: {len(data)} bytes")
-        header_size = struct.unpack(">I", data[pos:pos+4])[0]
-        pos += 4
-        
-        if header_size != 16:
-            print(f"Warning: Unexpected header size {header_size}, expected 15")
-        
-        # Read payload size
-        if len(data) < pos + 4:
-            raise ValueError(f"Data too short for payload size: {len(data)} bytes")
-        payload_size = struct.unpack(">I", data[pos:pos+4])[0]
-        pos += 4
-        
-        # Read header content (reward, zap, fire, spinner) - 7 bytes total
-        if len(data) < pos + 7:
-            raise ValueError(f"Data too short for header content: {len(data)} bytes")
-        
-        # Parse header components exactly like the log file
-        reward_int = struct.unpack(">i", data[pos:pos+4])[0]  # Signed 32-bit integer
-        reward = reward_int / 1000.0  # Divide by 1000 to get float
-        pos += 4
-        
-        is_done = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
-        pos += 1
-        
-        zap = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
-        pos += 1
-        
-        fire = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
-        pos += 1
-        
-        spinner = struct.unpack(">b", bytes([data[pos]]))[0]  # Signed byte
-        pos += 1
-        
-        # print(f"PIPE DEBUG - Decoded header: Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}, Done={is_done}")
-        
-        # Read game state data
-        if len(data) < pos + payload_size:
-            raise ValueError(f"Data too short for payload: expected {payload_size}, got {len(data) - pos}")
-        
-        game_data = np.frombuffer(data[pos:pos+payload_size], dtype=np.uint16)
+        # If header_data is not provided, we're in real-time mode reading from pipe
+        if header_data is None:
+            # Get start position in the binary data
+            pos = 0
+            
+            # Read header size (should be 16 - not 15!)
+            if len(data) < pos + 4:
+                raise ValueError(f"Data too short for header size: {len(data)} bytes")
+            header_size = struct.unpack(">I", data[pos:pos+4])[0]
+            pos += 4
+            
+            if header_size != 16:  # Changed from 15 to 16
+                print(f"Warning: Unexpected header size {header_size}, expected 16")
+            
+            # Read payload size
+            if len(data) < pos + 4:
+                raise ValueError(f"Data too short for payload size: {len(data)} bytes")
+            payload_size = struct.unpack(">I", data[pos:pos+4])[0]
+            pos += 4
+            
+            # Read header content (reward, done, zap, fire, spinner) - 8 bytes total (was 7)
+            if len(data) < pos + 8:  # Changed from 7 to 8
+                raise ValueError(f"Data too short for header content: {len(data)} bytes")
+            
+            # Parse header components exactly like the log file
+            reward_int = struct.unpack(">i", data[pos:pos+4])[0]  # Signed 32-bit integer
+            reward = reward_int / 1000.0  # Divide by 1000 to get float
+            pos += 4
+            
+            # Read done flag (this was missing proper handling before)
+            is_done = struct.unpack(">B", bytes([data[pos]]))[0] > 0  # Convert to boolean
+            pos += 1
+            
+            zap = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
+            pos += 1
+            
+            fire = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
+            pos += 1
+            
+            spinner = struct.unpack(">b", bytes([data[pos]]))[0]  # Signed byte
+            pos += 1
+            
+            # Read game state data
+            if len(data) < pos + payload_size:
+                raise ValueError(f"Data too short for payload: expected {payload_size}, got {len(data) - pos}")
+            
+            game_data = np.frombuffer(data[pos:pos+payload_size], dtype=np.uint16)
                    
         # Convert from uint16 to normalized float32 in range [-1, 1]
         game_data = game_data.astype(np.float32) - 32768.0
@@ -672,7 +674,11 @@ def main():
     """Main execution loop for Tempest AI."""
     env = TempestEnv()
     bc_model, rl_model = initialize_models(env)
-    threading.Thread(target=background_train, args=(rl_model,), daemon=True).start()
+    
+    # Start background training thread
+    training_thread = threading.Thread(target=background_train, args=(rl_model,), daemon=True)
+    training_thread.start()
+    print("Background training thread started")
 
     if ShouldReplayLog:
         args.replay = LogFile
@@ -694,23 +700,22 @@ def main():
     episode_rewards = deque(maxlen=5)
     total_episode_reward = 0
     
+    # Training queue management
+    last_training_request = time.time()
+    training_interval = 0.1  # Only request training every 100ms
+    
+    # Done state latch to track episode boundaries
+    done_latch = False
+    
     with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, \
          open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
         print("✔️ Lua connected.")
-        
-        # Track spinner movements for analytics
-        spinner_history = deque(maxlen=100)
-        positive_spinners = 0
-        negative_spinners = 0
         
         # Exploration annealing
         initial_exploration_ratio = 1.0
         min_exploration_ratio = 0.05
         exploration_decay = 0.9999  # Slow decay
         current_exploration_ratio = initial_exploration_ratio
-        
-        # For debugging directional bias
-        directional_balance_history = deque(maxlen=20)
         
         while True:
             try:
@@ -722,26 +727,66 @@ def main():
                 if state is None:
                     continue
 
-                env.update_state(state, reward, game_action, done)
-                total_episode_reward += reward
-                
-                if done:
-                    # End of episode tracking
+                # Handle done latch logic
+                if done and not done_latch:
+                    # First frame of done sequence
+                    done_latch = True
+                    print(f"Episode ended! Final reward: {reward:.2f}")
+                    
+                    # Process the terminal state normally
+                    env.update_state(state, reward, game_action, True)
+                    total_episode_reward += reward
+                    
+                    # Record end-of-episode stats
                     episode_rewards.append(total_episode_reward)
                     print(f"Episode finished! Reward: {total_episode_reward:.2f}, "
                           f"Avg Episode Reward: {np.mean(episode_rewards):.2f}")
+                    
+                    # Add to replay buffer with terminal state flag
+                    if not is_attract and env.prev_state is not None and env.prev_action is not None:
+                        threading.Thread(
+                            target=safe_add_to_buffer,
+                            args=(rl_model.replay_buffer, env.prev_state, env.state, 
+                                  env.prev_action, reward, True),  # Force done=True
+                            daemon=True
+                        ).start()
+                        
+                    # Reset environment for next episode
                     env.reset()
-                    frame_count = 0
                     total_episode_reward = 0
-                    # Reset bias tracking
-                    positive_spinners = 0
-                    negative_spinners = 0
+                    frame_count = 0
+                    
+                elif done and done_latch:
+                    # Ignore additional done frames during death sequence
+                    # Only respond with a default action to keep game running
+                    py_to_lua.write(struct.pack("bbb", 0, 0, 0))
+                    py_to_lua.flush()
+                    continue
+                    
+                elif not done and done_latch:
+                    # First frame of new episode after done sequence
+                    done_latch = False
+                    print("New episode started!")
+                    env.update_state(state, reward, game_action, False)
+                    total_episode_reward += reward
+                    
+                else:
+                    # Normal frame in middle of episode
+                    env.update_state(state, reward, game_action, False)
+                    total_episode_reward += reward
+                    
+                    # Add to replay buffer with careful device handling (non-blocking)
+                    if not is_attract and env.prev_state is not None and env.prev_action is not None:
+                        threading.Thread(
+                            target=safe_add_to_buffer,
+                            args=(rl_model.replay_buffer, env.prev_state, env.state, 
+                                  env.prev_action, reward, False),
+                            daemon=True
+                        ).start()
 
-                # Add to replay buffer with careful device handling
-                if not is_attract and env.prev_state is not None and env.prev_action is not None:
-                    safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, env.prev_action, reward, done)
-
+                # Action selection logic
                 if is_attract:
+                    # BC prediction is fast, can stay on main thread
                     action = train_bc(bc_model, state, *game_action)[1] if game_action else encode_action(0, 0, 0)
                 else:
                     # Anneal exploration over time
@@ -750,7 +795,7 @@ def main():
                     
                     # Get BC or RL prediction with balanced exploration
                     if random.random() < current_exploration_ratio:
-                        # BC action for exploration
+                        # BC action for exploration (fast)
                         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
                         bc_action = bc_model(state_tensor).detach().cpu().numpy()[0]
                         
@@ -758,91 +803,53 @@ def main():
                         fire_noise = 0 if random.random() < 0.9 else (1 if bc_action[0] < 0.5 else 0) 
                         zap_noise = 0 if random.random() < 0.9 else (1 if bc_action[1] < 0.5 else 0)
                         
-                        # Small directional noise for spinner with bias correction
-                        # Check recent directional balance and add noise in opposite direction
-                        spinner_bias_correction = 0
-                        if len(directional_balance_history) > 10:
-                            positive_ratio = sum(1 for d in directional_balance_history if d > 0) / len(directional_balance_history)
-                            if positive_ratio > 0.7:  # Too many positive values
-                                spinner_bias_correction = -0.05  # Encourage negative
-                            elif positive_ratio < 0.3:  # Too many negative values
-                                spinner_bias_correction = 0.05   # Encourage positive
-                        
-                        # Add spinner balance correction to the action
-                        spinner_noise = np.random.normal(0, 0.05) + spinner_bias_correction
+                        # Small random noise for spinner
+                        spinner_noise = np.random.normal(0, 0.05)
                         bc_action[2] = np.clip(bc_action[2] + spinner_noise, -1.0, 1.0)
                         
                         action = bc_action
                     else:
-                        # RL action with exploration noise biased towards smaller spinner deltas
+                        # RL prediction (can be slower) - move to another thread if causing lag
                         state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
-                        deterministic = frame_count > 10000 or random.random() < 0.7  # Increase deterministic actions
-                        raw_action = rl_model.predict(state_tensor, deterministic=deterministic)[0].flatten()
-                        
-                        # Apply directional bias correction if needed
-                        if not deterministic and len(directional_balance_history) > 10:
-                            positive_ratio = sum(1 for d in directional_balance_history if d > 0) / len(directional_balance_history)
-                            if positive_ratio > 0.7:  # Too many positive values
-                                # Encourage negative spinner values
-                                if raw_action[2] > 0:
-                                    raw_action[2] *= 0.5  # Reduce positive values
-                            elif positive_ratio < 0.3:  # Too many negative values
-                                # Encourage positive spinner values
-                                if raw_action[2] < 0:
-                                    raw_action[2] *= 0.5  # Reduce negative values
-                                    
-                        action = raw_action
+                        deterministic = frame_count > 10000 or random.random() < 0.7
+                        action = rl_model.predict(state_tensor, deterministic=deterministic)[0].flatten()
 
                 env.step(action)
                 fire, zap, spinner = env.decode_action(action)
                 
-                # Track spinner actions for analytics and bias correction
-                spinner_history.append(spinner)
-                if spinner > 0:
-                    positive_spinners += 1
-                elif spinner < 0:
-                    negative_spinners += 1
-                
-                # Track directional balance for later correction
-                directional_balance_history.append(spinner)
-                
+                # Send action back to game
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
 
-                if frame_count % 10 == 0 and rl_model.replay_buffer.pos > rl_model.learning_starts:
-                    training_queue.put(True)
+                # Request training in background thread, but limit frequency
+                current_time = time.time()
+                if (current_time - last_training_request > training_interval and 
+                    rl_model.replay_buffer.pos > rl_model.learning_starts and
+                    not training_queue.full()):
+                    training_queue.put(True, block=False)  # Non-blocking put
                     mean_rewards.append(reward)
+                    last_training_request = current_time
 
+                # Occasional reporting
                 if frame_count % 100 == 0:
                     actor_loss_mean = np.nanmean(actor_losses) if actor_losses else np.nan
                     critic_loss_mean = np.nanmean(critic_losses) if critic_losses else np.nan
                     ent_coef_mean = np.nanmean(ent_coefs) if ent_coefs else np.nan
                     reward_mean = np.nanmean(mean_rewards) if mean_rewards else np.nan
-                    print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, Buffer Size: {rl_model.replay_buffer.pos} Losses: Actor: ", actor_loss_mean, "Critic: ", critic_loss_mean, "Entropy: ", ent_coef_mean)
-
-                    # Report spinner statistics with directional bias info
-                    if spinner_history:
-                        spinner_abs = [abs(s) for s in spinner_history]
-                        spinner_avg = np.mean(spinner_abs)
-                        spinner_max = np.max(spinner_abs)
-                        total_spinners = positive_spinners + negative_spinners
-                        dir_ratio = 0.5
-                        if total_spinners > 0:
-                            dir_ratio = positive_spinners / total_spinners
-                        
-                        # print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
-                        #      f"% small (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%, "
-                        #      f"Dir bias: {dir_ratio:.2f} (+/-)")
                     
                     if not is_attract:
-                        print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
-                              f"Entropy Coef: {ent_coef_mean:.6f}, Mean Reward: {reward_mean:.2f}, "
-                          f"Expl: {current_exploration_ratio:.3f}")
+                        print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, "
+                              f"Buffer Size: {rl_model.replay_buffer.size()}")
+                        print(f"Metrics - Actor Loss: {actor_loss_mean:.3f}, Critic Loss: {critic_loss_mean:.3f}, "
+                              f"Entropy Coef: {ent_coef_mean:.3f}, Mean Reward: {reward_mean:.3f}, "
+                              f"Expl: {current_exploration_ratio:.3f}")
 
                 if save_signal:
-                    save_models(rl_model, bc_model)
+                    # Use a thread to save models without blocking
+                    threading.Thread(target=save_models, args=(rl_model, bc_model), daemon=True).start()
                     # Also reset exploration temporarily to try new strategies after save
                     current_exploration_ratio = min(0.1, current_exploration_ratio * 2.0)
+                
                 frame_count += 1
 
             except KeyboardInterrupt:
@@ -850,113 +857,9 @@ def main():
                 break
             except Exception as e:
                 print(f"Error: {e}")
+                traceback.print_exc()
                 time.sleep(5) 
                 initialize_models(env)
-    threading.Thread(target=background_train, args=(rl_model,), daemon=True).start()
-
-    if args.replay:
-        replay_log_file(args.replay, bc_model)
-        if not os.path.exists(LUA_TO_PY_PIPE):
-            return
-
-    for pipe in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
-        if os.path.exists(pipe): os.unlink(pipe)
-        os.mkfifo(pipe)
-        os.chmod(pipe, 0o666)
-
-    print("Pipes created. Waiting for Lua...")
-    frame_count = 0
-    with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, \
-         open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
-        print("✔️ Lua connected.")
-        
-        # Track spinner movements for analytics
-        spinner_history = deque(maxlen=100)
-        
-        while True:
-            try:
-                data = lua_to_py.read()
-                if not data:
-                    time.sleep(0.01)
-                    continue
-                state, frame_counter, reward, game_action, is_attract, done, save_signal = process_frame_data(data)
-                if state is None:
-                    continue
-
-                env.update_state(state, reward, game_action, done)
-                if done:
-                    env.reset()
-                    frame_count = 0
-
-                # Add to replay buffer with careful device handling
-                if not is_attract and env.prev_state is not None and env.prev_action is not None:
-                    safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, env.prev_action, reward, done)
-
-                if is_attract:
-                    action = train_bc(bc_model, state, *game_action)[1] if game_action else encode_action(0, 0, 0)
-                else:
-                    # Get BC or RL prediction with device consistency and bias towards smaller spinner movements
-                    if frame_count < 5000 and random.random() < 0.2:
-                        # BC action for exploration
-                        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-                        action = bc_model(state_tensor).detach().cpu().numpy()[0]
-                    else:
-                        # RL action with exploration noise biased towards smaller spinner deltas
-                        state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
-                        raw_action = rl_model.predict(state_tensor, deterministic=frame_count > 10000)[0].flatten()
-                        
-                        # Apply additional spinner bias based on observed game state patterns
-                        # This creates a "guided exploration" that focuses on smaller movements
-                        if not rl_model.predict(state_tensor, deterministic=True)[0].flatten()[2] == raw_action[2]:
-                            # We're in exploration mode for spinner
-                            # Bias exploration toward smaller deltas (less than 20) using a beta distribution
-                            spinner_scale = 0.15  # Controls the scale of typical random movements
-                            spinner_delta = np.random.beta(1.5, 3.0) * 2.0 - 1.0  # Beta dist centered and scaled
-                            raw_action[2] = spinner_delta * spinner_scale
-                            
-                        action = raw_action
-
-                env.step(action)
-                fire, zap, spinner = env.decode_action(action)
-                
-                # Track spinner actions for analytics
-                spinner_history.append(spinner)
-                
-                py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
-                py_to_lua.flush()
-
-                if frame_count % 10 == 0 and rl_model.replay_buffer.pos > rl_model.learning_starts:
-                    training_queue.put(True)
-                    mean_rewards.append(reward)
-
-                if frame_count % 100 == 0:
-                    print(f"Frame {frame_count}, Reward: {reward}, Done: {done}, Buffer Size: {rl_model.replay_buffer.pos}")
-                    actor_loss_mean = np.nanmean(actor_losses) if actor_losses else np.nan
-                    critic_loss_mean = np.nanmean(critic_losses) if critic_losses else np.nan
-                    ent_coef_mean = np.nanmean(ent_coefs) if ent_coefs else np.nan
-                    reward_mean = np.nanmean(mean_rewards) if mean_rewards else np.nan
-                    
-                    # Report spinner statistics
-                    if spinner_history:
-                        spinner_abs = [abs(s) for s in spinner_history]
-                        spinner_avg = np.mean(spinner_abs)
-                        spinner_max = np.max(spinner_abs)
-                        # print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
-                        #      f"% small moves (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%")
-                    
-                    print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
-                          f"Entropy Coef: {ent_coef_mean:.6f}, Mean Reward: {reward_mean:.2f}")
-
-                if save_signal:
-                    save_models(rl_model, bc_model)
-                frame_count += 1
-
-            except KeyboardInterrupt:
-                save_models(rl_model, bc_model)
-                break
-            except Exception as e:
-                print(f"Error: {e}")
-                time.sleep(5)
 
 def initialize_models(env):
     """Initialize models with improved SAC parameters."""
