@@ -30,8 +30,8 @@ import traceback
 
 # Constants
 ShouldReplayLog = False
-LogFile = "/Users/dave/mame/big.log"
-MaxLogFrames = 100000
+LogFile = "/Users/dave/mame/500k.log"
+MaxLogFrames = 50000
 
 NumberOfParams = 247
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
@@ -242,7 +242,7 @@ def process_frame_data(data):
         header_size = struct.unpack(">I", data[pos:pos+4])[0]
         pos += 4
         
-        if header_size != 15:
+        if header_size != 16:
             print(f"Warning: Unexpected header size {header_size}, expected 15")
         
         # Read payload size
@@ -260,6 +260,9 @@ def process_frame_data(data):
         reward = reward_int / 1000.0  # Divide by 1000 to get float
         pos += 4
         
+        is_done = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
+        pos += 1
+        
         zap = struct.unpack(">B", bytes([data[pos]]))[0]  # Unsigned byte
         pos += 1
         
@@ -269,7 +272,7 @@ def process_frame_data(data):
         spinner = struct.unpack(">b", bytes([data[pos]]))[0]  # Signed byte
         pos += 1
         
-        # print(f"PIPE DEBUG - Decoded header: Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}")
+        # print(f"PIPE DEBUG - Decoded header: Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}, Done={is_done}")
         
         # Read game state data
         if len(data) < pos + payload_size:
@@ -289,6 +292,7 @@ def process_frame_data(data):
             
         # Return with all the necessary values
         return state, frame_counter, float(reward), (fire, zap, spinner), True, is_done, save_signal
+   
     except Exception as e:
         print(f"Error processing frame data: {e}")
         traceback.print_exc()
@@ -449,7 +453,7 @@ def replay_log_file(log_file_path, bc_model):
                     break
                 
                 header_size = struct.unpack(">I", header_size_bytes)[0]
-                if header_size != 15:
+                if header_size != 16:
                     print(f"Warning: Expected header size of 15 bytes, got {header_size}")
                     exit
 
@@ -461,8 +465,8 @@ def replay_log_file(log_file_path, bc_model):
                 
                 payload_size = struct.unpack(">I", payload_size_bytes)[0]
                 
-                # Read header content (reward, zap, fire, spinner)
-                header_data = f.read(7)  # 4+1+1+1 bytes
+                # Read header content (done, reward, zap, fire, spinner)
+                header_data = f.read(8)  # 4+1+1+1+1 bytes
                 if len(header_data) < 7:
                     print(f"Short read on header data: got {len(header_data)}, expected 7")
                     break
@@ -470,13 +474,16 @@ def replay_log_file(log_file_path, bc_model):
                 # Parse header components EXACTLY as they're encoded in Lua
                 reward_int = struct.unpack(">i", header_data[0:4])[0]  # Signed int (lowercase i)
                 reward = reward_int / 1000.0  # Divide by 1000 to get float
+
+                # Every byte is special, every byte is great, if a byte is wasted, Dave gets quite irate
+                # Could be a bitmap, but you have to draw the line somewhere
+                                            
+                done = struct.unpack(">B", bytes([header_data[4]]))[0]  # Unsigned byte
+                zap = struct.unpack(">B", bytes([header_data[5]]))[0]  # Unsigned byte
+                fire = struct.unpack(">B", bytes([header_data[6]]))[0]  # Unsigned byte
+                spinner = struct.unpack(">b", bytes([header_data[7]]))[0]  # Signed byte
                 
-                # Use struct.unpack for all values to match Lua encoding
-                zap = struct.unpack(">B", bytes([header_data[4]]))[0]  # Unsigned byte
-                fire = struct.unpack(">B", bytes([header_data[5]]))[0]  # Unsigned byte
-                spinner = struct.unpack(">b", bytes([header_data[6]]))[0]  # Signed byte
-                
-                print(f"LOG DEBUG - Decoded: Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}")
+                # print(f"LOG DEBUG - Decoded: Done={done}, Reward={reward:.3f}, Zap={zap}, Fire={fire}, Spinner={spinner}")
 
                 # Read game state data
                 game_data_bytes = f.read(payload_size)
@@ -823,9 +830,9 @@ def main():
                         if total_spinners > 0:
                             dir_ratio = positive_spinners / total_spinners
                         
-                        print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
-                              f"% small (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%, "
-                              f"Dir bias: {dir_ratio:.2f} (+/-)")
+                        # print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
+                        #      f"% small (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%, "
+                        #      f"Dir bias: {dir_ratio:.2f} (+/-)")
                     
                     if not is_attract:
                         print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
@@ -934,8 +941,8 @@ def main():
                         spinner_abs = [abs(s) for s in spinner_history]
                         spinner_avg = np.mean(spinner_abs)
                         spinner_max = np.max(spinner_abs)
-                        print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
-                              f"% small moves (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%")
+                        # print(f"Spinner stats - Avg: {spinner_avg:.2f}, Max: {spinner_max}, "
+                        #      f"% small moves (<10): {sum(1 for s in spinner_abs if s < 10)/len(spinner_abs)*100:.1f}%")
                     
                     print(f"Metrics - Actor Loss: {actor_loss_mean:.6f}, Critic Loss: {critic_loss_mean:.6f}, "
                           f"Entropy Coef: {ent_coef_mean:.6f}, Mean Reward: {reward_mean:.2f}")

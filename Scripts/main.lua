@@ -153,15 +153,21 @@ local last_display_update = 0  -- Timestamp of last display update
 local DISPLAY_UPDATE_INTERVAL = 0.1  -- Update display every 0.1 seconds (10 times per second)
 
 -- Function to calculate reward for the current frame
+--
+-- Return reward and bDone, where bDone is true if the episode is done
+
 local function calculate_reward(game_state, level_state, player_state)
-    local reward = 0
     
+    local reward = 0
+    local bDone  = false
+
     -- 1. Survival reward: 1 point per frame for staying alive
     -- 2. Death penalty: -10 points only when transitioning from alive to dead
     if player_state.alive == 1 then
         -- Player is alive
         reward = reward + 1
     else
+        bDone = true
         -- Player is dead, but only apply penalty on transition
         if previous_alive_state == 1 then
             -- Just died - apply death penalty once
@@ -181,6 +187,9 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 3. Level completion reward: 1000 * new level number when level increases
     if level_state.level_number ~= previous_level then
         reward = reward + (1000 * previous_level)
+        if (previous_level ~= 0) then
+            bDone = true
+        end
     end
     
     -- 4. Aggression reward: Use weighted average of score per frame
@@ -206,15 +215,15 @@ local function calculate_reward(game_state, level_state, player_state)
     -- Update the LastRewardState with the current reward
     LastRewardState = reward
     
-    return reward
+    return reward, bDone
 end
 
 -- Function to send parameters and get action each frame
-local function process_frame(params, player_state, controls, reward)
+local function process_frame(params, player_state, controls, reward, bDone)
     -- In log-only mode, we only write to the log file and don't communicate with Python
 
     -- Get the size of the header in bytes 
-    local header_size = 4 + 4 + 4 + 1 + 1 + 1
+    local header_size = 4 + 4 + 4 + 1 + 1 + 1 + 1
     -- Get the size of the payload in bytes
     local payload_size = #params
 
@@ -238,6 +247,7 @@ local function process_frame(params, player_state, controls, reward)
                 log_file:write(string.pack(">I4", payload_size))                -- Write 32-bit payload size
                 -- Header
                 log_file:write(string.pack(">i4", int_reward))                  -- Write 32-bit reward (multiplied by 1000)
+                log_file:write(string.pack(">I1", bDone and 1 or 0))            -- Write 8-bit episode done value
                 log_file:write(string.pack(">I1", controls.zap_commanded))      -- Write 8-bit zap
                 log_file:write(string.pack(">I1", controls.fire_commanded))     -- Write 8-bit fire
                 log_file:write(string.pack(">i1", controls.spinner_delta))  -- Write 8-bit SIGNED spinner (lowercase i)
@@ -275,10 +285,11 @@ local function process_frame(params, player_state, controls, reward)
 
     pipe_out:write(string.pack(">I4", header_size))                         -- Write 32-bit header size    
     pipe_out:write(string.pack(">I4", payload_size))                        -- Write 32-bit payload size
-    pipe_out:write(string.pack(">I4", int_reward))                              -- Write 32-bit reward 
+    pipe_out:write(string.pack(">I4", int_reward))                          -- Write 32-bit reward 
+    pipe_out:write(string.pack(">I1", bDone and 1 or 0))                    -- Write 32-bit reward 
     pipe_out:write(string.pack(">I1", controls.zap_commanded))              -- Write 8-bit zap
     pipe_out:write(string.pack(">I1", controls.fire_commanded))             -- Write 8-bit fire
-    pipe_out:write(string.pack(">i1", controls.spinner_delta))          -- Write 8-bit SIGNED spinner (lowercase i)
+    pipe_out:write(string.pack(">i1", controls.spinner_delta))              -- Write 8-bit SIGNED spinner (lowercase i)
 
     -- Try to write to pipe, handle errors
     local success, err = pcall(function()
@@ -1037,6 +1048,7 @@ local frame_counter = 0
 local function frame_callback()
     -- Declare num_values at the start of the function
     local num_values = 0
+    local bDone = false
 
     -- Check if pipes are open, try to reopen if not
     if not pipe_out or not pipe_in then
@@ -1114,7 +1126,7 @@ local function frame_callback()
         mem:write_direct_u8(0x976F, 0x00)
         
         -- Calculate the reward for the current frame - do this ONCE per frame
-        local reward = calculate_reward(game_state, level_state, player_state)
+        local reward, bDone = calculate_reward(game_state, level_state, player_state)
         
         -- Add periodic save mechanism based on frame counter instead of key press
         -- This will trigger a save every 30,000 frames (approximately 8 minutes at 60fps)
@@ -1145,7 +1157,7 @@ local function frame_callback()
         frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
         -- Send the serialized data to the Python script and get the components
-        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward)
+        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone)
 
         -- Update total bytes sent
         total_bytes_sent = total_bytes_sent + #frame_data
@@ -1439,7 +1451,7 @@ local function on_mame_exit()
         
         -- Send one last time
         if pipe_out and pipe_in then
-            local result = process_frame(frame_data, player_state, controls, reward)
+            local result = process_frame(frame_data, player_state, controls, reward, true)
             print("Final save complete, response: " .. (result or "none"))
         end
     end
