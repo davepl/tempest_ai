@@ -195,12 +195,14 @@ local function calculate_reward(game_state, level_state, player_state)
     
     -- Add aggression bonus (scaled to be meaningful but not dominant)
     -- You could multiply by 10 to make it more significant
-    -- reward = reward + (avg_score_per_frame)
+    if (avg_score_per_frame > 0) then
+        reward = reward + (avg_score_per_frame)
+    end
     
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 50
 
-    local spinner_abs = math.min(127, math.abs(player_state.SpinnerDelta))
-    reward = reward + ((128 - spinner_abs) / 100)
+    -- local spinner_abs = math.min(127, math.abs(player_state.SpinnerDelta))
+    -- reward = reward + ((128 - spinner_abs) / 100)
 
     -- Update previous values for next frame
     previous_score = player_state.score
@@ -214,56 +216,30 @@ local function calculate_reward(game_state, level_state, player_state)
 end
 
 -- Function to send parameters and get action each frame
-local function process_frame(params, player_state, controls, reward, bDone)
+local function process_frame(params, player_state, controls, reward, bDone, bAttractMode)
     -- In log-only mode, we only write to the log file and don't communicate with Python
 
-    -- Get the size of the header in bytes 
-    local header_size = 4 + 4 + 4 + 1 + 1 + 1 + 1
-    -- Get the size of the payload in bytes
-    local payload_size = #params
+    -- Log the frame data to file
+    if log_file then
+        local success, err = pcall(function()
+            -- Write the raw data   
+            log_file:write(params)
+            log_file:flush()  -- Ensure data is written to disk
+        end)
+        
+        if not success then
+            print("ERROR writing to log file: " .. tostring(err))
+        end
+    else
+        -- Log file not open, attempting to open it
+        print("Log file not open, attempting to reopen")
+        open_pipes()
+    end
+    
+    -- Increment frame count after processing
+    frame_count = frame_count + 1
 
     if LOG_ONLY_MODE then
-        -- Log the frame data to file
-        if log_file then
-            local success, err = pcall(function()
-                -- Convert reward to integer with 3 decimal precision
-                local int_reward = math.floor((reward or 0) * 1000)
-                
-                -- Print debugging output every 100 frames to avoid spam
-                if frame_count % 100 == 0 then
-                    print(string.format("Writing frame %d - Header size: %d, Payload size: %d, Reward: %d/1000", 
-                          frame_count, header_size, payload_size, int_reward))
-                end
-                
-                assert(controls.spinner_delta > -127 and controls.spinner_delta < 128)
-                
-                -- Preamble - header and payload sizes
-                log_file:write(string.pack(">I4", header_size))                 -- Write 32-bit header size
-                log_file:write(string.pack(">I4", payload_size))                -- Write 32-bit payload size
-                -- Header
-                log_file:write(string.pack(">i4", int_reward))                  -- Write 32-bit reward (multiplied by 1000)
-                log_file:write(string.pack(">I1", bDone and 1 or 0))            -- Write 8-bit episode done value
-                log_file:write(string.pack(">I1", controls.zap_commanded))      -- Write 8-bit zap
-                log_file:write(string.pack(">I1", controls.fire_commanded))     -- Write 8-bit fire
-                log_file:write(string.pack(">i1", controls.spinner_delta))  -- Write 8-bit SIGNED spinner (lowercase i)
-                -- Write the raw data   
-                log_file:write(params)
-
-                log_file:flush()  -- Ensure data is written to disk
-            end)
-            
-            if not success then
-                print("ERROR writing to log file: " .. tostring(err))
-            end
-        else
-            -- Log file not open, attempting to open it
-            print("Log file not open, attempting to reopen")
-            open_pipes()
-        end
-        
-        -- Increment frame count after processing
-        frame_count = frame_count + 1
-        
         return controls.zap_commanded, controls.fire_commanded, controls.spinner_delta
     end
     
@@ -274,18 +250,6 @@ local function process_frame(params, player_state, controls, reward, bDone)
         end
     end
   
-    -- Send data to Python
-
-    local int_reward = math.floor((reward or 0) * 1000)
-
-    pipe_out:write(string.pack(">I4", header_size))                         -- Write 32-bit header size    
-    pipe_out:write(string.pack(">I4", payload_size))                        -- Write 32-bit payload size
-    pipe_out:write(string.pack(">I4", int_reward))                          -- Write 32-bit reward 
-    pipe_out:write(string.pack(">I1", bDone and 1 or 0))                    -- Write 32-bit reward 
-    pipe_out:write(string.pack(">I1", controls.zap_commanded))              -- Write 8-bit zap
-    pipe_out:write(string.pack(">I1", controls.fire_commanded))             -- Write 8-bit fire
-    pipe_out:write(string.pack(">i1", controls.spinner_delta))              -- Write 8-bit SIGNED spinner (lowercase i)
-
     -- Try to write to pipe, handle errors
     local success, err = pcall(function()
         pipe_out:write(params)
@@ -998,23 +962,27 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
 --        print(string.format("Game Mode: 0x%02X, Is Attract Mode: %s", game_state.game_mode, (game_state.game_mode & 0x80) == 0 and "true" or "false"))
     end
     
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    is_attract_mode = is_attract_mode and 1 or 0
+
     -- Create out-of-band context information structure
     -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
     -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte),
     -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8)
     local is_done = 0  -- We don't currently track if the game is done
-    local oob_data = string.pack(">IdBBBIIBBBh", 
-        1,                    -- num_values
-        LastRewardState,      -- reward
-        0,                    -- game_action
-        game_state.game_mode, -- game_mode
-        is_done,              -- done flag
-        game_state.frame_counter, -- frame_counter
-        player_state.score,   -- score
-        save_signal,          -- save_signal
-        controls.fire_commanded, -- fire_commanded (added)
-        controls.zap_commanded,  -- zap_commanded (added)
-        controls.spinner_delta   -- spinner_delta (added)
+    local oob_data = string.pack(">IdBBBIIBBBhB", 
+        #data,                          -- I num_values
+        LastRewardState,                -- d reward
+        0,                              -- B game_action
+        game_state.game_mode,           -- B game_mode
+        is_done,                        -- B done flag
+        game_state.frame_counter,       -- I frame_counter
+        player_state.score,             -- I score
+        save_signal,                    -- B save_signal
+        controls.fire_commanded,        -- B fire_commanded (added)
+        controls.zap_commanded,         -- B zap_commanded (added)
+        controls.spinner_delta,         -- h pinner_delta (added)
+        is_attract_mode                 -- B is_attract_mode
     )
     
     -- Combine out-of-band header with game state data
@@ -1138,7 +1106,7 @@ local function frame_callback()
         frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
 
         -- Send the serialized data to the Python script and get the components
-        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone)
+        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
 
         player_state.fire_commanded = fire
         player_state.zap_commanded = zap
@@ -1432,7 +1400,7 @@ local function on_mame_exit()
         local reward = calculate_reward(game_state, level_state, player_state)
         
         -- Get final frame data with save signal
-        local frame_data = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+        local frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
         
         -- Send one last time
         if pipe_out and pipe_in then
