@@ -32,8 +32,7 @@
 package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
--- Check command line arguments for -logonly mode
-local LOG_ONLY_MODE = false
+local LOG_ONLY_MODE = true
 
 local function clear_screen()
     io.write("\027[2J\027[H")
@@ -167,8 +166,7 @@ local function calculate_reward(game_state, level_state, player_state)
         -- Player is dead, but only apply penalty on transition
         if previous_alive_state == 1 then
             -- Just died - apply death penalty once
-            reward = reward - 10
-            print("Death penalty applied: -10")
+            reward = reward - 20000
         end
         -- No penalty on subsequent dead frames
     end
@@ -196,9 +194,9 @@ local function calculate_reward(game_state, level_state, player_state)
     
     -- Add aggression bonus (scaled to be meaningful but not dominant)
     -- You could multiply by 10 to make it more significant
-    if (avg_score_per_frame > 0) then
-        reward = reward + (avg_score_per_frame)
-    end
+    -- if (avg_score_per_frame > 0) then
+    --   reward = reward + (avg_score_per_frame)
+    -- end
     
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 50
 

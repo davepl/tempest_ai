@@ -28,9 +28,9 @@ import traceback
 import select
 
 # Constants
-ShouldReplayLog = False
-LogFile = "/Users/dave/mame/big.log"
-MaxLogFrames = 100000
+ShouldReplayLog = True
+LogFile = "/Users/dave/mame/1m.log"
+MaxLogFrames = 2000000
 
 NumberOfParams = 247
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
@@ -307,6 +307,10 @@ def replay_log_file(log_file_path, bc_model):
             header_values = struct.unpack(format_string, header_bytes)
             num_values = header_values[0]
             
+            if (num_values != NumberOfParams):
+                print(f"Warning: Invalid number of values: {num_values} != {NumberOfParams}")
+                continue
+            
             payload_size = num_values * 2
             payload_bytes = f.read(payload_size)
             if len(payload_bytes) < payload_size:
@@ -433,14 +437,14 @@ def background_rl_train(rl_model):
                 batch_size = min(64, max(8, buffer_size // 2))
                 
                 sampled_batch = rl_model.replay_buffer.sample(batch_size)
-                print(
-                    f"Sampled batch shapes - "
-                    f"obs: {sampled_batch.observations.shape}, "
-                    f"next_obs: {sampled_batch.next_observations.shape}, "
-                    f"actions: {sampled_batch.actions.shape}, "
-                    f"rewards: {sampled_batch.rewards.shape}, "
-                    f"dones: {sampled_batch.dones.shape}"
-                )
+                # print(
+                #     f"Sampled batch shapes - "
+                #     f"obs: {sampled_batch.observations.shape}, "
+                #     f"next_obs: {sampled_batch.next_observations.shape}, "
+                #     f"actions: {sampled_batch.actions.shape}, "
+                #     f"rewards: {sampled_batch.rewards.shape}, "
+                #     f"dones: {sampled_batch.dones.shape}"
+                # )
                 
                 rl_model.train(gradient_steps=5, batch_size=batch_size)
                 if hasattr(rl_model, "logger"):
