@@ -57,6 +57,7 @@ local frame_count = 0  -- Initialize frame counter
 
 -- Function to open pipes 
 local function open_pipes()
+    
     if (LOG_ONLY_MODE) then
 
         -- Only open the log file once to prevent truncation!
