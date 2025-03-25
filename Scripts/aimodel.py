@@ -24,11 +24,8 @@ from gymnasium import spaces
 import threading
 import queue
 from collections import deque
-import concurrent.futures
-from threading import Lock
 import traceback
 import select
-import torch.distributions as th
 
 # Constants
 ShouldReplayLog = False
@@ -60,6 +57,8 @@ mean_rewards = deque(maxlen=100)
 training_queue = queue.Queue()
 bc_training_queue = queue.Queue(maxsize=1000)
 bc_model_lock = threading.Lock()
+replay_buffer_batch = []  # Batch for replay buffer additions
+replay_buffer_lock = threading.Lock()
 
 class TempestEnv(gym.Env):
     """Custom Gym environment interfacing with Tempest game via Lua pipes."""
@@ -113,6 +112,8 @@ class TempestFeaturesExtractor(BaseFeaturesExtractor):
         ).to(device)
 
     def forward(self, observations):
+        if observations.dim() == 1:
+            observations = observations.unsqueeze(0)
         if observations.device != device:
             observations = observations.to(device)
         return self.feature_extractor(observations)
@@ -134,25 +135,26 @@ class BCModel(nn.Module):
         self.zap_output = nn.Linear(128, 1)
         self.spinner_output = nn.Linear(128, 1)
         
-        # Smaller initialization
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
-        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)  # Reduced LR
+        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)
         self.to(device)
 
     def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
         if x.device != device:
             x = x.to(device)
         features = self.feature_extractor(x)
         fire_out = torch.sigmoid(self.fire_output(features))
         zap_out = torch.sigmoid(self.zap_output(features))
         spinner_out_raw = self.spinner_output(features)
-        spinner_out = torch.clamp(spinner_out_raw, -1.0, 1.0)  # Clip to [-1, 1]
-        return torch.cat([fire_out, zap_out, spinner_out], dim=1), spinner_out_raw  # Return both for debugging
+        spinner_out = torch.clamp(spinner_out_raw, -1.0, 1.0)
+        return torch.cat([fire_out, zap_out, spinner_out], dim=1), spinner_out_raw
 
 def process_frame_data(data, header_data=None):
     """Process frame data from Lua using exact same format string as Lua."""
@@ -218,28 +220,36 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
 def safe_add_to_buffer(buffer, obs, next_obs, action, reward, done):
     """Add experience to RL replay buffer with validation."""
     try:
-        # Convert inputs to NumPy arrays, handling tensors
         obs = tensor_to_numpy(obs).flatten()
         next_obs = tensor_to_numpy(next_obs).flatten()
         action = tensor_to_numpy(action).flatten()
         
-        # Resize if shapes don’t match
         if obs.shape != (NumberOfParams,) or next_obs.shape != (NumberOfParams,) or action.shape != (3,):
             obs = np.resize(obs, NumberOfParams)
             next_obs = np.resize(next_obs, NumberOfParams)
             action = np.resize(action, 3)
         
         reward_scalar = float(tensor_to_numpy(reward))
-        done_scalar = int(bool(tensor_to_numpy(done)))  # Ensure done is 0 or 1 for SB3
+        done_scalar = int(bool(tensor_to_numpy(done)))
         
-        # Use the standard buffer.add method with NumPy arrays
-        buffer.add(obs, next_obs, action, reward_scalar, done_scalar,
-                   [{}] if hasattr(buffer, 'handle_timeout_termination') else None)
+        with replay_buffer_lock:
+            replay_buffer_batch.append((obs, next_obs, action, reward_scalar, done_scalar))
+            if len(replay_buffer_batch) >= 32:  # Batch size for efficiency
+                for item in replay_buffer_batch:
+                    buffer.add(*item, [{}] if hasattr(buffer, 'handle_timeout_termination') else None)
+                replay_buffer_batch.clear()
         
         return True
     except Exception as e:
         print(f"Error adding to buffer: {e}")
         return False
+
+def flush_replay_buffer_batch(buffer):
+    """Flush remaining replay buffer batch."""
+    with replay_buffer_lock:
+        for item in replay_buffer_batch:
+            buffer.add(*item, [{}] if hasattr(buffer, 'handle_timeout_termination') else None)
+        replay_buffer_batch.clear()
 
 def apply_minimal_compatibility_patches(model):
     """Ensure SB3 model compatibility and device consistency."""
@@ -289,27 +299,22 @@ def replay_log_file(log_file_path, bc_model):
     with open(log_file_path, 'rb') as f:
         frames_processed = 0
         while frame_count < MaxLogFrames:
-            # Read the fixed-size header
             header_bytes = f.read(header_size)
             if not header_bytes or len(header_bytes) < header_size:
                 print(f"End of file reached after {frames_processed} frames")
                 break
             
-            # Unpack the header to get num_values
             header_values = struct.unpack(format_string, header_bytes)
-            num_values = header_values[0]  # First value is the number of 16-bit values
+            num_values = header_values[0]
             
-            # Calculate payload size (num_values * 2 bytes per 16-bit value)
             payload_size = num_values * 2
             payload_bytes = f.read(payload_size)
             if len(payload_bytes) < payload_size:
                 print(f"Payload data incomplete after {frames_processed} frames")
                 break
             
-            # Combine header and payload for process_frame_data
             frame_data = header_bytes + payload_bytes
             
-            # Use process_frame_data to deserialize the frame
             result = process_frame_data(frame_data)
             if result is None:
                 print(f"Warning: Invalid frame data at frame {frames_processed}, skipping")
@@ -339,7 +344,7 @@ def replay_log_file(log_file_path, bc_model):
         if training_data:
             batch_loss = train_model_with_batch(bc_model, training_data)
             total_loss += batch_loss
-            num_batches += 1
+            num_batches += 1  # Corrected from 'num STACKs'
             frame_count += len(training_data)
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('nan')
@@ -379,12 +384,10 @@ def train_model_with_batch(model, batch):
         model.optimizer.zero_grad()
         preds, spinner_out_raw = model(state_tensor)
         
-        # Adjusted reward weighting
         reward_weights = torch.log1p(reward_tensor - reward_tensor.min() + 1e-6)
         reward_weights = reward_weights / reward_weights.mean()
         reward_weights = reward_weights.unsqueeze(1)
         
-        # Loss calculation
         fire_zap_loss = F.binary_cross_entropy(preds[:, :2], targets[:, :2], reduction='none') * reward_weights
         fire_zap_loss = fire_zap_loss.mean()
         spinner_loss = F.mse_loss(preds[:, 2:], targets[:, 2:], reduction='none') * reward_weights * 0.5
@@ -392,16 +395,10 @@ def train_model_with_batch(model, batch):
         
         loss = fire_zap_loss + spinner_loss
         
-        # Debug: Log predictions, raw spinner, and gradients
         if frame_count % 1000 == 0:
-            #print(f"Preds (mean): {preds.mean(dim=0).detach().cpu().numpy()}")
-            #print(f"Raw Spinner (mean): {spinner_out_raw.mean().detach().cpu().numpy()}")
-            #print(f"Targets (mean): {targets.mean(dim=0).detach().cpu().numpy()}")
             loss.backward()
             raw_grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
-            #print(f"Raw gradient norm (before clipping): {raw_grad_norm}")
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            #print(f"Gradient norm (after clipping): {sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)}")
             model.optimizer.step()
         else:
             loss.backward()
@@ -422,35 +419,36 @@ def background_bc_train(bc_model):
             time.sleep(0.01)
         except Exception as e:
             print(f"BC training error: {e}")
+            traceback.print_exc()
 
 def background_rl_train(rl_model):
     """Background RL training thread."""
     while True:
         try:
             training_queue.get(timeout=1.0)
+            flush_replay_buffer_batch(rl_model.replay_buffer)  # Ensure all buffered experiences are added
             if rl_model.replay_buffer.pos > rl_model.learning_starts:
                 apply_minimal_compatibility_patches(rl_model)
                 buffer_size = rl_model.replay_buffer.pos
                 batch_size = min(64, max(8, buffer_size // 2))
-                # Debug: Log buffer contents before training
-                sampled_batch = rl_model.replay_buffer.sample(batch_size)
-                print(f"Sampled batch shapes - obs: {sampled_batch.observations.shape}, "
-                      f"next_obs: {sampled_batch.next_observations.shape}, "
-                      f"actions: {sampled_batch.actions.shape}, "
-                      f"rewards: {sampled_batch.rewards.shape}, "
-                      f"dones: {sampled_batch.dones.shape}")
                 
-                # Debug: Log internal policy shapes
-                with torch.no_grad():
-                    mean_actions, log_std = rl_model.actor.mu(sampled_batch.observations), rl_model.actor.log_std
-                    print(f"Policy shapes - mean_actions: {mean_actions.shape}, log_std: {log_std.shape}")
+                sampled_batch = rl_model.replay_buffer.sample(batch_size)
+                print(
+                    f"Sampled batch shapes - "
+                    f"obs: {sampled_batch.observations.shape}, "
+                    f"next_obs: {sampled_batch.next_observations.shape}, "
+                    f"actions: {sampled_batch.actions.shape}, "
+                    f"rewards: {sampled_batch.rewards.shape}, "
+                    f"dones: {sampled_batch.dones.shape}"
+                )
                 
                 rl_model.train(gradient_steps=5, batch_size=batch_size)
-                if hasattr(rl_model, 'logger'):
+                if hasattr(rl_model, "logger"):
                     log_vals = rl_model.logger.name_to_value
-                    actor_losses.append(log_vals.get('train/actor_loss', float('nan')))
-                    critic_losses.append(log_vals.get('train/critic_loss', float('nan')))
-                    ent_coefs.append(log_vals.get('train/ent_coef', float('nan')))
+                    actor_losses.append(log_vals.get("train/actor_loss", float("nan")))
+                    critic_losses.append(log_vals.get("train/critic_loss", float("nan")))
+                    ent_coefs.append(log_vals.get("train/ent_coef", float("nan")))
+
             training_queue.task_done()
         except queue.Empty:
             continue
@@ -459,7 +457,7 @@ def background_rl_train(rl_model):
             traceback.print_exc()
             training_queue.task_done()
 
-frame_count = 0  # Define frame_count as a global variable for debugging
+frame_count = 0
 
 def main():
     """Main execution loop for Tempest AI."""
@@ -489,8 +487,6 @@ def main():
     last_training_request = time.time()
     training_interval = 0.1
     done_latch = False
-    game_action = (0, 0, 0)
-    game_mode = 0
     
     initial_exploration_ratio = 0.80
     min_exploration_ratio = 0.05
@@ -503,7 +499,6 @@ def main():
         
         while True:
             try:
-                # Try to read data from the pipe
                 ready_to_read, _, _ = select.select([lua_to_py], [], [], 0.01)
                 if not ready_to_read:
                     time.sleep(0.001)
@@ -514,31 +509,25 @@ def main():
                     time.sleep(0.001)
                     continue
 
-                # Process the data with proper error checking
                 result = process_frame_data(data)
                 if result is None:
                     print(f"Warning: Invalid data received, skipping frame.")
-                    py_to_lua.write(struct.pack("bbb", 0, 0, 0))  # Send default no-op
+                    py_to_lua.write(struct.pack("bbb", 0, 0, 0))
                     py_to_lua.flush()
                     continue
                 
-                # Unpack the results safely - check each value individually
                 state, reward, game_action, game_mode, done, is_attract, save_signal = result
                 
-                # Make sure each value is valid
                 if (state is None or reward is None or game_action is None or 
                     game_mode is None or done is None or is_attract is None):
                     print(f"Warning: Invalid data in processed result, skipping frame.")
-                    py_to_lua.write(struct.pack("bbb", 0, 0, 0))  # Send default no-op
+                    py_to_lua.write(struct.pack("bbb", 0, 0, 0))
                     py_to_lua.flush()
                     continue
                 
-                # Convert state to tensor and move to the correct device
                 state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-                
-                # Move the tensor to CPU and convert to NumPy before calling predict
                 action, _ = rl_model.predict(tensor_to_numpy(state_tensor), deterministic=True)
-                action = action.flatten()  # action is already a NumPy array
+                action = action.flatten()
 
                 if done and not done_latch:
                     done_latch = True
@@ -546,9 +535,8 @@ def main():
                     total_episode_reward += reward
                     episode_rewards.append(total_episode_reward)
                     if not is_attract and env.prev_state is not None and env.prev_action is not None:
-                        threading.Thread(target=safe_add_to_buffer,
-                                        args=(rl_model.replay_buffer, env.prev_state, env.state, 
-                                              env.prev_action, reward, True), daemon=True).start()
+                        safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, 
+                                          env.prev_action, reward, True)
                     env.reset()
                     total_episode_reward = 0
                     frame_count = 0
@@ -567,9 +555,8 @@ def main():
                     env.update_state(state, reward, game_action, False)
                     total_episode_reward += reward
                     if not is_attract and env.prev_state is not None and env.prev_action is not None:
-                        threading.Thread(target=safe_add_to_buffer,
-                                        args=(rl_model.replay_buffer, env.prev_state, env.state, 
-                                              env.prev_action, reward, False), daemon=True).start()
+                        safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, 
+                                          env.prev_action, reward, False)
 
                 if is_attract and game_action:
                     try:
@@ -594,7 +581,7 @@ def main():
                         with torch.no_grad():
                             state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32).to(device)
                             action, _ = rl_model.predict(tensor_to_numpy(state_tensor), deterministic=True)
-                            action = action.flatten()  # action is already a NumPy array
+                            action = action.flatten()
 
                 env.step(action)
                 fire, zap, spinner = env.decode_action(action)
