@@ -24,10 +24,10 @@ import select
 
 # Constants
 DEBUG_MODE = False  # Set to False in production for better performance
-FORCE_CPU = True  # Force CPU usage if having persistent issues with MPS
-ShouldReplayLog = False
-LogFile = "/Users/dave/mame/50k.log"
-MaxLogFrames = 100000
+FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
+ShouldReplayLog = True
+LogFile = "/Users/dave/mame/250k.log"
+MaxLogFrames = 250000
 
 NumberOfParams = 112
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
