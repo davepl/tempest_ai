@@ -32,7 +32,7 @@
 package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
-local LOG_ONLY_MODE = true
+local LOG_ONLY_MODE = false
 
 local function clear_screen()
     io.write("\027[2J\027[H")
@@ -200,7 +200,7 @@ local function calculate_reward(game_state, level_state, player_state)
     
     -- 6. Spinner stasis reward: 128 - abs(spinner_delta) / 50
 
-    -- local spinner_abs = math.min(127, math.abs(player_state.SpinnerDelta))
+    -- local spinner_abs = math.min(31, math.abs(player_state.SpinnerDelta))
     -- reward = reward + ((128 - spinner_abs) / 100)
 
     -- Update previous values for next frame
@@ -377,34 +377,6 @@ if not mem then
     return
 end
 
--- Helper function for calculating relative positions
-local function calculate_relative_position(player_pos, target_pos, is_open)
-    local direct_diff = target_pos - player_pos
-    
-    if is_open then
-        -- For open levels, just return the direct difference
-        return direct_diff
-    else
-        -- For closed levels, find the shortest path around the circle
-        -- Total segments is 16
-        local clockwise_diff = direct_diff
-        local counter_clockwise_diff = direct_diff
-        
-        if direct_diff > 8 then
-            clockwise_diff = direct_diff - 16
-        elseif direct_diff < -8 then
-            counter_clockwise_diff = direct_diff + 16
-        end
-        
-        -- Return the smallest absolute difference
-        if math.abs(clockwise_diff) < math.abs(counter_clockwise_diff) then
-            return clockwise_diff
-        else
-            return counter_clockwise_diff
-        end
-    end
-end
-
 -- **GameState Class**
 GameState = {}
 GameState.__index = GameState
@@ -454,13 +426,12 @@ function LevelState:update(mem)
     local player_pos = mem:read_u8(0x0200)   -- Player position
     local is_open = self.level_type == 0xFF
     
-    -- Read spike heights for all 16 segments and store them relative to player
+    -- Read spike heights for all 16 segments and store them using absolute positions
     self.spike_heights = {}
     for i = 0, 15 do  -- Use 0-based indexing to match game's segment numbering
         local height = mem:read_u8(0x03AC + i)
-        -- Adjust player_pos to 0-based indexing to match our loop
-        local rel_pos = calculate_relative_position(player_pos & 0x0F, i, is_open)
-        self.spike_heights[rel_pos] = height
+        -- Store absolute position directly
+        self.spike_heights[i] = height
     end
     
     -- Read tube angles for all 16 segments
@@ -526,13 +497,13 @@ function PlayerState:update(mem)
         -- Read depth (position along the tube)
         self.shot_positions[i] = mem:read_u8(0x02D3 + i - 1)  -- PlayerShotPositions
         
-        -- Read segment and make it relative to player position only if shot is active
+        -- Read segment and store absolute position
         local abs_segment = mem:read_u8(0x02AD + i - 1)       -- PlayerShotSegments
         if self.shot_positions[i] == 0 or abs_segment == 0 then
             self.shot_segments[i] = 0  -- Shot not active
         else
             abs_segment = abs_segment & 0x0F  -- Mask to get valid segment
-            self.shot_segments[i] = calculate_relative_position(self.position, abs_segment, is_open)
+            self.shot_segments[i] = abs_segment
         end
     end
 
@@ -629,9 +600,9 @@ function EnemiesState:update(mem)
         self.enemy_type_info[i] = mem:read_u8(0x0283 + i - 1)    -- Enemy type info at $0283
         self.active_enemy_info[i] = mem:read_u8(0x028A + i - 1)  -- Active enemy info at $028A
         
-        -- Get absolute segment number and convert to relative
+        -- Get absolute segment number and store it
         local abs_segment = mem:read_u8(0x0291 + i - 1) & 0x0F
-        self.enemy_segments[i] = calculate_relative_position(player_pos, abs_segment, is_open)
+        self.enemy_segments[i] = abs_segment
         
         -- Get main position value and LSB for more precision
         local pos = mem:read_u8(0x02DF + i - 1)       -- enemy_along at $02DF - main position
@@ -640,14 +611,14 @@ function EnemiesState:update(mem)
         self.enemy_depths[i] = {pos = pos, frac = lsb}
     end
 
-    -- Read all 4 enemy shot positions and convert to relative positions
+    -- Read all 4 enemy shot positions and store absolute positions
     for i = 1, 4 do
         local raw_pos = mem:read_u8(0x02DB + i - 1)
         if raw_pos == 0 then
             self.shot_positions[i] = nil  -- Mark inactive shots as nil
         else
             local abs_pos = raw_pos & 0x0F
-            self.shot_positions[i] = calculate_relative_position(player_pos, abs_pos, is_open)
+            self.shot_positions[i] = abs_pos
         end
     end
 
@@ -662,7 +633,7 @@ function EnemiesState:update(mem)
     end
 end
 
--- Helper function to decode enemy type info
+-- Function to decode enemy type info
 function EnemiesState:decode_enemy_type(type_byte)
     local enemy_type = type_byte & 0x07
     local between_segments = (type_byte & 0x80) ~= 0
@@ -670,11 +641,11 @@ function EnemiesState:decode_enemy_type(type_byte)
     return string.format("%d%s%s", 
         enemy_type,
         between_segments and "B" or "-",
-        segment_increasing and "+" or "-"
+        segment_increasing and "+" or ""  -- Remove the '+' sign for segment numbers
     )
 end
 
--- Helper function to decode enemy state info
+-- Function to decode enemy state info
 function EnemiesState:decode_enemy_state(state_byte)
     local split_behavior = state_byte & 0x03
     local can_shoot = (state_byte & 0x40) ~= 0
@@ -853,7 +824,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     table.insert(data, level_state.level_shape)
     
     -- Spike heights (fixed size: 16)
-    for i = -8, 7 do  -- Relative positions from -8 to 7
+    for i = 0, 15 do  
         table.insert(data, level_state.spike_heights[i] or 0)
     end
     
@@ -980,7 +951,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         save_signal,                    -- B save_signal
         controls.fire_commanded,        -- B fire_commanded (added)
         controls.zap_commanded,         -- B zap_commanded (added)
-        controls.spinner_delta,         -- h pinner_delta (added)
+        controls.spinner_delta,         -- h spinner_delta (added)
         is_attract_mode                 -- B is_attract_mode
     )
     
@@ -1026,7 +997,7 @@ local function frame_callback()
     mem:write_direct_u8(0xA592, 0xEA)
 
     -- Increase the maximum level for demo mode
-    mem:write_direct_u8(0x9196, 0x0F)
+    -- mem:write_direct_u8(0x9196, 0x0F)
 
 
     -- Update all state objects
@@ -1295,8 +1266,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     
     -- Add spike heights on its own line
     local heights_str = ""
-    -- For open levels, show 0-15, for closed levels show -8 to +7 but just display the values
-    for i = -8, 7 do
+    for i = 0, 15 do
         if level_state.spike_heights[i] then
             heights_str = heights_str .. string.format("%02X ", level_state.spike_heights[i])
         else
@@ -1322,7 +1292,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     for i = 1, 7 do
         enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
         enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
-        enemy_segs[i] = string.format("%+3d", enemies_state.enemy_segments[i])
+        -- Format enemy segments as two-digit hexadecimal numbers
+        enemy_segs[i] = string.format("%02X", enemies_state.enemy_segments[i])
         enemy_depths[i] = string.format("%02X.%02X", enemies_state.enemy_depths[i].pos, enemies_state.enemy_depths[i].frac)
     end
 
@@ -1344,7 +1315,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
 
     print(format_section("Enemies State", enemies_metrics))
 
-    -- move_cursor_to_row(40)  -- Move Enemy Segments display up one line   
     -- Add enemy segments and depths on their own lines
     print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
