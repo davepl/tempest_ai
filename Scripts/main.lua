@@ -787,7 +787,7 @@ local last_fps_time = os.time()
 local current_fps = 0
 
 -- Function to flatten and serialize the game state data to signed 16-bit integers
-local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, bDone)
     -- Create a consistent data structure with fixed sizes
     local data = {}
     
@@ -927,13 +927,13 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
     -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte),
     -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8)
-    local is_done = 0  -- We don't currently track if the game is done
+
     local oob_data = string.pack(">IdBBBIIBBBhB", 
         #data,                          -- I num_values
         LastRewardState,                -- d reward
         0,                              -- B game_action
         game_state.game_mode,           -- B game_mode
-        is_done,                        -- B done flag
+        bDone and 1 or 0,               -- B done flag
         game_state.frame_counter,       -- I frame_counter
         player_state.score,             -- I score
         save_signal,                    -- B save_signal
@@ -1061,7 +1061,7 @@ local function frame_callback()
         
         -- Flatten and serialize the game state data
         local frame_data
-        frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+        frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, bDone)
 
         -- Send the serialized data to the Python script and get the components
         local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
@@ -1357,7 +1357,7 @@ local function on_mame_exit()
         local reward = calculate_reward(game_state, level_state, player_state)
         
         -- Get final frame data with save signal
-        local frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state)
+        local frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, true)
         
         -- Send one last time
         if pipe_out and pipe_in then
