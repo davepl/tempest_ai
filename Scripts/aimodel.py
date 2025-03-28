@@ -25,7 +25,8 @@ import select
 # Constants
 DEBUG_MODE = False  # Set to False in production for better performance
 FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
-ShouldReplayLog = True
+SPINNER_POWER = 3  # Controls spinner movement distribution (higher = more small movements)
+ShouldReplayLog = False
 LogFile = "/Users/dave/mame/250k.log"
 MaxLogFrames = 250000
 
@@ -589,12 +590,12 @@ def main():
                             action = actor.get_action(state_tensor, deterministic=True)
                 
                 action_cpu = action.cpu()
-                fire, zap, spinner = decode_action(action_cpu)
+                fire, zap, spinner = decode_action(action_cpu, spinner_power=SPINNER_POWER)
 
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
 
-                if frame_count % 100 == 0:
+                if frame_count % 1000 == 0:
                     actor_loss_mean = np.mean(actor_losses) if actor_losses else float('nan')
                     critic_loss_mean = np.mean(critic_losses) if critic_losses else float('nan')
                     mean_reward_str = f"{np.mean(episode_rewards):.3f}" if episode_rewards else "N/A (no completed episodes yet)"
@@ -654,15 +655,38 @@ def encode_action(fire, zap, spinner_delta):
     # Return a PyTorch tensor with a batch dimension instead of numpy array
     return torch.tensor([[fire_val, zap_val, normalized_spinner]], dtype=torch.float32, device=device)
 
-def decode_action(action):
-    """Decode actions from PyTorch tensor."""
+def decode_action(action, spinner_power=3):
+    """Decode actions from PyTorch tensor.
+    
+    Args:
+        action: PyTorch tensor with shape [batch_size, 3]
+        spinner_power: Power to raise the spinner value to (default=3)
+                       Higher values = more concentration around center
+                       Lower values = more uniform distribution
+    """
     fire = 1 if action[0, 0].item() > 0.5 else 0
     zap = 1 if action[0, 1].item() > 0.5 else 0
+    
+    # Get raw spinner value between -1 and 1
     spinner_val = action[0, 2].item()
     if not np.isfinite(spinner_val):  # Handle NaN or inf
         spinner_val = 0.0
         print(f"Warning: Spinner value was {spinner_val}, defaulting to 0")
-    spinner = int(round(np.clip(spinner_val, -1.0, 1.0) * 31.0))  # Scale from -1 to +1 to -31 to +31
+    
+    # Apply non-linear transformation to favor smaller movements
+    # First ensure the value is within -1 to 1 range
+    clamped_val = np.clip(spinner_val, -1.0, 1.0)
+    
+    # Apply power transformation while preserving sign
+    sign = np.sign(clamped_val)
+    magnitude = abs(clamped_val)
+    
+    # Power transformation - higher power = more small movements
+    transformed_val = sign * (magnitude ** spinner_power)
+    
+    # Scale to range -31 to 31 and round to integer
+    spinner = int(round(transformed_val * 31.0))
+    
     return fire, zap, spinner
 
 if __name__ == "__main__":
