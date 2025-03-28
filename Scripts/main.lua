@@ -608,7 +608,7 @@ function EnemiesState:update(mem)
         local pos = mem:read_u8(0x02DF + i - 1)       -- enemy_along at $02DF - main position
         local lsb = mem:read_u8(0x029F + i - 1)       -- enemy_along_lsb at $029F - fractional part
         -- Store both values for display
-        self.enemy_depths[i] = {pos = pos, frac = lsb}
+        self.enemy_depths[i] = lsb + pos * 256
     end
 
     -- Read all 4 enemy shot positions and store absolute positions
@@ -860,15 +860,9 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
         table.insert(data, enemies_state.enemy_segments[i] or 0)
     end
     
-    -- Enemy depths (fixed size: 14 - 7 positions and 7 fractions)
+    -- Enemy depths (fixed size: 7 - 16bit positions)
     for i = 1, 7 do
-        if type(enemies_state.enemy_depths[i]) == "table" then
-            table.insert(data, enemies_state.enemy_depths[i].pos or 0)
-            table.insert(data, enemies_state.enemy_depths[i].frac or 0)
-        else
-            table.insert(data, 0)  -- Position
-            table.insert(data, 0)  -- Fraction
-        end
+        table.insert(data, enemies_state.enemy_depths[i] or 0)
     end
     
     -- Enemy shot positions (fixed size: 4)
@@ -887,27 +881,21 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     
     -- Add pending_vid (64 bytes)
     for i = 1, 64 do
-        table.insert(data, enemies_state.pending_vid[i] or 0)
+--        table.insert(data, enemies_state.pending_vid[i] or 0)
     end
     
     -- Add pending_seg (64 bytes)
     for i = 1, 64 do
-        table.insert(data, enemies_state.pending_seg[i] or 0)
+--        table.insert(data, enemies_state.pending_seg[i] or 0)
     end
     
-    -- Serialize the data to a binary string
+    -- Serialize the data to a binary string.  We will convert all values to 16-bit signed integers
+    -- and then pack them into a binary string.
+    
     local binary_data = ""
     for i, value in ipairs(data) do
-        -- Apply offset encoding to handle negative values
-        local encoded_value = value + 32768
-        -- Check if the encoded value would overflow
-        if encoded_value > 65535 then
-            print("Warning: Value at index " .. i .. " is too large: " .. value)
-            encoded_value = 65535
-        elseif encoded_value < 0 then
-            print("Warning: Value at index " .. i .. " is too negative: " .. value)
-            encoded_value = 0
-        end
+       
+        encoded_value = i & 0xFFFF
         binary_data = binary_data .. string.pack(">I2", encoded_value)
     end
   
@@ -1294,7 +1282,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
         -- Format enemy segments as two-digit hexadecimal numbers
         enemy_segs[i] = string.format("%02X", enemies_state.enemy_segments[i])
-        enemy_depths[i] = string.format("%02X.%02X", enemies_state.enemy_depths[i].pos, enemies_state.enemy_depths[i].frac)
+        enemy_depths[i] = string.format("%04X", enemies_state.enemy_depths[i])
     end
 
     local enemies_metrics = {

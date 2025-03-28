@@ -28,11 +28,11 @@ import traceback
 import select
 
 # Constants
-ShouldReplayLog = True
+ShouldReplayLog = False
 LogFile = "/Users/dave/mame/1m.log"
-MaxLogFrames = 2000000
+MaxLogFrames = 100000
 
-NumberOfParams = 247
+NumberOfParams = 112
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
 MODEL_DIR = "models"
@@ -155,6 +155,31 @@ class BCModel(nn.Module):
         spinner_out_raw = self.spinner_output(features)
         spinner_out = torch.clamp(spinner_out_raw, -1.0, 1.0)
         return torch.cat([fire_out, zap_out, spinner_out], dim=1), spinner_out_raw
+
+# Custom Actor-Critic RL implementation
+class Actor(nn.Module):
+    def __init__(self, state_dim=NumberOfParams):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fire_head = nn.Linear(256, 1)
+        self.zap_head = nn.Linear(256, 1)
+        self.spinner_head = nn.Linear(256, 1)
+        self.to(device)
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        fire = torch.sigmoid(self.fire_head(x))
+        zap = torch.sigmoid(self.zap_head(x))
+        spinner = torch.tanh(self.spinner_head(x))
+        return torch.cat([fire, zap, spinner], dim=-1)
+
+actor = Actor()
+actor_optimizer = optim.Adam(actor.parameters(), lr=1e-4)
+
+# Replay Buffer
+replay_buffer = deque(maxlen=100000)        
 
 def process_frame_data(data, header_data=None):
     """Process frame data from Lua using exact same format string as Lua."""
@@ -374,7 +399,7 @@ def train_model_with_batch(model, batch):
         
         for state, game_action, reward in batch:
             fire, zap, spinner = game_action
-            normalized_spinner = max(-127, min(127, spinner)) / 127.0
+            normalized_spinner = max(-31, min(31, spinner)) / 31.0
             states.append(state)
             fire_targets.append(float(fire))
             zap_targets.append(float(zap))
@@ -399,15 +424,9 @@ def train_model_with_batch(model, batch):
         
         loss = fire_zap_loss + spinner_loss
         
-        if frame_count % 1000 == 0:
-            loss.backward()
-            raw_grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            model.optimizer.step()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            model.optimizer.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+        model.optimizer.step()
     
     return loss.item()
 
@@ -425,41 +444,23 @@ def background_bc_train(bc_model):
             print(f"BC training error: {e}")
             traceback.print_exc()
 
-def background_rl_train(rl_model):
-    """Background RL training thread."""
+def background_rl_train():
     while True:
-        try:
-            training_queue.get(timeout=1.0)
-            flush_replay_buffer_batch(rl_model.replay_buffer)  # Ensure all buffered experiences are added
-            if rl_model.replay_buffer.pos > rl_model.learning_starts:
-                apply_minimal_compatibility_patches(rl_model)
-                buffer_size = rl_model.replay_buffer.pos
-                batch_size = min(64, max(8, buffer_size // 2))
-                
-                sampled_batch = rl_model.replay_buffer.sample(batch_size)
-                # print(
-                #     f"Sampled batch shapes - "
-                #     f"obs: {sampled_batch.observations.shape}, "
-                #     f"next_obs: {sampled_batch.next_observations.shape}, "
-                #     f"actions: {sampled_batch.actions.shape}, "
-                #     f"rewards: {sampled_batch.rewards.shape}, "
-                #     f"dones: {sampled_batch.dones.shape}"
-                # )
-                
-                rl_model.train(gradient_steps=5, batch_size=batch_size)
-                if hasattr(rl_model, "logger"):
-                    log_vals = rl_model.logger.name_to_value
-                    actor_losses.append(log_vals.get("train/actor_loss", float("nan")))
-                    critic_losses.append(log_vals.get("train/critic_loss", float("nan")))
-                    ent_coefs.append(log_vals.get("train/ent_coef", float("nan")))
-
-            training_queue.task_done()
-        except queue.Empty:
+        if len(replay_buffer) < 64:
+            time.sleep(0.01)
             continue
-        except Exception as e:
-            print(f"RL training error: {e}")
-            traceback.print_exc()
-            training_queue.task_done()
+        batch = random.sample(replay_buffer, 64)
+        states, actions, rewards, next_states, dones = map(torch.tensor, zip(*batch))
+        states, actions, rewards, next_states, dones = [x.float().to(device) for x in [states, actions, rewards, next_states, dones]]
+
+        predicted_actions = actor(states)
+        loss = F.mse_loss(predicted_actions, actions)
+
+        actor_optimizer.zero_grad()
+        loss.backward()
+        actor_optimizer.step()
+
+        actor_losses.append(loss.item())  # Track loss here
 
 frame_count = 0
 
@@ -469,7 +470,7 @@ def main():
     env = TempestEnv()
     bc_model, rl_model = initialize_models(env)
     
-    threading.Thread(target=background_rl_train, args=(rl_model,), daemon=True).start()
+    threading.Thread(target=background_rl_train, daemon=True).start()
     threading.Thread(target=background_bc_train, args=(bc_model,), daemon=True).start()
 
     if ShouldReplayLog:
@@ -530,8 +531,6 @@ def main():
                     continue
                 
                 state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-                action, _ = rl_model.predict(tensor_to_numpy(state_tensor), deterministic=True)
-                action = action.flatten()
 
                 if done and not done_latch:
                     done_latch = True
@@ -559,9 +558,10 @@ def main():
                     env.update_state(state, reward, game_action, False)
                     total_episode_reward += reward
                     if not is_attract and env.prev_state is not None and env.prev_action is not None:
-                        safe_add_to_buffer(rl_model.replay_buffer, env.prev_state, env.state, 
-                                          env.prev_action, reward, False)
+                        replay_buffer.append((env.prev_state, env.prev_action, reward, env.state, done))
 
+                action = encode_action(0, 0, 0)
+                
                 if is_attract and game_action:
                     try:
                         bc_training_queue.put((state, game_action, reward), block=False)
@@ -578,39 +578,25 @@ def main():
                         with bc_model_lock:
                             bc_model.eval()
                             with torch.no_grad():
-                                state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-                                preds, _ = bc_model(state_tensor)
-                                action = preds.cpu().numpy()[0]
+                                action_tensor = actor(state_tensor).squeeze(0)
+                            action = action_tensor.cpu().numpy()
                     else:
                         with torch.no_grad():
-                            state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32).to(device)
-                            action, _ = rl_model.predict(tensor_to_numpy(state_tensor), deterministic=True)
-                            action = action.flatten()
+                            action_tensor = actor(state_tensor).squeeze(0)
+                        action = action_tensor.cpu().numpy()
 
                 env.step(action)
                 fire, zap, spinner = env.decode_action(action)
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
 
-                current_time = time.time()
-                if (current_time - last_training_request > training_interval and 
-                    rl_model.replay_buffer.pos > rl_model.learning_starts and
-                    not training_queue.full()):
-                    training_queue.put(True, block=False)
-                    mean_rewards.append(reward)
-                    last_training_request = current_time
-
                 if frame_count % 100 == 0:
-                    actor_loss_mean = np.nanmean(actor_losses) if actor_losses else np.nan
-                    critic_loss_mean = np.nanmean(critic_losses) if critic_losses else np.nan
-                    ent_coef_mean = np.nanmean(ent_coefs) if ent_coefs else np.nan
-                    reward_mean = np.nanmean(mean_rewards) if mean_rewards else np.nan
-                    if not is_attract:
-                        print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, "
-                              f"Buffer Size: {rl_model.replay_buffer.size()}")
-                        print(f"Metrics - Actor Loss: {actor_loss_mean:.3f}, Critic Loss: {critic_loss_mean:.3f}, "
-                              f"Entropy Coef: {ent_coef_mean:.3f}, Mean Reward: {reward_mean:.3f}, "
-                              f"Expl: {current_exploration_ratio:.3f}")
+                    actor_loss_mean = np.mean(actor_losses) if actor_losses else float('nan')
+                    mean_reward = np.mean(episode_rewards) if episode_rewards else float('nan')
+                    print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, Buffer Size: {len(replay_buffer)}")
+                    print(f"Metrics - Actor Loss: {actor_loss_mean:.4f}, "
+                        f"Mean Episode Reward: {mean_reward:.3f}, "
+                        f"Exploration Ratio: {current_exploration_ratio:.3f}")
 
                 if save_signal:
                     threading.Thread(target=save_models, args=(rl_model, bc_model), daemon=True).start()
@@ -626,37 +612,30 @@ def main():
                 traceback.print_exc()
                 time.sleep(5)
 
+# Update initialize_models to load the actor:
 def initialize_models(env):
-    """Initialize models with improved SAC parameters."""
     bc_model = BCModel()
     if os.path.exists(BC_MODEL_PATH):
+        bc_model.train()  # Set training mode before loading
         bc_model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=device))
         print(f"Loaded BC model from {BC_MODEL_PATH}")
 
-    rl_model = SAC("MlpPolicy", env, policy_kwargs={
-        "features_extractor_class": TempestFeaturesExtractor,
-        "features_extractor_kwargs": {"features_dim": 128},
-        "net_arch": dict(pi=[256, 128], qf=[256, 128])
-    }, learning_rate=0.0005, buffer_size=100000, learning_starts=1000, batch_size=32,
-       train_freq=(10, "step"), gradient_steps=5, ent_coef="auto", target_entropy=-1.5,
-       tau=0.005, gamma=0.99, device=device, verbose=1)
-    
     if os.path.exists(LATEST_MODEL_PATH):
-        rl_model = SAC.load(LATEST_MODEL_PATH, env=env, device=device)
+        actor.train()  # Set training mode before loading
+        actor.load_state_dict(torch.load(LATEST_MODEL_PATH, map_location=device))
         print(f"Loaded RL model from {LATEST_MODEL_PATH}")
-    
-    apply_minimal_compatibility_patches(rl_model)
-    return bc_model, rl_model
 
-def save_models(rl_model, bc_model):
-    """Save RL and BC models to disk."""
+    return bc_model, actor
+
+def save_models(rl_model=None, bc_model=None):
     try:
         with bc_model_lock:
             torch.save(bc_model.state_dict(), BC_MODEL_PATH)
-        rl_model.save(LATEST_MODEL_PATH)
+        torch.save(actor.state_dict(), LATEST_MODEL_PATH)
         print(f"Models saved to {MODEL_DIR}")
     except Exception as e:
         print(f"Error saving models: {e}")
+
 
 def encode_action(fire, zap, spinner_delta):
     """Encode actions for RL model consistency."""
