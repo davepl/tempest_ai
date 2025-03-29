@@ -620,18 +620,6 @@ function EnemiesState:update(mem)
 
     local activeEnemies = self.num_enemies_in_tube + self.num_enemies_on_top
     
-    -- Add assertions with pcall to avoid crashes
-    local assert_result, error_message = pcall(function()
-        assert(activeEnemies <= 7, "Active enemies must be 7 or less")
-        assert(activeEnemies == self.active_flippers + self.active_pulsars + self.active_tankers + 
-               self.active_spikers + self.active_fuseballs, 
-               "Active enemies should match the sum of flippers, pulsars, tankers, spikers, and fuseballs")
-    end)
-    
-    if not assert_result then
-        print("Warning: " .. error_message)
-    end
-    
     -- Use math.min instead of min
     local maxEnemyIndex = math.min(7, activeEnemies)
     

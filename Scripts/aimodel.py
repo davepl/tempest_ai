@@ -94,11 +94,15 @@ class BCModel(nn.Module):
     def __init__(self, input_size=NumberOfParams):
         super().__init__()
         self.feature_extractor = nn.Sequential(
-            nn.Linear(input_size, 512),
+            nn.Linear(input_size, 1024),  # Increased from 512
             nn.LeakyReLU(),
-            nn.Linear(512, 256),
+            nn.BatchNorm1d(1024),  # Added BatchNorm for better training stability
+            nn.Linear(1024, 512),  # Increased from 256
             nn.LeakyReLU(),
-            nn.Linear(256, 128),
+            nn.BatchNorm1d(512),  # Added BatchNorm
+            nn.Linear(512, 256),   # Increased from 128
+            nn.LeakyReLU(),
+            nn.Linear(256, 128),   # Added an extra layer
             nn.LeakyReLU(),
             nn.Dropout(0.2)
         )
@@ -121,19 +125,55 @@ class BCModel(nn.Module):
             x = x.unsqueeze(0)
         if x.device != device:
             x = x.to(device)
-        features = self.feature_extractor(x)
-        fire_out = torch.sigmoid(self.fire_output(features))
-        zap_out = torch.sigmoid(self.zap_output(features))
-        spinner_out = torch.tanh(self.spinner_output(features))
-        spinner_var = torch.clamp(F.softplus(self.spinner_var_output(features)), 0.01, 0.5)
+            
+        # Handle batch normalization manually with special case for batch size of 1
+        # First linear + ReLU
+        x = self.feature_extractor[0](x)  # Linear
+        x = self.feature_extractor[1](x)  # LeakyReLU
+        
+        # First BatchNorm
+        if x.size(0) == 1:
+            # Skip BatchNorm for single sample
+            pass
+        else:
+            x = self.feature_extractor[2](x)  # BatchNorm
+        
+        # Second linear + ReLU
+        x = self.feature_extractor[3](x)  # Linear
+        x = self.feature_extractor[4](x)  # LeakyReLU
+        
+        # Second BatchNorm
+        if x.size(0) == 1:
+            # Skip BatchNorm for single sample
+            pass
+        else:
+            x = self.feature_extractor[5](x)  # BatchNorm
+        
+        # Third linear + ReLU
+        x = self.feature_extractor[6](x)  # Linear
+        x = self.feature_extractor[7](x)  # LeakyReLU
+        
+        # Fourth linear + ReLU + Dropout
+        x = self.feature_extractor[8](x)  # Linear
+        x = self.feature_extractor[9](x)  # LeakyReLU
+        x = self.feature_extractor[10](x)  # Dropout
+        
+        # Output heads
+        fire_out = torch.sigmoid(self.fire_output(x))
+        zap_out = torch.sigmoid(self.zap_output(x))
+        spinner_out = torch.tanh(self.spinner_output(x))
+        spinner_var = torch.clamp(F.softplus(self.spinner_var_output(x)), 0.01, 0.5)
         
         return torch.cat([fire_out, zap_out, spinner_out, spinner_var], dim=1), spinner_out
 
 class Actor(nn.Module):
     def __init__(self, state_dim=NumberOfParams):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
+        self.fc1 = nn.Linear(state_dim, 512)  # Increased from 256
+        self.bn1 = nn.BatchNorm1d(512)  # Added batch normalization
+        self.fc2 = nn.Linear(512, 256)  # Increased from 256 and added an extra layer
+        self.bn2 = nn.BatchNorm1d(256)  # Added batch normalization
+        self.fc3 = nn.Linear(256, 256)  # New layer 
         self.fire_head = nn.Linear(256, 1)
         self.zap_head = nn.Linear(256, 1)
         self.spinner_head = nn.Linear(256, 1)
@@ -150,8 +190,24 @@ class Actor(nn.Module):
         self.to(device)
 
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        x = self.fc1(state)
+        x = F.relu(x)
+        # Handle batch size of 1 for BatchNorm1d
+        if x.size(0) == 1:
+            x1 = x  # Skip batch norm for single sample
+        else:
+            x1 = self.bn1(x)
+        
+        x = self.fc2(x1)
+        x = F.relu(x)
+        # Handle batch size of 1 for BatchNorm1d
+        if x.size(0) == 1:
+            x2 = x  # Skip batch norm for single sample
+        else:
+            x2 = self.bn2(x)
+        
+        x = F.relu(self.fc3(x2))
+        
         fire_logits = torch.clamp(self.fire_head(x), -10.0, 10.0)  # Prevent extreme logits
         zap_logits = torch.clamp(self.zap_head(x), -10.0, 10.0)
         
@@ -202,14 +258,33 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim=NumberOfParams):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
+        self.fc1 = nn.Linear(state_dim, 512)  # Increased from 256
+        self.bn1 = nn.BatchNorm1d(512)  # Added batch normalization
+        self.fc2 = nn.Linear(512, 256)  # Increased from 256
+        self.bn2 = nn.BatchNorm1d(256)  # Added batch normalization
+        self.fc3 = nn.Linear(256, 256)  # New layer
         self.value_head = nn.Linear(256, 1)
         self.to(device)
 
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        x = self.fc1(state)
+        x = F.relu(x)
+        # Handle batch size of 1 for BatchNorm1d
+        if x.size(0) == 1:
+            x1 = x  # Skip batch norm for single sample
+        else:
+            x1 = self.bn1(x)
+        
+        x = self.fc2(x1)
+        x = F.relu(x)
+        # Handle batch size of 1 for BatchNorm1d
+        if x.size(0) == 1:
+            x2 = x  # Skip batch norm for single sample
+        else:
+            x2 = self.bn2(x)
+        
+        x = F.relu(self.fc3(x2))
+        
         return self.value_head(x)
 
 actor = Actor()
@@ -291,7 +366,6 @@ def train_model_with_batch(model, batch):
     global bc_spinner_error_before, bc_spinner_error_after, bc_train_count, frame_count
     
     with bc_model_lock:
-        model.train()
         states = []
         fire_targets = []
         zap_targets = []
@@ -310,6 +384,15 @@ def train_model_with_batch(model, batch):
         state_tensor = torch.FloatTensor(np.array(states)).to(device)
         targets = torch.FloatTensor([[f, z, s, 0.1] for f, z, s in zip(fire_targets, zap_targets, spinner_targets)]).to(device)
         reward_tensor = torch.FloatTensor(rewards).to(device)
+        
+        # Only set to train mode if we have more than 1 sample (BatchNorm requirement)
+        batch_size = state_tensor.size(0)
+        should_train = batch_size > 1
+        
+        if should_train:
+            model.train()
+        else:
+            model.eval()  # Use eval mode for single samples to avoid BatchNorm issues
         
         # Before training metrics if enabled
         if TRACK_BATCH_METRICS:
@@ -345,9 +428,10 @@ def train_model_with_batch(model, batch):
         
         loss = fire_zap_loss + spinner_loss
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-        model.optimizer.step()
+        if should_train:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            model.optimizer.step()
         
         # After training metrics if enabled
         if TRACK_BATCH_METRICS:
@@ -368,31 +452,6 @@ def train_model_with_batch(model, batch):
                 # Calculate spinner error (MSE)
                 spinner_error_after = F.mse_loss(preds_after[:, 2], targets[:, 2]).item()
                 bc_spinner_error_after.append(spinner_error_after)
-                
-                # Log metrics periodically or when significant improvement
-                fire_acc_change = fire_acc_after - fire_acc_before
-                zap_acc_change = zap_acc_after - zap_acc_before
-                spinner_error_change = spinner_error_before - spinner_error_after
-                
-                # Display metrics less frequently (every 50 batches) or when very significant change occurs
-                if (bc_train_count % 50 == 0 or 
-                    abs(fire_acc_change) > 0.2 or  # Increased from 0.1
-                    abs(zap_acc_change) > 0.2 or  # Increased from 0.1
-                    abs(spinner_error_change) > 0.1):  # Increased from 0.05
-                    
-                    # Calculate trends across recent batches
-                    fire_acc_trend = np.mean(bc_fire_accuracy_after) - np.mean(bc_fire_accuracy_before)
-                    zap_acc_trend = np.mean(bc_zap_accuracy_after) - np.mean(bc_zap_accuracy_before)
-                    spinner_error_trend = np.mean(bc_spinner_error_before) - np.mean(bc_spinner_error_after)
-                    
-                    # Only print if there's a significant trend or it's a milestone batch
-                    if bc_train_count % 200 == 0 or abs(fire_acc_trend) > 0.1 or abs(zap_acc_trend) > 0.1 or abs(spinner_error_trend) > 0.05:
-                        print("\n--- BC Training Metrics (Batch #" + str(bc_train_count) + ") ---")
-                        print(f"Fire accuracy: {fire_acc_before:.4f} → {fire_acc_after:.4f} (Δ{fire_acc_change:+.4f}, trend: {fire_acc_trend:+.4f})")
-                        print(f"Zap accuracy: {zap_acc_before:.4f} → {zap_acc_after:.4f} (Δ{zap_acc_change:+.4f}, trend: {zap_acc_trend:+.4f})")
-                        print(f"Spinner error: {spinner_error_before:.4f} → {spinner_error_after:.4f} (Δ{-spinner_error_change:+.4f}, trend: {spinner_error_trend:+.4f})")
-                        print(f"Weighted loss: {loss.item():.6f}")
-                        print("-----------------------------\n")
     
     return loss.item()
 
@@ -428,13 +487,16 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
         try:
             with rl_model_lock:
                 batch = random.sample(replay_buffer, batch_size)
-                states, actions, rewards, next_states, dones = map(torch.tensor, zip(*batch))
                 
-                states = states.to(device, dtype=torch.float32)
-                actions = actions.to(device, dtype=torch.float32)
-                rewards = rewards.to(device, dtype=torch.float32).unsqueeze(1)
-                next_states = next_states.to(device, dtype=torch.float32)
-                dones = dones.to(device, dtype=torch.float32).unsqueeze(1)
+                # Convert batch data to numpy arrays first for efficiency
+                states_list, actions_list, rewards_list, next_states_list, dones_list = zip(*batch)
+                
+                # Convert lists to numpy arrays before creating tensors
+                states = torch.tensor(np.array(states_list), dtype=torch.float32, device=device)
+                actions = torch.tensor(np.array(actions_list), dtype=torch.float32, device=device)
+                rewards = torch.tensor(np.array(rewards_list), dtype=torch.float32, device=device).unsqueeze(1)
+                next_states = torch.tensor(np.array(next_states_list), dtype=torch.float32, device=device)
+                dones = torch.tensor(np.array(dones_list), dtype=torch.float32, device=device).unsqueeze(1)
 
                 # Collect metrics before training if enabled
                 if TRACK_BATCH_METRICS:
@@ -542,37 +604,12 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
                         value_error_after = F.mse_loss(current_values_after, target_values_after).item()
                         value_errors_after.append(value_error_after)
                         
-                        # Log the changes if significant enough to be interesting
-                        fire_change = fire_prob_after - fire_prob_before
-                        zap_change = zap_prob_after - zap_prob_before
-                        spinner_mean_change = spinner_mean_avg_after - spinner_mean_avg_before
-                        spinner_var_change = spinner_var_avg_after - spinner_var_avg_before
-                        value_error_change = value_error_after - value_error_before
-                        
-                        # Log every 10 updates or if changes are significant (with increased thresholds)
-                        # Higher threshold for value error changes since those are expected to be larger
-                        if (frame_count % 50000 < 10 or  # Only print every 50k frames instead of 10k
-                            abs(fire_change) > 0.15 or  # Increased from 0.05
-                            abs(zap_change) > 0.15 or  # Increased from 0.05
-                            abs(spinner_mean_change) > 0.2 or  # Increased from 0.1
-                            abs(spinner_var_change) > 0.2 or  # Increased from 0.1 
-                            abs(value_error_change) > 0.5):  # Increased from 0.1 to 0.5
-                            
-                            fire_trend = np.mean(fire_probs_after) - np.mean(fire_probs_before)
-                            zap_trend = np.mean(zap_probs_after) - np.mean(zap_probs_before)
-                            spinner_mean_trend = np.mean(spinner_means_after) - np.mean(spinner_means_before)
-                            spinner_var_trend = np.mean(spinner_vars_after) - np.mean(spinner_vars_before)
-                            value_error_trend = np.mean(value_errors_after) - np.mean(value_errors_before)
-                            
-                            # Only print if we've accumulated enough steps or there's a clear trend
-                            if frame_count > 10000 or abs(fire_trend) > 0.1 or abs(zap_trend) > 0.1 or abs(value_error_trend) > 0.2:
-                                print("\n--- Batch Training Metrics ---")
-                                print(f"Fire probability: {fire_prob_before:.4f} → {fire_prob_after:.4f} (Δ{fire_change:+.4f}, trend: {fire_trend:+.4f})")
-                                print(f"Zap probability: {zap_prob_before:.4f} → {zap_prob_after:.4f} (Δ{zap_change:+.4f}, trend: {zap_trend:+.4f})")
-                                print(f"Spinner mean: {spinner_mean_avg_before:.4f} → {spinner_mean_avg_after:.4f} (Δ{spinner_mean_change:+.4f}, trend: {spinner_mean_trend:+.4f})")
-                                print(f"Spinner variance: {spinner_var_avg_before:.4f} → {spinner_var_avg_after:.4f} (Δ{spinner_var_change:+.4f}, trend: {spinner_var_trend:+.4f})")
-                                print(f"Value estimation error: {value_error_before:.4f} → {value_error_after:.4f} (Δ{value_error_change:+.4f}, trend: {value_error_trend:+.4f})")
-                                print("------------------------------\n")
+                        # Just update metrics without printing
+                        fire_trend = np.mean(fire_probs_after) - np.mean(fire_probs_before)
+                        zap_trend = np.mean(zap_probs_after) - np.mean(zap_probs_before)
+                        spinner_mean_trend = np.mean(spinner_means_after) - np.mean(spinner_means_before)
+                        spinner_var_trend = np.mean(spinner_vars_after) - np.mean(spinner_vars_before)
+                        value_error_trend = np.mean(value_errors_after) - np.mean(value_errors_before)
 
         except Exception as e:
             print(f"RL training error: {e}")
@@ -585,7 +622,7 @@ def replay_log_file(log_file_path, bc_model):
         print(f"Error: Log file {log_file_path} not found")
         return False
     
-    print(f"Replaying {log_file_path}")
+    print(f"Replaying log file: {log_file_path}")
     frame_count = 0
     batch_size = 128
     training_data = []
@@ -600,6 +637,11 @@ def replay_log_file(log_file_path, bc_model):
     
     format_string = ">IdBBBIIBBBhB"
     header_size = struct.calcsize(format_string)
+    
+    # Setup progress tracking
+    print("\n" + "-" * 50)
+    print(f"{'Frames':>8} | {'Loss':>8} | {'Fire%':>6} | {'Zap%':>6} | {'Reward':>8}")
+    print("-" * 50)
     
     with open(log_file_path, 'rb') as f:
         frames_processed = 0
@@ -645,8 +687,16 @@ def replay_log_file(log_file_path, bc_model):
                 batch_loss = train_model_with_batch(bc_model, training_data[:batch_size])
                 total_loss += batch_loss
                 num_batches += 1
-                if frame_count % 100 == 0:
-                    print(f"Frames: {frame_count} - Trained batch - loss: {batch_loss:.6f}")
+                
+                # Print progress every 1000 frames
+                if frame_count % 1000 == 0:
+                    current_fire_rate = total_fire / max(1, frames_processed) * 100
+                    current_zap_rate = total_zap / max(1, frames_processed) * 100
+                    avg_reward = total_reward / max(1, frames_processed)
+                    
+                    print(f"{frame_count:8d} | {batch_loss:8.4f} | {current_fire_rate:6.2f} | "
+                          f"{current_zap_rate:6.2f} | {avg_reward:8.2f}")
+                
                 training_data = training_data[batch_size:]
                 frame_count += batch_size
         
@@ -658,12 +708,15 @@ def replay_log_file(log_file_path, bc_model):
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('nan')
         
+        print("-" * 50)
         print(f"Replay complete: {frame_count} frames processed")
-        if frames_processed > 0:
-            print(f"FINAL STATS - Avg Fire: {total_fire/frames_processed:.4f}, "
-                  f"Avg Zap: {total_zap/frames_processed:.4f}, Avg Reward: {total_reward/frames_processed:.4f}, "
-                  f"Avg Loss: {avg_loss:.6f}")
+        print(f"Final Statistics:")
+        print(f"  - Fire Rate: {total_fire/frames_processed*100:.2f}%")
+        print(f"  - Zap Rate: {total_zap/frames_processed*100:.2f}%") 
+        print(f"  - Avg Reward: {total_reward/frames_processed:.2f}")
+        print(f"  - Avg Loss: {avg_loss:.6f}")
         
+        print(f"Saving BC model to {BC_MODEL_PATH}")
         torch.save(bc_model.state_dict(), BC_MODEL_PATH)
         return True
 
@@ -686,6 +739,29 @@ def setup_keyboard_input():
 def restore_keyboard_input(old_settings):
     """Restore original keyboard input settings."""
     termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old_settings)
+
+def print_metrics_table_header():
+    """Print the header row for the metrics table."""
+    header = (
+        f"{'Frame':>8} | {'Actor Loss':>10} | {'Critic Loss':>11} | {'Mean Reward':>12} | {'Explore %':>9} | "
+        f"{'BC Fire':>7} | {'BC Zap':>7} | {'Spin Err':>8} | {'Extreme %':>9} | {'Optimal %':>9} | {'Buffer':>7}"
+    )
+    separator = "-" * len(header)
+    print("\n" + separator)
+    print(header)
+    print(separator)
+
+def print_metrics_table_row(frame_count, metrics_dict):
+    """Print a single row of the metrics table with the provided metrics."""
+    row = (
+        f"{frame_count:8d} | {metrics_dict.get('actor_loss', 'N/A'):10.4f} | "
+        f"{metrics_dict.get('critic_loss', 'N/A'):11.2f} | {metrics_dict.get('mean_reward', 'N/A'):12.2f} | "
+        f"{metrics_dict.get('exploration', 0.0)*100:8.2f}% | "
+        f"{metrics_dict.get('bc_fire', 'N/A'):7.2f} | {metrics_dict.get('bc_zap', 'N/A'):7.2f} | "
+        f"{metrics_dict.get('spinner_error', 'N/A'):8.4f} | {metrics_dict.get('extreme_ratio', 0.0)*100:8.2f}% | "
+        f"{metrics_dict.get('optimal_ratio', 0.0)*100:8.2f}% | {metrics_dict.get('buffer_size', 0):7d}"
+    )
+    print(row)
 
 def main():
     """Main execution loop for Tempest AI."""
@@ -736,6 +812,9 @@ def main():
     last_spinner_values = deque(maxlen=100)
     extreme_threshold = 0.8  # Consider values above this magnitude as extreme
     
+    # Print metrics table header
+    print_metrics_table_header()
+    
     # Store previous state for proper next_state in replay buffer
     previous_state = None
     
@@ -778,25 +857,27 @@ def main():
                     total_episode_reward += reward
                     episode_rewards.append(total_episode_reward)
                     
-                    print(f"Episode completed with total reward: {total_episode_reward:.2f}")
-                    print(f"Current mean reward over last {len(episode_rewards)} episodes: {np.mean(episode_rewards):.2f}")
+                    # print(f"Episode completed with reward: {total_episode_reward:.2f}")
                     
                     # Reset tracking on new episode
                     last_spinner_values.clear()
                     previous_state = None
                     
                     if len(replay_buffer) >= 256 and not is_attract:
-                        print("Performing end-of-episode model update...")
+                        #print("Performing end-of-episode model update...")
                         with rl_model_lock:
                             for update_step in range(5):
                                 batch = random.sample(replay_buffer, min(256, len(replay_buffer)))
-                                states, actions, rewards, next_states, dones = map(torch.tensor, zip(*batch))
                                 
-                                states = states.to(device, dtype=torch.float32)
-                                actions = actions.to(device, dtype=torch.float32)
-                                rewards = rewards.to(device, dtype=torch.float32).unsqueeze(1)
-                                next_states = next_states.to(device, dtype=torch.float32)
-                                dones = dones.to(device, dtype=torch.float32).unsqueeze(1)
+                                # Convert batch data to numpy arrays first for efficiency
+                                states_list, actions_list, rewards_list, next_states_list, dones_list = zip(*batch)
+                                
+                                # Convert lists to numpy arrays before creating tensors
+                                states = torch.tensor(np.array(states_list), dtype=torch.float32, device=device)
+                                actions = torch.tensor(np.array(actions_list), dtype=torch.float32, device=device)
+                                rewards = torch.tensor(np.array(rewards_list), dtype=torch.float32, device=device).unsqueeze(1)
+                                next_states = torch.tensor(np.array(next_states_list), dtype=torch.float32, device=device)
+                                dones = torch.tensor(np.array(dones_list), dtype=torch.float32, device=device).unsqueeze(1)
 
                                 # Rest of the training code remains the same
                                 # ... [unchanged code]
@@ -808,7 +889,7 @@ def main():
                     
                 elif not done and done_latch:
                     done_latch = False
-                    total_episode_reward += reward
+                    total_episode_reward = 0  # Reset reward at beginning of new episode
                     previous_state = None  # Reset previous state when episode starts
                     
                 else:
@@ -841,13 +922,10 @@ def main():
                         if extreme_ratio > 0.7:
                             # Increase exploration to break out of the pattern
                             current_exploration_ratio = max(current_exploration_ratio, 0.5)
-                            if frame_count % 100 == 0:
-                                print(f"Detected stuck in extreme pattern! Increasing exploration to {current_exploration_ratio:.2f}")
                     
                     # Update exploration ratio
                     if frame_count % 1000 == 0 and current_exploration_ratio > min_exploration_ratio:
                         current_exploration_ratio *= exploration_decay
-                        print(f"New Exploration ratio: {current_exploration_ratio:.4f}")
                     
                     # Choose between exploitation and exploration
                     if random.random() < current_exploration_ratio:
@@ -855,6 +933,8 @@ def main():
                         if random.random() < BC_GUIDED_EXPLORATION_RATIO:
                             # BC-guided exploration: use the BC model's prediction with added noise
                             with torch.no_grad():
+                                # Temporarily set to eval mode to prevent BatchNorm issues with single samples
+                                bc_model.eval()
                                 bc_preds, _ = bc_model(state_tensor)
                                 
                                 # Extract predictions
@@ -873,9 +953,6 @@ def main():
                                 # Create action tensor with BC guidance plus noise
                                 action = torch.tensor([[float(bc_fire), float(bc_zap), spinner_value]], 
                                                      dtype=torch.float32, device=device)
-                                
-                                if frame_count % 1000 == 0:
-                                    print(f"Using BC-guided exploration: Fire={bc_fire}, Zap={bc_zap}, Spinner={spinner_value:.2f}")
                         else:
                             # Pure random exploration (20% of exploration actions)
                             # For truly random exploration, sometimes use values near the optimal range
@@ -913,8 +990,9 @@ def main():
                 try:
                     key = sys.stdin.read(1)
                     if key == 'm':
-                        print("Displaying metrics summary (triggered by keyboard)...")
+                        print("\nDisplaying metrics summary (triggered by keyboard)...")
                         display_combined_metrics()
+                        print_metrics_table_header()  # Reprint header after detailed metrics
                     # Add more keyboard commands here if needed
                 except:
                     pass
@@ -923,36 +1001,58 @@ def main():
                 py_to_lua.flush()
 
                 if frame_count % 1000 == 0:
+                    # Calculate metrics for table row
                     actor_loss_mean = np.mean(actor_losses) if actor_losses else float('nan')
                     critic_loss_mean = np.mean(critic_losses) if critic_losses else float('nan')
-                    mean_reward_str = f"{np.mean(episode_rewards):.3f}" if episode_rewards else "N/A (no completed episodes yet)"
+                    
+                    # Only use the last 5 episode rewards for the mean to prevent endless increase
+                    mean_reward = np.mean(list(episode_rewards)) if episode_rewards else float('nan')
                     
                     # Calculate spinner value distribution
+                    extreme_ratio = 0.0
+                    optimal_ratio = 0.0
                     if last_spinner_values:
                         extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
                         extreme_ratio = extreme_count / len(last_spinner_values)
-                        avg_spinner = sum(abs(v) for v in last_spinner_values) / len(last_spinner_values)
                         
                         # Calculate how often we're near the optimal spinner value
                         normalized_optimal = OPTIMAL_SPINNER_SPEED / 31.0
                         close_to_optimal_count = sum(1 for v in last_spinner_values if abs(abs(v) - abs(normalized_optimal)) < 0.1)
                         optimal_ratio = close_to_optimal_count / len(last_spinner_values)
-                        
-                        spinner_info = f", Extreme: {extreme_ratio:.2f}, Near optimal: {optimal_ratio:.2f}, Avg abs: {avg_spinner:.2f}"
-                    else:
-                        spinner_info = ""
                     
-                    print(f"Frame {frame_count}, Reward: {reward:.2f}, Done: {done}, Buffer Size: {len(replay_buffer)}{spinner_info}")
-                    print(f"Metrics - Actor Loss: {actor_loss_mean:.4f}, Critic Loss: {critic_loss_mean:.4f}, "
-                          f"Mean Episode Reward: {mean_reward_str}, Exploration Ratio: {current_exploration_ratio:.3f}")
+                    # Get BC metrics if available
+                    bc_fire_acc = np.mean(bc_fire_accuracy_after) if len(bc_fire_accuracy_after) > 0 else float('nan')
+                    bc_zap_acc = np.mean(bc_zap_accuracy_after) if len(bc_zap_accuracy_after) > 0 else float('nan')
+                    spinner_error = np.mean(bc_spinner_error_after) if len(bc_spinner_error_after) > 0 else float('nan')
+                    
+                    # Prepare metrics dictionary for table display
+                    metrics = {
+                        'actor_loss': actor_loss_mean,
+                        'critic_loss': critic_loss_mean,
+                        'mean_reward': mean_reward,
+                        'exploration': current_exploration_ratio,
+                        'bc_fire': bc_fire_acc,
+                        'bc_zap': bc_zap_acc,
+                        'spinner_error': spinner_error,
+                        'extreme_ratio': extreme_ratio,
+                        'optimal_ratio': optimal_ratio,
+                        'buffer_size': len(replay_buffer)
+                    }
+                    
+                    # Print metrics in table format
+                    print_metrics_table_row(frame_count, metrics)
                     
                     # Show full metrics summary every 50k frames
                     if frame_count % 50000 == 0:
                         display_combined_metrics()
+                        print_metrics_table_header()  # Reprint header after detailed metrics
 
                 if save_signal:
+                    print("\nSaving models...")
                     threading.Thread(target=save_models, args=(actor, bc_model), daemon=True).start()
                     current_exploration_ratio = min(0.5, current_exploration_ratio * 1.5)  # Increase exploration after save
+                    print(f"Increased exploration to {current_exploration_ratio:.2f} after save")
+                    print_metrics_table_header()  # Reprint header after save message
                 
                 frame_count += 1
 
@@ -978,28 +1078,29 @@ def transfer_knowledge_from_bc_to_rl(bc_model, actor_model):
     
     # First, get the feature extractor weights from BC model
     with torch.no_grad():
-        # Transfer shared feature layer weights
+        # Transfer first layer - BC index 0 to Actor fc1
         actor_model.fc1.weight.data.copy_(bc_model.feature_extractor[0].weight.data)
         actor_model.fc1.bias.data.copy_(bc_model.feature_extractor[0].bias.data)
         
-        # Transfer second layer weights
-        actor_model.fc2.weight.data.copy_(bc_model.feature_extractor[2].weight.data)
-        actor_model.fc2.bias.data.copy_(bc_model.feature_extractor[2].bias.data)
+        # Transfer second layer - BC index 4 to Actor fc2
+        actor_model.fc2.weight.data.copy_(bc_model.feature_extractor[4].weight.data)
+        actor_model.fc2.bias.data.copy_(bc_model.feature_extractor[4].bias.data)
         
-        # Transfer fire head weights - with scaling to account for different activation functions
+        # Transfer third layer - BC index 6 to Actor fc3
+        actor_model.fc3.weight.data.copy_(bc_model.feature_extractor[6].weight.data)
+        actor_model.fc3.bias.data.copy_(bc_model.feature_extractor[6].bias.data)
+        
+        # Transfer output heads
         actor_model.fire_head.weight.data.copy_(bc_model.fire_output.weight.data)
         actor_model.fire_head.bias.data.copy_(bc_model.fire_output.bias.data)
         
-        # Transfer zap head weights - with scaling to account for different activation functions
         actor_model.zap_head.weight.data.copy_(bc_model.zap_output.weight.data)
         actor_model.zap_head.bias.data.copy_(bc_model.zap_output.bias.data)
         
-        # Transfer spinner head weights
         actor_model.spinner_head.weight.data.copy_(bc_model.spinner_output.weight.data)
         actor_model.spinner_head.bias.data.copy_(bc_model.spinner_output.bias.data)
         
         # Initialize spinner variance head with reasonable values
-        # (We don't directly copy since BC model might not have matching architecture)
         actor_model.spinner_var_head.bias.data.fill_(-1.0)  # Start with low variance
     
     print("Knowledge transfer complete!")
@@ -1018,7 +1119,8 @@ def initialize_models(actor_model=None, critic_model=None):
     
     # First, try to load the BC model if it exists
     if os.path.exists(BC_MODEL_PATH):
-        bc_model.train()
+        # Always load in eval mode to avoid BatchNorm issues
+        bc_model.eval()
         bc_model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=device))
         print(f"Loaded BC model from {BC_MODEL_PATH}")
         bc_loaded = True
@@ -1028,8 +1130,9 @@ def initialize_models(actor_model=None, critic_model=None):
     
     # Check if RL model exists
     if os.path.exists(LATEST_MODEL_PATH):
-        actor_model.train()
-        critic_model.train()
+        # Always load in eval mode to avoid BatchNorm issues
+        actor_model.eval()
+        critic_model.eval()
         try:
             actor_model.load_state_dict(torch.load(LATEST_MODEL_PATH, map_location=device))
             print(f"Loaded RL model from {LATEST_MODEL_PATH}")
@@ -1054,10 +1157,14 @@ def save_models(actor_model=None, bc_model=None):
     try:
         if bc_model is not None:
             with bc_model_lock:
+                # Set to eval mode before saving to avoid BatchNorm issues on reload
+                bc_model.eval()
                 torch.save(bc_model.state_dict(), BC_MODEL_PATH)
                 print(f"BC model saved to {BC_MODEL_PATH}")
                 
         if actor_model is not None:
+            # Set to eval mode before saving
+            actor_model.eval()
             torch.save(actor_model.state_dict(), LATEST_MODEL_PATH)
             print(f"Actor model saved to {LATEST_MODEL_PATH}")
             
@@ -1128,73 +1235,87 @@ def decode_action(action, spinner_power=1.0):
     return fire, zap, spinner
 
 def display_combined_metrics():
-    """Display a combined summary of BC and RL training metrics."""
+    """Display a compact summary of training metrics."""
     global episode_rewards, replay_buffer
     
     try:
-        print("\n========== COMBINED TRAINING METRICS SUMMARY ==========")
-        print("-- Behavioral Cloning (BC) Metrics --")
+        print("\n========== METRICS SUMMARY ==========")
         
+        # Define table headers for each metric category
+        print("\nBC METRICS:")
+        print(f"{'Metric':<25} {'Before':<10} {'After':<10} {'Change':<10}")
+        print("-" * 55)
+        
+        # BC metrics
         if len(bc_fire_accuracy_before) > 0 and len(bc_fire_accuracy_after) > 0:
-            bc_fire_trend = np.mean(bc_fire_accuracy_after) - np.mean(bc_fire_accuracy_before)
-            bc_zap_trend = np.mean(bc_zap_accuracy_after) - np.mean(bc_zap_accuracy_before)
-            bc_spinner_trend = np.mean(bc_spinner_error_before) - np.mean(bc_spinner_error_after)
+            fire_before = np.mean(bc_fire_accuracy_before)
+            fire_after = np.mean(bc_fire_accuracy_after)
+            fire_change = fire_after - fire_before
             
-            print(f"Fire accuracy trend: {bc_fire_trend:+.4f} (Last: {bc_fire_accuracy_after[-1]:.4f})")
-            print(f"Zap accuracy trend: {bc_zap_trend:+.4f} (Last: {bc_zap_accuracy_after[-1]:.4f})")
-            print(f"Spinner error reduction: {bc_spinner_trend:+.4f} (Last: {bc_spinner_error_after[-1]:.4f})")
+            zap_before = np.mean(bc_zap_accuracy_before)
+            zap_after = np.mean(bc_zap_accuracy_after)
+            zap_change = zap_after - zap_before
+            
+            spinner_err_before = np.mean(bc_spinner_error_before)
+            spinner_err_after = np.mean(bc_spinner_error_after)
+            spinner_change = spinner_err_before - spinner_err_after
+            
+            print(f"{'Fire Accuracy':<25} {fire_before:<10.4f} {fire_after:<10.4f} {fire_change:+<10.4f}")
+            print(f"{'Zap Accuracy':<25} {zap_before:<10.4f} {zap_after:<10.4f} {zap_change:+<10.4f}")
+            print(f"{'Spinner Error':<25} {spinner_err_before:<10.4f} {spinner_err_after:<10.4f} {-spinner_change:+<10.4f}")
         else:
-            print("No BC training data available yet")
+            print("No BC training data available")
         
-        print("\n-- Reinforcement Learning (RL) Metrics --")
+        # RL metrics
+        print("\nRL METRICS:")
+        print(f"{'Metric':<25} {'Value':<10} {'Trend':<10}")
+        print("-" * 45)
         
         if len(actor_losses) > 0:
             actor_loss_avg = np.mean(actor_losses)
             critic_loss_avg = np.mean(critic_losses) if critic_losses else float('nan')
             
-            # Actor metrics
+            print(f"{'Actor Loss':<25} {actor_loss_avg:<10.4f}")
+            print(f"{'Critic Loss':<25} {critic_loss_avg:<10.2f}")
+            
             if len(fire_probs_before) > 0 and len(fire_probs_after) > 0:
                 fire_trend = np.mean(fire_probs_after) - np.mean(fire_probs_before)
                 zap_trend = np.mean(zap_probs_after) - np.mean(zap_probs_before)
                 spinner_mean_trend = np.mean(spinner_means_after) - np.mean(spinner_means_before)
                 spinner_var_trend = np.mean(spinner_vars_after) - np.mean(spinner_vars_before)
                 
-                print(f"Actor Loss: {actor_loss_avg:.4f}")
-                print(f"Critic Loss: {critic_loss_avg:.4f}")
-                print(f"Fire probability trend: {fire_trend:+.4f} (Last: {fire_probs_after[-1]:.4f})")
-                print(f"Zap probability trend: {zap_trend:+.4f} (Last: {zap_probs_after[-1]:.4f})")
-                print(f"Spinner mean trend: {spinner_mean_trend:+.4f} (Last: {spinner_means_after[-1]:.4f})")
-                print(f"Spinner variance trend: {spinner_var_trend:+.4f} (Last: {spinner_vars_after[-1]:.4f})")
+                print(f"{'Fire Probability':<25} {np.mean(fire_probs_after):<10.4f} {fire_trend:+<10.4f}")
+                print(f"{'Zap Probability':<25} {np.mean(zap_probs_after):<10.4f} {zap_trend:+<10.4f}")
+                print(f"{'Spinner Mean':<25} {np.mean(spinner_means_after):<10.4f} {spinner_mean_trend:+<10.4f}")
+                print(f"{'Spinner Variance':<25} {np.mean(spinner_vars_after):<10.4f} {spinner_var_trend:+<10.4f}")
                 
-                # Value function metrics
                 if len(value_errors_before) > 0 and len(value_errors_after) > 0:
                     value_error_trend = np.mean(value_errors_before) - np.mean(value_errors_after)
-                    print(f"Value error reduction: {value_error_trend:+.4f} (Last: {value_errors_after[-1]:.4f})")
-            else:
-                print(f"Actor Loss: {actor_loss_avg:.4f}")
-                print(f"Critic Loss: {critic_loss_avg:.4f}")
-                print("No detailed RL metrics available yet")
+                    print(f"{'Value Error Reduction':<25} {np.mean(value_errors_after):<10.4f} {value_error_trend:+<10.4f}")
         else:
-            print("No RL training data available yet")
+            print("No RL training data available")
         
-        # Episode performance
-        replay_buffer_size = len(replay_buffer) if 'replay_buffer' in globals() else 0
+        # Game performance
+        print("\nGAME PERFORMANCE:")
+        print(f"{'Metric':<25} {'Value':<10}")
+        print("-" * 35)
         
         if episode_rewards and len(episode_rewards) > 0:
-            print(f"\n-- Game Performance --")
-            print(f"Recent episode rewards: {[round(r, 1) for r in episode_rewards]}")
-            print(f"Mean episode reward: {np.mean(episode_rewards):.2f}")
-            print(f"Buffer size: {replay_buffer_size}")
+            mean_reward = np.mean(episode_rewards)
+            latest_reward = episode_rewards[-1] if episode_rewards else 0
+            buffer_size = len(replay_buffer) if 'replay_buffer' in globals() else 0
+            
+            print(f"{'Latest Episode Reward':<25} {latest_reward:<10.1f}")
+            print(f"{'Mean Episode Reward':<25} {mean_reward:<10.1f}")
+            print(f"{'Buffer Size':<25} {buffer_size:<10d}")
+            print(f"{'Episodes Completed':<25} {len(episode_rewards):<10d}")
         else:
-            print(f"\n-- Game Performance --")
-            print("No episode data available yet")
-            print(f"Buffer size: {replay_buffer_size}")
+            print("No completed episodes yet")
         
-        print("====================================================\n")
+        print("\n========== END SUMMARY ==========\n")
     except Exception as e:
         print(f"\nError displaying metrics: {e}")
         traceback.print_exc()
-        print("====================================================\n")
 
 if __name__ == "__main__":
     random.seed(42)
