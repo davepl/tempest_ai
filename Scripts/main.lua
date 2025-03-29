@@ -203,7 +203,14 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 6. Spinner stasis reward: 31 - abs(spinner_delta) / 10
 
     local spinner_abs = math.min(31, math.abs(player_state.SpinnerDelta))
-    reward = reward + ((31 - spinner_abs))
+    -- REMOVED: We don't want to reward minimal movement because it encourages getting stuck at extremes 
+    -- reward = reward + ((31 - spinner_abs))
+    
+    -- NEW: Reward active but moderate spinner movement
+    -- This creates a bell curve with peak reward around 8 speed and lower rewards at extremes
+    local optimal_speed = 4
+    local movement_reward = 20 * math.exp(-0.01 * (spinner_abs - optimal_speed)^2)
+    reward = reward + movement_reward
 
     -- Update previous values for next frame
     previous_score = player_state.score
@@ -547,17 +554,22 @@ function EnemiesState:new()
     self.active_fuseballs = 0
     self.pulse_beat = 0    -- Add pulse beat counter
     self.pulsing = 0      -- Add pulsing state
+    self.num_enemies_in_tube = 0
+    self.num_enemies_on_top = 0
+    self.enemies_pending = 0
     -- Available spawn slots (how many more can be created)
     self.spawn_slots_flippers = 0
     self.spawn_slots_pulsars = 0
     self.spawn_slots_tankers = 0
     self.spawn_slots_spikers = 0
     self.spawn_slots_fuseballs = 0
+    
     -- Enemy info arrays
     self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- 7 enemy type slots
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
     self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
     self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
+
     self.shot_positions = {}  -- Will store nil for inactive shots
     self.pending_vid = {}  -- 64-byte table
     self.pending_seg = {}  -- 64-byte table
@@ -573,13 +585,16 @@ end
 
 function EnemiesState:update(mem)
     -- Read active enemies (currently on screen)
-    self.active_flippers = mem:read_u8(0x0142)   -- n_flippers - current active count
-    self.active_pulsars = mem:read_u8(0x0143)    -- n_pulsars
-    self.active_tankers = mem:read_u8(0x0144)    -- n_tankers
-    self.active_spikers = mem:read_u8(0x0145)    -- n_spikers
+    self.active_flippers  = mem:read_u8(0x0142)   -- n_flippers - current active count
+    self.active_pulsars   = mem:read_u8(0x0143)    -- n_pulsars
+    self.active_tankers   = mem:read_u8(0x0144)    -- n_tankers
+    self.active_spikers   = mem:read_u8(0x0145)    -- n_spikers
     self.active_fuseballs = mem:read_u8(0x0146)  -- n_fuseballs
-    self.pulse_beat = mem:read_u8(0x0147)        -- pulse_beat counter
-    self.pulsing = mem:read_u8(0x0148)          -- pulsing state
+    self.pulse_beat       = mem:read_u8(0x0147)        -- pulse_beat counter
+    self.pulsing          = mem:read_u8(0x0148)          -- pulsing state
+    self.num_enemies_in_tube = mem:read_u8(0x0108)
+    self.num_enemies_on_top = mem:read_u8(0x0109)
+    self.enemies_pending = mem:read_u8(0x03AB)
 
     -- Update enemy shot segments from memory
     for i = 1, 4 do
@@ -597,8 +612,31 @@ function EnemiesState:update(mem)
     self.spawn_slots_spikers = mem:read_u8(0x0140)    -- avl_spikers
     self.spawn_slots_fuseballs = mem:read_u8(0x0141)  -- avl_fuseballs
 
+    -- Reset enemy arrays
+    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- 7 enemy type slots
+    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
+    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
+    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
+
+    local activeEnemies = self.num_enemies_in_tube + self.num_enemies_on_top
+    
+    -- Add assertions with pcall to avoid crashes
+    local assert_result, error_message = pcall(function()
+        assert(activeEnemies <= 7, "Active enemies must be 7 or less")
+        assert(activeEnemies == self.active_flippers + self.active_pulsars + self.active_tankers + 
+               self.active_spikers + self.active_fuseballs, 
+               "Active enemies should match the sum of flippers, pulsars, tankers, spikers, and fuseballs")
+    end)
+    
+    if not assert_result then
+        print("Warning: " .. error_message)
+    end
+    
+    -- Use math.min instead of min
+    local maxEnemyIndex = math.min(7, activeEnemies)
+    
     -- Read enemy type and state info
-    for i = 1, 7 do
+    for i = 1, maxEnemyIndex do
         self.enemy_type_info[i] = mem:read_u8(0x0283 + i - 1)    -- Enemy type info at $0283
         self.active_enemy_info[i] = mem:read_u8(0x028A + i - 1)  -- Active enemy info at $028A
         
@@ -846,6 +884,9 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     table.insert(data, enemies_state.spawn_slots_tankers)
     table.insert(data, enemies_state.spawn_slots_spikers)
     table.insert(data, enemies_state.spawn_slots_fuseballs)
+    table.insert(data, enemies_state.num_enemies_in_tube)
+    table.insert(data, enemies_state.num_enemies_on_top)
+    table.insert(data, enemies_state.enemies_pending)
     
     -- Enemy type info (fixed size: 7)
     for i = 1, 7 do
@@ -1330,6 +1371,9 @@ function update_display(status, game_state, level_state, player_state, enemies_s
             enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
             enemies_state.spawn_slots_fuseballs),
         ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
+        ["In Tube"] = string.format("%d enemies", enemies_state.num_enemies_in_tube),
+        ["On Top"] = string.format("%d enemies", enemies_state.num_enemies_on_top),
+        ["Pending"] = string.format("%d enemies", enemies_state.enemies_pending),
         ["Enemy Types"] = table.concat(enemy_types, " "),
         ["Enemy States"] = table.concat(enemy_states, " ")
     }
