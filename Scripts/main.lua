@@ -33,6 +33,8 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
 local LOG_ONLY_MODE = false
+local AUTO_PLAY_MODE = true
+local SHOW_DISPLAY = true
 
 local function clear_screen()
     io.write("\027[2J\027[H")
@@ -166,7 +168,7 @@ local function calculate_reward(game_state, level_state, player_state)
         -- Player is dead, but only apply penalty on transition
         if previous_alive_state == 1 then
             -- Just died - apply death penalty once
-            reward = reward - 20000
+            reward = reward - 1000
         end
         -- No penalty on subsequent dead frames
     end
@@ -201,7 +203,7 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 6. Spinner stasis reward: 31 - abs(spinner_delta) / 10
 
     local spinner_abs = math.min(31, math.abs(player_state.SpinnerDelta))
-    reward = reward + ((31 - spinner_abs) / 10)
+    reward = reward + ((31 - spinner_abs))
 
     -- Update previous values for next frame
     previous_score = player_state.score
@@ -973,6 +975,9 @@ local function frame_callback()
         end
     end
 
+    -- 2 Credits
+    mem:write_u8(0x0006, 2)
+
     -- Reset the countdown timer to zero all the time
     mem:write_u8(0x0004, 0)
 
@@ -1015,9 +1020,37 @@ local function frame_callback()
             mem:write_direct_u8(0x0041, 0x00)
             mem:write_direct_u8(0x0042, 0x00)
         end
+        if AUTO_PLAY_MODE then
+            local port = manager.machine.ioport.ports[":IN2"]
+            -- Press P1 Start in MAME with proper press/release simulation
+            if game_state.frame_counter % 300 == 0 then
+                -- Try different possible field names
+                local startField = port.fields["1 Player Start"] or 
+                                   port.fields["P1 Start"] or 
+                                   port.fields["Start 1"]
+                
+                if startField then
+                    -- Press the button
+                    startField:set_value(1)
+                    print("Pressing 1 Player Start button in attract mode")
+                else
+                    print("Error: Could not find start button field")
+                end
+            elseif game_state.frame_counter % 300 == 5 then
+                -- Release the button 5 frames later
+                local startField = port.fields["1 Player Start"] or 
+                                   port.fields["P1 Start"] or 
+                                   port.fields["Start 1"]
+                
+                if startField then
+                    startField:set_value(0)
+                    print("Releasing 1 Player Start button")
+                end
+            end
+        end
     else
         -- Four lives at all times
-        mem:write_direct_u8(0x0048, 0x04)
+        -- mem:write_direct_u8(0x0048, 0x04)
     end
 
     -- We only control the game in regular play mode (04) and zooming down the tube (20)
@@ -1087,7 +1120,7 @@ local function frame_callback()
         local should_update_display = not LOG_ONLY_MODE or 
                                      (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
 
-        if should_update_display then
+        if should_update_display and SHOW_DISPLAY then
             -- Update the display with the current action and metrics
             update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
             last_display_update = current_time_high_res

@@ -25,10 +25,10 @@ import select
 # Constants
 DEBUG_MODE = False  # Set to False in production for better performance
 FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
-SPINNER_POWER = 3  # Controls spinner movement distribution (higher = more small movements)
+SPINNER_POWER = 3.0  # Linear spinner movement (1.0 = linear, higher = more small movements)
 ShouldReplayLog = False
-LogFile = "/Users/dave/mame/250k.log"
-MaxLogFrames = 250000
+LogFile = "/Users/dave/mame/50k.log"
+MaxLogFrames = 100000
 
 NumberOfParams = 112
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
@@ -73,6 +73,7 @@ class BCModel(nn.Module):
         self.fire_output = nn.Linear(128, 1)
         self.zap_output = nn.Linear(128, 1)
         self.spinner_output = nn.Linear(128, 1)
+        self.spinner_var_output = nn.Linear(128, 1)  # New output for spinner variance
         
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -91,9 +92,10 @@ class BCModel(nn.Module):
         features = self.feature_extractor(x)
         fire_out = torch.sigmoid(self.fire_output(features))
         zap_out = torch.sigmoid(self.zap_output(features))
-        spinner_out_raw = self.spinner_output(features)
-        spinner_out = torch.clamp(spinner_out_raw, -1.0, 1.0)
-        return torch.cat([fire_out, zap_out, spinner_out], dim=1), spinner_out_raw
+        spinner_out = torch.tanh(self.spinner_output(features))
+        spinner_var = torch.clamp(F.softplus(self.spinner_var_output(features)), 0.01, 0.5)
+        
+        return torch.cat([fire_out, zap_out, spinner_out, spinner_var], dim=1), spinner_out
 
 class Actor(nn.Module):
     def __init__(self, state_dim=NumberOfParams):
@@ -103,6 +105,16 @@ class Actor(nn.Module):
         self.fire_head = nn.Linear(256, 1)
         self.zap_head = nn.Linear(256, 1)
         self.spinner_head = nn.Linear(256, 1)
+        self.spinner_var_head = nn.Linear(256, 1)  # New head for spinner variance
+        
+        # Initialize parameters with smaller values to reduce extreme outputs
+        torch.nn.init.xavier_uniform_(self.spinner_head.weight, gain=0.1)
+        torch.nn.init.xavier_uniform_(self.spinner_var_head.weight, gain=0.1)
+        if self.spinner_head.bias is not None:
+            torch.nn.init.zeros_(self.spinner_head.bias)
+        if self.spinner_var_head.bias is not None:
+            torch.nn.init.constant_(self.spinner_var_head.bias, -1.0)  # Start with low variance
+            
         self.to(device)
 
     def forward(self, state):
@@ -110,22 +122,37 @@ class Actor(nn.Module):
         x = F.relu(self.fc2(x))
         fire_logits = torch.clamp(self.fire_head(x), -10.0, 10.0)  # Prevent extreme logits
         zap_logits = torch.clamp(self.zap_head(x), -10.0, 10.0)
-        spinner = torch.tanh(self.spinner_head(x))  # Already in [-1, 1], but ensure no NaN
-        return torch.cat([fire_logits, zap_logits, spinner], dim=-1)
+        
+        # Use tanh with dampening to keep values more centered
+        raw_spinner = self.spinner_head(x)
+        spinner_mean = 0.8 * torch.tanh(raw_spinner)  # Scale down to [-0.8, 0.8] range to avoid extremes
+        
+        # Keep variance in reasonable range with sigmoid activation
+        raw_var = self.spinner_var_head(x)
+        spinner_var = torch.sigmoid(raw_var) * 0.2 + 0.05  # Range [0.05, 0.25]
+        
+        return torch.cat([fire_logits, zap_logits, spinner_mean, spinner_var], dim=-1)
 
     def get_action(self, state, deterministic=False):
         logits = self.forward(state)
-        fire_logits, zap_logits, spinner = torch.split(logits, 1, dim=-1)
+        fire_logits, zap_logits, spinner_mean, spinner_var = torch.split(logits, 1, dim=-1)
         
         if deterministic:
             fire = torch.sigmoid(fire_logits) > 0.5
             zap = torch.sigmoid(zap_logits) > 0.5
+            # Add minimal noise even in deterministic mode to prevent fixed values
+            spinner_noise = torch.randn_like(spinner_mean) * spinner_var * 0.25
         else:
             fire = torch.bernoulli(torch.sigmoid(fire_logits))
             zap = torch.bernoulli(torch.sigmoid(zap_logits))
+            # Add full stochastic sampling in exploration mode
+            spinner_noise = torch.randn_like(spinner_mean) * spinner_var
+        
+        # Combine mean and noise, then clamp to [-1, 1] with extra safety
+        spinner = torch.clamp(spinner_mean + spinner_noise, -0.95, 0.95)  # Avoid exact ±1.0
         
         # Ensure spinner is finite
-        spinner = torch.nan_to_num(spinner, nan=0.0, posinf=1.0, neginf=-1.0)
+        spinner = torch.nan_to_num(spinner, nan=0.0, posinf=0.5, neginf=-0.5)
         return torch.cat([fire, zap, spinner], dim=-1)
 
 class Critic(nn.Module):
@@ -197,12 +224,16 @@ def train_bc(model, state, fire_target, zap_target, spinner_target):
     """Train the BC model with explicit device verification."""
     state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
     normalized_spinner = max(-31, min(31, spinner_target)) / 31.0
-    targets = torch.tensor([[float(fire_target), float(zap_target), normalized_spinner]], 
+    
+    # Add default value for spinner variance - low for demo data
+    targets = torch.tensor([[float(fire_target), float(zap_target), normalized_spinner, 0.1]], 
                            dtype=torch.float32).to(device)
     
     model.optimizer.zero_grad()
     preds, _ = model(state_tensor)
-    loss = nn.MSELoss()(preds, targets)
+    
+    # Only train on fire, zap and spinner mean (not variance)
+    loss = nn.MSELoss()(preds[:, :3], targets[:, :3])
     
     loss.backward()
     model.optimizer.step()
@@ -230,7 +261,7 @@ def train_model_with_batch(model, batch):
             rewards.append(float(reward))
         
         state_tensor = torch.FloatTensor(np.array(states)).to(device)
-        targets = torch.FloatTensor([[f, z, s] for f, z, s in zip(fire_targets, zap_targets, spinner_targets)]).to(device)
+        targets = torch.FloatTensor([[f, z, s, 0.1] for f, z, s in zip(fire_targets, zap_targets, spinner_targets)]).to(device)
         reward_tensor = torch.FloatTensor(rewards).to(device)
         
         model.optimizer.zero_grad()
@@ -240,9 +271,10 @@ def train_model_with_batch(model, batch):
         reward_weights = reward_weights / reward_weights.mean()
         reward_weights = reward_weights.unsqueeze(1)
         
+        # Only use first 3 outputs for the loss (fire, zap, spinner mean)
         fire_zap_loss = F.binary_cross_entropy(preds[:, :2], targets[:, :2], reduction='none') * reward_weights
         fire_zap_loss = fire_zap_loss.mean()
-        spinner_loss = F.mse_loss(preds[:, 2:], targets[:, 2:], reduction='none') * reward_weights * 0.5
+        spinner_loss = F.mse_loss(preds[:, 2:3], targets[:, 2:3], reduction='none') * reward_weights * 0.5
         spinner_loss = spinner_loss.mean()
         
         loss = fire_zap_loss + spinner_loss
@@ -305,23 +337,41 @@ def background_rl_train(rl_model_lock):
                 with torch.no_grad():
                     current_values = critic(states)
                     advantages = torch.clamp(target_values - current_values, -10.0, 10.0)  # Clip advantages
-                fire_logits, zap_logits, spinner = torch.split(action_logits, 1, dim=-1)
+                fire_logits, zap_logits, spinner_mean, spinner_var = torch.split(action_logits, 1, dim=-1)
                 
                 fire_probs = torch.clamp(torch.sigmoid(fire_logits), 1e-8, 1 - 1e-8)
                 zap_probs = torch.clamp(torch.sigmoid(zap_logits), 1e-8, 1 - 1e-8)
                 
                 fire_log_probs = (torch.log(fire_probs) * actions[:, 0:1]) + (torch.log(1 - fire_probs) * (1 - actions[:, 0:1]))
                 zap_log_probs = (torch.log(zap_probs) * actions[:, 1:2]) + (torch.log(1 - zap_probs) * (1 - actions[:, 1:2]))
-                spinner_diff = torch.clamp(spinner - actions[:, 2:3], -1.0, 1.0)  # Clip spinner difference
-                spinner_log_probs = -0.5 * torch.pow(spinner_diff, 2)
+                
+                # Calculate log probabilities for spinner using Gaussian distribution
+                # Reduce variance scaling to make extreme log probs less likely
+                spinner_scaled_var = spinner_var * 0.5 + 0.01  # Add a minimum variance to avoid division by near-zero
+                spinner_diff = spinner_mean - actions[:, 2:3]
+                spinner_log_probs = -0.5 * (spinner_diff**2) / (spinner_scaled_var + 1e-8) - 0.5 * torch.log(2 * np.pi * (spinner_scaled_var + 1e-8))
+                
+                # Clip log probs to prevent extremely large values
+                fire_log_probs = torch.clamp(fire_log_probs, -10.0, 0.0)
+                zap_log_probs = torch.clamp(zap_log_probs, -10.0, 0.0)
+                spinner_log_probs = torch.clamp(spinner_log_probs, -10.0, 0.0)
                 
                 log_probs = fire_log_probs + zap_log_probs + spinner_log_probs
                 if advantages.dim() != log_probs.dim():
                     log_probs = log_probs.sum(dim=1, keepdim=True)
                 
-                actor_loss = -(log_probs * advantages.detach()).mean()
-                actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=0.5)  # Stricter clipping
+                # Multiply by normalized advantages instead of raw advantages to prevent huge gradient steps
+                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                normalized_advantages = torch.clamp(normalized_advantages, -3.0, 3.0)
+                actor_loss = -(log_probs * normalized_advantages.detach()).mean()
+                
+                # Add L2 regularization for spinner head to prevent extreme values
+                l2_reg = 0.001 * (actor.spinner_head.weight.pow(2).sum() + actor.spinner_var_head.weight.pow(2).sum())
+                total_loss = actor_loss + l2_reg
+                
+                total_loss.backward()
+                # Increase gradient clipping to prevent too small updates
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
                 actor_optimizer.step()
                 actor_losses.append(actor_loss.item())
 
@@ -448,7 +498,7 @@ def main():
     total_episode_reward = 0
     done_latch = False
     
-    initial_exploration_ratio = 0.80
+    initial_exploration_ratio = 0.25
     min_exploration_ratio = 0.05
     exploration_decay = 0.9999
     current_exploration_ratio = initial_exploration_ratio
@@ -525,23 +575,41 @@ def main():
                                 with torch.no_grad():
                                     current_values = critic(states)
                                     advantages = torch.clamp(target_values - current_values, -10.0, 10.0)  # Clip advantages
-                                fire_logits, zap_logits, spinner = torch.split(action_logits, 1, dim=-1)
+                                fire_logits, zap_logits, spinner_mean, spinner_var = torch.split(action_logits, 1, dim=-1)
                                 
                                 fire_probs = torch.clamp(torch.sigmoid(fire_logits), 1e-8, 1 - 1e-8)
                                 zap_probs = torch.clamp(torch.sigmoid(zap_logits), 1e-8, 1 - 1e-8)
                                 
                                 fire_log_probs = (torch.log(fire_probs) * actions[:, 0:1]) + (torch.log(1 - fire_probs) * (1 - actions[:, 0:1]))
                                 zap_log_probs = (torch.log(zap_probs) * actions[:, 1:2]) + (torch.log(1 - zap_probs) * (1 - actions[:, 1:2]))
-                                spinner_diff = torch.clamp(spinner - actions[:, 2:3], -1.0, 1.0)  # Clip spinner difference
-                                spinner_log_probs = -0.5 * torch.pow(spinner_diff, 2)
+                                
+                                # Calculate log probabilities for spinner using Gaussian distribution
+                                # Reduce variance scaling to make extreme log probs less likely
+                                spinner_scaled_var = spinner_var * 0.5 + 0.01  # Add a minimum variance to avoid division by near-zero
+                                spinner_diff = spinner_mean - actions[:, 2:3]
+                                spinner_log_probs = -0.5 * (spinner_diff**2) / (spinner_scaled_var + 1e-8) - 0.5 * torch.log(2 * np.pi * (spinner_scaled_var + 1e-8))
+                                
+                                # Clip log probs to prevent extremely large values
+                                fire_log_probs = torch.clamp(fire_log_probs, -10.0, 0.0)
+                                zap_log_probs = torch.clamp(zap_log_probs, -10.0, 0.0)
+                                spinner_log_probs = torch.clamp(spinner_log_probs, -10.0, 0.0)
                                 
                                 log_probs = fire_log_probs + zap_log_probs + spinner_log_probs
                                 if advantages.dim() != log_probs.dim():
                                     log_probs = log_probs.sum(dim=1, keepdim=True)
                                 
-                                actor_loss = -(log_probs * advantages.detach()).mean()
-                                actor_loss.backward()
-                                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=0.5)  # Stricter clipping
+                                # Multiply by normalized advantages instead of raw advantages to prevent huge gradient steps
+                                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                                normalized_advantages = torch.clamp(normalized_advantages, -3.0, 3.0)
+                                actor_loss = -(log_probs * normalized_advantages.detach()).mean()
+                                
+                                # Add L2 regularization for spinner head to prevent extreme values
+                                l2_reg = 0.001 * (actor.spinner_head.weight.pow(2).sum() + actor.spinner_var_head.weight.pow(2).sum())
+                                total_loss = actor_loss + l2_reg
+                                
+                                total_loss.backward()
+                                # Increase gradient clipping to prevent too small updates
+                                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
                                 actor_optimizer.step()
 
                                 if update_step == 0:
@@ -590,7 +658,7 @@ def main():
                             action = actor.get_action(state_tensor, deterministic=True)
                 
                 action_cpu = action.cpu()
-                fire, zap, spinner = decode_action(action_cpu, spinner_power=SPINNER_POWER)
+                fire, zap, spinner = decode_action(action_cpu)
 
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
@@ -655,14 +723,14 @@ def encode_action(fire, zap, spinner_delta):
     # Return a PyTorch tensor with a batch dimension instead of numpy array
     return torch.tensor([[fire_val, zap_val, normalized_spinner]], dtype=torch.float32, device=device)
 
-def decode_action(action, spinner_power=3):
+def decode_action(action, spinner_power=1.0):  # Change default to 1.0 for linear scaling
     """Decode actions from PyTorch tensor.
     
     Args:
         action: PyTorch tensor with shape [batch_size, 3]
-        spinner_power: Power to raise the spinner value to (default=3)
-                       Higher values = more concentration around center
-                       Lower values = more uniform distribution
+        spinner_power: Power to raise the spinner value to (default=1.0)
+                       1.0 = linear transformation
+                       Higher values = more small movements
     """
     fire = 1 if action[0, 0].item() > 0.5 else 0
     zap = 1 if action[0, 1].item() > 0.5 else 0
@@ -673,19 +741,30 @@ def decode_action(action, spinner_power=3):
         spinner_val = 0.0
         print(f"Warning: Spinner value was {spinner_val}, defaulting to 0")
     
-    # Apply non-linear transformation to favor smaller movements
-    # First ensure the value is within -1 to 1 range
-    clamped_val = np.clip(spinner_val, -1.0, 1.0)
+    # Apply mild clamping to avoid exact edge values
+    clamped_val = np.clip(spinner_val, -0.98, 0.98)
     
-    # Apply power transformation while preserving sign
+    # Apply mostly linear transformation while preserving sign
     sign = np.sign(clamped_val)
     magnitude = abs(clamped_val)
     
-    # Power transformation - higher power = more small movements
+    # Apply a milder transformation - using a lower power closer to 1.0 makes it more linear
+    # When spinner_power=1.0, this is a pure linear transformation
     transformed_val = sign * (magnitude ** spinner_power)
     
     # Scale to range -31 to 31 and round to integer
-    spinner = int(round(transformed_val * 31.0))
+    # Use larger ranges now that we have proper safeguards in the actor
+    max_spinner_val = 31  # Use full range of -31 to 31
+    
+    # Apply a scaling multiplier to increase range
+    scaling_multiplier = 1.2  # Increases range by 20%
+    scaled_val = transformed_val * scaling_multiplier
+    
+    # Still need to clamp to ensure it's within -1 to 1 range after scaling
+    scaled_val = np.clip(scaled_val, -1.0, 1.0)
+    
+    # Convert to integer spinner value
+    spinner = int(round(scaled_val * max_spinner_val))
     
     return fire, zap, spinner
 
