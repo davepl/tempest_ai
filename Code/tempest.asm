@@ -583,6 +583,13 @@ pending_vid         .ds  64              ; 16 x 4 = 64 Bytes ($40)
 ; $18 bits apparently mean something; see $b5bf.
 ; $40 bit set -> enemy_seg value increasing; clr -> decreasing (see $9eab)
 ; $80 bit set -> between segments (eg, flipper flipping)
+; 
+; 0 = Flipper
+; 1 = Pulsar
+; 2 = Tanker
+; 3 = Spiker
+; 4 = Fuseball
+; 5-7 Unused
 
 enemy_type_info     = $0283             ; 7 Bytes - Indexed by enemy number.
 

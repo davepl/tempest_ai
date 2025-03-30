@@ -29,15 +29,16 @@ import fcntl
 DEBUG_MODE = False  # Set to False in production for better performance
 FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
 SPINNER_POWER = 1.0  # Linear spinner movement (1.0 = linear, higher = more small movements)
-ShouldReplayLog = False
+ShouldReplayLog = True
 LogFile = "/Users/dave/mame/big.log"
-MaxLogFrames = 100000
+MaxLogFrames = 1000000
 
 # Target optimal spinner value from reward function - must match Lua
 OPTIMAL_SPINNER_SPEED = 4
+FIRE_EXPLORATION_RATIO = 0.2
 
 # Ensure this matches exactly what is sent from Lua
-NumberOfParams = 115  # Confirm this is correct based on Lua data serialization
+NumberOfParams = 122  # Confirm this is correct based on Lua data serialization
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
 MODEL_DIR = "models"
@@ -79,6 +80,12 @@ spinner_vars_before = deque(maxlen=20)
 spinner_vars_after = deque(maxlen=20)
 value_errors_before = deque(maxlen=20)
 value_errors_after = deque(maxlen=20)
+
+# Control source tracking
+random_control_count = 0
+bc_control_count = 0
+rl_control_count = 0
+total_control_count = 0
 
 # BC training metrics
 bc_fire_accuracy_before = deque(maxlen=20)
@@ -744,7 +751,7 @@ def print_metrics_table_header():
     """Print the header row for the metrics table."""
     header = (
         f"{'Frame':>8} | {'Actor Loss':>10} | {'Critic Loss':>11} | {'Mean Reward':>12} | {'Explore %':>9} | "
-        f"{'BC Fire':>7} | {'BC Zap':>7} | {'Spin Err':>8} | {'Extreme %':>9} | {'Optimal %':>9} | {'Buffer':>7}"
+        f"{'Random %':>8} | {'BC %':>8} | {'RL %':>8} | {'Spin Err':>8} | {'Extreme %':>9} | {'Buffer':>7}"
     )
     separator = "-" * len(header)
     print("\n" + separator)
@@ -757,15 +764,23 @@ def print_metrics_table_row(frame_count, metrics_dict):
         f"{frame_count:8d} | {metrics_dict.get('actor_loss', 'N/A'):10.4f} | "
         f"{metrics_dict.get('critic_loss', 'N/A'):11.2f} | {metrics_dict.get('mean_reward', 'N/A'):12.2f} | "
         f"{metrics_dict.get('exploration', 0.0)*100:8.2f}% | "
-        f"{metrics_dict.get('bc_fire', 'N/A'):7.2f} | {metrics_dict.get('bc_zap', 'N/A'):7.2f} | "
-        f"{metrics_dict.get('spinner_error', 'N/A'):8.4f} | {metrics_dict.get('extreme_ratio', 0.0)*100:8.2f}% | "
-        f"{metrics_dict.get('optimal_ratio', 0.0)*100:8.2f}% | {metrics_dict.get('buffer_size', 0):7d}"
+        f"{metrics_dict.get('random_ratio', 0.0)*100:7.2f}% | {metrics_dict.get('bc_ratio', 0.0)*100:7.2f}% | "
+        f"{metrics_dict.get('rl_ratio', 0.0)*100:7.2f}% | {metrics_dict.get('spinner_error', 'N/A'):8.4f} | "
+        f"{metrics_dict.get('extreme_ratio', 0.0)*100:8.2f}% | {metrics_dict.get('buffer_size', 0):7d}"
     )
     print(row)
 
 def main():
     """Main execution loop for Tempest AI."""
     global frame_count, actor, critic
+    global random_control_count, bc_control_count, rl_control_count, total_control_count
+    
+    # Reset control source counters
+    random_control_count = 0
+    bc_control_count = 0
+    rl_control_count = 0
+    total_control_count = 0
+    
     bc_model, actor = initialize_models(actor, critic)
     
     rl_model_lock = threading.Lock()
@@ -800,7 +815,7 @@ def main():
     done_latch = False
     
     # Lower initial exploration and make it decay faster
-    initial_exploration_ratio = 0.5  # Increased slightly for more BC-guided exploration
+    initial_exploration_ratio = 0.75  # Increased slightly for more BC-guided exploration
     min_exploration_ratio = 0.05  # Lowest exploration rate
     exploration_decay = 0.99  # Decay rate
     current_exploration_ratio = initial_exploration_ratio
@@ -950,9 +965,16 @@ def main():
                                 spinner_value = bc_spinner + random.gauss(0, noise_scale)
                                 spinner_value = max(-0.95, min(0.95, spinner_value))
                                 
+                                if (random.random() < FIRE_EXPLORATION_RATIO):
+                                    bc_fire = 0
+
                                 # Create action tensor with BC guidance plus noise
                                 action = torch.tensor([[float(bc_fire), float(bc_zap), spinner_value]], 
                                                      dtype=torch.float32, device=device)
+                                
+                                # Track BC-guided control
+                                bc_control_count += 1
+                                total_control_count += 1
                         else:
                             # Pure random exploration (20% of exploration actions)
                             # For truly random exploration, sometimes use values near the optimal range
@@ -975,10 +997,18 @@ def main():
                                     random.uniform(-1.0, 1.0)
                                 ], dtype=torch.float32, device=device)
                             action = random_actions.unsqueeze(0)
+                            
+                            # Track random control
+                            random_control_count += 1
+                            total_control_count += 1
                     else:
                         # In exploitation mode, use the RL policy
                         with torch.no_grad():
                             action = actor.get_action(state_tensor, deterministic=True)
+                        
+                        # Track RL control
+                        rl_control_count += 1
+                        total_control_count += 1
                 
                 action_cpu = action.cpu()
                 fire, zap, spinner = decode_action(action_cpu)
@@ -1020,9 +1050,12 @@ def main():
                         close_to_optimal_count = sum(1 for v in last_spinner_values if abs(abs(v) - abs(normalized_optimal)) < 0.1)
                         optimal_ratio = close_to_optimal_count / len(last_spinner_values)
                     
-                    # Get BC metrics if available
-                    bc_fire_acc = np.mean(bc_fire_accuracy_after) if len(bc_fire_accuracy_after) > 0 else float('nan')
-                    bc_zap_acc = np.mean(bc_zap_accuracy_after) if len(bc_zap_accuracy_after) > 0 else float('nan')
+                    # Calculate control source ratios
+                    random_ratio = random_control_count / max(1, total_control_count)
+                    bc_ratio = bc_control_count / max(1, total_control_count)
+                    rl_ratio = rl_control_count / max(1, total_control_count)
+                    
+                    # Get spinner error for BC model
                     spinner_error = np.mean(bc_spinner_error_after) if len(bc_spinner_error_after) > 0 else float('nan')
                     
                     # Prepare metrics dictionary for table display
@@ -1031,8 +1064,9 @@ def main():
                         'critic_loss': critic_loss_mean,
                         'mean_reward': mean_reward,
                         'exploration': current_exploration_ratio,
-                        'bc_fire': bc_fire_acc,
-                        'bc_zap': bc_zap_acc,
+                        'random_ratio': random_ratio,
+                        'bc_ratio': bc_ratio,
+                        'rl_ratio': rl_ratio,
                         'spinner_error': spinner_error,
                         'extreme_ratio': extreme_ratio,
                         'optimal_ratio': optimal_ratio,
@@ -1050,8 +1084,8 @@ def main():
                 if save_signal:
                     print("\nSaving models...")
                     threading.Thread(target=save_models, args=(actor, bc_model), daemon=True).start()
-                    current_exploration_ratio = min(0.5, current_exploration_ratio * 1.5)  # Increase exploration after save
-                    print(f"Increased exploration to {current_exploration_ratio:.2f} after save")
+                    #current_exploration_ratio = min(0.5, current_exploration_ratio * 1.5)  # Increase exploration after save
+                    #print(f"Increased exploration to {current_exploration_ratio:.2f} after save")
                     print_metrics_table_header()  # Reprint header after save message
                 
                 frame_count += 1

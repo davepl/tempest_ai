@@ -33,7 +33,7 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
 local LOG_ONLY_MODE = false
-local AUTO_PLAY_MODE = true
+local AUTO_PLAY_MODE = not LOG_ONLY_MODE
 local SHOW_DISPLAY = true
 
 local function clear_screen()
@@ -55,6 +55,13 @@ local log_file_opened = false  -- Track if we've already opened the file
 
 -- Add this near the top of the file with other global variables
 local frame_count = 0  -- Initialize frame counter
+
+-- Global variables for tracking bytes sent and FPS
+local total_bytes_sent = 0
+local frame_time_accum = 0  -- Time accumulator for FPS calculation
+local frame_count_accum = 0  -- Frame count accumulator for FPS calculation
+local last_fps_time = os.clock()  -- Use os.clock() for high precision timing
+local current_fps = 0  -- Current FPS value for display
 
 -- Function to open pipes 
 local function open_pipes()
@@ -147,7 +154,7 @@ local LastRewardState = 0
 local shutdown_requested = false
 
 local last_display_update = 0  -- Timestamp of last display update
-local DISPLAY_UPDATE_INTERVAL = 0.1  -- Update display every 0.1 seconds (10 times per second)
+local DISPLAY_UPDATE_INTERVAL = 0.05  -- Update display every 0.1 seconds (10 times per second)
 
 -- Function to calculate reward for the current frame
 --
@@ -203,14 +210,13 @@ local function calculate_reward(game_state, level_state, player_state)
     -- 6. Spinner stasis reward: 31 - abs(spinner_delta) / 10
 
     local spinner_abs = math.min(31, math.abs(player_state.SpinnerDelta))
-    -- REMOVED: We don't want to reward minimal movement because it encourages getting stuck at extremes 
-    -- reward = reward + ((31 - spinner_abs))
-    
-    -- NEW: Reward active but moderate spinner movement
-    -- This creates a bell curve with peak reward around 8 speed and lower rewards at extremes
-    local optimal_speed = 4
-    local movement_reward = 20 * math.exp(-0.01 * (spinner_abs - optimal_speed)^2)
-    reward = reward + movement_reward
+    if (spinner_abs == 0) then
+        reward = reward + 2
+    end
+
+    -- local optimal_speed = 4  -- Changed from 0 to 4 to match Python's OPTIMAL_SPINNER_SPEED
+    -- local movement_reward = 5 * math.exp(-0.01 * (spinner_abs - optimal_speed)^2)
+    -- reward = reward + movement_reward
 
     -- Update previous values for next frame
     previous_score = player_state.score
@@ -569,6 +575,7 @@ function EnemiesState:new()
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
     self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
     self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
+    self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
 
     self.shot_positions = {}  -- Will store nil for inactive shots
     self.pending_vid = {}  -- 64-byte table
@@ -617,7 +624,7 @@ function EnemiesState:update(mem)
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
     self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
     self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
-
+    self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
     local activeEnemies = self.num_enemies_in_tube + self.num_enemies_on_top
     
     -- Use math.min instead of min
@@ -629,14 +636,16 @@ function EnemiesState:update(mem)
         self.active_enemy_info[i] = mem:read_u8(0x028A + i - 1)  -- Active enemy info at $028A
         
         -- Get absolute segment number and store it
-        local abs_segment = mem:read_u8(0x0291 + i - 1) & 0x0F
+        local abs_segment = mem:read_u8(0x2B9 + i - 1) & 0x0F
         self.enemy_segments[i] = abs_segment
         
         -- Get main position value and LSB for more precision
         local pos = mem:read_u8(0x02DF + i - 1)       -- enemy_along at $02DF - main position
-        local lsb = mem:read_u8(0x029F + i - 1)       -- enemy_along_lsb at $029F - fractional part
         -- Store both values for display
-        self.enemy_depths[i] = lsb + pos * 256
+        self.enemy_depths[i] = pos
+
+        local lsb = mem:read_u8(0x029F + i - 1)       -- enemy_along_lsb at $029F - fractional part
+        self.enemy_depths_lsb[i] = lsb
     end
 
     -- Read all 4 enemy shot positions and store absolute positions
@@ -809,11 +818,6 @@ local function move_cursor_to_row(row)
     io.write(string.format("\027[%d;0H", row))
 end
 
--- Global variables for tracking bytes sent and FPS
-local total_bytes_sent = 0
-local last_fps_time = os.time()
-local current_fps = 0
-
 -- Function to flatten and serialize the game state data to signed 16-bit integers
 local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, bDone)
     -- Create a consistent data structure with fixed sizes
@@ -894,6 +898,11 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
     -- Enemy depths (fixed size: 7 - 16bit positions)
     for i = 1, 7 do
         table.insert(data, enemies_state.enemy_depths[i] or 0)
+    end
+
+    -- Enemy depths (fixed size: 7 - 16bit positions)
+    for i = 1, 7 do
+        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
     end
     
     -- Enemy shot positions (fixed size: 4)
@@ -1135,14 +1144,24 @@ local function frame_callback()
         -- Update total bytes sent
         total_bytes_sent = total_bytes_sent + #frame_data
 
-        -- Calculate FPS
-        frame_count = frame_count + 1
-        local current_time = os.time()
-        if current_time > last_fps_time then
-            current_fps = frame_count / (current_time - last_fps_time)
-            frame_count = 0
-            last_fps_time = current_time
+        -- FPS Calculation
+        local current_time = os.clock()
+        local time_diff = current_time - last_fps_time
+        
+        -- Accumulate frames and time for more accurate FPS calculation
+        frame_count_accum = frame_count_accum + 1
+        frame_time_accum = frame_time_accum + time_diff
+        
+        -- Update FPS every 0.5 seconds for a more accurate measurement
+        if frame_time_accum >= 0.5 then
+            current_fps = frame_count_accum / frame_time_accum
+            -- Reset accumulators
+            frame_count_accum = 0
+            frame_time_accum = 0
         end
+        
+        -- Always update the reference time for accurate time difference calculation
+        last_fps_time = current_time
 
         -- In LOG_ONLY_MODE, limit display updates to 10 times per second
         local current_time_high_res = os.clock()
@@ -1251,17 +1270,16 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Add shot positions on its own line
     local shots_str = ""
     for i = 1, 8 do
-        local segment_str = string.format("%+02d", player_state.shot_segments[i])
-        shots_str = shots_str .. string.format("%02X-%s ", player_state.shot_positions[i], segment_str)
+        shots_str = shots_str .. string.format("%02X ", player_state.shot_positions[i])
     end
     print("  Shot Positions: " .. shots_str)
     
-    -- Display enemy shot segments
-    local shot_segments_str = ""
-    for i = 1, 4 do
-        shot_segments_str = shot_segments_str .. string.format("%02X ", enemies_state.enemy_shot_segments[i].value)
+    -- Display player shot segments as a separate line
+    local player_shot_segments_str = ""
+    for i = 1, 8 do
+        player_shot_segments_str = player_shot_segments_str .. string.format("%02X ", player_state.shot_segments[i])
     end
-    print("  Shot Segments : " .. shot_segments_str)
+    print("  Shot Segments : " .. player_shot_segments_str)
     
     print("")  -- Empty line after section
 
@@ -1339,12 +1357,16 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     local enemy_states = {}
     local enemy_segs = {}
     local enemy_depths = {}
+    local enemy_lsbs = {}
     for i = 1, 7 do
         enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
         enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
         -- Format enemy segments as two-digit hexadecimal numbers
         enemy_segs[i] = string.format("%02X", enemies_state.enemy_segments[i])
-        enemy_depths[i] = string.format("%04X", enemies_state.enemy_depths[i])
+        -- Display enemy depths as 2-digit hex values
+        enemy_depths[i] = string.format("%02X", enemies_state.enemy_depths[i])
+        -- Display enemy LSBs as 2-digit hex values
+        enemy_lsbs[i] = string.format("%02X", enemies_state.enemy_depths_lsb[i])
     end
 
     local enemies_metrics = {
@@ -1371,6 +1393,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Add enemy segments and depths on their own lines
     print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
+    print("  Enemy LSBs    : " .. table.concat(enemy_lsbs, " "))
     
     -- Add enemy shot positions in a simple fixed format
     local shot_positions_str = ""
