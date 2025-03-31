@@ -607,7 +607,7 @@ active_enemy_info   = $028A         ; 7 Bytes - Indexed by active enemy number
 
 enm_move_pc         = $0291         ; 7 Bytes - Indexed by active enemy number - PCode program counter for each enemy
 enm_pc_storage      = $0298         ; 7 Bytes - Indexed by active enemy number - PCode storage 'register' for each enemy
-enemy_along_lsb     = $029F
+enemy_along_lsb     = $029F         ; 7 Bytes - Indexed by active enemy number
 
 shot_delay          = $02A6         ; 7 Bytes - Indexed by active enemy number
 
@@ -1265,7 +1265,7 @@ InitEnemyLocations:     lda     #$00
 
 ; Clear all enemies - used by init code
 
-ClearAllEnemies:        ldx     #$06
+ClearAllEnemies:        ldx     #MAX_ACTIVE_ENEMIES-1
                         lda     #$00
 -                       sta     enemy_along,x
                         dex

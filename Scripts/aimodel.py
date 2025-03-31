@@ -26,19 +26,24 @@ import termios
 import fcntl
 
 # Constants
+
+ShouldReplayLog = False
 DEBUG_MODE = False  # Set to False in production for better performance
 FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
 SPINNER_POWER = 1.0  # Linear spinner movement (1.0 = linear, higher = more small movements)
-ShouldReplayLog = True
+initial_exploration_ratio = 0.90
+min_exploration_ratio = 0.05  # Lowest exploration rate
+exploration_decay = 0.99  # Decay rate
+BC_GUIDED_EXPLORATION_RATIO = 1.0
+
 LogFile = "/Users/dave/mame/big.log"
 MaxLogFrames = 1000000
 
 # Target optimal spinner value from reward function - must match Lua
-OPTIMAL_SPINNER_SPEED = 4
-FIRE_EXPLORATION_RATIO = 0.2
+FIRE_EXPLORATION_RATIO = 0.05
 
 # Ensure this matches exactly what is sent from Lua
-NumberOfParams = 122  # Confirm this is correct based on Lua data serialization
+NumberOfParams = 128  # Confirm this is correct based on Lua data serialization
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
 MODEL_DIR = "models"
@@ -223,7 +228,8 @@ class Actor(nn.Module):
         
         # Create a bell curve preference centered at the normalized optimal value
         # This aligns the network's preference with the reward function's bell curve
-        normalized_optimal = OPTIMAL_SPINNER_SPEED / 31.0  # Convert 8 to normalized [-1, 1] scale
+        
+        normalized_optimal = 0
         
         # Apply a transformation that creates a bell curve with peak at normalized_optimal
         # We'll use a Gaussian-like penalty: exp(-(x-target)²/variance)
@@ -236,7 +242,7 @@ class Actor(nn.Module):
         # Keep variance in reasonable range with sigmoid activation
         # Lower variance near optimal value, higher at extremes
         raw_var = self.spinner_var_head(x)
-        spinner_var = torch.sigmoid(raw_var) * 0.15 + 0.05  # Range [0.05, 0.2]
+        spinner_var = torch.sigmoid(raw_var) * 0.15 
         
         return torch.cat([fire_logits, zap_logits, spinner_mean, spinner_var], dim=-1)
 
@@ -815,13 +821,10 @@ def main():
     done_latch = False
     
     # Lower initial exploration and make it decay faster
-    initial_exploration_ratio = 0.75  # Increased slightly for more BC-guided exploration
-    min_exploration_ratio = 0.05  # Lowest exploration rate
-    exploration_decay = 0.99  # Decay rate
+
     current_exploration_ratio = initial_exploration_ratio
     
     # Define exploration strategies
-    BC_GUIDED_EXPLORATION_RATIO = 0.8  # 80% of exploration uses BC model, 20% random
     
     # Add tracking for spinner values
     last_spinner_values = deque(maxlen=100)
@@ -930,7 +933,7 @@ def main():
                         extreme_ratio = extreme_count / len(last_spinner_values)
                         
                         # Calculate how close spinner values are to optimal
-                        normalized_optimal = OPTIMAL_SPINNER_SPEED / 31.0
+                        normalized_optimal = 0
                         avg_distance = sum(abs(abs(v) - abs(normalized_optimal)) for v in last_spinner_values) / len(last_spinner_values)
                         
                         # If over 70% of recent actions are extreme values, we might be stuck
@@ -980,7 +983,7 @@ def main():
                             # For truly random exploration, sometimes use values near the optimal range
                             if random.random() < 0.4:  # 40% of pure random exploration targets optimal range
                                 # Generate values with a bias toward the optimal spinner range
-                                optimal_normalized = OPTIMAL_SPINNER_SPEED / 31.0
+                                optimal_normalized = 0
                                 # Add Gaussian noise centered at optimal value
                                 spinner_val = optimal_normalized + random.gauss(0, 0.2)
                                 spinner_val = max(-0.95, min(0.95, spinner_val))
@@ -1046,7 +1049,7 @@ def main():
                         extreme_ratio = extreme_count / len(last_spinner_values)
                         
                         # Calculate how often we're near the optimal spinner value
-                        normalized_optimal = OPTIMAL_SPINNER_SPEED / 31.0
+                        normalized_optimal = 0
                         close_to_optimal_count = sum(1 for v in last_spinner_values if abs(abs(v) - abs(normalized_optimal)) < 0.1)
                         optimal_ratio = close_to_optimal_count / len(last_spinner_values)
                     
@@ -1235,7 +1238,7 @@ def decode_action(action, spinner_power=1.0):
     # Apply additional shaping toward optimal value when close to extremes
     if abs(spinner_val) > 0.7:
         # When close to extremes, bias toward the optimal value
-        normalized_optimal = OPTIMAL_SPINNER_SPEED / 31.0  # Normalized optimal value [-1, 1]
+        normalized_optimal = 0
         # Add a pull toward the optimal value with the same sign
         sign_optimal = normalized_optimal * np.sign(spinner_val)
         
@@ -1256,12 +1259,6 @@ def decode_action(action, spinner_power=1.0):
     
     # Convert to spinner value, with a slight bias toward optimal range
     raw_spinner = int(round(scaled_val * 31))
-    
-    # Add a slight bias toward optimal value
-    if random.random() < 0.1:  # 10% chance to nudge toward optimal
-        optimal_direction = np.sign(OPTIMAL_SPINNER_SPEED - abs(raw_spinner))
-        if optimal_direction != 0:
-            raw_spinner += int(optimal_direction)
     
     # Ensure we're in valid range
     spinner = max(-31, min(31, raw_spinner))
