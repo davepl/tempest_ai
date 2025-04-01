@@ -31,7 +31,7 @@ ShouldReplayLog = False
 DEBUG_MODE = False  # Set to False in production for better performance
 FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
 SPINNER_POWER = 1.0  # Linear spinner movement (1.0 = linear, higher = more small movements)
-initial_exploration_ratio = 0.90
+initial_exploration_ratio = 0.60
 min_exploration_ratio = 0.05  # Lowest exploration rate
 exploration_decay = 0.99  # Decay rate
 BC_GUIDED_EXPLORATION_RATIO = 1.0
@@ -1231,37 +1231,14 @@ def decode_action(action, spinner_power=1.0):
     
     # Get raw spinner value between -1 and 1
     spinner_val = action[0, 2].item()
-    if not np.isfinite(spinner_val):  # Handle NaN or inf
-        spinner_val = 0.0
-        print(f"Warning: Spinner value was {spinner_val}, defaulting to 0")
-    
-    # Apply additional shaping toward optimal value when close to extremes
-    if abs(spinner_val) > 0.7:
-        # When close to extremes, bias toward the optimal value
-        normalized_optimal = 0
-        # Add a pull toward the optimal value with the same sign
-        sign_optimal = normalized_optimal * np.sign(spinner_val)
-        
-        # The closer to extremes, the more we pull toward optimal
-        pull_strength = (abs(spinner_val) - 0.7) * 1.5  # Increases as we approach extremes
-        spinner_val = spinner_val * (1 - pull_strength) + sign_optimal * pull_strength
-        
-        # Still add some randomness but less than before
-        noise = np.random.normal(0, 0.05)  # Small amount of noise
-        spinner_val = spinner_val + noise
-        
-        # Re-clip after adjustments
-        spinner_val = np.clip(spinner_val, -0.98, 0.98)
-    
-    # Scale to -31 to 31 range using sigmoid-based scaling that favors mid-range values
-    # This creates a softer curve that doesn't jump to extremes as easily
-    scaled_val = np.tanh(spinner_val * 1.2)  # Slightly reduced from 1.5
-    
-    # Convert to spinner value, with a slight bias toward optimal range
-    raw_spinner = int(round(scaled_val * 31))
-    
-    # Ensure we're in valid range
-    spinner = max(-31, min(31, raw_spinner))
+
+    threshold = 0.1
+    if (spinner_val > threshold):
+        spinner = 9
+    elif (spinner_val < -threshold):
+        spinner = -9
+    else:
+        spinner = 0
     
     return fire, zap, spinner
 

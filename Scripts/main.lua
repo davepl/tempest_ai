@@ -158,8 +158,9 @@ local last_display_update = 0  -- Timestamp of last display update
 -- Return reward and bDone, where bDone is true if the episode is done
 
 local function calculate_reward(game_state, level_state, player_state, enemies_state)
+    
     local reward = 0
-    local bDone = false
+    local bDone = false             -- Track if the episode (life) is done
 
     -- Survival reward
     if player_state.alive == 1 then
@@ -175,11 +176,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         -- Level completion reward
         if level_state.level_number ~= previous_level then
             reward = reward + (1000 * previous_level)
-        end
-
-        -- Reward for being still when nothing to target
-        if player_state.SpinnerDelta == 0 then
-            reward = reward + 3
         end
 
         -- UPDATED: Enemy positioning reward based on the demoplay logic
@@ -212,7 +208,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if player_state.SpinnerDelta == 0 then
                     reward = reward + 25  -- Significant reward for being lined up and still
                 else
-                    reward = reward + 15  -- Good reward just for being lined up
+                    reward = reward + 12  -- Good reward just for being lined up
                 end
             else
                 -- Give decreasing rewards as distance increases
@@ -755,50 +751,6 @@ function EnemiesState:update(mem)
     self.nearest_enemy_seg = self:nearest_enemy_segment()
 end
 
-
--- Add a direct enemy scan function
-function EnemiesState:scan_for_enemies_in_segment(segment)
-    local enemies = {}
-    
-    -- Check standard enemy table
-    for i = 1, 7 do
-        if self.enemy_segments[i] == segment and 
-           (self.enemy_depths[i] > 0 or self.active_enemy_info[i] ~= 0) then
-            table.insert(enemies, {
-                depth = self.enemy_depths[i] + (self.enemy_depths_lsb[i] / 256.0),
-                type = self.enemy_type_info[i] & 0x07,
-                source = "standard"
-            })
-        end
-    end
-    
-    -- Check pending table
-    for i = 1, 64 do
-        if (self.pending_seg[i] & 0x0F) == segment and self.pending_vid[i] ~= 0 then
-            local encoded_depth = (self.pending_vid[i] >> 4) & 0x0F
-            table.insert(enemies, {
-                depth = encoded_depth * 16.0,
-                type = self.pending_vid[i] & 0x07,
-                source = "pending"
-            })
-        end
-    end
-    
-    -- Check display list
-    for i = 1, #self.display_list do
-        if self.display_list[i].segment == segment and 
-           self.display_list[i].command >= 0x80 then  -- Display commands are >= 0x80
-            table.insert(enemies, {
-                depth = self.display_list[i].depth,
-                type = self.display_list[i].type & 0x07,
-                source = "display"
-            })
-        end
-    end
-    
-    return enemies
-end
-
 -- Find the segment with the enemy closest to the top of the tube
 function EnemiesState:nearest_enemy_segment()
     local min_depth = 255  -- Initialize with maximum possible depth
@@ -824,6 +776,7 @@ end
 --   -1 = move counterclockwise
 --   +1 = move clockwise
 --    0 = if already on correct segment or no enemies found
+
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
     -- Get the segment with the nearest enemy
     local target_segment = enemies_state:nearest_enemy_segment()
@@ -1009,7 +962,7 @@ local function move_cursor_to_row(row)
 end
 
 -- Function to flatten and serialize the game state data to signed 16-bit integers
-local function flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, bDone)
+local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
     -- Create a consistent data structure with fixed sizes
     local data = {}
     
@@ -1187,7 +1140,7 @@ local function flatten_game_state_to_binary(game_state, level_state, player_stat
 
     local oob_data = string.pack(">IdBBBIIBBBhB", 
         #data,                          -- I num_values
-        LastRewardState,                -- d reward
+        reward,                         -- d reward
         0,                              -- B game_action
         game_state.game_mode,           -- B game_mode
         bDone and 1 or 0,               -- B done flag
@@ -1344,7 +1297,7 @@ local function frame_callback()
         
         -- Flatten and serialize the game state data
         local frame_data
-        frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, bDone)
+        frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
 
         -- Send the serialized data to the Python script and get the components
         local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
@@ -1632,7 +1585,7 @@ local function on_mame_exit()
         local reward = calculate_reward(game_state, level_state, player_state, enemies_state)
         
         -- Get final frame data with save signal
-        local frame_data, num_values = flatten_game_state_to_binary(game_state, level_state, player_state, enemies_state, true)
+        local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, true)
         
         -- Send one last time
         if pipe_out and pipe_in then
