@@ -1,179 +1,52 @@
 #!/usr/bin/env python3
 """
 Tempest AI Model: Uses expert-guided exploration with Reinforcement Learning (RL) in gameplay.
-- Expert guidance provides useful moves; RL optimizes during player control.
-- Communicates with Tempest via Lua pipes; saves/loads models for persistence.
+- Expert guidance provides useful moves based on enemy positions.
+- Core infrastructure maintained for future RL model integration.
+- Communicates with Tempest via Lua pipes; structure for future model saving/loading.
 """
 
 import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import time
 import struct
 import random
-import argparse
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import threading
-import queue
-from collections import deque
-import traceback
 import select
 import sys
-import termios
-import fcntl
+import traceback
+from collections import deque
 
 # Constants
-FORCE_CPU = False
-initial_exploration_ratio = 0.0
-min_exploration_ratio = 0.05
-exploration_decay = 0.99
-AIMING_GUIDED_EXPLORATION_RATIO = 0.9
-FIRE_EXPLORATION_RATIO = 0.05
 NumberOfParams = 128
+EXPERT_GUIDANCE_RATIO = 1.0  # Always use expert guidance for now
 
-# Add new parameter for expert-guided samples prioritization
-EXPERT_SAMPLE_WEIGHT = 2.0  # Expert samples are 2x more likely to be selected during training
-
+# Pipe paths
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
 
+# Model directory
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.zip"
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(description='Tempest AI Model')
-args = parser.parse_args()
-
 # Device selection
-if FORCE_CPU:
-    device = torch.device("cpu")
-    print("Using device: CPU (forced)")
-else:
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device.type.upper()}")
-
-# Training metrics
-actor_losses = deque(maxlen=100)
-critic_losses = deque(maxlen=100)
-replay_buffer = []  # Change from deque to list so we can store additional info
-episode_rewards = deque(maxlen=5)
+device = torch.device("cuda" if torch.cuda.is_available() else 
+                     "mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device.type.upper()}")
 
 # Control source tracking
-random_control_count = 0
+frame_count = 0
 guided_control_count = 0
-rl_control_count = 0
 total_control_count = 0
-
-# Add new parameter for expert-guided samples prioritization
-MAX_REPLAY_BUFFER = 100000
-
-class Actor(nn.Module):
-    def __init__(self, state_dim=NumberOfParams):
-        super().__init__()
-        self.fc1 = nn.Linear(state_dim, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, 256)
-        self.fire_head = nn.Linear(256, 1)
-        self.zap_head = nn.Linear(256, 1)
-        self.spinner_head = nn.Linear(256, 1)
-        self.spinner_var_head = nn.Linear(256, 1)
-        
-        torch.nn.init.xavier_uniform_(self.spinner_head.weight, gain=0.1)
-        torch.nn.init.xavier_uniform_(self.spinner_var_head.weight, gain=0.1)
-        if self.spinner_head.bias is not None:
-            torch.nn.init.zeros_(self.spinner_head.bias)
-        if self.spinner_var_head.bias is not None:
-            torch.nn.init.constant_(self.spinner_var_head.bias, -1.0)
-            
-        self.to(device)
-
-    def forward(self, state):
-        x = self.fc1(state)
-        x = F.relu(x)
-        if x.size(0) == 1:
-            x1 = x
-        else:
-            x1 = self.bn1(x)
-        x = self.fc2(x1)
-        x = F.relu(x)
-        if x.size(0) == 1:
-            x2 = x
-        else:
-            x2 = self.bn2(x)
-        x = F.relu(self.fc3(x2))
-        
-        fire_logits = torch.clamp(self.fire_head(x), -10.0, 10.0)
-        zap_logits = torch.clamp(self.zap_head(x), -10.0, 10.0)
-        raw_spinner = self.spinner_head(x)
-        normalized_optimal = 0
-        distance_from_optimal = raw_spinner - normalized_optimal
-        bell_curve_factor = torch.exp(-2.0 * distance_from_optimal * distance_from_optimal)
-        spinner_mean = torch.tanh(raw_spinner * bell_curve_factor * 2.0)
-        raw_var = self.spinner_var_head(x)
-        spinner_var = torch.sigmoid(raw_var) * 0.15
-        
-        return torch.cat([fire_logits, zap_logits, spinner_mean, spinner_var], dim=-1)
-
-    def get_action(self, state, deterministic=False):
-        logits = self.forward(state)
-        fire_logits, zap_logits, spinner_mean, spinner_var = torch.split(logits, 1, dim=-1)
-        
-        if deterministic:
-            fire = torch.sigmoid(fire_logits) > 0.5
-            zap = torch.sigmoid(zap_logits) > 0.5
-            spinner_noise = torch.randn_like(spinner_mean) * spinner_var * 0.3
-        else:
-            fire = torch.bernoulli(torch.sigmoid(fire_logits))
-            zap = torch.bernoulli(torch.sigmoid(zap_logits))
-            spinner_noise = torch.randn_like(spinner_mean) * spinner_var
-        
-        spinner = torch.clamp(spinner_mean + spinner_noise, -0.95, 0.95)
-        spinner = torch.nan_to_num(spinner, nan=0.0, posinf=0.5, neginf=-0.5)
-        return torch.cat([fire, zap, spinner], dim=-1)
-
-class Critic(nn.Module):
-    def __init__(self, state_dim=NumberOfParams):
-        super().__init__()
-        self.fc1 = nn.Linear(state_dim, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, 256)
-        self.value_head = nn.Linear(256, 1)
-        self.to(device)
-
-    def forward(self, state):
-        x = self.fc1(state)
-        x = F.relu(x)
-        if x.size(0) == 1:
-            x1 = x
-        else:
-            x1 = self.bn1(x)
-        x = self.fc2(x1)
-        x = F.relu(x) 
-        if x.size(0) == 1:
-            x2 = x
-        else:
-            x2 = self.bn2(x)
-        x = F.relu(self.fc3(x2))
-        return self.value_head(x)
-
-actor = Actor()
-critic = Critic()
-actor_optimizer = optim.Adam(actor.parameters(), lr=1e-4)
-critic_optimizer = optim.Adam(critic.parameters(), lr=1e-4)
+episode_rewards = deque(maxlen=5)
 
 def process_frame_data(data):
+    """Process binary frame data from Lua script"""
     if not data:
         return None
     
-    format_string = ">IdBBBIIBBBhBhB"
+    format_string = ">IdBBBIIBBBhBhBB"  # Added 'B' for is_open_level
     try:
         header_size = struct.calcsize(format_string)
         if len(data) < header_size:
@@ -181,7 +54,7 @@ def process_frame_data(data):
             return None
         
         values = struct.unpack(format_string, data[:header_size])
-        num_values, reward, game_action, game_mode, done, frame_counter, score, save_signal, fire, zap, spinner, is_attract, nearest_enemy_segment, player_segment = values
+        num_values, reward, game_action, game_mode, done, frame_counter, score, save_signal, fire, zap, spinner, is_attract, nearest_enemy_segment, player_segment, is_open_level = values
         
         game_data_bytes = data[header_size:]
         state_values = []
@@ -197,145 +70,170 @@ def process_frame_data(data):
         elif len(state) < NumberOfParams:
             state = np.pad(state, (0, NumberOfParams - len(state)), 'constant')
         
+        # Convert is_open_level from int to bool
+        is_open_level = bool(is_open_level)
+        
         game_action_tuple = (bool(fire), bool(zap), spinner)
-        return state, reward, game_action_tuple, game_mode, bool(done), bool(is_attract), save_signal, nearest_enemy_segment, player_segment
+        return state, reward, game_action_tuple, game_mode, bool(done), bool(is_attract), save_signal, nearest_enemy_segment, player_segment, is_open_level
         
     except Exception as e:
         print(f"ERROR unpacking data: {e}")
         traceback.print_exc()
         return None
 
-def background_rl_train(rl_model_lock, actor_model, critic_model):
-    gamma = 0.99
-    batch_size = 1024
-    
-    while True:
-        if len(replay_buffer) < batch_size:
-            time.sleep(0.01)
-            continue
-
-        try:
-            with rl_model_lock:
-                # Prioritized sampling - expert-guided experiences are more likely to be selected
-                sample_weights = [exp[5] for exp in replay_buffer]  # Get the expert weights
-                batch_indices = random.choices(range(len(replay_buffer)), weights=sample_weights, k=min(batch_size, len(replay_buffer)))
-                batch = [replay_buffer[i] for i in batch_indices]
-                
-                # Unpack the batch, ignoring the expert flag at index 5
-                states_list, actions_list, rewards_list, next_states_list, dones_list, _ = zip(*batch)
-                
-                states = torch.tensor(np.array(states_list), dtype=torch.float32, device=device)
-                actions = torch.tensor(np.array(actions_list), dtype=torch.float32, device=device)
-                rewards = torch.tensor(np.array(rewards_list), dtype=torch.float32, device=device).unsqueeze(1)
-                next_states = torch.tensor(np.array(next_states_list), dtype=torch.float32, device=device)
-                dones = torch.tensor(np.array(dones_list), dtype=torch.float32, device=device).unsqueeze(1)
-
-                # Critic training
-                critic_optimizer.zero_grad(set_to_none=True)
-                current_values = critic_model(states)
-                with torch.no_grad():
-                    next_values = critic_model(next_states)
-                    target_values = rewards + (1.0 - dones) * gamma * next_values
-                critic_loss = F.mse_loss(current_values, target_values)
-                critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(critic_model.parameters(), max_norm=0.5)
-                critic_optimizer.step()
-                critic_losses.append(critic_loss.item())
-
-                # Actor training
-                actor_optimizer.zero_grad(set_to_none=True)
-                action_logits = actor_model(states)
-                with torch.no_grad():
-                    current_values = critic_model(states)
-                    # Use a modified advantage calculation that better emphasizes positive rewards
-                    # and decreases the impact of negative rewards
-                    raw_advantages = target_values - current_values
-                    # Scale advantages - boost positive advantages and reduce penalty of negative ones
-                    scaled_advantages = torch.where(
-                        raw_advantages > 0, 
-                        raw_advantages * 1.2,  # Boost positive advantages
-                        raw_advantages * 0.8   # Soften negative advantages
-                    )
-                    advantages = torch.clamp(scaled_advantages, -10.0, 10.0)
-                fire_logits, zap_logits, spinner_mean, spinner_var = torch.split(action_logits, 1, dim=-1)
-                
-                fire_probs = torch.clamp(torch.sigmoid(fire_logits), 1e-8, 1 - 1e-8)
-                zap_probs = torch.clamp(torch.sigmoid(zap_logits), 1e-8, 1 - 1e-8)
-                
-                fire_log_probs = (torch.log(fire_probs) * actions[:, 0:1]) + (torch.log(1 - fire_probs) * (1 - actions[:, 0:1]))
-                zap_log_probs = (torch.log(zap_probs) * actions[:, 1:2]) + (torch.log(1 - zap_probs) * (1 - actions[:, 1:2]))
-                
-                spinner_scaled_var = spinner_var * 0.5 + 0.01
-                spinner_diff = spinner_mean - actions[:, 2:3]
-                spinner_log_probs = -0.5 * (spinner_diff**2) / (spinner_scaled_var + 1e-8) - 0.5 * torch.log(2 * np.pi * (spinner_scaled_var + 1e-8))
-                
-                fire_log_probs = torch.clamp(fire_log_probs, -10.0, 0.0)
-                zap_log_probs = torch.clamp(zap_log_probs, -10.0, 0.0)
-                spinner_log_probs = torch.clamp(spinner_log_probs, -10.0, 0.0)
-                
-                log_probs = fire_log_probs + zap_log_probs + spinner_log_probs
-                if advantages.dim() != log_probs.dim():
-                    log_probs = log_probs.sum(dim=1, keepdim=True)
-                
-                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                normalized_advantages = torch.clamp(normalized_advantages, -3.0, 3.0)
-                actor_loss = -(log_probs * normalized_advantages.detach()).mean()
-                
-                l2_reg = 0.001 * (actor_model.spinner_head.weight.pow(2).sum() + actor_model.spinner_var_head.weight.pow(2).sum())
-                total_loss = actor_loss + l2_reg
-                
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(actor_model.parameters(), max_norm=1.0)
-                actor_optimizer.step()
-                actor_losses.append(actor_loss.item())
-                
-        except Exception as e:
-            print(f"RL training error: {e}")
-            traceback.print_exc()
-            time.sleep(1)
-
-frame_count = 0
-
-def setup_keyboard_input():
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    new_settings = termios.tcgetattr(fd)
-    new_settings[3] = new_settings[3] & ~termios.ICANON & ~termios.ECHO
-    termios.tcsetattr(fd, termios.TCSANOW, new_settings)
-    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-    return old_settings
-
-def restore_keyboard_input(old_settings):
-    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old_settings)
-
 def print_metrics_table_header():
-    header = (
-        f"{'Frame':>8} | {'Actor Loss':>10} | {'Critic Loss':>11} | {'Mean Reward':>12} | {'Explore %':>9} | "
-        f"{'Random %':>8} | {'Guided %':>8} | {'RL %':>8} | {'Extreme %':>9} | {'Buffer':>7}"
-    )
+    """Print header for metrics table"""
+    header = f"{'Frame':>8} | {'Mean Reward':>12} | {'Guided %':>8} | {'Nearest Enemy':>15} | {'Level Type':>10}"
     separator = "-" * len(header)
     print("\n" + separator)
     print(header)
     print(separator)
 
 def print_metrics_table_row(frame_count, metrics_dict):
+    """Print row for metrics table"""
     row = (
-        f"{frame_count:8d} | {metrics_dict.get('actor_loss', 'N/A'):10.4f} | "
-        f"{metrics_dict.get('critic_loss', 'N/A'):11.2f} | {metrics_dict.get('mean_reward', 'N/A'):12.2f} | "
-        f"{metrics_dict.get('exploration', 0.0)*100:8.2f}% | "
-        f"{metrics_dict.get('random_ratio', 0.0)*100:7.2f}% | {metrics_dict.get('guided_ratio', 0.0)*100:7.2f}% | "
-        f"{metrics_dict.get('rl_ratio', 0.0)*100:7.2f}% | "
-        f"{metrics_dict.get('extreme_ratio', 0.0)*100:8.2f}% | {metrics_dict.get('buffer_size', 0):7d}"
+        f"{frame_count:8d} | {metrics_dict.get('mean_reward', 'N/A'):12.2f} | "
+        f"{metrics_dict.get('guided_ratio', 0.0)*100:7.2f}% | "
+        f"{metrics_dict.get('nearest_enemy', -1):15d} | "
+        f"{'Open' if metrics_dict.get('is_open_level', False) else 'Closed':10}"
     )
     print(row)
 
-def main():
-    global frame_count, actor, critic, random_control_count, guided_control_count, rl_control_count, total_control_count, replay_buffer
+def expert_decision(nearest_enemy_segment, player_segment, is_open_level=False):
+    """Make an expert-guided decision based on game state"""
+    # Add debug logging for key decisions
+    if frame_count % 60 == 0:
+        print(f"Expert decision: Player at {player_segment}, Enemy at {nearest_enemy_segment}, Open level: {is_open_level}")
     
-    rl_model_lock = threading.Lock()
-    threading.Thread(target=background_rl_train, args=(rl_model_lock, actor, critic), daemon=True).start()
+    if nearest_enemy_segment < 0:
+        # No enemies - don't move and fire occasionally
+        spinner_value = 0
+        fire_value = 1  # Shoot at spikes if nothing else - always at least shoot
+        return fire_value, 0, spinner_value
+        
+    elif nearest_enemy_segment == player_segment:
+        # Aligned with enemy - fire but don't move
+        spinner_value = 0
+        fire_value = 1  # Fire when aligned
+        return fire_value, 0, spinner_value
+        
+    else:
+        # Need to move toward enemy - calculate dynamic spinner value
+        if is_open_level:
+            # In open levels, there's only one path between segments
+            # Simple direct distance calculation
+            distance = abs(nearest_enemy_segment - player_segment)
+            
+            # Ensure movement directions match the Lua convention:
+            # - Negative spinner = clockwise motion (if target_segment > player_segment)
+            # - Positive spinner = counterclockwise motion (if target_segment < player_segment)
+            if nearest_enemy_segment > player_segment:
+                # Enemy is to the right, move clockwise (negative spinner)
+                spinner_value = -min(0.9, 0.3 + (distance * 0.05))
+                if frame_count % 60 == 0:
+                    print(f"  Open level: Enemy is to the right at {nearest_enemy_segment}, moving clockwise with spinner={spinner_value}")
+            else:
+                # Enemy is to the left, move counterclockwise (positive spinner)
+                spinner_value = min(0.9, 0.3 + (distance * 0.05))
+                if frame_count % 60 == 0:
+                    print(f"  Open level: Enemy is to the left at {nearest_enemy_segment}, moving counterclockwise with spinner={spinner_value}")
+                
+            # Always fire in open levels to ensure we don't get stuck without shooting
+            fire_value = 1
 
+        else:
+            # In closed levels (wrap around), calculate both directions
+            clockwise_distance = 0
+            counterclockwise_distance = 0
+            
+            if nearest_enemy_segment > player_segment:
+                clockwise_distance = nearest_enemy_segment - player_segment
+                counterclockwise_distance = player_segment + (16 - nearest_enemy_segment)
+            else:
+                clockwise_distance = nearest_enemy_segment + (16 - player_segment)
+                counterclockwise_distance = player_segment - nearest_enemy_segment
+            
+            # Use a proportional spinner value based on distance
+            min_distance = min(clockwise_distance, counterclockwise_distance)
+            
+            # Scale spinner value based on distance (greater distance = higher value)
+            # This creates a more dynamic response than fixed values
+            intensity = min(0.9, 0.3 + (min_distance * 0.05))
+            
+            if clockwise_distance < counterclockwise_distance:
+                # Move clockwise - IMPORTANT: In Tempest, NEGATIVE spinner values move CLOCKWISE
+                spinner_value = -intensity
+                if frame_count % 60 == 0:
+                    print(f"  Closed level: Moving clockwise with spinner={spinner_value}, CW dist={clockwise_distance}, CCW dist={counterclockwise_distance}")
+            else:
+                # Move counterclockwise - IMPORTANT: In Tempest, POSITIVE spinner values move COUNTERCLOCKWISE
+                spinner_value = intensity
+                if frame_count % 60 == 0:
+                    print(f"  Closed level: Moving counterclockwise with spinner={spinner_value}, CW dist={clockwise_distance}, CCW dist={counterclockwise_distance}")
+            
+            # Always fire in closed levels
+            fire_value = 1
+        
+    return fire_value, 0, spinner_value  # fire, zap, spinner
+
+def save_model(model_data=None):
+    """Placeholder for future model saving functionality"""
+    try:
+        print(f"Model saving functionality will be implemented with future RL models")
+        # Future implementation: torch.save(model.state_dict(), LATEST_MODEL_PATH)
+    except Exception as e:
+        print(f"Error in save_model placeholder: {e}")
+
+def load_model():
+    """Placeholder for future model loading functionality"""
+    try:
+        print(f"Model loading functionality will be implemented with future RL models")
+        # Future implementation: model.load_state_dict(torch.load(path))
+        return None
+    except Exception as e:
+        print(f"Error in load_model placeholder: {e}")
+        return None
+
+def encode_action(fire, zap, spinner_delta):
+    """Encode actions for future RL model"""
+    fire_val = float(fire)
+    zap_val = float(zap)
+    if abs(spinner_delta) < 10:
+        normalized_spinner = spinner_delta / 31.0
+    else:
+        sign = np.sign(spinner_delta)
+        magnitude = abs(spinner_delta)
+        squashed = 10.0 + (magnitude - 10.0) * (1.0 / (1.0 + (magnitude - 10.0) / 20.0))
+        normalized_spinner = sign * min(squashed / 31.0, 1.0)
+    return torch.tensor([[fire_val, zap_val, normalized_spinner]], dtype=torch.float32, device=device)
+
+def decode_action(action):
+    """Decode actions from model output"""
+    if isinstance(action, torch.Tensor):
+        fire = 1 if action[0, 0].item() > 0.5 else 0
+        zap = 1 if action[0, 1].item() > 0.5 else 0  # Changed from 0.95 to match expert guidance
+        spinner_val = action[0, 2].item()
+    else:
+        # Handle non-tensor actions (like from expert system)
+        fire, zap, spinner_val = action
+        
+    # Improved spinner value conversion for better precision
+    # Use a curve that's more responsive in the center range
+    # but still allows for maximum values
+    if abs(spinner_val) < 0.3:
+        # More precise control for small adjustments
+        spinner = int(spinner_val * 20)
+    else:
+        # Full range for larger movements
+        spinner = int(spinner_val * 31)
+    
+    return fire, zap, spinner
+
+def main():
+    """Main function that handles communication with Lua and decision making"""
+    global frame_count, guided_control_count, total_control_count
+    
+    # Create pipes
     for pipe in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
         if os.path.exists(pipe): os.unlink(pipe)
         os.mkfifo(pipe)
@@ -344,14 +242,9 @@ def main():
     print("Pipes created. Waiting for Lua...")
     total_episode_reward = 0
     done_latch = False
-    current_exploration_ratio = initial_exploration_ratio
-    last_spinner_values = deque(maxlen=100)
-    extreme_threshold = 0.8
     print_metrics_table_header()
-    previous_state = None
-    previous_action = None
-    is_expert_guided = False
     
+    # Main loop connecting to Lua
     with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, \
          open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
         print("✔️ Lua connected.")
@@ -368,6 +261,7 @@ def main():
                     time.sleep(0.001)
                     continue
 
+                # Process frame data from Lua
                 result = process_frame_data(data)
                 if result is None:
                     print(f"Warning: Invalid data received, skipping frame.")
@@ -375,7 +269,7 @@ def main():
                     py_to_lua.flush()
                     continue
                 
-                state, reward, game_action, game_mode, done, is_attract, save_signal, nearest_enemy_segment, player_segment = result
+                state, reward, game_action, game_mode, done, is_attract, save_signal, nearest_enemy_segment, player_segment, is_open_level = result
                 
                 if state is None or reward is None or game_action is None or game_mode is None or done is None or is_attract is None:
                     print(f"Warning: Invalid data in processed result, skipping frame.")
@@ -383,15 +277,15 @@ def main():
                     py_to_lua.flush()
                     continue
                 
-                state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-
+                # Print detailed debug info for open levels to diagnose issues
+                if is_open_level and frame_count % 60 == 0:
+                    print(f"Open level debug - Frame: {frame_count}, Player: {player_segment}, Nearest enemy: {nearest_enemy_segment}")
+                
+                # Episode management
                 if done and not done_latch:
                     done_latch = True
                     total_episode_reward += reward
                     episode_rewards.append(total_episode_reward)
-                    last_spinner_values.clear()
-                    previous_state = None
-                    previous_action = None
                     
                 elif done and done_latch:
                     py_to_lua.write(struct.pack("bbb", 0, 0, 0))
@@ -401,188 +295,56 @@ def main():
                 elif not done and done_latch:
                     done_latch = False
                     total_episode_reward = 0
-                    previous_state = None
-                    previous_action = None
                     
                 else:
                     total_episode_reward += reward
-                    # Add experiences to replay buffer regardless of attract mode
-                    # but we'll still track if it was from attract mode for debugging
-                    if previous_state is not None and previous_action is not None:
-                        # The expert weight will be EXPERT_SAMPLE_WEIGHT if this was an expert-guided action
-                        # otherwise it will be 1.0 (standard weight)
-                        expert_weight = EXPERT_SAMPLE_WEIGHT if is_expert_guided else 1.0
-                        
-                        # Add to replay buffer: state, action, reward, next_state, done, expert_weight
-                        replay_buffer.append((previous_state, previous_action.cpu().numpy()[0], reward, state, done, expert_weight))
-                        
-                        # Keep replay buffer size in check
-                        if len(replay_buffer) > MAX_REPLAY_BUFFER:
-                            # Remove oldest samples (non-expert ones first if possible)
-                            # Sort by expert_weight (ascending) so non-expert samples come first
-                            replay_buffer.sort(key=lambda x: x[5])
-                            # Remove a batch of oldest samples
-                            removal_count = max(1, int(0.05 * MAX_REPLAY_BUFFER))  # Remove 5% of buffer
-                            replay_buffer = replay_buffer[removal_count:]
 
-                previous_state = state
-                is_expert_guided = False  # Reset expert guidance flag for this frame
-
-                if len(last_spinner_values) >= 50:
-                    extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
-                    extreme_ratio = extreme_count / len(last_spinner_values)
-                    if extreme_ratio > 0.7:
-                        current_exploration_ratio = max(current_exploration_ratio, 0.5)
-                
-                if frame_count % 1000 == 0 and current_exploration_ratio > min_exploration_ratio:
-                    current_exploration_ratio *= exploration_decay
-                
-                if random.random() < current_exploration_ratio:
-                    if random.random() < AIMING_GUIDED_EXPLORATION_RATIO:
-                        # Enhanced expert-guided behavior
-                        if nearest_enemy_segment < 0:
-                            # No enemies - don't move
-                            spinner_value = 0
-                            fire_value = 0  # No enemies to shoot at
-                        elif nearest_enemy_segment == player_segment:
-                            # Aligned with enemy - fire but don't move
-                            spinner_value = 0
-                            fire_value = 1  # Fire when aligned
-                        else:
-                            # Need to move toward enemy - calculate dynamic spinner value
-                            # Calculate distances in both directions
-                            clockwise_distance = 0
-                            counterclockwise_distance = 0
-                            
-                            if nearest_enemy_segment > player_segment:
-                                clockwise_distance = nearest_enemy_segment - player_segment
-                                counterclockwise_distance = player_segment + (16 - nearest_enemy_segment)
-                            else:
-                                clockwise_distance = nearest_enemy_segment + (16 - player_segment)
-                                counterclockwise_distance = player_segment - nearest_enemy_segment
-                            
-                            # Use a proportional spinner value based on distance
-                            min_distance = min(clockwise_distance, counterclockwise_distance)
-                            
-                            # Scale spinner value based on distance (greater distance = higher value)
-                            # This creates a more dynamic response than fixed values
-                            intensity = min(0.9, 0.3 + (min_distance * 0.05))
-                            
-                            if clockwise_distance < counterclockwise_distance:
-                                # Move clockwise (negative spinner)
-                                spinner_value = -intensity
-                            else:
-                                # Move counterclockwise (positive spinner)
-                                spinner_value = intensity
-                            
-                            # Fire if we're close to alignment
-                            fire_value = 1.0 if min_distance <= 1 else 0.0
-                            
-                        action = torch.tensor([[fire_value, 0.0, spinner_value]], dtype=torch.float32, device=device)
-                        guided_control_count += 1
-                        total_control_count += 1
-                        is_expert_guided = True  # Mark this as expert-guided for the replay buffer
-                    else:
-                        if random.random() < 0.4:
-                            optimal_normalized = 0
-                            spinner_val = optimal_normalized + random.gauss(0, 0.2)
-                            spinner_val = max(-0.95, min(0.95, spinner_val))
-                            random_actions = torch.tensor([
-                                float(random.random() > 0.5),
-                                float(random.random() > 0.95),
-                                spinner_val
-                            ], dtype=torch.float32, device=device)
-                        else:
-                            random_actions = torch.tensor([
-                                float(random.random() > 0.5),
-                                float(random.random() > 0.95),
-                                random.uniform(-1.0, 1.0)
-                            ], dtype=torch.float32, device=device)
-                        action = random_actions.unsqueeze(0)
-                        random_control_count += 1
-                        total_control_count += 1
-                else:
-                    with torch.no_grad():
-                        action = actor.get_action(state_tensor, deterministic=True)
-                    rl_control_count += 1
+                # Always use expert guidance for now
+                if random.random() < EXPERT_GUIDANCE_RATIO:
+                    # Expert-guided behavior
+                    fire_value, zap_value, spinner_value = expert_decision(nearest_enemy_segment, player_segment, is_open_level)
+                    guided_control_count += 1
                     total_control_count += 1
-                
-                action_cpu = action.cpu()
-                fire, zap, spinner = decode_action(action_cpu)
-                last_spinner_values.append(action_cpu[0, 2].item())
-                previous_action = action  # Store action for next frame's replay buffer
+                else:
+                    # Future RL model will go here
+                    # For now, fall back to expert guidance
+                    fire_value, zap_value, spinner_value = expert_decision(nearest_enemy_segment, player_segment, is_open_level)
+                    guided_control_count += 1
+                    total_control_count += 1
 
+                # Convert decision to game controls
+                fire, zap, spinner = decode_action((fire_value, zap_value, spinner_value))
+
+                # Send controls to Lua
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
 
+                # Print metrics periodically
                 if frame_count % 1000 == 0:
-                    actor_loss_mean = np.mean(actor_losses) if actor_losses else float('nan')
-                    critic_loss_mean = np.mean(critic_losses) if critic_losses else float('nan')
                     mean_reward = np.mean(list(episode_rewards)) if episode_rewards else float('nan')
-                    extreme_ratio = 0.0
-                    if last_spinner_values:
-                        extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
-                        extreme_ratio = extreme_count / len(last_spinner_values)
-                    random_ratio = random_control_count / max(1, total_control_count)
                     guided_ratio = guided_control_count / max(1, total_control_count)
-                    rl_ratio = rl_control_count / max(1, total_control_count)
                     
                     metrics = {
-                        'actor_loss': actor_loss_mean,
-                        'critic_loss': critic_loss_mean,
                         'mean_reward': mean_reward,
-                        'exploration': current_exploration_ratio,
-                        'random_ratio': random_ratio,
                         'guided_ratio': guided_ratio,
-                        'rl_ratio': rl_ratio,
-                        'extreme_ratio': extreme_ratio,
-                        'buffer_size': len(replay_buffer)
+                        'nearest_enemy': nearest_enemy_segment,
+                        'is_open_level': is_open_level
                     }
                     print_metrics_table_row(frame_count, metrics)
 
                 if save_signal:
-                    print("\nSaving model...")
-                    threading.Thread(target=save_model, args=(actor,), daemon=True).start()
+                    print("\nSave signal received (placeholder for future model saving)")
                     print_metrics_table_header()
                 
                 frame_count += 1
 
             except KeyboardInterrupt:
-                save_model(actor)
+                print("\nKeyboard interrupt detected. Exiting...")
                 break
             except Exception as e:
                 print(f"Error: {e}")
                 traceback.print_exc()
-                time.sleep(5)
-
-def save_model(actor_model):
-    try:
-        actor_model.eval()
-        torch.save(actor_model.state_dict(), LATEST_MODEL_PATH)
-        print(f"Actor model saved to {LATEST_MODEL_PATH}")
-    except Exception as e:
-        print(f"Error saving model: {e}")
-        traceback.print_exc()
-
-def encode_action(fire, zap, spinner_delta):
-    fire_val = float(fire)
-    zap_val = float(zap)
-    if abs(spinner_delta) < 10:
-        normalized_spinner = spinner_delta / 31.0
-    else:
-        sign = np.sign(spinner_delta)
-        magnitude = abs(spinner_delta)
-        squashed = 10.0 + (magnitude - 10.0) * (1.0 / (1.0 + (magnitude - 10.0) / 20.0))
-        normalized_spinner = sign * min(squashed / 31.0, 1.0)
-    return torch.tensor([[fire_val, zap_val, normalized_spinner]], dtype=torch.float32, device=device)
-
-def decode_action(action):
-    fire = 1 if action[0, 0].item() > 0.5 else 0
-    zap = 1 if action[0, 1].item() > 0.5 else 0
-    spinner_val = action[0, 2].item()
-    spinner = int(spinner_val * 31)
-    
-    return fire, zap, spinner
+                time.sleep(1)
 
 if __name__ == "__main__":
     random.seed(42)

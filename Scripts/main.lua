@@ -793,36 +793,53 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
     end
     
     local player_segment = player_state.position & 0x0F  -- Apply mask for 0-15 range
+    local is_open = level_state.level_type == 0xFF  -- Check if level is open (non-wraparound)
     
-    -- Calculate distances in both directions, accounting for wraparound
-    -- Note: In Tempest, segments are numbered clockwise 0-15
-    
-    -- Calculate clockwise distance (player → target moving clockwise)
-    local clockwise_distance
-    if target_segment >= player_segment then
-        clockwise_distance = target_segment - player_segment
+    if is_open then
+        -- In open levels, distance is simply the direct difference between segments
+        if target_segment > player_segment then
+            return -1  -- Move clockwise (negative spinner value)
+        else
+            return 1   -- Move counterclockwise (positive spinner value)
+        end
     else
-        clockwise_distance = target_segment + 16 - player_segment
-    end
-    
-    -- Calculate counterclockwise distance (player → target moving counterclockwise)
-    local counterclockwise_distance
-    if player_segment >= target_segment then
-        counterclockwise_distance = player_segment - target_segment
-    else
-        counterclockwise_distance = player_segment + 16 - target_segment
-    end
-    
-    -- Return the direction with the shortest path
-    -- Note: In Tempest, positive spinner value moves player counterclockwise
-    -- and negative spinner value moves player clockwise
-    if clockwise_distance < counterclockwise_distance then
-        return -1  -- Move clockwise (negative spinner value)
-    elseif clockwise_distance > counterclockwise_distance then
-        return 1   -- Move counterclockwise (positive spinner value)
-    else
-        -- Equal distances - maintain previous direction to prevent oscillation
-        return (player_state.SpinnerDelta > 0) and 1 or -1
+        -- In closed/wraparound levels, calculate distances in both directions
+        
+        -- Calculate clockwise distance (player → target moving clockwise)
+        local clockwise_distance
+        if target_segment >= player_segment then
+            clockwise_distance = target_segment - player_segment
+        else
+            clockwise_distance = target_segment + 16 - player_segment
+        end
+        
+        -- Calculate counterclockwise distance (player → target moving counterclockwise)
+        local counterclockwise_distance
+        if player_segment >= target_segment then
+            counterclockwise_distance = player_segment - target_segment
+        else
+            counterclockwise_distance = player_segment + 16 - target_segment
+        end
+        
+        -- Log boundary crossing cases for debugging
+        if math.abs(target_segment - player_segment) > 8 then
+            print(string.format(
+                "BOUNDARY CROSSING: Player at %d, Enemy at %d, CW: %d, CCW: %d", 
+                player_segment, target_segment,
+                clockwise_distance, counterclockwise_distance))
+        end
+        
+        -- Return the direction with the shortest path
+        -- Note: In Tempest, positive spinner value moves player counterclockwise
+        -- and negative spinner value moves player clockwise
+        if clockwise_distance < counterclockwise_distance then
+            return -1  -- Move clockwise (negative spinner value)
+        elseif clockwise_distance > counterclockwise_distance then
+            return 1   -- Move counterclockwise (positive spinner value)
+        else
+            -- Equal distances - maintain previous direction to prevent oscillation
+            return (player_state.SpinnerDelta > 0) and 1 or -1
+        end
     end
 end
 
@@ -1145,13 +1162,19 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     is_attract_mode = is_attract_mode and 1 or 0
+    
+    -- Determine if this is an open level (FF) or closed level (00)
+    local is_open_level = level_state.level_type == 0xFF
+    is_open_level = is_open_level and 1 or 0
 
     -- Create out-of-band context information structure
     -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
     -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte),
-    -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8)
+    -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8),
+    -- is_attract (byte), nearest_enemy_segment (byte), player_segment (byte),
+    -- is_open_level (byte)
 
-    local oob_data = string.pack(">IdBBBIIBBBhBhB", 
+    local oob_data = string.pack(">IdBBBIIBBBhBhBB", 
         #data,                          -- I num_values
         reward,                         -- d reward
         0,                              -- B game_action
@@ -1164,8 +1187,9 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         controls.zap_commanded,         -- B zap_commanded (added)
         controls.spinner_delta,         -- h spinner_delta (added)
         is_attract_mode,                -- B is_attract_mode
-        enemies_state:nearest_enemy_segment(), -- B nearest_enemy_segment
-        player_state.position           -- Player segment
+        enemies_state:nearest_enemy_segment(), -- h nearest_enemy_segment
+        player_state.position,          -- B player segment
+        is_open_level                   -- B is_open_level (added)
     )
     
     -- Combine out-of-band header with game state data
