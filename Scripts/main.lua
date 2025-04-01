@@ -60,10 +60,6 @@ local frame_count = 0  -- Initialize frame counter
 
 -- Global variables for tracking bytes sent and FPS
 local total_bytes_sent = 0
-local frame_time_accum = 0  -- Time accumulator for FPS calculation
-local frame_count_accum = 0  -- Frame count accumulator for FPS calculation
-local last_fps_time = os.clock()  -- Use os.clock() for high precision timing
-local current_fps = 0  -- Current FPS value for display
 
 -- Function to open pipes 
 local function open_pipes()
@@ -432,6 +428,10 @@ function GameState:new()
     self.frame_counter = 0  -- Frame counter for tracking progress
     self.last_save_time = os.time()  -- Track when we last sent save signal
     self.save_interval = 300  -- Send save signal every 5 minutes (300 seconds)
+    
+    -- FPS tracking (now handled at global level, not in GameState)
+    self.current_fps = 0  -- Store the FPS value for display
+    
     return self
 end
 
@@ -443,6 +443,32 @@ function GameState:update(mem)
     self.p1_level = mem:read_u8(0x0046)   -- Player 1 level
     self.p1_lives = mem:read_u8(0x0048)   -- Player 1 lives
     self.frame_counter = self.frame_counter + 1  -- Increment frame counter
+    
+    -- The current_fps is now only updated when FPS is calculated in frame_callback
+end
+
+-- Store the last time a full debug dump was performed
+local last_debug_time = os.clock()
+
+-- Enhanced debug print for the frame callback
+local function debug_dump_state()
+    local current_time = os.clock()
+    if current_time - last_debug_time < 5.0 then
+        return  -- Only dump debug info every 5 seconds
+    end
+    
+    last_debug_time = current_time
+    
+    print("\n----- DEBUG STATE DUMP -----")
+    print(string.format("Game counter: %d, Reported FPS: %.2f", 
+        game_state.frame_counter, game_state.current_fps))
+    
+    -- Dump timing data
+    print(string.format("Current time: %.6f, Last FPS time: %.6f, Diff: %.6f", 
+        current_time, game_state.last_fps_time, current_time - game_state.last_fps_time))
+    print(string.format("Frame count accum: %d", game_state.frame_count_accum))
+    print(string.format("Current timer value: %d", mem:read_u8(0x0003)))
+    print("---------------------------\n")
 end
 
 -- **LevelState Class**
@@ -821,14 +847,6 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
             counterclockwise_distance = player_segment + 16 - target_segment
         end
         
-        -- Log boundary crossing cases for debugging
-        if math.abs(target_segment - player_segment) > 8 then
-            print(string.format(
-                "BOUNDARY CROSSING: Player at %d, Enemy at %d, CW: %d, CCW: %d", 
-                player_segment, target_segment,
-                clockwise_distance, counterclockwise_distance))
-        end
-        
         -- Return the direction with the shortest path
         -- Note: In Tempest, positive spinner value moves player counterclockwise
         -- and negative spinner value moves player clockwise
@@ -959,7 +977,7 @@ function Controls:apply_action(fire, zap, spinner, game_state, player_state)
     end
 end
 
--- Instantiate state objects
+-- Instantiate state objects - AFTER defining all classes
 local game_state = GameState:new()
 local level_state = LevelState:new()
 local player_state = PlayerState:new()
@@ -1200,8 +1218,44 @@ end
 
 -- Update the frame_callback function to track bytes sent and calculate FPS
 local frame_counter = 0
+local lastTimer = 0
+local last_fps_time = os.time()  -- Use os.time() for wall clock time
+
+-- Add a global tracker for timer value changes
+local timer_changes = 0
+local timer_check_start_time = os.clock()
+
+-- Add a last update time tracker for precise intervals
+local last_update_time = os.clock()
+
+-- Add tracking for different frame detection methods
+local last_player_position = nil
+local last_timer_value = nil
+local method_fps_counter = {0, 0, 0}  -- For 3 different methods
+local method_start_time = os.clock()
 
 local function frame_callback()
+    -- Check the time counter at address 0x0003
+    local currentTimer = mem:read_u8(0x0003)
+    
+    -- Check if the timer changed
+    if currentTimer == lastTimer then
+        return true
+    end
+    lastTimer = currentTimer
+    
+    -- Increment frame count and track FPS
+    frame_count = frame_count + 1
+    local current_time = os.time()
+    
+    -- Calculate FPS every second
+    if current_time > last_fps_time then
+        -- Update the FPS display only when we calculate it
+        game_state.current_fps = frame_count  -- Update in GameState for display
+        frame_count = 0
+        last_fps_time = current_time
+    end
+    
     -- Update game state first
     game_state:update(mem)
     
@@ -1214,7 +1268,8 @@ local function frame_callback()
     -- Update enemies state last to ensure all references are correct
     enemies_state:update(mem)
     
-    if game_state.gamegstate == 0x80 then
+    -- Check if the game mode is in high score entry, mash AAA if it is
+    if game_state.game_mode == x80 then
         local port = manager.machine.ioport.ports[":BUTTONSP1"]
         local startField = port.fields["P1 Button 2"]
 
@@ -1311,8 +1366,6 @@ local function frame_callback()
     -- Calculate the reward for the current frame - do this ONCE per frame
     local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state)
 
-
-
     -- NOP out the jump that skips scoring in attract mode
     mem:write_direct_u8(0xCA6F, 0xEA)
     mem:write_direct_u8(0xCA70, 0xEA)
@@ -1362,24 +1415,6 @@ local function frame_callback()
     -- Update total bytes sent
     total_bytes_sent = total_bytes_sent + #frame_data
 
-    -- FPS Calculation
-    local current_time = os.clock()
-    local time_diff = current_time - last_fps_time
-    
-    -- Accumulate frames and time for more accurate FPS calculation
-    frame_count_accum = frame_count_accum + 1
-    frame_time_accum = frame_time_accum + time_diff
-    
-    -- Update FPS every 0.5 seconds for a more accurate measurement
-    if frame_time_accum >= 0.5 then
-        current_fps = frame_count_accum / frame_time_accum
-        -- Reset accumulators
-        frame_count_accum = 0
-        frame_time_accum = 0
-    end
-    
-    -- Always update the reference time for accurate time difference calculation
-    last_fps_time = current_time
 
     -- In LOG_ONLY_MODE, limit display updates to 10 times per second
     local current_time_high_res = os.clock()
@@ -1423,7 +1458,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"P1 Level", game_state.p1_level},
         {"Frame", game_state.frame_counter},
         {"Bytes Sent", total_bytes_sent},
-        {"FPS", string.format("%.2f", current_fps)},
+        {"FPS", string.format("%.2f", game_state.current_fps)},
         {"Payload Size", num_values},
         {"Last Reward", string.format("%.2f", LastRewardState)},
         {"Log Only Mode", LOG_ONLY_MODE and "ENABLED" or "OFF"}
