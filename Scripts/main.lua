@@ -175,7 +175,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- Level completion reward
         if level_state.level_number ~= previous_level then
-            reward = reward + (1000 * previous_level)
+            reward = reward + (100 * previous_level)
         end
 
         -- UPDATED: Enemy positioning reward based on the demoplay logic
@@ -206,9 +206,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             if min_distance == 0 then
                 -- Extra reward if player is not moving while lined up (ready to fire)
                 if player_state.SpinnerDelta == 0 then
-                    reward = reward + 25  -- Significant reward for being lined up and still
+                    reward = reward + 12  -- Significant reward for being lined up and still
                 else
-                    reward = reward + 12  -- Good reward just for being lined up
+                    reward = reward + 15  -- Good reward just for being lined up
                 end
             else
                 -- Give decreasing rewards as distance increases
@@ -221,13 +221,19 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Small bonus for moving in the correct direction toward the target
                 local move_direction = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
                 if move_direction ~= 0 then
-                    -- If moving in the correct direction (sign matches after -9 multiplication)
-                    if (move_direction < 0 and player_state.SpinnerDelta > 0) or 
-                    (move_direction > 0 and player_state.SpinnerDelta < 0) then
+                    -- Check if player is moving in the direction that will reach the target faster
+                    -- direction < 0 means go clockwise (need negative spinner)
+                    -- direction > 0 means go counterclockwise (need positive spinner)
+                    if (move_direction < 0 and player_state.SpinnerDelta < 0) or 
+                       (move_direction > 0 and player_state.SpinnerDelta > 0) then
                         reward = reward + 5  -- Small bonus for moving the right way
                     elseif player_state.SpinnerDelta ~= 0 then
                         reward = reward - 1  -- Small penalty for moving the wrong way
                     end
+                end
+
+                if (target_segment >= 0 and player_state.SpinnerDelta == 0) then
+                    reward = reward - 2
                 end
             end
         end
@@ -787,29 +793,36 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
     end
     
     local player_segment = player_state.position & 0x0F  -- Apply mask for 0-15 range
-    local is_open = level_state.level_type == 0xFF      -- Check if level is open
     
-    -- Calculate distances in both directions
-    local clockwise_distance = 0
-    local counterclockwise_distance = 0
+    -- Calculate distances in both directions, accounting for wraparound
+    -- Note: In Tempest, segments are numbered clockwise 0-15
     
-    if target_segment > player_segment then
+    -- Calculate clockwise distance (player → target moving clockwise)
+    local clockwise_distance
+    if target_segment >= player_segment then
         clockwise_distance = target_segment - player_segment
-        counterclockwise_distance = player_segment + (16 - target_segment)
     else
-        clockwise_distance = target_segment + (16 - player_segment)
-        counterclockwise_distance = player_segment - target_segment
+        clockwise_distance = target_segment + 16 - player_segment
     end
     
-    -- For both open and closed levels, use the same distance comparison logic
+    -- Calculate counterclockwise distance (player → target moving counterclockwise)
+    local counterclockwise_distance
+    if player_segment >= target_segment then
+        counterclockwise_distance = player_segment - target_segment
+    else
+        counterclockwise_distance = player_segment + 16 - target_segment
+    end
+    
+    -- Return the direction with the shortest path
+    -- Note: In Tempest, positive spinner value moves player counterclockwise
+    -- and negative spinner value moves player clockwise
     if clockwise_distance < counterclockwise_distance then
-        return 1  -- Move clockwise
+        return -1  -- Move clockwise (negative spinner value)
     elseif clockwise_distance > counterclockwise_distance then
-        return -1  -- Move counterclockwise
+        return 1   -- Move counterclockwise (positive spinner value)
     else
         -- Equal distances - maintain previous direction to prevent oscillation
-        -- If no previous movement, prefer clockwise for consistency
-        return player_state.SpinnerDelta >= 0 and 1 or -1
+        return (player_state.SpinnerDelta > 0) and 1 or -1
     end
 end
 
@@ -1138,7 +1151,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte),
     -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8)
 
-    local oob_data = string.pack(">IdBBBIIBBBhB", 
+    local oob_data = string.pack(">IdBBBIIBBBhBhB", 
         #data,                          -- I num_values
         reward,                         -- d reward
         0,                              -- B game_action
@@ -1150,7 +1163,9 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         controls.fire_commanded,        -- B fire_commanded (added)
         controls.zap_commanded,         -- B zap_commanded (added)
         controls.spinner_delta,         -- h spinner_delta (added)
-        is_attract_mode                 -- B is_attract_mode
+        is_attract_mode,                -- B is_attract_mode
+        enemies_state:nearest_enemy_segment(), -- B nearest_enemy_segment
+        player_state.position           -- Player segment
     )
     
     -- Combine out-of-band header with game state data
@@ -1175,6 +1190,18 @@ local function frame_callback()
     -- Update enemies state last to ensure all references are correct
     enemies_state:update(mem)
     
+    if game_state.gamegstate == 0x80 then
+        local port = manager.machine.ioport.ports[":BUTTONSP1"]
+        local startField = port.fields["P1 Button 2"]
+
+        -- Press P1 Start in MAME with proper press/release simulation
+        if game_state.frame_counter % 60 == 0 then
+            startField:set_value(1)
+        elseif game_state.frame_counter % 60 == 5 then
+            startField:set_value(0)
+        end
+    end
+
     -- Declare num_values at the start of the function
     local num_values = 0
     local bDone = false
@@ -1227,7 +1254,7 @@ local function frame_callback()
         if AUTO_PLAY_MODE then
             local port = manager.machine.ioport.ports[":IN2"]
             -- Press P1 Start in MAME with proper press/release simulation
-            if game_state.frame_counter % 300 == 0 then
+            if game_state.frame_counter % 60 == 0 then
                 -- Try different possible field names
                 local startField = port.fields["1 Player Start"] or 
                                    port.fields["P1 Start"] or 
@@ -1240,7 +1267,7 @@ local function frame_callback()
                 else
                     print("Error: Could not find start button field")
                 end
-            elseif game_state.frame_counter % 300 == 5 then
+            elseif game_state.frame_counter % 60 == 5 then
                 -- Release the button 5 frames later
                 local startField = port.fields["1 Player Start"] or 
                                    port.fields["P1 Start"] or 
@@ -1260,91 +1287,95 @@ local function frame_callback()
     -- Calculate the reward for the current frame - do this ONCE per frame
     local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state)
 
-    -- We only control the game in regular play mode (04) and zooming down the tube (20)
-    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
 
 
-        -- NOP out the jump that skips scoring in attract mode
-        mem:write_direct_u8(0xCA6F, 0xEA)
-        mem:write_direct_u8(0xCA70, 0xEA)
+    -- NOP out the jump that skips scoring in attract mode
+    mem:write_direct_u8(0xCA6F, 0xEA)
+    mem:write_direct_u8(0xCA70, 0xEA)
 
-        -- NOP out the clearing of zap_fire_new
-        mem:write_direct_u8(0x976E, 0x00)
-        mem:write_direct_u8(0x976F, 0x00)
-        -- Add periodic save mechanism based on frame counter instead of key press
-        -- This will trigger a save every 30,000 frames (approximately 8 minutes at 60fps)
-        if game_state.frame_counter % 30000 == 0 then
-            print("Frame counter triggered save at frame " .. game_state.frame_counter)
-            game_state.last_save_time = 0  -- Force save on next frame
-        end
-        
-        -- Try to detect ESC key press using a more reliable method
-        -- Check for ESC key in all available ports
-        local esc_pressed = false
-        for port_name, port in pairs(manager.machine.ioport.ports) do
-            for field_name, field in pairs(port.fields) do
-                if field_name:find("ESC") or field_name:find("Escape") then
-                    if field.pressed then
-                        print("ESC key detected - Triggering save")
-                        game_state.last_save_time = 0  -- Force save on next frame
-                        esc_pressed = true
-                        break
-                    end
+    -- NOP out the clearing of zap_fire_new
+    mem:write_direct_u8(0x976E, 0x00)
+    mem:write_direct_u8(0x976F, 0x00)
+    -- Add periodic save mechanism based on frame counter instead of key press
+    -- This will trigger a save every 30,000 frames (approximately 8 minutes at 60fps)
+    if game_state.frame_counter % 30000 == 0 then
+        print("Frame counter triggered save at frame " .. game_state.frame_counter)
+        game_state.last_save_time = 0  -- Force save on next frame
+    end
+    
+    -- Try to detect ESC key press using a more reliable method
+    -- Check for ESC key in all available ports
+    local esc_pressed = false
+    for port_name, port in pairs(manager.machine.ioport.ports) do
+        for field_name, field in pairs(port.fields) do
+            if field_name:find("ESC") or field_name:find("Escape") then
+                if field.pressed then
+                    print("ESC key detected - Triggering save")
+                    game_state.last_save_time = 0  -- Force save on next frame
+                    esc_pressed = true
+                    break
                 end
             end
-            if esc_pressed then break end
         end
-        
-        -- Flatten and serialize the game state data
-        local frame_data
-        frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
+        if esc_pressed then break end
+    end
+    
+    -- Flatten and serialize the game state data
+    local frame_data
+    frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
 
-        -- Send the serialized data to the Python script and get the components
-        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
+    -- Send the serialized data to the Python script and get the components
+    local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
 
-        -- BOT: Calculate spinner value based on direction to nearest enemy, it will play like demo mode
-        -- Calculate spinner value based on direction to nearest enemy, override what the model said above
-        -- spinner = -9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
+    -- BOT: Calculate spinner value based on direction to nearest enemy, it will play like demo mode
+    -- Calculate spinner value based on direction to nearest enemy, override what the model said above
+    -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
-        player_state.fire_commanded = fire
-        player_state.zap_commanded = zap
-        player_state.SpinnerDelta = spinner
+    player_state.fire_commanded = fire
+    player_state.zap_commanded = zap
+    player_state.SpinnerDelta = spinner
 
-        -- Update total bytes sent
-        total_bytes_sent = total_bytes_sent + #frame_data
+    -- Update total bytes sent
+    total_bytes_sent = total_bytes_sent + #frame_data
 
-        -- FPS Calculation
-        local current_time = os.clock()
-        local time_diff = current_time - last_fps_time
-        
-        -- Accumulate frames and time for more accurate FPS calculation
-        frame_count_accum = frame_count_accum + 1
-        frame_time_accum = frame_time_accum + time_diff
-        
-        -- Update FPS every 0.5 seconds for a more accurate measurement
-        if frame_time_accum >= 0.5 then
-            current_fps = frame_count_accum / frame_time_accum
-            -- Reset accumulators
-            frame_count_accum = 0
-            frame_time_accum = 0
-        end
-        
-        -- Always update the reference time for accurate time difference calculation
-        last_fps_time = current_time
+    -- FPS Calculation
+    local current_time = os.clock()
+    local time_diff = current_time - last_fps_time
+    
+    -- Accumulate frames and time for more accurate FPS calculation
+    frame_count_accum = frame_count_accum + 1
+    frame_time_accum = frame_time_accum + time_diff
+    
+    -- Update FPS every 0.5 seconds for a more accurate measurement
+    if frame_time_accum >= 0.5 then
+        current_fps = frame_count_accum / frame_time_accum
+        -- Reset accumulators
+        frame_count_accum = 0
+        frame_time_accum = 0
+    end
+    
+    -- Always update the reference time for accurate time difference calculation
+    last_fps_time = current_time
 
-        -- In LOG_ONLY_MODE, limit display updates to 10 times per second
-        local current_time_high_res = os.clock()
-        local should_update_display = not LOG_ONLY_MODE or 
-                                     (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
+    -- In LOG_ONLY_MODE, limit display updates to 10 times per second
+    local current_time_high_res = os.clock()
+    local should_update_display = not LOG_ONLY_MODE or 
+                                    (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
 
-        if should_update_display and SHOW_DISPLAY then
-            -- Update the display with the current action and metrics
-            update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
-            last_display_update = current_time_high_res
-        end
+    if should_update_display and SHOW_DISPLAY then
+        -- Update the display with the current action and metrics
+        update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
+        last_display_update = current_time_high_res
+    end
 
+    -- We only control the game in regular play mode (04) and zooming down the tube (20)
+    
+    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
         -- Apply the action to MAME controls
         controls:apply_action(fire, zap, spinner, game_state, player_state)
+    elseif game_state.gamestate == 0x12 then
+        -- Apply the action to MAME controls
+        controls:apply_action(0, frame_count % 2, 0, game_state, player_state)
     end
 
     return true

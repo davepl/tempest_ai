@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tempest AI Model: Combines Behavioral Cloning (BC) in attract mode with Reinforcement Learning (RL) in gameplay.
-- BC learns from game AI demonstrations; RL optimizes during player control.
+Tempest AI Model: Uses expert-guided exploration with Reinforcement Learning (RL) in gameplay.
+- Expert guidance provides useful moves; RL optimizes during player control.
 - Communicates with Tempest via Lua pipes; saves/loads models for persistence.
 """
 
@@ -26,30 +26,26 @@ import termios
 import fcntl
 
 # Constants
-ShouldReplayLog = False
-FORCE_CPU = False  # Force CPU usage if having persistent issues with MPS
-SPINNER_POWER = 1.0  # Linear spinner movement (1.0 = linear, higher = more small movements)
-initial_exploration_ratio = 0.25
-min_exploration_ratio = 0.05  # Lowest exploration rate
-exploration_decay = 0.99  # Decay rate
-BC_GUIDED_EXPLORATION_RATIO = 1.0
-LogFile = "/Users/dave/mame/big.log"
-MaxLogFrames = 1000000
+FORCE_CPU = False
+initial_exploration_ratio = 0.5
+min_exploration_ratio = 0.05
+exploration_decay = 0.99
+AIMING_GUIDED_EXPLORATION_RATIO = 0.9
 FIRE_EXPLORATION_RATIO = 0.05
-NumberOfParams = 128  # Confirm this matches Lua data serialization
+NumberOfParams = 128
+
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
+
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.zip"
-BC_MODEL_PATH = f"{MODEL_DIR}/tempest_bc_model.pt"
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Tempest AI Model')
-parser.add_argument('--replay', type=str, help='Path to a log file to replay for BC training')
 args = parser.parse_args()
 
-# Device selection: CUDA > MPS > CPU
+# Device selection
 if FORCE_CPU:
     device = torch.device("cpu")
     print("Using device: CPU (forced)")
@@ -57,78 +53,17 @@ else:
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device.type.upper()}")
 
-# Training metrics buffers and synchronization
+# Training metrics
 actor_losses = deque(maxlen=100)
 critic_losses = deque(maxlen=100)
-bc_training_queue = queue.Queue(maxsize=1000)
-bc_model_lock = threading.Lock()
 replay_buffer = deque(maxlen=100000)
 episode_rewards = deque(maxlen=5)
-bc_spinner_error_after = deque(maxlen=20)
 
 # Control source tracking
 random_control_count = 0
-bc_control_count = 0
+guided_control_count = 0
 rl_control_count = 0
 total_control_count = 0
-
-class BCModel(nn.Module):
-    """Enhanced BC model with clipped linear spinner output."""
-    def __init__(self, input_size=NumberOfParams):
-        super().__init__()
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_size, 1024),
-            nn.LeakyReLU(),
-            nn.BatchNorm1d(1024),
-            nn.Linear(1024, 512),
-            nn.LeakyReLU(),
-            nn.BatchNorm1d(512),
-            nn.Linear(512, 256),
-            nn.LeakyReLU(),
-            nn.Linear(256, 128),
-            nn.LeakyReLU(),
-            nn.Dropout(0.2)
-        )
-        self.fire_output = nn.Linear(128, 1)
-        self.zap_output = nn.Linear(128, 1)
-        self.spinner_output = nn.Linear(128, 1)
-        self.spinner_var_output = nn.Linear(128, 1)
-        
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)
-        self.to(device)
-
-    def forward(self, x):
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        if x.device != device:
-            x = x.to(device)
-            
-        x = self.feature_extractor[0](x)
-        x = self.feature_extractor[1](x)
-        if x.size(0) > 1:
-            x = self.feature_extractor[2](x)
-        x = self.feature_extractor[3](x)
-        x = self.feature_extractor[4](x)
-        if x.size(0) > 1:
-            x = self.feature_extractor[5](x)
-        x = self.feature_extractor[6](x)
-        x = self.feature_extractor[7](x)
-        x = self.feature_extractor[8](x)
-        x = self.feature_extractor[9](x)
-        x = self.feature_extractor[10](x)
-        
-        fire_out = torch.sigmoid(self.fire_output(x))
-        zap_out = torch.sigmoid(self.zap_output(x))
-        spinner_out = torch.tanh(self.spinner_output(x))
-        spinner_var = torch.clamp(F.softplus(self.spinner_var_output(x)), 0.01, 0.5)
-        
-        return torch.cat([fire_out, zap_out, spinner_out, spinner_var], dim=1), spinner_out
 
 class Actor(nn.Module):
     def __init__(self, state_dim=NumberOfParams):
@@ -215,7 +150,7 @@ class Critic(nn.Module):
         else:
             x1 = self.bn1(x)
         x = self.fc2(x1)
-        x = F.relu(x)
+        x = F.relu(x)  # Fixed from 'najczęściej(x)'
         if x.size(0) == 1:
             x2 = x
         else:
@@ -229,11 +164,10 @@ actor_optimizer = optim.Adam(actor.parameters(), lr=1e-4)
 critic_optimizer = optim.Adam(critic.parameters(), lr=1e-4)
 
 def process_frame_data(data):
-    """Process frame data from Lua using exact same format string as Lua."""
     if not data:
         return None
     
-    format_string = ">IdBBBIIBBBhB"
+    format_string = ">IdBBBIIBBBhBhB"
     try:
         header_size = struct.calcsize(format_string)
         if len(data) < header_size:
@@ -241,7 +175,7 @@ def process_frame_data(data):
             return None
         
         values = struct.unpack(format_string, data[:header_size])
-        num_values, reward, game_action, game_mode, done, frame_counter, score, save_signal, fire, zap, spinner, is_attract = values
+        num_values, reward, game_action, game_mode, done, frame_counter, score, save_signal, fire, zap, spinner, is_attract, nearest_enemy_segment, player_segment = values
         
         game_data_bytes = data[header_size:]
         state_values = []
@@ -258,89 +192,16 @@ def process_frame_data(data):
             state = np.pad(state, (0, NumberOfParams - len(state)), 'constant')
         
         game_action_tuple = (bool(fire), bool(zap), spinner)
-        return state, reward, game_action_tuple, game_mode, bool(done), bool(is_attract), save_signal
+        return state, reward, game_action_tuple, game_mode, bool(done), bool(is_attract), save_signal, nearest_enemy_segment, player_segment
         
     except Exception as e:
         print(f"ERROR unpacking data: {e}")
         traceback.print_exc()
         return None
 
-def train_model_with_batch(model, batch):
-    """Train model with a batch of data and reward information."""
-    global bc_spinner_error_after
-    
-    with bc_model_lock:
-        states = []
-        fire_targets = []
-        zap_targets = []
-        spinner_targets = []
-        rewards = []
-        
-        for state, game_action, reward in batch:
-            fire, zap, spinner = game_action
-            normalized_spinner = max(-31, min(31, spinner)) / 31.0
-            states.append(state)
-            fire_targets.append(float(fire))
-            zap_targets.append(float(zap))
-            spinner_targets.append(normalized_spinner)
-            rewards.append(float(reward))
-        
-        state_tensor = torch.FloatTensor(np.array(states)).to(device)
-        targets = torch.FloatTensor([[f, z, s, 0.1] for f, z, s in zip(fire_targets, zap_targets, spinner_targets)]).to(device)
-        reward_tensor = torch.FloatTensor(rewards).to(device)
-        
-        batch_size = state_tensor.size(0)
-        should_train = batch_size > 1
-        
-        if should_train:
-            model.train()
-        else:
-            model.eval()
-        
-        model.optimizer.zero_grad()
-        preds, _ = model(state_tensor)
-        
-        reward_weights = torch.log1p(reward_tensor - reward_tensor.min() + 1e-6)
-        reward_weights = reward_weights / reward_weights.mean()
-        reward_weights = reward_weights.unsqueeze(1)
-        
-        fire_zap_loss = F.binary_cross_entropy(preds[:, :2], targets[:, :2], reduction='none') * reward_weights
-        fire_zap_loss = fire_zap_loss.mean()
-        spinner_loss = F.mse_loss(preds[:, 2:3], targets[:, 2:3], reduction='none') * reward_weights * 0.5
-        spinner_loss = spinner_loss.mean()
-        
-        loss = fire_zap_loss + spinner_loss
-        
-        if should_train:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            model.optimizer.step()
-        
-        with torch.no_grad():
-            preds_after, _ = model(state_tensor)
-            spinner_error_after = F.mse_loss(preds_after[:, 2], targets[:, 2]).item()
-            bc_spinner_error_after.append(spinner_error_after)
-    
-    return loss.item()
-
-def background_bc_train(bc_model):
-    """Background BC training thread."""
-    while True:
-        try:
-            batch = []
-            while len(batch) < 256 and not bc_training_queue.empty():
-                batch.append(bc_training_queue.get())
-            if batch:
-                train_model_with_batch(bc_model, batch)
-            time.sleep(0.01)
-        except Exception as e:
-            print(f"BC training error: {e}")
-            traceback.print_exc()
-
 def background_rl_train(rl_model_lock, actor_model, critic_model):
-    """Background RL training thread with explicit model parameters."""
     gamma = 0.99
-    batch_size = 64
+    batch_size = 1024
     
     while True:
         if len(replay_buffer) < batch_size:
@@ -358,6 +219,7 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
                 next_states = torch.tensor(np.array(next_states_list), dtype=torch.float32, device=device)
                 dones = torch.tensor(np.array(dones_list), dtype=torch.float32, device=device).unsqueeze(1)
 
+                # Critic training
                 critic_optimizer.zero_grad(set_to_none=True)
                 current_values = critic_model(states)
                 with torch.no_grad():
@@ -369,6 +231,7 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
                 critic_optimizer.step()
                 critic_losses.append(critic_loss.item())
 
+                # Actor training
                 actor_optimizer.zero_grad(set_to_none=True)
                 action_logits = actor_model(states)
                 with torch.no_grad():
@@ -411,107 +274,9 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
             traceback.print_exc()
             time.sleep(1)
 
-def replay_log_file(log_file_path, bc_model):
-    """Train BC model by replaying demonstration log file."""
-    if not os.path.exists(log_file_path):
-        print(f"Error: Log file {log_file_path} not found")
-        return False
-    
-    print(f"Replaying log file: {log_file_path}")
-    frame_count = 0
-    batch_size = 128
-    training_data = []
-    total_loss = 0
-    num_batches = 0
-    
-    total_fire = 0
-    total_zap = 0
-    total_reward = 0
-    
-    format_string = ">IdBBBIIBBBhB"
-    header_size = struct.calcsize(format_string)
-    
-    print("\n" + "-" * 50)
-    print(f"{'Frames':>8} | {'Loss':>8} | {'Fire%':>6} | {'Zap%':>6} | {'Reward':>8}")
-    print("-" * 50)
-    
-    with open(log_file_path, 'rb') as f:
-        frames_processed = 0
-        while frame_count < MaxLogFrames:
-            header_bytes = f.read(header_size)
-            if not header_bytes or len(header_bytes) < header_size:
-                print(f"End of file reached after {frames_processed} frames")
-                break
-            
-            header_values = struct.unpack(format_string, header_bytes)
-            num_values = header_values[0]
-            
-            if num_values != NumberOfParams:
-                print(f"Warning: Invalid number of values: {num_values} != {NumberOfParams}")
-                continue
-            
-            payload_size = num_values * 2
-            payload_bytes = f.read(payload_size)
-            if len(payload_bytes) < payload_size:
-                print(f"Payload data incomplete after {frames_processed} frames")
-                break
-            
-            frame_data = header_bytes + payload_bytes
-            result = process_frame_data(frame_data)
-            if result is None:
-                print(f"Warning: Invalid frame data at frame {frames_processed}, skipping")
-                continue
-            
-            state, reward, game_action, game_mode, done, is_attract, save_signal = result
-            fire, zap, spinner = game_action
-            
-            frames_processed += 1
-            total_fire += fire
-            total_zap += zap
-            total_reward += reward
-            
-            action = (fire, zap, spinner)
-            training_data.append((state, action, reward))
-            
-            if len(training_data) >= batch_size:
-                batch_loss = train_model_with_batch(bc_model, training_data[:batch_size])
-                total_loss += batch_loss
-                num_batches += 1
-                
-                if frame_count % 1000 == 0:
-                    current_fire_rate = total_fire / max(1, frames_processed) * 100
-                    current_zap_rate = total_zap / max(1, frames_processed) * 100
-                    avg_reward = total_reward / max(1, frames_processed)
-                    print(f"{frame_count:8d} | {batch_loss:8.4f} | {current_fire_rate:6.2f} | "
-                          f"{current_zap_rate:6.2f} | {avg_reward:8.2f}")
-                
-                training_data = training_data[batch_size:]
-                frame_count += batch_size
-        
-        if training_data:
-            batch_loss = train_model_with_batch(bc_model, training_data)
-            total_loss += batch_loss
-            num_batches += 1
-            frame_count += len(training_data)
-        
-        avg_loss = total_loss / num_batches if num_batches > 0 else float('nan')
-        
-        print("-" * 50)
-        print(f"Replay complete: {frame_count} frames processed")
-        print(f"Final Statistics:")
-        print(f"  - Fire Rate: {total_fire/frames_processed*100:.2f}%")
-        print(f"  - Zap Rate: {total_zap/frames_processed*100:.2f}%")
-        print(f"  - Avg Reward: {total_reward/frames_processed:.2f}")
-        print(f"  - Avg Loss: {avg_loss:.6f}")
-        
-        print(f"Saving BC model to {BC_MODEL_PATH}")
-        torch.save(bc_model.state_dict(), BC_MODEL_PATH)
-        return True
-
 frame_count = 0
 
 def setup_keyboard_input():
-    """Set up non-blocking keyboard input."""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     new_settings = termios.tcgetattr(fd)
@@ -522,14 +287,12 @@ def setup_keyboard_input():
     return old_settings
 
 def restore_keyboard_input(old_settings):
-    """Restore original keyboard input settings."""
     termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old_settings)
 
 def print_metrics_table_header():
-    """Print the header row for the metrics table."""
     header = (
         f"{'Frame':>8} | {'Actor Loss':>10} | {'Critic Loss':>11} | {'Mean Reward':>12} | {'Explore %':>9} | "
-        f"{'Random %':>8} | {'BC %':>8} | {'RL %':>8} | {'Spin Err':>8} | {'Extreme %':>9} | {'Buffer':>7}"
+        f"{'Random %':>8} | {'Guided %':>8} | {'RL %':>8} | {'Extreme %':>9} | {'Buffer':>7}"
     )
     separator = "-" * len(header)
     print("\n" + separator)
@@ -537,41 +300,21 @@ def print_metrics_table_header():
     print(separator)
 
 def print_metrics_table_row(frame_count, metrics_dict):
-    """Print a single row of the metrics table with the provided metrics."""
     row = (
         f"{frame_count:8d} | {metrics_dict.get('actor_loss', 'N/A'):10.4f} | "
         f"{metrics_dict.get('critic_loss', 'N/A'):11.2f} | {metrics_dict.get('mean_reward', 'N/A'):12.2f} | "
         f"{metrics_dict.get('exploration', 0.0)*100:8.2f}% | "
-        f"{metrics_dict.get('random_ratio', 0.0)*100:7.2f}% | {metrics_dict.get('bc_ratio', 0.0)*100:7.2f}% | "
-        f"{metrics_dict.get('rl_ratio', 0.0)*100:7.2f}% | {metrics_dict.get('spinner_error', 'N/A'):8.4f} | "
+        f"{metrics_dict.get('random_ratio', 0.0)*100:7.2f}% | {metrics_dict.get('guided_ratio', 0.0)*100:7.2f}% | "
+        f"{metrics_dict.get('rl_ratio', 0.0)*100:7.2f}% | "
         f"{metrics_dict.get('extreme_ratio', 0.0)*100:8.2f}% | {metrics_dict.get('buffer_size', 0):7d}"
     )
     print(row)
 
 def main():
-    """Main execution loop for Tempest AI."""
-    global frame_count, actor, critic, random_control_count, bc_control_count, rl_control_count, total_control_count
+    global frame_count, actor, critic, random_control_count, guided_control_count, rl_control_count, total_control_count
     
-    bc_model, actor = initialize_models(actor, critic)
     rl_model_lock = threading.Lock()
-    
-    try:
-        old_terminal_settings = setup_keyboard_input()
-        print("Keyboard commands enabled: Press 'm' for metrics display (detailed metrics disabled in this version)")
-    except:
-        print("Warning: Could not set up keyboard input. Metrics display via keyboard disabled.")
-        old_terminal_settings = None
-    
     threading.Thread(target=background_rl_train, args=(rl_model_lock, actor, critic), daemon=True).start()
-    threading.Thread(target=background_bc_train, args=(bc_model,), daemon=True).start()
-
-    if ShouldReplayLog:
-        args.replay = LogFile
-
-    if args.replay:
-        replay_log_file(args.replay, bc_model)
-        if not os.path.exists(LUA_TO_PY_PIPE):
-            return
 
     for pipe in [LUA_TO_PY_PIPE, PY_TO_LUA_PIPE]:
         if os.path.exists(pipe): os.unlink(pipe)
@@ -610,7 +353,7 @@ def main():
                     py_to_lua.flush()
                     continue
                 
-                state, reward, game_action, game_mode, done, is_attract, save_signal = result
+                state, reward, game_action, game_mode, done, is_attract, save_signal, nearest_enemy_segment, player_segment = result
                 
                 if state is None or reward is None or game_action is None or game_mode is None or done is None or is_attract is None:
                     print(f"Warning: Invalid data in processed result, skipping frame.")
@@ -640,78 +383,59 @@ def main():
                 else:
                     total_episode_reward += reward
                     if not is_attract and previous_state is not None:
-                        replay_buffer.append((previous_state, game_action, reward, state, done))
+                        replay_buffer.append((previous_state, action.cpu().numpy()[0], reward, state, done))
 
                 previous_state = state
 
-                if is_attract and game_action:
-                    try:
-                        bc_training_queue.put((state, game_action, reward), block=False)
-                        action = encode_action(1, 1, -1)
-                    except queue.Full:
-                        print("BC training queue is full, skipping attract mode action")
-                        action = encode_action(0, 0, 0)
-                else:
-                    if len(last_spinner_values) >= 50:
-                        extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
-                        extreme_ratio = extreme_count / len(last_spinner_values)
-                        if extreme_ratio > 0.7:
-                            current_exploration_ratio = max(current_exploration_ratio, 0.5)
-                    
-                    if frame_count % 1000 == 0 and current_exploration_ratio > min_exploration_ratio:
-                        current_exploration_ratio *= exploration_decay
-                    
-                    if random.random() < current_exploration_ratio:
-                        if random.random() < BC_GUIDED_EXPLORATION_RATIO:
-                            with torch.no_grad():
-                                bc_model.eval()
-                                bc_preds, _ = bc_model(state_tensor)
-                                bc_fire = bc_preds[0, 0].item() > 0.5
-                                bc_zap = bc_preds[0, 1].item() > 0.5
-                                bc_spinner = bc_preds[0, 2].item()
-                                noise_scale = 0.3
-                                spinner_value = bc_spinner + random.gauss(0, noise_scale)
-                                spinner_value = max(-0.95, min(0.95, spinner_value))
-                                if random.random() < FIRE_EXPLORATION_RATIO:
-                                    bc_fire = 0
-                                action = torch.tensor([[float(bc_fire), float(bc_zap), spinner_value]], 
-                                                     dtype=torch.float32, device=device)
-                                bc_control_count += 1
-                                total_control_count += 1
+                if len(last_spinner_values) >= 50:
+                    extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
+                    extreme_ratio = extreme_count / len(last_spinner_values)
+                    if extreme_ratio > 0.7:
+                        current_exploration_ratio = max(current_exploration_ratio, 0.5)
+                
+                if frame_count % 1000 == 0 and current_exploration_ratio > min_exploration_ratio:
+                    current_exploration_ratio *= exploration_decay
+                
+                if random.random() < current_exploration_ratio:
+                    if random.random() < AIMING_GUIDED_EXPLORATION_RATIO:
+                        if nearest_enemy_segment == player_segment or nearest_enemy_segment < 0:
+                            spinner_value = 0
+                        elif nearest_enemy_segment < player_segment:
+                            spinner_value = 0.35
                         else:
-                            if random.random() < 0.4:
-                                optimal_normalized = 0
-                                spinner_val = optimal_normalized + random.gauss(0, 0.2)
-                                spinner_val = max(-0.95, min(0.95, spinner_val))
-                                random_actions = torch.tensor([
-                                    float(random.random() > 0.5),
-                                    float(random.random() > 0.95),
-                                    spinner_val
-                                ], dtype=torch.float32, device=device)
-                            else:
-                                random_actions = torch.tensor([
-                                    float(random.random() > 0.5),
-                                    float(random.random() > 0.95),
-                                    random.uniform(-1.0, 1.0)
-                                ], dtype=torch.float32, device=device)
-                            action = random_actions.unsqueeze(0)
-                            random_control_count += 1
-                            total_control_count += 1
-                    else:
-                        with torch.no_grad():
-                            action = actor.get_action(state_tensor, deterministic=True)
-                        rl_control_count += 1
+                            spinner_value = -0.35
+                        action = torch.tensor([[1.0, 0.0, spinner_value]], dtype=torch.float32, device=device)
+                        guided_control_count += 1
                         total_control_count += 1
+                    else:
+                        if random.random() < 0.4:
+                            optimal_normalized = 0
+                            spinner_val = optimal_normalized + random.gauss(0, 0.2)
+                            spinner_val = max(-0.95, min(0.95, spinner_val))
+                            random_actions = torch.tensor([
+                                float(random.random() > 0.5),
+                                float(random.random() > 0.95),
+                                spinner_val
+                            ], dtype=torch.float32, device=device)
+                        else:
+                            random_actions = torch.tensor([
+                                float(random.random() > 0.5),
+                                float(random.random() > 0.95),
+                                random.uniform(-1.0, 1.0)
+                            ], dtype=torch.float32, device=device)
+                        action = random_actions.unsqueeze(0)
+                        random_control_count += 1
+                        total_control_count += 1
+                else:
+                    with torch.no_grad():
+                        action = actor.get_action(state_tensor, deterministic=True)
+                    rl_control_count += 1
+                    total_control_count += 1
                 
                 action_cpu = action.cpu()
                 fire, zap, spinner = decode_action(action_cpu)
                 last_spinner_values.append(action_cpu[0, 2].item())
 
-                try:
-                    sys.stdin.read(1)
-                except:
-                    pass
-                
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
 
@@ -724,9 +448,8 @@ def main():
                         extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
                         extreme_ratio = extreme_count / len(last_spinner_values)
                     random_ratio = random_control_count / max(1, total_control_count)
-                    bc_ratio = bc_control_count / max(1, total_control_count)
+                    guided_ratio = guided_control_count / max(1, total_control_count)
                     rl_ratio = rl_control_count / max(1, total_control_count)
-                    spinner_error = np.mean(bc_spinner_error_after) if bc_spinner_error_after else float('nan')
                     
                     metrics = {
                         'actor_loss': actor_loss_mean,
@@ -734,113 +457,38 @@ def main():
                         'mean_reward': mean_reward,
                         'exploration': current_exploration_ratio,
                         'random_ratio': random_ratio,
-                        'bc_ratio': bc_ratio,
+                        'guided_ratio': guided_ratio,
                         'rl_ratio': rl_ratio,
-                        'spinner_error': spinner_error,
                         'extreme_ratio': extreme_ratio,
                         'buffer_size': len(replay_buffer)
                     }
                     print_metrics_table_row(frame_count, metrics)
 
                 if save_signal:
-                    print("\nSaving models...")
-                    threading.Thread(target=save_models, args=(actor, bc_model), daemon=True).start()
+                    print("\nSaving model...")
+                    threading.Thread(target=save_model, args=(actor,), daemon=True).start()
                     print_metrics_table_header()
                 
                 frame_count += 1
 
             except KeyboardInterrupt:
-                save_models(actor, bc_model)
+                save_model(actor)
                 break
             except Exception as e:
                 print(f"Error: {e}")
                 traceback.print_exc()
                 time.sleep(5)
-        
-        if old_terminal_settings:
-            restore_keyboard_input(old_terminal_settings)
 
-def transfer_knowledge_from_bc_to_rl(bc_model, actor_model):
-    """Transfer knowledge from BC model to RL model."""
-    print("Transferring knowledge from BC model to RL model...")
-    with torch.no_grad():
-        actor_model.fc1.weight.data.copy_(bc_model.feature_extractor[0].weight.data)
-        actor_model.fc1.bias.data.copy_(bc_model.feature_extractor[0].bias.data)
-        actor_model.fc2.weight.data.copy_(bc_model.feature_extractor[4].weight.data)
-        actor_model.fc2.bias.data.copy_(bc_model.feature_extractor[4].bias.data)
-        actor_model.fc3.weight.data.copy_(bc_model.feature_extractor[6].weight.data)
-        actor_model.fc3.bias.data.copy_(bc_model.feature_extractor[6].bias.data)
-        actor_model.fire_head.weight.data.copy_(bc_model.fire_output.weight.data)
-        actor_model.fire_head.bias.data.copy_(bc_model.fire_output.bias.data)
-        actor_model.zap_head.weight.data.copy_(bc_model.zap_output.weight.data)
-        actor_model.zap_head.bias.data.copy_(bc_model.zap_output.bias.data)
-        actor_model.spinner_head.weight.data.copy_(bc_model.spinner_output.weight.data)
-        actor_model.spinner_head.bias.data.copy_(bc_model.spinner_output.bias.data)
-        actor_model.spinner_var_head.bias.data.fill_(-1.0)
-    print("Knowledge transfer complete!")
-    return actor_model
-
-def initialize_models(actor_model=None, critic_model=None):
-    """Initialize BC and RL models, with knowledge transfer between them."""
-    if actor_model is None:
-        actor_model = Actor()
-    if critic_model is None:
-        critic_model = Critic()
-    
-    bc_model = BCModel()
-    transfer_happened = False
-    
-    if os.path.exists(BC_MODEL_PATH):
-        bc_model.eval()
-        bc_model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=device))
-        print(f"Loaded BC model from {BC_MODEL_PATH}")
-        bc_loaded = True
-    else:
-        bc_loaded = False
-        print("No existing BC model found - will train from scratch")
-    
-    if os.path.exists(LATEST_MODEL_PATH):
-        actor_model.eval()
-        critic_model.eval()
-        try:
-            actor_model.load_state_dict(torch.load(LATEST_MODEL_PATH, map_location=device))
-            print(f"Loaded RL model from {LATEST_MODEL_PATH}")
-        except Exception as e:
-            print(f"Error loading RL model: {e}. Will initialize from BC model.")
-            if bc_loaded:
-                actor_model = transfer_knowledge_from_bc_to_rl(bc_model, actor_model)
-                transfer_happened = True
-    elif bc_loaded:
-        actor_model = transfer_knowledge_from_bc_to_rl(bc_model, actor_model)
-        transfer_happened = True
-    
-    if not transfer_happened and bc_loaded and random.random() < 0.3:
-        print("Refreshing RL model with BC knowledge (periodic knowledge update)")
-        actor_model = transfer_knowledge_from_bc_to_rl(bc_model, actor_model)
-    
-    return bc_model, actor_model
-
-def save_models(actor_model=None, bc_model=None):
-    """Save BC and RL models."""
+def save_model(actor_model):
     try:
-        if bc_model is not None:
-            with bc_model_lock:
-                bc_model.eval()
-                torch.save(bc_model.state_dict(), BC_MODEL_PATH)
-                print(f"BC model saved to {BC_MODEL_PATH}")
-                
-        if actor_model is not None:
-            actor_model.eval()
-            torch.save(actor_model.state_dict(), LATEST_MODEL_PATH)
-            print(f"Actor model saved to {LATEST_MODEL_PATH}")
-            
-        print(f"All models saved to {MODEL_DIR}")
+        actor_model.eval()
+        torch.save(actor_model.state_dict(), LATEST_MODEL_PATH)
+        print(f"Actor model saved to {LATEST_MODEL_PATH}")
     except Exception as e:
-        print(f"Error saving models: {e}")
+        print(f"Error saving model: {e}")
         traceback.print_exc()
 
 def encode_action(fire, zap, spinner_delta):
-    """Encode actions for RL model consistency."""
     fire_val = float(fire)
     zap_val = float(zap)
     if abs(spinner_delta) < 10:
@@ -852,8 +500,7 @@ def encode_action(fire, zap, spinner_delta):
         normalized_spinner = sign * min(squashed / 31.0, 1.0)
     return torch.tensor([[fire_val, zap_val, normalized_spinner]], dtype=torch.float32, device=device)
 
-def decode_action(action, spinner_power=SPINNER_POWER):
-    """Decode actions from PyTorch tensor."""
+def decode_action(action):
     fire = 1 if action[0, 0].item() > 0.5 else 0
     zap = 1 if action[0, 1].item() > 0.5 else 0
     spinner_val = action[0, 2].item()
