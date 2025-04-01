@@ -27,12 +27,15 @@ import fcntl
 
 # Constants
 FORCE_CPU = False
-initial_exploration_ratio = 0.5
+initial_exploration_ratio = 0.0
 min_exploration_ratio = 0.05
 exploration_decay = 0.99
 AIMING_GUIDED_EXPLORATION_RATIO = 0.9
 FIRE_EXPLORATION_RATIO = 0.05
 NumberOfParams = 128
+
+# Add new parameter for expert-guided samples prioritization
+EXPERT_SAMPLE_WEIGHT = 2.0  # Expert samples are 2x more likely to be selected during training
 
 LUA_TO_PY_PIPE = "/tmp/lua_to_py"
 PY_TO_LUA_PIPE = "/tmp/py_to_lua"
@@ -56,7 +59,7 @@ else:
 # Training metrics
 actor_losses = deque(maxlen=100)
 critic_losses = deque(maxlen=100)
-replay_buffer = deque(maxlen=100000)
+replay_buffer = []  # Change from deque to list so we can store additional info
 episode_rewards = deque(maxlen=5)
 
 # Control source tracking
@@ -64,6 +67,9 @@ random_control_count = 0
 guided_control_count = 0
 rl_control_count = 0
 total_control_count = 0
+
+# Add new parameter for expert-guided samples prioritization
+MAX_REPLAY_BUFFER = 100000
 
 class Actor(nn.Module):
     def __init__(self, state_dim=NumberOfParams):
@@ -107,7 +113,7 @@ class Actor(nn.Module):
         raw_spinner = self.spinner_head(x)
         normalized_optimal = 0
         distance_from_optimal = raw_spinner - normalized_optimal
-        bell_curve_factor = torch.exp(-4.0 * distance_from_optimal * distance_from_optimal)
+        bell_curve_factor = torch.exp(-2.0 * distance_from_optimal * distance_from_optimal)
         spinner_mean = torch.tanh(raw_spinner * bell_curve_factor * 2.0)
         raw_var = self.spinner_var_head(x)
         spinner_var = torch.sigmoid(raw_var) * 0.15
@@ -150,7 +156,7 @@ class Critic(nn.Module):
         else:
             x1 = self.bn1(x)
         x = self.fc2(x1)
-        x = F.relu(x)  # Fixed from 'najczęściej(x)'
+        x = F.relu(x) 
         if x.size(0) == 1:
             x2 = x
         else:
@@ -210,8 +216,13 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
 
         try:
             with rl_model_lock:
-                batch = random.sample(replay_buffer, batch_size)
-                states_list, actions_list, rewards_list, next_states_list, dones_list = zip(*batch)
+                # Prioritized sampling - expert-guided experiences are more likely to be selected
+                sample_weights = [exp[5] for exp in replay_buffer]  # Get the expert weights
+                batch_indices = random.choices(range(len(replay_buffer)), weights=sample_weights, k=min(batch_size, len(replay_buffer)))
+                batch = [replay_buffer[i] for i in batch_indices]
+                
+                # Unpack the batch, ignoring the expert flag at index 5
+                states_list, actions_list, rewards_list, next_states_list, dones_list, _ = zip(*batch)
                 
                 states = torch.tensor(np.array(states_list), dtype=torch.float32, device=device)
                 actions = torch.tensor(np.array(actions_list), dtype=torch.float32, device=device)
@@ -236,7 +247,16 @@ def background_rl_train(rl_model_lock, actor_model, critic_model):
                 action_logits = actor_model(states)
                 with torch.no_grad():
                     current_values = critic_model(states)
-                    advantages = torch.clamp(target_values - current_values, -10.0, 10.0)
+                    # Use a modified advantage calculation that better emphasizes positive rewards
+                    # and decreases the impact of negative rewards
+                    raw_advantages = target_values - current_values
+                    # Scale advantages - boost positive advantages and reduce penalty of negative ones
+                    scaled_advantages = torch.where(
+                        raw_advantages > 0, 
+                        raw_advantages * 1.2,  # Boost positive advantages
+                        raw_advantages * 0.8   # Soften negative advantages
+                    )
+                    advantages = torch.clamp(scaled_advantages, -10.0, 10.0)
                 fire_logits, zap_logits, spinner_mean, spinner_var = torch.split(action_logits, 1, dim=-1)
                 
                 fire_probs = torch.clamp(torch.sigmoid(fire_logits), 1e-8, 1 - 1e-8)
@@ -311,7 +331,7 @@ def print_metrics_table_row(frame_count, metrics_dict):
     print(row)
 
 def main():
-    global frame_count, actor, critic, random_control_count, guided_control_count, rl_control_count, total_control_count
+    global frame_count, actor, critic, random_control_count, guided_control_count, rl_control_count, total_control_count, replay_buffer
     
     rl_model_lock = threading.Lock()
     threading.Thread(target=background_rl_train, args=(rl_model_lock, actor, critic), daemon=True).start()
@@ -329,6 +349,8 @@ def main():
     extreme_threshold = 0.8
     print_metrics_table_header()
     previous_state = None
+    previous_action = None
+    is_expert_guided = False
     
     with os.fdopen(os.open(LUA_TO_PY_PIPE, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_to_py, \
          open(PY_TO_LUA_PIPE, "wb") as py_to_lua:
@@ -369,6 +391,7 @@ def main():
                     episode_rewards.append(total_episode_reward)
                     last_spinner_values.clear()
                     previous_state = None
+                    previous_action = None
                     
                 elif done and done_latch:
                     py_to_lua.write(struct.pack("bbb", 0, 0, 0))
@@ -379,13 +402,31 @@ def main():
                     done_latch = False
                     total_episode_reward = 0
                     previous_state = None
+                    previous_action = None
                     
                 else:
                     total_episode_reward += reward
-                    if not is_attract and previous_state is not None:
-                        replay_buffer.append((previous_state, action.cpu().numpy()[0], reward, state, done))
+                    # Add experiences to replay buffer regardless of attract mode
+                    # but we'll still track if it was from attract mode for debugging
+                    if previous_state is not None and previous_action is not None:
+                        # The expert weight will be EXPERT_SAMPLE_WEIGHT if this was an expert-guided action
+                        # otherwise it will be 1.0 (standard weight)
+                        expert_weight = EXPERT_SAMPLE_WEIGHT if is_expert_guided else 1.0
+                        
+                        # Add to replay buffer: state, action, reward, next_state, done, expert_weight
+                        replay_buffer.append((previous_state, previous_action.cpu().numpy()[0], reward, state, done, expert_weight))
+                        
+                        # Keep replay buffer size in check
+                        if len(replay_buffer) > MAX_REPLAY_BUFFER:
+                            # Remove oldest samples (non-expert ones first if possible)
+                            # Sort by expert_weight (ascending) so non-expert samples come first
+                            replay_buffer.sort(key=lambda x: x[5])
+                            # Remove a batch of oldest samples
+                            removal_count = max(1, int(0.05 * MAX_REPLAY_BUFFER))  # Remove 5% of buffer
+                            replay_buffer = replay_buffer[removal_count:]
 
                 previous_state = state
+                is_expert_guided = False  # Reset expert guidance flag for this frame
 
                 if len(last_spinner_values) >= 50:
                     extreme_count = sum(1 for v in last_spinner_values if abs(v) > extreme_threshold)
@@ -398,15 +439,49 @@ def main():
                 
                 if random.random() < current_exploration_ratio:
                     if random.random() < AIMING_GUIDED_EXPLORATION_RATIO:
-                        if nearest_enemy_segment == player_segment or nearest_enemy_segment < 0:
+                        # Enhanced expert-guided behavior
+                        if nearest_enemy_segment < 0:
+                            # No enemies - don't move
                             spinner_value = 0
-                        elif nearest_enemy_segment < player_segment:
-                            spinner_value = 0.35
+                            fire_value = 0  # No enemies to shoot at
+                        elif nearest_enemy_segment == player_segment:
+                            # Aligned with enemy - fire but don't move
+                            spinner_value = 0
+                            fire_value = 1  # Fire when aligned
                         else:
-                            spinner_value = -0.35
-                        action = torch.tensor([[1.0, 0.0, spinner_value]], dtype=torch.float32, device=device)
+                            # Need to move toward enemy - calculate dynamic spinner value
+                            # Calculate distances in both directions
+                            clockwise_distance = 0
+                            counterclockwise_distance = 0
+                            
+                            if nearest_enemy_segment > player_segment:
+                                clockwise_distance = nearest_enemy_segment - player_segment
+                                counterclockwise_distance = player_segment + (16 - nearest_enemy_segment)
+                            else:
+                                clockwise_distance = nearest_enemy_segment + (16 - player_segment)
+                                counterclockwise_distance = player_segment - nearest_enemy_segment
+                            
+                            # Use a proportional spinner value based on distance
+                            min_distance = min(clockwise_distance, counterclockwise_distance)
+                            
+                            # Scale spinner value based on distance (greater distance = higher value)
+                            # This creates a more dynamic response than fixed values
+                            intensity = min(0.9, 0.3 + (min_distance * 0.05))
+                            
+                            if clockwise_distance < counterclockwise_distance:
+                                # Move clockwise (negative spinner)
+                                spinner_value = -intensity
+                            else:
+                                # Move counterclockwise (positive spinner)
+                                spinner_value = intensity
+                            
+                            # Fire if we're close to alignment
+                            fire_value = 1.0 if min_distance <= 1 else 0.0
+                            
+                        action = torch.tensor([[fire_value, 0.0, spinner_value]], dtype=torch.float32, device=device)
                         guided_control_count += 1
                         total_control_count += 1
+                        is_expert_guided = True  # Mark this as expert-guided for the replay buffer
                     else:
                         if random.random() < 0.4:
                             optimal_normalized = 0
@@ -435,6 +510,7 @@ def main():
                 action_cpu = action.cpu()
                 fire, zap, spinner = decode_action(action_cpu)
                 last_spinner_values.append(action_cpu[0, 2].item())
+                previous_action = action  # Store action for next frame's replay buffer
 
                 py_to_lua.write(struct.pack("bbb", fire, zap, spinner))
                 py_to_lua.flush()
@@ -505,6 +581,7 @@ def decode_action(action):
     zap = 1 if action[0, 1].item() > 0.5 else 0
     spinner_val = action[0, 2].item()
     spinner = int(spinner_val * 31)
+    
     return fire, zap, spinner
 
 if __name__ == "__main__":
