@@ -27,7 +27,7 @@ PIPE_CONFIG = {
     "lua_to_py": "/tmp/lua_to_py",
     "py_to_lua": "/tmp/py_to_lua",
     "params_count": 128,
-    "expert_ratio_start": 0.60,  # Start with 75% expert guidance
+    "expert_ratio_start": 0.4,    # Start with these level of expert guidance
     "expert_ratio_min": 0.01,     # Minimum expert guidance (10%)
     "expert_ratio_decay": 0.98,  # Multiply by 0.98 each decay step
     "expert_ratio_decay_steps": 10000,  # Decay every 10,000 frames
@@ -40,14 +40,14 @@ LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
 
 # RL hyperparameters
 RL_CONFIG = {
-    "batch_size": 64,
+    "batch_size": 512,
     "gamma": 0.99,         # Discount factor
     "epsilon_start": 1.0,
-    "epsilon_end": 0.1,
+    "epsilon_end": 0.01,
     "epsilon_decay": 10000,
     "update_target_every": 1000,
     "learning_rate": 1e-4,
-    "memory_size": 100000,
+    "memory_size": 500000,
     "save_interval": 50000,
     "train_freq": 4
 }
@@ -118,19 +118,21 @@ class ReplayMemory:
         return len(self.memory)
 
 class DQN(nn.Module):
-    """Deep Q-Network model"""
+    """Deep Q-Network model (Improved)"""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, action_size)
-        
+        self.fc1 = nn.Linear(state_size, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, 64)
+        self.out = nn.Linear(64, action_size)
+
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        return self.fc4(x)
+        x = F.relu(self.fc4(x))
+        return self.out(x)
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
@@ -389,7 +391,7 @@ def expert_action_to_index(fire, zap, spinner):
 
 def encode_action_to_game(fire, zap, spinner):
     """Convert action values to game-compatible format"""
-    spinner_val = spinner * (20 if abs(spinner) < 0.3 else 31)
+    spinner_val = spinner * 31
     return int(fire), int(zap), int(spinner_val)
 
 def decay_epsilon(frame_count):
