@@ -1269,16 +1269,15 @@ local function frame_callback()
     enemies_state:update(mem)
     
     -- Check if the game mode is in high score entry, mash AAA if it is
-    if game_state.game_mode == x80 then
-        local port = manager.machine.ioport.ports[":BUTTONSP1"]
-        local startField = port.fields["P1 Button 2"]
-
-        -- Press P1 Start in MAME with proper press/release simulation
+    if game_state.game_mode == 0x80 then
         if game_state.frame_counter % 60 == 0 then
-            startField:set_value(1)
-        elseif game_state.frame_counter % 60 == 5 then
-            startField:set_value(0)
+            controls.fire_field:set_value(1)
+            print("Pressing Fire")
+        elseif game_state.frame_counter % 60 == 30 then
+            controls.fire_field:set_value(0)
+            print("Releasing Fire")
         end
+        return true
     end
 
     -- Declare num_values at the start of the function
@@ -1427,13 +1426,12 @@ local function frame_callback()
         last_display_update = current_time_high_res
     end
 
-    -- We only control the game in regular play mode (04) and zooming down the tube (20)
-    
-    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
-        -- Apply the action to MAME controls
+    -- We only control the game in regular play mode (04), zooming down the tube (20), AND High Score Entry (24)
+    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then -- Added 0x24
+        -- Apply the action determined by the AI (Python script) to MAME controls
         controls:apply_action(fire, zap, spinner, game_state, player_state)
-    elseif game_state.gamestate == 0x12 then
-        -- Apply the action to MAME controls
+    elseif game_state.gamestate == 0x12 then -- This state might need verification too
+        -- Apply the action to MAME controls (Seems like hardcoded zap?)
         controls:apply_action(0, frame_count % 2, 0, game_state, player_state)
     end
 
