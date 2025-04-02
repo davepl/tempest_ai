@@ -29,6 +29,9 @@ from datetime import datetime
 from stable_baselines3 import DQN
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure
+import termios
+import tty
+import fcntl
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -76,6 +79,8 @@ class MetricsData:
     last_decay_step: int = 0
     enemy_seg: int = -1
     open_level: bool = False
+    override_expert: bool = False  # New field for expert override
+    saved_expert_ratio: float = 0.75  # New field to save ratio during override
     
     @property
     def guided_ratio(self) -> float:
@@ -88,6 +93,18 @@ class MetricsData:
         if not self.episode_rewards:
             return float('nan')
         return np.mean(list(self.episode_rewards))
+
+    def toggle_override(self, kb):
+        """Toggle expert guidance override"""
+        self.override_expert = not self.override_expert
+        if self.override_expert:
+            self.saved_expert_ratio = self.expert_ratio
+            self.expert_ratio = 0.0
+            print_with_terminal_restore(kb, "\nExpert guidance disabled (override ON)")
+        else:
+            self.expert_ratio = self.saved_expert_ratio
+            print_with_terminal_restore(kb, "\nExpert guidance restored (override OFF)")
+        display_metrics_header(kb)
 
 @dataclass
 class FrameData:
@@ -337,6 +354,45 @@ class DQNAgent:
                 return False
         return False
 
+class KeyboardHandler:
+    """Non-blocking keyboard input handler"""
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.old_settings = termios.tcgetattr(self.fd)
+        
+    def __enter__(self):
+        tty.setraw(sys.stdin.fileno())
+        # Set stdin non-blocking
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        return self
+        
+    def __exit__(self, *args):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+        
+    def check_key(self):
+        """Check for keyboard input non-blockingly"""
+        try:
+            return sys.stdin.read(1)
+        except (IOError, TypeError):
+            return None
+            
+    def restore_terminal(self):
+        """Temporarily restore terminal settings for printing"""
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+        
+    def set_raw_mode(self):
+        """Set terminal back to raw mode"""
+        tty.setraw(sys.stdin.fileno())
+
+def print_with_terminal_restore(kb_handler, *args, **kwargs):
+    """Print with proper terminal settings"""
+    if kb_handler:
+        kb_handler.restore_terminal()
+    print(*args, **kwargs, flush=True)
+    if kb_handler:
+        kb_handler.set_raw_mode()
+
 def setup_environment():
     """Set up pipes and model directory"""
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -363,6 +419,10 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         num_values, reward, game_action, game_mode, done, frame_counter, score, \
         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
         
+        # Debug: Print when save signal is received in raw data
+        if save_signal:
+            print(f"\nDEBUG: Raw save signal received in header: {save_signal}")
+        
         state_data = data[header_size:]
         
         # Safely process state values with error handling
@@ -383,7 +443,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         elif len(state) < PIPE_CONFIG.params_count:
             state = np.pad(state, (0, PIPE_CONFIG.params_count - len(state)))
                 
-        return FrameData(
+        frame_data = FrameData(
             state=state,
             reward=reward,
             action=(bool(fire), bool(zap), spinner),
@@ -395,34 +455,40 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             player_seg=player_seg,
             open_level=bool(is_open)
         )
+        
+        # Debug: Print when save signal is set in FrameData
+        if frame_data.save_signal:
+            print(f"DEBUG: Created FrameData with save_signal=True")
+            
+        return frame_data
     except Exception as e:
         print(f"Error parsing frame data: {e}")
         return None
 
-def display_metrics_header():
+def display_metrics_header(kb=None):
     """Display header for metrics table"""
     header = (
         f"{'Frame':>8} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
     )
-    print(f"\n{'-' * len(header)}\n{header}\n{'-' * len(header)}")
+    print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
+    print_with_terminal_restore(kb, header)
+    print_with_terminal_restore(kb, f"{'-' * len(header)}")
 
-def display_metrics_row(agent):
+def display_metrics_row(agent, kb=None):
     """Display current metrics in tabular format"""
     mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
     dqn_reward = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
     mean_loss = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
-    # Calculate guided ratio from the current expert_ratio setting, not from count history
     guided_ratio = metrics.expert_ratio
-    expert_counts = f"{metrics.guided_count}/{metrics.total_controls}"
     mem_size = len(agent.memory) if agent else 0
     
     row = (
         f"{metrics.frame_count:8d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
-        f"{mean_loss:8.4f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% ({expert_counts}) | "
-        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10}"
+        f"{mean_loss:8.4f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
+        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {'ON' if metrics.override_expert else 'OFF':10}"
     )
-    print(row)
+    print_with_terminal_restore(kb, row)
 
 def get_expert_action(enemy_seg, player_seg, is_open_level):
     """Calculate expert-guided action based on game state"""
@@ -502,140 +568,167 @@ def main():
     metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
     metrics.last_decay_step = 0
         
-    # Display initial metrics header and values
-    display_metrics_header()
-    display_metrics_row(agent)
-    
-    total_reward = 0
-    was_done = False
-    last_state = None
-    last_action_idx = None
-    episode_dqn_reward = 0
-    episode_expert_reward = 0
-    
-    with os.fdopen(os.open(PIPE_CONFIG.lua_to_py, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_in, \
-         open(PIPE_CONFIG.py_to_lua, "wb") as lua_out:
-         
-        while True:
-            # Check for incoming data
-            if not select.select([lua_in], [], [], 0.01)[0]:
-                time.sleep(0.001)
-                continue
+    # Initialize keyboard handler
+    kb = KeyboardHandler()
+    with kb:
+        # Display initial metrics header and values
+        print_with_terminal_restore(kb, "\n" + "="*80)
+        print_with_terminal_restore(kb, "Tempest AI Training Started")
+        print_with_terminal_restore(kb, "="*80 + "\n")
+        display_metrics_header(kb)
+        display_metrics_row(agent, kb)
+        
+        total_reward = 0
+        was_done = False
+        last_state = None
+        last_action_idx = None
+        episode_dqn_reward = 0
+        episode_expert_reward = 0
+        
+        with os.fdopen(os.open(PIPE_CONFIG.lua_to_py, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_in, \
+             open(PIPE_CONFIG.py_to_lua, "wb") as lua_out:
+             
+            while True:
+                # Check for keyboard input
+                key = kb.check_key()
+                if key == 'o':  # Toggle override
+                    metrics.toggle_override(kb)
+                elif key == 'q':  # Add quit option
+                    print_with_terminal_restore(kb, "\nQuitting...")
+                    break
                 
-            data = lua_in.read()
-            if not data:
-                time.sleep(0.001)
-                continue
+                # Check for incoming data
+                if not select.select([lua_in], [], [], 0.01)[0]:
+                    time.sleep(0.001)
+                    continue
                 
-            frame = parse_frame_data(data)
-            if not frame:
-                lua_out.write(struct.pack("bbb", 0, 0, 0))
-                lua_out.flush()
-                continue
+                data = lua_in.read()
+                if not data:
+                    time.sleep(0.001)
+                    continue
                 
-            # Update metrics counter
-            metrics.frame_count += 1
-            
-            # Update exploration rate and expert ratio
-            metrics.epsilon = decay_epsilon(metrics.frame_count)
-            decay_expert_ratio(metrics.frame_count)
-            
-            # Process previous step's results if we have them
-            if last_state is not None and last_action_idx is not None:
-                # Add experience to replay memory
-                agent.step(
-                    last_state, 
-                    np.array([[last_action_idx]]), 
-                    frame.reward, 
-                    frame.state, 
-                    frame.done
-                )
+                frame = parse_frame_data(data)
+                if not frame:
+                    lua_out.write(struct.pack("bbb", 0, 0, 0))
+                    lua_out.flush()
+                    continue
                 
-                # Track total reward
-                total_reward += frame.reward
+                # Debug: Check frame's save signal immediately after parsing
+                if frame.save_signal:
+                    print(f"DEBUG: Main loop received frame with save_signal=True")
                 
-                # Track which system's rewards (expert or DQN)
-                if metrics.last_action_source == "expert":
-                    episode_expert_reward += frame.reward
-                else:
-                    episode_dqn_reward += frame.reward
-            
-            # Update episode tracking
-            if frame.done:
-                if not was_done:
-                    metrics.episode_rewards.append(total_reward)
-                    if episode_dqn_reward > 0:
-                        metrics.dqn_rewards.append(episode_dqn_reward)
-                    if episode_expert_reward > 0:
-                        metrics.expert_rewards.append(episode_expert_reward)
+                # Handle save signal from game BEFORE other processing
+                if frame.save_signal:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
+                    print_with_terminal_restore(kb, "\n" + "="*80)
+                    print_with_terminal_restore(kb, f"SAVE SIGNAL RECEIVED at frame {metrics.frame_count}")
+                    print_with_terminal_restore(kb, f"Saving model to: {save_path}")
+                    try:
+                        agent.save(save_path)
+                        agent.save(LATEST_MODEL_PATH)
+                        print_with_terminal_restore(kb, f"Model saved successfully! (Expert ratio: {metrics.expert_ratio:.2f})")
+                        print_with_terminal_restore(kb, "="*80 + "\n")
+                        display_metrics_header(kb)
+                    except Exception as e:
+                        print_with_terminal_restore(kb, f"ERROR saving model: {e}")
+                
+                # Update metrics counter
+                metrics.frame_count += 1
+                
+                # Update exploration rate and expert ratio
+                metrics.epsilon = decay_epsilon(metrics.frame_count)
+                decay_expert_ratio(metrics.frame_count)
+                
+                # Process previous step's results if we have them
+                if last_state is not None and last_action_idx is not None:
+                    # Add experience to replay memory
+                    agent.step(
+                        last_state, 
+                        np.array([[last_action_idx]]), 
+                        frame.reward, 
+                        frame.state, 
+                        frame.done
+                    )
                     
-                was_done = True
-                lua_out.write(struct.pack("bbb", 0, 0, 0))
+                    # Track total reward
+                    total_reward += frame.reward
+                    
+                    # Track which system's rewards (expert or DQN)
+                    if metrics.last_action_source == "expert":
+                        episode_expert_reward += frame.reward
+                    else:
+                        episode_dqn_reward += frame.reward
+                
+                # Update episode tracking
+                if frame.done:
+                    if not was_done:
+                        metrics.episode_rewards.append(total_reward)
+                        if episode_dqn_reward > 0:
+                            metrics.dqn_rewards.append(episode_dqn_reward)
+                        if episode_expert_reward > 0:
+                            metrics.expert_rewards.append(episode_expert_reward)
+                        
+                    was_done = True
+                    lua_out.write(struct.pack("bbb", 0, 0, 0))
+                    lua_out.flush()
+                    last_state = None
+                    last_action_idx = None
+                    continue
+                elif was_done:
+                    was_done = False
+                    total_reward = 0
+                    episode_dqn_reward = 0
+                    episode_expert_reward = 0
+                
+                # Store frame data for metrics
+                metrics.enemy_seg = frame.enemy_seg
+                metrics.open_level = frame.open_level
+                
+                # Generate action (expert or DQN based on expert_ratio)
+                metrics.total_controls += 1
+                
+                # Decide between expert system and DQN
+                if random.random() < metrics.expert_ratio:
+                    # Use expert system
+                    fire, zap, spinner = get_expert_action(
+                        frame.enemy_seg, frame.player_seg, frame.open_level
+                    )
+                    metrics.guided_count += 1
+                    metrics.last_action_source = "expert"
+                    
+                    # Convert expert action to index for training
+                    action_idx = expert_action_to_index(fire, zap, spinner)
+                else:
+                    # Use DQN
+                    action_idx = agent.act(frame.state, metrics.epsilon)
+                    fire, zap, spinner = ACTION_MAPPING[action_idx]
+                    metrics.last_action_source = "dqn"
+                
+                # Store state and action for next frame's training
+                last_state = frame.state
+                last_action_idx = action_idx
+                
+                # Send action to game
+                game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
+                lua_out.write(struct.pack("bbb", game_fire, game_zap, game_spinner))
                 lua_out.flush()
-                last_state = None
-                last_action_idx = None
-                continue
-            elif was_done:
-                was_done = False
-                total_reward = 0
-                episode_dqn_reward = 0
-                episode_expert_reward = 0
-            
-            # Store frame data for metrics
-            metrics.enemy_seg = frame.enemy_seg
-            metrics.open_level = frame.open_level
-            
-            # Generate action (expert or DQN based on expert_ratio)
-            metrics.total_controls += 1
-            
-            # Decide between expert system and DQN
-            if random.random() < metrics.expert_ratio:
-                # Use expert system
-                fire, zap, spinner = get_expert_action(
-                    frame.enemy_seg, frame.player_seg, frame.open_level
-                )
-                metrics.guided_count += 1
-                metrics.last_action_source = "expert"
                 
-                # Convert expert action to index for training
-                action_idx = expert_action_to_index(fire, zap, spinner)
-            else:
-                # Use DQN
-                action_idx = agent.act(frame.state, metrics.epsilon)
-                fire, zap, spinner = ACTION_MAPPING[action_idx]
-                metrics.last_action_source = "dqn"
-            
-            # Store state and action for next frame's training
-            last_state = frame.state
-            last_action_idx = action_idx
-            
-            # Send action to game
-            game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
-            lua_out.write(struct.pack("bbb", game_fire, game_zap, game_spinner))
-            lua_out.flush()
-            
-            # Update target network periodically
-            if metrics.frame_count % RL_CONFIG.update_target_every == 0:
-                agent.update_target_network()
-            
-            # Update metrics display
-            if metrics.frame_count % 1000 == 0:
-                display_metrics_row(agent)
+                # Update target network periodically
+                if metrics.frame_count % RL_CONFIG.update_target_every == 0:
+                    agent.update_target_network()
                 
-            # Save model periodically
-            if metrics.frame_count % RL_CONFIG.save_interval == 0:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                agent.save(f"{MODEL_DIR}/tempest_model_{timestamp}.pt")
-                agent.save(LATEST_MODEL_PATH)
+                # Update metrics display
+                if metrics.frame_count % 1000 == 0:
+                    display_metrics_row(agent, kb)
+                    if metrics.override_expert:
+                        print_with_terminal_restore(kb, "Expert guidance: DISABLED (override)")
                 
-            # Handle save signal from game
-            if frame.save_signal:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
-                agent.save(save_path)
-                agent.save(LATEST_MODEL_PATH)
-                print(f"\nSave signal received. Model saved to {save_path}")
-                display_metrics_header()
+                # Save model periodically
+                if metrics.frame_count % RL_CONFIG.save_interval == 0:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    agent.save(f"{MODEL_DIR}/tempest_model_{timestamp}.pt")
+                    agent.save(LATEST_MODEL_PATH)
 
 if __name__ == "__main__":
     # Set seeds for reproducibility
