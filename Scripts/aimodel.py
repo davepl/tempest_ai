@@ -11,6 +11,11 @@ import os
 import time
 import struct
 import random
+import sys
+import subprocess
+import warnings
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple, Deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,36 +26,105 @@ import threading
 import queue
 from collections import deque, namedtuple
 from datetime import datetime
+from stable_baselines3 import DQN
+from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.logger import configure
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+@dataclass
+class PipeConfigData:
+    """Configuration for pipe communication"""
+    lua_to_py: str = "/tmp/lua_to_py"
+    py_to_lua: str = "/tmp/py_to_lua"
+    params_count: int = 128
+    expert_ratio_start: float = 0.5
+    expert_ratio_min: float = 0.01
+    expert_ratio_decay: float = 0.98
+    expert_ratio_decay_steps: int = 10000
+    expert_ratio_cycle: bool = False
+    reset_frame_count: bool = False
+    reset_expert_ratio: bool = True
+
+@dataclass
+class RLConfigData:
+    """Configuration for reinforcement learning"""
+    batch_size: int = 512
+    gamma: float = 0.99
+    epsilon_start: float = 1.0
+    epsilon_end: float = 0.01
+    epsilon_decay: int = 10000
+    update_target_every: int = 1000
+    learning_rate: float = 1e-4
+    memory_size: int = 500000
+    save_interval: int = 50000
+    train_freq: int = 4
+
+@dataclass
+class MetricsData:
+    """Metrics tracking for training progress"""
+    frame_count: int = 0
+    guided_count: int = 0
+    total_controls: int = 0
+    episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    losses: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    epsilon: float = 1.0
+    expert_ratio: float = 0.75
+    last_decay_step: int = 0
+    enemy_seg: int = -1
+    open_level: bool = False
+    
+    @property
+    def guided_ratio(self) -> float:
+        """Calculate the ratio of guided actions"""
+        return self.guided_count / max(1, self.total_controls)
+    
+    @property
+    def mean_reward(self) -> float:
+        """Calculate mean reward over recent episodes"""
+        if not self.episode_rewards:
+            return float('nan')
+        return np.mean(list(self.episode_rewards))
+
+@dataclass
+class FrameData:
+    """Game state data for a single frame"""
+    state: np.ndarray
+    reward: float
+    action: Tuple[bool, bool, float]  # fire, zap, spinner
+    mode: int
+    done: bool
+    attract: bool
+    save_signal: bool
+    enemy_seg: int
+    player_seg: int
+    open_level: bool
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'FrameData':
+        """Create FrameData from dictionary"""
+        return cls(
+            state=data["state"],
+            reward=data["reward"],
+            action=data["action"],
+            mode=data["mode"],
+            done=data["done"],
+            attract=data["attract"],
+            save_signal=data["save_signal"],
+            enemy_seg=data["enemy_seg"],
+            player_seg=data["player_seg"],
+            open_level=data["open_level"]
+        )
 
 # Configuration constants
-PIPE_CONFIG = {
-    "lua_to_py": "/tmp/lua_to_py",
-    "py_to_lua": "/tmp/py_to_lua",
-    "params_count": 128,
-    "expert_ratio_start": 0.4,    # Start with these level of expert guidance
-    "expert_ratio_min": 0.01,     # Minimum expert guidance (10%)
-    "expert_ratio_decay": 0.98,  # Multiply by 0.98 each decay step
-    "expert_ratio_decay_steps": 10000,  # Decay every 10,000 frames
-    "expert_ratio_cycle": False,    # If true, reset expert ratio every 10,000 frames
-    "reset_frame_count": False,  # Set to True to reset frame count when loading a model
-    "reset_expert_ratio": True   # Set to True to reset expert ratio to start value
-}
+PIPE_CONFIG = PipeConfigData()
+RL_CONFIG = RLConfigData()
+
 MODEL_DIR = "models"
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
-
-# RL hyperparameters
-RL_CONFIG = {
-    "batch_size": 512,
-    "gamma": 0.99,         # Discount factor
-    "epsilon_start": 1.0,
-    "epsilon_end": 0.01,
-    "epsilon_decay": 10000,
-    "update_target_every": 1000,
-    "learning_rate": 1e-4,
-    "memory_size": 500000,
-    "save_interval": 50000,
-    "train_freq": 4
-}
 
 # Define action space
 # We'll discretize the spinner movement into 7 values:
@@ -58,39 +132,29 @@ RL_CONFIG = {
 # And 2 options for fire button (0: no fire, 1: fire)
 # Total action space: 14 actions (7 spinner positions × 2 fire options)
 ACTION_MAPPING = {
-    0: (0, 0, -0.3),   # Hard left, no fire
-    1: (0, 0, -0.2),   # Medium left, no fire
-    2: (0, 0, -0.1),   # Soft left, no fire
-    3: (0, 0, 0.0),    # Center, no fire
-    4: (0, 0, 0.1),    # Soft right, no fire
-    5: (0, 0, 0.2),    # Medium right, no fire
-    6: (0, 0, 0.3),    # Hard right, no fire
-    7: (1, 0, -0.3),   # Hard left, fire
-    8: (1, 0, -0.2),   # Medium left, fire
-    9: (1, 0, -0.1),   # Soft left, fire
-    10: (1, 0, 0.0),   # Center, fire
-    11: (1, 0, 0.1),   # Soft right, fire
-    12: (1, 0, 0.2),   # Medium right, fire
-    13: (1, 0, 0.3),   # Hard right, fire
+    0: (0, 0, -0.3),   # Hard left, no fire, no zap
+    1: (0, 0, -0.2),   # Medium left, no fire, no zap
+    2: (0, 0, -0.1),   # Soft left, no fire, no zap
+    3: (0, 0, 0.0),    # Center, no fire, no zap
+    4: (0, 0, 0.1),    # Soft right, no fire, no zap
+    5: (0, 0, 0.2),    # Medium right, no fire, no zap
+    6: (0, 0, 0.3),    # Hard right, no fire, no zap
+    7: (1, 0, -0.3),   # Hard left, fire, no zap
+    8: (1, 0, -0.2),   # Medium left, fire, no zap
+    9: (1, 0, -0.1),   # Soft left, fire, no zap
+    10: (1, 0, 0.0),   # Center, fire, no zap
+    11: (1, 0, 0.1),   # Soft right, fire, no zap
+    12: (1, 0, 0.2),   # Medium right, fire, no zap
+    13: (1, 0, 0.3),   # Hard right, fire, no zap
+    14: (1, 1, 0.0),   # Zap+Fire+Sit
 }
 
 # Initialize device
 device = torch.device("cuda" if torch.cuda.is_available() else 
                       "mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Metrics tracking
-metrics = {
-    "frame_count": 0,
-    "guided_count": 0,
-    "total_controls": 0,
-    "episode_rewards": deque(maxlen=20),
-    "dqn_rewards": deque(maxlen=20),
-    "expert_rewards": deque(maxlen=20),
-    "losses": deque(maxlen=100),
-    "epsilon": RL_CONFIG["epsilon_start"],
-    "expert_ratio": PIPE_CONFIG["expert_ratio_start"],
-    "last_decay_step": 0
-}
+metrics = MetricsData()
 
 # Experience replay memory
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
@@ -143,10 +207,10 @@ class DQNAgent:
         # Q-Networks (online and target)
         self.qnetwork_local = DQN(state_size, action_size).to(device)
         self.qnetwork_target = DQN(state_size, action_size).to(device)
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=RL_CONFIG["learning_rate"])
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=RL_CONFIG.learning_rate)
         
         # Replay memory
-        self.memory = ReplayMemory(RL_CONFIG["memory_size"])
+        self.memory = ReplayMemory(RL_CONFIG.memory_size)
         
         # Initialize target network with same weights as local network
         self.update_target_network()
@@ -155,9 +219,7 @@ class DQNAgent:
         self.train_queue = queue.Queue(maxsize=100)
         self.training_thread = None
         self.running = True
-        self.start_training_thread()
-        
-    def start_training_thread(self):
+
         """Start background thread for training"""
         self.training_thread = threading.Thread(target=self.background_train, daemon=True)
         self.training_thread.start()
@@ -179,11 +241,11 @@ class DQNAgent:
                 
     def train_step(self):
         """Perform a single training step on one batch"""
-        if len(self.memory) < RL_CONFIG["batch_size"]:
+        if len(self.memory) < RL_CONFIG.batch_size:
             return
             
         # Sample batch from memory
-        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG["batch_size"])
+        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
         
         # Get Q values for current states
         Q_expected = self.qnetwork_local(states).gather(1, actions)
@@ -192,7 +254,7 @@ class DQNAgent:
         with torch.no_grad():
             best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
             Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
-            Q_targets = rewards + (RL_CONFIG["gamma"] * Q_targets_next * (1 - dones))
+            Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
         
         # Compute loss and perform optimization
         loss = F.mse_loss(Q_expected, Q_targets)
@@ -203,7 +265,7 @@ class DQNAgent:
         self.optimizer.step()
         
         # Update metrics
-        metrics["losses"].append(loss.item())
+        metrics.losses.append(loss.item())
     
     def update_target_network(self):
         """Update target network with weights from local network"""
@@ -245,11 +307,11 @@ class DQNAgent:
             'target_state_dict': self.qnetwork_target.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'memory_size': len(self.memory),
-            'epsilon': metrics["epsilon"],
-            'frame_count': metrics["frame_count"],
-            'expert_ratio': metrics["expert_ratio"]
+            'epsilon': metrics.epsilon,
+            'frame_count': metrics.frame_count,
+            'expert_ratio': metrics.expert_ratio
         }, filename)
-        print(f"Model saved to {filename} (frame {metrics['frame_count']}, expert ratio {metrics['expert_ratio']:.2f})")
+        print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
         
     def load(self, filename):
         """Load model weights"""
@@ -261,14 +323,14 @@ class DQNAgent:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 
                 # Load frame count and epsilon (for exploration)
-                metrics["epsilon"] = checkpoint.get('epsilon', RL_CONFIG["epsilon_start"])
-                metrics["frame_count"] = checkpoint.get('frame_count', 0)
+                metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
+                metrics.frame_count = checkpoint.get('frame_count', 0)
                 
                 # Always set the expert ratio to the start value
-                metrics["expert_ratio"] = PIPE_CONFIG["expert_ratio_start"]
-                metrics["last_decay_step"] = 0
+                metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
+                metrics.last_decay_step = 0
                 
-                print(f"Loaded model from frame {metrics['frame_count']}, expert ratio reset to {metrics['expert_ratio']:.2f}")
+                print(f"Loaded model from frame {metrics.frame_count}, expert ratio reset to {metrics.expert_ratio:.2f}")
                 return True
             except Exception as e:
                 print(f"Error loading model: {e}")
@@ -278,58 +340,64 @@ class DQNAgent:
 def setup_environment():
     """Set up pipes and model directory"""
     os.makedirs(MODEL_DIR, exist_ok=True)
-    for pipe in [PIPE_CONFIG["lua_to_py"], PIPE_CONFIG["py_to_lua"]]:
+    for pipe in [PIPE_CONFIG.lua_to_py, PIPE_CONFIG.py_to_lua]:
         if os.path.exists(pipe):
             os.unlink(pipe)
         os.mkfifo(pipe)
         os.chmod(pipe, 0o666)
 
-def parse_frame_data(data):
+def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state"""
-    if not data:
-        return None
-    
-    # Expected format: timestamp, reward, actions, mode, done, counters, etc.
-    format_str = ">IdBBBIIBBBhBhBB"
-    header_size = struct.calcsize(format_str)
-    
-    if len(data) < header_size:
-        return None
+    try:
+        if not data or len(data) < 10:  # Minimal size check
+            return None
         
-    # Extract header values
-    values = struct.unpack(format_str, data[:header_size])
-    num_values, reward, game_action, game_mode, done, frame_counter, score, \
-    save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
-    
-    # Log save signal if received
-    if save_signal:
-        print(f"Save signal detected: {save_signal}")
-    
-    # Process remaining game state data
-    state_data = data[header_size:]
-    state_values = [
-        struct.unpack(">H", state_data[i:i+2])[0] - 32768
-        for i in range(0, len(state_data), 2)
-        if i + 1 < len(state_data)
-    ]
-    
-    # Normalize and pad/truncate state array
-    state = np.array(state_values, dtype=np.float32) / 32768.0
-    state = (state[:PIPE_CONFIG["params_count"]] if len(state) > PIPE_CONFIG["params_count"]
-            else np.pad(state, (0, PIPE_CONFIG["params_count"] - len(state))))
+        format_str = ">IdBBBIIBBBhBhBB"
+        header_size = struct.calcsize(format_str)
+        
+        if len(data) < header_size:
+            print(f"Received data too small: {len(data)} bytes, need {header_size}")
+            return None
             
-    return {
-        "state": state,
-        "reward": reward,
-        "action": (bool(fire), bool(zap), spinner),
-        "mode": game_mode,
-        "done": bool(done),
-        "attract": bool(is_attract),
-        "save_signal": bool(save_signal),
-        "enemy_seg": nearest_enemy,
-        "player_seg": player_seg,
-        "open_level": bool(is_open)
-    }
+        values = struct.unpack(format_str, data[:header_size])
+        num_values, reward, game_action, game_mode, done, frame_counter, score, \
+        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
+        
+        state_data = data[header_size:]
+        
+        # Safely process state values with error handling
+        state_values = []
+        for i in range(0, len(state_data), 2):
+            if i + 1 < len(state_data):
+                try:
+                    value = struct.unpack(">H", state_data[i:i+2])[0] - 32768
+                    state_values.append(value)
+                except struct.error:
+                    continue  # Skip this value on error
+        
+        state = np.array(state_values, dtype=np.float32) / 32768.0
+        
+        # Ensure state has correct dimensions
+        if len(state) > PIPE_CONFIG.params_count:
+            state = state[:PIPE_CONFIG.params_count]
+        elif len(state) < PIPE_CONFIG.params_count:
+            state = np.pad(state, (0, PIPE_CONFIG.params_count - len(state)))
+                
+        return FrameData(
+            state=state,
+            reward=reward,
+            action=(bool(fire), bool(zap), spinner),
+            mode=game_mode,
+            done=bool(done),
+            attract=bool(is_attract),
+            save_signal=bool(save_signal),
+            enemy_seg=nearest_enemy,
+            player_seg=player_seg,
+            open_level=bool(is_open)
+        )
+    except Exception as e:
+        print(f"Error parsing frame data: {e}")
+        return None
 
 def display_metrics_header():
     """Display header for metrics table"""
@@ -341,24 +409,24 @@ def display_metrics_header():
 
 def display_metrics_row(agent):
     """Display current metrics in tabular format"""
-    mean_reward = np.mean(list(metrics["episode_rewards"])) if metrics["episode_rewards"] else float('nan')
-    dqn_reward = np.mean(list(metrics["dqn_rewards"])) if metrics["dqn_rewards"] else float('nan')
-    mean_loss = np.mean(list(metrics["losses"])) if metrics["losses"] else float('nan')
+    mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
+    dqn_reward = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
+    mean_loss = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
     # Calculate guided ratio from the current expert_ratio setting, not from count history
-    guided_ratio = metrics["expert_ratio"]
-    expert_counts = f"{metrics['guided_count']}/{metrics['total_controls']}"
+    guided_ratio = metrics.expert_ratio
+    expert_counts = f"{metrics.guided_count}/{metrics.total_controls}"
     mem_size = len(agent.memory) if agent else 0
     
     row = (
-        f"{metrics['frame_count']:8d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
-        f"{mean_loss:8.4f} | {metrics['epsilon']:7.3f} | {guided_ratio*100:7.2f}% ({expert_counts}) | "
-        f"{mem_size:8d} | {'Open' if metrics.get('open_level', False) else 'Closed':10}"
+        f"{metrics.frame_count:8d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
+        f"{mean_loss:8.4f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% ({expert_counts}) | "
+        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10}"
     )
     print(row)
 
 def get_expert_action(enemy_seg, player_seg, is_open_level):
     """Calculate expert-guided action based on game state"""
-    if enemy_seg < 0 or enemy_seg == player_seg:
+    if enemy_seg == player_seg:
         return 1, 0, 0  # Fire only when no enemies or aligned
         
     # Calculate movement based on level type
@@ -396,43 +464,43 @@ def encode_action_to_game(fire, zap, spinner):
 
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate"""
-    return max(RL_CONFIG["epsilon_end"], 
-               RL_CONFIG["epsilon_start"] * 
-               np.exp(-frame_count / RL_CONFIG["epsilon_decay"]))
+    return max(RL_CONFIG.epsilon_end, 
+               RL_CONFIG.epsilon_start * 
+               np.exp(-frame_count / RL_CONFIG.epsilon_decay))
 
 def decay_expert_ratio(current_step):
     """Update expert ratio based on 10,000 frame intervals"""
-    step_interval = current_step // PIPE_CONFIG["expert_ratio_decay_steps"]
+    step_interval = current_step // PIPE_CONFIG.expert_ratio_decay_steps
     
     # Only update if we've moved to a new interval
-    if step_interval > metrics["last_decay_step"]:
-        metrics["last_decay_step"] = step_interval
+    if step_interval > metrics.last_decay_step:
+        metrics.last_decay_step = step_interval
         if step_interval == 0:
             # First interval - use starting value
-            metrics["expert_ratio"] = PIPE_CONFIG["expert_ratio_start"]
+            metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
         else:
             # Apply decay
-            metrics["expert_ratio"] *= PIPE_CONFIG["expert_ratio_decay"]
+            metrics.expert_ratio *= PIPE_CONFIG.expert_ratio_decay
         
         # Ensure we don't go below the minimum
-        metrics["expert_ratio"] = max(PIPE_CONFIG["expert_ratio_min"], metrics["expert_ratio"])
+        metrics.expert_ratio = max(PIPE_CONFIG.expert_ratio_min, metrics.expert_ratio)
         
-    return metrics["expert_ratio"]
+    return metrics.expert_ratio
 
 def main():
     """Main game loop handling Lua communication and decisions"""
     setup_environment()
     
     # Initialize DQN agent
-    agent = DQNAgent(PIPE_CONFIG["params_count"], len(ACTION_MAPPING))
+    agent = DQNAgent(PIPE_CONFIG.params_count, len(ACTION_MAPPING))
     
     # Try to load existing model
     if not agent.load(LATEST_MODEL_PATH):
         print("No existing model found. Starting with new model.")
     
     # Always initialize expert ratio to the start value
-    metrics["expert_ratio"] = PIPE_CONFIG["expert_ratio_start"]
-    metrics["last_decay_step"] = 0
+    metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
+    metrics.last_decay_step = 0
         
     # Display initial metrics header and values
     display_metrics_header()
@@ -445,8 +513,8 @@ def main():
     episode_dqn_reward = 0
     episode_expert_reward = 0
     
-    with os.fdopen(os.open(PIPE_CONFIG["lua_to_py"], os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_in, \
-         open(PIPE_CONFIG["py_to_lua"], "wb") as lua_out:
+    with os.fdopen(os.open(PIPE_CONFIG.lua_to_py, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_in, \
+         open(PIPE_CONFIG.py_to_lua, "wb") as lua_out:
          
         while True:
             # Check for incoming data
@@ -466,11 +534,11 @@ def main():
                 continue
                 
             # Update metrics counter
-            metrics["frame_count"] += 1
+            metrics.frame_count += 1
             
             # Update exploration rate and expert ratio
-            metrics["epsilon"] = decay_epsilon(metrics["frame_count"])
-            decay_expert_ratio(metrics["frame_count"])
+            metrics.epsilon = decay_epsilon(metrics.frame_count)
+            decay_expert_ratio(metrics.frame_count)
             
             # Process previous step's results if we have them
             if last_state is not None and last_action_idx is not None:
@@ -478,28 +546,28 @@ def main():
                 agent.step(
                     last_state, 
                     np.array([[last_action_idx]]), 
-                    frame["reward"], 
-                    frame["state"], 
-                    frame["done"]
+                    frame.reward, 
+                    frame.state, 
+                    frame.done
                 )
                 
                 # Track total reward
-                total_reward += frame["reward"]
+                total_reward += frame.reward
                 
                 # Track which system's rewards (expert or DQN)
-                if metrics.get("last_action_source") == "expert":
-                    episode_expert_reward += frame["reward"]
+                if metrics.last_action_source == "expert":
+                    episode_expert_reward += frame.reward
                 else:
-                    episode_dqn_reward += frame["reward"]
+                    episode_dqn_reward += frame.reward
             
             # Update episode tracking
-            if frame["done"]:
+            if frame.done:
                 if not was_done:
-                    metrics["episode_rewards"].append(total_reward)
+                    metrics.episode_rewards.append(total_reward)
                     if episode_dqn_reward > 0:
-                        metrics["dqn_rewards"].append(episode_dqn_reward)
+                        metrics.dqn_rewards.append(episode_dqn_reward)
                     if episode_expert_reward > 0:
-                        metrics["expert_rewards"].append(episode_expert_reward)
+                        metrics.expert_rewards.append(episode_expert_reward)
                     
                 was_done = True
                 lua_out.write(struct.pack("bbb", 0, 0, 0))
@@ -514,33 +582,31 @@ def main():
                 episode_expert_reward = 0
             
             # Store frame data for metrics
-            metrics.update({
-                "enemy_seg": frame["enemy_seg"],
-                "open_level": frame["open_level"]
-            })
+            metrics.enemy_seg = frame.enemy_seg
+            metrics.open_level = frame.open_level
             
             # Generate action (expert or DQN based on expert_ratio)
-            metrics["total_controls"] += 1
+            metrics.total_controls += 1
             
             # Decide between expert system and DQN
-            if random.random() < metrics["expert_ratio"]:
+            if random.random() < metrics.expert_ratio:
                 # Use expert system
                 fire, zap, spinner = get_expert_action(
-                    frame["enemy_seg"], frame["player_seg"], frame["open_level"]
+                    frame.enemy_seg, frame.player_seg, frame.open_level
                 )
-                metrics["guided_count"] += 1
-                metrics["last_action_source"] = "expert"
+                metrics.guided_count += 1
+                metrics.last_action_source = "expert"
                 
                 # Convert expert action to index for training
                 action_idx = expert_action_to_index(fire, zap, spinner)
             else:
                 # Use DQN
-                action_idx = agent.act(frame["state"], metrics["epsilon"])
+                action_idx = agent.act(frame.state, metrics.epsilon)
                 fire, zap, spinner = ACTION_MAPPING[action_idx]
-                metrics["last_action_source"] = "dqn"
+                metrics.last_action_source = "dqn"
             
             # Store state and action for next frame's training
-            last_state = frame["state"]
+            last_state = frame.state
             last_action_idx = action_idx
             
             # Send action to game
@@ -549,21 +615,21 @@ def main():
             lua_out.flush()
             
             # Update target network periodically
-            if metrics["frame_count"] % RL_CONFIG["update_target_every"] == 0:
+            if metrics.frame_count % RL_CONFIG.update_target_every == 0:
                 agent.update_target_network()
             
             # Update metrics display
-            if metrics["frame_count"] % 1000 == 0:
+            if metrics.frame_count % 1000 == 0:
                 display_metrics_row(agent)
                 
             # Save model periodically
-            if metrics["frame_count"] % RL_CONFIG["save_interval"] == 0:
+            if metrics.frame_count % RL_CONFIG.save_interval == 0:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 agent.save(f"{MODEL_DIR}/tempest_model_{timestamp}.pt")
                 agent.save(LATEST_MODEL_PATH)
                 
             # Handle save signal from game
-            if frame["save_signal"]:
+            if frame.save_signal:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
                 agent.save(save_path)

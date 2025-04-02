@@ -202,9 +202,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             if min_distance == 0 then
                 -- Extra reward if player is not moving while lined up (ready to fire)
                 if player_state.SpinnerDelta == 0 then
-                    reward = reward + 12  -- Significant reward for being lined up and still
+                    reward = reward + 15  -- Significant reward for being lined up and still
                 else
-                    reward = reward + 15  -- Good reward just for being lined up
+                    reward = reward + 10   -- Good reward just for being lined up
                 end
             else
                 -- Give decreasing rewards as distance increases
@@ -228,8 +228,14 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     end
                 end
 
-                if (target_segment >= 0 and player_state.SpinnerDelta == 0) then
-                    reward = reward - 2
+                -- If there are no enemies, or if we're zooming down the tube, don't move around
+
+                if (target_segment < 0 or game_state.gamestate == 0x20) then
+                    if (player_state.SpinnerDelta == 0) then
+                        reward = reward + 10
+                    else
+                        reward = reward - math.abs(player_state.SpinnerDelta)
+                    end
                 end
             end
         end
@@ -803,61 +809,22 @@ function EnemiesState:nearest_enemy_segment()
     return closest_segment  -- Returns the segment number or -1 if no enemies found
 end
 
--- Determine the best direction to move to reach the nearest enemy
--- Returns: 
---   -1 = move counterclockwise
---   +1 = move clockwise
---    0 = if already on correct segment or no enemies found
-
+-- Function to calculate the direction to the nearest enemy segment
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-    -- Get the segment with the nearest enemy
     local target_segment = enemies_state:nearest_enemy_segment()
-    
-    -- If no enemy found or player is already on that segment, no movement needed
-    if target_segment == -1 or (player_state.position & 0x0F) == target_segment then
-        return 0
-    end
-    
-    local player_segment = player_state.position & 0x0F  -- Apply mask for 0-15 range
-    local is_open = level_state.level_type == 0xFF  -- Check if level is open (non-wraparound)
-    
-    if is_open then
-        -- In open levels, distance is simply the direct difference between segments
-        if target_segment > player_segment then
-            return -1  -- Move clockwise (negative spinner value)
-        else
-            return 1   -- Move counterclockwise (positive spinner value)
-        end
-    else
-        -- In closed/wraparound levels, calculate distances in both directions
-        
-        -- Calculate clockwise distance (player → target moving clockwise)
-        local clockwise_distance
-        if target_segment >= player_segment then
-            clockwise_distance = target_segment - player_segment
-        else
-            clockwise_distance = target_segment + 16 - player_segment
-        end
-        
-        -- Calculate counterclockwise distance (player → target moving counterclockwise)
-        local counterclockwise_distance
-        if player_segment >= target_segment then
-            counterclockwise_distance = player_segment - target_segment
-        else
-            counterclockwise_distance = player_segment + 16 - target_segment
-        end
-        
-        -- Return the direction with the shortest path
-        -- Note: In Tempest, positive spinner value moves player counterclockwise
-        -- and negative spinner value moves player clockwise
-        if clockwise_distance < counterclockwise_distance then
-            return -1  -- Move clockwise (negative spinner value)
-        elseif clockwise_distance > counterclockwise_distance then
-            return 1   -- Move counterclockwise (positive spinner value)
-        else
-            -- Equal distances - maintain previous direction to prevent oscillation
-            return (player_state.SpinnerDelta > 0) and 1 or -1
-        end
+    if target_segment < 0 then return 0 end -- No enemy
+
+    local player_segment = player_state.position
+    local delta = target_segment - player_segment
+    if delta == 0 then return 0 end -- Already aligned
+
+    if level_state.level_type == 0xFF then -- Open Level
+        -- Open Level Logic: Return negative delta to match spinner direction needed
+        return -delta 
+    else -- Closed Level
+        -- Closed Level Logic: Calculate shortest signed distance with wraparound
+        -- Result is in range [-8, 7], negative for CW, positive for CCW
+        return (delta + 8) % 16 - 8
     end
 end
 
