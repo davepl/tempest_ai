@@ -74,7 +74,7 @@ class ServerConfigData:
     """Configuration for socket server"""
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
-    max_clients: int = 16
+    max_clients: int = 48
     params_count: int = 128
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.01
@@ -114,6 +114,7 @@ class MetricsData:
     open_level: bool = False
     override_expert: bool = False  # New field for expert override
     saved_expert_ratio: float = 0.75  # New field to save ratio during override
+    expert_mode: bool = False  # New field for expert mode (fixed 0.80 ratio)
     last_action_source: str = ""
     # FPS tracking
     frames_last_second: int = 0
@@ -142,6 +143,18 @@ class MetricsData:
         else:
             self.expert_ratio = self.saved_expert_ratio
             print_with_terminal_restore(kb, "\nExpert guidance restored (override OFF)")
+        display_metrics_header(kb)
+        
+    def toggle_expert_mode(self, kb):
+        """Toggle expert mode (fixed 0.80 ratio)"""
+        self.expert_mode = not self.expert_mode
+        if self.expert_mode:
+            self.saved_expert_ratio = self.expert_ratio
+            self.expert_ratio = 0.80
+            print_with_terminal_restore(kb, "\nExpert mode enabled (fixed 80% expert guidance)")
+        else:
+            self.expert_ratio = self.saved_expert_ratio
+            print_with_terminal_restore(kb, "\nExpert mode disabled (normal guidance restored)")
         display_metrics_header(kb)
 
 @dataclass
@@ -993,10 +1006,17 @@ def display_metrics_row(agent, kb=None):
         with global_server.client_lock:
             client_count = len(global_server.clients)
     
+    # Determine override status
+    override_status = "OFF"
+    if metrics.override_expert:
+        override_status = "ON"
+    elif metrics.expert_mode:
+        override_status = "EXPERT"
+    
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.4f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {'ON' if metrics.override_expert else 'OFF':10}"
+        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
     )
     print_with_terminal_restore(kb, row)
 
@@ -1050,6 +1070,10 @@ def decay_epsilon(frame_count):
 
 def decay_expert_ratio(current_step):
     """Update expert ratio based on 10,000 frame intervals"""
+    # Skip decay if expert mode is active
+    if metrics.expert_mode:
+        return metrics.expert_ratio
+        
     step_interval = current_step // SERVER_CONFIG.expert_ratio_decay_steps
     
     # Only update if we've moved to a new interval
@@ -1086,7 +1110,7 @@ def main():
     kb_handler = None
     if IS_INTERACTIVE:
         kb_handler = KeyboardHandler()
-        print("Running in interactive mode. Press 'o' to toggle expert override, 'q' to quit.", flush=True)
+        print("Running in interactive mode. Press 'o' to toggle expert override, 'e' to toggle expert mode, 'q' to quit.", flush=True)
     else:
         print("Running in non-interactive mode (background/redirected). Keyboard input disabled.", flush=True)
     
@@ -1140,6 +1164,8 @@ def main():
                             break
                         elif char == 'o':
                             metrics.toggle_override(kb_handler) # Pass handler for printing
+                        elif char == 'e':
+                            metrics.toggle_expert_mode(kb_handler) # Pass handler for printing
                     
                     # Update metrics display periodically
                     current_time = time.time()
