@@ -74,7 +74,7 @@ class ServerConfigData:
     """Configuration for socket server"""
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
-    max_clients: int = 48
+    max_clients: int = 32
     params_count: int = 128
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.01
@@ -557,6 +557,7 @@ class SocketServer:
         self.clients = {}  # Dictionary to track active clients
         self.client_states = {}  # Dictionary to store per-client state
         self.client_lock = threading.Lock()  # Lock for client dictionaries
+        self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
         
     def start(self):
         """Start the socket server"""
@@ -627,12 +628,33 @@ class SocketServer:
             print(f"Server error: {e}")
             traceback.print_exc()
         finally:
+            # Signal all client threads to shut down
+            self.shutdown_event.set()
+            
             # Close the server socket
             try:
                 self.server_socket.close()
             except:
                 pass
+                
+            # Wait for all client threads to finish
+            self.cleanup_all_clients()
             print("Server stopped")
+            
+    def cleanup_all_clients(self):
+        """Clean up all client threads and resources"""
+        with self.client_lock:
+            # Get all client IDs
+            client_ids = list(self.clients.keys())
+            
+            # Remove all clients from tracking
+            for client_id in client_ids:
+                if client_id in self.clients:
+                    del self.clients[client_id]
+                if client_id in self.client_states:
+                    del self.client_states[client_id]
+            
+            print(f"Cleaned up all {len(client_ids)} clients during shutdown")
     
     def generate_client_id(self):
         """Generate a unique client ID"""
@@ -703,7 +725,7 @@ class SocketServer:
                 return
             
             # Main communication loop
-            while self.running:
+            while self.running and not self.shutdown_event.is_set():
                 # Wait for data with timeout using select
                 ready = select.select([client_socket], [], [], 0.1)
                 if not ready[0]:
@@ -1009,9 +1031,9 @@ def display_metrics_row(agent, kb=None):
     # Determine override status
     override_status = "OFF"
     if metrics.override_expert:
-        override_status = "ON"
+        override_status = "SELF"
     elif metrics.expert_mode:
-        override_status = "EXPERT"
+        override_status = "BOT"
     
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
@@ -1130,7 +1152,7 @@ def main():
     # Start a stats thread or keyboard handler loop based on interactivity
     def stats_reporter():
         last_stats_time = time.time()
-        while True:
+        while server.running:
             time.sleep(1)
             
             # Update metrics every 10 seconds but don't display them
@@ -1180,6 +1202,28 @@ def main():
 
     except KeyboardInterrupt:
         print("\nShutting down server (KeyboardInterrupt)...")
+    finally:
+        # Ensure server is marked as not running
+        server.running = False
+        
+        # Wait for server thread to finish
+        if server_thread.is_alive():
+            print("Waiting for server to shut down...", flush=True)
+            server_thread.join(timeout=5.0)
+            if server_thread.is_alive():
+                print("Server thread did not shut down gracefully, forcing exit", flush=True)
+        
+        # Save the model one last time
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = f"{MODEL_DIR}/tempest_model_exit_{timestamp}.pt"
+            agent.save(save_path)
+            agent.save(LATEST_MODEL_PATH)
+            print(f"Final model saved to {save_path}", flush=True)
+        except Exception as e:
+            print(f"Error saving final model: {e}", flush=True)
+        
+        print("Server shutdown complete", flush=True)
 
 if __name__ == "__main__":
     # Set seeds for reproducibility
