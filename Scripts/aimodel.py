@@ -76,9 +76,9 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 16
     params_count: int = 128
-    expert_ratio_start: float = 0.5
+    expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.01
-    expert_ratio_decay: float = 0.98
+    expert_ratio_decay: float = 0.995
     expert_ratio_decay_steps: int = 10000
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
@@ -1002,8 +1002,12 @@ def display_metrics_row(agent, kb=None):
 
 def get_expert_action(enemy_seg, player_seg, is_open_level):
     """Calculate expert-guided action based on game state"""
+ 
+    if enemy_seg == -1:
+        return 0, 0, 0  # No enemies, might as well fire at spikes
+
     if enemy_seg == player_seg:
-        return 1, 0, 0  # Fire only when no enemies or aligned
+        return 1, 0, 0  # Fire when aligned
         
     # Calculate movement based on level type
     if is_open_level:
