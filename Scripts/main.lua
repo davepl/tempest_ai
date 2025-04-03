@@ -108,7 +108,7 @@ local function open_socket()
         
         -- Create a new socket connection
         socket = emu.file("rw")  -- "rw" mode for read/write
-        local result = socket:open("socket.127.0.0.1:9999")
+        local result = socket:open("socket.192.168.1.248:9999")
         
         if result == nil then
             print("Successfully opened socket connection to localhost:9999")
@@ -180,73 +180,32 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- Level completion reward
         if level_state.level_number ~= previous_level then
-            reward = reward + (100 * previous_level)
+            reward = reward + (10 * previous_level)
         end
 
-        -- UPDATED: Enemy positioning reward based on the demoplay logic
-        -- Find the enemy segment closest to the top of the tube
-        local target_segment = enemies_state:nearest_enemy_segment()
-        
-        -- Only proceed with target-based rewards if there's at least one enemy
+        -- Reward calculation calling direction_to_nearest_enemy
+
+        target_segment = enemies_state:nearest_enemy_segment()
+        player_segment = player_state.position & 0x0F
+
         if target_segment >= 0 then
-            local player_segment = player_state.position & 0x0F  -- Apply mask to ensure 0-15 range
-            local is_open = level_state.level_type == 0xFF
-            
-            -- Calculate the direction and distance to the nearest enemy
-            local clockwise_distance = 0
-            local counterclockwise_distance = 0
-            
-            if target_segment > player_segment then
-                clockwise_distance = target_segment - player_segment
-                counterclockwise_distance = player_segment + (16 - target_segment)
-            else
-                clockwise_distance = target_segment + (16 - player_segment)
-                counterclockwise_distance = player_segment - target_segment
-            end
-            
-            -- Find the minimum distance considering wraparound
-            local min_distance = math.min(clockwise_distance, counterclockwise_distance)
-            
-            -- Larger reward for being directly lined up with an enemy
-            if min_distance == 0 then
-                -- Extra reward if player is not moving while lined up (ready to fire)
-                if player_state.SpinnerDelta == 0 then
-                    reward = reward + 15  -- Significant reward for being lined up and still
-                else
-                    reward = reward + 10   -- Good reward just for being lined up
-                end
-            else
-                -- Give decreasing rewards as distance increases
-                -- The demoplay routine wants to minimize the distance to the closest enemy
-                local alignment_reward = 10 - min_distance  -- Up to 9 points for being 1 segment away, down to 0 for 10+ segments away
-                if alignment_reward > 0 then
-                    reward = reward + alignment_reward
-                end
-                
-                -- Small bonus for moving in the correct direction toward the target
-                local move_direction = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-                if move_direction ~= 0 then
-                    -- Check if player is moving in the direction that will reach the target faster
-                    -- direction < 0 means go clockwise (need negative spinner)
-                    -- direction > 0 means go counterclockwise (need positive spinner)
-                    if (move_direction < 0 and player_state.SpinnerDelta < 0) or 
-                       (move_direction > 0 and player_state.SpinnerDelta > 0) then
-                        reward = reward + 5  -- Small bonus for moving the right way
-                    elseif player_state.SpinnerDelta ~= 0 then
-                        reward = reward - 1  -- Small penalty for moving the wrong way
-                    end
-                end
+            local direction = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
+            local distance = math.abs(direction)
 
-                -- If there are no enemies, or if we're zooming down the tube, don't move around
-
-                if (target_segment < 0 or game_state.gamestate == 0x20) then
-                    if (player_state.SpinnerDelta == 0) then
-                        reward = reward + 10
-                    else
-                        reward = reward - math.abs(player_state.SpinnerDelta)
-                    end
+            if distance == 0 then
+                reward = reward + (player_state.SpinnerDelta == 0 and 15 or 10)
+            else
+                reward = reward + math.max(0, 10 - distance)
+                if direction * player_state.SpinnerDelta > 0 then
+                    reward = reward + 5
+                elseif player_state.SpinnerDelta ~= 0 then
+                    reward = reward - 1
                 end
             end
+        end
+
+        if target_segment < 0 or game_state.gamestate == 0x20 then
+            reward = reward + (player_state.SpinnerDelta == 0 and 10 or -math.abs(player_state.SpinnerDelta))
         end
     else
         if previous_alive_state == 1 then
@@ -450,17 +409,63 @@ clear_screen()
 math.randomseed(os.time())
 
 -- Access the main CPU and memory space
-local mainCpu = manager.machine.devices[":maincpu"]
-if not mainCpu then
-    print("Error: Main CPU not found")
-    return
+local mainCpu = nil
+local mem = nil
+
+-- Try to access machine using the manager API with proper error handling
+local success, err = pcall(function()
+    -- First, check if manager is available
+    if not manager then
+        error("MAME manager API not available")
+    end
+    
+    -- Then check if machine is available on manager
+    if not manager.machine then
+        error("manager.machine not available")
+    end
+    
+    -- Finally, access the devices
+    mainCpu = manager.machine.devices[":maincpu"]
+    if not mainCpu then
+        error("Main CPU not found")
+    end
+    
+    mem = mainCpu.spaces["program"]
+    if not mem then
+        error("Program memory space not found")
+    end
+end)
+
+if not success then
+    print("Error accessing MAME machine: " .. tostring(err))
+    print("Attempting alternative access method...")
+    
+    -- Try alternative access methods
+    success, err = pcall(function()
+        -- Try accessing machine directly if available
+        if machine then
+            mainCpu = machine.devices[":maincpu"]
+            if not mainCpu then
+                error("Main CPU not found via machine")
+            end
+            
+            mem = mainCpu.spaces["program"]
+            if not mem then
+                error("Program memory space not found via machine")
+            end
+        else
+            error("Neither manager.machine nor machine is available")
+        end
+    end)
+    
+    if not success then
+        print("Error with alternative access method: " .. tostring(err))
+        print("FATAL: Cannot access MAME memory")
+        return
+    end
 end
 
-local mem = mainCpu.spaces["program"]
-if not mem then
-    print("Error: Program memory space not found")
-    return
-end
+print("Successfully accessed MAME memory interface")
 
 -- **GameState Class**
 GameState = {}
@@ -852,24 +857,31 @@ function EnemiesState:nearest_enemy_segment()
     return closest_segment  -- Returns the segment number or -1 if no enemies found
 end
 
--- Function to calculate the direction to the nearest enemy segment
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-    local target_segment = enemies_state:nearest_enemy_segment()
-    if target_segment < 0 then return 0 end -- No enemy
+    local enemy_seg = enemies_state:nearest_enemy_segment()
+    local player_seg = player_state.position
 
-    local player_segment = player_state.position
-    local delta = target_segment - player_segment
-    if delta == 0 then return 0 end -- Already aligned
-
-    if level_state.level_type == 0xFF then -- Open Level
-        -- Open Level Logic: Return negative delta to match spinner direction needed
-        return -delta 
-    else -- Closed Level
-        -- Closed Level Logic: Calculate shortest signed distance with wraparound
-        -- Result is in range [-8, 7], negative for CW, positive for CCW
-        return (delta + 8) % 16 - 8
+    if enemy_seg < 0 or enemy_seg == player_seg then 
+        return 0 -- No enemy or aligned
     end
+
+    local intensity
+    local spinner
+    if level_state.level_type == 0xFF then -- Open Level
+        local distance = math.abs(enemy_seg - player_seg)
+        intensity = math.min(0.9, 0.3 + (distance * 0.05))
+        spinner = enemy_seg > player_seg and -intensity or intensity
+    else -- Closed Level
+        local clockwise = (enemy_seg - player_seg) % 16
+        local counter = (player_seg - enemy_seg) % 16
+        local min_dist = math.min(clockwise, counter)
+        intensity = math.min(0.9, 0.3 + (min_dist * 0.05))
+        spinner = clockwise < counter and -intensity or intensity
+    end
+
+    return spinner
 end
+
 
 -- Function to decode enemy type info
 function EnemiesState:decode_enemy_type(type_byte)

@@ -7,14 +7,29 @@ Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
 - Communicates with Tempest via socket connection
 """
 
+# Global debug flag - set to False to disable debug output
+DEBUG_MODE = False
+
 # Override the built-in print function to always flush output
 # This ensures proper line breaks in output when running in background
 import builtins
 _original_print = builtins.print
 
 def _flushing_print(*args, **kwargs):
+    # Use CR+LF line endings consistently
+    new_args = []
+    for arg in args:
+        if isinstance(arg, str):
+            # Strip trailing whitespace and line endings
+            arg = arg.rstrip()
+            new_args.append(arg)
+        else:
+            new_args.append(arg)
+    
+    # Set end parameter to use CR+LF
+    kwargs["end"] = "\r\n"
     kwargs['flush'] = True
-    return _original_print(*args, **kwargs)
+    return _original_print(*new_args, **kwargs)
 
 builtins.print = _flushing_print
 
@@ -100,6 +115,10 @@ class MetricsData:
     override_expert: bool = False  # New field for expert override
     saved_expert_ratio: float = 0.75  # New field to save ratio during override
     last_action_source: str = ""
+    # FPS tracking
+    frames_last_second: int = 0
+    last_fps_time: float = 0
+    fps: float = 0.0
     
     @property
     def guided_ratio(self) -> float:
@@ -191,6 +210,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else
 print(f"Using device: {device}")
 
 metrics = MetricsData()
+
+# Global reference to server for metrics display
+global_server = None
 
 # Experience replay memory
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
@@ -347,8 +369,11 @@ class DQNAgent:
             'frame_count': metrics.frame_count,
             'expert_ratio': metrics.expert_ratio
         }, filename)
-        print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
         
+        # Only print on exit save (modified externally)
+        if "exit" in filename or "shutdown" in filename:
+            print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
+
     def load(self, filename):
         """Load model weights"""
         if os.path.exists(filename):
@@ -428,7 +453,32 @@ class SafeMetrics:
     
     def update_frame_count(self):
         with self.lock:
+            # Update total frame count
             self.metrics.frame_count += 1
+            
+            # Update FPS tracking
+            current_time = time.time()
+            
+            # Initialize last_fps_time if this is the first frame
+            if self.metrics.last_fps_time == 0:
+                self.metrics.last_fps_time = current_time
+                
+            # Count frames for this second
+            self.metrics.frames_last_second += 1
+            
+            # Calculate FPS every second
+            elapsed = current_time - self.metrics.last_fps_time
+            if elapsed >= 1.0:
+                # Calculate frames per second with more accuracy
+                new_fps = self.metrics.frames_last_second / elapsed
+                
+                # Store the new FPS value
+                self.metrics.fps = new_fps
+                
+                # Reset counters
+                self.metrics.frames_last_second = 0
+                self.metrics.last_fps_time = current_time
+                
             return self.metrics.frame_count
             
     def get_epsilon(self):
@@ -479,6 +529,10 @@ class SafeMetrics:
         with self.lock:
             return self.metrics.override_expert
 
+    def get_fps(self):
+        with self.lock:
+            return self.metrics.fps
+
 class SocketServer:
     """Socket-based server to handle multiple clients"""
     def __init__(self, host, port, agent, safe_metrics):
@@ -525,7 +579,10 @@ class SocketServer:
                         'episode_dqn_reward': 0,
                         'episode_expert_reward': 0,
                         'connected_time': datetime.now(),
-                        'frames_processed': 0
+                        'frames_processed': 0,
+                        'fps': 0.0,  # Track per-client FPS
+                        'frames_last_second': 0,  # Frames in current second
+                        'last_fps_update': time.time()  # Last FPS calculation time
                     }
                     
                     # Store client information
@@ -567,16 +624,37 @@ class SocketServer:
     def generate_client_id(self):
         """Generate a unique client ID"""
         with self.client_lock:
-            # Find the first available ID
+            # Check for reusable IDs first (clients that have disconnected)
             for i in range(SERVER_CONFIG.max_clients):
                 if i not in self.clients:
                     return i
-            # If all IDs are used, use timestamp as fallback
-            return f"overflow_{int(time.time())}"
+                    
+            # Before falling back to overflow, try to clean up disconnected clients
+            # that might still be in the dictionary but are no longer active
+            disconnected_ids = []
+            for client_id, thread in self.clients.items():
+                if isinstance(client_id, int) and not thread.is_alive():
+                    disconnected_ids.append(client_id)
+                    
+            # If we found disconnected clients, reuse the first ID
+            if disconnected_ids:
+                reused_id = disconnected_ids[0]
+                print(f"Reusing client ID {reused_id} from disconnected client")
+                return reused_id
+                
+            # If we still can't find an ID, use a numeric ID above the max_clients
+            # but keep it as a number instead of a string with "overflow_"
+            return SERVER_CONFIG.max_clients + len(self.clients) - SERVER_CONFIG.max_clients
     
     def handle_client(self, client_socket, client_id):
         """Handle communication with a client"""
         print(f"Starting handler for client {client_id}", flush=True)
+        
+        # Client-specific FPS tracking
+        frames_this_second = 0
+        fps_start_time = time.time()
+        last_fps_update = fps_start_time
+        client_fps = 0.0
         
         try:
             # Set socket to non-blocking mode
@@ -655,17 +733,26 @@ class SocketServer:
                     with self.client_lock:
                         state = self.client_states[client_id]
                         state['frames_processed'] += 1
+                        
+                        # Update client-specific FPS tracking
+                        current_time = time.time()
+                        state['frames_last_second'] += 1
+                        elapsed = current_time - state['last_fps_update']
+                        
+                        # Calculate client FPS every second
+                        if elapsed >= 1.0:
+                            state['fps'] = state['frames_last_second'] / elapsed
+                            state['frames_last_second'] = 0
+                            state['last_fps_update'] = current_time
                     
                     # Handle save signal from game
                     if frame.save_signal:
-                        print(f"Client {client_id}: SAVE SIGNAL RECEIVED", flush=True)
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
                         
                         try:
                             self.agent.save(save_path)
                             self.agent.save(LATEST_MODEL_PATH)
-                            print(f"Model saved to {save_path}", flush=True)
                         except Exception as e:
                             print(f"ERROR saving model: {e}", flush=True)
                     
@@ -704,7 +791,6 @@ class SocketServer:
                                 state['episode_dqn_reward'],
                                 state['episode_expert_reward']
                             )
-                            print(f"Client {client_id}: Episode complete, reward={state['total_reward']:.2f}", flush=True)
                         
                         state['was_done'] = True
                         client_socket.sendall(struct.pack("bbb", 0, 0, 0))
@@ -746,7 +832,6 @@ class SocketServer:
                     # Periodic target network update (only from client 0)
                     if client_id == 0 and current_frame % RL_CONFIG.update_target_every == 0:
                         self.agent.update_target_network()
-                        print(f"Updated target network at frame {current_frame}", flush=True)
                     
                     # Periodic model saving (only from client 0)
                     if client_id == 0 and current_frame % RL_CONFIG.save_interval == 0:
@@ -754,13 +839,6 @@ class SocketServer:
                         save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
                         self.agent.save(save_path)
                         self.agent.save(LATEST_MODEL_PATH)
-                        print(f"Periodic save at frame {current_frame}", flush=True)
-                    
-                    # Periodic client status update
-                    if state['frames_processed'] % 1000 == 0:
-                        duration = datetime.now() - state['connected_time']
-                        print(f"Client {client_id}: Processed {state['frames_processed']} frames, "
-                              f"connected for {duration}, latest reward: {state['total_reward']:.2f}", flush=True)
                 
                 except BlockingIOError:
                     # Expected with non-blocking socket
@@ -786,8 +864,45 @@ class SocketServer:
             # Remove client from tracking
             with self.client_lock:
                 if client_id in self.clients:
+                    # Mark this thread as not alive before removing
+                    self.clients[client_id] = None
+                    # Remove from clients dict
                     del self.clients[client_id]
+                    # Also remove from client_states dict
+                    if client_id in self.client_states:
+                        del self.client_states[client_id]
                 print(f"Client {client_id} disconnected, {len(self.clients)} clients remaining", flush=True)
+                
+                # Perform periodic cleanup of any stale client entries
+                if len(self.clients) > SERVER_CONFIG.max_clients / 2:
+                    self.cleanup_disconnected_clients()
+
+    def cleanup_disconnected_clients(self):
+        """Clean up any disconnected clients to free up their IDs"""
+        with self.client_lock:
+            # Find clients with dead threads
+            disconnected_clients = []
+            for client_id, thread in self.clients.items():
+                if thread is None or not thread.is_alive():
+                    disconnected_clients.append(client_id)
+            
+            # Remove them from our tracking dictionaries
+            for client_id in disconnected_clients:
+                if client_id in self.clients:
+                    del self.clients[client_id]
+                if client_id in self.client_states:
+                    del self.client_states[client_id]
+                    
+            if disconnected_clients:
+                print(f"Cleaned up {len(disconnected_clients)} disconnected clients. Available IDs: {SERVER_CONFIG.max_clients - len(self.clients)}")
+
+    def is_override_active(self):
+        with self.client_lock:
+            return self.metrics.override_expert
+            
+    def get_fps(self):
+        with self.client_lock:
+            return self.metrics.fps
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state"""
@@ -807,7 +922,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
         
         # Debug: Print when save signal is received in raw data
-        if save_signal:
+        if save_signal and DEBUG_MODE:
             print(f"\nDEBUG: Raw save signal received in header: {save_signal}", flush=True)
         
         state_data = data[header_size:]
@@ -844,7 +959,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         )
         
         # Debug: Print when save signal is set in FrameData
-        if frame_data.save_signal:
+        if frame_data.save_signal and DEBUG_MODE:
             print(f"DEBUG: Created FrameData with save_signal=True", flush=True)
             
         return frame_data
@@ -856,7 +971,7 @@ def display_metrics_header(kb=None):
     """Display header for metrics table"""
     if not IS_INTERACTIVE: return
     header = (
-        f"{'Frame':>8} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
+        f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
         f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
@@ -872,8 +987,14 @@ def display_metrics_row(agent, kb=None):
     guided_ratio = metrics.expert_ratio
     mem_size = len(agent.memory) if agent else 0
     
+    # Get client count from server if available
+    client_count = 0
+    if global_server:
+        with global_server.client_lock:
+            client_count = len(global_server.clients)
+    
     row = (
-        f"{metrics.frame_count:8d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
+        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.4f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
         f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {'ON' if metrics.override_expert else 'OFF':10}"
     )
@@ -944,6 +1065,8 @@ def decay_expert_ratio(current_step):
 
 def main():
     """Main function to launch server with multi-client support"""
+    global global_server
+    
     setup_environment()
     
     print("\nStarting Tempest AI Server with socket communication", flush=True)
@@ -974,6 +1097,7 @@ def main():
     
     # Create and start the socket server
     server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, safe_metrics)
+    global_server = server
     
     # Start a stats thread or keyboard handler loop based on interactivity
     def stats_reporter():
@@ -981,24 +1105,10 @@ def main():
         while True:
             time.sleep(1)
             
-            # Every 10 seconds, display summary stats
+            # Update metrics every 10 seconds but don't display them
             current_time = time.time()
             if current_time - last_stats_time >= 10:
-                with safe_metrics.lock:
-                    frame_count = metrics.frame_count
-                    mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
-                    epsilon = metrics.epsilon
-                    expert_ratio = metrics.expert_ratio
-                    memory_size = len(agent.memory)
-                    guided_pct = (metrics.guided_count / max(1, metrics.total_controls)) * 100
-                    client_count = len(server.clients)
-                
-                # Use print_with_terminal_restore if interactive, regular print otherwise
-                status_func = print_with_terminal_restore if IS_INTERACTIVE else print
-                status_func(kb_handler if IS_INTERACTIVE else None,
-                               f"Status: Clients={client_count}, Frame={frame_count}, "
-                               f"Reward={mean_reward:.2f}, ε={epsilon:.3f}, "
-                               f"Expert={expert_ratio*100:.1f}%, Memory={memory_size}")
+                # Just update the timestamps
                 last_stats_time = current_time
     
     # Start stats reporter thread (runs regardless of interactivity)
