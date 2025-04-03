@@ -4,8 +4,19 @@ Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
 - Makes intelligent decisions based on enemy positions and level types
 - Uses a Deep Q-Network (DQN) for reinforcement learning
 - Expert system provides guidance and training examples
-- Communicates with Tempest via Lua pipes
+- Communicates with Tempest via socket connection
 """
+
+# Override the built-in print function to always flush output
+# This ensures proper line breaks in output when running in background
+import builtins
+_original_print = builtins.print
+
+def _flushing_print(*args, **kwargs):
+    kwargs['flush'] = True
+    return _original_print(*args, **kwargs)
+
+builtins.print = _flushing_print
 
 import os
 import time
@@ -32,21 +43,28 @@ from stable_baselines3.common.logger import configure
 import termios
 import tty
 import fcntl
+import socket
+import traceback
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
+# Global flag to track if running interactively
+# Check this early before any potential tty interaction
+IS_INTERACTIVE = sys.stdin.isatty()
+print(f"Script Start: sys.stdin.isatty() = {IS_INTERACTIVE}") # DEBUG
+
 @dataclass
-class PipeConfigData:
-    """Configuration for pipe communication"""
-    lua_to_py: str = "/tmp/lua_to_py"
-    py_to_lua: str = "/tmp/py_to_lua"
+class ServerConfigData:
+    """Configuration for socket server"""
+    host: str = "0.0.0.0"  # Listen on all interfaces
+    port: int = 9999
+    max_clients: int = 16
     params_count: int = 128
     expert_ratio_start: float = 0.5
     expert_ratio_min: float = 0.01
     expert_ratio_decay: float = 0.98
     expert_ratio_decay_steps: int = 10000
-    expert_ratio_cycle: bool = False
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
 
@@ -81,6 +99,7 @@ class MetricsData:
     open_level: bool = False
     override_expert: bool = False  # New field for expert override
     saved_expert_ratio: float = 0.75  # New field to save ratio during override
+    last_action_source: str = ""
     
     @property
     def guided_ratio(self) -> float:
@@ -137,7 +156,7 @@ class FrameData:
         )
 
 # Configuration constants
-PIPE_CONFIG = PipeConfigData()
+SERVER_CONFIG = ServerConfigData()
 RL_CONFIG = RLConfigData()
 
 MODEL_DIR = "models"
@@ -344,7 +363,7 @@ class DQNAgent:
                 metrics.frame_count = checkpoint.get('frame_count', 0)
                 
                 # Always set the expert ratio to the start value
-                metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
+                metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
                 metrics.last_decay_step = 0
                 
                 print(f"Loaded model from frame {metrics.frame_count}, expert ratio reset to {metrics.expert_ratio:.2f}")
@@ -387,20 +406,388 @@ class KeyboardHandler:
 
 def print_with_terminal_restore(kb_handler, *args, **kwargs):
     """Print with proper terminal settings"""
-    if kb_handler:
+    if IS_INTERACTIVE and kb_handler:
         kb_handler.restore_terminal()
     print(*args, **kwargs, flush=True)
-    if kb_handler:
+    if IS_INTERACTIVE and kb_handler:
         kb_handler.set_raw_mode()
 
 def setup_environment():
-    """Set up pipes and model directory"""
+    """Set up environment for socket server"""
+    print("\nSetting up environment...")
     os.makedirs(MODEL_DIR, exist_ok=True)
-    for pipe in [PIPE_CONFIG.lua_to_py, PIPE_CONFIG.py_to_lua]:
-        if os.path.exists(pipe):
-            os.unlink(pipe)
-        os.mkfifo(pipe)
-        os.chmod(pipe, 0o666)
+    print(f"Model directory: {MODEL_DIR}")
+    print(f"Server will listen on {SERVER_CONFIG.host}:{SERVER_CONFIG.port}")
+    print(f"Ready to handle up to {SERVER_CONFIG.max_clients} clients")
+
+# Thread-safe metrics storage
+class SafeMetrics:
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.lock = threading.Lock()
+    
+    def update_frame_count(self):
+        with self.lock:
+            self.metrics.frame_count += 1
+            return self.metrics.frame_count
+            
+    def get_epsilon(self):
+        with self.lock:
+            return self.metrics.epsilon
+            
+    def update_epsilon(self):
+        with self.lock:
+            self.metrics.epsilon = decay_epsilon(self.metrics.frame_count)
+            return self.metrics.epsilon
+            
+    def update_expert_ratio(self):
+        with self.lock:
+            decay_expert_ratio(self.metrics.frame_count)
+            return self.metrics.expert_ratio
+    
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward):
+        with self.lock:
+            if total_reward > 0:
+                self.metrics.episode_rewards.append(total_reward)
+            if dqn_reward > 0:
+                self.metrics.dqn_rewards.append(dqn_reward)
+            if expert_reward > 0:
+                self.metrics.expert_rewards.append(expert_reward)
+    
+    def increment_guided_count(self):
+        with self.lock:
+            self.metrics.guided_count += 1
+    
+    def increment_total_controls(self):
+        with self.lock:
+            self.metrics.total_controls += 1
+            
+    def update_action_source(self, source):
+        with self.lock:
+            self.metrics.last_action_source = source
+            
+    def update_game_state(self, enemy_seg, open_level):
+        with self.lock:
+            self.metrics.enemy_seg = enemy_seg
+            self.metrics.open_level = open_level
+    
+    def get_expert_ratio(self):
+        with self.lock:
+            return self.metrics.expert_ratio
+            
+    def is_override_active(self):
+        with self.lock:
+            return self.metrics.override_expert
+
+class SocketServer:
+    """Socket-based server to handle multiple clients"""
+    def __init__(self, host, port, agent, safe_metrics):
+        self.host = host
+        self.port = port
+        self.agent = agent
+        self.metrics = safe_metrics
+        self.running = True
+        self.clients = {}  # Dictionary to track active clients
+        self.client_states = {}  # Dictionary to store per-client state
+        self.client_lock = threading.Lock()  # Lock for client dictionaries
+        
+    def start(self):
+        """Start the socket server"""
+        try:
+            # Create server socket
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(SERVER_CONFIG.max_clients)
+            
+            print(f"Server started on {self.host}:{self.port}", flush=True)
+            print("Waiting for client connections...", flush=True)
+            
+            # Accept client connections in a loop
+            while self.running:
+                try:
+                    # Accept new connection (timeout after 1 second to check running flag)
+                    self.server_socket.settimeout(1.0)
+                    client_socket, client_address = self.server_socket.accept()
+                    
+                    # Generate a unique client ID
+                    client_id = self.generate_client_id()
+                    
+                    print(f"New connection from {client_address}, assigned ID: {client_id}", flush=True)
+                    
+                    # Initialize client state
+                    client_state = {
+                        'address': client_address,
+                        'last_state': None,
+                        'last_action_idx': None,
+                        'total_reward': 0,
+                        'was_done': False,
+                        'episode_dqn_reward': 0,
+                        'episode_expert_reward': 0,
+                        'connected_time': datetime.now(),
+                        'frames_processed': 0
+                    }
+                    
+                    # Store client information
+                    with self.client_lock:
+                        self.client_states[client_id] = client_state
+                    
+                    # Start a thread to handle this client
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, client_id),
+                        daemon=True
+                    )
+                    
+                    # Store thread and start it
+                    with self.client_lock:
+                        self.clients[client_id] = client_thread
+                    
+                    client_thread.start()
+                    
+                except socket.timeout:
+                    # This is expected - just a way to periodically check self.running
+                    continue
+                except Exception as e:
+                    print(f"Error accepting client connection: {e}")
+                    traceback.print_exc()
+                    time.sleep(1)  # Brief pause on error
+            
+        except Exception as e:
+            print(f"Server error: {e}")
+            traceback.print_exc()
+        finally:
+            # Close the server socket
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            print("Server stopped")
+    
+    def generate_client_id(self):
+        """Generate a unique client ID"""
+        with self.client_lock:
+            # Find the first available ID
+            for i in range(SERVER_CONFIG.max_clients):
+                if i not in self.clients:
+                    return i
+            # If all IDs are used, use timestamp as fallback
+            return f"overflow_{int(time.time())}"
+    
+    def handle_client(self, client_socket, client_id):
+        """Handle communication with a client"""
+        print(f"Starting handler for client {client_id}", flush=True)
+        
+        try:
+            # Set socket to non-blocking mode
+            client_socket.setblocking(False)
+            
+            # Make buffer size for receiving
+            buffer_size = 4096 # Buffer for frame data
+            
+            # --- Initial Ping Handshake ---
+            ping_ok = False # Flag to track successful handshake
+            try:
+                # Set blocking briefly to wait for the initial ping header
+                client_socket.setblocking(True)
+                client_socket.settimeout(2.0) # 2 second timeout for ping
+                ping_header = client_socket.recv(4)
+                if not ping_header or len(ping_header) < 4:
+                    print(f"Client {client_id} disconnected (no initial ping header)", flush=True)
+                else:
+                    print(f"Client {client_id}: Initial ping received successfully.", flush=True)
+                    ping_ok = True # Signal success
+            except socket.timeout:
+                print(f"Client {client_id} timed out waiting for initial ping.", flush=True)
+            except Exception as e:
+                print(f"Client {client_id} error during initial ping: {e}", flush=True)
+            finally:
+                # Restore non-blocking mode for main loop
+                client_socket.setblocking(False)
+                client_socket.settimeout(None)
+            # --- End Initial Ping Handshake ---
+
+            # Exit loop if ping handshake failed
+            if not ping_ok:
+                return
+            
+            # Main communication loop
+            while self.running:
+                # Wait for data with timeout using select
+                ready = select.select([client_socket], [], [], 0.1)
+                if not ready[0]:
+                    # No data available, continue
+                    continue
+                
+                try:
+                    # Receive data length first (4-byte integer)
+                    length_data = client_socket.recv(4)
+                    if not length_data or len(length_data) < 4:
+                        print(f"Client {client_id} disconnected (no length header)", flush=True)
+                        break
+                    
+                    # Unpack data length
+                    data_length = struct.unpack(">I", length_data)[0]
+                    
+                    # Now receive the actual data
+                    data = b""
+                    remaining = data_length
+                    
+                    while remaining > 0:
+                        chunk = client_socket.recv(min(buffer_size, remaining))
+                        if not chunk:
+                            break
+                        data += chunk
+                        remaining -= len(chunk)
+                    
+                    if len(data) < data_length:
+                        print(f"Client {client_id} sent incomplete data, expected {data_length}, got {len(data)}", flush=True)
+                        continue
+                    
+                    # Parse the frame data
+                    frame = parse_frame_data(data)
+                    if not frame:
+                        # Send empty response on parsing failure
+                        client_socket.sendall(struct.pack("bbb", 0, 0, 0))
+                        continue
+                    
+                    # Get client state
+                    with self.client_lock:
+                        state = self.client_states[client_id]
+                        state['frames_processed'] += 1
+                    
+                    # Handle save signal from game
+                    if frame.save_signal:
+                        print(f"Client {client_id}: SAVE SIGNAL RECEIVED", flush=True)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
+                        
+                        try:
+                            self.agent.save(save_path)
+                            self.agent.save(LATEST_MODEL_PATH)
+                            print(f"Model saved to {save_path}", flush=True)
+                        except Exception as e:
+                            print(f"ERROR saving model: {e}", flush=True)
+                    
+                    # Update global metrics
+                    current_frame = self.metrics.update_frame_count()
+                    self.metrics.update_epsilon()
+                    self.metrics.update_expert_ratio()
+                    self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
+                    
+                    # Process previous step's results if available
+                    if state['last_state'] is not None and state['last_action_idx'] is not None:
+                        # Add experience to replay memory
+                        self.agent.step(
+                            state['last_state'],
+                            np.array([[state['last_action_idx']]]),
+                            frame.reward,
+                            frame.state,
+                            frame.done
+                        )
+                        
+                        # Track rewards
+                        state['total_reward'] += frame.reward
+                        
+                        # Track which system's rewards
+                        if hasattr(metrics, 'last_action_source'):
+                            if metrics.last_action_source == "expert":
+                                state['episode_expert_reward'] += frame.reward
+                            else:
+                                state['episode_dqn_reward'] += frame.reward
+                    
+                    # Handle episode completion
+                    if frame.done:
+                        if not state['was_done']:
+                            self.metrics.add_episode_reward(
+                                state['total_reward'],
+                                state['episode_dqn_reward'],
+                                state['episode_expert_reward']
+                            )
+                            print(f"Client {client_id}: Episode complete, reward={state['total_reward']:.2f}", flush=True)
+                        
+                        state['was_done'] = True
+                        client_socket.sendall(struct.pack("bbb", 0, 0, 0))
+                        state['last_state'] = None
+                        state['last_action_idx'] = None
+                        continue
+                    elif state['was_done']:
+                        state['was_done'] = False
+                        state['total_reward'] = 0
+                        state['episode_dqn_reward'] = 0
+                        state['episode_expert_reward'] = 0
+                    
+                    # Generate action
+                    self.metrics.increment_total_controls()
+                    
+                    # Decide between expert system and DQN
+                    if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
+                        # Use expert system
+                        fire, zap, spinner = get_expert_action(
+                            frame.enemy_seg, frame.player_seg, frame.open_level
+                        )
+                        self.metrics.increment_guided_count()
+                        self.metrics.update_action_source("expert")
+                        action_idx = expert_action_to_index(fire, zap, spinner)
+                    else:
+                        # Use DQN with current epsilon
+                        action_idx = self.agent.act(frame.state, self.metrics.get_epsilon())
+                        fire, zap, spinner = ACTION_MAPPING[action_idx]
+                        self.metrics.update_action_source("dqn")
+                    
+                    # Store state and action for next iteration
+                    state['last_state'] = frame.state
+                    state['last_action_idx'] = action_idx
+                    
+                    # Send action to game
+                    game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
+                    client_socket.sendall(struct.pack("bbb", game_fire, game_zap, game_spinner))
+                    
+                    # Periodic target network update (only from client 0)
+                    if client_id == 0 and current_frame % RL_CONFIG.update_target_every == 0:
+                        self.agent.update_target_network()
+                        print(f"Updated target network at frame {current_frame}", flush=True)
+                    
+                    # Periodic model saving (only from client 0)
+                    if client_id == 0 and current_frame % RL_CONFIG.save_interval == 0:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
+                        self.agent.save(save_path)
+                        self.agent.save(LATEST_MODEL_PATH)
+                        print(f"Periodic save at frame {current_frame}", flush=True)
+                    
+                    # Periodic client status update
+                    if state['frames_processed'] % 1000 == 0:
+                        duration = datetime.now() - state['connected_time']
+                        print(f"Client {client_id}: Processed {state['frames_processed']} frames, "
+                              f"connected for {duration}, latest reward: {state['total_reward']:.2f}", flush=True)
+                
+                except BlockingIOError:
+                    # Expected with non-blocking socket
+                    time.sleep(0.001)
+                except ConnectionResetError:
+                    print(f"Client {client_id} connection reset", flush=True)
+                    break
+                except BrokenPipeError:
+                    print(f"Client {client_id} connection broken", flush=True)
+                    break
+                except Exception as e:
+                    print(f"Error handling client {client_id}: {e}", flush=True)
+                    traceback.print_exc()
+                    break
+        
+        finally:
+            # Clean up client resources
+            try:
+                client_socket.close()
+            except:
+                pass
+            
+            # Remove client from tracking
+            with self.client_lock:
+                if client_id in self.clients:
+                    del self.clients[client_id]
+                print(f"Client {client_id} disconnected, {len(self.clients)} clients remaining", flush=True)
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state"""
@@ -412,7 +799,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
-            print(f"Received data too small: {len(data)} bytes, need {header_size}")
+            print(f"Received data too small: {len(data)} bytes, need {header_size}", flush=True)
             return None
             
         values = struct.unpack(format_str, data[:header_size])
@@ -421,7 +808,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         
         # Debug: Print when save signal is received in raw data
         if save_signal:
-            print(f"\nDEBUG: Raw save signal received in header: {save_signal}")
+            print(f"\nDEBUG: Raw save signal received in header: {save_signal}", flush=True)
         
         state_data = data[header_size:]
         
@@ -438,10 +825,10 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         state = np.array(state_values, dtype=np.float32) / 32768.0
         
         # Ensure state has correct dimensions
-        if len(state) > PIPE_CONFIG.params_count:
-            state = state[:PIPE_CONFIG.params_count]
-        elif len(state) < PIPE_CONFIG.params_count:
-            state = np.pad(state, (0, PIPE_CONFIG.params_count - len(state)))
+        if len(state) > SERVER_CONFIG.params_count:
+            state = state[:SERVER_CONFIG.params_count]
+        elif len(state) < SERVER_CONFIG.params_count:
+            state = np.pad(state, (0, SERVER_CONFIG.params_count - len(state)))
                 
         frame_data = FrameData(
             state=state,
@@ -458,15 +845,16 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         
         # Debug: Print when save signal is set in FrameData
         if frame_data.save_signal:
-            print(f"DEBUG: Created FrameData with save_signal=True")
+            print(f"DEBUG: Created FrameData with save_signal=True", flush=True)
             
         return frame_data
     except Exception as e:
-        print(f"Error parsing frame data: {e}")
+        print(f"Error parsing frame data: {e}", flush=True)
         return None
 
 def display_metrics_header(kb=None):
     """Display header for metrics table"""
+    if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
         f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
@@ -477,6 +865,7 @@ def display_metrics_header(kb=None):
 
 def display_metrics_row(agent, kb=None):
     """Display current metrics in tabular format"""
+    if not IS_INTERACTIVE: return
     mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
     dqn_reward = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
     mean_loss = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
@@ -536,199 +925,121 @@ def decay_epsilon(frame_count):
 
 def decay_expert_ratio(current_step):
     """Update expert ratio based on 10,000 frame intervals"""
-    step_interval = current_step // PIPE_CONFIG.expert_ratio_decay_steps
+    step_interval = current_step // SERVER_CONFIG.expert_ratio_decay_steps
     
     # Only update if we've moved to a new interval
     if step_interval > metrics.last_decay_step:
         metrics.last_decay_step = step_interval
         if step_interval == 0:
             # First interval - use starting value
-            metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
+            metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
         else:
             # Apply decay
-            metrics.expert_ratio *= PIPE_CONFIG.expert_ratio_decay
+            metrics.expert_ratio *= SERVER_CONFIG.expert_ratio_decay
         
         # Ensure we don't go below the minimum
-        metrics.expert_ratio = max(PIPE_CONFIG.expert_ratio_min, metrics.expert_ratio)
+        metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
         
     return metrics.expert_ratio
 
 def main():
-    """Main game loop handling Lua communication and decisions"""
+    """Main function to launch server with multi-client support"""
     setup_environment()
     
-    # Initialize DQN agent
-    agent = DQNAgent(PIPE_CONFIG.params_count, len(ACTION_MAPPING))
+    print("\nStarting Tempest AI Server with socket communication", flush=True)
+    
+    # Initialize DQN agent (shared across all clients)
+    agent = DQNAgent(SERVER_CONFIG.params_count, len(ACTION_MAPPING))
     
     # Try to load existing model
     if not agent.load(LATEST_MODEL_PATH):
-        print("No existing model found. Starting with new model.")
+        print("No existing model found. Starting with new model.", flush=True)
     
-    # Always initialize expert ratio to the start value
-    metrics.expert_ratio = PIPE_CONFIG.expert_ratio_start
+    # Setup keyboard handler ONLY if interactive
+    kb_handler = None
+    if IS_INTERACTIVE:
+        kb_handler = KeyboardHandler()
+        print("Running in interactive mode. Press 'o' to toggle expert override, 'q' to quit.", flush=True)
+    else:
+        print("Running in non-interactive mode (background/redirected). Keyboard input disabled.", flush=True)
+    
+    # Initialize metrics and wrap in thread-safe container
+    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
     metrics.last_decay_step = 0
-        
-    # Initialize keyboard handler
-    kb = KeyboardHandler()
-    with kb:
-        # Display initial metrics header and values
-        print_with_terminal_restore(kb, "\n" + "="*80)
-        print_with_terminal_restore(kb, "Tempest AI Training Started")
-        print_with_terminal_restore(kb, "="*80 + "\n")
-        display_metrics_header(kb)
-        display_metrics_row(agent, kb)
-        
-        total_reward = 0
-        was_done = False
-        last_state = None
-        last_action_idx = None
-        episode_dqn_reward = 0
-        episode_expert_reward = 0
-        
-        with os.fdopen(os.open(PIPE_CONFIG.lua_to_py, os.O_RDONLY | os.O_NONBLOCK), "rb") as lua_in, \
-             open(PIPE_CONFIG.py_to_lua, "wb") as lua_out:
-             
-            while True:
-                # Check for keyboard input
-                key = kb.check_key()
-                if key == 'o':  # Toggle override
-                    metrics.toggle_override(kb)
-                elif key == 'q':  # Add quit option
-                    print_with_terminal_restore(kb, "\nQuitting...")
-                    break
+    safe_metrics = SafeMetrics(metrics)
+    
+    print("\n" + "="*80, flush=True)
+    print("Tempest AI Socket Server Started", flush=True)
+    print("="*80 + "\n", flush=True)
+    
+    # Create and start the socket server
+    server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, safe_metrics)
+    
+    # Start a stats thread or keyboard handler loop based on interactivity
+    def stats_reporter():
+        last_stats_time = time.time()
+        while True:
+            time.sleep(1)
+            
+            # Every 10 seconds, display summary stats
+            current_time = time.time()
+            if current_time - last_stats_time >= 10:
+                with safe_metrics.lock:
+                    frame_count = metrics.frame_count
+                    mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
+                    epsilon = metrics.epsilon
+                    expert_ratio = metrics.expert_ratio
+                    memory_size = len(agent.memory)
+                    guided_pct = (metrics.guided_count / max(1, metrics.total_controls)) * 100
+                    client_count = len(server.clients)
                 
-                # Check for incoming data
-                if not select.select([lua_in], [], [], 0.01)[0]:
-                    time.sleep(0.001)
-                    continue
-                
-                data = lua_in.read()
-                if not data:
-                    time.sleep(0.001)
-                    continue
-                
-                frame = parse_frame_data(data)
-                if not frame:
-                    lua_out.write(struct.pack("bbb", 0, 0, 0))
-                    lua_out.flush()
-                    continue
-                
-                # Debug: Check frame's save signal immediately after parsing
-                if frame.save_signal:
-                    print(f"DEBUG: Main loop received frame with save_signal=True")
-                
-                # Handle save signal from game BEFORE other processing
-                if frame.save_signal:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    save_path = f"{MODEL_DIR}/tempest_model_{timestamp}.pt"
-                    print_with_terminal_restore(kb, "\n" + "="*80)
-                    print_with_terminal_restore(kb, f"SAVE SIGNAL RECEIVED at frame {metrics.frame_count}")
-                    print_with_terminal_restore(kb, f"Saving model to: {save_path}")
-                    try:
-                        agent.save(save_path)
-                        agent.save(LATEST_MODEL_PATH)
-                        print_with_terminal_restore(kb, f"Model saved successfully! (Expert ratio: {metrics.expert_ratio:.2f})")
-                        print_with_terminal_restore(kb, "="*80 + "\n")
-                        display_metrics_header(kb)
-                    except Exception as e:
-                        print_with_terminal_restore(kb, f"ERROR saving model: {e}")
-                
-                # Update metrics counter
-                metrics.frame_count += 1
-                
-                # Update exploration rate and expert ratio
-                metrics.epsilon = decay_epsilon(metrics.frame_count)
-                decay_expert_ratio(metrics.frame_count)
-                
-                # Process previous step's results if we have them
-                if last_state is not None and last_action_idx is not None:
-                    # Add experience to replay memory
-                    agent.step(
-                        last_state, 
-                        np.array([[last_action_idx]]), 
-                        frame.reward, 
-                        frame.state, 
-                        frame.done
-                    )
+                # Use print_with_terminal_restore if interactive, regular print otherwise
+                status_func = print_with_terminal_restore if IS_INTERACTIVE else print
+                status_func(kb_handler if IS_INTERACTIVE else None,
+                               f"Status: Clients={client_count}, Frame={frame_count}, "
+                               f"Reward={mean_reward:.2f}, ε={epsilon:.3f}, "
+                               f"Expert={expert_ratio*100:.1f}%, Memory={memory_size}")
+                last_stats_time = current_time
+    
+    # Start stats reporter thread (runs regardless of interactivity)
+    stats_thread = threading.Thread(target=stats_reporter, daemon=True)
+    stats_thread.start()
+    
+    # Start server thread
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    
+    try:
+        # If interactive, handle keyboard input
+        if IS_INTERACTIVE:
+            with kb_handler:
+                display_metrics_header(kb_handler)
+                display_interval = 5.0 # Update display every 5 seconds
+                last_display_time = time.time()
+
+                while server.running:
+                    char = kb_handler.check_key()
+                    if char:
+                        if char == 'q':
+                            print_with_terminal_restore(kb_handler, "\n'q' pressed, shutting down...")
+                            server.running = False
+                            break
+                        elif char == 'o':
+                            metrics.toggle_override(kb_handler) # Pass handler for printing
                     
-                    # Track total reward
-                    total_reward += frame.reward
+                    # Update metrics display periodically
+                    current_time = time.time()
+                    if current_time - last_display_time >= display_interval:
+                        display_metrics_row(agent, kb_handler)
+                        last_display_time = current_time
                     
-                    # Track which system's rewards (expert or DQN)
-                    if metrics.last_action_source == "expert":
-                        episode_expert_reward += frame.reward
-                    else:
-                        episode_dqn_reward += frame.reward
-                
-                # Update episode tracking
-                if frame.done:
-                    if not was_done:
-                        metrics.episode_rewards.append(total_reward)
-                        if episode_dqn_reward > 0:
-                            metrics.dqn_rewards.append(episode_dqn_reward)
-                        if episode_expert_reward > 0:
-                            metrics.expert_rewards.append(episode_expert_reward)
-                        
-                    was_done = True
-                    lua_out.write(struct.pack("bbb", 0, 0, 0))
-                    lua_out.flush()
-                    last_state = None
-                    last_action_idx = None
-                    continue
-                elif was_done:
-                    was_done = False
-                    total_reward = 0
-                    episode_dqn_reward = 0
-                    episode_expert_reward = 0
-                
-                # Store frame data for metrics
-                metrics.enemy_seg = frame.enemy_seg
-                metrics.open_level = frame.open_level
-                
-                # Generate action (expert or DQN based on expert_ratio)
-                metrics.total_controls += 1
-                
-                # Decide between expert system and DQN
-                if random.random() < metrics.expert_ratio:
-                    # Use expert system
-                    fire, zap, spinner = get_expert_action(
-                        frame.enemy_seg, frame.player_seg, frame.open_level
-                    )
-                    metrics.guided_count += 1
-                    metrics.last_action_source = "expert"
-                    
-                    # Convert expert action to index for training
-                    action_idx = expert_action_to_index(fire, zap, spinner)
-                else:
-                    # Use DQN
-                    action_idx = agent.act(frame.state, metrics.epsilon)
-                    fire, zap, spinner = ACTION_MAPPING[action_idx]
-                    metrics.last_action_source = "dqn"
-                
-                # Store state and action for next frame's training
-                last_state = frame.state
-                last_action_idx = action_idx
-                
-                # Send action to game
-                game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
-                lua_out.write(struct.pack("bbb", game_fire, game_zap, game_spinner))
-                lua_out.flush()
-                
-                # Update target network periodically
-                if metrics.frame_count % RL_CONFIG.update_target_every == 0:
-                    agent.update_target_network()
-                
-                # Update metrics display
-                if metrics.frame_count % 1000 == 0:
-                    display_metrics_row(agent, kb)
-                    if metrics.override_expert:
-                        print_with_terminal_restore(kb, "Expert guidance: DISABLED (override)")
-                
-                # Save model periodically
-                if metrics.frame_count % RL_CONFIG.save_interval == 0:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    agent.save(f"{MODEL_DIR}/tempest_model_{timestamp}.pt")
-                    agent.save(LATEST_MODEL_PATH)
+                    time.sleep(0.01) # Prevent busy-waiting for keys
+        else:
+            # If not interactive, just wait for server thread to finish (e.g., on error or external signal)
+            server_thread.join()
+
+    except KeyboardInterrupt:
+        print("\nShutting down server (KeyboardInterrupt)...")
 
 if __name__ == "__main__":
     # Set seeds for reproducibility

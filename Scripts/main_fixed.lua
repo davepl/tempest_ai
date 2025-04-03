@@ -44,7 +44,7 @@ end
 -- Function to move the cursor to the home position using ANSI escape codes
 local function move_cursor_home()
     io.write("\027[H")
-end
+local pipe_out = nil
 
 -- Log file for storing frame data
 local log_file = nil  -- Will hold the file handle, not the path
@@ -319,54 +319,19 @@ local function process_frame(params, player_state, controls, reward, bDone, bAtt
         return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on write error
     end
     
-    -- Verify that the number of parameters matches expected value
-    local num_params = 0
-    if params and string.len(params) > 0 then
-        num_params = string.len(params) / 2  -- Each parameter is 2 bytes
-    end
-    
-    if num_params < 128 then
-        print("Warning: Payload size mismatch. Expected 128 params, got " .. num_params)
-    end
-    
-    -- Try to read from socket with timeout protection
+    -- Try to read from socket, handle errors
     local fire, zap, spinner = 0, 0, 0  -- Default values
-    local read_start_time = os.clock()
-    local read_timeout = 0.5  -- 500ms timeout for socket read
-    
     success, err = pcall(function()
-        -- Use non-blocking approach with timeout
-        local action_bytes = nil
-        local elapsed = 0
-        
-        while not action_bytes and elapsed < read_timeout do
-            action_bytes = socket:read(3)
-            
-            if not action_bytes or #action_bytes < 3 then
-                -- If read fails, sleep a tiny bit and try again
-                -- Use non-blocking sleep
-                local wait_start = os.clock()
-                while os.clock() - wait_start < 0.01 do
-                    -- Busy wait instead of os.execute which can freeze MAME
-                end
-                elapsed = os.clock() - read_start_time
-                action_bytes = nil
-            end
-        end
+        -- Read exactly 3 bytes for the three i8 values
+        local action_bytes = socket:read(3)
         
         if action_bytes and #action_bytes == 3 then
             -- Unpack the three signed 8-bit integers
             fire, zap, spinner = string.unpack("bbb", action_bytes)
         else
-            -- Default action if read fails or times out
-            print("Failed to read action from socket after " .. elapsed .. "s, got " .. 
-                  (action_bytes and #action_bytes or 0) .. " bytes")
+            -- Default action if read fails
+            print("Failed to read action from socket, got " .. (action_bytes and #action_bytes or 0) .. " bytes")
             fire, zap, spinner = 0, 0, 0
-            
-            -- If we timed out, reconnect
-            if elapsed >= read_timeout then
-                error("Socket read timeout exceeded")
-            end
         end
     end)
     
