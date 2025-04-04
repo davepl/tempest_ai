@@ -249,7 +249,7 @@ local function process_frame(params, player_state, controls, reward, bDone, bAtt
     frame_count = frame_count + 1
 
     if LOG_ONLY_MODE then
-        return controls.zap_commanded, controls.fire_commanded, controls.spinner_delta
+        return controls.fire_commanded, controls.zap_commanded, controls.spinner_delta
     end
     
     -- Check if socket is open, try to reopen if not
@@ -584,6 +584,8 @@ function PlayerState:new()
     self.SpinnerDelta = 0
     self.prevSpinnerAccum = 0
     self.inferredSpinnerDelta = 0
+    self.fire_commanded = 0   -- Add fire_commanded field
+    self.zap_commanded = 0    -- Add zap_commanded field
     return self
 end
 
@@ -1174,8 +1176,8 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     local binary_data = ""
     for i, value in ipairs(data) do
-       
-        encoded_value = i & 0xFFFF
+        -- Use the actual value from the data table, not just the index
+        encoded_value = value & 0xFFFF
         binary_data = binary_data .. string.pack(">I2", encoded_value)
     end
   
@@ -1428,6 +1430,7 @@ local function frame_callback()
     -- BOT: Calculate spinner value based on direction to nearest enemy, it will play like demo mode
     -- Calculate spinner value based on direction to nearest enemy, override what the model said above
     -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
+
 
     player_state.fire_commanded = fire
     player_state.zap_commanded = zap
