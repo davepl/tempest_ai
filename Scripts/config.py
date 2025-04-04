@@ -3,6 +3,11 @@
 Configuration and shared types for Tempest AI.
 """
 
+# Prevent direct execution
+if __name__ == "__main__":
+    print("This is not the main application, run 'main.py' instead")
+    exit(1)
+
 import os
 import sys
 import time
@@ -23,7 +28,7 @@ class ServerConfigData:
     """Configuration for socket server"""
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
-    max_clients: int = 32
+    max_clients: int = 36
     params_count: int = 128
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.01
@@ -125,6 +130,9 @@ class MetricsData:
         with self.lock:
             # Import here to avoid circular imports
             from aimodel import decay_expert_ratio
+            # Skip decay if expert mode is active
+            if self.expert_mode:
+                return self.expert_ratio
             decay_expert_ratio(self.frame_count)
             return self.expert_ratio
     
@@ -190,6 +198,13 @@ class MetricsData:
         """Toggle expert mode"""
         with self.lock:
             self.expert_mode = not self.expert_mode
+            if self.expert_mode:
+                # Save current expert ratio and set to 1.0 (100%) when expert mode is ON
+                self.saved_expert_ratio = self.expert_ratio
+                self.expert_ratio = 1.0
+            else:
+                # Restore the saved expert ratio when expert mode is OFF
+                self.expert_ratio = self.saved_expert_ratio
             if kb_handler:
                 print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}")
 

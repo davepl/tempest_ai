@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Socket server functionality for Tempest AI.
-Handles client connections, data processing, and communication.
+Socket server for Tempest AI.
 """
 
+# Prevent direct execution
+if __name__ == "__main__":
+    print("This is not the main application, run 'main.py' instead")
+    exit(1)
+
 import os
-import time
-import struct
-import random
 import sys
-import threading
-import select
+import time
 import socket
+import select
+import struct
+import threading
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Any
+import random
 import traceback
 from datetime import datetime
-import numpy as np
 
 # Import from config.py
 from config import (

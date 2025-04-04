@@ -170,7 +170,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     -- Survival reward
     if player_state.alive == 1 then
 
-        reward = reward + 1
+        -- reward = reward + 1
 
         -- Score reward
         local score_delta = player_state.score - previous_score
@@ -193,11 +193,11 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             local distance = math.abs(direction)
 
             if distance == 0 then
-                reward = reward + (player_state.SpinnerDelta == 0 and 15 or 10)
+                reward = reward + (player_state.SpinnerDelta == 0 and 50 or 20)
             else
                 reward = reward + math.max(0, 10 - distance)
                 if direction * player_state.SpinnerDelta > 0 then
-                    reward = reward + 5
+                    reward = reward + 10
                 elseif player_state.SpinnerDelta ~= 0 then
                     reward = reward - 1
                 end
@@ -209,7 +209,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
     else
         if previous_alive_state == 1 then
-            reward = reward - 1000
+            reward = reward - 250
             bDone = true
         end
     end

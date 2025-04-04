@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-Display functionality for Tempest AI metrics.
-Handles terminal output and formatting for metrics display.
+Metrics display for Tempest AI.
 """
 
+# Prevent direct execution
+if __name__ == "__main__":
+    print("This is not the main application, run 'main.py' instead")
+    exit(1)
+
+import os
 import sys
 import time
+import threading
+import termios
+import tty
+import fcntl
 import numpy as np
+from typing import Optional, List, Dict, Any
 
 # Import from config.py
 from config import metrics, IS_INTERACTIVE

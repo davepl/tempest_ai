@@ -7,6 +7,11 @@ Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
 - Communicates with Tempest via socket connection
 """
 
+# Prevent direct execution
+if __name__ == "__main__":
+    print("This is not the main application, run 'main.py' instead")
+    exit(1)
+
 # Global debug flag - set to False to disable debug output
 DEBUG_MODE = False
 
@@ -335,7 +340,6 @@ class DQNAgent:
                 metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
                 metrics.last_decay_step = 0
                 
-                print(f"Loaded model from frame {metrics.frame_count}, expert ratio reset to {metrics.expert_ratio:.2f}")
                 return True
             except Exception as e:
                 print(f"Error loading model: {e}")
@@ -481,14 +485,15 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state"""
     try:
         if not data or len(data) < 10:  # Minimal size check
-            return None
+            print("ERROR: Received empty or too small data packet", flush=True)
+            sys.exit(1)
         
         format_str = ">IdBBBIIBBBhBhBB"
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
-            print(f"Received data too small: {len(data)} bytes, need {header_size}", flush=True)
-            return None
+            print(f"ERROR: Received data too small: {len(data)} bytes, need {header_size}", flush=True)
+            sys.exit(1)
             
         values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score, \
@@ -508,15 +513,15 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
                     value = struct.unpack(">H", state_data[i:i+2])[0] - 32768
                     state_values.append(value)
                 except struct.error:
-                    continue  # Skip this value on error
+                    print(f"ERROR: Failed to unpack state value at position {i}", flush=True)
+                    sys.exit(1)
         
         state = np.array(state_values, dtype=np.float32) / 32768.0
         
-        # Ensure state has correct dimensions
-        if len(state) > SERVER_CONFIG.params_count:
-            state = state[:SERVER_CONFIG.params_count]
-        elif len(state) < SERVER_CONFIG.params_count:
-            state = np.pad(state, (0, SERVER_CONFIG.params_count - len(state)))
+        # Check for parameter count mismatch and exit if there's a problem
+        if len(state) != SERVER_CONFIG.params_count:
+            print(f"ERROR: Parameter count mismatch. Expected {SERVER_CONFIG.params_count}, got {len(state)}", flush=True)
+            sys.exit(1)
                 
         frame_data = FrameData(
             state=state,
@@ -537,8 +542,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             
         return frame_data
     except Exception as e:
-        print(f"Error parsing frame data: {e}", flush=True)
-        return None
+        print(f"ERROR parsing frame data: {e}", flush=True)
+        sys.exit(1)
 
 def display_metrics_header(kb=None):
     """Display header for metrics table"""
