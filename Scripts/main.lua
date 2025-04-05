@@ -204,16 +204,22 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             local distance = math.abs(direction)
 
             if distance == 0 then
-                reward = reward + (player_state.SpinnerDelta == 0 and 50 or 20)
+                -- Much higher reward for perfect alignment and staying still
+                reward = reward + (player_state.SpinnerDelta == 0 and 100 or -10)
             else
+                -- Base reward for being close to target
                 reward = reward + math.max(0, 10 - distance)
+                
+                -- Movement rewards/penalties
                 if direction * player_state.SpinnerDelta > 0 then
-                    reward = reward + 10  -- Moving in correct direction
-                    reward = reward + math.abs(player_state.SpinnerDelta)
+                    -- Only reward moving in correct direction, no bonus for speed
+                    reward = reward + 10
                 elseif player_state.SpinnerDelta ~= 0 then
-                    reward = reward - 5   -- Moving in wrong direction
+                    -- Bigger penalty for wrong movement
+                    reward = reward - 15
                 else
-                    reward = reward - 3   -- Not moving when we should be
+                    -- Small penalty for not moving when not aligned
+                    reward = reward - 3
                 end
             end
         end
