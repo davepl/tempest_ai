@@ -29,10 +29,10 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 128
+    params_count: int = 50
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.05
-    expert_ratio_decay: float = 0.995
+    expert_ratio_decay: float = 0.999
     expert_ratio_decay_steps: int = 10000
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
@@ -40,7 +40,7 @@ class ServerConfigData:
 @dataclass
 class RLConfigData:
     """Configuration for reinforcement learning"""
-    state_size: int = 128  # Size of state vector from game
+    state_size: int = 50  # Size of state vector from game
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
     batch_size: int = 512
     gamma: float = 0.99

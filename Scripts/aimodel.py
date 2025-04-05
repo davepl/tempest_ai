@@ -73,7 +73,9 @@ from config import (
     MODEL_DIR,
     LATEST_MODEL_PATH,
     ACTION_MAPPING,
-    metrics as config_metrics
+    metrics as config_metrics,
+    ServerConfigData,
+    RLConfigData
 )
 
 # Suppress warnings
@@ -84,37 +86,13 @@ warnings.filterwarnings('ignore')
 IS_INTERACTIVE = sys.stdin.isatty()
 print(f"Script Start: sys.stdin.isatty() = {IS_INTERACTIVE}") # DEBUG
 
-@dataclass
-class ServerConfigData:
-    """Configuration for socket server"""
-    host: str = "0.0.0.0"  # Listen on all interfaces
-    port: int = 9999
-    max_clients: int = 32
-    params_count: int = 128
-    expert_ratio_start: float = 0.75
-    expert_ratio_min: float = 0.01
-    expert_ratio_decay: float = 0.995
-    expert_ratio_decay_steps: int = 10000
-    reset_frame_count: bool = False
-    reset_expert_ratio: bool = True
+# Initialize configuration
+server_config = ServerConfigData()
+rl_config = RLConfigData()
 
-@dataclass
-class RLConfigData:
-    """Configuration for reinforcement learning"""
-    state_size: int = 128  # Size of state vector from game
-    action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 512
-    gamma: float = 0.99
-    epsilon: float = 1.0
-    epsilon_start: float = 1.0
-    epsilon_end: float = 0.01
-    epsilon_min: float = 0.01
-    epsilon_decay: int = 10000
-    update_target_every: int = 1000
-    learning_rate: float = 1e-4
-    memory_size: int = 500000
-    save_interval: int = 50000
-    train_freq: int = 4
+# Use values from config
+params_count = server_config.params_count
+state_size = rl_config.state_size
 
 @dataclass
 class FrameData:
@@ -147,8 +125,8 @@ class FrameData:
         )
 
 # Configuration constants
-SERVER_CONFIG = ServerConfigData()
-RL_CONFIG = RLConfigData()
+SERVER_CONFIG = server_config
+RL_CONFIG = rl_config
 
 # Initialize device
 device = torch.device("cuda" if torch.cuda.is_available() else 
@@ -192,9 +170,9 @@ class DQN(nn.Module):
         super(DQN, self).__init__()
         self.fc1 = nn.Linear(state_size, 512)
         self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 128)
-        self.fc4 = nn.Linear(128, 64)
-        self.out = nn.Linear(64, action_size)
+        self.fc3 = nn.Linear(256, 64)
+        self.fc4 = nn.Linear(64, 32)
+        self.out = nn.Linear(32, action_size)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))

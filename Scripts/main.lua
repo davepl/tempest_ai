@@ -225,14 +225,14 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 end
 
 -- Function to send parameters and get action each frame
-local function process_frame(params, player_state, controls, reward, bDone, bAttractMode)
+local function process_frame(rawdata, player_state, controls, reward, bDone, bAttractMode)
     -- In log-only mode, we only write to the log file and don't communicate with Python
 
     -- Log the frame data to file
     if log_file then
         local success, err = pcall(function()
             -- Write the raw data   
-            log_file:write(params)
+            log_file:write(rawdata)
             log_file:flush()  -- Ensure data is written to disk
         end)
         
@@ -261,13 +261,13 @@ local function process_frame(params, player_state, controls, reward, bDone, bAtt
   
     -- Try to write to socket, handle errors
     local success, err = pcall(function()
-        -- Add 4-byte length header to params
-        local data_length = #params
+        -- Add 4-byte length header to rawdata
+        local data_length = #rawdata
         local length_header = string.pack(">H", data_length)
         
         -- Write length header followed by data
         socket:write(length_header)
-        socket:write(params)
+        socket:write(rawdata)
     end)
     
     if not success then
@@ -276,16 +276,6 @@ local function process_frame(params, player_state, controls, reward, bDone, bAtt
         if socket then socket:close(); socket = nil end
         open_socket()
         return 0, 0, 0  -- Return zeros for fire, zap, spinner_delta on write error
-    end
-    
-    -- Verify that the number of parameters matches expected value
-    local num_params = 0
-    if params and string.len(params) > 0 then
-        num_params = string.len(params) / 2  -- Each parameter is 2 bytes
-    end
-    
-    if num_params < 128 then
-        print("Warning: Payload size mismatch. Expected 128 params, got " .. num_params)
     end
     
     -- Try to read from socket with timeout protection
@@ -1039,11 +1029,11 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     local data = {}
     
     -- Game state (5 values, frame counter is now in OOB data)
-    table.insert(data, game_state.gamestate)
-    table.insert(data, game_state.game_mode)
-    table.insert(data, game_state.countdown_timer)
-    table.insert(data, game_state.credits)
-    table.insert(data, game_state.p1_lives)
+--    table.insert(data, game_state.gamestate)
+--    table.insert(data, game_state.game_mode)
+--    table.insert(data, game_state.countdown_timer)
+--    table.insert(data, game_state.credits)
+--    table.insert(data, game_state.p1_lives)
     table.insert(data, game_state.p1_level)
     
     -- Add nearest enemy segment and segment delta
@@ -1070,11 +1060,11 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     -- Player state (5 values + arrays, score is now in OOB data)
     table.insert(data, player_state.position)
-    table.insert(data, player_state.alive)
-    table.insert(data, player_state.player_state)  -- Add player state to serialized data 
-    table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
+--    table.insert(data, player_state.alive)
+--    table.insert(data, player_state.player_state)  -- Add player state to serialized data 
+--    table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
     table.insert(data, player_state.superzapper_uses)
-    table.insert(data, player_state.superzapper_active)
+--    table.insert(data, player_state.superzapper_active)
     table.insert(data, player_state.shot_count)
     
     -- Player shot positions (fixed size: 8)
@@ -1094,37 +1084,37 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     -- Spike heights (fixed size: 16)
     for i = 0, 15 do  
-        table.insert(data, level_state.spike_heights[i] or 0)
+--        table.insert(data, level_state.spike_heights[i] or 0)
     end
     
     -- Level angles (fixed size: 16)
     for i = 0, 15 do
-        table.insert(data, level_state.level_angles[i] or 0)
+--        table.insert(data, level_state.level_angles[i] or 0)
     end
     
     -- Enemies state (counts: 10 values)
-    table.insert(data, enemies_state.active_flippers)
-    table.insert(data, enemies_state.active_pulsars)
-    table.insert(data, enemies_state.active_tankers)
-    table.insert(data, enemies_state.active_spikers)
-    table.insert(data, enemies_state.active_fuseballs)
-    table.insert(data, enemies_state.spawn_slots_flippers)
-    table.insert(data, enemies_state.spawn_slots_pulsars)
-    table.insert(data, enemies_state.spawn_slots_tankers)
-    table.insert(data, enemies_state.spawn_slots_spikers)
-    table.insert(data, enemies_state.spawn_slots_fuseballs)
+--    table.insert(data, enemies_state.active_flippers)
+--    table.insert(data, enemies_state.active_pulsars)
+--    table.insert(data, enemies_state.active_tankers)
+--    table.insert(data, enemies_state.active_spikers)
+--    table.insert(data, enemies_state.active_fuseballs)
+--    table.insert(data, enemies_state.spawn_slots_flippers)
+--    table.insert(data, enemies_state.spawn_slots_pulsars)
+--    table.insert(data, enemies_state.spawn_slots_tankers)
+--    table.insert(data, enemies_state.spawn_slots_spikers)
+--    table.insert(data, enemies_state.spawn_slots_fuseballs)
     table.insert(data, enemies_state.num_enemies_in_tube)
     table.insert(data, enemies_state.num_enemies_on_top)
     table.insert(data, enemies_state.enemies_pending)
     
     -- Enemy type info (fixed size: 7)
     for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_type_info[i] or 0)
+--        table.insert(data, enemies_state.enemy_type_info[i] or 0)
     end
     
     -- Active enemy info (fixed size: 7)
     for i = 1, 7 do
-        table.insert(data, enemies_state.active_enemy_info[i] or 0)
+--        table.insert(data, enemies_state.active_enemy_info[i] or 0)
     end
     
     -- Enemy segments (fixed size: 7)
@@ -1139,7 +1129,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
 
     -- Enemy depths (fixed size: 7 - 16bit positions)
     for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
+--        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
     end
     
     -- Enemy shot positions (fixed size: 4)
@@ -1149,7 +1139,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
 
     -- Enemy shot positions (fixed size: 4)
     for i = 1, 4 do
-        table.insert(data, enemies_state.enemy_shot_lsb[i] or 0)
+--        table.insert(data, enemies_state.enemy_shot_lsb[i] or 0)
     end
     
     -- Enemy shot segments (fixed size: 4)
@@ -1158,8 +1148,8 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     end
     
     -- Additional game state (pulse beat, pulsing)
-    table.insert(data, enemies_state.pulse_beat or 0)
-    table.insert(data, enemies_state.pulsing or 0)
+--    table.insert(data, enemies_state.pulse_beat or 0)
+--    table.insert(data, enemies_state.pulsing or 0)
     
     -- Add pending_vid (64 bytes)
     for i = 1, 64 do
