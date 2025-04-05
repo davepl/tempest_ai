@@ -29,7 +29,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 50
+    params_count: int = 54
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.995
@@ -37,10 +37,13 @@ class ServerConfigData:
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
 
+# Create instance of ServerConfigData first
+SERVER_CONFIG = ServerConfigData()
+
 @dataclass
 class RLConfigData:
     """Configuration for reinforcement learning"""
-    state_size: int = 50  # Size of state vector from game
+    state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
     batch_size: int = 512
     gamma: float = 0.99
@@ -55,6 +58,9 @@ class RLConfigData:
     save_interval: int = 50000
     train_freq: int = 4
     target_update: int = 10000
+
+# Create instance of RLConfigData after its definition
+RL_CONFIG = RLConfigData()
 
 @dataclass
 class MetricsData:
@@ -228,8 +234,6 @@ ACTION_MAPPING = {
 }
 
 # Create instances of config classes
-SERVER_CONFIG = ServerConfigData()
-RL_CONFIG = RLConfigData()
 metrics = MetricsData()
 
 # Import print_with_terminal_restore from metrics_display to avoid circular imports

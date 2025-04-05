@@ -562,7 +562,7 @@ def get_expert_action(enemy_seg, player_seg, is_open_level):
     """Calculate expert-guided action based on game state"""
  
     if enemy_seg == -1:
-        return 1, 0, 0  # No enemies, might as well fire at spikes
+        return 1, 0, 0  # No enemies, might as well fire
 
     if enemy_seg == player_seg:
         return 1, 0, 0  # Fire when aligned
@@ -570,30 +570,34 @@ def get_expert_action(enemy_seg, player_seg, is_open_level):
     # Calculate movement based on level type
     if is_open_level:
         distance = abs(enemy_seg - player_seg)
-        intensity = min(0.9, 0.3 + (distance * 0.05))
+        intensity = min(0.9, 0.1 + (distance * 0.25))  # Lower base intensity
         spinner = -intensity if enemy_seg > player_seg else intensity
     else:
         # Calculate shortest path with wraparound
         clockwise = (enemy_seg - player_seg) % 16
         counter = (player_seg - enemy_seg) % 16
         min_dist = min(clockwise, counter)
-        intensity = min(0.9, 0.3 + (min_dist * 0.05))
+        intensity = min(0.9, 0.1 + (min_dist * 0.25))  # Lower base intensity
         spinner = -intensity if clockwise < counter else intensity
     
     return 1, 0, spinner  # Fire while moving
 
 def expert_action_to_index(fire, zap, spinner):
     """Convert continuous expert actions to discrete action index"""
-    # Map fire, zap, spinner to closest discrete action
-    # First, determine fire component (0 or 1)
-    fire_idx = 7 if fire else 0  # 0 for no fire (actions 0-6), 7 for fire (actions 7-13)
+    if zap:
+        return 14  # Special case for zap action
+        
+    # Clamp spinner value between -0.9 and 0.9
+    spinner_value = max(-0.9, min(0.9, spinner))
     
-    # Then determine spinner component (0-6)
-    spinner_value = max(-0.9, min(0.9, spinner))  # Clamp between -0.9 and 0.9
-    spinner_idx = int((spinner_value + 0.9) / 0.3)  # Map to 0-6
-    spinner_idx = min(6, spinner_idx)  # Just to be safe
+    # Map spinner to 0-6 range
+    spinner_idx = int((spinner_value + 0.9) / 0.3)
+    spinner_idx = min(6, spinner_idx)  # Ensure we don't exceed valid range
     
-    return fire_idx + spinner_idx
+    # If firing, offset by 7 to get into the firing action range (7-13)
+    base_idx = 0 if not fire else 7
+    
+    return base_idx + spinner_idx
 
 def encode_action_to_game(fire, zap, spinner):
     """Convert action values to game-compatible format"""

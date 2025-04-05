@@ -213,15 +213,16 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Movement rewards/penalties
                 if direction * player_state.SpinnerDelta > 0 then
                     -- Only reward moving in correct direction, no bonus for speed
-                    reward = reward + 10
+                    reward = reward + 25
                 elseif player_state.SpinnerDelta ~= 0 then
                     -- Bigger penalty for wrong movement
-                    reward = reward - 15
+                    reward = reward - 25
                 else
                     -- Small penalty for not moving when not aligned
-                    reward = reward - 3
+                    reward = reward - 10
                 end
             end
+
         end
 
     else
@@ -678,12 +679,6 @@ function EnemiesState:new()
     self.num_enemies_on_top = 0
     self.enemies_pending = 0
     self.nearest_enemy_seg = -1  -- Track the segment of the nearest enemy
-    -- Available spawn slots (how many more can be created)
-    self.spawn_slots_flippers = 0
-    self.spawn_slots_pulsars = 0
-    self.spawn_slots_tankers = 0
-    self.spawn_slots_spikers = 0
-    self.spawn_slots_fuseballs = 0
     
     -- Enemy info arrays
     self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- 7 enemy type slots
@@ -693,9 +688,12 @@ function EnemiesState:new()
     self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}   -- 7 enemy depth positions LSB
     self.enemy_shot_lsb = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy shot LSB values at $02E6
 
-    self.shot_positions = {}  -- Will store nil for inactive shots
+    -- Convert shot positions to simple array like other state values
+    self.shot_positions = {0, 0, 0, 0}  -- 4 shot positions
+    
     self.pending_vid = {}  -- 64-byte table
     self.pending_seg = {}  -- 64-byte table
+    
     -- Enemy shot segments parameters extracted from memory address 02B5
     self.enemy_shot_segments = {
         { address = 0x02B5, value = 0 },
@@ -748,77 +746,19 @@ function EnemiesState:update(mem)
 
     local activeEnemies = self.num_enemies_in_tube + self.num_enemies_on_top
     
-    -- Read enemy type and state info
+    -- Read enemy segments and depths from memory
     for i = 1, 7 do
-        -- Get raw values from memory
-        self.enemy_type_info[i] = mem:read_u8(0x0283 + i - 1)    -- Enemy type info at $0283
-        self.active_enemy_info[i] = mem:read_u8(0x028A + i - 1)  -- Active enemy info at $028A
-        self.enemy_segments[i] = mem:read_u8(0x02B9 + i - 1) & 0x0F
-        
-        -- Also read state flags and movement vectors here
-        local state_flags = mem:read_u8(0x0275 + i - 1)
-        self.enemy_state_flags[i] = state_flags
-        
-        -- Read movement vector and handle two's complement
-        local move_vector = mem:read_u8(0x0291 + i - 1)
-        if move_vector > 127 then
-            move_vector = move_vector - 256  -- Convert to signed
-        end
-        self.enemy_move_vectors[i] = move_vector
-        
-        -- Check if enemy is active using multiple indicators
-        local is_active = false
-        
-        -- Main activity test: Active info bit 7 is clear (0) AND either type or depth is non-zero
-        if (self.active_enemy_info[i] & 0x80) == 0 then
-            local raw_depth = mem:read_u8(0x02DF + i - 1)
-            if raw_depth > 0 or (self.enemy_type_info[i] & 0x07) > 0 then
-                is_active = true
-            end
-        end
-        
-        -- State flags can confirm activity - bit 1 (0x02) indicates movement
-        if (state_flags & 0x02) ~= 0 then
-            is_active = true
-        end
-        
-        -- For pulsars specifically, look at the pulse state
-        if (self.enemy_type_info[i] & 0x07) == 2 and self.pulsing > 0 then
-            is_active = true
-        end
-        
-        -- Only populate data if the enemy is active
-        if is_active then
-            -- Get main position value and LSB for more precision
-            local pos = mem:read_u8(0x02DF + i - 1)       -- enemy_along at $02DF - main position
-            local lsb = mem:read_u8(0x029F + i - 1)       -- enemy_along_lsb at $029F - fractional part
-            
-            -- Store values from memory
-            self.enemy_depths[i] = pos
-            self.enemy_depths_lsb[i] = lsb
-            
-            -- Track shot LSB
-            self.enemy_shot_lsb[i] = mem:read_u8(0x02E6 + i - 1)
-        else
-            -- Zero out ALL values for inactive enemies to avoid stale data
-            self.enemy_depths[i] = 0
-            self.enemy_depths_lsb[i] = 0
-            self.enemy_segments[i] = 0  -- Important: Zero out segment for inactive enemies
-            self.enemy_move_vectors[i] = 0
-            self.enemy_state_flags[i] = 0
-            self.enemy_shot_lsb[i] = 0
+        self.enemy_segments[i] = mem:read_u8(0x02B9 + i - 1)  -- enemy_seg array at $02B9
+        self.enemy_depths[i] = mem:read_u8(0x02DF + i - 1)    -- enemy_along array at $02DF
+        if (self.enemy_depths[i] == 0) then
+            self.enemy_segments[i] = 0
         end
     end
     
     -- Read all 4 enemy shot positions and store absolute positions
     for i = 1, 4 do
         local raw_pos = mem:read_u8(0x02DB + i - 1)
-        if raw_pos == 0 then
-            self.shot_positions[i] = nil  -- Mark inactive shots as nil
-        else
-            local abs_pos = raw_pos & 0x0F
-            self.shot_positions[i] = abs_pos
-        end
+        self.shot_positions[i] = raw_pos  -- Store full raw position value
     end
 
     -- Read pending_seg (64 bytes starting at 0x0203)
@@ -1144,19 +1084,19 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         table.insert(data, enemies_state.enemy_depths[i] or 0)
     end
 
-    -- Enemy depths (fixed size: 7 - 16bit positions)
+    -- Enemy depths LSB (fixed size: 7 - 16bit positions)
     for i = 1, 7 do
 --        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
     end
     
     -- Enemy shot positions (fixed size: 4)
     for i = 1, 4 do
-        table.insert(data, enemies_state.shot_positions[i] or 0)
+        table.insert(data, enemies_state.shot_positions[i])
     end
 
-    -- Enemy shot positions (fixed size: 4)
+    -- Enemy shot positions LSB (fixed size: 4)
     for i = 1, 4 do
---        table.insert(data, enemies_state.enemy_shot_lsb[i] or 0)
+        table.insert(data, enemies_state.enemy_shot_lsb[i] or 0)
     end
     
     -- Enemy shot segments (fixed size: 4)
@@ -1183,6 +1123,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     local binary_data = ""
     for i, value in ipairs(data) do
+        -- If value is a table, print an error and return nil
         -- Use the actual value from the data table, not just the index
         encoded_value = value & 0xFFFF  -- Mask to 16 bits
         binary_data = binary_data .. string.pack(">H", encoded_value)
