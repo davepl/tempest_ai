@@ -488,7 +488,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">IdBBBIIBBBhBhBB"
+        format_str = ">HdBBBHHHBBBhBhBB"  # Updated to include both score components
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
@@ -496,31 +496,31 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
             
         values = struct.unpack(format_str, data[:header_size])
-        num_values, reward, game_action, game_mode, done, frame_counter, score, \
+        num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
         
-        # Debug: Print when save signal is received in raw data
-        if save_signal and DEBUG_MODE:
-            print(f"\nDEBUG: Raw save signal received in header: {save_signal}", flush=True)
+        # Combine score components
+        score = (score_high * 65536) + score_low
         
         state_data = data[header_size:]
         
         # Safely process state values with error handling
         state_values = []
-        for i in range(0, len(state_data), 2):
+        for i in range(0, len(state_data), 2):  # Using 2 bytes per value
             if i + 1 < len(state_data):
                 try:
-                    value = struct.unpack(">H", state_data[i:i+2])[0] - 32768
-                    state_values.append(value)
-                except struct.error:
-                    print(f"ERROR: Failed to unpack state value at position {i}", flush=True)
+                    value = struct.unpack(">H", state_data[i:i+2])[0]
+                    normalized = (value / 255.0) * 2.0 - 1.0
+                    state_values.append(normalized)
+                except struct.error as e:
+                    print(f"ERROR: Failed to unpack state value at position {i}: {e}", flush=True)
                     sys.exit(1)
         
-        state = np.array(state_values, dtype=np.float32) / 32768.0
+        state = np.array(state_values, dtype=np.float32)  # Already normalized
         
-        # Check for parameter count mismatch and exit if there's a problem
-        if len(state) != SERVER_CONFIG.params_count:
-            print(f"ERROR: Parameter count mismatch. Expected {SERVER_CONFIG.params_count}, got {len(state)}", flush=True)
+        # Verify we got the expected number of values
+        if len(state_values) != num_values:
+            print(f"ERROR: Expected {num_values} state values but got {len(state_values)}", flush=True)
             sys.exit(1)
                 
         frame_data = FrameData(
@@ -536,10 +536,6 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             open_level=bool(is_open)
         )
         
-        # Debug: Print when save signal is set in FrameData
-        if frame_data.save_signal and DEBUG_MODE:
-            print(f"DEBUG: Created FrameData with save_signal=True", flush=True)
-            
         return frame_data
     except Exception as e:
         print(f"ERROR parsing frame data: {e}", flush=True)
@@ -591,7 +587,7 @@ def get_expert_action(enemy_seg, player_seg, is_open_level):
     """Calculate expert-guided action based on game state"""
  
     if enemy_seg == -1:
-        return 0, 0, 0  # No enemies, might as well fire at spikes
+        return 1, 0, 0  # No enemies, might as well fire at spikes
 
     if enemy_seg == player_seg:
         return 1, 0, 0  # Fire when aligned

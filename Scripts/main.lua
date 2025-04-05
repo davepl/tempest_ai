@@ -114,7 +114,7 @@ local function open_socket()
             print("Successfully opened socket connection to localhost:9999")
             
             -- Send initial 4-byte ping for handshake
-            local ping_data = string.pack(">I", 0)  -- 4-byte integer with value 0
+            local ping_data = string.pack(">H", 0)  -- 2-byte integer with value 0
             socket:write(ping_data)
             print("Initial handshake ping sent")
         else
@@ -263,7 +263,7 @@ local function process_frame(params, player_state, controls, reward, bDone, bAtt
     local success, err = pcall(function()
         -- Add 4-byte length header to params
         local data_length = #params
-        local length_header = string.pack(">I", data_length)
+        local length_header = string.pack(">H", data_length)
         
         -- Write length header followed by data
         socket:write(length_header)
@@ -1171,14 +1171,14 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
 --        table.insert(data, enemies_state.pending_seg[i] or 0)
     end
     
-    -- Serialize the data to a binary string.  We will convert all values to 16-bit signed integers
+    -- Serialize the data to a binary string.  We will convert all values to 16-bit integers
     -- and then pack them into a binary string.
     
     local binary_data = ""
     for i, value in ipairs(data) do
         -- Use the actual value from the data table, not just the index
-        encoded_value = value & 0xFFFF
-        binary_data = binary_data .. string.pack(">I2", encoded_value)
+        encoded_value = value & 0xFFFF  -- Mask to 16 bits
+        binary_data = binary_data .. string.pack(">H", encoded_value)
     end
   
     -- Check if it's time to send a save signal
@@ -1216,22 +1216,31 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- is_attract (byte), nearest_enemy_segment (byte), player_segment (byte),
     -- is_open_level (byte)
 
-    local oob_data = string.pack(">IdBBBIIBBBhBhBB", 
-        #data,                          -- I num_values
+    -- Pack header data using 2-byte integers where possible
+    local score = player_state.score or 0
+    local score_high = math.floor(score / 65536)  -- High 16 bits
+    local score_low = score % 65536               -- Low 16 bits
+    
+    -- Mask frame counter to 16 bits to prevent overflow
+    local frame = game_state.frame_counter % 65536
+    
+    local oob_data = string.pack(">HdBBBHHHBBBhBhBB", 
+        #data,                          -- H num_values
         reward,                         -- d reward
         0,                              -- B game_action
         game_state.game_mode,           -- B game_mode
         bDone and 1 or 0,               -- B done flag
-        game_state.frame_counter,       -- I frame_counter
-        player_state.score,             -- I score
+        frame,                          -- H frame_counter (now masked to 16 bits)
+        score_high,                     -- H score high 16 bits
+        score_low,                      -- H score low 16 bits
         save_signal,                    -- B save_signal
-        controls.fire_commanded,        -- B fire_commanded (added)
-        controls.zap_commanded,         -- B zap_commanded (added)
-        controls.spinner_delta,         -- h spinner_delta (added)
-        is_attract_mode,                -- B is_attract_mode
+        controls.fire_commanded,        -- B fire_commanded
+        controls.zap_commanded,         -- B zap_commanded
+        controls.spinner_delta,         -- h spinner_delta
+        is_attract_mode and 1 or 0,     -- B is_attract_mode
         enemies_state:nearest_enemy_segment(), -- h nearest_enemy_segment
         player_state.position,          -- B player segment
-        is_open_level                   -- B is_open_level (added)
+        is_open_level and 1 or 0        -- B is_open_level
     )
     
     -- Combine out-of-band header with game state data

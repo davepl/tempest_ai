@@ -182,77 +182,65 @@ class SocketServer:
     
     def handle_client(self, client_socket, client_id):
         """Handle communication with a client"""
-        # Client-specific FPS tracking
-        frames_this_second = 0
-        fps_start_time = time.time()
-        last_fps_update = fps_start_time
-        client_fps = 0.0
-        
         try:
             # Set socket to non-blocking mode
             client_socket.setblocking(False)
             
-            # Make buffer size for receiving
-            buffer_size = 4096 # Buffer for frame data
+            # Disable Nagle's algorithm to reduce latency
+            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            # Increase socket buffer sizes for better performance
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            
+            buffer_size = 32768
             
             # --- Initial Ping Handshake ---
-            ping_ok = False # Flag to track successful handshake
+            ping_ok = False
             try:
-                # Set blocking briefly to wait for the initial ping header
                 client_socket.setblocking(True)
-                client_socket.settimeout(2.0) # 2 second timeout for ping
-                ping_header = client_socket.recv(4)
-                if not ping_header or len(ping_header) < 4:
+                client_socket.settimeout(2.0)
+                ping_header = client_socket.recv(2)
+                if not ping_header or len(ping_header) < 2:
                     print(f"Client {client_id} disconnected (no initial ping header)")
                 else:
-                    ping_ok = True # Signal success
-            except socket.timeout:
-                print(f"Client {client_id} timed out waiting for initial ping.")
-            except Exception as e:
-                print(f"Client {client_id} error during initial ping: {e}")
+                    ping_ok = True
+            except (socket.timeout, ConnectionResetError, BrokenPipeError) as e:
+                print(f"Client {client_id} error during handshake: {e}")
             finally:
-                # Restore non-blocking mode for main loop
                 client_socket.setblocking(False)
                 client_socket.settimeout(None)
-            # --- End Initial Ping Handshake ---
-
-            # Exit loop if ping handshake failed
+                
             if not ping_ok:
-                return
-            
+                raise ConnectionError("Handshake failed")
+
             # Main communication loop
             while self.running and not self.shutdown_event.is_set():
-                # Wait for data with timeout using select
-                ready = select.select([client_socket], [], [], 0.1)
-                if not ready[0]:
-                    # No data available, continue
-                    continue
-                
                 try:
-                    # Receive data length first (4-byte integer)
-                    length_data = client_socket.recv(4)
-                    if not length_data or len(length_data) < 4:
-                        print(f"Client {client_id} disconnected (no length header)")
-                        break
-                    
-                    # Unpack data length
-                    data_length = struct.unpack(">I", length_data)[0]
-                    
-                    # Now receive the actual data
+                    ready = select.select([client_socket], [], [], 0.1)
+                    if not ready[0]:
+                        continue
+
+                    # Receive data length
+                    length_data = client_socket.recv(2)
+                    if not length_data or len(length_data) < 2:
+                        raise ConnectionError("Client disconnected")
+
+                    data_length = struct.unpack(">H", length_data)[0]
                     data = b""
                     remaining = data_length
-                    
+
                     while remaining > 0:
                         chunk = client_socket.recv(min(buffer_size, remaining))
                         if not chunk:
-                            break
+                            raise ConnectionError("Connection broken during data receive")
                         data += chunk
                         remaining -= len(chunk)
-                    
+
                     if len(data) < data_length:
-                        print(f"Client {client_id} sent incomplete data, expected {data_length}, got {len(data)}")
+                        print(f"Client {client_id} sent incomplete data")
                         continue
-                    
+
                     # Parse the frame data
                     frame = parse_frame_data(data)
                     if not frame:
@@ -364,59 +352,62 @@ class SocketServer:
                     if client_id == 0 and current_frame % RL_CONFIG.save_interval == 0:
                         self.agent.save(LATEST_MODEL_PATH)
                 
-                except BlockingIOError:
+                except (BlockingIOError, InterruptedError):
                     # Expected with non-blocking socket
                     time.sleep(0.001)
-                except ConnectionResetError:
-                    print(f"Client {client_id} connection reset")
-                    break
-                except BrokenPipeError:
-                    print(f"Client {client_id} connection broken")
+                    continue
+                except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
+                    print(f"Client {client_id} connection error: {e}")
                     break
                 except Exception as e:
                     print(f"Error handling client {client_id}: {e}")
                     traceback.print_exc()
                     break
-        
+
+        except Exception as e:
+            print(f"Fatal error handling client {client_id}: {e}")
+            traceback.print_exc()
         finally:
-            # Clean up client resources
+            # Ensure proper cleanup in all cases
+            try:
+                client_socket.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             try:
                 client_socket.close()
             except:
                 pass
-            
-            # Remove client from tracking
+
+            # Clean up client state atomically
             with self.client_lock:
+                if client_id in self.client_states:
+                    del self.client_states[client_id]
                 if client_id in self.clients:
-                    # Mark client as disconnected
-                    self.clients[client_id] = None
-                    # Remove client from dictionary
                     del self.clients[client_id]
-                    # Update metrics.client_count
-                    metrics.client_count = len(self.clients)
-                    print(f"Client {client_id} disconnected, {len(self.clients)} clients remaining")
-                
-                # Perform periodic cleanup of any stale client entries
-                if len(self.clients) > SERVER_CONFIG.max_clients / 2:
-                    self.cleanup_disconnected_clients()
+                # Update metrics after cleanup
+                metrics.client_count = len(self.clients)
+                print(f"Client {client_id} cleanup complete, {len(self.clients)} clients remaining")
 
     def cleanup_disconnected_clients(self):
         """Clean up any disconnected clients to free up their IDs"""
         with self.client_lock:
-            # Find clients with dead threads
-            disconnected_clients = []
-            for client_id, thread in self.clients.items():
-                if thread is None or not thread.is_alive():
-                    disconnected_clients.append(client_id)
+            # Find clients with dead threads or None entries
+            disconnected_clients = [
+                client_id for client_id, thread in self.clients.items()
+                if thread is None or (isinstance(thread, threading.Thread) and not thread.is_alive())
+            ]
             
-            # Remove disconnected clients
+            # Remove disconnected clients and their states
             for client_id in disconnected_clients:
                 if client_id in self.clients:
                     del self.clients[client_id]
+                if client_id in self.client_states:
+                    del self.client_states[client_id]
             
-            # Update metrics.client_count
+            # Update metrics
             metrics.client_count = len(self.clients)
-            print(f"Cleaned up {len(disconnected_clients)} disconnected clients. Available IDs: {SERVER_CONFIG.max_clients - len(self.clients)}")
+            if disconnected_clients:
+                print(f"Cleaned up {len(disconnected_clients)} disconnected clients. Available IDs: {SERVER_CONFIG.max_clients - len(self.clients)}")
 
     def is_override_active(self):
         with self.client_lock:

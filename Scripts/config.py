@@ -31,7 +31,7 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 128
     expert_ratio_start: float = 0.75
-    expert_ratio_min: float = 0.01
+    expert_ratio_min: float = 0.05
     expert_ratio_decay: float = 0.995
     expert_ratio_decay_steps: int = 10000
     reset_frame_count: bool = False
