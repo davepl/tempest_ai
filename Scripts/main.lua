@@ -172,6 +172,12 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- reward = reward + 1
 
+        -- Reward for having as many shots as possible active with at least one in reserve
+        if (player_state.shot_count < 8) then
+            reward = reward + player_state.shot_count / 2
+        end
+
+        reward = reward + player_state.player_lives
         -- Score reward
         local score_delta = player_state.score - previous_score
         if score_delta > 0 then
@@ -188,7 +194,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         target_segment = enemies_state:nearest_enemy_segment()
         player_segment = player_state.position & 0x0F
 
-        if target_segment >= 0 then
+        if target_segment < 0 or game_state.gamestate == 0x20 then
+            reward = reward + (player_state.SpinnerDelta == 0 and 20 or -math.abs(player_state.SpinnerDelta))
+        else
             local direction = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
             local distance = math.abs(direction)
 
@@ -197,19 +205,19 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             else
                 reward = reward + math.max(0, 10 - distance)
                 if direction * player_state.SpinnerDelta > 0 then
-                    reward = reward + 10
+                    reward = reward + 10  -- Moving in correct direction
+                    reward = reward + math.abs(player_state.SpinnerDelta)
                 elseif player_state.SpinnerDelta ~= 0 then
-                    reward = reward - 1
+                    reward = reward - 5   -- Moving in wrong direction
+                else
+                    reward = reward - 3   -- Not moving when we should be
                 end
             end
         end
 
-        if target_segment < 0 or game_state.gamestate == 0x20 then
-            reward = reward + (player_state.SpinnerDelta == 0 and 10 or -math.abs(player_state.SpinnerDelta))
-        end
     else
         if previous_alive_state == 1 then
-            reward = reward - 250
+            reward = reward - 500
             bDone = true
         end
     end
