@@ -177,7 +177,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             reward = reward + player_state.shot_count / 2
         end
 
-        reward = reward + player_state.player_lives
+        if (player_state.player_lives ~= nil) then
+            reward = reward + player_state.player_lives
+        end
+
         -- Score reward
         local score_delta = player_state.score - previous_score
         if score_delta > 0 then
