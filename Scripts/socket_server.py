@@ -217,7 +217,7 @@ class SocketServer:
             # Main communication loop
             while self.running and not self.shutdown_event.is_set():
                 try:
-                    ready = select.select([client_socket], [], [], 0.1)
+                    ready = select.select([client_socket], [], [], 0.01)
                     if not ready[0]:
                         continue
 
