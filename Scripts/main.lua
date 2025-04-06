@@ -34,7 +34,7 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 
 local LOG_ONLY_MODE           = false
 local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
-local SHOW_DISPLAY            = false
+local SHOW_DISPLAY            = true
 local DISPLAY_UPDATE_INTERVAL = 0.05  
 
 local function clear_screen()
@@ -696,6 +696,7 @@ function EnemiesState:new()
     self.active_fuseballs = 0
     self.pulse_beat = 0    -- Add pulse beat counter
     self.pulsing = 0      -- Add pulsing state
+    self.pulsar_fliprate = 0 -- NEW: Add pulsar fliprate
     self.num_enemies_in_tube = 0
     self.num_enemies_on_top = 0
     self.enemies_pending = 0
@@ -745,6 +746,7 @@ function EnemiesState:update(mem)
     self.active_fuseballs = mem:read_u8(0x0146)  -- n_fuseballs
     self.pulse_beat       = mem:read_u8(0x0147)        -- pulse_beat counter
     self.pulsing          = mem:read_u8(0x0148)          -- pulsing state
+    self.pulsar_fliprate  = mem:read_u8(0x00B2)          -- NEW: Pulsar flip rate at $B2
     self.num_enemies_in_tube = mem:read_u8(0x0108)
     self.num_enemies_on_top = mem:read_u8(0x0109)
     self.enemies_pending = mem:read_u8(0x03AB)
@@ -1045,11 +1047,10 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     local data = {}
     
     -- Game state (5 values, frame counter is now in OOB data)
---    table.insert(data, game_state.gamestate)
---    table.insert(data, game_state.game_mode)
---    table.insert(data, game_state.countdown_timer)
---    table.insert(data, game_state.credits)
---    table.insert(data, game_state.p1_lives)
+    table.insert(data, game_state.gamestate)
+    table.insert(data, game_state.game_mode)
+    table.insert(data, game_state.countdown_timer)
+    table.insert(data, game_state.p1_lives)
     table.insert(data, game_state.p1_level)
     
     -- Add nearest enemy segment and segment delta
@@ -1076,11 +1077,11 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     -- Player state (5 values + arrays, score is now in OOB data)
     table.insert(data, player_state.position)
---    table.insert(data, player_state.alive)
---    table.insert(data, player_state.player_state)  -- Add player state to serialized data 
---    table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
+    table.insert(data, player_state.alive)
+    table.insert(data, player_state.player_state)  -- Add player state to serialized data 
+    table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
     table.insert(data, player_state.superzapper_uses)
---    table.insert(data, player_state.superzapper_active)
+    table.insert(data, player_state.superzapper_active)
     table.insert(data, player_state.shot_count)
     
     -- Player shot positions (fixed size: 8)
@@ -1100,37 +1101,38 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     -- Spike heights (fixed size: 16)
     for i = 0, 15 do  
---        table.insert(data, level_state.spike_heights[i] or 0)
+        table.insert(data, level_state.spike_heights[i] or 0)
     end
     
     -- Level angles (fixed size: 16)
     for i = 0, 15 do
---        table.insert(data, level_state.level_angles[i] or 0)
+        table.insert(data, level_state.level_angles[i] or 0)
     end
     
     -- Enemies state (counts: 10 values)
---    table.insert(data, enemies_state.active_flippers)
---    table.insert(data, enemies_state.active_pulsars)
---    table.insert(data, enemies_state.active_tankers)
---    table.insert(data, enemies_state.active_spikers)
---    table.insert(data, enemies_state.active_fuseballs)
---    table.insert(data, enemies_state.spawn_slots_flippers)
---    table.insert(data, enemies_state.spawn_slots_pulsars)
---    table.insert(data, enemies_state.spawn_slots_tankers)
---    table.insert(data, enemies_state.spawn_slots_spikers)
---    table.insert(data, enemies_state.spawn_slots_fuseballs)
+    table.insert(data, enemies_state.active_flippers)
+    table.insert(data, enemies_state.active_pulsars)
+    table.insert(data, enemies_state.active_tankers)
+    table.insert(data, enemies_state.active_spikers)
+    table.insert(data, enemies_state.active_fuseballs)
+    table.insert(data, enemies_state.spawn_slots_flippers)
+    table.insert(data, enemies_state.spawn_slots_pulsars)
+    table.insert(data, enemies_state.spawn_slots_tankers)
+    table.insert(data, enemies_state.spawn_slots_spikers)
+    table.insert(data, enemies_state.spawn_slots_fuseballs)
     table.insert(data, enemies_state.num_enemies_in_tube)
     table.insert(data, enemies_state.num_enemies_on_top)
     table.insert(data, enemies_state.enemies_pending)
+    table.insert(data, enemies_state.pulsar_fliprate) -- NEW: Add pulsar fliprate
     
     -- Enemy type info (fixed size: 7)
     for i = 1, 7 do
---        table.insert(data, enemies_state.enemy_type_info[i] or 0)
+        table.insert(data, enemies_state.enemy_type_info[i] or 0)
     end
     
     -- Active enemy info (fixed size: 7)
     for i = 1, 7 do
---        table.insert(data, enemies_state.active_enemy_info[i] or 0)
+        table.insert(data, enemies_state.active_enemy_info[i] or 0)
     end
     
     -- Enemy segments (fixed size: 7)
@@ -1145,7 +1147,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
 
     -- Enemy depths LSB (fixed size: 7 - 16bit positions)
     for i = 1, 7 do
---        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
+        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
     end
     
     -- Enemy shot positions (fixed size: 4)
@@ -1164,17 +1166,17 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     end
     
     -- Additional game state (pulse beat, pulsing)
---    table.insert(data, enemies_state.pulse_beat or 0)
---    table.insert(data, enemies_state.pulsing or 0)
+    table.insert(data, enemies_state.pulse_beat or 0)
+    table.insert(data, enemies_state.pulsing or 0)
     
     -- Add pending_vid (64 bytes)
     for i = 1, 64 do
---        table.insert(data, enemies_state.pending_vid[i] or 0)
+        table.insert(data, enemies_state.pending_vid[i] or 0)
     end
     
     -- Add pending_seg (64 bytes)
     for i = 1, 64 do
---        table.insert(data, enemies_state.pending_seg[i] or 0)
+        table.insert(data, enemies_state.pending_seg[i] or 0)
     end
     
     -- Serialize the data to a binary string.  We will convert all values to 16-bit integers
@@ -1182,8 +1184,6 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     
     local binary_data = ""
     for i, value in ipairs(data) do
-        -- If value is a table, print an error and return nil
-        -- Use the actual value from the data table, not just the index
         encoded_value = value & 0xFFFF  -- Mask to 16 bits
         binary_data = binary_data .. string.pack(">H", encoded_value)
     end
@@ -1202,11 +1202,6 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         if shutdown_requested then
             print("SHUTDOWN SAVE: Final save before MAME exits")
         end
-    end
-    
-    -- Debug output for game mode value occasionally
-    if game_state.frame_counter % 60 == 0 then
---        print(string.format("Game Mode: 0x%02X, Is Attract Mode: %s", game_state.game_mode, (game_state.game_mode & 0x80) == 0 and "true" or "false"))
     end
     
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
@@ -1648,6 +1643,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
             enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
             enemies_state.spawn_slots_fuseballs),
         ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
+        ["Flip Rate"] = string.format("%02X", enemies_state.pulsar_fliprate), -- NEW: Display Pulsar Flip Rate
         ["In Tube"] = string.format("%d enemies", enemies_state.num_enemies_in_tube),
         ["Nearest Enemy"] = string.format("segment %d", enemies_state.nearest_enemy_seg),
         ["On Top"] = string.format("%d enemies", enemies_state.num_enemies_on_top),
