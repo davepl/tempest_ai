@@ -820,6 +820,7 @@ function EnemiesState:nearest_enemy_segment()
     for i = 1, 7 do
         local depth = self.enemy_depths[i]
         local segment = self.enemy_segments[i] & 0x0F  -- Mask to ensure 0-15
+        -- Only consider active enemies with valid segments
         if depth > 0 and segment >= 0 and segment <= 15 then
             if depth < min_depth then
                 min_depth = depth
@@ -828,31 +829,31 @@ function EnemiesState:nearest_enemy_segment()
         end
     end
     
-    -- Check pending enemies (64 slots at 0x0203)
-    for i = 1, 64 do
-        local pending_seg = self.pending_seg[i] & 0x0F
-        local pending_vid = self.pending_vid[i]  -- Could use as a proxy for depth/activity
-        if pending_seg > 0 and pending_vid > 0 then  -- Active pending enemy
-            -- Assume pending enemies closer to top have lower vid or use a heuristic
-            local assumed_depth = pending_vid  -- Adjust based on actual depth mapping
-            if assumed_depth < min_depth then
-                min_depth = assumed_depth
-                closest_segment = pending_seg
-            end
-        end
-    end
+    -- -- Check pending enemies (64 slots at 0x0203) -- Removed for reliability
+    -- for i = 1, 64 do
+    --     local pending_seg = self.pending_seg[i] & 0x0F
+    --     local pending_vid = self.pending_vid[i]  -- Could use as a proxy for depth/activity
+    --     if pending_seg > 0 and pending_vid > 0 then  -- Active pending enemy
+    --         -- Assume pending enemies closer to top have lower vid or use a heuristic
+    --         local assumed_depth = pending_vid  -- Adjust based on actual depth mapping
+    --         if assumed_depth < min_depth then
+    --             min_depth = assumed_depth
+    --             closest_segment = pending_seg
+    --         end
+    --     end
+    -- end
     
-    -- Check enemy shots (4 slots at 0x02B5)
-    for i = 1, 4 do
-        local shot_seg = self.enemy_shot_segments[i].value & 0x0F
-        local shot_depth = self.shot_positions[i]
-        if shot_seg > 0 and shot_depth > 0 then
-            if shot_depth < min_depth then
-                min_depth = shot_depth
-                closest_segment = shot_seg
-            end
-        end
-    end
+    -- -- Check enemy shots (4 slots at 0x02B5) -- Removed as shots shouldn't be primary targets
+    -- for i = 1, 4 do
+    --     local shot_seg = self.enemy_shot_segments[i].value & 0x0F
+    --     local shot_depth = self.shot_positions[i]
+    --     if shot_seg > 0 and shot_depth > 0 then
+    --         if shot_depth < min_depth then
+    --             min_depth = shot_depth
+    --             closest_segment = shot_seg
+    --         end
+    --     end
+    -- end
     
     return closest_segment
 end
