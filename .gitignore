@@ -1,6 +1,6 @@
 /.DS_Store
 Scripts/models
+Scripts/__pycache__
 cfg
 nvram
 models
-

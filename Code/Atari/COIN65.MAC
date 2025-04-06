@@ -1,0 +1,664 @@
+        .SBTTL COIN65 - 650X "UNIVERSAL" COIN ROUTINE
+        .SBTTL *********************************
+        .SBTTL * PROGRAMERS: DOWNEND & ALBAUGH *
+        .SBTTL *                               *
+        .SBTTL * CHECKER:                      *
+        .SBTTL *                               *
+        .SBTTL *********************************
+
+        .SBTTL EXPLANATION
+	.RAD=10
+        .RADIX 16
+	.ENABL LC
+        .LIST MEB
+;THIS IS A MAJOR REVISION OF THE COIN ROUTINE DERIVED FROM PENNY.
+;ALL NEW PROGRAMS SHOULD USE THIS ROUTINE.  OLD PROGRAMS CAN CONTINUE
+;TO USE PENNY, BUT NO FURTHER OPTIONS WILL BE SUPPORTED IN PENNY.
+;REVISED 7/80 TO SUPPORT BONUS-ADDER
+        .SBTTL DEFAULT ASSIGNMENTS
+        .LIST CND
+	.IIF NDF,FTEST,FTEST=0		;NOT FIELD TEST
+        .IIF NDF,MODES,MODES=4          ;FOUR COIN MODES STANDARD
+					;ALTERNATE IS MODES=0
+	.IIF NDF,MECHS,MECHS=3		;# OF MECHS (1,2 OR 3)
+	.IIF NDF,INCLUDE,INCLUDE=0	;NOT ".INCLUDE"'D
+;IF "INCLUDE=1",THE ".END" IS SUPPRESSED
+	.IIF NDF,RTS,RTS=1		;EXIT VIA RTS
+;IF RTS=0,EXITS BY FALLING OUT
+	.IIF NDF,BONADD,BONADD=0	;DO NOT BONUS-ADDER,BONADD=1 TO DO BONUS ADDER
+	.IF EQ,MECHS-3			;DEFAULTS FOR MECHS=3
+	.IIF NDF,MULTS,MULTS=1   		;IMPLEMENT H.DELMAN STANDARD MULTIPLIERS
+					        ;(SEE GHM,GDM BELOW)
+	.IIF NDF,EMCTRS,EMCTRS=3         	;3 ELECTRO-MECH COUNTERS
+	.IIF NDF,OFFSET,OFFSET=1		;OFFSET BY 1
+	.ENDC				;EQ,MECHS-3
+	
+	.IF EQ,MECHS-2			;DEFAULTS FOR MECHS=2
+	.IIF NDF,MULTS,MULTS=0	   		;MULTIPLIERS DO NOT APPLY
+	.IIF NDF,EMCTRS,EMCTRS=0	   	;NO E.M. COUNTERS
+        .IIF NDF,OFFSET,OFFSET=2	   	;SWITCHES AND STATUS BYTES TWO-APART
+	.ENDC				;EQ, MECHS-2
+
+	.IF EQ,MECHS-1			;DEFAULTS FOR MECHS=1
+	.IIF NDF,MULTS,MULTS=1			;H. DELMAN STD. MULTS
+	.IIF NDF,EMCTRS,EMCTRS=1		;1 COUNTER
+	.IIF NDF,OFFSET,OFFSET=1		;OFFSET FOR COUNTERS
+	.ENDC				;EQ,MECHS-1
+
+	.IIF NDF,SEPCCT,SEPCCT=0	;DO NOT IMPLEMENT SEPARATE $CNCT'S
+;USE SEPCCT=1 ONLY FOR WIERD,NON-STANDARD MECH-MULTIPLIERS
+        .IIF NDF,COIN,COIN=0            ;COIN IS LOW-TRUE
+        .IIF NDF,CNTINT,CNTINT=1        ;COUNT INTERRUPTS (IN $INTCT)
+        .IIF NDF,SLAM,SLAM=1            ;SLAM IS HIGH-TRUE
+        .IIF NDF,CMZP,CMZP=1            ;COIN MODE IS IN ZERO-PAGE
+;D0,D1=0,1,2,3 FOR FREE, 2 PLAY/COIN, 1 PLAY/COIN,2 COIN/PLAY
+;D2,D3=0,1,2,3 FOR 1,4,5,6 "UNITS"/RIGHT COIN
+;D4=0,1 FOR 1,2 "UNITS"/MIDDLE COIN
+;ONLY D2,3,4 USED IF MODES=0
+        .IIF NDF,COIN67,COIN67=0        ;COINS NOT IN D7,D6 OF SAME BYTE
+	.IIF NDF,COIN01,COIN01=0	;COINS NOT IN D0,D1 EITHER
+        .IIF NDF,PRST,PRST=30.          ;PRE-COIN SLAM KILLS COINS FOR 30 FRAMES
+        .IIF NDF,POST,POST=30.          ;POST-COIN SLAM KILLS COINS WITHIN 30 FRAMES
+	.IF NE,<EMCTRS>*<EMCTRS-1>*<EMCTRS-3>*<EMCTRS-4>
+	.ERROR		;NONE,ONE,THREE, OR FOUR E.M.CTRS ONLY
+	.ENDC
+	.IF NE,FTEST
+	CCTRS	=1			;FIELD TEST, 1 COIN COUNTER
+	.IFF
+	CCTRS	=EMCTRS			;NORMALLY
+	.ENDC
+        .IF NE,CMZP
+;IF YOU USE CMZP=0, DEFINE EQUIVALENT MACROS
+;(GCM NOT NEEDED IF MODES=0)
+        .MACRO GCM
+;ACC0,ACC1:=COIN OPTION ACC 2-7=0,Z-FLAG SET PER ACC  CARRY IS DON'T CARE.
+        LDA Z,$CMODE			;GET COIN MODE FROM ZERO-PAGE
+	.IF NE,MULTS
+	AND I,3				;ISOLATE COINS-CREDITS OPTION
+	.ENDC				;NE,MULTS
+        .ENDM
+
+;GHM, GDM NOT NEEDED IF MULTS=0
+	.MACRO GHM
+;ACC=0 FOR 1 "UNIT" ,<>0 FOR 2 "UNITS" PER MIDDLE-MECH COIN.
+;  Z FLAG SET PER ACC.  CARRY IS DON'T CARE
+	LDA Z,$CMODE			;GET COIN MODE FROM ZERO-PAGE
+	AND I,10			;ISOLATE HALF-MULTIPLIER
+	.ENDM
+
+	.MACRO GDM
+;ACC=0,1,2,3 FOR 1,4,5,6 "UNITS" PER RIGHT-MECH COIN.  CARRY CLEAR.  Z-FLAG SET PER ACC
+	LDA Z,$CMODE
+	AND I,0C
+	LSR
+	LSR
+	.ENDM
+        .ENDC			;NE,CMZP
+	.MACRO GBAM
+;ACC= 0,1,2,3,4,5,6,7 FOR BONUS-ADDER MODE
+	LDA Z,$CMODE
+	LSR
+	LSR
+	LSR
+	LSR
+	LSR			;ISOLATE BONUS-ADDER MODE IN BITS 0-2
+	.ENDM
+        .NLIST CND
+	.NLIST CND
+;ENTRY POINT
+        .GLOBL MOOLAH
+;
+;EXTERNAL REFERENCES
+	.IF NE,BONADD
+	.GLOBL $BCCNT
+	.GLOBL $BC
+	.ENDC
+	.IF NE,MODES!MULTS
+	.IF NE,CMZP
+        .GLOBL $CMODE                   ;INPUT COIN MODE
+	.ENDC				;NE, CMZP
+	.ENDC				;NE,MODES!MULTS
+        .GLOBL $COINA,$LAM              ;SWITCH LOCATIONS (COIN & SLAM)
+        .GLOBL $LMBIT                   ;MASK WITH 1 IN BIT WHERE SLAM SW. IS
+        .GLOBL $CNSTT,$PSTSL		;INTERNAL LOCATIONS
+	.GLOBL $INTCT			;INTERRUPT COUNTER
+        .GLOBL $LMTIM,$CNCT             ;SLAM-TIMER, COINCOUNT
+	.IF NE,MODES
+        .GLOBL $$CRDT                   ;RESULT OF ALL THIS
+	.ENDC				;NE,MODES
+	.IF NE,EMCTRS
+	.GLOBL $CCTIM			;COIN-COUNTER TIMER BYTE(S)
+	.ENDC				;NE,EMCTRS
+        .IF NE,MODES*<MODES-4>
+        .ERROR   ;2 FLAVORS-0 OR 4 MODES
+        .ENDC				;NE,MODES*<MODES-4>
+	.IF NE,<MECHS-2>*<MECHS-3>*<MECHS-1>	;CHECK # OF MECHS SPEC'D
+	.ERROR ;1, 2 OR 3 MECHS ONLY, PLEASE
+	.ENDC				;NE,<MECHS-2>*<CMECHS-3>*<MECHS-1>
+	.IF EQ,RTS!INCLUDE
+	.ERROR ;NO RTS, NO INCLUDE???
+	.ENDC			;RTS!INCLUDE
+	.IF NE,MULTS*SEPCCT
+	.ERROR ;BOTH MULTS AND SEPCCT?!?
+	.ENDC				;NE,MULTS*SEPCCT
+	.IF NE,MODES*SEPCCT
+	.ERROR ;SEPCCT AND MODES TOO?!?
+	.ENDC				;NE,MODES*SEPCCT
+        .IIF GT,PRST-31.,PRST=31.
+        .IIF GT,POST-63.,POST=63.
+;        The coin routine assumes the presence of the following .GLOBL variables:
+	.IF NE,BONADD
+	.REPT 0
+$BCCNT:	ONE BASE PAGE BYTE USED TO COUNT COINS TOWARDS
+	BONUS COINS. IT MUST BE INITIALIZED TO ZERO ON
+	POWER-ON. IT MUST ALSO BE INITIALIZED TO ZERO
+	WHEN A START-BUTTON IA PUSHED.
+$BC:	ONE BASE-PAGE BYTE USED TO
+	HOLD ACTUAL BONUS COINS ACCRUED.
+	INITIALIZE TO ZERO AT POWER-ON
+	AND EACH TIME A START BUTTON IS
+	PUSED.***CLEAR $BCCNT, THEN & BC.
+	.ENDR
+	.ENDC
+	.IF NE,MODES
+	.REPT 0
+$$CRDT:   Base page byte initialized to 0 on restart.  This is where accrued  credit
+        is  kept.   Should  be  decremented  for each player-start.  Note that a DECREMENT
+        instruction must be used to insure  mutual  exclusion  between  the  main  program
+        accessing  $$CRDT  and  the  interrupt-driven coin routine accessing $$CRDT".  Not
+        used if MODES=0
+	.ENDR
+	.ENDC			;NE,MODES
+	.IF NE,CMZP
+	.REPT 0
+	.IIF NDF,SEPCCT,SEPCCT=0	;DO NOT IMPLEMENT SEPARATE $CNCT'S
+$CMODE:   Base page byte that contains the coin option  switches  in  its  low-order
+        bits  (high true).  You must put them there.  This is not used if flag CMZP=0.
+	See bit definitions in DEFAULT ASSIGNMENTS, and Macro definitions GCM,GHM,GDM.
+	.ENDR
+	.ENDC			;NE,CMZP
+	.REPT 0
+$CNSTT:   "MECHS" base page bytes ($CNSTT, $CNSTT+OFFSET,$CNSTT+2*OFFSET) which should be
+	initialized to 00 (the timers for coin detection).
+$COINA:   "MECHS" locations containing coin switches in D7. Left mech is at  $COINA,  Right
+        mech is  at  $COINA+(2*OFFSET). If COIN67=1, Switches  are  all in $COINA, D7-Right,
+	D6-Mid, D5-Left. If Coin01=1, D0-Right,	D1-MId, D2-Left.
+	.ENDR
+	.IF NE,SEPCCT
+	.REPT 0
+$CNCT:    "MECHS" base page bytes ($CNCT, $CNCT+OFFSET, $CNCT+(2*OFFSET)) which must be zeroed
+	 on pwron - coin counters for program (As distinct from $CCTIM,Below). Only one is used
+	if SEPCCT=0.
+	.ENDR
+	.IFF
+	.REPT 0
+$CNCT:	  Base page byte which must be initialized to zero on pwron. This is used to count
+	coins for program (As distinct from $CCTIM, below).
+	.ENDR
+	.ENDC			;NE,SEPCCT
+	.REPT 0
+$PSTSL:   "MECHS" base page bytes  ($PSTSL, $PSTSL+OFFSET,$PSTSL+(2*OFFSET)used to
+	time post-coin slam.
+$LAM:     Address of the SLAM switch.  The bit position inside $LAM is specified  by
+       $LMBIT (see below)
+$LMBIT:  Mask used to select which bit in the slam switch  byte  should  be  tested
+        (used as I,$LMBIT).  NOT A LOCATION, JUST A VALUE!!
+$LMTIM:   Base  page  byte  used  as  a  timer  for  pre-slam  protection.   May  be
+        initialized  to  0FF  at  pwron  to  disallow  coin input for 4 seconds.  Coins are
+        disallowed for two frames anyway.  This will be non-zero if SLAM was
+	true within PRST*4 frames.
+$INTCT:  Interrupt counter for  long  string-timer.   If  CNTINT=1,  this  will  be
+        incremented  (default  case).   If CNTINT=0, this should be equated to an existing
+        counter.
+$CCTIM:  Timers(s) for pulses output to electro-mechanical counters, if EMCTRS > 0.
+	Sign of $CCTIM(X) set if assoc. coin counter should be turned on, cleared
+	for off. If 3 used, they are Left @ $CCTIM, Mid @ $CCTIM+OFFSET,
+	Right @ $CCTIM+(2*OFFSET)
+Space requirements:
+                RAM: 3+CMZP+2*MECHS+EMCTRS (13. TYPICAL)
+                ROM: About 200. bytes
+The coin routine also assumes it will be called 4 times  a  frame,  where  one  frame=1/60
+second.   In  most  cases  this may be accomplished by making the coin routine part of the
+interrupt routine.
+	.ENDR
+	.IF EQ,OFFSET-2
+	.REPT 0
+SAMPLE BASE PAGE ALLOCATION:  (WHERE OFFSET=2,MECHS=3)
+	$BCCNT:	.BLKB 1		;COUNT TOWARDS BONUS COIN
+	$BC:	.BLKB 1		;BONUS COINS
+	$CCTIM:	.BLKB 1		;COIN COUNTER TIMER (IF 1 USED)
+        $$CRDT: .BLKB 1		;CREDIT TOTAL
+        $CNCT:  .BLKB 1		;COIN COUNT
+	$LMTIM:	.BLKB 1		;PRE-COIN SLAM-TIMER
+	$CMODE:	.BLKB 1		;COIN MODE
+        $PSTSL: .BLKB 6		;POST-COIN SLAM TIMERS (@ 0,2,4)
+        $CNSTT  =$PSTSL+1	;COIN STATUS/TIMERS (@ 1,3,5)
+        .ENDR
+	.ENDC			;EQ,OFFSET-2
+	.IF EQ,OFFSET-1
+	.REPT 0
+SAMPLE BASE PAGE ALLOCATION: (WHERE OFFSET=1,MODES=4)
+	$BCCNT:	.BLKB 1		;COUNT TOWARDS BONUS COIN
+	$BC:	.BLKB 1		;BONUS COINS
+	$CCTIM:	.BLKB EMCTRS	;E.M. COUNTER TIMERS (-FOR ON)
+	$$CRDT:	.BLKB 1		;CREDIT TOTAL
+	$CNCT:	.BLKB 1		;"UNIT-COIN" COUNT
+	$PSTSL:	.BLKB MECHS	;POST-COIN SLAM TIMERS
+	$CNSTT:	.BLKB MECHS	;COIN-STATUS/TIMER
+	$LMTIM:	.BLKB 1		;PRE-COIN SLAM TIMER
+	$CMODE:	.BLKB 1		;COIN MODE
+	.ENDR
+	.ENDC			;EQ,OFFSET-1
+        .IF EQ,MODES-4
+        .REPT 0
+THE COIN MODES ARE:
+  0:    FREE PLAY- $CNCT is zeroed, $$CRDT is not changed
+  1:    2 PLAYS PER COIN
+  2:    1 PLAY PER COIN
+  3:    2 COINS PER PLAY
+        .ENDR
+        .ENDC			;EQ,MODES-4
+        .REPT 0
+                   *** COIN DETECTION ***
+Coin detection, courtesy of Mike Albaugh, uses two counters in one  byte  ($CNSTT).   This
+byte  is  used to remember the condition of the coin switch.  The upper counter (D7,D6,D5)
+runs when the coin is absent and is reset when the coin is  present.   The  lower  counter
+(D4-D0)  runs  when  the  coin is present and is reset when the coin is absent, unless the
+coin was present for 5 successive samples.  This "unless"  enables  $CNSTT  to  "remember"
+that a coin has been VALID-HIGH while waiting for VALID-LOW.
+Basically, a valid coin is defined as between 16 and 800 ms of coin present, preceded  and
+followed  by  33 ms of coin absent.  The 33 ms lows need not immediately precede or follow
+the high.  The lower five bits count  down  from  31  when  the  coin  is  present.   This
+countdown  is  fast  (once  per  interupt)  for the first five samples (31-26, about 16-20
+milliseconds) then slow (once per EIGHT interrupts) for the remaining counts (26-0,  about
+800  ms).   The  count  then  stops  at zero.  This counter is reset if the coin goes away
+during the first five counts, I.E., the coin must be present for at least  16  ms.   After
+that  the coin must go away for eight counts to reset it.  This is because after the first
+five counts a coin is VALID HIGH and must not be reset until VALID LOW occurs  to  prevent
+mid-coin glitches from making a valid coin into 0 or 2 (or more) coins.
+
+The upper three bits count up from zero when the coin is absent.  The count  is  reset  if
+coin  is  ever  found  present.   When  the  count  finally wraps (8 samples, 33 ms).  The
+coin-present counter is checked.  A count from 27-31 (less than 16-20 ms) is too short.  A
+count of 0 (more than 800 ms) is too long.  Both of these cases are simply reset to 31.  A
+count of 1-26 is a (tentatively) valid coin.  The counter is again set to 31, but  another
+counter ($PSTSL) is started.
+
+$PSTSL is the POST-COIN-SLAM timer.  Initially  set  to  120,  it  counts  down  once  per
+interrupt  (4  times per frame) to give a nominal 1/2 second delay.  If the slam switch is
+seen during this time, $PSTSL is cleared, invalidating the coin.  The length of the  delay
+(in  frames)  is  defined by POST which defaults to 30.  It may be set as high as 63 (1.05
+seconds) by definition E.G.
+
+        POST=50         ;POST-SLAM=50 FRAMES
+
+SIMILARY A SLAM IS "REMEMBERED" FOR PRST frames (default=30, max=31) and no  coin  can  be
+"seen" during this time.
+
+Note that the proper initial  state  of  all  these  counters  etc  is  0,  therefore  the
+traditional power-on clear does the trick.  Since coins "transit" from $CNSTT to $PSTSL to
+$CNCT to $$CRDT, locations should be cleared in that order, I.E.   $$CRDT  should  be  the
+last location cleared. ($$CRDT, of course, exists only if MODES=4)
+        .ENDR
+        .SBTTL DETECT COIN
+;INSTRUCTIONS IN BRACKETS( "[" AND "]" ) ARE FOR ILLUSTRATION ONLY, AND ARE NOT
+;ACTUALLY ASSEMBLED.
+MOOLAH:
+	.IF EQ,MECHS-1
+	LDA A,$COINA
+	.IF EQ,COIN01		;IF NOT IN D0
+	ASL			;SHIFT SWITCH (D7) INTO CARRY
+	.IFF
+	LSR			;SHIFT SWITCH (D0) INTO CARRY
+	.ENDC			;EQ, COIN01
+	LDA Z,$CNSTT
+	.IFF			;IF MECHS=2 OR 3
+        LDX I,OFFSET*<MECHS-1>	;X IS USED TO INDEX FROM RIGHT TO LEFT COIN MECH
+        .IF EQ,COIN67!COIN01
+$DETCT: LDA AX,$COINA
+        ASL
+        .IFF
+$DETCT:	LDA A,$COINA            ;GET COIN SWITCHES
+	CPX I,OFFSET		;WHICH MECH ARE WE DOING
+	BEQ 11$			;MIDDLE (X=OFFSET) SHIFT TWICE
+	BCS 12$			;RIGHT (X=2*OFFSET) SHIFT ONCE
+	.IF NE,COIN01
+	LSR			;ELSE LEFT, SHIFT THRICE
+11$:	LSR
+12$:	LSR
+	.IFF
+	ASL			;ELSE LEFT, SHIFT THRICE
+11$:	ASL
+12$:	ASL
+        .ENDC			;NE,COIN01
+	.ENDC			;EQ,COIN67!COIN01
+        LDA ZX,$CNSTT
+	.IFTF			;ANY # OF MECHS
+        AND I,31.               ;SHARED INST. SEE BELOW IN BRACKETS []
+        .IF EQ,COIN
+        BCS 5$                  ;BRANCH IF INPUT HIGH (COIN ABSENT)
+        .IFF
+        BCC 5$                  ;BRANCH IF INPUT LOW (COIN ABSENT)
+        .ENDC			;EQ,COIN
+;       [AND I,31.]             ISOLATE COIN-ON DOWN-COUNTER, RESET COIN-OFF UP-CTR.
+        BEQ 1$                  ;STICK AT 0 (TERMINAL COUNT)
+        CMP I,27.               ;IN FIRST FIVE SAMPLES?
+        BCS 10$                 ;YES, RUN FAST
+        TAY                     ;ELSE SAVE STATUS
+        LDA Z,$INTCT            ;CHECK INTERUPT CTR
+        AND I,7                 ;ARE D0-D2 ALL ONES?
+        CMP I,7			;SET CARRY IF SO
+        TYA                     ;STATUS BACK INTO ACC
+        BCC 1$                  ;SKIP IF NOT ALL ONES
+10$:    SBC I,1                 ;CARRY SET
+	.IFT			;EQ, MECHS-1
+1$:	STA Z,$CNSTT
+	.IFF			;IF MECHS>1
+1$:     STA ZX,$CNSTT           ;SAVE UPDATED STATUS
+	.IFTF			;ANY # OF MECHS
+        LDA A,$LAM              ;CHECK SLAM SWITCH
+        AND I,$LMBIT
+        .IF NE,SLAM
+        BEQ 2$                  ;BRANCH IF BIT LO (SWITCH OFF)
+        .IFF
+        BNE 2$                  ;BRANCH IF BIT HI (SWITCH OFF)
+        .ENDC			;NE,SLAM
+        LDA I,PRST*8            ;ELSE SET PRE-COIN SLAM TIMER
+        STA Z,$LMTIM            ;DECR. 8 TIMES/FRAME=PRST FRAMES
+2$:     LDA Z,$LMTIM            ;CHECK PRE-COIN SLAM TIMER
+        BEQ 3$                  ;O.K.
+        DEC Z,$LMTIM            ;ELSE RUN TIMER
+        LDA I,0
+	.IFT			;MECHS=1
+	STA Z,$CNSTT		;CLEAR COIN STATUS
+	STA Z,$PSTSL		;CLEAR POST-COIN SLAM TIMER
+3$:	CLC			;DEFAULT "NO COIN DETECTED"
+	LDA Z,$PSTSL		;CHECK POST-COIN SLAM TIMER
+	BEQ 8$			;EMPTY, PROCEED
+	DEC Z,$PSTSL		;ELSE RUN TIMER
+	.IFF			;IF MECHS>1
+        STA ZX,$CNSTT           ;CLEAR COIN STATUS
+        STA ZX,$PSTSL           ;CLEAR POST-COIN SLAM-TIMER
+3$:     CLC                     ;DEFAULT "NO COIN DETECTED"
+        LDA ZX,$PSTSL           ;CHECK POST-COIN SLAM-TIMER
+        BEQ 8$                  ;EMPTY, PROCEED
+        DEC ZX,$PSTSL           ;RUN TIMER
+	.IFTF			;ANY # OF MECHS
+        BNE 8$                  ;NOT DONE, PROCEED
+        SEC                     ;WHEN IT BECOMES ZERO, INDICATE A COIN
+        BCS 8$                  ;(ALWAYS)
+	
+5$:;    [AND I,31.]             GET COIN-ON DOWN-CTR (ACTUALLY DONE BEFORE)
+        CMP I,27.               ;IS COIN VALID YET (ON FOR >4 SAMPLES)
+        BCS 6$                  ;NO, RESET IT
+	.IFT			;MECHS=1
+	LDA Z,$CNSTT		;GET STATUS AGAIN
+	.IFF			;MECHS>1
+        LDA ZX,$CNSTT           ;GET STATUS AGAIN
+	.IFTF			;ANY # OF MECHS
+        ADC I,32.               ;BUMP COIN-OFF UP-CTR.
+        BCC 1$                  ;IF IT DIDN'T WRAP, JUST STORE STATUS
+        BEQ 6$                  ;IT WRAPPED BUT COIN WAS ON TOO LONG, JUST RESET
+        CLC                     ;SET "VALIDITY" AGAIN
+6$:     LDA I,31.               ;RESET DOWN-COUNTER
+        BCS 1$                  ;BRANCH IF COIN TOO LONG OR TOO SHORT
+	.IFT
+	STA Z,$CNSTT		;SAVE RESET STATUS
+	LDA Z,$PSTSL		;CHECK HOWIE'S ASSUMPTION
+	.IFF
+        STA ZX,$CNSTT           ;SAVE RESET STATUS
+;       [CLC]                   DEFAULT TO "NO COIN" (CARRY IS ALREADY CLEAR)
+        LDA ZX,$PSTSL           ;CHECK HOWIES ASSUMPTION
+	.IFTF			;ANY # MECHS
+        BEQ 7$                  ;BRANCH IF $PSTSL VACANT
+        SEC                     ;ELSE GIVE CREDIT A LITTLE EARLY
+7$:     LDA I,POST*4            ;/(4 COUNTS/FRAME)="POST" FRAMES
+	.IFT			;MECHS=1
+	STA Z,$PSTSL
+	.IFF			;MECHS>1
+        STA ZX,$PSTSL           ;DELAY ACCEPTANCE FOR POST/60 SEC.
+	.ENDC			;EQ,MECHS-1
+        
+8$:                             ;CARRY=1 IF COIN FALLS OUT
+        BCC 9$
+	.IF NE,MULTS
+;FALL THROUGH TO "MECH-MULTIPLIERS"
+	.PAGE
+	.SBTTL MECH-MULTIPLIERS
+	.IF EQ,MECHS-2	
+	TXA			;WHICH MECH
+	BEQ 85$			;LEFT,ADD1
+	.ENDC			;EQ,MECHS-2
+	.IF EQ,MECHS-3
+	LDA I,0			;START WITH 0 (TO ADD 1)
+	CPX I,OFFSET		;CHECK WHICH MECH
+	BCC 85$			;IF LEFT, ALWAYS ADD 1
+	BEQ 83$			;IF CENTER, CHECK HALF-MUL
+	.ENDC			;EQ,MECHS-3
+	GDM			;GET DOLLAR MUL
+	BEQ 85$			;00-ADD 1
+	ADC I,2			;ELSE MAP 1,2,3 TO 3,4,5
+	.IF EQ,MECHS-3
+	BNE 85$			;(ALWAYS)
+	
+83$:	GHM
+	BEQ 85$
+	LDA I,1
+	.ENDC			;EQ,MECHS-3
+85$:	SEC
+	.IF EQ,MECHS-1
+	.IF NE,BONADD
+	PHA
+	ADC Z,$BCCNT			;UPDATE BONUS-ADDER COUNTER
+	STA Z,$BCCNT
+	PLA
+	SEC
+	.ENDC				;NE.BONADD
+	ADC Z,$CNCT
+	STA Z,$CNCT		;UPDATE CNCT
+	.IFF			;IF MORE THAN ONE MECH
+	.IF NE,SEPCCT
+	.PRINT			;I'M NOT SURE YOU WANT TO DO THIS, ARE YOU?
+	.IF NE,BONADD
+	.PRINT	;ERROR:ERROR:!!!!
+	.PRINT	;ERROR:YOU CANNOT HAVE
+	.PRINT	;SEPARATE COIN-COUNTS(SEPCCT=1)
+	.PRINT	;AND BONUS-ADDER(BONADD=1)AT
+	.PRINT	;THE SAME TIME. SORRY.
+	.PRINT	;********************
+	INC AY,$BCCNT			;ASSEMBLED IN TO CAUSE AN ERROR.
+	.ENDC
+	ADC X,$CNCT
+	STA X,$CNCT		;UPDATE COIN COUNT FOR PROGRAM
+	.IFF			;NE,SEPCCT
+	.IF EQ,<MULTS-1>!<CCTRS-1>	;IF MULTS REQUIRED, BUT ONLY ONE COUNTER
+
+;THE NORMAN AVELLAR MEMORIAL KLUGE
+
+;
+;###NOTE:  THIS CODE PROVIDED ONLY FOR OLD AMERICAN GAMES. USE WITH 5 DM
+;MECHS IS STRONGLY DISCOURAGED
+	TAY			;SAVE INCREMENT
+	.IFTF			;EQ,<MULTS-1>!<CCTRS-1>
+	.IF NE,BONADD
+	PHA
+	ADC Z,$BCCNT			;UPDATE BONUS-ADDER COUNTER
+	STA Z,$BCCNT
+	PLA
+	SEC
+	.ENDC				;NE, BONADD
+	ADC $CNCT
+	STA $CNCT
+	.IFT			;EQ,<MULTS-1>!<CCTRS-1>
+	INY
+	TYA
+	.IF EQ,MECHS-3
+	CMP I,3			;IS IT DOLLAR MULT
+	BCC 87$			;NO, SKIP	
+	LDA I,3			;ELSE FORCE 4 (3+CARRY)
+	.IFF			;EQ,MECHS-3
+	AND I,4
+	BNE 87$
+	SEC
+	.ENDC			;EQ,MECHS-3
+87$:	ADC $CCTIM
+	STA $CCTIM
+	.ENDC			;EQ,<MULTS-1>!<CCTRS-1>
+	.ENDC			;SEPCCT
+	.ENDC			;EQ,MECHS-1
+	.IFF			;NE, MULTS
+;FALL THROUGH TO BUMP $CNCT
+	.IF EQ,MECHS-1
+	INC Z,$CNCT		;BUMP COIN COUNT
+	.IF NE,BONADD
+	INC Z,$BCCNT		;UPDATE BONUS-ADDER COUNTER
+	.ENDC			;NE, BONADD
+	.IFF			;IF MECHS=2 OR 3
+	.IF NE,SEPCCT		;IF ASKED FOR SEPARATE COUNT,
+	INC X,$CNCT		;USE INDEXED INC
+	.IF NE,BONADD
+	.PRINT	;ERROR:ERROR:!!!!
+	.PRINT	;ERROR:YOU CANOT HAVE
+	.PRINT	;SEPARATE COIN-COUNTS(SEPCCT=1)
+	.PRINT	;AND BONUS-ADDER(BONADD=1)AT
+	.PRINT	;THE SAME TIME.SORRY.
+	.PRINT	;********************
+	INC AY,$BCCNT			;ASSEMBLED IN TO CAUSE AN ERROR.
+	.ENDC
+	.IFF			;ELSE USE COMMON COUNTER
+        INC $CNCT
+	.IF NE,BONADD
+	INC Z,$BCCNT		;UPDATE BONUS-ADDER COUNTER
+	.ENDC			;NE,BONADD
+	.ENDC			;NE,SEPCCT
+	.ENDC			;EQ, MECHS-1
+	.ENDC			;NE,MULTS
+	.IF EQ,CCTRS-1		;IF 1 COIN COUNTER USED
+	.IF EQ,MULTS*<MECHS-1>	;AND NO MULTS, OR JUST 1 MECH
+	INC $CCTIM		;INIT COIN PULSE TO E.M. COUNTER
+	.ENDC			;EQ,MULTS*<MECHS-1>
+	.ENDC			;EQ,CCTRS-1
+	.IF NE,MECHS-1		;IF 2 OR 3 MECHS
+	.IF GE,CCTRS-3		;IF 3 OR 4 COUNTERS USED
+	INC X,$CCTIM		;"QUEUE" PULSE FOR E.M. COUNTER
+	.ENDC			;EQ,CCTRS-3
+	.IFTF			;ANY # OF MECHS
+9$:
+	.IFT			;ONLY FOR MORE THAN ONE MECH
+        .REPT OFFSET
+        DEX
+        .ENDR
+	.IF GT,.-$DETCT-126.
+	BMI 120$
+	JMP $DETCT
+120$:
+	.IFF
+        BPL $DETCT
+	.ENDC			;GT,.-DETECT-126.
+	.ENDC			;NE,MECHS-1
+	.IF NE,BONADD
+	;FALL THRU TO BONUS-ADDER
+	.PAGE
+	.SBTTL BONUS-ADDER
+$BONUS:	GBAM			;GET BONUS ADDER MODE
+	TAY
+	LDA Z,$BCCNT
+	SEC
+	SBC AY,$MODLO		;SEE IF ENOUGH UNIT-COINS HAVE ACCUMULATED
+	BMI $EXTB		;BRANCH IF NOT
+	STA Z,$BCCNT		;ELSE UPDATE BONUS-ADDER AND...
+	INC Z,$BC		;GIVE ONE OR TWO BONUS UNIT-COINS
+	CPY I,3
+	BNE $EXTB
+	INC Z,$BC		;MODE 3 YIELDS 2 BONUS COINS FOR 4 INSERTED
+	BNE $EXTB		;BRA
+$MODLO:				;THIS IS THE NUMBER OF UNIT-COINS REQUIRED TO RECEIVE BONUS
+	.BYTE 7F,2,4,4,5,3,7F,7F	;7F IS USED TO GENERATE ZERO BONUS COINS
+$EXTB:
+	.ENDC
+        .IF EQ,MODES-4          ;ONLY IF MODES=4
+;FALL THROUGH TO CONVERT COINS TO CREDITS
+	.PAGE
+	.SBTTL COINS TO CREDITS
+$CNVRT:	GCM		;GET COIN MODE IN 0,1
+	TAY			;SAVE IT
+	BEQ 2$			;IF FREE PLAY CMODE=0, DO NOTHING
+	LSR			;ELSE FORM PRICE (0,1,1,2)
+	ADC I,0
+	EOR I,0FF
+	SEC
+	ADC $CNCT		;ACC <- COINCT-PRICE
+	.IIF EQ,BONADD,BCC $EXT
+	.IF NE,BONADD
+	BCS 33$			;BRANCH IF NO BORROW
+	;[CLC]
+	ADC Z,$BC			;ADD IN BONUS COINS-SEE IF THEY HELP
+	BMI $EXT		;BRANCH IF COINCT+BONUS COINS <PRICE
+	STA Z,$BC			;ELSE ACC=UNUSED BONUS COINS
+	LDA I,0			;ACC=NEW $CNCT
+	.ENDC
+33$:				;GENERATE CREDITS: 1 OR 2
+	CPY I,2			;Y=COIN MODE-COIN MODE 2 OR 3?
+	BCS 1$			;BRANCH IF MODE 2 OR 3-GIVE 1 CREDIT
+	INC $$CRDT		;ELSE GIVE 2 FOR MODE 1
+1$:	INC $$CRDT
+2$:	STA $CNCT		;UPDAT COINCT
+	.ENDC
+$EXT:
+	.IIF NE,CNTINT,	INC Z,$INTCT	;COUNT INTERUPTS WHEN REQUESTED
+	.IF NE,EMCTRS		;INCLUDE PULSER FOR E.M. CTRS
+;FALL THROUGH TO HANDLE E.M. COUNTERS
+	.SBTTL ELECTRO-MECH. CTRS
+	LDA Z,$INTCT		;GET $INTCT 
+	LSR			;USE LSB FOR PULSE=4 FRAMES
+	BCS 99$
+	.ENDC			;NE,EMCTRS
+	.IF EQ,EMCTRS-1
+	LDA Z,$CCTIM		;GET COIN-COUNTER TIMER
+	BEQ 99$			;BRANCH IF IDLE
+	CMP I,10		;MSB'S CLEAR?
+	BCS 1$			;NO,SKIP
+	ADC I,-1		;ELSE INIT PULSE, SET CARRY
+1$:	ADC I,0EF		;(ONE LESS CUZ CARRY SET) DEC MSB'S OF TIMER
+	STA Z,$CCTIM		;STORE UPDATED TIMER
+	.ENDC			;EQ,EMCTRS-1
+	.IF GE,EMCTRS-3		;IF 3 OR 4 CTRS
+	LDY I,0			;START WITH FLAG OF 0
+	LDX I,OFFSET*<EMCTRS-1>
+1$:	LDA X,$CCTIM		;CHECK TIMER(X)
+	BEQ 3$			;NEITHER RUNNING NOR PENDING
+	CMP I,10		;IS IT RUNNING
+	BCC 3$			;NO, SKIP
+	ADC I,0EF		;ELSE DEC 4 MSB
+	INY			;SET ON FLAG
+2$:	STA X,$CCTIM
+3$:
+	.REPT OFFSET
+	DEX
+	.ENDR
+	BPL 1$
+	TYA			;CHECK "ON" FLAG
+	BNE 99$			;SKIP IF ANY ON
+;IF NONE OF THE COUNTERS ARE CURRENTLY ON, WE CHECK TO SEE IF ANY CAN BE
+;STARTED.
+	LDX I,OFFSET*<EMCTRS-1>	
+4$:	LDA X,$CCTIM		;NEED WE START THIS ONE
+	BEQ 5$			;NO, NO COUNTS PENDING
+	CLC
+	ADC I,0EF		;SET 4 MSB, DEC 4 LSB
+	STA X,$CCTIM		;START TIMER
+	BMI 99$			;EXIT, SO WE DON'T START MORE
+5$:
+	.REPT OFFSET
+	DEX
+	.ENDR
+	BPL 4$
+	.ENDC			;GE, EMCTRS-3
+99$:
+	.IF NE,RTS		;IF THIS IS A SUBROUTINE
+	RTS
+	.ENDC			;NE,RTS
+	.RADIX .RAD		;RESTORE RADIX
+
+	.IIF EQ,INCLUDE,	.END	;NO .END TO ".INCLUDE"'D FILES
+                                                                                                                                                                                                                                                                                                                        

@@ -169,7 +169,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- Stronger reward for maintaining lives
         if player_state.player_lives ~= nil then
-            reward = reward + (player_state.player_lives * 50)  -- Higher value per life
+            reward = reward + (player_state.player_lives)
         end
 
         -- Score-based reward (keep this as a strong motivator)
@@ -191,13 +191,13 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             -- No enemies: reward staying still more strongly
             reward = reward + (player_state.SpinnerDelta == 0 and 50 or -20)
         else
-            local direction = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-            local distance  = math.abs(direction)
+            -- Get desired spinner direction, segment distance, AND enemy depth
+            local desired_spinner, segment_distance, enemy_depth = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
-            if distance == 0 then
-
+            -- Check alignment based on actual segment distance
+            if segment_distance == 0 then 
                 -- Massive reward for alignment + firing incentive
-                reward = reward + 200
+                reward = reward + 250
                 -- Bonus for shooting when aligned
                 if player_state.shot_count > 0 then
                     reward = reward + 100
@@ -206,14 +206,12 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if player_state.SpinnerDelta ~= 0 then
                     reward = reward - 50
                 end
-
             else 
-                
-                -- Enemies at the top of tube should be shot when beside the player
-
-                if (distance < 2) then
-                    local depth = enemies_state:depth_of_top_enemy(enemies_state, player_state)
-                    if (depth <= 0x20) then
+                -- Misaligned case (segment_distance > 0)
+                -- Enemies at the top of tube should be shot when close (using segment distance)
+                if (segment_distance < 2) then -- Check using actual segment distance
+                    -- Use the depth returned by direction_to_nearest_enemy
+                    if (enemy_depth <= 0x20) then 
                         if player_state.fire_commanded == 1 then
                             -- Strong reward for firing at close enemies
                             reward = reward + 250
@@ -224,19 +222,16 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     end
                 end
 
-                -- Graduated reward for proximity
-                reward = reward + (20 - distance * 2)  -- Closer = better
+                -- Graduated reward for proximity (higher reward for smaller segment distance)
+                reward = reward + (10 - segment_distance) -- Simple linear reward for proximity
                 
-                -- Movement incentives
-                if direction * player_state.SpinnerDelta > 0 then
-                    -- Strong reward for correct movement
+                -- Movement incentives (using desired_spinner direction)
+                if desired_spinner * player_state.SpinnerDelta > 0 then
+                    -- Strong reward for correct movement (signs match)
                     reward = reward + 50
                 elseif player_state.SpinnerDelta ~= 0 then
-                    -- Strong penalty for wrong movement
+                    -- Strong penalty for wrong movement (signs mismatch)
                     reward = reward - 50
-                else
-                    -- Moderate penalty for inaction when misaligned
-                    reward = reward - 25
                 end
                 
                 -- Encourage maintaining shots in reserve
@@ -811,7 +806,7 @@ function EnemiesState:update(mem)
     self.nearest_enemy_seg = self:nearest_enemy_segment()
 end
 
--- Find the segment with the enemy closest to the top of the tube
+-- Find the segment and depth of the enemy closest to the top of the tube
 function EnemiesState:nearest_enemy_segment()
     local min_depth = 255
     local closest_segment = -1
@@ -855,51 +850,42 @@ function EnemiesState:nearest_enemy_segment()
     --     end
     -- end
     
-    return closest_segment
+    return closest_segment, min_depth -- Return both segment and depth
 end
 
-function EnemiesState:depth_of_top_enemy()
-    local min_depth = 255  -- Initialize with maximum possible depth
-    local closest_segment = -1  -- Initialize with invalid segment
-    
-    -- Check the standard enemy table for non-zero depths
-    for i = 1, 7 do
-        -- Only consider enemies with a valid depth and segment
-        if self.enemy_depths[i] > 0 and 
-           self.enemy_segments[i] >= 0 and self.enemy_segments[i] <= 15 then
-            if self.enemy_depths[i] < min_depth then
-                min_depth = self.enemy_depths[i]
-                closest_segment = self.enemy_segments[i]
-            end
-        end
-    end  -- Returns the segment number or -1 if no enemies found
-    return min_depth
-end
-
+-- function EnemiesState:depth_of_top_enemy() -- This will be removed later
 
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-    local enemy_seg = enemies_state:nearest_enemy_segment()
+    -- Get segment AND depth of nearest enemy
+    local enemy_seg, enemy_depth = enemies_state:nearest_enemy_segment() 
     local player_seg = player_state.position
 
-    if enemy_seg < 0 or enemy_seg == player_seg then 
-        return 0 -- No enemy or aligned
+    if enemy_seg < 0 then 
+        return 0, 0, 255 -- No enemy, return spinner 0, distance 0, max depth
+    end
+    
+    -- If already aligned, distance is 0
+    if enemy_seg == player_seg then
+        return 0, 0, enemy_depth -- Aligned, return spinner 0, distance 0, current depth
     end
 
     local intensity
     local spinner
+    local actual_segment_distance
+
     if level_state.level_type == 0xFF then -- Open Level
-        local distance = math.abs(enemy_seg - player_seg)
-        intensity = math.min(0.9, 0.3 + (distance * 0.05))
+        actual_segment_distance = math.abs(enemy_seg - player_seg)
+        intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
         spinner = enemy_seg > player_seg and -intensity or intensity
     else -- Closed Level
         local clockwise = (enemy_seg - player_seg) % 16
         local counter = (player_seg - enemy_seg) % 16
-        local min_dist = math.min(clockwise, counter)
-        intensity = math.min(0.9, 0.3 + (min_dist * 0.05))
+        actual_segment_distance = math.min(clockwise, counter)
+        intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
         spinner = clockwise < counter and -intensity or intensity
     end
 
-    return spinner
+    return spinner, actual_segment_distance, enemy_depth -- Return spinner, distance, AND depth
 end
 
 
