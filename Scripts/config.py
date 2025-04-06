@@ -30,9 +30,9 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 284
-    expert_ratio_start: float = 0.75
+    expert_ratio_start: float = 0.95
     expert_ratio_min: float = 0.0
-    expert_ratio_decay: float = 0.995
+    expert_ratio_decay: float = 0.999
     expert_ratio_decay_steps: int = 10000
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
@@ -45,7 +45,7 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 512
+    batch_size: int = 2048
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
@@ -53,8 +53,8 @@ class RLConfigData:
     epsilon_min: float = 0.01
     epsilon_decay: int = 10000
     update_target_every: int = 1000
-    learning_rate: float = 1e-4
-    memory_size: int = 500000
+    learning_rate: float = 1.5e-4
+    memory_size: int = 100000
     save_interval: int = 50000
     train_freq: int = 4
     target_update: int = 10000
