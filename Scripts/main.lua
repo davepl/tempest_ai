@@ -34,7 +34,7 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 
 local LOG_ONLY_MODE           = false
 local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local DISPLAY_UPDATE_INTERVAL = 0.05  
 
 local function clear_screen()
@@ -202,9 +202,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if player_state.shot_count > 0 then
                     reward = reward + 100
                 end
-                -- Small penalty for unnecessary movement when aligned
+                -- Small penalty for unnecessary movement when aligned (but could be moving to next enemy after firing, so not that bad)
                 if player_state.SpinnerDelta ~= 0 then
-                    reward = reward - 50
+                    reward = reward - 10
                 end
             else 
                 -- Misaligned case (segment_distance > 0)
@@ -217,6 +217,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                             reward = reward + 250
                         else
                             -- Moderate penalty for not firing at close enemies
+                            print("*")
                             reward = reward - 50
                         end
                     end
@@ -226,7 +227,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 reward = reward + (10 - segment_distance) -- Simple linear reward for proximity
                 
                 -- Movement incentives (using desired_spinner direction)
-                if desired_spinner * player_state.SpinnerDelta > 0 then
+                if desired_spinner * player_state.SpinnerDelta < 0 then
                     -- Strong reward for correct movement (signs match)
                     reward = reward + 50
                 elseif player_state.SpinnerDelta ~= 0 then
@@ -882,7 +883,8 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
         local counter = (player_seg - enemy_seg) % 16
         actual_segment_distance = math.min(clockwise, counter)
         intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
-        spinner = clockwise < counter and -intensity or intensity
+        -- Corrected: Command spinner OPPOSITE to shortest path direction (match assembly)
+        spinner = clockwise < counter and intensity or -intensity 
     end
 
     return spinner, actual_segment_distance, enemy_depth -- Return spinner, distance, AND depth
