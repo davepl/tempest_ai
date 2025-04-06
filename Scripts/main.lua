@@ -702,13 +702,22 @@ function EnemiesState:new()
     self.enemies_pending = 0
     self.nearest_enemy_seg = -1  -- Track the segment of the nearest enemy
     
-    -- Enemy info arrays
-    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- 7 enemy type slots
-    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
-    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
-    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
+    -- Enemy info arrays (Original)
+    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- Raw type byte from $0169 (or similar)
+    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- Raw state byte from $0170 (or similar)
+    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers ($02B9)
+    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions ($02DF)
+    -- LSB/Display list related fields remain...
     self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}   -- 7 enemy depth positions LSB
     self.enemy_shot_lsb = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy shot LSB values at $02E6
+
+    -- NEW: Decoded Enemy Info Tables (Size 7)
+    self.enemy_core_type = {0, 0, 0, 0, 0, 0, 0}        -- Bits 0-2 from type byte
+    self.enemy_direction_moving = {0, 0, 0, 0, 0, 0, 0} -- Bit 6 from type byte (0/1)
+    self.enemy_between_segments = {0, 0, 0, 0, 0, 0, 0} -- Bit 7 from type byte (0/1)
+    self.enemy_moving_away = {0, 0, 0, 0, 0, 0, 0}      -- Bit 7 from state byte (0/1)
+    self.enemy_can_shoot = {0, 0, 0, 0, 0, 0, 0}        -- Bit 6 from state byte (0/1)
+    self.enemy_split_behavior = {0, 0, 0, 0, 0, 0, 0}   -- Bits 0-1 from state byte
 
     -- Convert shot positions to simple array like other state values
     self.shot_positions = {0, 0, 0, 0}  -- 4 shot positions
@@ -729,16 +738,24 @@ end
 function EnemiesState:update(mem)
     -- First, initialize/reset all arrays at the beginning
     -- Reset enemy arrays
-    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- 7 enemy type slots
-    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- 7 active enemy slots
-    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}     -- 7 enemy segment numbers
-    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}       -- 7 enemy depth positions
-    self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}   -- 7 enemy depth positions LSB
-    self.enemy_shot_lsb = {0, 0, 0, 0, 0, 0, 0}     -- Reset enemy shot LSB values
-    self.enemy_move_vectors = {0, 0, 0, 0, 0, 0, 0} -- Movement vectors
-    self.enemy_state_flags = {0, 0, 0, 0, 0, 0, 0}  -- State flags
-    
-    -- Read active enemies (currently on screen)
+    -- Keep resetting original raw arrays
+    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}
+    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_shot_lsb = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_move_vectors = {0, 0, 0, 0, 0, 0, 0} -- Keep this reset if used elsewhere
+    self.enemy_state_flags = {0, 0, 0, 0, 0, 0, 0}  -- Keep this reset if used elsewhere
+    -- NEW: Reset decoded tables
+    self.enemy_core_type = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_direction_moving = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_between_segments = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_moving_away = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_can_shoot = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_split_behavior = {0, 0, 0, 0, 0, 0, 0}
+
+    -- Read active enemies counts, pulse state, etc.
     self.active_flippers  = mem:read_u8(0x0142)   -- n_flippers - current active count
     self.active_pulsars   = mem:read_u8(0x0143)    -- n_pulsars
     self.active_tankers   = mem:read_u8(0x0144)    -- n_tankers
@@ -769,15 +786,53 @@ function EnemiesState:update(mem)
 
     local activeEnemies = self.num_enemies_in_tube + self.num_enemies_on_top
     
-    -- Read enemy segments and depths from memory
+    -- Read standard enemy segments and depths first
     for i = 1, 7 do
-        self.enemy_segments[i] = mem:read_u8(0x02B9 + i - 1)  -- enemy_seg array at $02B9
-        self.enemy_depths[i] = mem:read_u8(0x02DF + i - 1)    -- enemy_along array at $02DF
+        self.enemy_segments[i] = mem:read_u8(0x02B9 + i - 1)
+        self.enemy_depths[i] = mem:read_u8(0x02DF + i - 1)
         if (self.enemy_depths[i] == 0) then
             self.enemy_segments[i] = 0
         end
     end
+
+    -- Read raw type/state bytes for all 7 slots THEN decode based on activity check using depth
+    local raw_type_bytes = {}
+    local raw_state_bytes = {}
+    for i = 1, 7 do
+        -- Read raw bytes (Type confirmed at $0283, State confirmed at $028A)
+        raw_type_bytes[i] = mem:read_u8(0x0283 + i - 1) 
+        raw_state_bytes[i] = mem:read_u8(0x028A + i - 1) 
+        -- Store raw bytes as well, might be useful
+        self.enemy_type_info[i] = raw_type_bytes[i]
+        self.active_enemy_info[i] = raw_state_bytes[i]
+    end
     
+    -- Now loop again, decoding only if the corresponding depth indicates activity
+    for i = 1, 7 do
+        if self.enemy_depths[i] > 0 then -- Check activity using depth for this index
+            local type_byte = raw_type_bytes[i]
+            local state_byte = raw_state_bytes[i]
+            
+            -- Decode Type Byte ($0283)
+            self.enemy_core_type[i] = type_byte & 0x07
+            self.enemy_direction_moving[i] = (type_byte & 0x40) ~= 0 and 1 or 0 -- Bit 6: Segment increasing?
+            self.enemy_between_segments[i] = (type_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Between segments?
+
+            -- Decode State Byte ($028A)
+            self.enemy_moving_away[i] = (state_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Moving Away?
+            self.enemy_can_shoot[i] = (state_byte & 0x40) ~= 0 and 1 or 0   -- Bit 6: Can Shoot?
+            self.enemy_split_behavior[i] = state_byte & 0x03               -- Bits 0-1: Split Behavior
+        else
+            -- Zero out decoded values for inactive slots (based on depth)
+            self.enemy_core_type[i] = 0
+            self.enemy_direction_moving[i] = 0
+            self.enemy_between_segments[i] = 0
+            self.enemy_moving_away[i] = 0
+            self.enemy_can_shoot[i] = 0
+            self.enemy_split_behavior[i] = 0
+        end
+    end
+
     -- Read all 4 enemy shot positions and store absolute positions
     for i = 1, 4 do
         local raw_pos = mem:read_u8(0x02DB + i - 1)
@@ -1125,14 +1180,14 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     table.insert(data, enemies_state.enemies_pending)
     table.insert(data, enemies_state.pulsar_fliprate) -- NEW: Add pulsar fliprate
     
-    -- Enemy type info (fixed size: 7)
+    -- Decoded Enemy Type/State Info (Size 7 each)
     for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_type_info[i] or 0)
-    end
-    
-    -- Active enemy info (fixed size: 7)
-    for i = 1, 7 do
-        table.insert(data, enemies_state.active_enemy_info[i] or 0)
+        table.insert(data, enemies_state.enemy_core_type[i] or 0)
+        table.insert(data, enemies_state.enemy_direction_moving[i] or 0)
+        table.insert(data, enemies_state.enemy_between_segments[i] or 0)
+        table.insert(data, enemies_state.enemy_moving_away[i] or 0)
+        table.insert(data, enemies_state.enemy_can_shoot[i] or 0)
+        table.insert(data, enemies_state.enemy_split_behavior[i] or 0)
     end
     
     -- Enemy segments (fixed size: 7)
@@ -1659,6 +1714,21 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
     print("  Enemy LSBs    : " .. table.concat(enemy_lsbs, " "))
     print("  Shot LSBs     : " .. table.concat(enemy_shot_lsbs, " "))
+    
+    -- NEW: Display decoded enemy info tables
+    local enemy_core_types_str = table.concat(enemies_state.enemy_core_type, " ")
+    local enemy_dir_mov_str = table.concat(enemies_state.enemy_direction_moving, " ")
+    local enemy_between_str = table.concat(enemies_state.enemy_between_segments, " ")
+    local enemy_mov_away_str = table.concat(enemies_state.enemy_moving_away, " ")
+    local enemy_can_shoot_str = table.concat(enemies_state.enemy_can_shoot, " ")
+    local enemy_split_str = table.concat(enemies_state.enemy_split_behavior, " ")
+    
+    print("  Enemy Core Type: " .. enemy_core_types_str)
+    print("  Enemy Dir Mov  : " .. enemy_dir_mov_str)
+    print("  Enemy Between  : " .. enemy_between_str)
+    print("  Enemy Mov Away : " .. enemy_mov_away_str)
+    print("  Enemy Can Shoot: " .. enemy_can_shoot_str)
+    print("  Enemy Split Bhv: " .. enemy_split_str)
     
     -- Add enemy shot positions in a simple fixed format
     local shot_positions_str = ""

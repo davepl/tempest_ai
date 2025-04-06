@@ -29,7 +29,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 256
+    params_count: int = 284
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.995
