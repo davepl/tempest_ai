@@ -46,7 +46,7 @@ def stats_reporter(agent, kb_handler):
             traceback.print_exc()
             break
 
-def keyboard_input_handler(keyboard_handler):
+def keyboard_input_handler(agent, keyboard_handler):
     """Thread function to handle keyboard input"""
     print("Starting keyboard input handler thread...")
     
@@ -66,11 +66,11 @@ def keyboard_input_handler(keyboard_handler):
                     agent.save(LATEST_MODEL_PATH)
                     print(f"Model saved to {LATEST_MODEL_PATH}")
                 elif key == 'o':
-                    print("Toggle override mode...")
-                    metrics.toggle_override()
+                    metrics.toggle_override(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
                 elif key == 'e':
-                    print("Toggle expert mode...")
-                    metrics.toggle_expert_mode()
+                    metrics.toggle_expert_mode(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)
         except Exception as e:
@@ -118,7 +118,8 @@ def main():
     keyboard_handler = None
     if IS_INTERACTIVE:
         keyboard_handler = KeyboardHandler()
-        keyboard_thread = threading.Thread(target=keyboard_input_handler, args=(keyboard_handler,))
+        keyboard_handler.setup_terminal()
+        keyboard_thread = threading.Thread(target=keyboard_input_handler, args=(agent, keyboard_handler))
         keyboard_thread.daemon = True
         keyboard_thread.start()
     

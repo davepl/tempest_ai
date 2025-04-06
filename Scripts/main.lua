@@ -227,7 +227,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
     else
         if previous_alive_state == 1 then
-            reward = reward - 500
+            reward = reward - 5000
             bDone = true
         end
     end

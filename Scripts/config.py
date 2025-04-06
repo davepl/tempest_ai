@@ -197,8 +197,10 @@ class MetricsData:
                 self.expert_ratio = 0.0
             else:
                 self.expert_ratio = self.saved_expert_ratio
-            if kb_handler:
-                print_with_terminal_restore(kb_handler, f"\nOverride mode: {'ON' if self.override_expert else 'OFF'}")
+            if kb_handler and IS_INTERACTIVE:
+                # Import here to avoid circular import at top level
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nOverride mode: {'ON' if self.override_expert else 'OFF'}\r")
     
     def toggle_expert_mode(self, kb_handler=None):
         """Toggle expert mode"""
@@ -211,8 +213,10 @@ class MetricsData:
             else:
                 # Restore the saved expert ratio when expert mode is OFF
                 self.expert_ratio = self.saved_expert_ratio
-            if kb_handler:
-                print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}")
+            if kb_handler and IS_INTERACTIVE:
+                # Import here to avoid circular import at top level
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}\r")
 
 # Define action space
 ACTION_MAPPING = {
@@ -237,11 +241,11 @@ ACTION_MAPPING = {
 metrics = MetricsData()
 
 # Import print_with_terminal_restore from metrics_display to avoid circular imports
-def print_with_terminal_restore(kb_handler, *args, **kwargs):
-    """Print with terminal restore if in interactive mode"""
-    if IS_INTERACTIVE and kb_handler:
-        # Import here to avoid circular imports
-        from metrics_display import print_with_terminal_restore as _print
-        _print(*args, **kwargs)
-    else:
-        print(*args, **kwargs) 
+# # DEF print_with_terminal_restore(kb_handler, *args, **kwargs):
+# #     \"\"\"Print with terminal restore if in interactive mode\"\"\"
+# #     if IS_INTERACTIVE and kb_handler:
+# #         # Import here to avoid circular imports
+# #         from metrics_display import print_with_terminal_restore as _print
+# #         _print(*args, **kwargs)
+# #     else:
+# #         print(*args, **kwargs) 

@@ -324,33 +324,63 @@ class DQNAgent:
 class KeyboardHandler:
     """Non-blocking keyboard input handler"""
     def __init__(self):
+        if not IS_INTERACTIVE:
+            self.fd = None
+            self.old_settings = None
+            return
         self.fd = sys.stdin.fileno()
         self.old_settings = termios.tcgetattr(self.fd)
-        
+
+    def setup_terminal(self):
+        """Set the terminal to raw and non-blocking mode."""
+        if not IS_INTERACTIVE:
+            return
+        try:
+            tty.setraw(self.fd)
+            # Set stdin non-blocking
+            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        except termios.error as e:
+            print(f"Warning: Could not set terminal to raw mode: {e}")
+            # Proceed without raw mode if it fails
+
     def __enter__(self):
-        tty.setraw(sys.stdin.fileno())
-        # Set stdin non-blocking
-        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        # This method is kept for potential future use as context manager
+        # but setup_terminal should be called explicitly for current usage
+        self.setup_terminal()
         return self
         
     def __exit__(self, *args):
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+        # This method is kept for potential future use as context manager
+        self.restore_terminal()
         
     def check_key(self):
         """Check for keyboard input non-blockingly"""
+        if not IS_INTERACTIVE or self.fd is None:
+            return None
         try:
             return sys.stdin.read(1)
         except (IOError, TypeError):
             return None
             
     def restore_terminal(self):
-        """Temporarily restore terminal settings for printing"""
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+        """Restore original terminal settings."""
+        if not IS_INTERACTIVE or self.fd is None or self.old_settings is None:
+            return
+        try:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+        except termios.error as e:
+            print(f"Warning: Could not restore terminal settings: {e}")
         
     def set_raw_mode(self):
-        """Set terminal back to raw mode"""
-        tty.setraw(sys.stdin.fileno())
+        """Set terminal back to raw mode (redundant if setup_terminal is used)"""
+        # This might be redundant now, consider removing if not used elsewhere
+        if not IS_INTERACTIVE or self.fd is None:
+            return
+        try:
+            tty.setraw(self.fd)
+        except termios.error as e:
+            print(f"Warning: Could not set terminal to raw mode: {e}")
 
 def print_with_terminal_restore(kb_handler, *args, **kwargs):
     """Print with proper terminal settings"""
