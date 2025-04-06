@@ -159,75 +159,100 @@ local shutdown_requested = false
 local last_display_update = 0  -- Timestamp of last display update
 
 -- Function to calculate reward for the current frame
---
--- Return reward and bDone, where bDone is true if the episode is done
-
 local function calculate_reward(game_state, level_state, player_state, enemies_state)
-    
     local reward = 0
-    local bDone = false             -- Track if the episode (life) is done
+    local bDone = false
 
-    -- Survival reward
+    -- Base survival reward - make staying alive more valuable
     if player_state.alive == 1 then
+        reward = reward + 10  -- Constant reward for being alive each frame
 
-        -- reward = reward + 1
-
-        -- Reward for having as many shots as possible active with at least one in reserve
-        if (player_state.shot_count < 8) then
-            reward = reward + player_state.shot_count / 2
+        -- Stronger reward for maintaining lives
+        if player_state.player_lives ~= nil then
+            reward = reward + (player_state.player_lives * 50)  -- Higher value per life
         end
 
-        if (player_state.player_lives ~= nil) then
-            reward = reward + player_state.player_lives
-        end
-
-        -- Score reward
+        -- Score-based reward (keep this as a strong motivator)
         local score_delta = player_state.score - previous_score
         if score_delta > 0 then
-            reward = reward + score_delta
+            reward = reward + (score_delta * 2)  -- Amplify score impact
         end
 
-        -- Level completion reward
+        -- Level completion bonus
         if level_state.level_number ~= previous_level then
-            reward = reward + (10 * previous_level)
+            reward = reward + (50 * previous_level)  -- Increased bonus for progression
         end
 
-        -- Reward calculation calling direction_to_nearest_enemy
-
-        target_segment = enemies_state:nearest_enemy_segment()
-        player_segment = player_state.position & 0x0F
+        -- Enemy targeting logic
+        local target_segment = enemies_state:nearest_enemy_segment()
+        local player_segment = player_state.position & 0x0F
 
         if target_segment < 0 or game_state.gamestate == 0x20 then
-            reward = reward + (player_state.SpinnerDelta == 0 and 20 or -math.abs(player_state.SpinnerDelta))
+            -- No enemies: reward staying still more strongly
+            reward = reward + (player_state.SpinnerDelta == 0 and 50 or -20)
         else
             local direction = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-            local distance = math.abs(direction)
+            local distance  = math.abs(direction)
 
             if distance == 0 then
-                -- Much higher reward for perfect alignment and staying still
-                reward = reward + (player_state.SpinnerDelta == 0 and 100 or -10)
-            else
-                -- Base reward for being close to target
-                reward = reward + math.max(0, 10 - distance)
+
+                -- Massive reward for alignment + firing incentive
+                reward = reward + 200
+                -- Bonus for shooting when aligned
+                if player_state.shot_count > 0 then
+                    reward = reward + 100
+                end
+                -- Small penalty for unnecessary movement when aligned
+                if player_state.SpinnerDelta ~= 0 then
+                    reward = reward - 50
+                end
+
+            else 
                 
-                -- Movement rewards/penalties
+                -- Enemies at the top of tube should be shot when beside the player
+
+                if (distance < 2) then
+                    local depth = enemies_state:depth_of_top_enemy(enemies_state, player_state)
+                    if (depth <= 0x20) then
+                        if player_state.fire_commanded == 1 then
+                            -- Strong reward for firing at close enemies
+                            reward = reward + 250
+                        else
+                            -- Moderate penalty for not firing at close enemies
+                            reward = reward - 50
+                        end
+                    end
+                end
+
+                -- Graduated reward for proximity
+                reward = reward + (20 - distance * 2)  -- Closer = better
+                
+                -- Movement incentives
                 if direction * player_state.SpinnerDelta > 0 then
-                    -- Only reward moving in correct direction, no bonus for speed
-                    reward = reward + 25
+                    -- Strong reward for correct movement
+                    reward = reward + 50
                 elseif player_state.SpinnerDelta ~= 0 then
-                    -- Bigger penalty for wrong movement
-                    reward = reward - 25
+                    -- Strong penalty for wrong movement
+                    reward = reward - 50
                 else
-                    -- Small penalty for not moving when not aligned
-                    reward = reward - 10
+                    -- Moderate penalty for inaction when misaligned
+                    reward = reward - 25
+                end
+                
+                -- Encourage maintaining shots in reserve
+                if player_state.shot_count < 2 or player_state.shot_count > 7 then
+                    reward = reward - 20  -- Penalty for not having shots ready
+                elseif player_state.shot_count >= 4 then
+                    reward = reward + 20  -- Bonus for good ammo management
                 end
             end
-
         end
 
     else
+        -- Massive penalty for death to prioritize survival, equal to the cost of a bonus life in points
+
         if previous_alive_state == 1 then
-            reward = reward - 5000
+            reward = reward - 20000
             bDone = true
         end
     end
@@ -788,6 +813,51 @@ end
 
 -- Find the segment with the enemy closest to the top of the tube
 function EnemiesState:nearest_enemy_segment()
+    local min_depth = 255
+    local closest_segment = -1
+    
+    -- Check standard enemy table (7 slots)
+    for i = 1, 7 do
+        local depth = self.enemy_depths[i]
+        local segment = self.enemy_segments[i] & 0x0F  -- Mask to ensure 0-15
+        if depth > 0 and segment >= 0 and segment <= 15 then
+            if depth < min_depth then
+                min_depth = depth
+                closest_segment = segment
+            end
+        end
+    end
+    
+    -- Check pending enemies (64 slots at 0x0203)
+    for i = 1, 64 do
+        local pending_seg = self.pending_seg[i] & 0x0F
+        local pending_vid = self.pending_vid[i]  -- Could use as a proxy for depth/activity
+        if pending_seg > 0 and pending_vid > 0 then  -- Active pending enemy
+            -- Assume pending enemies closer to top have lower vid or use a heuristic
+            local assumed_depth = pending_vid  -- Adjust based on actual depth mapping
+            if assumed_depth < min_depth then
+                min_depth = assumed_depth
+                closest_segment = pending_seg
+            end
+        end
+    end
+    
+    -- Check enemy shots (4 slots at 0x02B5)
+    for i = 1, 4 do
+        local shot_seg = self.enemy_shot_segments[i].value & 0x0F
+        local shot_depth = self.shot_positions[i]
+        if shot_seg > 0 and shot_depth > 0 then
+            if shot_depth < min_depth then
+                min_depth = shot_depth
+                closest_segment = shot_seg
+            end
+        end
+    end
+    
+    return closest_segment
+end
+
+function EnemiesState:depth_of_top_enemy()
     local min_depth = 255  -- Initialize with maximum possible depth
     local closest_segment = -1  -- Initialize with invalid segment
     
@@ -801,10 +871,10 @@ function EnemiesState:nearest_enemy_segment()
                 closest_segment = self.enemy_segments[i]
             end
         end
-    end
-    
-    return closest_segment  -- Returns the segment number or -1 if no enemies found
+    end  -- Returns the segment number or -1 if no enemies found
+    return min_depth
 end
+
 
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
     local enemy_seg = enemies_state:nearest_enemy_segment()
