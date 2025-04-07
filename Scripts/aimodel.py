@@ -180,11 +180,12 @@ class DQN(nn.Module):
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
-    def __init__(self, state_size, action_size, learning_rate=1e-4, gamma=0.99, 
-                 epsilon=1.0, epsilon_min=0.01, epsilon_decay=10000, 
-                 memory_size=500000, batch_size=512):
+    def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma, 
+                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, epsilon_decay=RL_CONFIG.epsilon_decay, 
+                 memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
         self.state_size = state_size
         self.action_size = action_size
+        self.last_save_time = 0.0 # Initialize last save time
         
         # Q-Networks (online and target)
         self.qnetwork_local = DQN(state_size, action_size).to(device)
@@ -283,20 +284,38 @@ class DQNAgent:
             self.train_queue.put(True)
             
     def save(self, filename):
-        """Save model weights"""
-        torch.save({
-            'policy_state_dict': self.qnetwork_local.state_dict(),
-            'target_state_dict': self.qnetwork_target.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'memory_size': len(self.memory),
-            'epsilon': metrics.epsilon,
-            'frame_count': metrics.frame_count,
-            'expert_ratio': metrics.expert_ratio
-        }, filename)
+        """Save model weights, rate-limited unless forced."""
+        is_forced_save = "exit" in filename or "shutdown" in filename
+        current_time = time.time()
+        save_interval = 30.0 # Minimum seconds between saves
         
-        # Only print on exit save (modified externally)
-        if "exit" in filename or "shutdown" in filename:
-            print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
+        # Rate limit non-forced saves
+        if not is_forced_save:
+            if current_time - self.last_save_time < save_interval:
+                # Optional: Add a debug print if needed
+                # print(f"Skipping save to {filename}, too soon since last save.")
+                return # Skip save
+        
+        # Proceed with save if forced or interval elapsed
+        try:
+            torch.save({
+                'policy_state_dict': self.qnetwork_local.state_dict(),
+                'target_state_dict': self.qnetwork_target.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'memory_size': len(self.memory),
+                'epsilon': metrics.epsilon,
+                'frame_count': metrics.frame_count,
+                'expert_ratio': metrics.expert_ratio
+            }, filename)
+            
+            # Update last save time ONLY on successful save
+            self.last_save_time = current_time
+            
+            # Only print on forced exit/shutdown saves
+            if is_forced_save:
+                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
+        except Exception as e:
+            print(f"ERROR saving model to {filename}: {e}")
 
     def load(self, filename):
         """Load model weights"""
