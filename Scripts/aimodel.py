@@ -341,72 +341,109 @@ class DQNAgent:
         return False
 
 class KeyboardHandler:
-    """Non-blocking keyboard input handler"""
+    """Cross-platform non-blocking keyboard input handler."""
     def __init__(self):
+        self.platform = sys.platform
+        self.msvcrt = None
+        self.fd = None
+        self.old_settings = None
+
         if not IS_INTERACTIVE:
-            self.fd = None
-            self.old_settings = None
-            return
-        self.fd = sys.stdin.fileno()
-        self.old_settings = termios.tcgetattr(self.fd)
+            return # Don't initialize if not interactive
+
+        if self.platform == 'win32':
+            try:
+                import msvcrt
+                self.msvcrt = msvcrt
+                print("KeyboardHandler: Using msvcrt for Windows.")
+            except ImportError:
+                print("Warning: msvcrt module not found on Windows. Keyboard input disabled.")
+        elif self.platform in ('linux', 'darwin'):
+            try:
+                self.fd = sys.stdin.fileno()
+                self.old_settings = termios.tcgetattr(self.fd)
+                print(f"KeyboardHandler: Using termios/tty for {self.platform}.")
+            except termios.error as e:
+                print(f"Warning: Failed to get terminal attributes: {e}. Keyboard input might be impaired.")
+                self.fd = None # Ensure fd is None if setup failed
+                self.old_settings = None
+        else:
+            print(f"Warning: Unsupported platform '{self.platform}' for KeyboardHandler. Keyboard input disabled.")
 
     def setup_terminal(self):
-        """Set the terminal to raw and non-blocking mode."""
-        if not IS_INTERACTIVE:
-            return
-        try:
-            tty.setraw(self.fd)
-            # Set stdin non-blocking
-            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        except termios.error as e:
-            print(f"Warning: Could not set terminal to raw mode: {e}")
-            # Proceed without raw mode if it fails
+        """Set the terminal to raw/non-blocking (Unix-only)."""
+        if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
+            try:
+                tty.setraw(self.fd)
+                flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+                fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            except termios.error as e:
+                print(f"Warning: Could not set terminal to raw/non-blocking mode: {e}")
+        # No setup needed for Windows msvcrt
 
     def __enter__(self):
-        # This method is kept for potential future use as context manager
-        # but setup_terminal should be called explicitly for current usage
         self.setup_terminal()
         return self
         
     def __exit__(self, *args):
-        # This method is kept for potential future use as context manager
         self.restore_terminal()
         
     def check_key(self):
-        """Check for keyboard input non-blockingly"""
-        if not IS_INTERACTIVE or self.fd is None:
+        """Check for keyboard input non-blockingly (cross-platform)."""
+        if not IS_INTERACTIVE:
             return None
+            
         try:
-            return sys.stdin.read(1)
+            if self.platform == 'win32' and self.msvcrt:
+                if self.msvcrt.kbhit():
+                    # Read the byte and decode assuming simple ASCII/UTF-8 key
+                    key_byte = self.msvcrt.getch()
+                    try:
+                        return key_byte.decode('utf-8')
+                    except UnicodeDecodeError:
+                        return None # Or handle special keys differently
+                else:
+                    return None # No key waiting on Windows
+            elif self.platform in ('linux', 'darwin') and self.fd is not None:
+                # Existing Unix non-blocking read (assumes raw mode set)
+                return sys.stdin.read(1)
+            else:
+                # Unsupported platform or setup failed
+                return None
         except (IOError, TypeError):
+            # Catch potential errors during read
             return None
             
     def restore_terminal(self):
-        """Restore original terminal settings."""
-        if not IS_INTERACTIVE or self.fd is None or self.old_settings is None:
-            return
-        try:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
-        except termios.error as e:
-            print(f"Warning: Could not restore terminal settings: {e}")
+        """Restore original terminal settings (Unix-only)."""
+        if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+            except termios.error as e:
+                print(f"Warning: Could not restore terminal settings: {e}")
+        # No restore needed for Windows msvcrt
         
     def set_raw_mode(self):
-        """Set terminal back to raw mode (redundant if setup_terminal is used)"""
-        # This might be redundant now, consider removing if not used elsewhere
-        if not IS_INTERACTIVE or self.fd is None:
-            return
-        try:
-            tty.setraw(self.fd)
-        except termios.error as e:
-            print(f"Warning: Could not set terminal to raw mode: {e}")
+        """Set terminal back to raw mode (Unix-only)."""
+        if self.platform in ('linux', 'darwin') and self.fd is not None:
+            try:
+                tty.setraw(self.fd)
+            except termios.error as e:
+                print(f"Warning: Could not set terminal to raw mode: {e}")
+        # No equivalent needed for Windows msvcrt
 
 def print_with_terminal_restore(kb_handler, *args, **kwargs):
-    """Print with proper terminal settings"""
-    if IS_INTERACTIVE and kb_handler:
+    """Print with proper terminal settings (cross-platform safe)."""
+    # Only attempt restore/set_raw if on Unix and handler is valid
+    is_unix_like = kb_handler and kb_handler.platform in ('linux', 'darwin')
+    
+    if IS_INTERACTIVE and is_unix_like:
         kb_handler.restore_terminal()
+        
+    # Standard print call - works on all platforms
     print(*args, **kwargs, flush=True)
-    if IS_INTERACTIVE and kb_handler:
+    
+    if IS_INTERACTIVE and is_unix_like:
         kb_handler.set_raw_mode()
 
 def setup_environment():
