@@ -103,7 +103,7 @@ local function open_socket()
         -- Close existing socket if any
         if socket then
             socket:close()
-            socket = nil
+            socket = nil 
         end
         
         -- Create a new socket connection
