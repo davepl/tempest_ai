@@ -60,9 +60,6 @@ from datetime import datetime
 from stable_baselines3 import DQN
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure
-import termios
-import tty
-import fcntl
 import socket
 import traceback
 
@@ -353,13 +350,19 @@ class KeyboardHandler:
 
         if self.platform == 'win32':
             try:
-                import msvcrt
+                import msvcrt # Import here for Windows
                 self.msvcrt = msvcrt
                 print("KeyboardHandler: Using msvcrt for Windows.")
             except ImportError:
                 print("Warning: msvcrt module not found on Windows. Keyboard input disabled.")
         elif self.platform in ('linux', 'darwin'):
             try:
+                # Import termios, tty, fcntl only on Unix-like systems
+                import termios
+                import tty
+                import fcntl
+                global termios, tty, fcntl # Make them available to methods
+
                 self.fd = sys.stdin.fileno()
                 self.old_settings = termios.tcgetattr(self.fd)
                 print(f"KeyboardHandler: Using termios/tty for {self.platform}.")
@@ -367,6 +370,10 @@ class KeyboardHandler:
                 print(f"Warning: Failed to get terminal attributes: {e}. Keyboard input might be impaired.")
                 self.fd = None # Ensure fd is None if setup failed
                 self.old_settings = None
+            except ImportError:
+                 print("Warning: termios, tty, or fcntl module not found. Keyboard input disabled on Unix-like system.")
+                 self.fd = None
+                 self.old_settings = None
         else:
             print(f"Warning: Unsupported platform '{self.platform}' for KeyboardHandler. Keyboard input disabled.")
 
@@ -374,11 +381,17 @@ class KeyboardHandler:
         """Set the terminal to raw/non-blocking (Unix-only)."""
         if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
             try:
-                tty.setraw(self.fd)
-                flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-                fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                # Ensure termios, tty, fcntl are available
+                if 'termios' in globals() and 'tty' in globals() and 'fcntl' in globals():
+                    tty.setraw(self.fd)
+                    flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+                    fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                else:
+                    print("Warning: Unix terminal modules not imported, cannot set raw mode.")
             except termios.error as e:
                 print(f"Warning: Could not set terminal to raw/non-blocking mode: {e}")
+            except NameError: # Catch if modules weren't imported
+                 print("Warning: Unix terminal modules not available, cannot set raw mode.")
         # No setup needed for Windows msvcrt
 
     def __enter__(self):
@@ -392,7 +405,7 @@ class KeyboardHandler:
         """Check for keyboard input non-blockingly (cross-platform)."""
         if not IS_INTERACTIVE:
             return None
-            
+
         try:
             if self.platform == 'win32' and self.msvcrt:
                 if self.msvcrt.kbhit():
@@ -405,31 +418,64 @@ class KeyboardHandler:
                 else:
                     return None # No key waiting on Windows
             elif self.platform in ('linux', 'darwin') and self.fd is not None:
-                # Existing Unix non-blocking read (assumes raw mode set)
-                return sys.stdin.read(1)
+                 # Ensure tty is available
+                 if 'tty' in globals():
+                     # Existing Unix non-blocking read (assumes raw mode set)
+                     # Need to handle potential blocking if not fully raw/non-blocking
+                     # This simple read might block if not set up correctly
+                     # A more robust way might involve select.select
+                     try:
+                         # Peek with select to see if data is available
+                         import select
+                         if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+                             return sys.stdin.read(1)
+                         else:
+                             return None # No data available
+                     except ImportError:
+                         # Fallback if select isn't available (highly unlikely)
+                         return sys.stdin.read(1) # Original potentially blocking call
+                     except Exception as e: # Catch other potential read errors
+                        # print(f"Debug: Unix key read error: {e}") # Optional debug
+                        return None
+                 else:
+                     print("Warning: Unix tty module not available for key check.")
+                     return None
             else:
                 # Unsupported platform or setup failed
                 return None
-        except (IOError, TypeError):
+        except (IOError, TypeError) as e:
             # Catch potential errors during read
+            # print(f"Debug: General key check error: {e}") # Optional debug
             return None
-            
+
     def restore_terminal(self):
         """Restore original terminal settings (Unix-only)."""
         if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
             try:
-                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+                # Ensure termios is available
+                if 'termios' in globals():
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+                else:
+                     print("Warning: Unix termios module not available for restore.")
             except termios.error as e:
                 print(f"Warning: Could not restore terminal settings: {e}")
+            except NameError: # Catch if modules weren't imported
+                 print("Warning: Unix termios module not available for restore.")
         # No restore needed for Windows msvcrt
-        
+
     def set_raw_mode(self):
         """Set terminal back to raw mode (Unix-only)."""
         if self.platform in ('linux', 'darwin') and self.fd is not None:
             try:
-                tty.setraw(self.fd)
-            except termios.error as e:
+                 # Ensure tty is available
+                 if 'tty' in globals():
+                     tty.setraw(self.fd)
+                 else:
+                      print("Warning: Unix tty module not available for set_raw_mode.")
+            except termios.error as e: # termios might still raise error here
                 print(f"Warning: Could not set terminal to raw mode: {e}")
+            except NameError: # Catch if modules weren't imported
+                 print("Warning: Unix tty module not available for set_raw_mode.")
         # No equivalent needed for Windows msvcrt
 
 def print_with_terminal_restore(kb_handler, *args, **kwargs):

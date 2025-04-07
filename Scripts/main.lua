@@ -108,7 +108,7 @@ local function open_socket()
         
         -- Create a new socket connection
         socket = emu.file("rw")  -- "rw" mode for read/write
-        local result = socket:open("socket.192.168.1.248:9999")
+        local result = socket:open("socket.192.168.1.164:9999")
         
         if result == nil then
             print("Successfully opened socket connection to localhost:9999")

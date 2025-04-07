@@ -12,9 +12,6 @@ import os
 import sys
 import time
 import threading
-import termios
-import tty
-import fcntl
 import numpy as np
 from typing import Optional, List, Dict, Any
 
