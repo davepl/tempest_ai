@@ -163,7 +163,14 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     local reward = 0
     local bDone = false
 
+    -- We want as many shots active as possible, but only up to 7, so that we have one in reserve for close enemies
+    
+    if (player_state.shot_count < 8) then
+        reward = reward + player_state.shot_count
+    end
+
     -- Base survival reward - make staying alive more valuable
+    
     if player_state.alive == 1 then
         reward = reward + 10  -- Constant reward for being alive each frame
 

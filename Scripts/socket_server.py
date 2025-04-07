@@ -306,7 +306,7 @@ class SocketServer:
                                 state['episode_dqn_reward'],
                                 state['episode_expert_reward']
                             )
-                        
+
                         state['was_done'] = True
                         client_socket.sendall(struct.pack("bbb", 0, 0, 0))
                         state['last_state'] = None
