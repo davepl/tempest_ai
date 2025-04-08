@@ -32,6 +32,9 @@
 package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
+-- Define constants
+local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
+
 local LOG_ONLY_MODE           = false
 local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
 local SHOW_DISPLAY            = true
@@ -651,17 +654,24 @@ function PlayerState:update(mem)
 
     -- Read all 8 shot positions and segments
     local is_open = mem:read_u8(0x0111) == 0xFF
+    local player_abs_segment = self.position & 0x0F
     for i = 1, 8 do
         -- Read depth (position along the tube)
         self.shot_positions[i] = mem:read_u8(0x02D3 + i - 1)  -- PlayerShotPositions
-        
-        -- Read segment and store absolute position
-        local abs_segment = mem:read_u8(0x02AD + i - 1)       -- PlayerShotSegments
-        if self.shot_positions[i] == 0 or abs_segment == 0 then
-            self.shot_segments[i] = 0  -- Shot not active
+
+        -- If shot position is 0, the shot is inactive, regardless of segment memory
+        if self.shot_positions[i] == 0 then
+            self.shot_segments[i] = INVALID_SEGMENT
         else
-            abs_segment = abs_segment & 0x0F  -- Mask to get valid segment
-            self.shot_segments[i] = abs_segment
+            -- Position is non-zero, now check the segment memory
+            local abs_segment = mem:read_u8(0x02AD + i - 1)
+            if abs_segment == 0 then -- Also treat segment 0 as inactive/invalid
+                 self.shot_segments[i] = INVALID_SEGMENT
+            else
+                 -- Valid position and valid segment read, calculate relative segment
+                 abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
+                 self.shot_segments[i] = absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
+            end
         end
     end
 
@@ -707,7 +717,7 @@ function EnemiesState:new()
     self.num_enemies_in_tube = 0
     self.num_enemies_on_top = 0
     self.enemies_pending = 0
-    self.nearest_enemy_seg = -1  -- Track the segment of the nearest enemy
+    self.nearest_enemy_seg = INVALID_SEGMENT  -- Initialize relative nearest enemy segment with sentinel
     
     -- Enemy info arrays (Original)
     self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- Raw type byte from $0169 (or similar)
@@ -775,9 +785,18 @@ function EnemiesState:update(mem)
     self.num_enemies_on_top = mem:read_u8(0x0109)
     self.enemies_pending = mem:read_u8(0x03AB)
 
-    -- Update enemy shot segments from memory
+    -- Update enemy shot segments from memory (store relative distances)
+    local player_abs_segment = mem:read_u8(0x0200) & 0x0F -- Get current player absolute segment
+    local is_open = mem:read_u8(0x0111) == 0xFF
+
     for i = 1, 4 do
-        self.enemy_shot_segments[i].value = mem:read_u8(self.enemy_shot_segments[i].address)
+        local abs_segment = mem:read_u8(self.enemy_shot_segments[i].address)
+        if abs_segment == 0 then
+            self.enemy_shot_segments[i].value = INVALID_SEGMENT  -- Not active, use sentinel
+        else
+            local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
+            self.enemy_shot_segments[i].value = absolute_to_relative_segment(player_abs_segment, segment, is_open)
+        end
     end
 
     -- Get player position and level type for relative calculations
@@ -793,12 +812,17 @@ function EnemiesState:update(mem)
 
     local activeEnemies = self.num_enemies_in_tube + self.num_enemies_on_top
     
-    -- Read standard enemy segments and depths first
+    -- Read standard enemy segments and depths first, store relative segments
     for i = 1, 7 do
-        self.enemy_segments[i] = mem:read_u8(0x02B9 + i - 1)
+        local abs_segment = mem:read_u8(0x02B9 + i - 1)
         self.enemy_depths[i] = mem:read_u8(0x02DF + i - 1)
-        if (self.enemy_depths[i] == 0) then
-            self.enemy_segments[i] = 0
+
+        if (self.enemy_depths[i] == 0 or abs_segment == 0) then
+            self.enemy_segments[i] = INVALID_SEGMENT  -- Not active, use sentinel
+        else
+            local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
+            -- Store relative segment distance
+            self.enemy_segments[i] = absolute_to_relative_segment(player_abs_segment, segment, is_open)
         end
     end
 
@@ -846,9 +870,16 @@ function EnemiesState:update(mem)
         self.shot_positions[i] = raw_pos  -- Store full raw position value
     end
 
-    -- Read pending_seg (64 bytes starting at 0x0203)
+    -- Read pending_seg (64 bytes starting at 0x0203), store relative
     for i = 1, 64 do
-        self.pending_seg[i] = mem:read_u8(0x0203 + i - 1)
+        local abs_segment = mem:read_u8(0x0203 + i - 1)
+        if abs_segment == 0 then
+            self.pending_seg[i] = INVALID_SEGMENT  -- Not active, use sentinel
+        else
+            local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
+            -- Store relative segment distance
+            self.pending_seg[i] = absolute_to_relative_segment(player_abs_segment, segment, is_open)
+        end
     end
 
     -- Read pending_vid (64 bytes starting at 0x0243)
@@ -859,78 +890,77 @@ function EnemiesState:update(mem)
     -- Scan the display list region for additional enemy data
     self.display_list = {}
     for i = 0, 31 do  -- Just scan part of it for efficiency
+        local command = mem:read_u8(0x0300 + i * 4)
+        local abs_segment = mem:read_u8(0x0301 + i * 4) & 0x0F
+        local depth = mem:read_u8(0x0302 + i * 4)
+        local type_val = mem:read_u8(0x0303 + i * 4)
+
+        -- Calculate relative segment if command is active
+        local rel_segment = INVALID_SEGMENT
+        if command ~= 0 and depth ~= 0 and abs_segment >= 0 and abs_segment <= 15 then
+            rel_segment = absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
+        end
+
         self.display_list[i] = {
-            command = mem:read_u8(0x0300 + i * 4),
-            segment = mem:read_u8(0x0301 + i * 4) & 0x0F,
-            depth = mem:read_u8(0x0302 + i * 4),
-            type = mem:read_u8(0x0303 + i * 4)
+            command = command,
+            segment = rel_segment, -- Store relative segment
+            depth = depth,
+            type = type_val
         }
     end
-    
-    -- Update nearest enemy segment
-    self.nearest_enemy_seg = self:nearest_enemy_segment()
+
+    -- Calculate and store the relative nearest enemy segment for internal use
+    local nearest_abs_seg, _ = self:nearest_enemy_segment() -- Call the function that finds absolute
+    if nearest_abs_seg == -1 then
+        self.nearest_enemy_seg = INVALID_SEGMENT
+    else
+        self.nearest_enemy_seg = absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, is_open)
+    end
 end
 
--- Find the segment and depth of the enemy closest to the top of the tube
+-- Find the *absolute* segment and depth of the enemy closest to the top of the tube
+-- This is used primarily for OOB data packing and targeting decisions that need absolute values.
 function EnemiesState:nearest_enemy_segment()
     local min_depth = 255
-    local closest_segment = -1
-    
+    local closest_absolute_segment = -1 -- Use -1 as sentinel for *absolute* segment not found
+
     -- Check standard enemy table (7 slots)
     for i = 1, 7 do
-        local depth = self.enemy_depths[i]
-        local segment = self.enemy_segments[i] & 0x0F  -- Mask to ensure 0-15
-        -- Only consider active enemies with valid segments
-        if depth > 0 and segment >= 0 and segment <= 15 then
+        -- Read the absolute segment and depth directly from memory for this calculation
+        local abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F -- Mask to 0-15
+        local depth = mem:read_u8(0x02DF + i - 1)
+
+        -- Only consider active enemies with valid segments (0-15)
+        if depth > 0 and abs_segment >= 0 and abs_segment <= 15 then
             if depth < min_depth then
                 min_depth = depth
-                closest_segment = segment
+                closest_absolute_segment = abs_segment
             end
         end
     end
-    
-    -- -- Check pending enemies (64 slots at 0x0203) -- Removed for reliability
-    -- for i = 1, 64 do
-    --     local pending_seg = self.pending_seg[i] & 0x0F
-    --     local pending_vid = self.pending_vid[i]  -- Could use as a proxy for depth/activity
-    --     if pending_seg > 0 and pending_vid > 0 then  -- Active pending enemy
-    --         -- Assume pending enemies closer to top have lower vid or use a heuristic
-    --         local assumed_depth = pending_vid  -- Adjust based on actual depth mapping
-    --         if assumed_depth < min_depth then
-    --             min_depth = assumed_depth
-    --             closest_segment = pending_seg
-    --         end
-    --     end
-    -- end
-    
-    -- -- Check enemy shots (4 slots at 0x02B5) -- Removed as shots shouldn't be primary targets
-    -- for i = 1, 4 do
-    --     local shot_seg = self.enemy_shot_segments[i].value & 0x0F
-    --     local shot_depth = self.shot_positions[i]
-    --     if shot_seg > 0 and shot_depth > 0 then
-    --         if shot_depth < min_depth then
-    --             min_depth = shot_depth
-    --             closest_segment = shot_seg
-    --         end
-    --     end
-    -- end
-    
-    return closest_segment, min_depth -- Return both segment and depth
+
+    -- Return the absolute segment (-1 if none found) and its depth
+    return closest_absolute_segment, min_depth
 end
 
 -- function EnemiesState:depth_of_top_enemy() -- This will be removed later
 
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-    -- Get segment AND depth of nearest enemy
-    local enemy_seg, enemy_depth = enemies_state:nearest_enemy_segment() 
-    local player_seg = player_state.position
+    -- Get the *absolute* segment AND depth of nearest enemy from the dedicated function
+    local enemy_abs_seg, enemy_depth = enemies_state:nearest_enemy_segment()
+    local player_abs_seg = player_state.position & 0x0F
+    local is_open = level_state.level_type == 0xFF
 
-    if enemy_seg < 0 then 
+    -- If no enemy was found (absolute segment is -1)
+    if enemy_abs_seg == -1 then
         return 0, 0, 255 -- No enemy, return spinner 0, distance 0, max depth
     end
-    
-    -- If already aligned, distance is 0
-    if enemy_seg == player_seg then
+
+    -- Calculate the relative segment distance using the helper function
+    local enemy_relative_dist = absolute_to_relative_segment(player_abs_seg, enemy_abs_seg, is_open)
+
+    -- If already aligned (relative distance is 0)
+    if enemy_relative_dist == 0 then
         return 0, 0, enemy_depth -- Aligned, return spinner 0, distance 0, current depth
     end
 
@@ -938,17 +968,22 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
     local spinner
     local actual_segment_distance
 
-    if level_state.level_type == 0xFF then -- Open Level
-        actual_segment_distance = math.abs(enemy_seg - player_seg)
-        intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
-        spinner = enemy_seg > player_seg and -intensity or intensity
-    else -- Closed Level
-        local clockwise = (enemy_seg - player_seg) % 16
-        local counter = (player_seg - enemy_seg) % 16
-        actual_segment_distance = math.min(clockwise, counter)
-        intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
-        -- Corrected: Command spinner OPPOSITE to shortest path direction (match assembly)
-        spinner = clockwise < counter and intensity or -intensity 
+    -- Calculate actual segment distance based on relative distance
+    actual_segment_distance = math.abs(enemy_relative_dist)
+
+    -- Set intensity based on distance
+    intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
+
+    -- Set spinner direction based on the sign of the relative distance
+    -- The absolute_to_relative_segment function handles open/closed logic correctly
+    if is_open then
+        -- Open Level: Positive relative distance means enemy is clockwise (higher segment index)
+        -- We want to move counter-clockwise (negative spinner) towards it.
+        spinner = enemy_relative_dist > 0 and -intensity or intensity
+    else
+        -- Closed Level: Positive relative distance means enemy is clockwise.
+        -- We want to move clockwise (positive spinner) towards it.
+        spinner = enemy_relative_dist > 0 and intensity or -intensity
     end
 
     return spinner, actual_segment_distance, enemy_depth -- Return spinner, distance, AND depth
@@ -1107,70 +1142,62 @@ end
 local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
     -- Create a consistent data structure with fixed sizes
     local data = {}
-    
+
     -- Game state (5 values, frame counter is now in OOB data)
     table.insert(data, game_state.gamestate)
     table.insert(data, game_state.game_mode)
     table.insert(data, game_state.countdown_timer)
     table.insert(data, game_state.p1_lives)
     table.insert(data, game_state.p1_level)
-    
-    -- Add nearest enemy segment and segment delta
-    local nearest_enemy_seg = enemies_state.nearest_enemy_seg
-    local player_segment = player_state.position & 0x0F
+
+    -- Get nearest enemy relative segment (or INVALID_SEGMENT) stored in state
+    local nearest_relative_seg = enemies_state.nearest_enemy_seg -- This is relative or INVALID_SEGMENT
     local segment_delta = 0
-    
-    -- Only calculate delta if we have a valid nearest enemy
-    if nearest_enemy_seg >= 0 then
-        -- Calculate clockwise distance to nearest enemy
-        if nearest_enemy_seg > player_segment then
-            segment_delta = nearest_enemy_seg - player_segment
-        else
-            segment_delta = nearest_enemy_seg + (16 - player_segment)
-        end
-        -- Convert to shortest path (clockwise or counterclockwise)
-        if segment_delta > 8 then
-            segment_delta = -(16 - segment_delta)
-        end
+
+    -- Use the relative segment directly as the delta if valid
+    if nearest_relative_seg ~= INVALID_SEGMENT then
+        segment_delta = nearest_relative_seg
     end
-    
-    table.insert(data, nearest_enemy_seg)  -- -1 if no enemy
-    table.insert(data, segment_delta)      -- Shortest path delta (-8 to +8)
-    
+
+    -- Insert relative segment and delta into main payload
+    -- Use INVALID_SEGMENT sentinel for nearest_relative_seg if no enemy
+    table.insert(data, nearest_relative_seg)
+    table.insert(data, segment_delta)      -- Relative distance (-7 to +8 or -15 to +15) or 0
+
     -- Player state (5 values + arrays, score is now in OOB data)
-    table.insert(data, player_state.position)
+    table.insert(data, player_state.position) -- Keep absolute player position here if needed, or mask if only segment used
     table.insert(data, player_state.alive)
-    table.insert(data, player_state.player_state)  -- Add player state to serialized data 
-    table.insert(data, player_state.player_depth)  -- Add player depth to serialized data
+    table.insert(data, player_state.player_state)
+    table.insert(data, player_state.player_depth)
     table.insert(data, player_state.superzapper_uses)
     table.insert(data, player_state.superzapper_active)
     table.insert(data, player_state.shot_count)
-    
-    -- Player shot positions (fixed size: 8)
+
+    -- Player shot positions (fixed size: 8) - Absolute depth
     for i = 1, 8 do
         table.insert(data, player_state.shot_positions[i] or 0)
     end
-    
-    -- Player shot segments (fixed size: 8)
+
+    -- Player shot segments (fixed size: 8) - Relative segments
     for i = 1, 8 do
-        table.insert(data, player_state.shot_segments[i] or 0)
+        table.insert(data, player_state.shot_segments[i] or INVALID_SEGMENT) -- Use sentinel
     end
-    
+
     -- Level state (3 values + arrays)
     table.insert(data, level_state.level_number)
     table.insert(data, level_state.level_type)
     table.insert(data, level_state.level_shape)
-    
-    -- Spike heights (fixed size: 16)
-    for i = 0, 15 do  
+
+    -- Spike heights (fixed size: 16) - Absolute heights indexed 0-15 (as per user's accepted diff)
+    for i = 0, 15 do
         table.insert(data, level_state.spike_heights[i] or 0)
     end
-    
-    -- Level angles (fixed size: 16)
+
+    -- Level angles (fixed size: 16) - Absolute angles
     for i = 0, 15 do
         table.insert(data, level_state.level_angles[i] or 0)
     end
-    
+
     -- Enemies state (counts: 10 values)
     table.insert(data, enemies_state.active_flippers)
     table.insert(data, enemies_state.active_pulsars)
@@ -1185,9 +1212,9 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     table.insert(data, enemies_state.num_enemies_in_tube)
     table.insert(data, enemies_state.num_enemies_on_top)
     table.insert(data, enemies_state.enemies_pending)
-    table.insert(data, enemies_state.pulsar_fliprate) -- NEW: Add pulsar fliprate
-    
-    -- Decoded Enemy Type/State Info (Size 7 each)
+    table.insert(data, enemies_state.pulsar_fliprate)
+
+    -- Decoded Enemy Type/State Info (Size 7 each) - Absolute info
     for i = 1, 7 do
         table.insert(data, enemies_state.enemy_core_type[i] or 0)
         table.insert(data, enemies_state.enemy_direction_moving[i] or 0)
@@ -1196,121 +1223,132 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         table.insert(data, enemies_state.enemy_can_shoot[i] or 0)
         table.insert(data, enemies_state.enemy_split_behavior[i] or 0)
     end
-    
-    -- Enemy segments (fixed size: 7)
+
+    -- Enemy segments (fixed size: 7) - Relative segments
     for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_segments[i] or 0)
+        table.insert(data, enemies_state.enemy_segments[i] or INVALID_SEGMENT) -- Use sentinel
     end
-    
-    -- Enemy depths (fixed size: 7 - 16bit positions)
+
+    -- Enemy depths (fixed size: 7 - 16bit positions) - Absolute depth
     for i = 1, 7 do
         table.insert(data, enemies_state.enemy_depths[i] or 0)
     end
 
-    -- Enemy depths LSB (fixed size: 7 - 16bit positions)
+    -- Enemy depths LSB (fixed size: 7 - 16bit positions) - Absolute LSB
     for i = 1, 7 do
         table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
     end
-    
-    -- Enemy shot positions (fixed size: 4)
+
+    -- Enemy shot positions (fixed size: 4) - Absolute depth
     for i = 1, 4 do
         table.insert(data, enemies_state.shot_positions[i])
     end
 
-    -- Enemy shot positions LSB (fixed size: 4)
+    -- Enemy shot positions LSB (fixed size: 4) - Absolute LSB
     for i = 1, 4 do
         table.insert(data, enemies_state.enemy_shot_lsb[i] or 0)
     end
-    
-    -- Enemy shot segments (fixed size: 4)
+
+    -- Enemy shot segments (fixed size: 4) - Relative segments
     for i = 1, 4 do
-        table.insert(data, enemies_state.enemy_shot_segments[i].value)
+        table.insert(data, enemies_state.enemy_shot_segments[i].value or INVALID_SEGMENT) -- Use sentinel
     end
-    
+
     -- Additional game state (pulse beat, pulsing)
     table.insert(data, enemies_state.pulse_beat or 0)
     table.insert(data, enemies_state.pulsing or 0)
-    
-    -- Add pending_vid (64 bytes)
+
+    -- Add pending_vid (64 bytes) - Absolute info
     for i = 1, 64 do
         table.insert(data, enemies_state.pending_vid[i] or 0)
     end
-    
-    -- Add pending_seg (64 bytes)
+
+    -- Add pending_seg (64 bytes) - Relative segments
     for i = 1, 64 do
-        table.insert(data, enemies_state.pending_seg[i] or 0)
+        table.insert(data, enemies_state.pending_seg[i] or INVALID_SEGMENT) -- Use sentinel
     end
-    
-    -- Serialize the data to a binary string.  We will convert all values to 16-bit integers
-    -- and then pack them into a binary string.
-    
+
+    -- Serialize the main data payload to a binary string. Convert all values to 16-bit integers.
     local binary_data = ""
     for i, value in ipairs(data) do
-        encoded_value = value & 0xFFFF  -- Mask to 16 bits
-        binary_data = binary_data .. string.pack(">H", encoded_value)
+        -- Ensure value is treated as signed short for packing if negative
+        local packed_value
+        if type(value) == "number" and value < 0 then
+             -- Convert negative numbers to their two's complement 16-bit representation
+             packed_value = 0xFFFF + value + 1
+        else
+             -- Handle positive numbers and non-numbers (like nil, defaulting to 0)
+             packed_value = (value or 0) & 0xFFFF
+        end
+        binary_data = binary_data .. string.pack(">H", packed_value) -- Pack as unsigned short (H)
     end
-  
+
     -- Check if it's time to send a save signal
     local current_time = os.time()
     local save_signal = 0
-    
+
     -- Send save signal every N seconds or when exiting play mode or when shutdown requested
     if current_time - game_state.last_save_time >= game_state.save_interval or shutdown_requested then
         save_signal = 1
         game_state.last_save_time = current_time
         print("Sending save signal to Python script")
-        
+
         -- If this is a shutdown save, add extra debug info
         if shutdown_requested then
             print("SHUTDOWN SAVE: Final save before MAME exits")
         end
     end
-    
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    is_attract_mode = is_attract_mode and 1 or 0
-    
-    -- Determine if this is an open level (FF) or closed level (00)
-    local is_open_level = level_state.level_type == 0xFF
-    is_open_level = is_open_level and 1 or 0
 
-    -- Create out-of-band context information structure
-    -- Pack: num_values (uint32), reward (double), game_action (byte), game_mode (byte), 
-    -- done flag (byte), frame_counter (uint32), score (uint32), save_signal (byte),
-    -- fire_commanded (byte), zap_commanded (byte), spinner_delta (int8),
-    -- is_attract (byte), nearest_enemy_segment (byte), player_segment (byte),
-    -- is_open_level (byte)
+    -- --- OOB Data Packing ---
+    -- This section MUST remain unchanged to maintain compatibility with the Python model.
+    -- It requires specific ABSOLUTE values.
+
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    local is_open_level = level_state.level_type == 0xFF
+
+    -- Get the ABSOLUTE nearest enemy segment (-1 sentinel) and depth for OOB packing
+    local nearest_abs_seg_oob, enemy_depth_oob = enemies_state:nearest_enemy_segment()
+    local player_abs_seg_oob = player_state.position & 0x0F -- Use absolute player segment 0-15
+
+    local is_enemy_present_oob = (nearest_abs_seg_oob ~= -1) and 1 or 0 -- Check against -1 sentinel
 
     -- Pack header data using 2-byte integers where possible
     local score = player_state.score or 0
     local score_high = math.floor(score / 65536)  -- High 16 bits
     local score_low = score % 65536               -- Low 16 bits
-    
+
     -- Mask frame counter to 16 bits to prevent overflow
     local frame = game_state.frame_counter % 65536
-    
-    local oob_data = string.pack(">HdBBBHHHBBBhBhBB", 
-        #data,                          -- H num_values
+
+    -- Ensure the format string and order match EXACTLY the previous working version.
+    -- H = unsigned short (uint16)
+    -- d = double
+    -- B = unsigned char (uint8)
+    -- h = signed short (int16)
+    local oob_data = string.pack(">HdBBBHHHBBBhBhBB",
+        #data,                          -- H num_values (size of main payload in 16-bit words)
         reward,                         -- d reward
-        0,                              -- B game_action
+        0,                              -- B game_action (placeholder)
         game_state.game_mode,           -- B game_mode
         bDone and 1 or 0,               -- B done flag
-        frame,                          -- H frame_counter (now masked to 16 bits)
+        frame,                          -- H frame_counter (16-bit)
         score_high,                     -- H score high 16 bits
         score_low,                      -- H score low 16 bits
         save_signal,                    -- B save_signal
         controls.fire_commanded,        -- B fire_commanded
         controls.zap_commanded,         -- B zap_commanded
-        controls.spinner_delta,         -- h spinner_delta
+        controls.spinner_delta,         -- h spinner_delta (model output, int8 range but packed as int16)
         is_attract_mode and 1 or 0,     -- B is_attract_mode
-        enemies_state:nearest_enemy_segment(), -- h nearest_enemy_segment
-        player_state.position,          -- B player segment
+        nearest_abs_seg_oob,            -- h nearest_enemy_segment (ABSOLUTE, -1 sentinel, packed as int16)
+        player_abs_seg_oob,             -- B player_segment (ABSOLUTE 0-15)
         is_open_level and 1 or 0        -- B is_open_level
     )
-    
+    -- --- End OOB Data Packing ---
+
     -- Combine out-of-band header with game state data
     local final_data = oob_data .. binary_data
-    
-    return final_data, #data  -- Return the number of 16-bit integers
+
+    return final_data, #data  -- Return the combined data and the size of the main payload
 end
 
 -- Update the frame_callback function to track bytes sent and calculate FPS
@@ -1536,6 +1574,16 @@ local function frame_callback()
     return true
 end
 
+-- Helper function to format segment values for display
+local function format_segment(value)
+    if value == INVALID_SEGMENT then
+        return "---"
+    else
+        -- Use %+03d: this ensures a sign and pads with 0 to a width of 2 digits (total 3 chars like +01, -07)
+        return string.format("%+03d", value)
+    end
+end
+
 -- Update the update_display function to show total bytes sent and FPS
 function update_display(status, game_state, level_state, player_state, enemies_state, current_action, num_values, reward)
     clear_screen()
@@ -1617,14 +1665,14 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Add shot positions on its own line
     local shots_str = ""
     for i = 1, 8 do
-        shots_str = shots_str .. string.format("%02X ", player_state.shot_positions[i])
+        shots_str = shots_str .. string.format(" %02X ", player_state.shot_positions[i])
     end
     print("  Shot Positions: " .. shots_str)
     
     -- Display player shot segments as a separate line
     local player_shot_segments_str = ""
     for i = 1, 8 do
-        player_shot_segments_str = player_shot_segments_str .. string.format("%02X ", player_state.shot_segments[i])
+        player_shot_segments_str = player_shot_segments_str .. format_segment(player_state.shot_segments[i]) .. " "
     end
     print("  Shot Segments : " .. player_shot_segments_str)
     
@@ -1683,8 +1731,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     for i = 1, 7 do
         enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
         enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
-        -- Format enemy segments as two-digit hexadecimal numbers
-        enemy_segs[i] = string.format("%02X", enemies_state.enemy_segments[i])
+        -- Format enemy segments using the helper function
+        enemy_segs[i] = format_segment(enemies_state.enemy_segments[i])
         -- Display enemy depths as 2-digit hex values
         enemy_depths[i] = string.format("%02X", enemies_state.enemy_depths[i])
         -- Display enemy LSBs as 2-digit hex values
@@ -1707,7 +1755,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
         ["Flip Rate"] = string.format("%02X", enemies_state.pulsar_fliprate), -- NEW: Display Pulsar Flip Rate
         ["In Tube"] = string.format("%d enemies", enemies_state.num_enemies_in_tube),
-        ["Nearest Enemy"] = string.format("segment %d", enemies_state.nearest_enemy_seg),
+        -- Display relative nearest enemy segment using format_segment
+        ["Nearest Enemy"] = string.format("segment %s", format_segment(enemies_state.nearest_enemy_seg)),
         ["On Top"] = string.format("%d enemies", enemies_state.num_enemies_on_top),
         ["Pending"] = string.format("%d enemies", enemies_state.enemies_pending),
         ["Enemy Types"] = table.concat(enemy_types, " "),
@@ -1743,14 +1792,14 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         local pos_value = enemies_state.shot_positions[i] or 0
         -- Mask to 8 bits (0-255) to display only one byte
         pos_value = pos_value & 0xFF
-        shot_positions_str = shot_positions_str .. string.format("%02X ", pos_value)
+        shot_positions_str = shot_positions_str .. string.format(" %02X ", pos_value)
     end
     print("  Shot Positions: " .. shot_positions_str)
     
-    -- Display enemy shot segments
+    -- Display enemy shot segments using format_segment
     local shot_segments_str = ""
     for i = 1, 4 do
-        shot_segments_str = shot_segments_str .. string.format("%02X ", enemies_state.enemy_shot_segments[i].value)
+        shot_segments_str = shot_segments_str .. format_segment(enemies_state.enemy_shot_segments[i].value) .. " "
     end
     print("  Shot Segments : " .. shot_segments_str)
     
@@ -1767,11 +1816,13 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     -- Display pending_seg similarly
     local pending_seg_str = ""
     for i = 1, 64 do
-        pending_seg_str = pending_seg_str .. string.format("%02X ", enemies_state.pending_seg[i])
+        pending_seg_str = pending_seg_str .. format_segment(enemies_state.pending_seg[i]) .. " "
         if i % 16 == 0 then pending_seg_str = pending_seg_str .. "\n  " end
     end
     print("  Pending SEG   : " .. pending_seg_str)
 end
+
+
 
 -- Function to be called when MAME is shutting down
 local function on_mame_exit()
@@ -1817,3 +1868,32 @@ callback_ref = emu.add_machine_frame_notifier(frame_callback)
 
 -- Register the shutdown callback
 emu.register_stop(on_mame_exit)
+
+-- Function to get the relative distance to a target segment
+function absolute_to_relative_segment(current_abs_segment, target_abs_segment, is_open_level)
+    -- Mask inputs to ensure they are within 0-15 range
+    current_abs_segment = current_abs_segment & 0x0F
+    target_abs_segment = target_abs_segment & 0x0F
+    
+    -- Check if target segment is valid (e.g., not 0 if 0 represents inactive)
+    -- Note: Caller should handle cases where target_abs_segment might represent an invalid state before calling.
+    -- We assume 0-15 are potentially valid target segments here.
+
+    -- Get segment distance based on level type
+    if is_open_level then
+        -- Open level: simple distance calculation (-15 to +15)
+        return target_abs_segment - current_abs_segment
+    else
+        -- Closed level: find shortest path around the circle (-7 to +8)
+        -- Note: The range is -7 to +8, not -8 to +7, because a distance of 8 can be reached
+        -- clockwise or counter-clockwise, but we need a convention. We'll return +8.
+        local diff = target_abs_segment - current_abs_segment
+        if diff > 8 then
+            return diff - 16 -- Wrap around (e.g., 1 -> 15 is -2)
+        elseif diff <= -8 then
+            return diff + 16 -- Wrap around (e.g., 15 -> 1 is +2)
+        else
+            return diff
+        end
+    end
+end

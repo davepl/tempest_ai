@@ -63,6 +63,30 @@ from stable_baselines3.common.logger import configure
 import socket
 import traceback
 
+# Platform-specific imports for KeyboardHandler
+import sys
+# Initialize all potential module variables to None first
+msvcrt = termios = tty = fcntl = None
+
+if sys.platform == 'win32':
+    try:
+        import msvcrt
+    except ImportError:
+        # msvcrt remains None
+        print("Warning: msvcrt module not found on Windows. Keyboard input will be disabled.")
+elif sys.platform in ('linux', 'darwin'):
+    try:
+        import termios
+        import tty
+        import fcntl
+        import select
+    except ImportError:
+        # termios, tty, fcntl remain None
+        print("Warning: termios, tty, or fcntl module not found. Keyboard input will be disabled.")
+else:
+    # All remain None
+    print(f"Warning: Unsupported platform '{sys.platform}' for keyboard input.")
+
 # Import from config.py
 from config import (
     SERVER_CONFIG,
@@ -197,41 +221,47 @@ class DQNAgent:
         self.update_target_network()
         
         # Training queue for background thread
-        self.train_queue = queue.Queue(maxsize=100)
+        self.train_queue = queue.Queue(maxsize=1000)
         self.training_thread = None
         self.running = True
 
         """Start background thread for training"""
-        self.training_thread = threading.Thread(target=self.background_train, daemon=True)
+        self.training_thread = threading.Thread(target=self.background_train, daemon=True, name="TrainingWorker")
         self.training_thread.start()
         
     def background_train(self):
         """Run training in background thread"""
         print(f"Training thread started on {device}")
-        while self.running:
+        while self.running: 
             try:
-                if self.train_queue.qsize() > 0:
-                    # Process batch
-                    self.train_step()
-                else:
-                    # Sleep to reduce CPU usage
-                    time.sleep(0.01)
+                # Get an item from the queue. This blocks if the queue is empty.
+                # The item itself is just a signal (True), we don't need its value.
+                _ = self.train_queue.get() 
+                
+                # If we get an item, process one training step
+                self.train_step()
+                
+                # Signal that the task is done
+                self.train_queue.task_done()
+
+            except queue.Empty: 
+                # This shouldn't typically happen with a blocking get unless maybe
+                # a timeout was added, but handle just in case.
+                continue 
             except Exception as e:
                 print(f"Training error: {e}")
-                time.sleep(1)  # Prevent tight loop on error
-                
+                traceback.print_exc() # Print full traceback for errors
+                time.sleep(1) # Pause after error
+
     def train_step(self):
         """Perform a single training step on one batch"""
         if len(self.memory) < RL_CONFIG.batch_size:
             return
             
-        # Sample batch from memory
         states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
         
-        # Get Q values for current states
         Q_expected = self.qnetwork_local(states).gather(1, actions)
         
-        # Compute target Q values (Double DQN approach)
         with torch.no_grad():
             best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
             Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
@@ -240,14 +270,10 @@ class DQNAgent:
         # Compute loss and perform optimization
         loss = F.mse_loss(Q_expected, Q_targets)
         self.optimizer.zero_grad()
-        loss.backward()
-        # Gradient clipping to stabilize training
-        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), 1)
-        self.optimizer.step()
-        
-        # Update metrics
+        loss.backward() 
+        self.optimizer.step() 
         metrics.losses.append(loss.item())
-    
+
     def update_target_network(self):
         """Update target network with weights from local network"""
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
@@ -342,57 +368,49 @@ class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""
     def __init__(self):
         self.platform = sys.platform
-        self.msvcrt = None
+        # Store module references or None if import failed
+        self.msvcrt = msvcrt 
+        self.termios = termios
+        self.tty = tty
+        self.fcntl = fcntl
+        
         self.fd = None
         self.old_settings = None
 
         if not IS_INTERACTIVE:
-            return # Don't initialize if not interactive
+            return 
 
         if self.platform == 'win32':
-            try:
-                import msvcrt # Import here for Windows
-                self.msvcrt = msvcrt
+            if self.msvcrt:
                 print("KeyboardHandler: Using msvcrt for Windows.")
-            except ImportError:
-                print("Warning: msvcrt module not found on Windows. Keyboard input disabled.")
         elif self.platform in ('linux', 'darwin'):
-            try:
-                # Import termios, tty, fcntl only on Unix-like systems
-                import termios
-                import tty
-                import fcntl
-                global termios, tty, fcntl # Make them available to methods
-
-                self.fd = sys.stdin.fileno()
-                self.old_settings = termios.tcgetattr(self.fd)
-                print(f"KeyboardHandler: Using termios/tty for {self.platform}.")
-            except termios.error as e:
-                print(f"Warning: Failed to get terminal attributes: {e}. Keyboard input might be impaired.")
-                self.fd = None # Ensure fd is None if setup failed
-                self.old_settings = None
-            except ImportError:
-                 print("Warning: termios, tty, or fcntl module not found. Keyboard input disabled on Unix-like system.")
-                 self.fd = None
-                 self.old_settings = None
+            if self.termios: 
+                try:
+                    self.fd = sys.stdin.fileno()
+                    self.old_settings = self.termios.tcgetattr(self.fd)
+                    print(f"KeyboardHandler: Using termios/tty for {self.platform}.")
+                except self.termios.error as e:
+                    print(f"Warning: Failed to get terminal attributes: {e}. Keyboard input might be impaired.")
+                    self.fd = None 
+                    self.old_settings = None
+            else:
+                 print("Warning: Unix terminal modules failed to import. Keyboard input disabled.")
         else:
             print(f"Warning: Unsupported platform '{self.platform}' for KeyboardHandler. Keyboard input disabled.")
 
     def setup_terminal(self):
         """Set the terminal to raw/non-blocking (Unix-only)."""
         if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
-            try:
-                # Ensure termios, tty, fcntl are available
-                if 'termios' in globals() and 'tty' in globals() and 'fcntl' in globals():
-                    tty.setraw(self.fd)
-                    flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-                    fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                else:
-                    print("Warning: Unix terminal modules not imported, cannot set raw mode.")
-            except termios.error as e:
-                print(f"Warning: Could not set terminal to raw/non-blocking mode: {e}")
-            except NameError: # Catch if modules weren't imported
-                 print("Warning: Unix terminal modules not available, cannot set raw mode.")
+            # Use instance attributes to check if modules were imported successfully
+            if self.tty and self.fcntl and self.termios:
+                try:
+                    self.tty.setraw(self.fd)
+                    flags = self.fcntl.fcntl(self.fd, self.fcntl.F_GETFL)
+                    self.fcntl.fcntl(self.fd, self.fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                except self.termios.error as e:
+                    print(f"Warning: Could not set terminal to raw/non-blocking mode: {e}")
+            else:
+                 print("Warning: Required Unix terminal modules not available, cannot set raw mode.")
         # No setup needed for Windows msvcrt
 
     def __enter__(self):
@@ -419,64 +437,47 @@ class KeyboardHandler:
                 else:
                     return None # No key waiting on Windows
             elif self.platform in ('linux', 'darwin') and self.fd is not None:
-                 # Ensure tty is available
-                 if 'tty' in globals():
-                     # Existing Unix non-blocking read (assumes raw mode set)
-                     # Need to handle potential blocking if not fully raw/non-blocking
-                     # This simple read might block if not set up correctly
-                     # A more robust way might involve select.select
+                 # Check if required modules are available via instance attributes
+                 if self.termios and select: # Need termios for setup, select for check
                      try:
-                         # Peek with select to see if data is available
-                         import select
                          if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
                              return sys.stdin.read(1)
                          else:
-                             return None # No data available
-                     except ImportError:
-                         # Fallback if select isn't available (highly unlikely)
-                         return sys.stdin.read(1) # Original potentially blocking call
-                     except Exception as e: # Catch other potential read errors
-                        # print(f"Debug: Unix key read error: {e}") # Optional debug
+                             return None 
+                     except Exception as e:
                         return None
                  else:
-                     print("Warning: Unix tty module not available for key check.")
+                     print("Warning: Unix termios/select modules not available for key check.")
                      return None
             else:
-                # Unsupported platform or setup failed
                 return None
         except (IOError, TypeError) as e:
-            # Catch potential errors during read
-            # print(f"Debug: General key check error: {e}") # Optional debug
             return None
 
     def restore_terminal(self):
         """Restore original terminal settings (Unix-only)."""
         if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
-            try:
-                # Ensure termios is available
-                if 'termios' in globals():
-                    termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
-                else:
-                     print("Warning: Unix termios module not available for restore.")
-            except termios.error as e:
-                print(f"Warning: Could not restore terminal settings: {e}")
-            except NameError: # Catch if modules weren't imported
+             # Check if termios module is available via instance attribute
+             if self.termios:
+                try:
+                    self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.old_settings)
+                except self.termios.error as e:
+                    print(f"Warning: Could not restore terminal settings: {e}")
+             else:
                  print("Warning: Unix termios module not available for restore.")
         # No restore needed for Windows msvcrt
 
     def set_raw_mode(self):
         """Set terminal back to raw mode (Unix-only)."""
         if self.platform in ('linux', 'darwin') and self.fd is not None:
-            try:
-                 # Ensure tty is available
-                 if 'tty' in globals():
-                     tty.setraw(self.fd)
-                 else:
-                      print("Warning: Unix tty module not available for set_raw_mode.")
-            except termios.error as e: # termios might still raise error here
-                print(f"Warning: Could not set terminal to raw mode: {e}")
-            except NameError: # Catch if modules weren't imported
-                 print("Warning: Unix tty module not available for set_raw_mode.")
+             # Check if tty/termios modules are available via instance attributes
+             if self.tty and self.termios:
+                try:
+                    self.tty.setraw(self.fd)
+                except self.termios.error as e: 
+                    print(f"Warning: Could not set terminal to raw mode: {e}")
+             else:
+                  print("Warning: Unix tty/termios modules not available for set_raw_mode.")
         # No equivalent needed for Windows msvcrt
 
 def print_with_terminal_restore(kb_handler, *args, **kwargs):

@@ -30,7 +30,7 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 284
-    expert_ratio_start: float = 0.95
+    expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.999
     expert_ratio_decay_steps: int = 10000
@@ -45,16 +45,16 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 256
+    batch_size: int = 512
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
-    epsilon_min: float = 0.01
+    epsilon_min: float = 0.001
     epsilon_decay: int = 10000
-    update_target_every: int = 1000
-    learning_rate: float = 0.00025
-    memory_size: int = 100000
+    update_target_every: int = 500
+    learning_rate: float = 0.00015
+    memory_size: int = 1000000
     save_interval: int = 50000
     train_freq: int = 4
     target_update: int = 10000
@@ -71,7 +71,7 @@ class MetricsData:
     episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    losses: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = 1.0
     expert_ratio: float = 0.75
     last_decay_step: int = 0
@@ -240,12 +240,12 @@ ACTION_MAPPING = {
 # Create instances of config classes
 metrics = MetricsData()
 
-# Import print_with_terminal_restore from metrics_display to avoid circular imports
-# # DEF print_with_terminal_restore(kb_handler, *args, **kwargs):
-# #     \"\"\"Print with terminal restore if in interactive mode\"\"\"
-# #     if IS_INTERACTIVE and kb_handler:
-# #         # Import here to avoid circular imports
-# #         from metrics_display import print_with_terminal_restore as _print
-# #         _print(*args, **kwargs)
-# #     else:
-# #         print(*args, **kwargs) 
+# # Import print_with_terminal_restore from metrics_display to avoid circular imports
+# # # DEF print_with_terminal_restore(kb_handler, *args, **kwargs):
+# # #     \"\"\"Print with terminal restore if in interactive mode\"\"\"
+# # #     if IS_INTERACTIVE and kb_handler:
+# # #         # Import here to avoid circular imports
+# # #         from metrics_display import print_with_terminal_restore as _print
+# # #         _print(*args, **kwargs)
+# # #     else:
+# # #         print(*args, **kwargs) 

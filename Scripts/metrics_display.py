@@ -51,13 +51,14 @@ def print_metrics_line(message, is_header=False):
 def display_metrics_header():
     """Display the header for metrics output"""
     # Clear screen first
-    clear_screen()
+    # clear_screen()
     
-    # Print header
+    # Print header (Increase Frame width, Add TrainQ)
     header = (
-        f"{'Frame':>8} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
+        f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
-        f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11}"
+        f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
+        f"{'TrainQ':>7}" # Added TrainQ column
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header
@@ -86,13 +87,19 @@ def display_metrics_row(agent, kb_handler):
     # Get the latest loss value
     latest_loss = metrics.losses[-1] if metrics.losses else 0
     
-    # Format the row
+    # Get Training Queue Size
+    train_q_size = 0
+    if agent and hasattr(agent, 'train_queue'):
+        train_q_size = agent.train_queue.qsize()
+
+    # Format the row (Increase Frame width, add comma formatting, add TrainQ)
     row = (
-        f"{metrics.frame_count:>8} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} "
         f"{latest_loss:>10.2f} {metrics.client_count:>8} "
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
-        f"{'ON' if metrics.expert_mode else 'OFF':>11}"
+        f"{'ON' if metrics.expert_mode else 'OFF':>11} "
+        f"{train_q_size:>7}" # Added TrainQ value
     )
     
     print_metrics_line(row)
