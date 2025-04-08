@@ -190,7 +190,8 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- Level completion bonus
         if level_state.level_number ~= previous_level then
-            reward = reward + (50 * previous_level)  -- Increased bonus for progression
+            reward = reward + (500 * previous_level)  -- Increased bonus for progression
+            bDone = true
         end
 
         -- Enemy targeting logic
