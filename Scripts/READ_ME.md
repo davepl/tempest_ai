@@ -15,3 +15,4 @@ start /b mame tempest1 -skip_gameinfo -autoboot_script c:\users\dave\source\repo
 
 Headless on MacOS:
 SDL_VIDEODRIVER=dummy mame tempest1 -video none -seconds_to_run 1000000000 -sound none &
+o

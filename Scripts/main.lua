@@ -921,21 +921,39 @@ end
 
 -- Find the *absolute* segment and depth of the enemy closest to the top of the tube
 -- This is used primarily for OOB data packing and targeting decisions that need absolute values.
+-- If multiple enemies share the minimum depth, it chooses the one closest in segment distance.
 function EnemiesState:nearest_enemy_segment()
     local min_depth = 255
     local closest_absolute_segment = -1 -- Use -1 as sentinel for *absolute* segment not found
+    local min_relative_distance_abs = 17 -- Sentinel for minimum absolute relative distance (max possible is 15 or 8)
+
+    -- Get player state needed for relative calculations
+    local player_abs_segment = mem:read_u8(0x0200) & 0x0F
+    local is_open = mem:read_u8(0x0111) == 0xFF
 
     -- Check standard enemy table (7 slots)
     for i = 1, 7 do
         -- Read the absolute segment and depth directly from memory for this calculation
-        local abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F -- Mask to 0-15
-        local depth = mem:read_u8(0x02DF + i - 1)
+        local current_abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F -- Mask to 0-15
+        local current_depth = mem:read_u8(0x02DF + i - 1)
 
         -- Only consider active enemies with valid segments (0-15)
-        if depth > 0 and abs_segment >= 0 and abs_segment <= 15 then
-            if depth < min_depth then
-                min_depth = depth
-                closest_absolute_segment = abs_segment
+        if current_depth > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 then
+            -- Calculate relative distance for this enemy
+            local current_relative_distance = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
+            local current_relative_distance_abs = math.abs(current_relative_distance)
+
+            -- Priority 1: Closer depth always wins
+            if current_depth < min_depth then
+                min_depth = current_depth
+                closest_absolute_segment = current_abs_segment
+                min_relative_distance_abs = current_relative_distance_abs
+            -- Priority 2: Same depth, closer segment wins
+            elseif current_depth == min_depth then
+                if current_relative_distance_abs < min_relative_distance_abs then
+                    closest_absolute_segment = current_abs_segment
+                    min_relative_distance_abs = current_relative_distance_abs
+                end
             end
         end
     end
