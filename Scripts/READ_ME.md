@@ -15,4 +15,12 @@ start /b mame tempest1 -skip_gameinfo -autoboot_script c:\users\dave\source\repo
 
 Headless on MacOS:
 SDL_VIDEODRIVER=dummy mame tempest1 -video none -seconds_to_run 1000000000 -sound none &
-o
+
+
+Training Notes
+--------------
+
+Apr-09-25: 
+Removed movement award, letting proximity do the work.
+At 5M frames, spinner alternates between inaction and basic aiming on level 1 and tracking on level 2
+

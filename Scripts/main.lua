@@ -717,7 +717,11 @@ function EnemiesState:new()
     self.num_enemies_on_top = 0
     self.enemies_pending = 0
     self.nearest_enemy_seg = INVALID_SEGMENT  -- Initialize relative nearest enemy segment with sentinel
-    
+    -- NEW Engineered Features for Targeting/Aiming
+    self.is_aligned_with_nearest = 0.0
+    self.nearest_enemy_depth_raw = 255 -- Sentinel value (max depth)
+    self.alignment_error_magnitude = 0.0
+
     -- Enemy info arrays (Original)
     self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- Raw type byte from $0169 (or similar)
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- Raw state byte from $0170 (or similar)
@@ -909,11 +913,34 @@ function EnemiesState:update(mem)
     end
 
     -- Calculate and store the relative nearest enemy segment for internal use
-    local nearest_abs_seg, _ = self:nearest_enemy_segment() -- Call the function that finds absolute
+    -- Capture BOTH return values: absolute segment and depth
+    local nearest_abs_seg, nearest_depth = self:nearest_enemy_segment()
     if nearest_abs_seg == -1 then
         self.nearest_enemy_seg = INVALID_SEGMENT
+        -- Set default values for engineered features when no enemy
+        self.is_aligned_with_nearest = 0.0
+        self.nearest_enemy_depth_raw = 255 -- Use max depth as sentinel
+        self.alignment_error_magnitude = 0.0
     else
-        self.nearest_enemy_seg = absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, is_open)
+        local nearest_rel_seg = absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, is_open)
+        self.nearest_enemy_seg = nearest_rel_seg -- Store relative for internal use/display
+        self.nearest_enemy_depth_raw = nearest_depth -- Store raw depth
+
+        -- Calculate Is_Aligned
+        self.is_aligned_with_nearest = (nearest_rel_seg == 0) and 1.0 or 0.0
+
+        -- Calculate Alignment_Error_Magnitude (Scaled to 0-10000 for packing)
+        local error_abs = math.abs(nearest_rel_seg)
+        local normalized_error = 0.0
+        if is_open then
+            -- Normalize based on max possible distance in open level (15)
+            if error_abs > 0 then normalized_error = error_abs / 15.0 end
+        else
+            -- Normalize based on max possible distance in closed level (8)
+            if error_abs > 0 then normalized_error = error_abs / 8.0 end
+        end
+        -- Scale to 0-10000 and store as integer
+        self.alignment_error_magnitude = math.floor(normalized_error * 10000.0)
     end
 end
 
@@ -1180,6 +1207,10 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- Use INVALID_SEGMENT sentinel for nearest_relative_seg if no enemy
     table.insert(data, nearest_relative_seg)
     table.insert(data, segment_delta)      -- Relative distance (-7 to +8 or -15 to +15) or 0
+    -- Add NEW Engineered Features (Targeting/Aiming)
+    table.insert(data, enemies_state.nearest_enemy_depth_raw) -- Raw depth (0-255)
+    table.insert(data, enemies_state.is_aligned_with_nearest) -- Float (0.0 or 1.0)
+    table.insert(data, enemies_state.alignment_error_magnitude) -- Float (0.0-1.0)
 
     -- Player state (5 values + arrays, score is now in OOB data)
     table.insert(data, player_state.position) -- Keep absolute player position here if needed, or mask if only segment used

@@ -29,7 +29,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 284
+    params_count: int = 287
     expert_ratio_start: float = 0.75
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.999
@@ -53,7 +53,7 @@ class RLConfigData:
     epsilon_min: float = 0.001
     epsilon_decay: int = 10000
     update_target_every: int = 500
-    learning_rate: float = 0.00015
+    learning_rate: float = 0.001
     memory_size: int = 1000000
     save_interval: int = 50000
     train_freq: int = 4
