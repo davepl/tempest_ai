@@ -213,12 +213,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if player_state.shot_count > 0 then
                     reward = reward + 100
                 end
-                -- Small penalty for unnecessary movement when aligned (but could be moving to next enemy after firing, so not that bad)
-                if player_state.SpinnerDelta ~= 0 then
-                    reward = reward - 10
-                end
+                -- REMOVED penalty for movement when aligned; the alignment bonus incentivizes staying put.
             else 
-                -- Misaligned case (segment_distance > 0)
+                -- MISALIGNED CASE (segment_distance > 0)
                 -- Enemies at the top of tube should be shot when close (using segment distance)
                 if (segment_distance < 2) then -- Check using actual segment distance
                     -- Use the depth returned by direction_to_nearest_enemy
@@ -238,12 +235,13 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 reward = reward + (10 - segment_distance) -- Simple linear reward for proximity
                 
                 -- Movement incentives (using desired_spinner direction)
+                -- Penalize if the DETECTED movement (SpinnerDelta) is OPPOSITE to the desired direction.
+                -- Let proximity reward handle encouragement towards the target.
                 if desired_spinner * player_state.SpinnerDelta < 0 then
-                    -- Strong reward for correct movement (signs match)
-                    reward = reward + 50
-                elseif player_state.SpinnerDelta ~= 0 then
-                    -- Strong penalty for wrong movement (signs mismatch)
+                    -- Strong penalty for moving AWAY from the target.
                     reward = reward - 50
+                -- No explicit reward for moving towards, let proximity handle that.
+                -- No penalty for staying still when misaligned (proximity reward decreases naturally).
                 end
                 
                 -- Encourage maintaining shots in reserve
@@ -1713,33 +1711,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print(string.format("  %-25s: %d", "Model Spinner", player_state.SpinnerDelta))
     print("")
 
-    -- Format and print level state
-    print("--[ Level State ]-------------------------------------")
-    print(string.format("  %-14s: %-10s  %-14s: %-10s  %-14s: %s",
-        "Level Number", level_state.level_number,
-        "Level Type", level_state.level_type == 0xFF and "Open" or "Closed",
-        "Level Shape", level_state.level_shape))
-    
-    -- Add spike heights on its own line
-    local heights_str = ""
-    for i = 0, 15 do
-        if level_state.spike_heights[i] then
-            heights_str = heights_str .. string.format("%02X ", level_state.spike_heights[i])
-        else
-            heights_str = heights_str .. "-- "
-        end
-    end
-    print("  Spike Heights: " .. heights_str)
-    
-    -- Add level angles on its own line
-    local angles_str = ""
-    for i = 0, 15 do
-        angles_str = angles_str .. string.format("%02X ", level_state.level_angles[i])
-    end
-    print("  Level Angles : " .. angles_str)
-    print("")
-
-    -- Format and print enemies state at row 31
+    -- Format and print level state at row 31
     move_cursor_to_row(31)
     local enemy_types = {}
     local enemy_states = {}
