@@ -23,4 +23,6 @@ Training Notes
 Apr-09-25: 
 Removed movement award, letting proximity do the work.
 At 5M frames, spinner alternates between inaction and basic aiming on level 1 and tracking on level 2
+Added engineered params for distance to enemy, etc, and it learned to move around (but not always shoot) in 1M frames
 
+o

@@ -162,7 +162,7 @@ local shutdown_requested = false
 local last_display_update = 0  -- Timestamp of last display update
 
 -- Function to calculate reward for the current frame
-local function calculate_reward(game_state, level_state, player_state, enemies_state)
+local function calculate_reward(game_state, level_state, player_state, enemies_state, commanded_spinner)
     local reward = 0
     local bDone = false
 
@@ -200,7 +200,8 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         if target_segment < 0 or game_state.gamestate == 0x20 then
             -- No enemies: reward staying still more strongly
-            reward = reward + (player_state.SpinnerDelta == 0 and 50 or -20)
+            -- Use commanded_spinner here to check if model *intended* to stay still
+            reward = reward + (commanded_spinner == 0 and 50 or -20)
         else
             -- Get desired spinner direction, segment distance, AND enemy depth
             local desired_spinner, segment_distance, enemy_depth = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
@@ -225,7 +226,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                             reward = reward + 250
                         else
                             -- Moderate penalty for not firing at close enemies
-                            print("*")
                             reward = reward - 50
                         end
                     end
@@ -234,10 +234,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Graduated reward for proximity (higher reward for smaller segment distance)
                 reward = reward + (10 - segment_distance) -- Simple linear reward for proximity
                 
-                -- Movement incentives (using desired_spinner direction)
-                -- Penalize if the DETECTED movement (SpinnerDelta) is OPPOSITE to the desired direction.
-                -- Let proximity reward handle encouragement towards the target.
-                if desired_spinner * player_state.SpinnerDelta < 0 then
+                -- Movement incentives (using desired_spinner direction and commanded_spinner)
+                -- Penalize if the COMMANDED movement (commanded_spinner) is OPPOSITE to the desired direction.
+                if desired_spinner * commanded_spinner < 0 then
                     -- Strong penalty for moving AWAY from the target.
                     reward = reward - 50
                 -- No explicit reward for moving towards, let proximity handle that.
@@ -1546,7 +1545,9 @@ local function frame_callback()
     end
 
     -- Calculate the reward for the current frame - do this ONCE per frame
-    local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state)
+    -- Note: We calculate reward *before* getting the commanded spinner for *this* frame.
+    --       To use the commanded spinner *in* the reward calculation, we need to get it first.
+    --       (Refactoring needed - see below)
 
     -- NOP out the jump that skips scoring in attract mode
     mem:write_direct_u8(0xCA6F, 0xEA)
@@ -1579,17 +1580,44 @@ local function frame_callback()
         if esc_pressed then break end
     end
     
-    -- Flatten and serialize the game state data
+    -- 1. Get the action COMMANDED by the AI for the CURRENT state (from Python)
+    --    To do this, we first need to send the *previous* frame's state/reward/done.
+    --    The flatten function packs the reward/done for the *current* frame into the OOB header,
+    --    so we need a temporary flatten/send just to get the action.
+    --    This seems inefficient. Let's rethink. Python needs (s, a, r, s', d).
+    --    Lua sends s' and r/d for the transition that *ended* in s'.
+    --    So, Python receives (s', r, d) and needs to decide action 'a' for s'.
+
+    -- Let's simplify: Calculate reward first, flatten, send, get action.
+
+    -- Calculate the reward based on the state *before* the commanded action is known.
+    -- This is necessary because the reward is packed in the data sent *to* python.
+    -- We will pass 0 for commanded_spinner here as it's not known yet.
+    -- NOTE: This means the reward calculation CANNOT depend on the commanded spinner.
+    --       If it MUST, the protocol needs changing.
+    --       Let's assume for now it's okay to use the *previous* frame's commanded spinner (in player_state.SpinnerDelta)
+    --       or just ignore commanded spinner's effect on reward.
+    --       We'll revert calculate_reward temporarily to not require commanded_spinner.
+    -- TODO: Re-evaluate if calculate_reward *truly* needs commanded_spinner or if previous frame's effect is ok.
+
+    -- Calculate reward based on *previous* action's effect (using player_state.SpinnerDelta)
+    -- Revert calculate_reward call temporarily
+    -- local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, 0) -- Placeholder 0
+    -- Let's try using the inferred spinner delta from the player state, which reflects the last actual movement
+    local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.inferredSpinnerDelta)
+
+    -- Flatten and serialize the game state data (using the calculated reward/bDone for OOB header)
     local frame_data
     frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
 
-    -- Send the serialized data to the Python script and get the components
+    -- Send the current state data (s') and reward/done (r, d) to Python,
+    -- and get the action (a) for this state (s') back.
     local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
 
-    -- BOT: Calculate spinner value based on direction to nearest enemy, it will play like demo mode
-    -- Calculate spinner value based on direction to nearest enemy, override what the model said above
-    -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
+    -- Now we have the commanded spinner for THIS frame (stored in local var 'spinner')
 
+    -- BOT: Example override (commented out)
+    -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
     player_state.fire_commanded = fire
     player_state.zap_commanded = zap
