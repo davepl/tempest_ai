@@ -37,7 +37,7 @@ local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 
 local LOG_ONLY_MODE           = false
 local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local DISPLAY_UPDATE_INTERVAL = 0.05  
 
 local function clear_screen()
@@ -192,6 +192,15 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         if level_state.level_number ~= previous_level then
             reward = reward + (500 * previous_level)  -- Increased bonus for progression
             bDone = true
+        end
+
+        -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
+
+        if (game_state.gamestate == 0x04) then
+            if (player_state.superzapper_active ~= 0) then
+                reward = reward - 250
+                print("#")
+            end
         end
 
         -- Enemy targeting logic
