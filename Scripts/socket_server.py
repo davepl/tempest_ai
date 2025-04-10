@@ -159,26 +159,56 @@ class SocketServer:
     def generate_client_id(self):
         """Generate a unique client ID"""
         with self.client_lock:
-            # Check for reusable IDs first (clients that have disconnected)
-            for i in range(SERVER_CONFIG.max_clients):
-                if i not in self.clients:
-                    return i
-                    
-            # Before falling back to overflow, try to clean up disconnected clients
-            # that might still be in the dictionary but are no longer active
-            disconnected_ids = []
-            for client_id, thread in self.clients.items():
-                if isinstance(client_id, int) and not thread.is_alive():
-                    disconnected_ids.append(client_id)
-                    
-            # If we found disconnected clients, reuse the first ID
-            if disconnected_ids:
-                reused_id = disconnected_ids[0]
+            # --- Method 1: Reuse available IDs within max_clients ---
+            all_possible_ids = set(range(SERVER_CONFIG.max_clients))
+            # Get keys *currently* in the clients dictionary
+            current_ids = set(self.clients.keys())
+            available_ids = list(all_possible_ids - current_ids)
+
+            if available_ids:
+                available_ids.sort()
+                # print(f"DEBUG: Reusing available ID {available_ids[0]}") # Debug print
+                return available_ids[0]
+
+            # --- Method 2: Clean up dead threads and reuse their ID ---
+            disconnected_ids_found = []
+            # Iterate over a copy of items for safety during potential modifications
+            items_copy = list(self.clients.items())
+            for client_id, thread_or_none in items_copy:
+                # Check if it's an integer ID (ignore potential non-int keys if any)
+                if not isinstance(client_id, int):
+                    continue
+
+                # Check if thread is None OR if it's a Thread object but not alive
+                is_disconnected = False
+                if thread_or_none is None:
+                    is_disconnected = True
+                elif isinstance(thread_or_none, threading.Thread) and not thread_or_none.is_alive():
+                     is_disconnected = True
+                # elif not isinstance(thread_or_none, threading.Thread): # Handle cases where value isn't None or Thread (shouldn't happen ideally)
+                #     print(f"DEBUG: Found unexpected type for client {client_id}: {type(thread_or_none)}")
+                #     is_disconnected = True # Treat unexpected types as disconnected
+
+                if is_disconnected:
+                    disconnected_ids_found.append(client_id)
+                    # Clean up this specific ID immediately since we found it dead
+                    if client_id in self.clients:
+                        # print(f"DEBUG: Cleaning up dead client {client_id} during ID generation") # Debug print
+                        del self.clients[client_id]
+                    if client_id in self.client_states:
+                        del self.client_states[client_id]
+
+            # If we cleaned up any dead clients, update count and return the first ID found
+            if disconnected_ids_found:
+                metrics.client_count = len(self.clients) # Update count after removal
+                reused_id = disconnected_ids_found[0]
+                # print(f"DEBUG: Reusing ID {reused_id} after immediate cleanup. Active: {metrics.client_count}") # Debug print
                 return reused_id
-                
-            # If we still can't find an ID, use a numeric ID above the max_clients
-            # but keep it as a number instead of a string with "overflow_"
-            return SERVER_CONFIG.max_clients + len(self.clients) - SERVER_CONFIG.max_clients
+
+            # --- Method 3: Assign an ID above max_clients ---
+            overflow_id = SERVER_CONFIG.max_clients + len(self.clients)
+            # print(f"DEBUG: Assigning overflow ID {overflow_id}. Active: {len(self.clients)}") # Debug print
+            return overflow_id
     
     def handle_client(self, client_socket, client_id):
         """Handle communication with a client"""
