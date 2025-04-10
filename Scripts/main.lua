@@ -37,7 +37,7 @@ local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 
 local LOG_ONLY_MODE           = false
 local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
-local SHOW_DISPLAY            = false
+local SHOW_DISPLAY            = true
 local DISPLAY_UPDATE_INTERVAL = 0.05  
 
 local function clear_screen()
@@ -199,7 +199,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         if (game_state.gamestate == 0x04) then
             if (player_state.superzapper_active ~= 0) then
                 reward = reward - 250
-                print("#")
             end
         end
 
