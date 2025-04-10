@@ -175,7 +175,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     -- Base survival reward - make staying alive more valuable
     
     if player_state.alive == 1 then
-        reward = reward + 10  -- Constant reward for being alive each frame
+        reward = reward + 1  -- Constant reward for being alive each frame
 
         -- Stronger reward for maintaining lives
         if player_state.player_lives ~= nil then
@@ -185,14 +185,14 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         -- Score-based reward (keep this as a strong motivator)
         local score_delta = player_state.score - previous_score
         if score_delta > 0 then
-            reward = reward + (score_delta * 2)  -- Amplify score impact
+            reward = reward + (score_delta * 5)  -- Amplify score impact
         end
 
-        -- Level completion bonus
-        if level_state.level_number ~= previous_level then
-            reward = reward + (500 * previous_level)  -- Increased bonus for progression
-            bDone = true
-        end
+        -- Level completion bonus removed since it would come after end of the episode
+        -- if level_state.level_number ~= previous_level then
+        --     reward = reward + (500 * previous_level)  -- Increased bonus for progression
+        --     bDone = true
+        -- end
 
         -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
 
@@ -201,10 +201,27 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 reward = reward - 250
             end
         end
-
+                
         -- Enemy targeting logic
         local target_segment = enemies_state:nearest_enemy_segment()
         local player_segment = player_state.position & 0x0F
+
+        -- Check to see if any enemy shots are active in our lane, and if so check the distance.  If it's less than or equal to 0x24
+        -- reward theplayer for moving out of the way of the enemy shot.
+
+        for i = 1, 4 do
+            if (enemies_state.enemy_shot_segments[i].value == player_segment) then
+                if (enemies_state.shot_positions[i] <= 0x24) then
+                    -- BUGBUG we should really check to see the commanded_spinner is in a direction
+                    --        that would have avoided the shot, but this is a good start.
+                    if (commanded_spinner == 0) then 
+                        reward = reward - 100
+                    else
+                        reward = reward + commanded_spinner * 100
+                    end
+                end
+            end
+        end
 
         if target_segment < 0 or game_state.gamestate == 0x20 then
             -- No enemies: reward staying still more strongly
@@ -254,7 +271,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Encourage maintaining shots in reserve
                 if player_state.shot_count < 2 or player_state.shot_count > 7 then
                     reward = reward - 20  -- Penalty for not having shots ready
-                elseif player_state.shot_count >= 4 then
+                elseif player_state.shot_count >= 5 then
                     reward = reward + 20  -- Bonus for good ammo management
                 end
             end
@@ -878,6 +895,11 @@ function EnemiesState:update(mem)
     for i = 1, 4 do
         local raw_pos = mem:read_u8(0x02DB + i - 1)
         self.shot_positions[i] = raw_pos  -- Store full raw position value
+
+        -- Invalidate the segment values for any shots that are zeroed
+        if (self.shot_positions[i] == 0) then
+            self.enemy_shot_segments[i].value = INVALID_SEGMENT
+        end
     end
 
     -- Read pending_seg (64 bytes starting at 0x0203), store relative
@@ -1284,14 +1306,21 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         table.insert(data, enemies_state.enemy_segments[i] or INVALID_SEGMENT) -- Use sentinel
     end
 
-    -- Enemy depths (fixed size: 7 - 16bit positions) - Absolute depth
+    -- NEW: Top Enemy Segments (fixed size: 7) - Relative segments only for enemies at depth 0x10
     for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_depths[i] or 0)
+        if enemies_state.enemy_depths[i] == 0x10 then
+            table.insert(data, enemies_state.enemy_segments[i]) -- Insert the relative segment
+        else
+            table.insert(data, INVALID_SEGMENT) -- Use sentinel if not at depth 0x10
+        end
     end
 
-    -- Enemy depths LSB (fixed size: 7 - 16bit positions) - Absolute LSB
+    -- Enemy depths (fixed size: 7) - Absolute depth combined with LSB
     for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_depths_lsb[i] or 0)
+        local depth = enemies_state.enemy_depths[i] or 0
+        local lsb = enemies_state.enemy_depths_lsb[i] or 0
+        -- Combine MSB depth and LSB (scaled 0-1) into a float
+        table.insert(data, depth + (lsb / 255.0))
     end
 
     -- Enemy shot positions (fixed size: 4) - Absolute depth
@@ -1299,16 +1328,11 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         table.insert(data, enemies_state.shot_positions[i])
     end
 
-    -- Enemy shot positions LSB (fixed size: 4) - Absolute LSB
-    for i = 1, 4 do
-        table.insert(data, enemies_state.enemy_shot_lsb[i] or 0)
-    end
-
     -- Enemy shot segments (fixed size: 4) - Relative segments
     for i = 1, 4 do
         table.insert(data, enemies_state.enemy_shot_segments[i].value or INVALID_SEGMENT) -- Use sentinel
     end
-
+        
     -- Additional game state (pulse beat, pulsing)
     table.insert(data, enemies_state.pulse_beat or 0)
     table.insert(data, enemies_state.pulsing or 0)
@@ -1825,6 +1849,18 @@ function update_display(status, game_state, level_state, player_state, enemies_s
 
     -- Add enemy segments and depths on their own lines
     print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
+
+    -- NEW: Display segments of enemies specifically at depth 0x10
+    local top_enemy_segs = {}
+    for i = 1, 7 do
+        if enemies_state.enemy_depths[i] == 0x10 then
+            top_enemy_segs[i] = format_segment(enemies_state.enemy_segments[i])
+        else
+            top_enemy_segs[i] = format_segment(INVALID_SEGMENT)
+        end
+    end
+    print("  Enemies On Top: " .. table.concat(top_enemy_segs, " "))
+
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
     print("  Enemy LSBs    : " .. table.concat(enemy_lsbs, " "))
     print("  Shot LSBs     : " .. table.concat(enemy_shot_lsbs, " "))

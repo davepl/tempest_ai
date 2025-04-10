@@ -224,12 +224,13 @@ class SocketServer:
                     # Receive data length
                     length_data = client_socket.recv(2)
                     if not length_data or len(length_data) < 2:
-                        raise ConnectionError("Client disconnected")
+                        raise ConnectionError("Client disconnected (failed to read length)")
 
                     data_length = struct.unpack(">H", length_data)[0]
                     data = b""
                     remaining = data_length
 
+                    # Ensure we read the entire message based on length header
                     while remaining > 0:
                         chunk = client_socket.recv(min(buffer_size, remaining))
                         if not chunk:
@@ -238,18 +239,51 @@ class SocketServer:
                         remaining -= len(chunk)
 
                     if len(data) < data_length:
-                        print(f"Client {client_id} sent incomplete data")
+                        print(f"Client {client_id}: Received incomplete data packet ({len(data)}/{data_length} bytes)")
                         continue
 
-                    # Parse the frame data
+                    # --- Parameter Count Validation ---
+                    # Peek at the number of values from the OOB header *before* full parsing
+                    try:
+                        # Expected header format includes num_values as the first H (unsigned short)
+                        header_format_peek = ">H" # Only need the first value
+                        peek_size = struct.calcsize(header_format_peek)
+                        if len(data) >= peek_size:
+                            num_values_received = struct.unpack(header_format_peek, data[:peek_size])[0]
+                            if num_values_received != SERVER_CONFIG.params_count:
+                                # Raise a specific error if count mismatches config
+                                raise ValueError(f"Parameter count mismatch! Expected {SERVER_CONFIG.params_count}, received {num_values_received}")
+                        else:
+                             # This should ideally not happen if length check above is correct
+                             raise ConnectionError("Data too short to read parameter count")
+                    except ValueError as ve:
+                         # Catch the specific ValueError for parameter count mismatch
+                         print(f"Client {client_id}: {ve}. Closing connection.")
+                         break # Exit the loop to close the connection
+                    except Exception as e:
+                         # Catch other potential unpacking errors during peek
+                         print(f"Client {client_id}: Error checking parameter count: {e}. Closing connection.")
+                         traceback.print_exc()
+                         break # Exit the loop
+
+                    # --- End Parameter Count Validation ---
+
+
+                    # Parse the full frame data (only if count check passed)
                     frame = parse_frame_data(data)
                     if not frame:
+                        print(f"Client {client_id}: Failed to parse frame data after count check.")
                         # Send empty response on parsing failure
                         client_socket.sendall(struct.pack("bbb", 0, 0, 0))
                         continue
                     
                     # Get client state
                     with self.client_lock:
+                        # Check if client_id still exists before accessing state
+                        if client_id not in self.client_states:
+                            print(f"Client {client_id}: State not found, likely disconnected during processing. Aborting frame.")
+                            break # Exit loop if state is gone
+
                         state = self.client_states[client_id]
                         state['frames_processed'] += 1
                         
@@ -267,9 +301,13 @@ class SocketServer:
                     # Handle save signal from game
                     if frame.save_signal:
                         try:
-                            self.agent.save(LATEST_MODEL_PATH)
+                            # Ensure agent exists before saving
+                            if hasattr(self, 'agent') and self.agent:
+                                self.agent.save(LATEST_MODEL_PATH)
+                            else:
+                                print(f"Client {client_id}: Agent not available for saving.")
                         except Exception as e:
-                            print(f"ERROR saving model: {e}")
+                            print(f"Client {client_id}: ERROR saving model: {e}")
                     
                     # Update global metrics
                     current_frame = self.metrics.update_frame_count()
@@ -278,91 +316,124 @@ class SocketServer:
                     self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
                     
                     # Process previous step's results if available
-                    if state['last_state'] is not None and state['last_action_idx'] is not None:
-                        # Add experience to replay memory
-                        self.agent.step(
-                            state['last_state'],
-                            np.array([[state['last_action_idx']]]),
-                            frame.reward,
-                            frame.state,
-                            frame.done
-                        )
-                        
+                    if state.get('last_state') is not None and state.get('last_action_idx') is not None:
+                         # Ensure agent exists before stepping
+                        if hasattr(self, 'agent') and self.agent:
+                            self.agent.step(
+                                state['last_state'],
+                                np.array([[state['last_action_idx']]]),
+                                frame.reward,
+                                frame.state,
+                                frame.done
+                            )
+                        else:
+                             print(f"Client {client_id}: Agent not available for step.")
+
+
                         # Track rewards
-                        state['total_reward'] += frame.reward
-                        
+                        state['total_reward'] = state.get('total_reward', 0) + frame.reward
+
                         # Track which system's rewards
                         if hasattr(metrics, 'last_action_source'):
                             if metrics.last_action_source == "expert":
-                                state['episode_expert_reward'] += frame.reward
+                                state['episode_expert_reward'] = state.get('episode_expert_reward', 0) + frame.reward
                             else:
-                                state['episode_dqn_reward'] += frame.reward
+                                state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0) + frame.reward
                     
                     # Handle episode completion
                     if frame.done:
-                        if not state['was_done']:
-                            self.metrics.add_episode_reward(
-                                state['total_reward'],
-                                state['episode_dqn_reward'],
-                                state['episode_expert_reward']
-                            )
+                        if not state.get('was_done', False):
+                             # Add rewards only if the episode wasn't already marked done
+                             self.metrics.add_episode_reward(
+                                 state.get('total_reward', 0),
+                                 state.get('episode_dqn_reward', 0),
+                                 state.get('episode_expert_reward', 0)
+                             )
 
                         state['was_done'] = True
-                        client_socket.sendall(struct.pack("bbb", 0, 0, 0))
+                        # Send empty action on 'done' frame to prevent issues
+                        try:
+                            client_socket.sendall(struct.pack("bbb", 0, 0, 0))
+                        except (BrokenPipeError, ConnectionResetError):
+                             print(f"Client {client_id}: Connection lost when sending done confirmation.")
+                             break # Exit loop if connection is lost
+
+
+                        # Reset state for next episode
                         state['last_state'] = None
                         state['last_action_idx'] = None
-                        continue
-                    elif state['was_done']:
-                        state['was_done'] = False
                         state['total_reward'] = 0
                         state['episode_dqn_reward'] = 0
                         state['episode_expert_reward'] = 0
+                        continue # Skip action generation for this frame
+
+                    elif state.get('was_done', False):
+                         # Reset episode state if previous frame was done
+                         state['was_done'] = False
+                         state['total_reward'] = 0
+                         state['episode_dqn_reward'] = 0
+                         state['episode_expert_reward'] = 0
                     
-                    # Generate action
+                    # Generate action (only if not 'done')
                     self.metrics.increment_total_controls()
                     
                     # Decide between expert system and DQN
-                    if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
-                        # Use expert system
-                        fire, zap, spinner = get_expert_action(
-                            frame.enemy_seg, frame.player_seg, frame.open_level
-                        )
-                        self.metrics.increment_guided_count()
-                        self.metrics.update_action_source("expert")
-                        action_idx = expert_action_to_index(fire, zap, spinner)
+                    action_idx = None # Initialize action_idx
+                    fire, zap, spinner = 0, 0, 0.0 # Default actions
+
+                    # Ensure agent exists before deciding action
+                    if hasattr(self, 'agent') and self.agent:
+                        if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
+                            # Use expert system
+                            fire, zap, spinner = get_expert_action(
+                                frame.enemy_seg, frame.player_seg, frame.open_level
+                            )
+                            self.metrics.increment_guided_count()
+                            self.metrics.update_action_source("expert")
+                            action_idx = expert_action_to_index(fire, zap, spinner)
+                        else:
+                            # Use DQN with current epsilon
+                            action_idx = self.agent.act(frame.state, self.metrics.get_epsilon())
+                            fire, zap, spinner = ACTION_MAPPING[action_idx]
+                            self.metrics.update_action_source("dqn")
                     else:
-                        # Use DQN with current epsilon
-                        action_idx = self.agent.act(frame.state, self.metrics.get_epsilon())
-                        fire, zap, spinner = ACTION_MAPPING[action_idx]
-                        self.metrics.update_action_source("dqn")
-                    
-                    # Store state and action for next iteration
-                    state['last_state'] = frame.state
-                    state['last_action_idx'] = action_idx
-                    
+                         print(f"Client {client_id}: Agent not available for action generation.")
+                         # Keep default action (0,0,0)
+
+                    # Store state and action for next iteration (only if action was generated)
+                    if action_idx is not None:
+                        state['last_state'] = frame.state
+                        state['last_action_idx'] = action_idx
+
                     # Send action to game
                     game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
-                    client_socket.sendall(struct.pack("bbb", game_fire, game_zap, game_spinner))
-                    
+                    try:
+                        client_socket.sendall(struct.pack("bbb", game_fire, game_zap, game_spinner))
+                    except (BrokenPipeError, ConnectionResetError):
+                        print(f"Client {client_id}: Connection lost when sending action.")
+                        break # Exit loop if connection is lost
+
+
                     # Periodic target network update (only from client 0)
-                    if client_id == 0 and current_frame % RL_CONFIG.update_target_every == 0:
+                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
                         self.agent.update_target_network()
-                    
+
                     # Periodic model saving (only from client 0)
-                    if client_id == 0 and current_frame % RL_CONFIG.save_interval == 0:
+                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.save_interval == 0:
                         self.agent.save(LATEST_MODEL_PATH)
-                
+
+
                 except (BlockingIOError, InterruptedError):
-                    # Expected with non-blocking socket
+                    # Expected with non-blocking socket, short sleep prevents busy-waiting
                     time.sleep(0.001)
                     continue
                 except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
                     print(f"Client {client_id} connection error: {e}")
-                    break
+                    break # Exit the loop on connection errors
                 except Exception as e:
                     print(f"Error handling client {client_id}: {e}")
                     traceback.print_exc()
-                    break
+                    break # Exit the loop on other errors
 
         except Exception as e:
             print(f"Fatal error handling client {client_id}: {e}")
@@ -372,42 +443,49 @@ class SocketServer:
             try:
                 client_socket.shutdown(socket.SHUT_RDWR)
             except:
-                pass
+                pass # Ignore errors during shutdown
             try:
                 client_socket.close()
             except:
-                pass
+                pass # Ignore errors during close
 
             # Clean up client state atomically
             with self.client_lock:
-                if client_id in self.client_states:
+                client_exists = client_id in self.client_states
+                if client_exists:
                     del self.client_states[client_id]
                 if client_id in self.clients:
-                    del self.clients[client_id]
+                     # Replace thread with None to mark for cleanup
+                     self.clients[client_id] = None
+
                 # Update metrics after cleanup
-                metrics.client_count = len(self.clients)
-                print(f"Client {client_id} cleanup complete, {len(self.clients)} clients remaining")
+                metrics.client_count = len([c for c in self.clients.values() if c is not None])
+                if client_exists:
+                    print(f"Client {client_id} cleanup complete. Active clients: {metrics.client_count}")
+
+            # Schedule cleanup of disconnected clients (thread safe)
+            threading.Timer(1.0, self.cleanup_disconnected_clients).start()
 
     def cleanup_disconnected_clients(self):
-        """Clean up any disconnected clients to free up their IDs"""
+        """Clean up any disconnected clients marked as None to free up their IDs"""
+        cleaned_count = 0
         with self.client_lock:
-            # Find clients with dead threads or None entries
-            disconnected_clients = [
-                client_id for client_id, thread in self.clients.items()
-                if thread is None or (isinstance(thread, threading.Thread) and not thread.is_alive())
+            # Find clients marked as None
+            disconnected_ids = [
+                client_id for client_id, thread_or_none in self.clients.items()
+                if thread_or_none is None
             ]
-            
-            # Remove disconnected clients and their states
-            for client_id in disconnected_clients:
+
+            # Remove disconnected clients from the main dictionary
+            for client_id in disconnected_ids:
                 if client_id in self.clients:
                     del self.clients[client_id]
-                if client_id in self.client_states:
-                    del self.client_states[client_id]
-            
-            # Update metrics
-            metrics.client_count = len(self.clients)
-            if disconnected_clients:
-                print(f"Cleaned up {len(disconnected_clients)} disconnected clients. Available IDs: {SERVER_CONFIG.max_clients - len(self.clients)}")
+                    cleaned_count += 1
+
+            # Update metrics if needed
+            if cleaned_count > 0:
+                metrics.client_count = len(self.clients)
+                print(f"Background cleanup removed {cleaned_count} disconnected clients. Active: {metrics.client_count}")
 
     def is_override_active(self):
         with self.client_lock:
