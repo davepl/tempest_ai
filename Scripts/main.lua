@@ -111,7 +111,7 @@ local function open_socket()
         
         -- Create a new socket connection
         socket = emu.file("rw")  -- "rw" mode for read/write
-        local result = socket:open("socket.127.0.0.1:9999")
+        local result = socket:open("socket.m2macpro.local:9999")
         
         if result == nil then
             print("Successfully opened socket connection to localhost:9999")
