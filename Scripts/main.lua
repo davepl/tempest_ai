@@ -111,7 +111,7 @@ local function open_socket()
         
         -- Create a new socket connection
         socket = emu.file("rw")  -- "rw" mode for read/write
-        local result = socket:open("socket.ubdellamd:9999")
+        local result = socket:open("socket.127.0.0.1:9999")
         
         if result == nil then
             print("Successfully opened socket connection to localhost:9999")
@@ -1491,6 +1491,10 @@ local function frame_callback()
             controls.fire_field:set_value(0)
             print("Releasing Fire")
         end
+        return true
+    elseif game_state.gamestate == 0x16 then
+        -- Game is in level select mode
+        controls:apply_action(0, 0, 9, game_state, player_state)
         return true
     end
 
