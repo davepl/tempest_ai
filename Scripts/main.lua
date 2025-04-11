@@ -261,7 +261,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Penalize if the COMMANDED movement (commanded_spinner) is OPPOSITE to the desired direction.
                 if desired_spinner * commanded_spinner < 0 then
                     -- Strong penalty for moving AWAY from the target.
-                    reward = reward - 150
+                    reward = reward - 50
                 -- No explicit reward for moving towards, let proximity handle that.
                 -- No penalty for staying still when misaligned (proximity reward decreases naturally).
                 end
@@ -554,11 +554,10 @@ function PlayerState:new()
     self.fire_detected = 0
     self.zap_detected = 0
     self.SpinnerAccum = 0
-    self.SpinnerDelta = 0
     self.prevSpinnerAccum = 0
-    self.inferredSpinnerDelta = 0
     self.fire_commanded = 0   -- Add fire_commanded field
     self.zap_commanded = 0    -- Add zap_commanded field
+    self.spinner_commanded = 0 -- Renamed from SpinnerDelta
     return self
 end
 
@@ -616,7 +615,8 @@ function PlayerState:update(mem)
     
     -- Store previous spinner position
     local currentSpinnerAccum = mem:read_u8(0x0051)
-    self.SpinnerDelta = mem:read_u8(0x0050)
+    -- Read the spinner delta from memory into the renamed field
+    self.spinner_commanded = mem:read_u8(0x0050) -- Value read here is overwritten later
     
     -- Calculate inferred delta by comparing with previous position
     local rawDelta = currentSpinnerAccum - self.prevSpinnerAccum
@@ -628,7 +628,9 @@ function PlayerState:update(mem)
         rawDelta = rawDelta + 256
     end
     
-    self.inferredSpinnerDelta = rawDelta
+    -- Rename spinner_delta to spinner_detected
+    self.spinner_detected = rawDelta
+
     self.SpinnerAccum = currentSpinnerAccum
     self.prevSpinnerAccum = currentSpinnerAccum
 end
@@ -1071,37 +1073,33 @@ end
 
 function Controls:apply_action(fire, zap, spinner, game_state, player_state)
     -- Fix the attract mode check - bit 0x80 being CLEAR indicates attract mode
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0 
     
     if is_attract_mode then
         -- In attract mode:
-        -- 1. Fire is always true regardless of physical control existence
-        self.fire_commanded = 1  -- Set this first, unconditionally
+        self.fire_commanded = 1
+        if self.fire_field then self.fire_field:set_value(1) end
+        self.zap_commanded = 0 -- Ensure zap is off
+        if self.zap_field then self.zap_field:set_value(0) end
         
-        -- Now set the physical control if it exists
-        if self.fire_field then 
-            self.fire_field:set_value(1)
-        end
-        
-        -- 2. Zap is always false (already set to 0 above)
-        
-        -- 3. Use inferred spinner delta
-        self.spinner_delta = player_state.inferredSpinnerDelta
+        -- Use the DETECTED spinner delta for display/state in attract mode
+        self.spinner_delta = player_state.spinner_detected -- Use renamed field
+        -- Do NOT write the model's spinner to memory in attract mode
         
     else
         -- In actual gameplay:
-        -- Always use the inferred spinner delta for display
-        self.spinner_delta = player_state.inferredSpinnerDelta
+        -- Use the DETECTED spinner delta for display/state
+        self.spinner_delta = player_state.spinner_detected -- Use renamed field
         
-        -- But apply the model's fire, zap, and spinner values to the physical controls
+        -- Apply the model's commanded actions
         self.fire_commanded = fire
         self.zap_commanded = zap
+        self.spinner_commanded = spinner -- This should probably be set here too if used elsewhere
 
         if self.fire_field then self.fire_field:set_value(fire) end
         if self.zap_field then self.zap_field:set_value(zap) end
         
-        -- Apply the model's spinner value to the game
-
+        -- Apply the model's commanded spinner value to the game's hardware register
         mem:write_u8(0x0050, spinner)
     end
 end
@@ -1530,11 +1528,6 @@ local function frame_callback()
     --    To do this, we first need to send the *previous* frame's state/reward/done.
     --    The flatten function packs the reward/done for the *current* frame into the OOB header,
     --    so we need a temporary flatten/send just to get the action.
-    --    This seems inefficient. Let's rethink. Python needs (s, a, r, s', d).
-    --    Lua sends s' and r/d for the transition that *ended* in s'.
-    --    So, Python receives (s', r, d) and needs to decide action 'a' for s'.
-
-    -- Let's simplify: Calculate reward first, flatten, send, get action.
 
     -- Calculate the reward based on the state *before* the commanded action is known.
     -- This is necessary because the reward is packed in the data sent *to* python.
@@ -1546,11 +1539,8 @@ local function frame_callback()
     --       We'll revert calculate_reward temporarily to not require commanded_spinner.
     -- TODO: Re-evaluate if calculate_reward *truly* needs commanded_spinner or if previous frame's effect is ok.
 
-    -- Calculate reward based on *previous* action's effect (using player_state.SpinnerDelta)
-    -- Revert calculate_reward call temporarily
-    -- local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, 0) -- Placeholder 0
-    -- Let's try using the inferred spinner delta from the player state, which reflects the last actual movement
-    local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.inferredSpinnerDelta)
+    -- Calculate reward based on *detected* movement from the previous frame
+    local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.spinner_detected)
 
     -- Flatten and serialize the game state data (using the calculated reward/bDone for OOB header)
     local frame_data
@@ -1567,7 +1557,7 @@ local function frame_callback()
 
     player_state.fire_commanded = fire
     player_state.zap_commanded = zap
-    player_state.SpinnerDelta = spinner
+    player_state.spinner_commanded = spinner -- Assign to renamed field
 
     -- Update total bytes sent
     total_bytes_sent = total_bytes_sent + #frame_data
@@ -1586,8 +1576,8 @@ local function frame_callback()
     if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then -- Added 0x24
         -- Apply the action determined by the AI (Python script) to MAME controls
         controls:apply_action(fire, zap, spinner, game_state, player_state)
-    elseif game_state.gamestate == 0x12 then -- This state might need verification too
-        -- Apply the action to MAME controls (Seems like hardcoded zap?)
+    elseif game_state.gamestate == 0x12 then -- This state might need verification too, but 
+        -- Apply the action to MAME controls for entering initials(Seems like hardcoded zap?)
         controls:apply_action(0, frame_count % 2, 0, game_state, player_state)
     end
 
@@ -1661,8 +1651,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Fire Detected", string.format("%d", player_state.fire_detected)},
         {"Zap Detected", string.format("%d", player_state.zap_detected)},
         {"SpinnerAccum", string.format("%d", player_state.SpinnerAccum)},
-        {"SpinnerDelta", string.format("%d", player_state.SpinnerDelta)},
-        {"InferredDelta", string.format("%d", player_state.inferredSpinnerDelta)}
+        {"SpinnerCmd", string.format("%d", player_state.spinner_commanded)}, -- Commanded value
+        {"SpinnerDet", string.format("%d", player_state.spinner_detected)} -- Detected value (renamed)
     }
     
     -- Calculate how many rows we need (ceiling of items/3)
@@ -1702,7 +1692,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     print(string.format("  %-25s: %d", "Fire (Inferred)", controls.fire_commanded))
     print(string.format("  %-25s: %d", "Superzapper (Inferred)", controls.zap_commanded))
-    print(string.format("  %-25s: %d", "Spinner Delta (Inferred)", controls.spinner_delta))
+    -- This uses the value from the Controls object, which is now set to spinner_detected
+    print(string.format("  %-25s: %d", "Spinner Delta (Detected)", controls.spinner_delta))
     print(string.format("  %-25s: %s", "Attract Mode", is_attract_mode and "Active" or "Inactive"))
     print("")
 
@@ -1710,7 +1701,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("--[ Model Output ]------------------------------------")
     print(string.format("  %-25s: %d", "Model Fire", player_state.fire_commanded))
     print(string.format("  %-25s: %d", "Model Zap", player_state.zap_commanded))
-    print(string.format("  %-25s: %d", "Model Spinner", player_state.SpinnerDelta))
+    print(string.format("  %-25s: %d", "Model Spinner", player_state.spinner_commanded))
     print("")
 
     -- Format and print level state at row 31
