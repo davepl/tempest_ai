@@ -35,10 +35,12 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Define constants
 local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 
-local LOG_ONLY_MODE           = false
-local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
 local SHOW_DISPLAY            = true
 local DISPLAY_UPDATE_INTERVAL = 0.05  
+
+-- Access the main CPU and memory space
+local mainCpu = nil
+local mem = nil
 
 local function clear_screen()
     io.write("\027[2J\027[H")
@@ -48,11 +50,6 @@ end
 local function move_cursor_home()
     io.write("\027[H")
 end
-
--- Log file for storing frame data
-local log_file = nil  -- Will hold the file handle, not the path
-local log_file_path = "/Users/dave/mame/tempest.log"  -- Store the path separately
-local log_file_opened = false  -- Track if we've already opened the file
 
 -- Global socket variable
 local socket = nil
@@ -66,41 +63,6 @@ local total_bytes_sent = 0
 -- Function to open socket connection
 local function open_socket()
     
-    if (LOG_ONLY_MODE) then
-
-        -- Only open the log file once to prevent truncation!
-        if log_file_opened then
-            return true
-        end
-        
-        -- Ensure log file is opened properly in binary mode
-        local log_success, log_err = pcall(function()
-            -- Close the log file if it's already open
-            if log_file then
-                log_file:close()
-                log_file = nil
-            end
-            
-            -- Open log file in binary mode, with explicit path - ONLY ONCE
-            log_file = io.open(log_file_path, "wb")
-            
-            if not log_file then
-                print("Failed to open log file: file handle is nil")
-                return false
-            end
-            
-            print("Successfully opened log file for writing")
-            log_file_opened = true  -- Mark as opened so we don't reopen
-        end)
-        
-        if not log_success then
-            print("Error opening log file: " .. tostring(log_err))
-            return false
-        end
-        
-        return true
-    end
-
     -- Try to open socket connection
     local socket_success, err = pcall(function()
         -- Close existing socket if any
@@ -131,19 +93,7 @@ local function open_socket()
         print("Error opening socket connection: " .. tostring(err or "unknown error"))
         return false
     end
-    
-    -- Open log file for appending in binary mode
-    if not log_file then
-        local log_success, log_err = pcall(function()
-            log_file = io.open("tempest.log", "ab")
-        end)
-        
-        if not log_success or not log_file then
-            print("Warning: Failed to open log file: " .. tostring(log_err))
-        else
-            print("Opened log file for frame data recording")
-        end
-    end
+   
     
     return true
 end
@@ -166,24 +116,18 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     local reward = 0
     local bDone = false
 
-    -- We want as many shots active as possible, but only up to 7, so that we have one in reserve for close enemies
-    
-    if (player_state.shot_count < 8) then
-        reward = reward + player_state.shot_count
-    end
-
     -- Base survival reward - make staying alive more valuable
     
     if player_state.alive == 1 then
 
         -- Stronger reward for maintaining lives
         if player_state.player_lives ~= nil then
-            reward = reward + (player_state.player_lives)
+            reward = reward + (player_state.player_lives) 
         end
 
         -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
-        if score_delta > 0 and score_delta < 5000 then
+        if score_delta > 0 and score_delta < 1000 then
             reward = reward + (score_delta * 5)  -- Amplify score impact
         end
 
@@ -205,37 +149,92 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         local target_segment = enemies_state:nearest_enemy_segment()
         local player_segment = player_state.position & 0x0F
 
-        -- Check to see if any enemy shots are active in our lane, and if so check the distance.  If it's less than or equal to 0x24
-        -- reward theplayer for moving out of the way of the enemy shot.
+        -- Check to see if any enemy shots are active in our lane, and if so check the distance.
+        local player_abs_segment = player_state.position & 0x0F
+        local is_open = level_state.level_type == 0xFF
 
+        -- *** Combined Threat Dodging Logic ***
+        local immediate_threat_in_lane = false
+
+        -- 1. Check for close enemy shots (depth <= 0x24)
         for i = 1, 4 do
-            if (enemies_state.enemy_shot_segments[i].value == player_segment) then
-                if (enemies_state.shot_positions[i] <= 0x24) then
-                    -- BUGBUG we should really check to see the commanded_spinner is in a direction
-                    --        that would have avoided the shot, but this is a good start.
-                    if (commanded_spinner == 0) then 
-                        reward = reward - 100
-                    else
-                        reward = reward + commanded_spinner * 100
+            local shot_abs_segment = mem:read_u8(enemies_state.enemy_shot_segments[i].address) & 0x0F
+            local shot_depth = enemies_state.shot_positions[i]
+            if shot_depth > 0 and shot_depth <= 0x24 and shot_abs_segment == player_abs_segment then
+                immediate_threat_in_lane = true
+                -- print("Threat: Close Shot") -- Debug
+                break -- Found a shot threat
+            end
+        end
+
+        -- 2. If no shot threat, check for close charging Fuseballs (depth <= 0x40)
+        if not immediate_threat_in_lane then
+            for i = 1, 7 do
+                -- Is it a Fuseball (type 4) moving towards player (bit 7 clear) and close enough?
+                if enemies_state.enemy_core_type[i] == 4 and 
+                   (enemies_state.active_enemy_info[i] & 0x80) == 0 and
+                   enemies_state.enemy_depths[i] <= 0x40 then
+                    
+                    -- Is it in the player's current absolute segment?
+                    local fuseball_abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F
+                    if fuseball_abs_segment == player_abs_segment then
+                        immediate_threat_in_lane = true
+                        -- print("Threat: Close Fuseball") -- Debug
+                        break -- Found a fuseball threat
                     end
                 end
             end
         end
 
+        -- 3. Apply reward/penalty if there is an immediate threat
+        if immediate_threat_in_lane then
+            if commanded_spinner == 0 then
+                -- Penalty for not moving when a threat is incoming
+                reward = reward - 100
+            else
+                -- Player commanded a move. Check if it's a valid dodge.
+                local valid_dodge = false
+                if not is_open then
+                    -- Closed level: any non-zero move is a dodge
+                    valid_dodge = true
+                else
+                    -- Open level: check edges
+                    if player_abs_segment == 0 then
+                        -- At left edge (0), only moving towards seg 1 (negative spinner) is valid
+                        if commanded_spinner < 0 then valid_dodge = true end
+                    elseif player_abs_segment == 15 then
+                        -- At right edge (15), only moving towards seg 14 (positive spinner) is valid
+                        if commanded_spinner > 0 then valid_dodge = true end
+                    else
+                        -- Not at an edge (1-14), any non-zero move is valid
+                        valid_dodge = true
+                    end
+                end
+
+                if valid_dodge then
+                    -- Reward successful dodge attempt, proportional to speed
+                    reward = reward + math.abs(commanded_spinner) * 100
+                -- else
+                    -- Optional: Penalize attempting to move off edge?
+                end
+            end
+        end
+        -- *** End Combined Threat Dodging Logic ***
+
         if target_segment < 0 or game_state.gamestate == 0x20 then
             -- No enemies: reward staying still more strongly
             -- Use commanded_spinner here to check if model *intended* to stay still
-            reward = reward + (commanded_spinner == 0 and 50 or -20)
+            reward = reward + (commanded_spinner == 0 and 150 or -20)
         else
             -- Get desired spinner direction, segment distance, AND enemy depth
             local desired_spinner, segment_distance, enemy_depth = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
             -- Check alignment based on actual segment distance
             if segment_distance == 0 then 
-                -- Massive reward for alignment + firing incentive
+                -- Big reward for alignment + firing incentive
                 reward = reward + 250
                 -- Bonus for shooting when aligned
-                if player_state.shot_count > 0 then
+                if player_state.fire_commanded then
                     reward = reward + 100
                 end
                 -- REMOVED penalty for movement when aligned; the alignment bonus incentivizes staying put.
@@ -262,7 +261,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Penalize if the COMMANDED movement (commanded_spinner) is OPPOSITE to the desired direction.
                 if desired_spinner * commanded_spinner < 0 then
                     -- Strong penalty for moving AWAY from the target.
-                    reward = reward - 50
+                    reward = reward - 150
                 -- No explicit reward for moving towards, let proximity handle that.
                 -- No penalty for staying still when misaligned (proximity reward decreases naturally).
                 end
@@ -297,32 +296,9 @@ end
 
 -- Function to send parameters and get action each frame
 local function process_frame(rawdata, player_state, controls, reward, bDone, bAttractMode)
-    -- In log-only mode, we only write to the log file and don't communicate with Python
-
-    -- Log the frame data to file
-    if log_file then
-        local success, err = pcall(function()
-            -- Write the raw data   
-            log_file:write(rawdata)
-            log_file:flush()  -- Ensure data is written to disk
-        end)
-        
-        if not success then
-            print("ERROR writing to log file: " .. tostring(err))
-        end
-    else
-        -- Log file not open, attempting to open it
-        print("Log file not open, attempting to reopen")
-        open_socket()
-    end
-    
     -- Increment frame count after processing
     frame_count = frame_count + 1
 
-    if LOG_ONLY_MODE then
-        return controls.fire_commanded, controls.zap_commanded, controls.spinner_delta
-    end
-    
     -- Check if socket is open, try to reopen if not
     if not socket then
         if not open_socket() then
@@ -402,76 +378,12 @@ local function process_frame(rawdata, player_state, controls, reward, bDone, bAt
     return fire, zap, spinner
 end
 
--- Call this during initialization
-local function start_python_script()
-    -- In log-only mode, we don't need to start the Python script
-    if LOG_ONLY_MODE then
-        print("Log-only mode: Skipping Python script startup")
-        
-        -- Still open the log file
-        local log_success, log_err = pcall(function()
-            log_file = io.open("tempest.log", "ab")
-        end)
-        
-        if not log_success or not log_file then
-            print("Warning: Failed to open log file: " .. tostring(log_err))
-        else
-            print("Opened log file for frame data recording")
-        end
-        
-        return true  -- Return success
-    end
-    
-    -- print("Starting Python script")
-    
-    -- Comment these out if you're trying to debug the Python side...
-
-    -- Kill any existing Python script instances
-    -- os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
-    
-    -- Launch Python script in the background with proper error handling
-    local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
-    local result = os.execute(cmd)
-    
-    if result ~= 0 then
-        print("Warning: Failed to start Python script")
-        return false
-    end
-    
-    -- Give Python script a moment to start up and create socket server
-    -- print("Waiting for Python script to initialize...")
-    os.execute("sleep 3")
-    
-    -- Check if Python script is running
-    local python_running = os.execute("pgrep -f 'python.*aimodel.py' >/dev/null") == 0
-    if not python_running then
-        print("Warning: Python script failed to start or terminated early")
-        print("Check /tmp/python_output.log for errors")
-        return false
-    end
-    
-    -- print("Python script started successfully")
-    
-    -- Try to open socket immediately
-    local socket_opened = open_socket()
-    if not socket_opened then
-        print("Initial socket connection failed, will retry during frame callback")
-    end
-    
-    return true
-end
-
-start_python_script()
 clear_screen()
 
 -- Add after the initial requires, before the GameState class
 
 -- Seed the random number generator once at script start
 math.randomseed(os.time())
-
--- Access the main CPU and memory space
-local mainCpu = nil
-local mem = nil
 
 -- Try to access machine using the manager API with proper error handling
 local success, err = pcall(function()
@@ -1515,7 +1427,7 @@ local function frame_callback()
         return true
     elseif game_state.gamestate == 0x16 then
         -- Game is in level select mode
-        controls:apply_action(0, 0, 9, game_state, player_state)
+        -- controls:apply_action(0, 0, 9, game_state, player_state)
         return true
     end
 
@@ -1536,83 +1448,60 @@ local function frame_callback()
     -- 2 Credits
     mem:write_u8(0x0006, 2)
 
-    -- Reset the countdown timer to zero all the time
-    mem:write_u8(0x0004, 0)
-
+    -- Reset the countdown timer to zero all the time in order to move quickly through attract mode
+    -- mem:write_u8(0x0004, 0)
     -- NOP out the jump that skips scoring in attract mode
-    mem:write_direct_u8(0xCA6F, 0xEA)
-    mem:write_direct_u8(0xCA70, 0xEA)
+    -- mem:write_direct_u8(0xCA6F, 0xEA)
+    -- mem:write_direct_u8(0xCA70, 0xEA)
     
     -- NOP out the damage the copy protection code does to memory when it detects a bad checksum
     mem:write_direct_u8(0xA591, 0xEA)
     mem:write_direct_u8(0xA592, 0xEA)
 
-    -- Initialize action to "none" as default
-    local action = "none"
     local status_message = ""
-
-    -- Massage game state to keep it out of the high score and banner modes
-    if game_state.countdown_timer > 0 then
-        -- Write 0 to memory location 4
-        mem:write_u8(0x0004, 0)
-        game_state.countdown_timer = 0
-    end
 
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
     -- In attract mode, zero the score if we're dead or zooming down the tube
 
     if is_attract_mode then
-        if game_state.gamestate == 0x06 or game_state.gamestate == 0x20 then
-            mem:write_direct_u8(0x0040, 0x00)
-            mem:write_direct_u8(0x0041, 0x00)
-            mem:write_direct_u8(0x0042, 0x00)
-        end
-        if AUTO_PLAY_MODE then
-            local port = manager.machine.ioport.ports[":IN2"]
-            -- Press P1 Start in MAME with proper press/release simulation
-            if game_state.frame_counter % 60 == 0 then
-                -- Try different possible field names
-                local startField = port.fields["1 Player Start"] or 
-                                   port.fields["P1 Start"] or 
-                                   port.fields["Start 1"]
-                
-                if startField then
-                    -- Press the button
-                    startField:set_value(1)
-                    print("Pressing 1 Player Start button in attract mode")
-                else
-                    print("Error: Could not find start button field")
-                end
-            elseif game_state.frame_counter % 60 == 5 then
-                -- Release the button 5 frames later
-                local startField = port.fields["1 Player Start"] or 
-                                   port.fields["P1 Start"] or 
-                                   port.fields["Start 1"]
-                
-                if startField then
-                    startField:set_value(0)
-                    print("Releasing 1 Player Start button")
-                end
+
+        local port = manager.machine.ioport.ports[":IN2"]
+        -- Press P1 Start in MAME with proper press/release simulation
+        if game_state.frame_counter % 60 == 0 then
+            -- Try different possible field names
+            local startField = port.fields["1 Player Start"] or 
+                                port.fields["P1 Start"] or 
+                                port.fields["Start 1"]
+            
+            if startField then
+                -- Press the button
+                startField:set_value(1)
+                print("Pressing 1 Player Start button in attract mode")
+            else
+                print("Error: Could not find start button field")
+            end
+        elseif game_state.frame_counter % 60 == 5 then
+            -- Release the button 5 frames later
+            local startField = port.fields["1 Player Start"] or 
+                                port.fields["P1 Start"] or 
+                                port.fields["Start 1"]
+            
+            if startField then
+                startField:set_value(0)
+                print("Releasing 1 Player Start button")
             end
         end
-    else
-        -- Four lives at all times
-        -- mem:write_direct_u8(0x0048, 0x04)
     end
-
     -- Calculate the reward for the current frame - do this ONCE per frame
     -- Note: We calculate reward *before* getting the commanded spinner for *this* frame.
     --       To use the commanded spinner *in* the reward calculation, we need to get it first.
     --       (Refactoring needed - see below)
 
-    -- NOP out the jump that skips scoring in attract mode
-    mem:write_direct_u8(0xCA6F, 0xEA)
-    mem:write_direct_u8(0xCA70, 0xEA)
-
     -- NOP out the clearing of zap_fire_new
-    mem:write_direct_u8(0x976E, 0x00)
-    mem:write_direct_u8(0x976F, 0x00)
+    -- mem:write_direct_u8(0x976E, 0x00)
+    -- mem:write_direct_u8(0x976F, 0x00)
+    
     -- Add periodic save mechanism based on frame counter instead of key press
     -- This will trigger a save every 30,000 frames (approximately 8 minutes at 60fps)
     if game_state.frame_counter % 30000 == 0 then
@@ -1684,10 +1573,8 @@ local function frame_callback()
     total_bytes_sent = total_bytes_sent + #frame_data
 
 
-    -- In LOG_ONLY_MODE, limit display updates to 10 times per second
     local current_time_high_res = os.clock()
-    local should_update_display = not LOG_ONLY_MODE or 
-                                    (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
+    local should_update_display = (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
 
     if should_update_display and SHOW_DISPLAY then
         -- Update the display with the current action and metrics
@@ -1738,7 +1625,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"FPS", string.format("%.2f", game_state.current_fps)},
         {"Payload Size", num_values},
         {"Last Reward", string.format("%.2f", LastRewardState)},
-        {"Log Only Mode", LOG_ONLY_MODE and "ENABLED" or "OFF"}
     }
     
     -- Calculate how many rows we need (ceiling of items/3)
@@ -1833,8 +1719,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     local enemy_states = {}
     local enemy_segs = {}
     local enemy_depths = {}
-    local enemy_lsbs = {}
-    local enemy_shot_lsbs = {}  -- New array for shot LSBs
     for i = 1, 7 do
         enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
         enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
@@ -1842,10 +1726,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         enemy_segs[i] = format_segment(enemies_state.enemy_segments[i])
         -- Display enemy depths as 2-digit hex values
         enemy_depths[i] = string.format("%02X", enemies_state.enemy_depths[i])
-        -- Display enemy LSBs as 2-digit hex values
-        enemy_lsbs[i] = string.format("%02X", enemies_state.enemy_depths_lsb[i])
-        -- Display enemy shot LSBs as 2-digit hex values
-        enemy_shot_lsbs[i] = string.format("%02X", enemies_state.enemy_shot_lsb[i])
     end
 
     local enemies_metrics = {
@@ -1887,8 +1767,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     print("  Enemies On Top: " .. table.concat(top_enemy_segs, " "))
 
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
-    print("  Enemy LSBs    : " .. table.concat(enemy_lsbs, " "))
-    print("  Shot LSBs     : " .. table.concat(enemy_shot_lsbs, " "))
     
     -- NEW: Display decoded enemy info tables
     local enemy_core_types_str = table.concat(enemies_state.enemy_core_type, " ")
@@ -1983,16 +1861,9 @@ local function on_mame_exit()
     if socket then socket:close(); socket = nil end
     print("Socket closed during MAME shutdown")
     
-    -- Close log file
-    if log_file then
-        log_file:close()
-        log_file = nil
-        print("Log file closed during MAME shutdown")
-    end
 end
 
 -- Start the Python script but don't wait for socket to open
-start_python_script()
 clear_screen()
 
 -- Register the frame callback with MAME.  Keep a reference to the callback or it will be garbage collected
