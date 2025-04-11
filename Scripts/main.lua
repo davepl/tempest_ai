@@ -175,16 +175,15 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     -- Base survival reward - make staying alive more valuable
     
     if player_state.alive == 1 then
-        reward = reward + 1  -- Constant reward for being alive each frame
 
         -- Stronger reward for maintaining lives
         if player_state.player_lives ~= nil then
             reward = reward + (player_state.player_lives)
         end
 
-        -- Score-based reward (keep this as a strong motivator)
+        -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
-        if score_delta > 0 then
+        if score_delta > 0 and score_delta < 5000 then
             reward = reward + (score_delta * 5)  -- Amplify score impact
         end
 
@@ -746,6 +745,9 @@ function EnemiesState:new()
     self.nearest_enemy_depth_raw = 255 -- Sentinel value (max depth)
     self.alignment_error_magnitude = 0.0
 
+    -- NEW: Array to track charging fuseballs by absolute segment (0-15 -> index 1-16)
+    self.charging_fuseball_segments = {}
+
     -- Enemy info arrays (Original)
     self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}    -- Raw type byte from $0169 (or similar)
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}  -- Raw state byte from $0170 (or similar)
@@ -888,6 +890,19 @@ function EnemiesState:update(mem)
             self.enemy_moving_away[i] = 0
             self.enemy_can_shoot[i] = 0
             self.enemy_split_behavior[i] = 0
+        end
+    end
+
+    -- NEW: Calculate charging Fuseball segments
+    -- Initialize with 16 zeros (for absolute segments 0-15 -> indices 1-16)
+    self.charging_fuseball_segments = {}
+    for i = 1, 7 do
+        -- Check if it's a Fuseball (type 4) and moving towards player (bit 7 of state byte is clear)
+        if self.enemy_core_type[i] == 4 and (self.active_enemy_info[i] & 0x80) == 0 then
+            -- Read the absolute segment directly from memory
+            local abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F -- Mask to 0-15
+            -- Set the flag in our table (use 1-based index)
+            self.charging_fuseball_segments[abs_segment + 1] = 1
         end
     end
 
@@ -1331,6 +1346,12 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- Enemy shot segments (fixed size: 4) - Relative segments
     for i = 1, 4 do
         table.insert(data, enemies_state.enemy_shot_segments[i].value or INVALID_SEGMENT) -- Use sentinel
+    end
+
+    -- NEW: Charging Fuseball flags per absolute segment (fixed size: 16)
+    for i = 1, 16 do
+        -- Insert 1 if a fuseball is charging towards the rim in this segment, 0 otherwise
+        table.insert(data, enemies_state.charging_fuseball_segments[i] or 0)
     end
         
     -- Additional game state (pulse beat, pulsing)
@@ -1918,6 +1939,19 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         if i % 16 == 0 then pending_seg_str = pending_seg_str .. "\n  " end
     end
     print("  Pending SEG   : " .. pending_seg_str)
+
+    -- NEW: Display charging fuseball flags per absolute segment
+    local charging_fuseball_str = {}
+    for i = 1, 16 do
+        if enemies_state.charging_fuseball_segments[i] == 1 then
+            table.insert(charging_fuseball_str, "*")
+        else
+            table.insert(charging_fuseball_str, "-")
+        end
+    end
+    print("  Fuseball Chrg : " .. table.concat(charging_fuseball_str, " "))
+    
+    print("")  -- Empty line after section
 end
 
 
