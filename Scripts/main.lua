@@ -28,31 +28,25 @@
     - Tempest ROM set loaded in MAME.
 --]]
 
+-- Define the server address as a global variable
+local SERVER_ADDRESS = "socket.localhost:9999"
+
 -- Add the Scripts directory to Lua's package path
-package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
+package.path = package.path .. ";/Users/dave/source/repos/tempest_ai/Scripts/?.lua"
 -- Now require the module by name only (without path or extension)
 
 -- Define constants
 local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 
-local LOG_ONLY_MODE           = false
-local AUTO_PLAY_MODE          = not LOG_ONLY_MODE
-local SHOW_DISPLAY            = true
-local DISPLAY_UPDATE_INTERVAL = 0.05  
+local AUTO_START_GAME         = true -- flag to control auto-starting during attract mode
 
-local function clear_screen()
-    io.write("\027[2J\027[H")
-end
+-- Timer and FPS tracking variables (Initialize globally)
+local lastTimerValue = 0 
+local lastFPSTime = os.time()
+local frameCountSinceLastFPS = 0 
 
--- Function to move the cursor to the home position using ANSI escape codes
-local function move_cursor_home()
-    io.write("\027[H")
-end
-
--- Log file for storing frame data
-local log_file = nil  -- Will hold the file handle, not the path
-local log_file_path = "/Users/dave/mame/tempest.log"  -- Store the path separately
-local log_file_opened = false  -- Track if we've already opened the file
+-- Load the display module
+local Display = require("display")
 
 -- Global socket variable
 local socket = nil
@@ -66,41 +60,6 @@ local total_bytes_sent = 0
 -- Function to open socket connection
 local function open_socket()
     
-    if (LOG_ONLY_MODE) then
-
-        -- Only open the log file once to prevent truncation!
-        if log_file_opened then
-            return true
-        end
-        
-        -- Ensure log file is opened properly in binary mode
-        local log_success, log_err = pcall(function()
-            -- Close the log file if it's already open
-            if log_file then
-                log_file:close()
-                log_file = nil
-            end
-            
-            -- Open log file in binary mode, with explicit path - ONLY ONCE
-            log_file = io.open(log_file_path, "wb")
-            
-            if not log_file then
-                print("Failed to open log file: file handle is nil")
-                return false
-            end
-            
-            print("Successfully opened log file for writing")
-            log_file_opened = true  -- Mark as opened so we don't reopen
-        end)
-        
-        if not log_success then
-            print("Error opening log file: " .. tostring(log_err))
-            return false
-        end
-        
-        return true
-    end
-
     -- Try to open socket connection
     local socket_success, err = pcall(function()
         -- Close existing socket if any
@@ -111,15 +70,16 @@ local function open_socket()
         
         -- Create a new socket connection
         socket = emu.file("rw")  -- "rw" mode for read/write
-        local result = socket:open("socket.m2macpro.local:9999")
+        -- Use the global SERVER_ADDRESS variable
+        local result = socket:open(SERVER_ADDRESS) 
         
         if result == nil then
-            print("Successfully opened socket connection to localhost:9999")
+            -- Update print statement to reflect the actual address used
+            print("Successfully opened socket connection to " .. SERVER_ADDRESS) 
             
             -- Send initial 4-byte ping for handshake
             local ping_data = string.pack(">H", 0)  -- 2-byte integer with value 0
             socket:write(ping_data)
-            print("Initial handshake ping sent")
         else
             print("Failed to open socket connection: " .. tostring(result))
             socket = nil
@@ -130,19 +90,6 @@ local function open_socket()
     if not socket_success or not socket then
         print("Error opening socket connection: " .. tostring(err or "unknown error"))
         return false
-    end
-    
-    -- Open log file for appending in binary mode
-    if not log_file then
-        local log_success, log_err = pcall(function()
-            log_file = io.open("tempest.log", "ab")
-        end)
-        
-        if not log_success or not log_file then
-            print("Warning: Failed to open log file: " .. tostring(log_err))
-        else
-            print("Opened log file for frame data recording")
-        end
     end
     
     return true
@@ -202,11 +149,11 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
                 
         -- Enemy targeting logic
-        local target_segment = enemies_state:nearest_enemy_segment()
+        local target_segment = enemies_state.nearest_enemy_seg 
         local player_segment = player_state.position & 0x0F
 
         -- Check to see if any enemy shots are active in our lane, and if so check the distance.  If it's less than or equal to 0x24
-        -- reward theplayer for moving out of the way of the enemy shot.
+        -- reward the player for moving out of the way of the enemy shot.
 
         for i = 1, 4 do
             if (enemies_state.enemy_shot_segments[i].value == player_segment) then
@@ -222,7 +169,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             end
         end
 
-        if target_segment < 0 or game_state.gamestate == 0x20 then
+        if target_segment == INVALID_SEGMENT or game_state.gamestate == 0x20 then 
             -- No enemies: reward staying still more strongly
             -- Use commanded_spinner here to check if model *intended* to stay still
             reward = reward + (commanded_spinner == 0 and 50 or -20)
@@ -297,32 +244,9 @@ end
 
 -- Function to send parameters and get action each frame
 local function process_frame(rawdata, player_state, controls, reward, bDone, bAttractMode)
-    -- In log-only mode, we only write to the log file and don't communicate with Python
-
-    -- Log the frame data to file
-    if log_file then
-        local success, err = pcall(function()
-            -- Write the raw data   
-            log_file:write(rawdata)
-            log_file:flush()  -- Ensure data is written to disk
-        end)
-        
-        if not success then
-            print("ERROR writing to log file: " .. tostring(err))
-        end
-    else
-        -- Log file not open, attempting to open it
-        print("Log file not open, attempting to reopen")
-        open_socket()
-    end
-    
     -- Increment frame count after processing
     frame_count = frame_count + 1
 
-    if LOG_ONLY_MODE then
-        return controls.fire_commanded, controls.zap_commanded, controls.spinner_delta
-    end
-    
     -- Check if socket is open, try to reopen if not
     if not socket then
         if not open_socket() then
@@ -402,72 +326,8 @@ local function process_frame(rawdata, player_state, controls, reward, bDone, bAt
     return fire, zap, spinner
 end
 
--- Call this during initialization
-local function start_python_script()
-    -- In log-only mode, we don't need to start the Python script
-    if LOG_ONLY_MODE then
-        print("Log-only mode: Skipping Python script startup")
-        
-        -- Still open the log file
-        local log_success, log_err = pcall(function()
-            log_file = io.open("tempest.log", "ab")
-        end)
-        
-        if not log_success or not log_file then
-            print("Warning: Failed to open log file: " .. tostring(log_err))
-        else
-            print("Opened log file for frame data recording")
-        end
-        
-        return true  -- Return success
-    end
-    
-    -- print("Starting Python script")
-    
-    -- Comment these out if you're trying to debug the Python side...
-
-    -- Kill any existing Python script instances
-    -- os.execute("pkill -f 'python.*aimodel.py' 2>/dev/null")
-    
-    -- Launch Python script in the background with proper error handling
-    local cmd = "python /Users/dave/source/repos/tempest/Scripts/aimodel.py >/tmp/python_output.log 2>&1 &"
-    local result = os.execute(cmd)
-    
-    if result ~= 0 then
-        print("Warning: Failed to start Python script")
-        return false
-    end
-    
-    -- Give Python script a moment to start up and create socket server
-    -- print("Waiting for Python script to initialize...")
-    os.execute("sleep 3")
-    
-    -- Check if Python script is running
-    local python_running = os.execute("pgrep -f 'python.*aimodel.py' >/dev/null") == 0
-    if not python_running then
-        print("Warning: Python script failed to start or terminated early")
-        print("Check /tmp/python_output.log for errors")
-        return false
-    end
-    
-    -- print("Python script started successfully")
-    
-    -- Try to open socket immediately
-    local socket_opened = open_socket()
-    if not socket_opened then
-        print("Initial socket connection failed, will retry during frame callback")
-    end
-    
-    return true
-end
-
-start_python_script()
-clear_screen()
-
--- Add after the initial requires, before the GameState class
-
--- Seed the random number generator once at script start
-math.randomseed(os.time())
+-- Use the global SERVER_ADDRESS variable for the print statement
+print("Connecting to server at " .. SERVER_ADDRESS) 
 
 -- Access the main CPU and memory space
 local mainCpu = nil
@@ -497,33 +357,11 @@ local success, err = pcall(function()
     end
 end)
 
+-- If the primary access method failed, print the error and stop the script.
 if not success then
-    print("Error accessing MAME machine: " .. tostring(err))
-    print("Attempting alternative access method...")
-    
-    -- Try alternative access methods
-    success, err = pcall(function()
-        -- Try accessing machine directly if available
-        if machine then
-            mainCpu = machine.devices[":maincpu"]
-            if not mainCpu then
-                error("Main CPU not found via machine")
-            end
-            
-            mem = mainCpu.spaces["program"]
-            if not mem then
-                error("Program memory space not found via machine")
-            end
-        else
-            error("Neither manager.machine nor machine is available")
-        end
-    end)
-    
-    if not success then
-        print("Error with alternative access method: " .. tostring(err))
-        print("FATAL: Cannot access MAME memory")
-        return
-    end
+    print("Error accessing MAME machine via manager: " .. tostring(err))
+    print("FATAL: Cannot access MAME memory")
+    return -- Stop script execution
 end
 
 print("Successfully accessed MAME memory interface")
@@ -537,15 +375,15 @@ function GameState:new()
     self.credits = 0
     self.p1_level = 0
     self.p1_lives = 0
-    self.gamestate = 0    -- Game state from address 0
-    self.game_mode = 0    -- Game mode from address 5
-    self.countdown_timer = 0  -- Countdown timer from address 4
-    self.frame_counter = 0  -- Frame counter for tracking progress
-    self.last_save_time = os.time()  -- Track when we last sent save signal
-    self.save_interval = 300  -- Send save signal every 5 minutes (300 seconds)
+    self.gamestate = 0                  -- Game state from address 0
+    self.game_mode = 0                  -- Game mode from address 5
+    self.countdown_timer = 0            -- Countdown timer from address 4
+    self.frame_counter = 0              -- Frame counter for tracking progress
+    self.last_save_time = os.time()     -- Track when we last sent save signal
+    self.save_interval = 300            -- Send save signal every 5 minutes (300 seconds)
     
     -- FPS tracking (now handled at global level, not in GameState)
-    self.current_fps = 0  -- Store the FPS value for display
+    self.current_fps = 0                -- Store the FPS value for display
     
     return self
 end
@@ -562,30 +400,6 @@ function GameState:update(mem)
     -- The current_fps is now only updated when FPS is calculated in frame_callback
 end
 
--- Store the last time a full debug dump was performed
-local last_debug_time = os.clock()
-
--- Enhanced debug print for the frame callback
-local function debug_dump_state()
-    local current_time = os.clock()
-    if current_time - last_debug_time < 5.0 then
-        return  -- Only dump debug info every 5 seconds
-    end
-    
-    last_debug_time = current_time
-    
-    print("\n----- DEBUG STATE DUMP -----")
-    print(string.format("Game counter: %d, Reported FPS: %.2f", 
-        game_state.frame_counter, game_state.current_fps))
-    
-    -- Dump timing data
-    print(string.format("Current time: %.6f, Last FPS time: %.6f, Diff: %.6f", 
-        current_time, game_state.last_fps_time, current_time - game_state.last_fps_time))
-    print(string.format("Frame count accum: %d", game_state.frame_count_accum))
-    print(string.format("Current timer value: %d", mem:read_u8(0x0003)))
-    print("---------------------------\n")
-end
-
 -- **LevelState Class**
 LevelState = {}
 LevelState.__index = LevelState
@@ -594,7 +408,7 @@ function LevelState:new()
     local self = setmetatable({}, LevelState)
     self.level_number = 0
     self.spike_heights = {}  -- Array of 16 spike heights
-    self.level_type = 0     -- 00 = closed, FF = open
+    self.is_open_level = false -- NEW field to track open level status
     self.level_angles = {}  -- Array of 16 tube angles
     self.level_shape = 0    -- Level shape (level_number % 16)
     return self
@@ -602,10 +416,8 @@ end
 
 function LevelState:update(mem)
     self.level_number = mem:read_u8(0x009F)  -- Example address for level number
-    self.level_type = mem:read_u8(0x0111)    -- Level type (00=closed, FF=open)
+    self.is_open_level = (mem:read_u8(0x0111) == 0xFF) -- Update the boolean field directly
     self.level_shape = self.level_number % 16  -- Calculate level shape
-    local player_pos = mem:read_u8(0x0200)   -- Player position
-    local is_open = self.level_type == 0xFF
     
     -- Read spike heights for all 16 segments and store them using absolute positions
     self.spike_heights = {}
@@ -650,7 +462,8 @@ function PlayerState:new()
     return self
 end
 
-function PlayerState:update(mem)
+-- Update PlayerState:update to accept level_state
+function PlayerState:update(mem, level_state)
     self.position = mem:read_u8(0x0200)          -- Player position
     self.player_state = mem:read_u8(0x0201)      -- Player state value at $201
     self.player_depth = mem:read_u8(0x0202)      -- Player depth along the tube
@@ -675,7 +488,8 @@ function PlayerState:update(mem)
     self.shot_count = mem:read_u8(0x0135)                   -- Number of active player shots
 
     -- Read all 8 shot positions and segments
-    local is_open = mem:read_u8(0x0111) == 0xFF
+    -- Use level_state.is_open_level instead of reading memory again
+    local is_open = level_state.is_open_level
     local player_abs_segment = self.position & 0x0F
     for i = 1, 8 do
         -- Read depth (position along the tube)
@@ -692,6 +506,7 @@ function PlayerState:update(mem)
             else
                  -- Valid position and valid segment read, calculate relative segment
                  abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
+                 -- Pass is_open from level_state
                  self.shot_segments[i] = absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
             end
         end
@@ -781,42 +596,44 @@ function EnemiesState:new()
     return self
 end
 
-function EnemiesState:update(mem)
+-- Update EnemiesState:update to accept level_state
+function EnemiesState:update(mem, level_state)
     -- First, initialize/reset all arrays at the beginning
     -- Reset enemy arrays
     -- Keep resetting original raw arrays
-    self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}
-    self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_shot_lsb = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_move_vectors = {0, 0, 0, 0, 0, 0, 0} -- Keep this reset if used elsewhere
-    self.enemy_state_flags = {0, 0, 0, 0, 0, 0, 0}  -- Keep this reset if used elsewhere
+    self.enemy_type_info        = {0, 0, 0, 0, 0, 0, 0}
+    self.active_enemy_info      = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_segments         = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_depths           = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_depths_lsb       = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_shot_lsb         = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_move_vectors     = {0, 0, 0, 0, 0, 0, 0} -- Keep this reset if used elsewhere
+    self.enemy_state_flags      = {0, 0, 0, 0, 0, 0, 0}  -- Keep this reset if used elsewhere
     -- NEW: Reset decoded tables
-    self.enemy_core_type = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_core_type        = {0, 0, 0, 0, 0, 0, 0}
     self.enemy_direction_moving = {0, 0, 0, 0, 0, 0, 0}
     self.enemy_between_segments = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_moving_away = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_can_shoot = {0, 0, 0, 0, 0, 0, 0}
-    self.enemy_split_behavior = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_moving_away      = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_can_shoot        = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_split_behavior   = {0, 0, 0, 0, 0, 0, 0}
 
     -- Read active enemies counts, pulse state, etc.
-    self.active_flippers  = mem:read_u8(0x0142)   -- n_flippers - current active count
-    self.active_pulsars   = mem:read_u8(0x0143)    -- n_pulsars
-    self.active_tankers   = mem:read_u8(0x0144)    -- n_tankers
-    self.active_spikers   = mem:read_u8(0x0145)    -- n_spikers
-    self.active_fuseballs = mem:read_u8(0x0146)  -- n_fuseballs
-    self.pulse_beat       = mem:read_u8(0x0147)        -- pulse_beat counter
-    self.pulsing          = mem:read_u8(0x0148)          -- pulsing state
-    self.pulsar_fliprate  = mem:read_u8(0x00B2)          -- NEW: Pulsar flip rate at $B2
-    self.num_enemies_in_tube = mem:read_u8(0x0108)
-    self.num_enemies_on_top = mem:read_u8(0x0109)
-    self.enemies_pending = mem:read_u8(0x03AB)
+    self.active_flippers        = mem:read_u8(0x0142)       -- n_flippers - current active count
+    self.active_pulsars         = mem:read_u8(0x0143)       -- n_pulsars
+    self.active_tankers         = mem:read_u8(0x0144)       -- n_tankers
+    self.active_spikers         = mem:read_u8(0x0145)       -- n_spikers
+    self.active_fuseballs       = mem:read_u8(0x0146)       -- n_fuseballs
+    self.pulse_beat             = mem:read_u8(0x0147)       -- pulse_beat counter
+    self.pulsing                = mem:read_u8(0x0148)       -- pulsing state
+    self.pulsar_fliprate        = mem:read_u8(0x00B2)       -- pulsar flip rate
+    self.num_enemies_in_tube    = mem:read_u8(0x0108)
+    self.num_enemies_on_top     = mem:read_u8(0x0109)
+    self.enemies_pending        = mem:read_u8(0x03AB)
 
     -- Update enemy shot segments from memory (store relative distances)
     local player_abs_segment = mem:read_u8(0x0200) & 0x0F -- Get current player absolute segment
-    local is_open = mem:read_u8(0x0111) == 0xFF
+    -- Use level_state.is_open_level
+    local is_open = level_state.is_open_level
 
     for i = 1, 4 do
         local abs_segment = mem:read_u8(self.enemy_shot_segments[i].address)
@@ -824,13 +641,15 @@ function EnemiesState:update(mem)
             self.enemy_shot_segments[i].value = INVALID_SEGMENT  -- Not active, use sentinel
         else
             local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
+            -- Pass is_open from level_state
             self.enemy_shot_segments[i].value = absolute_to_relative_segment(player_abs_segment, segment, is_open)
         end
     end
 
     -- Get player position and level type for relative calculations
     local player_pos = mem:read_u8(0x0200)
-    local is_open = mem:read_u8(0x0111) == 0xFF
+    -- Use level_state.is_open_level
+    -- local is_open = mem:read_u8(0x0111) == 0xFF -- No longer needed
 
     -- Read available spawn slots (how many more can be created)
     self.spawn_slots_flippers = mem:read_u8(0x013D)   -- avl_flippers - spawn slots available
@@ -851,6 +670,7 @@ function EnemiesState:update(mem)
         else
             local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
             -- Store relative segment distance
+            -- Pass is_open from level_state
             self.enemy_segments[i] = absolute_to_relative_segment(player_abs_segment, segment, is_open)
         end
     end
@@ -893,7 +713,6 @@ function EnemiesState:update(mem)
         end
     end
 
-    -- NEW: Calculate charging Fuseball segments
     -- Initialize with 16 zeros (for absolute segments 0-15 -> indices 1-16)
     self.charging_fuseball_segments = {}
     for i = 1, 7 do
@@ -925,6 +744,7 @@ function EnemiesState:update(mem)
         else
             local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
             -- Store relative segment distance
+            -- Pass is_open from level_state
             self.pending_seg[i] = absolute_to_relative_segment(player_abs_segment, segment, is_open)
         end
     end
@@ -945,6 +765,7 @@ function EnemiesState:update(mem)
         -- Calculate relative segment if command is active
         local rel_segment = INVALID_SEGMENT
         if command ~= 0 and depth ~= 0 and abs_segment >= 0 and abs_segment <= 15 then
+            -- Pass is_open from level_state
             rel_segment = absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
         end
 
@@ -958,7 +779,8 @@ function EnemiesState:update(mem)
 
     -- Calculate and store the relative nearest enemy segment for internal use
     -- Capture BOTH return values: absolute segment and depth
-    local nearest_abs_seg, nearest_depth = self:nearest_enemy_segment()
+    -- Pass level_state to nearest_enemy_segment
+    local nearest_abs_seg, nearest_depth = self:nearest_enemy_segment(level_state)
     if nearest_abs_seg == -1 then
         self.nearest_enemy_seg = INVALID_SEGMENT
         -- Set default values for engineered features when no enemy
@@ -966,7 +788,8 @@ function EnemiesState:update(mem)
         self.nearest_enemy_depth_raw = 255 -- Use max depth as sentinel
         self.alignment_error_magnitude = 0.0
     else
-        local nearest_rel_seg = absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, is_open)
+        -- Pass is_open from level_state
+        local nearest_rel_seg = absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, level_state.is_open_level)
         self.nearest_enemy_seg = nearest_rel_seg -- Store relative for internal use/display
         self.nearest_enemy_depth_raw = nearest_depth -- Store raw depth
 
@@ -976,7 +799,8 @@ function EnemiesState:update(mem)
         -- Calculate Alignment_Error_Magnitude (Scaled to 0-10000 for packing)
         local error_abs = math.abs(nearest_rel_seg)
         local normalized_error = 0.0
-        if is_open then
+        -- Use level_state.is_open_level
+        if level_state.is_open_level then
             -- Normalize based on max possible distance in open level (15)
             if error_abs > 0 then normalized_error = error_abs / 15.0 end
         else
@@ -991,14 +815,21 @@ end
 -- Find the *absolute* segment and depth of the enemy closest to the top of the tube
 -- This is used primarily for OOB data packing and targeting decisions that need absolute values.
 -- If multiple enemies share the minimum depth, it chooses the one closest in segment distance.
-function EnemiesState:nearest_enemy_segment()
+-- Update EnemiesState:nearest_enemy_segment to accept level_state
+function EnemiesState:nearest_enemy_segment(level_state)
+    -- Add check for nil level_state at the beginning of the function
+    if not level_state then
+        error("FATAL: level_state argument is nil inside EnemiesState:nearest_enemy_segment", 2) -- Level 2 error points to the caller
+    end
+
     local min_depth = 255
     local closest_absolute_segment = -1 -- Use -1 as sentinel for *absolute* segment not found
     local min_relative_distance_abs = 17 -- Sentinel for minimum absolute relative distance (max possible is 15 or 8)
 
     -- Get player state needed for relative calculations
     local player_abs_segment = mem:read_u8(0x0200) & 0x0F
-    local is_open = mem:read_u8(0x0111) == 0xFF
+    -- Use level_state.is_open_level
+    local is_open = level_state.is_open_level
 
     -- Check standard enemy table (7 slots)
     for i = 1, 7 do
@@ -1009,6 +840,7 @@ function EnemiesState:nearest_enemy_segment()
         -- Only consider active enemies with valid segments (0-15)
         if current_depth > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 then
             -- Calculate relative distance for this enemy
+            -- Pass is_open from level_state
             local current_relative_distance = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
             local current_relative_distance_abs = math.abs(current_relative_distance)
 
@@ -1031,13 +863,13 @@ function EnemiesState:nearest_enemy_segment()
     return closest_absolute_segment, min_depth
 end
 
--- function EnemiesState:depth_of_top_enemy() -- This will be removed later
-
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
     -- Get the *absolute* segment AND depth of nearest enemy from the dedicated function
-    local enemy_abs_seg, enemy_depth = enemies_state:nearest_enemy_segment()
+    -- Pass level_state
+    local enemy_abs_seg, enemy_depth = enemies_state:nearest_enemy_segment(level_state)
     local player_abs_seg = player_state.position & 0x0F
-    local is_open = level_state.level_type == 0xFF
+    -- Use level_state.is_open_level
+    local is_open = level_state.is_open_level
 
     -- If no enemy was found (absolute segment is -1)
     if enemy_abs_seg == -1 then
@@ -1045,6 +877,7 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
     end
 
     -- Calculate the relative segment distance using the helper function
+    -- Pass is_open from level_state
     local enemy_relative_dist = absolute_to_relative_segment(player_abs_seg, enemy_abs_seg, is_open)
 
     -- If already aligned (relative distance is 0)
@@ -1064,6 +897,7 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
 
     -- Set spinner direction based on the sign of the relative distance
     -- The absolute_to_relative_segment function handles open/closed logic correctly
+    -- Use is_open derived from level_state
     if is_open then
         -- Open Level: Positive relative distance means enemy is clockwise (higher segment index)
         -- We want to move counter-clockwise (negative spinner) towards it.
@@ -1114,33 +948,11 @@ Controls.__index = Controls
 function Controls:new()
     local self = setmetatable({}, Controls)
 
-    -- Debug: List all available ports and fields
-    for port_tag, port in pairs(manager.machine.ioport.ports) do
-        print("Port: " .. port_tag)
-        for field_name, field in pairs(port.fields) do
-            print("  Field: " .. field_name)
-        end
-    end
-
     -- Get button ports
     self.button_port = manager.machine.ioport.ports[":BUTTONSP1"]
-    print("Button port found: " .. (self.button_port and "Yes" or "No"))
-    if self.button_port then
-        print("Fire field found: " .. (self.button_port.fields["P1 Button 1"] and "Yes" or "No"))
-        if self.button_port.fields["P1 Button 1"] then
-            print("Fire field type: " .. type(self.button_port.fields["P1 Button 1"]))
-        end
-    end
     
     -- Get spinner/dial port
     self.spinner_port = manager.machine.ioport.ports[":KNOBP1"]
-    print("Spinner port found: " .. (self.spinner_port and "Yes" or "No"))
-    if self.spinner_port then
-        print("Dial field found: " .. (self.spinner_port.fields["Dial"] and "Yes" or "No"))
-        if self.spinner_port.fields["Dial"] then
-            print("Dial field type: " .. type(self.spinner_port.fields["Dial"]))
-        end
-    end
     
     -- Set up button fields
     self.fire_field = self.button_port and self.button_port.fields["P1 Button 1"] or nil
@@ -1149,48 +961,56 @@ function Controls:new()
     -- Set up spinner field
     self.spinner_field = self.spinner_port and self.spinner_port.fields["Dial"] or nil
     
-    -- Track commanded states
+    -- Track commanded states (consider if these are needed if player_state already tracks them)
     self.fire_commanded = 0
     self.zap_commanded = 0
     self.spinner_delta = 0
+
+    -- Validation prints during initialization (can be removed later if desired)
+    print("Button port found: " .. (self.button_port and "Yes" or "No"))
+    if self.button_port then
+        print("  Fire field found: " .. (self.fire_field and "Yes" or "No"))
+        print("  Zap field found: " .. (self.zap_field and "Yes" or "No"))
+    end
+    print("Spinner port found: " .. (self.spinner_port and "Yes" or "No"))
+    if self.spinner_port then
+        print("  Dial field found: " .. (self.spinner_field and "Yes" or "No"))
+    end
     
     return self
 end
 
+-- Controls:apply_action: Use player_state directly for inferred values
 function Controls:apply_action(fire, zap, spinner, game_state, player_state)
     -- Fix the attract mode check - bit 0x80 being CLEAR indicates attract mode
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     
     if is_attract_mode then
         -- In attract mode:
-        -- 1. Fire is always true regardless of physical control existence
-        self.fire_commanded = 1  -- Set this first, unconditionally
+        -- 1. Set fire command in player_state (model doesn't control attract mode fire)
+        player_state.fire_commanded = 1 
+        if self.fire_field then self.fire_field:set_value(1) end
         
-        -- Now set the physical control if it exists
-        if self.fire_field then 
-            self.fire_field:set_value(1)
-        end
-        
-        -- 2. Zap is always false (already set to 0 above)
-        
-        -- 3. Use inferred spinner delta
-        self.spinner_delta = player_state.inferredSpinnerDelta
+        -- 2. Ensure zap is off
+        player_state.zap_commanded = 0
+        if self.zap_field then self.zap_field:set_value(0) end
+
+        -- 3. Spinner delta is inferred (game controls it), update player_state.SpinnerDelta
+        player_state.SpinnerDelta = player_state.inferredSpinnerDelta 
         
     else
         -- In actual gameplay:
-        -- Always use the inferred spinner delta for display
-        self.spinner_delta = player_state.inferredSpinnerDelta
-        
-        -- But apply the model's fire, zap, and spinner values to the physical controls
-        self.fire_commanded = fire
-        self.zap_commanded = zap
+        -- Apply the model's fire, zap, and spinner values to the physical controls
+        -- Update player_state with the commanded values
+        player_state.fire_commanded = fire
+        player_state.zap_commanded = zap
+        player_state.SpinnerDelta = spinner -- This is the commanded spinner from Python
 
         if self.fire_field then self.fire_field:set_value(fire) end
         if self.zap_field then self.zap_field:set_value(zap) end
         
-        -- Apply the model's spinner value to the game
-
-        mem:write_u8(0x0050, spinner)
+        -- Apply the model's spinner value to the game's spinner delta input
+        if self.spinner_field then mem:write_u8(0x0050, spinner) end
     end
 end
 
@@ -1200,31 +1020,6 @@ local level_state = LevelState:new()
 local player_state = PlayerState:new()
 local enemies_state = EnemiesState:new()
 local controls = Controls:new()
-
--- Remove all ncurses-related code and replace with this display function
-local function format_section(title, metrics)
-    local width = 40
-    local separator = string.rep("-", width - 4)
-    local result = string.format("--[ %s ]%s\n", title, separator)
-    
-    -- Find the longest key for alignment
-    local max_key_length = 0
-    for key, _ in pairs(metrics) do
-        max_key_length = math.max(max_key_length, string.len(key))
-    end
-    
-    -- Format each metric
-    for key, value in pairs(metrics) do
-        result = result .. string.format("  %-" .. max_key_length .. "s : %s\n", key, tostring(value))
-    end
-    
-    return result .. "\n"
-end
-
--- Function to move the cursor to a specific row
-local function move_cursor_to_row(row)
-    io.write(string.format("\027[%d;0H", row))
-end
 
 -- Function to flatten and serialize the game state data to signed 16-bit integers
 local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
@@ -1275,9 +1070,10 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         table.insert(data, player_state.shot_segments[i] or INVALID_SEGMENT) -- Use sentinel
     end
 
-    -- Level state (3 values + arrays)
+    -- Level state (2 values + arrays) - Removed level_type
     table.insert(data, level_state.level_number)
-    table.insert(data, level_state.level_type)
+    -- Remove level_type from data payload
+    -- table.insert(data, level_state.level_type)
     table.insert(data, level_state.level_shape)
 
     -- Spike heights (fixed size: 16) - Absolute heights indexed 0-15 (as per user's accepted diff)
@@ -1404,10 +1200,11 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- It requires specific ABSOLUTE values.
 
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    local is_open_level = level_state.level_type == 0xFF
+    local is_open_level = level_state.is_open_level
 
     -- Get the ABSOLUTE nearest enemy segment (-1 sentinel) and depth for OOB packing
-    local nearest_abs_seg_oob, enemy_depth_oob = enemies_state:nearest_enemy_segment()
+    -- Pass level_state
+    local nearest_abs_seg_oob, enemy_depth_oob = enemies_state:nearest_enemy_segment(level_state)
     local player_abs_seg_oob = player_state.position & 0x0F -- Use absolute player segment 0-15
 
     local is_enemy_present_oob = (nearest_abs_seg_oob ~= -1) and 1 or 0 -- Check against -1 sentinel
@@ -1452,56 +1249,44 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
 end
 
 -- Update the frame_callback function to track bytes sent and calculate FPS
-local frame_counter = 0
-local lastTimer = 0
-local last_fps_time = os.time()  -- Use os.time() for wall clock time
-
--- Add a global tracker for timer value changes
-local timer_changes = 0
-local timer_check_start_time = os.clock()
-
--- Add a last update time tracker for precise intervals
-local last_update_time = os.clock()
-
--- Add tracking for different frame detection methods
-local last_player_position = nil
-local last_timer_value = nil
-local method_fps_counter = {0, 0, 0}  -- For 3 different methods
-local method_start_time = os.clock()
-
 local function frame_callback()
     -- Check the time counter at address 0x0003
     local currentTimer = mem:read_u8(0x0003)
     
     -- Check if the timer changed
-    if currentTimer == lastTimer then
+    if currentTimer == lastTimerValue then -- Use the global variable
         return true
     end
-    lastTimer = currentTimer
+    lastTimerValue = currentTimer -- Update the global variable
     
     -- Increment frame count and track FPS
-    frame_count = frame_count + 1
-    local current_time = os.time()
+    frameCountSinceLastFPS = frameCountSinceLastFPS + 1 -- Use the global variable
+    local currentTime = os.time()
     
     -- Calculate FPS every second
-    if current_time > last_fps_time then
-        -- Update the FPS display only when we calculate it
-        game_state.current_fps = frame_count  -- Update in GameState for display
-        frame_count = 0
-        last_fps_time = current_time
+    if currentTime > lastFPSTime then -- Use the global variable
+        -- Ensure division by zero doesn't happen if time hasn't advanced
+        local time_diff = currentTime - lastFPSTime
+        if time_diff > 0 then
+            game_state.current_fps = frameCountSinceLastFPS / time_diff -- More accurate FPS
+        else
+            game_state.current_fps = 0 -- Or some default if time hasn't advanced
+        end
+        frameCountSinceLastFPS = 0 -- Reset the global variable
+        lastFPSTime = currentTime -- Update the global variable
     end
     
     -- Update game state first
     game_state:update(mem)
     
-    -- Update level state next
-    level_state:update(mem)
+    -- Update level state next (Crucial: sets level_state.is_open_level)
+    level_state:update(mem) 
     
-    -- Update player state before enemies state
-    player_state:update(mem)
+    -- Update player state, passing the updated level_state
+    player_state:update(mem, level_state)
     
-    -- Update enemies state last to ensure all references are correct
-    enemies_state:update(mem)
+    -- Update enemies state last, passing the updated level_state
+    enemies_state:update(mem, level_state)
     
     -- Check if the game mode is in high score entry, mash AAA if it is
     if game_state.game_mode == 0x80 then
@@ -1514,41 +1299,47 @@ local function frame_callback()
         end
         return true
     elseif game_state.gamestate == 0x16 then
-        -- Game is in level select mode
-        controls:apply_action(0, 0, 9, game_state, player_state)
+        -- Game is in level select mode, advance selection 
+        -- controls:apply_action(0, 0, 9, game_state, player_state)
         return true
     end
-
-    -- Declare num_values at the start of the function
-    local num_values = 0
-    local bDone = false
 
     -- Check if socket is open, try to reopen if not
     if not socket then
         if not open_socket() then
-            -- If socket isn't open yet, just update the display without sending data
-            -- Update the display with empty controls
-            update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, num_values)
-            return true
+            -- If socket isn't open yet, display waiting message and try again next frame
+            if Display.SHOW_DISPLAY then 
+                Display.update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, 0, nil, total_bytes_sent, LastRewardState)
+            end
+            -- Do NOT return true here. Let the callback attempt connection again next frame.
+            -- The rest of the function (requiring the socket) will be skipped implicitly.
+            return true -- Still need to return true to MAME, but skip processing this frame's data
         end
+        -- If open_socket succeeded, socket is now not nil, and we proceed.
     end
 
-    -- 2 Credits
+    -- If we reach here, the socket should be open.
+
+    -- Declare num_values (will be set by flatten_game_state_to_binary)
+    local num_values = 0 
+    local bDone = false
+
+    -- 2 Credits (Consider if this needs to be set every frame)
     mem:write_u8(0x0006, 2)
 
-    -- Reset the countdown timer to zero all the time
+    -- Reset the countdown timer to zero all the time (Consider if this needs to be set every frame)
     mem:write_u8(0x0004, 0)
 
-    -- NOP out the jump that skips scoring in attract mode
+    -- NOP out the jump that skips scoring in attract mode (Can likely be done once at init)
     mem:write_direct_u8(0xCA6F, 0xEA)
     mem:write_direct_u8(0xCA70, 0xEA)
     
-    -- NOP out the damage the copy protection code does to memory when it detects a bad checksum
+    -- NOP out the damage the copy protection code does to memory when it detects a bad checksum (Can likely be done once at init)
     mem:write_direct_u8(0xA591, 0xEA)
     mem:write_direct_u8(0xA592, 0xEA)
 
-    -- Initialize action to "none" as default
-    local action = "none"
+    -- Initialize action to "none" as default (Redundant if 'action' var isn't used before assignment below?)
+    -- local action = "none" 
     local status_message = ""
 
     -- Massage game state to keep it out of the high score and banner modes
@@ -1560,401 +1351,76 @@ local function frame_callback()
 
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
-    -- In attract mode, zero the score if we're dead or zooming down the tube
-
+    -- Handle Attract Mode (P1 Start Button, Score Reset)
     if is_attract_mode then
+        -- Zero score if dead or zooming
         if game_state.gamestate == 0x06 or game_state.gamestate == 0x20 then
             mem:write_direct_u8(0x0040, 0x00)
             mem:write_direct_u8(0x0041, 0x00)
             mem:write_direct_u8(0x0042, 0x00)
         end
-        if AUTO_PLAY_MODE then
+        -- Auto-start logic
+        if AUTO_START_GAME then 
             local port = manager.machine.ioport.ports[":IN2"]
-            -- Press P1 Start in MAME with proper press/release simulation
-            if game_state.frame_counter % 60 == 0 then
-                -- Try different possible field names
+            if port then -- Check if port exists
                 local startField = port.fields["1 Player Start"] or 
                                    port.fields["P1 Start"] or 
                                    port.fields["Start 1"]
                 
                 if startField then
-                    -- Press the button
-                    startField:set_value(1)
-                    print("Pressing 1 Player Start button in attract mode")
+                    if game_state.frame_counter % 60 == 0 then
+                        startField:set_value(1)
+                    elseif game_state.frame_counter % 60 == 5 then
+                        startField:set_value(0)
+                    end
                 else
-                    print("Error: Could not find start button field")
+                     print("Error: Could not find start button field in :IN2")
                 end
-            elseif game_state.frame_counter % 60 == 5 then
-                -- Release the button 5 frames later
-                local startField = port.fields["1 Player Start"] or 
-                                   port.fields["P1 Start"] or 
-                                   port.fields["Start 1"]
-                
-                if startField then
-                    startField:set_value(0)
-                    print("Releasing 1 Player Start button")
-                end
+            else
+                print("Error: Could not find port :IN2")
             end
         end
-    else
-        -- Four lives at all times
-        -- mem:write_direct_u8(0x0048, 0x04)
-    end
+        -- In attract mode, we don't need to calculate reward or get actions from Python
+        -- We can potentially return early after handling display updates
+        
+    else 
+        -- Gameplay Mode Logic
+        -- Calculate reward based on previous action's effect
+        local reward, bDoneCurrent = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.inferredSpinnerDelta)
+        bDone = bDoneCurrent -- Update the main bDone flag
 
-    -- Calculate the reward for the current frame - do this ONCE per frame
-    -- Note: We calculate reward *before* getting the commanded spinner for *this* frame.
-    --       To use the commanded spinner *in* the reward calculation, we need to get it first.
-    --       (Refactoring needed - see below)
+        -- Flatten and serialize the game state data
+        local frame_data
+        frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
 
-    -- NOP out the jump that skips scoring in attract mode
-    mem:write_direct_u8(0xCA6F, 0xEA)
-    mem:write_direct_u8(0xCA70, 0xEA)
+        -- Send state and get action from Python
+        local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
 
-    -- NOP out the clearing of zap_fire_new
-    mem:write_direct_u8(0x976E, 0x00)
-    mem:write_direct_u8(0x976F, 0x00)
-    -- Add periodic save mechanism based on frame counter instead of key press
-    -- This will trigger a save every 30,000 frames (approximately 8 minutes at 60fps)
-    if game_state.frame_counter % 30000 == 0 then
-        print("Frame counter triggered save at frame " .. game_state.frame_counter)
-        game_state.last_save_time = 0  -- Force save on next frame
-    end
-    
-    -- Try to detect ESC key press using a more reliable method
-    -- Check for ESC key in all available ports
-    local esc_pressed = false
-    for port_name, port in pairs(manager.machine.ioport.ports) do
-        for field_name, field in pairs(port.fields) do
-            if field_name:find("ESC") or field_name:find("Escape") then
-                if field.pressed then
-                    print("ESC key detected - Triggering save")
-                    game_state.last_save_time = 0  -- Force save on next frame
-                    esc_pressed = true
-                    break
-                end
-            end
+        -- Update player_state with commanded actions
+        player_state.fire_commanded = fire
+        player_state.zap_commanded = zap
+        player_state.SpinnerDelta = spinner 
+
+        -- Update total bytes sent
+        total_bytes_sent = total_bytes_sent + #frame_data
+
+        -- Apply actions only in specific gameplay states
+        if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then
+            controls:apply_action(fire, zap, spinner, game_state, player_state)
         end
-        if esc_pressed then break end
     end
-    
-    -- 1. Get the action COMMANDED by the AI for the CURRENT state (from Python)
-    --    To do this, we first need to send the *previous* frame's state/reward/done.
-    --    The flatten function packs the reward/done for the *current* frame into the OOB header,
-    --    so we need a temporary flatten/send just to get the action.
-    --    This seems inefficient. Let's rethink. Python needs (s, a, r, s', d).
-    --    Lua sends s' and r/d for the transition that *ended* in s'.
-    --    So, Python receives (s', r, d) and needs to decide action 'a' for s'.
 
-    -- Let's simplify: Calculate reward first, flatten, send, get action.
-
-    -- Calculate the reward based on the state *before* the commanded action is known.
-    -- This is necessary because the reward is packed in the data sent *to* python.
-    -- We will pass 0 for commanded_spinner here as it's not known yet.
-    -- NOTE: This means the reward calculation CANNOT depend on the commanded spinner.
-    --       If it MUST, the protocol needs changing.
-    --       Let's assume for now it's okay to use the *previous* frame's commanded spinner (in player_state.SpinnerDelta)
-    --       or just ignore commanded spinner's effect on reward.
-    --       We'll revert calculate_reward temporarily to not require commanded_spinner.
-    -- TODO: Re-evaluate if calculate_reward *truly* needs commanded_spinner or if previous frame's effect is ok.
-
-    -- Calculate reward based on *previous* action's effect (using player_state.SpinnerDelta)
-    -- Revert calculate_reward call temporarily
-    -- local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, 0) -- Placeholder 0
-    -- Let's try using the inferred spinner delta from the player state, which reflects the last actual movement
-    local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.inferredSpinnerDelta)
-
-    -- Flatten and serialize the game state data (using the calculated reward/bDone for OOB header)
-    local frame_data
-    frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
-
-    -- Send the current state data (s') and reward/done (r, d) to Python,
-    -- and get the action (a) for this state (s') back.
-    local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
-
-    -- Now we have the commanded spinner for THIS frame (stored in local var 'spinner')
-
-    -- BOT: Example override (commented out)
-    -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-
-    player_state.fire_commanded = fire
-    player_state.zap_commanded = zap
-    player_state.SpinnerDelta = spinner
-
-    -- Update total bytes sent
-    total_bytes_sent = total_bytes_sent + #frame_data
-
-
-    -- In LOG_ONLY_MODE, limit display updates to 10 times per second
+    -- Update Display (if enabled and interval met)
     local current_time_high_res = os.clock()
-    local should_update_display = not LOG_ONLY_MODE or 
-                                    (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
-
-    if should_update_display and SHOW_DISPLAY then
-        -- Update the display with the current action and metrics
-        update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
+    local should_update_display = (current_time_high_res - last_display_update) >= Display.DISPLAY_UPDATE_INTERVAL 
+    if should_update_display and Display.SHOW_DISPLAY then 
+        -- The 'action' variable was never assigned, using placeholder 'N/A'
+        Display.update_display(status_message, game_state, level_state, player_state, enemies_state, "N/A", num_values, LastRewardState, total_bytes_sent, LastRewardState) 
         last_display_update = current_time_high_res
     end
 
-    -- We only control the game in regular play mode (04), zooming down the tube (20), AND High Score Entry (24)
-    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then -- Added 0x24
-        -- Apply the action determined by the AI (Python script) to MAME controls
-        controls:apply_action(fire, zap, spinner, game_state, player_state)
-    elseif game_state.gamestate == 0x12 then -- This state might need verification too
-        -- Apply the action to MAME controls (Seems like hardcoded zap?)
-        controls:apply_action(0, frame_count % 2, 0, game_state, player_state)
-    end
-
-    return true
+    return true -- Always return true to MAME to continue emulation
 end
-
--- Helper function to format segment values for display
-local function format_segment(value)
-    if value == INVALID_SEGMENT then
-        return "---"
-    else
-        -- Use %+03d: this ensures a sign and pads with 0 to a width of 2 digits (total 3 chars like +01, -07)
-        return string.format("%+03d", value)
-    end
-end
-
--- Update the update_display function to show total bytes sent and FPS
-function update_display(status, game_state, level_state, player_state, enemies_state, current_action, num_values, reward)
-    clear_screen()
-    move_cursor_to_row(1)
-
-    -- Format and print game state in 3 columns at row 1
-    print("--[ Game State ]--------------------------------------")
-    
-    -- Create game metrics in a more organized way for 3-column display
-    local game_metrics = {
-        {"Gamestate", string.format("0x%02X", game_state.gamestate)},
-        {"Game Mode", string.format("0x%02X", game_state.game_mode)},
-        {"Countdown", string.format("0x%02X", game_state.countdown_timer)},
-        {"Credits", game_state.credits},
-        {"P1 Lives", game_state.p1_lives},
-        {"P1 Level", game_state.p1_level},
-        {"Frame", game_state.frame_counter},
-        {"Bytes Sent", total_bytes_sent},
-        {"FPS", string.format("%.2f", game_state.current_fps)},
-        {"Payload Size", num_values},
-        {"Last Reward", string.format("%.2f", LastRewardState)},
-        {"Log Only Mode", LOG_ONLY_MODE and "ENABLED" or "OFF"}
-    }
-    
-    -- Calculate how many rows we need (ceiling of items/3)
-    local rows = math.ceil(#game_metrics / 3)
-    
-    for row = 1, rows do
-        local line = "  "
-        for col = 1, 3 do
-            local idx = (row - 1) * 3 + col
-            if idx <= #game_metrics then
-                local key, value = table.unpack(game_metrics[idx])
-                -- Format each metric with fixed width to fit in 80 columns
-                line = line .. string.format("%-14s: %-10s", key, tostring(value))
-            end
-        end
-        print(line)
-    end
-    print("")  -- Empty line after section
-
-    -- Format and print player state
-    print("--[ Player State ]------------------------------------")
-    
-    -- Create player metrics in a more organized way for 3-column display
-    local player_metrics = {
-        {"Position", string.format("%d", player_state.position)},
-        {"State", string.format("0x%02X", player_state.player_state)},
-        {"Depth", string.format("%d", player_state.player_depth)},
-        {"Alive", string.format("%d", player_state.alive)},
-        {"Score", string.format("%d", player_state.score)},
-        {"Szapper Uses", string.format("%d", player_state.superzapper_uses)},
-        {"Szapper Active", string.format("%d", player_state.superzapper_active)},
-        {"Shot Count", string.format("%d", player_state.shot_count)},
-        {"Debounce", string.format("%d", player_state.debounce)},
-        {"Fire Detected", string.format("%d", player_state.fire_detected)},
-        {"Zap Detected", string.format("%d", player_state.zap_detected)},
-        {"SpinnerAccum", string.format("%d", player_state.SpinnerAccum)},
-        {"SpinnerDelta", string.format("%d", player_state.SpinnerDelta)},
-        {"InferredDelta", string.format("%d", player_state.inferredSpinnerDelta)}
-    }
-    
-    -- Calculate how many rows we need (ceiling of items/3)
-    local rows = math.ceil(#player_metrics / 3)
-    
-    for row = 1, rows do
-        local line = "  "
-        for col = 1, 3 do
-            local idx = (row - 1) * 3 + col
-            if idx <= #player_metrics then
-                local key, value = table.unpack(player_metrics[idx])
-                -- Format each metric with fixed width to fit in 80 columns
-                line = line .. string.format("%-14s: %-10s", key, value)
-            end
-        end
-        print(line)
-    end
-    
-    -- Add shot positions on its own line
-    local shots_str = ""
-    for i = 1, 8 do
-        shots_str = shots_str .. string.format(" %02X ", player_state.shot_positions[i])
-    end
-    print("  Shot Positions: " .. shots_str)
-    
-    -- Display player shot segments as a separate line
-    local player_shot_segments_str = ""
-    for i = 1, 8 do
-        player_shot_segments_str = player_shot_segments_str .. format_segment(player_state.shot_segments[i]) .. " "
-    end
-    print("  Shot Segments : " .. player_shot_segments_str)
-    
-    print("")  -- Empty line after section
-
-    -- Format and print player controls
-    print("--[ Player Controls (Game Inferred Values) ]----------")
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    print(string.format("  %-25s: %d", "Fire (Inferred)", controls.fire_commanded))
-    print(string.format("  %-25s: %d", "Superzapper (Inferred)", controls.zap_commanded))
-    print(string.format("  %-25s: %d", "Spinner Delta (Inferred)", controls.spinner_delta))
-    print(string.format("  %-25s: %s", "Attract Mode", is_attract_mode and "Active" or "Inactive"))
-    print("")
-
-    -- Add Model State section
-    print("--[ Model Output ]------------------------------------")
-    print(string.format("  %-25s: %d", "Model Fire", player_state.fire_commanded))
-    print(string.format("  %-25s: %d", "Model Zap", player_state.zap_commanded))
-    print(string.format("  %-25s: %d", "Model Spinner", player_state.SpinnerDelta))
-    print("")
-
-    -- Format and print level state at row 31
-    move_cursor_to_row(31)
-    local enemy_types = {}
-    local enemy_states = {}
-    local enemy_segs = {}
-    local enemy_depths = {}
-    local enemy_lsbs = {}
-    local enemy_shot_lsbs = {}  -- New array for shot LSBs
-    for i = 1, 7 do
-        enemy_types[i] = enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i])
-        enemy_states[i] = enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i])
-        -- Format enemy segments using the helper function
-        enemy_segs[i] = format_segment(enemies_state.enemy_segments[i])
-        -- Display enemy depths as 2-digit hex values
-        enemy_depths[i] = string.format("%02X", enemies_state.enemy_depths[i])
-        -- Display enemy LSBs as 2-digit hex values
-        enemy_lsbs[i] = string.format("%02X", enemies_state.enemy_depths_lsb[i])
-        -- Display enemy shot LSBs as 2-digit hex values
-        enemy_shot_lsbs[i] = string.format("%02X", enemies_state.enemy_shot_lsb[i])
-    end
-
-    local enemies_metrics = {
-        ["Flippers"] = string.format("%d active, %d spawn slots", enemies_state.active_flippers, enemies_state.spawn_slots_flippers),
-        ["Pulsars"] = string.format("%d active, %d spawn slots", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars),
-        ["Tankers"] = string.format("%d active, %d spawn slots", enemies_state.active_tankers, enemies_state.spawn_slots_tankers),
-        ["Spikers"] = string.format("%d active, %d spawn slots", enemies_state.active_spikers, enemies_state.spawn_slots_spikers),
-        ["Fuseballs"] = string.format("%d active, %d spawn slots", enemies_state.active_fuseballs, enemies_state.spawn_slots_fuseballs),
-        ["Total"] = string.format("%d active, %d spawn slots", 
-            enemies_state:get_total_active(),
-            enemies_state.spawn_slots_flippers + enemies_state.spawn_slots_pulsars + 
-            enemies_state.spawn_slots_tankers + enemies_state.spawn_slots_spikers + 
-            enemies_state.spawn_slots_fuseballs),
-        ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
-        ["Flip Rate"] = string.format("%02X", enemies_state.pulsar_fliprate), -- NEW: Display Pulsar Flip Rate
-        ["In Tube"] = string.format("%d enemies", enemies_state.num_enemies_in_tube),
-        -- Display relative nearest enemy segment using format_segment
-        ["Nearest Enemy"] = string.format("segment %s", format_segment(enemies_state.nearest_enemy_seg)),
-        ["On Top"] = string.format("%d enemies", enemies_state.num_enemies_on_top),
-        ["Pending"] = string.format("%d enemies", enemies_state.enemies_pending),
-        ["Enemy Types"] = table.concat(enemy_types, " "),
-        ["Enemy States"] = table.concat(enemy_states, " ")
-    }
-
-    print(format_section("Enemies State", enemies_metrics))
-
-    -- Add enemy segments and depths on their own lines
-    print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
-
-    -- NEW: Display segments of enemies specifically at depth 0x10
-    local top_enemy_segs = {}
-    for i = 1, 7 do
-        if enemies_state.enemy_depths[i] == 0x10 then
-            top_enemy_segs[i] = format_segment(enemies_state.enemy_segments[i])
-        else
-            top_enemy_segs[i] = format_segment(INVALID_SEGMENT)
-        end
-    end
-    print("  Enemies On Top: " .. table.concat(top_enemy_segs, " "))
-
-    print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
-    print("  Enemy LSBs    : " .. table.concat(enemy_lsbs, " "))
-    print("  Shot LSBs     : " .. table.concat(enemy_shot_lsbs, " "))
-    
-    -- NEW: Display decoded enemy info tables
-    local enemy_core_types_str = table.concat(enemies_state.enemy_core_type, " ")
-    local enemy_dir_mov_str = table.concat(enemies_state.enemy_direction_moving, " ")
-    local enemy_between_str = table.concat(enemies_state.enemy_between_segments, " ")
-    local enemy_mov_away_str = table.concat(enemies_state.enemy_moving_away, " ")
-    local enemy_can_shoot_str = table.concat(enemies_state.enemy_can_shoot, " ")
-    local enemy_split_str = table.concat(enemies_state.enemy_split_behavior, " ")
-    
-    print("  Enemy Core Type: " .. enemy_core_types_str)
-    print("  Enemy Dir Mov  : " .. enemy_dir_mov_str)
-    print("  Enemy Between  : " .. enemy_between_str)
-    print("  Enemy Mov Away : " .. enemy_mov_away_str)
-    print("  Enemy Can Shoot: " .. enemy_can_shoot_str)
-    print("  Enemy Split Bhv: " .. enemy_split_str)
-    
-    -- Add enemy shot positions in a simple fixed format
-    local shot_positions_str = ""
-    for i = 1, 4 do
-        local pos_value = enemies_state.shot_positions[i] or 0
-        -- Mask to 8 bits (0-255) to display only one byte
-        pos_value = pos_value & 0xFF
-        shot_positions_str = shot_positions_str .. string.format(" %02X ", pos_value)
-    end
-    print("  Shot Positions: " .. shot_positions_str)
-    
-    -- Display enemy shot segments using format_segment
-    local shot_segments_str = ""
-    for i = 1, 4 do
-        shot_segments_str = shot_segments_str .. format_segment(enemies_state.enemy_shot_segments[i].value) .. " "
-    end
-    print("  Shot Segments : " .. shot_segments_str)
-    
-    print("")  -- Empty line after section
-
-    -- Display pending_vid (64 bytes)
-    local pending_vid_str = ""
-    for i = 1, 64 do
-        pending_vid_str = pending_vid_str .. string.format("%02X ", enemies_state.pending_vid[i])
-        if i % 16 == 0 then pending_vid_str = pending_vid_str .. "\n  " end
-    end
-    print("  Pending VID   : " .. pending_vid_str)
-
-    -- Display pending_seg similarly
-    local pending_seg_str = ""
-    for i = 1, 64 do
-        pending_seg_str = pending_seg_str .. format_segment(enemies_state.pending_seg[i]) .. " "
-        if i % 16 == 0 then pending_seg_str = pending_seg_str .. "\n  " end
-    end
-    print("  Pending SEG   : " .. pending_seg_str)
-
-    -- NEW: Display charging fuseball flags per absolute segment
-    local charging_fuseball_str = {}
-    for i = 1, 16 do
-        if enemies_state.charging_fuseball_segments[i] == 1 then
-            table.insert(charging_fuseball_str, "*")
-        else
-            table.insert(charging_fuseball_str, "-")
-        end
-    end
-    print("  Fuseball Chrg : " .. table.concat(charging_fuseball_str, " "))
-    
-    print("")  -- Empty line after section
-end
-
-
 
 -- Function to be called when MAME is shutting down
 local function on_mame_exit()
@@ -1967,7 +1433,8 @@ local function on_mame_exit()
     -- We can use the existing objects since they should still be valid
     if game_state and level_state and player_state and enemies_state then
         -- Calculate reward one more time
-        local reward = calculate_reward(game_state, level_state, player_state, enemies_state)
+        -- Pass 0 for commanded_spinner as it's shutdown
+        local reward = calculate_reward(game_state, level_state, player_state, enemies_state, 0) 
         
         -- Get final frame data with save signal
         local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, true)
@@ -1981,19 +1448,8 @@ local function on_mame_exit()
     
     -- Close socket
     if socket then socket:close(); socket = nil end
-    print("Socket closed during MAME shutdown")
-    
-    -- Close log file
-    if log_file then
-        log_file:close()
-        log_file = nil
-        print("Log file closed during MAME shutdown")
-    end
+    print("Socket closed during MAME shutdown")    
 end
-
--- Start the Python script but don't wait for socket to open
-start_python_script()
-clear_screen()
 
 -- Register the frame callback with MAME.  Keep a reference to the callback or it will be garbage collected
 callback_ref = emu.add_machine_frame_notifier(frame_callback)
