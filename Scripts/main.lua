@@ -36,20 +36,30 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest_ai/Scripts/?.l
 
 local AUTO_START_GAME         = true -- flag to control auto-starting during attract mode
 
--- Timer and FPS tracking variables (Initialize globally)
-local lastTimerValue         = 0 
+-- Timer and FPS tracking variables 
 local lastFPSTime            = os.time()
 local frameCountSinceLastFPS = 0 
 local socket                 = nil
 local frame_count            = 0 
 local total_bytes_sent       = 0
 
--- Load the display module
+-- Access the main CPU and memory space
+local mainCpu = nil
+local mem = nil
+
+-- Tracking variables
+local previous_score = 0
+local previous_level = 0
+local previous_alive_state = 1  -- Track previous alive state, initialize as alive
+local LastRewardState = 0
+local shutdown_requested = false
+local last_display_update = 0  -- Timestamp of last display update
+
+-- Load the required modules
 local Display       = require("display")
 local SegmentUtils  = require("segment")
 local StateUtils    = require("state")
 
--- Global socket variable
 
 -- Function to open socket connection
 local function open_socket()
@@ -85,18 +95,6 @@ local function open_socket()
     return true
 end
 
-
--- Declare global variables for reward calculation
-local previous_score = 0
-local previous_level = 0
-local previous_alive_state = 1  -- Track previous alive state, initialize as alive
-
--- Declare a global variable to store the last reward state
-local LastRewardState = 0
-
-local shutdown_requested = false
-
-local last_display_update = 0  -- Timestamp of last display update
 
 -- Function to calculate reward for the current frame
 local function calculate_reward(game_state, level_state, player_state, enemies_state, commanded_spinner)
@@ -303,13 +301,6 @@ local function process_frame(rawdata, player_state, reward, bDone, bAttractMode)
     return fire, zap, spinner
 end
 
--- Use the global SERVER_ADDRESS variable for the print statement
-print("Connecting to server at " .. SERVER_ADDRESS) 
-
--- Access the main CPU and memory space
-local mainCpu = nil
-local mem = nil
-
 -- Try to access machine using the manager API with proper error handling
 local success, err = pcall(function()
     -- First, check if manager is available
@@ -334,22 +325,12 @@ local success, err = pcall(function()
     end
 end)
 
--- If the primary access method failed, print the error and stop the script.
-if not success then
-    print("Error accessing MAME machine via manager: " .. tostring(err))
-        print("FATAL: Cannot access MAME memory")
-    return -- Stop script execution
-end
-
-print("Successfully accessed MAME memory interface")
-
--- Instantiate state objects using StateUtils
-local game_state = StateUtils.GameState:new()
-local level_state = StateUtils.LevelState:new()
-local player_state = StateUtils.PlayerState:new()
+-- Instantiate state objects 
+local game_state    = StateUtils.GameState:new()
+local level_state   = StateUtils.LevelState:new()
+local player_state  = StateUtils.PlayerState:new()
 local enemies_state = StateUtils.EnemiesState:new()
--- Instantiate ControlState from StateUtils
-local controls = StateUtils.ControlState:new() 
+local controls      = StateUtils.ControlState:new() 
 
 -- Update the frame_callback function
 local function frame_callback()
@@ -495,6 +476,7 @@ local function frame_callback()
 end
 
 -- Function to be called when MAME is shutting down
+
 local function on_mame_exit()
     print("MAME is shutting down - Sending final save signal")
     shutdown_requested = true
