@@ -205,7 +205,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             bDone = true
         end
     end
-o
+
     -- Update previous values
     previous_score = player_state.score
     previous_level = level_state.level_number

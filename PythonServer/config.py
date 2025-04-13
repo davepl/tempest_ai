@@ -72,6 +72,8 @@ class MetricsData:
     dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    expert_inference_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    dqn_inference_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
     epsilon: float = 1.0
     expert_ratio: float = 0.75
     last_decay_step: int = 0
@@ -217,6 +219,16 @@ class MetricsData:
                 # Import here to avoid circular import at top level
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}\r")
+
+    def update_expert_inference_time(self, time_ms: float):
+        """Update expert inference time tracking"""
+        with self.lock:
+            self.expert_inference_times.append(time_ms)
+
+    def update_dqn_inference_time(self, time_ms: float):
+        """Update DQN inference time tracking"""
+        with self.lock:
+            self.dqn_inference_times.append(time_ms)
 
 # Define action space
 ACTION_MAPPING = {
