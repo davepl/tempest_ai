@@ -1,9 +1,9 @@
 -- display.lua: Module for handling console display output
 
 local Display = {}
+local SegmentUtils = require("segment") -- Require segment utils
 
 -- Define constants locally within the module
-local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 local SHOW_DISPLAY = true
 local DISPLAY_UPDATE_INTERVAL = 0.05  
 
@@ -22,7 +22,8 @@ end
 
 -- Helper function to format segment values for display
 local function format_segment(value)
-    if value == INVALID_SEGMENT then
+    -- Use constant from SegmentUtils
+    if value == SegmentUtils.INVALID_SEGMENT then 
         return "---"
     else
         -- Use %+03d: this ensures a sign and pads with 0 to a width of 2 digits (total 3 chars like +01, -07)
@@ -163,7 +164,7 @@ function Display.update_display(status, game_state, level_state, player_state, e
     -- Add shot positions on its own line
     local shots_str = ""
     for i = 1, 8 do
-        shots_str = shots_str .. string.format(" %02X ", player_state.shot_positions[i])
+        shots_str = shots_str .. string.format("  %02X ", player_state.shot_positions[i])
     end
     print("  Shot Positions: " .. shots_str)
     
@@ -172,7 +173,7 @@ function Display.update_display(status, game_state, level_state, player_state, e
     for i = 1, 8 do
         player_shot_segments_str = player_shot_segments_str .. format_segment(player_state.shot_segments[i]) .. " " -- Call local format_segment
     end
-    print("  Shot Segments : " .. player_shot_segments_str)
+    print("  Shot Segments  : " .. player_shot_segments_str)
     
     print("")  -- Empty line after section
 
@@ -191,17 +192,21 @@ function Display.update_display(status, game_state, level_state, player_state, e
     local enemy_states = {}
     local enemy_segs = {}
     local enemy_depths = {}
-    local enemy_lsbs = {}
-    local enemy_shot_lsbs = {}  -- New array for shot LSBs
+    local enemy_lsbs = {} -- Still includes depth LSB, remove later if confirmed unused
+    -- local enemy_shot_lsbs = {}  -- Initialize later
+
     for i = 1, 7 do
-        -- Need access to enemies_state:decode_enemy_type/state
-        -- These should ideally be moved here too or passed in
-        -- For now, assume they are available globally or refactor later
-        enemy_types[i] = decode_enemy_type(enemies_state.enemy_type_info[i]) -- Use local decode function
-        enemy_states[i] = decode_enemy_state(enemies_state.active_enemy_info[i]) -- Use local decode function
-        enemy_segs[i] = format_segment(enemies_state.enemy_segments[i]) -- Call local format_segment
-        enemy_depths[i] = string.format("%02X", enemies_state.enemy_depths[i])
-        enemy_lsbs[i] = string.format("%02X", enemies_state.enemy_depths_lsb[i])
+        enemy_types[i] = decode_enemy_type(enemies_state.enemy_type_info[i]) 
+        enemy_states[i] = decode_enemy_state(enemies_state.active_enemy_info[i]) 
+        enemy_segs[i] = format_segment(enemies_state.enemy_segments[i]) 
+        enemy_depths[i] = string.format(" %02X", enemies_state.enemy_depths[i])
+        enemy_lsbs[i] = string.format(" %02X", enemies_state.enemy_depths_lsb[i]) -- Still formatting depth LSB
+        -- Removed shot LSB formatting from this loop
+    end
+
+    -- Populate enemy_shot_lsbs separately for the 4 shots
+    local enemy_shot_lsbs = {} 
+    for i = 1, 4 do
         enemy_shot_lsbs[i] = string.format("%02X", enemies_state.enemy_shot_lsb[i])
     end
 
@@ -229,7 +234,7 @@ function Display.update_display(status, game_state, level_state, player_state, e
     print(format_section("Enemies State", enemies_metrics)) -- Call local format_section
 
     -- Add enemy segments and depths on their own lines
-    print("  Enemy Segments: " .. table.concat(enemy_segs, " "))
+    print("  Enemy Segments : " .. table.concat(enemy_segs, " "))
 
     -- Display segments of enemies specifically at depth 0x10
     local top_enemy_segs = {}
@@ -237,15 +242,14 @@ function Display.update_display(status, game_state, level_state, player_state, e
         if enemies_state.enemy_depths[i] == 0x10 then
             top_enemy_segs[i] = format_segment(enemies_state.enemy_segments[i]) -- Call local format_segment
         else
-            top_enemy_segs[i] = format_segment(INVALID_SEGMENT) -- Use local constant
+            top_enemy_segs[i] = format_segment(SegmentUtils.INVALID_SEGMENT) -- Use constant from SegmentUtils
         end
     end
-    print("  Enemies On Top: " .. table.concat(top_enemy_segs, " "))
+    print("  Enemies On Top : " .. table.concat(top_enemy_segs, " "))
+    print("  Enemy Depths   : " .. table.concat(enemy_depths, " "))
+    -- Add the line to print the Enemy Depth LSBs
+    print("  Enemy LSBs     : " .. table.concat(enemy_lsbs, " ")) 
 
-    print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
-    print("  Enemy LSBs    : " .. table.concat(enemy_lsbs, " "))
-    print("  Shot LSBs     : " .. table.concat(enemy_shot_lsbs, " "))
-    
     -- Display decoded enemy info tables
     local enemy_core_types_str = table.concat(enemies_state.enemy_core_type, " ")
     local enemy_dir_mov_str = table.concat(enemies_state.enemy_direction_moving, " ")
@@ -266,16 +270,17 @@ function Display.update_display(status, game_state, level_state, player_state, e
     for i = 1, 4 do
         local pos_value = enemies_state.shot_positions[i] or 0
         pos_value = pos_value & 0xFF
-        shot_positions_str = shot_positions_str .. string.format(" %02X ", pos_value)
+        shot_positions_str = shot_positions_str .. string.format("%02X ", pos_value)
     end
-    print("  Shot Positions: " .. shot_positions_str)
-    
+    print("  Shot Positions : " .. shot_positions_str)
+    print("  Shot LSBs      : " .. table.concat(enemy_shot_lsbs, " ")) -- Now prints correctly formatted 4 LSBs + placeholders
+
     -- Display enemy shot segments using format_segment
     local shot_segments_str = ""
     for i = 1, 4 do
         shot_segments_str = shot_segments_str .. format_segment(enemies_state.enemy_shot_segments[i].value) .. " " -- Call local format_segment
     end
-    print("  Shot Segments : " .. shot_segments_str)
+    print("  Shot Segments  : " .. shot_segments_str)
     
     print("")  -- Empty line after section
 
