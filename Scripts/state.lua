@@ -29,7 +29,15 @@ end
 
 function GameState:update(mem) -- Keep mem parameter for clarity, even if relying on global
     self.gamestate = mem:read_u8(0x0000)
-    self.game_mode = mem:read_u8(0x0005)
+
+    local mode_read = mem:read_u8(0x0005)
+    if mode_read == nil then
+        print("Warning: Failed to read game_mode (0x0005). Defaulting to 0.")
+        self.game_mode = 0 -- Assign a default value
+    else
+        self.game_mode = mode_read -- Assign the read value
+    end
+
     self.countdown_timer = mem:read_u8(0x0004)
     self.credits = mem:read_u8(0x0006)
     self.p1_level = mem:read_u8(0x0046)

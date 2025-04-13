@@ -201,11 +201,11 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     else -- Player not alive
         -- Massive penalty for death to prioritize survival, equal to the cost of a bonus life in points
         if previous_alive_state == 1 then
-            reward = reward - 20000
+            reward = reward - 20000 * 10
             bDone = true
         end
     end
-
+o
     -- Update previous values
     previous_score = player_state.score
     previous_level = level_state.level_number
@@ -378,7 +378,7 @@ local function frame_callback()
         return true
     elseif game_state.gamestate == 0x16 then
         -- Game is in level select mode, advance selection 
-        -- controls:apply_action(0, 0, 9, game_state, player_state)
+        controls:apply_action(mem, 0, 0, 9, game_state, player_state)
         return true
     end
 
@@ -480,7 +480,7 @@ end
 local function on_mame_exit()
     print("MAME is shutting down - Sending final save signal")
     shutdown_requested = true
-    
+        
     if game_state and level_state and player_state and enemies_state then
         local reward = calculate_reward(game_state, level_state, player_state, enemies_state, 0) 
         -- Use StateUtils flatten, passing controls and true for shutdown
@@ -498,6 +498,7 @@ local function on_mame_exit()
 end
 
 -- Register callbacks
+print("Registering callbacks with MAME")
 callback_ref = emu.add_machine_frame_notifier(frame_callback)
 emu.register_stop(on_mame_exit)
 
