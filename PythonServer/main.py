@@ -15,6 +15,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import setproctitle
+import queue
 
 from aimodel import (
     DQNAgent, KeyboardHandler
@@ -43,6 +45,7 @@ class DQN(nn.Module):
 # +++ End DQN model definition +++
 
 def inference_worker(state_queue: Queue, action_queue: Queue, model_path: str):
+    setproctitle.setproctitle("python_inference")
     """
     Worker process dedicated to running model inference using PyTorch.
     Loads the model once and then waits for states to predict actions.
@@ -52,29 +55,18 @@ def inference_worker(state_queue: Queue, action_queue: Queue, model_path: str):
                           "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[InferWorker] Starting. Using device: {device}. Loading model from: {model_path}")
 
-    model = None # Initialize model to None
+    model = None
     state_size = RL_CONFIG.state_size # Get state size from config
     action_size = RL_CONFIG.action_size # Get action size from config
 
-    # Attempt to load the model within a try-except block
+    # Attempt to load the model
     try:
         if os.path.exists(model_path):
-            # Instantiate the model structure
             model = DQN(state_size, action_size).to(device)
-            # Load the checkpoint dictionary
             checkpoint = torch.load(model_path, map_location=device)
-            # Load the state dict into the model
-            model.load_state_dict(checkpoint['policy_state_dict']) # Use 'policy_state_dict' as saved by DQNAgent
-            model.eval() # Set model to evaluation mode
+            model.load_state_dict(checkpoint['policy_state_dict'])
+            model.eval()
             print("[InferWorker] Model loaded and set to eval mode successfully.")
-            # Optional warm-up prediction
-            try:
-                dummy_state = torch.zeros((1, state_size), device=device)
-                with torch.no_grad():
-                    _ = model(dummy_state)
-                print("[InferWorker] Model warm-up prediction done.")
-            except Exception as warmup_e:
-                print(f"[InferWorker] Model warm-up failed: {warmup_e}")
         else:
              print(f"[InferWorker] Model file not found at {model_path}. Worker will not predict.")
 
@@ -153,6 +145,13 @@ def stats_reporter(agent, kb_handler):
         try:
             current_time = time.time()
             if current_time - last_report >= report_interval:
+                # +++ Calculate average DQN inference time +++
+                with metrics.lock: # Access deque under lock
+                    if metrics.dqn_inference_times: # Avoid division by zero
+                        metrics.avg_dqn_inf_time = np.mean(list(metrics.dqn_inference_times))
+                    else:
+                        metrics.avg_dqn_inf_time = 0.0
+                # +++ End calculation +++
                 display_metrics_row(agent, kb_handler)
                 last_report = current_time
             
@@ -199,6 +198,7 @@ def keyboard_input_handler(agent, keyboard_handler):
             break
 
 def main():
+    setproctitle.setproctitle("python_socket")
     """Main function to run the Tempest AI application"""
     print("[Main] Starting main function...")
     # Ensure clean start for processes, especially on macOS/Windows

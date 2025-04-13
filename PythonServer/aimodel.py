@@ -221,7 +221,7 @@ class DQNAgent:
         self.update_target_network()
         
         # Training queue for background thread
-        self.train_queue = queue.Queue(maxsize=1000)
+        self.train_queue = queue.Queue(maxsize=100)
         self.training_thread = None
         self.running = True
 

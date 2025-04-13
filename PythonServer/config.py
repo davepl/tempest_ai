@@ -74,6 +74,7 @@ class MetricsData:
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     expert_inference_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
     dqn_inference_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    avg_dqn_inf_time: float = 0.0
     epsilon: float = 1.0
     expert_ratio: float = 0.75
     last_decay_step: int = 0
