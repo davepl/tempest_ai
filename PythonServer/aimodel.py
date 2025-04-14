@@ -174,13 +174,42 @@ class ReplayMemory:
         self.memory.append(Experience(state, action, reward, next_state, done))
         
     def sample(self, batch_size):
-        """Sample random batch of experiences"""
-        experiences = random.sample(self.memory, min(batch_size, len(self.memory)))
-        states = torch.from_numpy(np.vstack([e.state for e in experiences])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
-        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences]).astype(np.uint8)).float().to(device)
+        """Sample random batch of experiences. Optimized for performance."""
+        actual_batch_size = min(batch_size, len(self.memory))
+        if actual_batch_size == 0:
+             return None # Cannot sample from empty memory
+             
+        experiences = random.sample(self.memory, actual_batch_size)
+        
+        # Pre-allocate lists
+        states_list = []
+        actions_list = []
+        rewards_list = []
+        next_states_list = []
+        dones_list = []
+        
+        # Accumulate experiences into lists
+        for e in experiences:
+             states_list.append(e.state)
+             actions_list.append(e.action)
+             rewards_list.append(e.reward)
+             next_states_list.append(e.next_state)
+             dones_list.append(e.done)
+             
+        # Convert lists to NumPy arrays once at the end
+        # Note: This returns NumPy arrays, assuming batch_sampler_thread handles conversion to queue
+        states = np.array(states_list, dtype=np.float32)
+        # Action is likely a nested list like [[idx]], ensure correct dtype and shape handling
+        actions = np.array(actions_list, dtype=np.int64) 
+        rewards = np.array(rewards_list, dtype=np.float32)
+        next_states = np.array(next_states_list, dtype=np.float32)
+        dones = np.array(dones_list, dtype=np.bool_)
+        
+        # Ensure correct shapes if needed (e.g., for rewards, actions, dones if they are scalars)
+        # Example: if actions.ndim == 1: actions = actions.reshape(-1, 1)
+        # Example: if rewards.ndim == 1: rewards = rewards.reshape(-1, 1)
+        # Example: if dones.ndim == 1: dones = dones.reshape(-1, 1)
+        
         return states, actions, rewards, next_states, dones
         
     def __len__(self):
@@ -220,6 +249,29 @@ class DQNAgent:
         
         self.policy_net = DQN(state_size, action_size).to(self.device)
         self.target_net = DQN(state_size, action_size).to(self.device)
+
+        # --- Compile the models (PyTorch 2.0+) ---
+        try:
+            # Check if torch.compile is available (requires PyTorch >= 2.0)
+            if hasattr(torch, 'compile'): 
+                # *** Add check: Only compile if NOT on MPS device ***
+                if self.device.type != 'mps':
+                    print("[DQNAgent] Attempting torch.compile() (Device is not MPS)...")
+                    # Compile policy network (used for training and action selection)
+                    self.policy_net = torch.compile(self.policy_net)
+                    # Compile target network (used for target Q-value calculation)
+                    self.target_net = torch.compile(self.target_net) 
+                    print("[DQNAgent] torch.compile() applied successfully.")
+                else:
+                    print("[DQNAgent] Skipping torch.compile() because device is MPS.")
+            else:
+                 print("[DQNAgent] torch.compile() not available in this PyTorch version.")
+        except Exception as compile_err:
+             # Catch potential errors during compilation (e.g., unsupported ops)
+             print(f"[DQNAgent Warning] torch.compile() failed: {compile_err}")
+        # --- End Compile ---
+
+        # Load state AFTER compiling policy net
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval() # Target network is only for inference
 
@@ -246,10 +298,18 @@ class DQNAgent:
         # Convert NumPy arrays to tensors and move to the configured device
         try:
             states = torch.tensor(states_np, dtype=torch.float32).to(self.device)
-            # Actions might need squeeze/unsqueeze depending on shape from numpy
+            
+            # Actions need to be [batch_size, 1] for gather
             actions = torch.tensor(actions_np, dtype=torch.int64).to(self.device)
-            if actions.ndim == 1: actions = actions.unsqueeze(-1) # Ensure shape [batch_size, 1]
-                
+            # --> Explicitly reshape/squeeze to ensure [batch_size, 1] <--
+            if actions.shape == (self.batch_size, 1, 1):
+                 actions = actions.squeeze(-1) # Convert [B, 1, 1] to [B, 1]
+            elif actions.ndim == 1:
+                 actions = actions.unsqueeze(-1) # Convert [B] to [B, 1]
+            # else: Assume it's already [B, 1] or handle other unexpected shapes
+            if actions.shape[1] != 1: # Final check
+                 raise ValueError(f"Action tensor final shape is not [batch_size, 1]: {actions.shape}")
+
             rewards = torch.tensor(rewards_np, dtype=torch.float32).to(self.device)
             if rewards.ndim == 1: rewards = rewards.unsqueeze(-1)
                 
@@ -261,6 +321,7 @@ class DQNAgent:
 
         except Exception as tensor_err:
              print(f"[DQNAgent Error] Failed converting batch numpy arrays to tensors: {tensor_err}")
+             traceback.print_exc() # Add traceback for conversion errors
              return None
 
         # --- Q-value prediction and target calculation ---
@@ -314,8 +375,11 @@ class DQNAgent:
         self.memory.push(state, action, reward, next_state, done)
         # Note: Removed the trigger to put data in train_queue
 
-    def save(self, filename, metrics_state: Optional[Dict] = None):
-        """Save model weights and optionally metrics state."""
+    def save(self, filename: Path, metrics_state: Optional[Dict] = None):
+        """Save model weights and optionally metrics state using an atomic pattern."""
+        # Define a temporary filename
+        tmp_filename = filename.parent / (filename.name + ".tmp")
+        
         try:
             # Ensure the directory exists
             filename.parent.mkdir(parents=True, exist_ok=True)
@@ -329,11 +393,23 @@ class DQNAgent:
             if metrics_state:
                  save_data['metrics_state'] = metrics_state
                  
-            torch.save(save_data, str(filename))
-            # print(f"[DQNAgent] Model saved to {filename}")
+            # 1. Save to the temporary file
+            torch.save(save_data, str(tmp_filename))
+            
+            # 2. Atomically replace the old file with the new one
+            # os.replace() is generally atomic on POSIX and Windows
+            os.replace(tmp_filename, filename)
+            
+            # print(f"[DQNAgent] Model saved atomically to {filename}") # Optional success log
         except Exception as e:
-             print(f"[DQNAgent Error] Failed to save model to {filename}: {e}")
+             print(f"[DQNAgent Error] Failed during atomic save to {filename}: {e}")
              traceback.print_exc()
+             # Clean up temporary file if rename failed
+             if tmp_filename.exists():
+                  try:
+                       tmp_filename.unlink()
+                  except OSError as rm_err:
+                       print(f"[DQNAgent Error] Failed to remove temporary file {tmp_filename}: {rm_err}")
 
     def load(self, filename):
         """Load model weights and return success status and metrics state if available."""

@@ -59,55 +59,64 @@ class DQN(nn.Module):
 
 def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue, 
                      model_path: Path, shutdown_event: mp.Event, 
+                     inference_ready_event: mp.Event,
                      state_size: int, action_size: int):
     """Worker process dedicated to DQN inference."""
     setproctitle.setproctitle("python_inference")
     print("[InferWorker] Starting...")
+    
+    # Limit threads for inference efficiency
     try:
-        # Limit threads for inference
         torch.set_num_threads(1)
-        print(f"[InferWorker] Set torch num_threads=1")
+        print("[InferWorker] Set torch num_threads=1")
+    except Exception as thread_err:
+        print(f"[InferWorker Warning] Failed to set torch threads: {thread_err}")
 
-        # Initialize agent *within this process*
+    agent = None
+    last_model_check_time = 0
+    model_check_interval = 30 # seconds
+
+    try:
+        # --- Initialize Agent --- 
         agent = DQNAgent(state_size, action_size)
-        print(f"[InferWorker] DQNAgent initialized on device: {DEVICE}")
+        print(f"[InferWorker] DQNAgent initialized on device: {agent.device}")
 
-        # Load model initially
-        last_load_time = 0
-        load_interval = 30 # Check for model updates every 30 seconds
+        # --- Load Initial Model --- 
         if model_path.exists():
-             success, _ = agent.load(model_path) # Ignore metrics state
-             if success:
-                 last_load_time = time.time()
-                 print(f"[InferWorker] Initial model loaded from {model_path}")
-             else:
-                 print(f"[InferWorker] Initial model load FAILED from {model_path}")
+            success, _ = agent.load(model_path)
+            if success:
+                print(f"[InferWorker] Initial model loaded from {model_path}")
+            else:
+                print(f"[InferWorker Warning] Failed to load initial model from {model_path}. Using fresh weights.")
         else:
-             print(f"[InferWorker] Model file not found at {model_path}. Using fresh weights.")
+             print(f"[InferWorker Warning] Model file {model_path} not found. Using fresh weights.")
+             
+        # --- Signal Main Process that Worker is Ready --- 
+        inference_ready_event.set()
+        print("[InferWorker] Signaled ready to main process.")
 
-        agent.policy_net.eval() # Ensure model is in evaluation mode
-
+        # --- Inference Loop --- 
         while not shutdown_event.is_set():
             try:
                 # Periodically check for updated model weights
                 current_time = time.time()
-                if current_time - last_load_time > load_interval:
+                if current_time - last_model_check_time > model_check_interval:
                      if model_path.exists():
                           # print("[InferWorker] Checking for model update...") # Debug
                           # TODO: Implement more robust check? Stat file mtime?
                           mtime = model_path.stat().st_mtime
-                          if mtime > last_load_time: # Check if file is newer
-                               print(f"[InferWorker] Model file updated (mtime: {mtime:.0f} > last load: {last_load_time:.0f}). Reloading...")
+                          if mtime > last_model_check_time: # Check if file is newer
+                               print(f"[InferWorker] Model file updated (mtime: {mtime:.0f} > last load: {last_model_check_time:.0f}). Reloading...")
                                success, _ = agent.load(model_path) # Reload weights
                                if success:
                                     agent.policy_net.eval()
-                                    last_load_time = mtime # Use mtime as new load time
+                                    last_model_check_time = mtime # Use mtime as new load time
                                else:
                                     print("[InferWorker] Model reload FAILED.")
-                                    last_load_time = current_time # Update time anyway to avoid rapid checks
+                                    last_model_check_time = current_time # Update time anyway to avoid rapid checks
                           # else: # Optional: print("[InferWorker] Model file unchanged, skipping reload.")
                      # else: Keep using existing weights if file disappeared
-                     last_load_time = current_time # Update check time even if file missing
+                     last_model_check_time = current_time # Update check time even if file missing
 
                 # Get state from the queue (blocking with timeout)
                 state = state_queue.get(timeout=0.5) # Timeout to allow checking shutdown/reload
@@ -222,38 +231,27 @@ def batch_sampler_thread(replay_memory, batch_queue, shutdown_event, batch_size,
     while not shutdown_event.is_set():
         try:
             if len(replay_memory) >= min_buffer_size:
-                # ReplayMemory.sample returns tensors: (states, actions, rewards, next_states, dones)
-                batch_tensors = replay_memory.sample(batch_size)
+                # ReplayMemory.sample now returns NumPy arrays directly
+                batch_numpy = replay_memory.sample(batch_size)
                 
-                if batch_tensors:
-                    # Convert tensors to NumPy arrays for pickling
-                    try:
-                        states, actions, rewards, next_states, dones = batch_tensors
-                        batch_numpy = (
-                            states.cpu().numpy(), 
-                            actions.cpu().numpy(), 
-                            rewards.cpu().numpy(), 
-                            next_states.cpu().numpy(), 
-                            dones.cpu().numpy()
-                        )
-                    except Exception as conversion_err:
-                         print(f"[BatchSampler] Error converting batch tensors to numpy: {conversion_err}")
-                         time.sleep(0.1) # Avoid spamming errors
-                         continue
-
+                if batch_numpy:
+                    # No conversion needed, data is already numpy
                     try:
                         batch_queue.put(batch_numpy, timeout=0.1) # Put numpy batch in queue
                     except Full:
-                        time.sleep(0.05)
+                        time.sleep(0.05) # Give trainer time to catch up
                         continue
+
                 else:
+                     # Sample returned None (e.g., memory empty)
                      time.sleep(0.1)
             else:
+                # Not enough memory yet, wait longer
                 time.sleep(0.5)
         except Exception as e:
             print(f"[BatchSampler] Error: {e}")
             traceback.print_exc()
-            time.sleep(1)
+            time.sleep(1) # Wait after error
     print("[BatchSampler] Shutdown signal received, exiting.")
 
 def loss_reporter_thread(loss_queue, metrics_obj, shutdown_event):
@@ -325,6 +323,8 @@ def main():
     loss_queue = ctx.Queue(maxsize=RL_CONFIG.loss_queue_size)
     # Shutdown Signal
     shutdown_event = ctx.Event()
+    # Inference Ready Signal
+    inference_ready_event = ctx.Event()
 
     # --- Initialize Main Agent (for Memory, Step, Target Updates) ---
     num_flattened_values = 315 # UPDATE THIS IF LUA CHANGES
@@ -354,7 +354,9 @@ def main():
     # --- Start Inference Process --- 
     inference_process = ctx.Process(
         target=inference_worker,
-        args=(state_queue, action_queue, LATEST_MODEL_PATH, shutdown_event, state_size, action_size),
+        args=(state_queue, action_queue, LATEST_MODEL_PATH, 
+              shutdown_event, inference_ready_event, # Pass ready event
+              state_size, action_size),
         name="InferenceProcess"
     )
     inference_process.daemon = True
@@ -396,6 +398,11 @@ def main():
     if IS_INTERACTIVE:
          kb_handler = KeyboardHandler()
          print("[Main] Keyboard handler active. Keys: (o)verride, (e)xpert mode, (q)uit")
+
+    # --- Wait for Inference Worker to be Ready --- 
+    print("[Main] Waiting for inference worker to signal readiness...")
+    inference_ready_event.wait() # Block until event is set
+    print("[Main] Inference worker ready. Starting server...")
 
     # --- Start Socket Server ---
     # Pass queues and main_agent (for step/target updates)
