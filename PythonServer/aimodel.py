@@ -62,6 +62,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure
 import socket
 import traceback
+from pathlib import Path
 
 # Platform-specific imports for KeyboardHandler
 import sys
@@ -201,168 +202,184 @@ class DQN(nn.Module):
         return self.out(x)
 
 class DQNAgent:
-    """DQN Agent with experience replay and target network"""
+    """Deep Q-Network agent"""
     def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma, 
-                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, epsilon_decay=RL_CONFIG.epsilon_decay, 
                  memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
+        """Initialize agent components"""
         self.state_size = state_size
         self.action_size = action_size
-        self.last_save_time = 0.0 # Initialize last save time
-        
-        # Q-Networks (online and target)
-        self.qnetwork_local = DQN(state_size, action_size).to(device)
-        self.qnetwork_target = DQN(state_size, action_size).to(device)
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
-        
-        # Replay memory
         self.memory = ReplayMemory(memory_size)
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.learning_rate = learning_rate
+        self.is_ready = False # <-- Add readiness flag, initially False
         
-        # Initialize target network with same weights as local network
-        self.update_target_network()
+        # Use defined DEVICE from config
+        self.device = device 
+        print(f"[DQNAgent] Initializing models on device: {self.device}")
         
-        # Training queue for background thread
-        self.train_queue = queue.Queue(maxsize=100)
-        self.training_thread = None
-        self.running = True
+        self.policy_net = DQN(state_size, action_size).to(self.device)
+        self.target_net = DQN(state_size, action_size).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval() # Target network is only for inference
 
-        """Start background thread for training"""
-        self.training_thread = threading.Thread(target=self.background_train, daemon=True, name="TrainingWorker")
-        self.training_thread.start()
-        
-    def background_train(self):
-        """Run training in background thread"""
-        print(f"Training thread started on {device}")
-        while self.running: 
-            try:
-                # Get an item from the queue. This blocks if the queue is empty.
-                # The item itself is just a signal (True), we don't need its value.
-                _ = self.train_queue.get() 
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
+        self.loss_fn = nn.SmoothL1Loss() # Huber loss
+
+        # Removed train_queue, training_thread, and related events/locks
+        # Training is now external
+        print("[DQNAgent] Initialized. Training will be handled externally.")
+        self.is_ready = True # <-- Set to True after successful initialization
+
+    def train_step(self, batch):
+        """Perform a single training step on a provided batch."""
+        if not batch:
+            return None
+
+        # Unpack the batch (expecting tuples of NumPy arrays from the queue)
+        try:
+            states_np, actions_np, rewards_np, next_states_np, dones_np = batch
+        except ValueError as e:
+             print(f"[DQNAgent Error] Failed to unpack batch: {e}. Batch type: {type(batch)}") 
+             return None # Cannot proceed if batch is malformed
+
+        # Convert NumPy arrays to tensors and move to the configured device
+        try:
+            states = torch.tensor(states_np, dtype=torch.float32).to(self.device)
+            # Actions might need squeeze/unsqueeze depending on shape from numpy
+            actions = torch.tensor(actions_np, dtype=torch.int64).to(self.device)
+            if actions.ndim == 1: actions = actions.unsqueeze(-1) # Ensure shape [batch_size, 1]
                 
-                # If we get an item, process one training step
-                self.train_step()
+            rewards = torch.tensor(rewards_np, dtype=torch.float32).to(self.device)
+            if rewards.ndim == 1: rewards = rewards.unsqueeze(-1)
                 
-                # Signal that the task is done
-                self.train_queue.task_done()
-
-            except queue.Empty: 
-                # This shouldn't typically happen with a blocking get unless maybe
-                # a timeout was added, but handle just in case.
-                continue 
-            except Exception as e:
-                print(f"Training error: {e}")
-                traceback.print_exc() # Print full traceback for errors
-                time.sleep(1) # Pause after error
-
-    def train_step(self):
-        """Perform a single training step on one batch"""
-        if len(self.memory) < RL_CONFIG.batch_size:
-            return
+            next_states = torch.tensor(next_states_np, dtype=torch.float32).to(self.device)
             
-        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
-        
-        Q_expected = self.qnetwork_local(states).gather(1, actions)
-        
-        with torch.no_grad():
-            best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
-            Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
-            Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
-        
-        # Compute loss and perform optimization
-        loss = F.mse_loss(Q_expected, Q_targets)
+            # Ensure dones are boolean and correct shape
+            dones = torch.tensor(dones_np.astype(np.bool_), dtype=torch.bool).to(self.device)
+            if dones.ndim == 1: dones = dones.unsqueeze(-1)
+
+        except Exception as tensor_err:
+             print(f"[DQNAgent Error] Failed converting batch numpy arrays to tensors: {tensor_err}")
+             return None
+
+        # --- Q-value prediction and target calculation ---
+        # Get current Q values from policy network
+        current_q_values = self.policy_net(states).gather(1, actions)
+
+        # Get next Q values from target network
+        with torch.no_grad(): # No gradients needed for target calculation
+            next_q_values = self.target_net(next_states).max(1)[0].unsqueeze(-1)
+            # Zero out Q values for terminal states
+            next_q_values[dones] = 0.0
+
+        # Compute the expected Q values (Bellman equation)
+        target_q_values = rewards + (self.gamma * next_q_values)
+
+        # --- Loss Calculation and Optimization ---
+        # Compute loss (e.g., Huber loss)
+        loss = self.loss_fn(current_q_values, target_q_values)
+
+        # Optimize the model
         self.optimizer.zero_grad()
-        loss.backward() 
-        self.optimizer.step() 
-        metrics.losses.append(loss.item())
+        loss.backward()
+        # Optional: Gradient clipping
+        # torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+        self.optimizer.step()
+
+        return loss # Return the calculated loss tensor
 
     def update_target_network(self):
-        """Update target network with weights from local network"""
-        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-        
+        """Copy weights from policy network to target network"""
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        # print("[DQNAgent] Updated target network.") # Optional log
+
     def act(self, state, epsilon=0.0):
-        """Select action using epsilon-greedy policy"""
-        # Convert state to tensor
-        state = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        
-        # Set evaluation mode
-        self.qnetwork_local.eval()
-        
-        with torch.no_grad():
-            action_values = self.qnetwork_local(state)
-            
-        # Set training mode back
-        self.qnetwork_local.train()
-        
-        # Epsilon-greedy action selection
+        """Choose action based on epsilon-greedy policy"""
         if random.random() < epsilon:
-            return random.randrange(self.action_size)
+            return random.randrange(self.action_size) # Explore
         else:
-            return action_values.cpu().data.numpy().argmax()
-            
+            # Exploit
+            state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.policy_net(state)
+            return q_values.max(1)[1].item() # Return action index
+
     def step(self, state, action, reward, next_state, done):
-        """Add experience to memory and queue for training"""
-        # Save experience in replay memory
+        """Store experience in replay memory."""
+        # Reward scaling/clipping can be done here before pushing
+        # reward = np.sign(reward) # Example: clipping reward
+        # reward = reward / 1000.0 # Example: scaling reward
+        
         self.memory.push(state, action, reward, next_state, done)
-        
-        # Add training task to queue if not full
-        if not self.train_queue.full():
-            self.train_queue.put(True)
-            
-    def save(self, filename):
-        """Save model weights, rate-limited unless forced."""
-        is_forced_save = "exit" in filename or "shutdown" in filename
-        current_time = time.time()
-        save_interval = 30.0 # Minimum seconds between saves
-        
-        # Rate limit non-forced saves
-        if not is_forced_save:
-            if current_time - self.last_save_time < save_interval:
-                # Optional: Add a debug print if needed
-                # print(f"Skipping save to {filename}, too soon since last save.")
-                return # Skip save
-        
-        # Proceed with save if forced or interval elapsed
+        # Note: Removed the trigger to put data in train_queue
+
+    def save(self, filename, metrics_state: Optional[Dict] = None):
+        """Save model weights and optionally metrics state."""
         try:
-            torch.save({
-                'policy_state_dict': self.qnetwork_local.state_dict(),
-                'target_state_dict': self.qnetwork_target.state_dict(),
+            # Ensure the directory exists
+            filename.parent.mkdir(parents=True, exist_ok=True)
+            
+            save_data = {
+                'policy_net_state_dict': self.policy_net.state_dict(),
+                'target_net_state_dict': self.target_net.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
-                'memory_size': len(self.memory),
-                'epsilon': metrics.epsilon,
-                'frame_count': metrics.frame_count,
-                'expert_ratio': metrics.expert_ratio
-            }, filename)
-            
-            # Update last save time ONLY on successful save
-            self.last_save_time = current_time
-            
-            # Only print on forced exit/shutdown saves
-            if is_forced_save:
-                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
+            }
+            # Include metrics state if provided
+            if metrics_state:
+                 save_data['metrics_state'] = metrics_state
+                 
+            torch.save(save_data, str(filename))
+            # print(f"[DQNAgent] Model saved to {filename}")
         except Exception as e:
-            print(f"ERROR saving model to {filename}: {e}")
+             print(f"[DQNAgent Error] Failed to save model to {filename}: {e}")
+             traceback.print_exc()
 
     def load(self, filename):
-        """Load model weights"""
-        if os.path.exists(filename):
-            try:
-                checkpoint = torch.load(filename, map_location=device)
-                self.qnetwork_local.load_state_dict(checkpoint['policy_state_dict'])
-                self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                
-                # Load frame count and epsilon (for exploration)
-                metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
-                metrics.frame_count = checkpoint.get('frame_count', 0)
-                
-                # Always set the expert ratio to the start value
-                metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
-                metrics.last_decay_step = 0
-                
-                return True
-            except Exception as e:
-                print(f"Error loading model: {e}")
-                return False
-        return False
+        """Load model weights and return success status and metrics state if available."""
+        # Reset readiness before attempting load
+        self.is_ready = False 
+        if not Path(filename).is_file():
+            print(f"[DQNAgent] Model file not found at {filename}. Cannot load.")
+            return False, None # Return success=False, metrics=None
+            
+        try:
+            # Explicitly set weights_only=False as we are saving more than just weights
+            checkpoint = torch.load(str(filename), map_location=self.device, weights_only=False)
+            self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+            
+            # Load target_net state if present
+            if 'target_net_state_dict' in checkpoint:
+                 self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+            else:
+                 self.target_net.load_state_dict(self.policy_net.state_dict())
+                 print("[DQNAgent Warning] Target network state not found in checkpoint, copied from policy network.")
+            
+            # Load optimizer state if present
+            if 'optimizer_state_dict' in checkpoint:
+                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            else:
+                 print("[DQNAgent Warning] Optimizer state not found in checkpoint, optimizer not loaded.")
+            
+            self.target_net.eval() # Ensure target net is in eval mode
+            print(f"[DQNAgent] Model weights loaded from {filename}")
+            
+            # Load metrics state if present
+            loaded_metrics_state = checkpoint.get('metrics_state', None)
+            if loaded_metrics_state:
+                 print(f"[DQNAgent] Found metrics state in checkpoint.")
+                 
+            self.is_ready = True # <-- Set ready flag only on SUCCESSFUL load
+            return True, loaded_metrics_state # Return success=True, metrics_state (or None)
+            
+        except KeyError as e:
+            print(f"[DQNAgent Error] Failed to load model from {filename}. Missing key: {e}")
+            traceback.print_exc()
+            return False, None
+        except Exception as e:
+             print(f"[DQNAgent Error] Failed to load model from {filename}: {e}")
+             traceback.print_exc()
+             return False, None
 
 class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""

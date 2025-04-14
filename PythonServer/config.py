@@ -15,13 +15,26 @@ import threading
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 from collections import deque
+from pathlib import Path
+import torch
+# Import the actual Metrics class
+from metrics import Metrics
 
 # Global flags
 IS_INTERACTIVE = sys.stdin.isatty()
 
 # Directory paths
-MODEL_DIR = "models"
-LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
+MODEL_DIR = Path("models") # Define as Path object
+# Define as Path object using / operator for path joining
+LATEST_MODEL_PATH = MODEL_DIR / "tempest_model_latest.pt"
+
+# -- Determine PyTorch Device --
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else # Check for Apple Silicon GPU
+    "cpu"
+)
+print(f"[Config] Using PyTorch device: {DEVICE}")
 
 @dataclass
 class ServerConfigData:
@@ -56,180 +69,18 @@ class RLConfigData:
     learning_rate: float = 0.001
     memory_size: int = 1000000
     save_interval: int = 50000
+    save_interval_seconds: int = 60
     train_freq: int = 4
     target_update: int = 10000
+    min_buffer_size: int = 10000
+    train_queue_size: int = 20
+    loss_queue_size: int = 100
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
 
-@dataclass
-class MetricsData:
-    """Metrics tracking for training progress"""
-    frame_count: int = 0
-    guided_count: int = 0
-    total_controls: int = 0
-    episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
-    expert_inference_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
-    dqn_inference_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
-    avg_dqn_inf_time: float = 0.0
-    epsilon: float = 1.0
-    expert_ratio: float = 0.75
-    last_decay_step: int = 0
-    enemy_seg: int = -1
-    open_level: bool = False
-    override_expert: bool = False
-    saved_expert_ratio: float = 0.75
-    expert_mode: bool = False
-    last_action_source: str = ""
-    frames_last_second: int = 0
-    last_fps_time: float = 0
-    fps: float = 0.0
-    client_count: int = 0
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    
-    def update_frame_count(self):
-        """Update frame count and FPS tracking"""
-        with self.lock:
-            # Update total frame count
-            self.frame_count += 1
-            
-            # Update FPS tracking
-            current_time = time.time()
-            
-            # Initialize last_fps_time if this is the first frame
-            if self.last_fps_time == 0:
-                self.last_fps_time = current_time
-                
-            # Count frames for this second
-            self.frames_last_second += 1
-            
-            # Calculate FPS every second
-            elapsed = current_time - self.last_fps_time
-            if elapsed >= 1.0:
-                # Calculate frames per second with more accuracy
-                new_fps = self.frames_last_second / elapsed
-                
-                # Store the new FPS value
-                self.fps = new_fps
-                
-                # Reset counters
-                self.frames_last_second = 0
-                self.last_fps_time = current_time
-                
-            return self.frame_count
-    
-    def get_epsilon(self):
-        """Get current epsilon value"""
-        with self.lock:
-            return self.epsilon
-    
-    def update_epsilon(self):
-        """Update epsilon based on frame count"""
-        with self.lock:
-            # Import here to avoid circular imports
-            from aimodel import decay_epsilon
-            self.epsilon = decay_epsilon(self.frame_count)
-            return self.epsilon
-    
-    def update_expert_ratio(self):
-        """Update expert ratio based on frame count"""
-        with self.lock:
-            # Import here to avoid circular imports
-            from aimodel import decay_expert_ratio
-            # Skip decay if expert mode is active
-            if self.expert_mode:
-                return self.expert_ratio
-            decay_expert_ratio(self.frame_count)
-            return self.expert_ratio
-    
-    def add_episode_reward(self, total_reward, dqn_reward, expert_reward):
-        """Add episode rewards to tracking"""
-        with self.lock:
-            if total_reward > 0:
-                self.episode_rewards.append(total_reward)
-            if dqn_reward > 0:
-                self.dqn_rewards.append(dqn_reward)
-            if expert_reward > 0:
-                self.expert_rewards.append(expert_reward)
-    
-    def increment_guided_count(self):
-        """Increment guided count"""
-        with self.lock:
-            self.guided_count += 1
-    
-    def increment_total_controls(self):
-        """Increment total controls"""
-        with self.lock:
-            self.total_controls += 1
-    
-    def update_action_source(self, source):
-        """Update last action source"""
-        with self.lock:
-            self.last_action_source = source
-    
-    def update_game_state(self, enemy_seg, open_level):
-        """Update game state"""
-        with self.lock:
-            self.enemy_seg = enemy_seg
-            self.open_level = open_level
-    
-    def get_expert_ratio(self):
-        """Get current expert ratio"""
-        with self.lock:
-            return self.expert_ratio
-    
-    def is_override_active(self):
-        """Check if override is active"""
-        with self.lock:
-            return self.override_expert
-    
-    def get_fps(self):
-        """Get current FPS"""
-        with self.lock:
-            return self.fps
-    
-    def toggle_override(self, kb_handler=None):
-        """Toggle override mode"""
-        with self.lock:
-            self.override_expert = not self.override_expert
-            if self.override_expert:
-                self.saved_expert_ratio = self.expert_ratio
-                self.expert_ratio = 0.0
-            else:
-                self.expert_ratio = self.saved_expert_ratio
-            if kb_handler and IS_INTERACTIVE:
-                # Import here to avoid circular import at top level
-                from aimodel import print_with_terminal_restore
-                print_with_terminal_restore(kb_handler, f"\nOverride mode: {'ON' if self.override_expert else 'OFF'}\r")
-    
-    def toggle_expert_mode(self, kb_handler=None):
-        """Toggle expert mode"""
-        with self.lock:
-            self.expert_mode = not self.expert_mode
-            if self.expert_mode:
-                # Save current expert ratio and set to 1.0 (100%) when expert mode is ON
-                self.saved_expert_ratio = self.expert_ratio
-                self.expert_ratio = 1.0
-            else:
-                # Restore the saved expert ratio when expert mode is OFF
-                self.expert_ratio = self.saved_expert_ratio
-            if kb_handler and IS_INTERACTIVE:
-                # Import here to avoid circular import at top level
-                from aimodel import print_with_terminal_restore
-                print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}\r")
-
-    def update_expert_inference_time(self, time_ms: float):
-        """Update expert inference time tracking"""
-        with self.lock:
-            self.expert_inference_times.append(time_ms)
-
-    def update_dqn_inference_time(self, time_ms: float):
-        """Update DQN inference time tracking"""
-        with self.lock:
-            self.dqn_inference_times.append(time_ms)
+# Create the global metrics instance using the imported class
+metrics = Metrics()
 
 # Define action space
 ACTION_MAPPING = {
@@ -249,9 +100,6 @@ ACTION_MAPPING = {
     13: (1, 0, 0.3),   # Hard right, fire, no zap
     14: (1, 1, 0.0),   # Zap+Fire+Sit
 }
-
-# Create instances of config classes
-metrics = MetricsData()
 
 # # Import print_with_terminal_restore from metrics_display to avoid circular imports
 # # # DEF print_with_terminal_restore(kb_handler, *args, **kwargs):

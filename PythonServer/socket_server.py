@@ -21,6 +21,7 @@ import random
 import traceback
 from datetime import datetime
 import multiprocessing as mp # Added for queue Empty exception
+from queue import Full, Empty
 
 # Import from config.py
 from config import (
@@ -42,19 +43,27 @@ from aimodel import (
 
 class SocketServer:
     """Socket-based server to handle multiple clients"""
-    def __init__(self, host, port, agent, safe_metrics, state_queue, action_queue):
+    def __init__(self, state_queue=None, action_queue=None, 
+                 metrics=None, main_agent_ref=None, 
+                 host=SERVER_CONFIG.host, port=SERVER_CONFIG.port):
         print(f"Initializing SocketServer on {host}:{port}")
         self.host = host
         self.port = port
-        self.agent = agent
-        self.metrics = safe_metrics
-        self.state_queue = state_queue
-        self.action_queue = action_queue
+        self.state_queue = state_queue # Queue to send states TO inference process
+        self.action_queue = action_queue # Queue to receive actions FROM inference process
+        self.main_agent_ref = main_agent_ref # Reference to main agent for step/target updates
+        self.metrics = metrics # Shared metrics object
         self.running = True
-        self.clients = {}  # Dictionary to track active clients
+        self.clients = {}  # Dictionary to track active clients (thread objects or None)
         self.client_states = {}  # Dictionary to store per-client state
         self.client_lock = threading.Lock()  # Lock for client dictionaries
         self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
+        
+        # Use passed metrics object
+        if self.metrics is None:
+            from config import metrics as global_metrics # Fallback
+            self.metrics = global_metrics
+            print("[SocketServer Warning] Metrics object not passed, using global fallback.")
         
     def start(self):
         """Start the socket server"""
@@ -144,6 +153,14 @@ class SocketServer:
             self.cleanup_all_clients()
             print("Server stopped")
             
+    def shutdown(self):
+        """Initiates the server shutdown sequence."""
+        print("[SocketServer] Shutdown requested.")
+        self.running = False # Stop accepting new connections
+        self.shutdown_event.set() # Signal client threads to stop
+        # Closing the server socket is handled in the finally block of start()
+        # after threads have been potentially joined/signaled.
+
     def cleanup_all_clients(self):
         """Clean up all client threads and resources"""
         with self.client_lock:
@@ -334,12 +351,42 @@ class SocketServer:
                     if frame.save_signal:
                         try:
                             # Ensure agent exists before saving
-                            if hasattr(self, 'agent') and self.agent:
-                                self.agent.save(LATEST_MODEL_PATH)
+                            if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
+                                # --> ADD Check if agent is ready <--
+                                if self.main_agent_ref.is_ready:
+                                    current_time = time.time()
+                                    save_allowed = False
+                                    metrics_state_to_save = None
+                                    
+                                    # Check and update last save time atomically under lock
+                                    with self.metrics.lock:
+                                        time_since_last_save = current_time - self.metrics.last_agent_save_time
+                                        if time_since_last_save >= 60.0: # 60 second cooldown
+                                            save_allowed = True
+                                            self.metrics.last_agent_save_time = current_time # Update time *before* save
+                                            # Prepare metrics state while holding lock
+                                            metrics_state_to_save = {
+                                                'frame_count': self.metrics.frame_count,
+                                                'epsilon': self.metrics.epsilon,
+                                                'expert_ratio': self.metrics.expert_ratio,
+                                                'last_decay_step': self.metrics.last_decay_step
+                                            }
+                                        # else: save_allowed remains False
+                                    
+                                    # Perform save outside the lock if allowed
+                                    if save_allowed:
+                                        self.main_agent_ref.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                                        print(f"[SocketServer Client {client_id}] Save signal processed. Saved model and metrics (Frame: {metrics_state_to_save['frame_count']}).")
+                                    # else: # Optional debug print for skipped saves
+                                    #     print(f"[SocketServer Client {client_id}] Save signal received, but skipped (Cooldown). Last save was {time_since_last_save:.1f}s ago.")
+                                else:
+                                    # Agent exists but is not ready (still initializing/loading)
+                                    print(f"[SocketServer Client {client_id}] Save signal received, but skipped (Agent not ready).")
                             else:
                                 print(f"Client {client_id}: Agent not available for saving.")
                         except Exception as e:
                             print(f"Client {client_id}: ERROR saving model: {e}")
+                            traceback.print_exc()
                     
                     # Update global metrics
                     current_frame = self.metrics.update_frame_count()
@@ -350,8 +397,8 @@ class SocketServer:
                     # Process previous step's results if available
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:
                          # Ensure agent exists before stepping
-                        if hasattr(self, 'agent') and self.agent:
-                            self.agent.step(
+                        if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
+                            self.main_agent_ref.step(
                                  state['last_state'],
                                  np.array([[state['last_action_idx']]]),
                                  frame.reward,
@@ -414,69 +461,71 @@ class SocketServer:
                     fire, zap, spinner = 0, 0, 0.0 # Default actions
                     inference_time_ms = 0.0 # Initialize inference time
 
-                    # Ensure agent exists before deciding action (still need agent for exploration info potentially)
-                    if hasattr(self, 'agent') and self.agent:
-                        # --- Action Decision Logic ---
-                        if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
-                            # --- Use expert system (No change here) ---
-                            start_expert_time = time.time()
-                            fire, zap, spinner = get_expert_action(
-                                frame.enemy_seg, frame.player_seg, frame.open_level
-                            )
-                            action_idx = expert_action_to_index(fire, zap, spinner)
-                            expert_time_ms = (time.time() - start_expert_time) * 1000
-                            self.metrics.increment_guided_count()
-                            self.metrics.update_action_source("expert")
-                            self.metrics.update_expert_inference_time(expert_time_ms)
-                            # --- End Expert System ---
-                        else:
-                            # --- Use DQN via Multiprocessing Queue ---
-                            self.metrics.update_action_source("dqn")
-                            # 1. Send state to worker process
-                            # Note: We send the raw frame.state, assuming worker handles batching
-                            queue_put_start = time.time()
-                            try:
-                                self.state_queue.put(frame.state)
-                            except Exception as q_put_e:
-                                 print(f"Client {client_id}: Failed to put state in queue: {q_put_e}. Using default action.")
-                                 # Keep default action (0, 0, 0), action_idx remains None initially
-                                 # To be robust, set a default action_idx or handle None later
-                                 action_idx = 0 # Choose a default action index (e.g., 'do nothing')
-                                 fire, zap, spinner = ACTION_MAPPING[action_idx]
+                    # Ensure main_agent_ref exists before deciding action
+                    if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
+                         # --- Action Decision Logic ---
+                         # Get decision parameters once to reduce locking
+                         effective_ratio, override_active, expert_mode_active, current_epsilon = self.metrics.get_decision_params()
+                         
+                         # Decide between expert system and DQN based on effective ratio
+                         if random.random() < effective_ratio and not override_active: # Use effective ratio
+                              # --- Use expert system (No change here) ---
+                              start_expert_time = time.time()
+                              fire, zap, spinner = get_expert_action(
+                                  frame.enemy_seg, frame.player_seg, frame.open_level
+                              )
+                              action_idx = expert_action_to_index(fire, zap, spinner)
+                              expert_time_ms = (time.time() - start_expert_time) * 1000
+                              self.metrics.increment_guided_count()
+                              self.metrics.update_action_source("expert")
+                              self.metrics.update_expert_inference_time(expert_time_ms)
+                              # --- End Expert System ---
+                         else:
+                              # --- Use Inference Worker via Queues ---
+                              start_dqn_time = time.time()
+                              self.metrics.update_action_source("dqn")
+                              
+                              # 1. Send state to inference worker
+                              try:
+                                   self.state_queue.put(frame.state, timeout=0.1) # Timeout if queue full
+                              except Full:
+                                   print(f"Client {client_id}: State queue full, using default action.")
+                                   action_idx = 0
+                                   fire, zap, spinner = ACTION_MAPPING[action_idx]
+                              except Exception as sq_put_e:
+                                   print(f"Client {client_id}: Error putting state in queue: {sq_put_e}. Using default.")
+                                   action_idx = 0
+                                   fire, zap, spinner = ACTION_MAPPING[action_idx]
+                              else:
+                                   # 2. Get action and inference time back (if put succeeded)
+                                   try:
+                                       # Block waiting for result (with timeout)
+                                       action_idx, inference_time_sec = self.action_queue.get(timeout=1.0) 
+                                       inference_time_ms = inference_time_sec * 1000
+                                       self.metrics.update_dqn_inference_time(inference_time_ms)
+                                       
+                                       # Get fire, zap, spinner from action_idx
+                                       if action_idx is not None and action_idx in ACTION_MAPPING:
+                                           fire, zap, spinner = ACTION_MAPPING[action_idx]
+                                       else:
+                                           print(f"Client {client_id}: Invalid action_idx {action_idx} from queue. Using default.")
+                                           action_idx = 0
+                                           fire, zap, spinner = ACTION_MAPPING[action_idx]
+                                  
+                                   except Empty:
+                                       print(f"Client {client_id}: Timeout waiting for action from inference worker. Using default.")
+                                       action_idx = 0
+                                       fire, zap, spinner = ACTION_MAPPING[action_idx]
+                                   except Exception as aq_get_e:
+                                       print(f"Client {client_id}: Error getting action from queue: {aq_get_e}. Using default.")
+                                       action_idx = 0
+                                       fire, zap, spinner = ACTION_MAPPING[action_idx]
+                                       traceback.print_exc()
 
-
-                            # 2. Get action index and inference time from worker process (blocking)
-                            # Only get from queue if put was successful
-                            if action_idx is None: # action_idx is still None if put succeeded
-                                try:
-                                    # Expecting (action_idx, inference_time_sec) from worker
-                                    # Add timeout to prevent indefinite blocking if worker dies
-                                    action_idx, inference_time_sec = self.action_queue.get(timeout=1.0)  # Reduced from 5.0
-                                    inference_time_ms = inference_time_sec * 1000
-                                    self.metrics.update_dqn_inference_time(inference_time_ms)
-
-                                    # Get fire, zap, spinner from the received action_idx
-                                    if action_idx is not None and action_idx in ACTION_MAPPING:
-                                        fire, zap, spinner = ACTION_MAPPING[action_idx]
-                                    else:
-                                         print(f"Client {client_id}: Received invalid action_idx {action_idx} from queue. Using default.")
-                                         action_idx = 0 # Reset to default if invalid
-                                         fire, zap, spinner = ACTION_MAPPING[action_idx]
-
-                                except mp.queues.Empty:
-                                    print(f"Client {client_id}: Timeout waiting for action from inference worker. Using default action.")
-                                    action_idx = 0 # Default action index on timeout
-                                    fire, zap, spinner = ACTION_MAPPING[action_idx]
-                                except Exception as q_get_e:
-                                     print(f"Client {client_id}: Failed to get action from queue: {q_get_e}. Using default action.")
-                                     action_idx = 0 # Default action index on error
-                                     fire, zap, spinner = ACTION_MAPPING[action_idx]
-
-                            # --- End DQN via Queue ---
+                              # --- End Inference Worker via Queues --- 
                     else:
-                         print(f"Client {client_id}: Agent not available for action generation.")
-                         # Keep default action (0,0,0) -> action_idx remains None initially
-                         # Set default index if agent missing
+                         # Handle case where main_agent_ref might be None (though unlikely now)
+                         print(f"Client {client_id}: Main agent reference not available for action generation.")
                          action_idx = 0
                          fire, zap, spinner = ACTION_MAPPING[action_idx]
 
@@ -502,14 +551,12 @@ class SocketServer:
                         break # Exit loop if connection is lost
 
 
-                    # Periodic target network update (only from client 0)
-                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
-                        self.agent.update_target_network()
+                    # Use main_agent_ref for target network update
+                    current_frame = self.metrics.frame_count # Use metrics frame count
+                    if client_id == 0 and hasattr(self, 'main_agent_ref') and self.main_agent_ref and current_frame % RL_CONFIG.update_target_every == 0:
+                        self.main_agent_ref.update_target_network()
 
-                    # Periodic model saving (only from client 0)
-                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.save_interval == 0:
-                        self.agent.save(LATEST_MODEL_PATH)
-
+                    # Periodic model saving is handled by training worker or main process shutdown
 
                 except (BlockingIOError, InterruptedError):
                     # Expected with non-blocking socket, short sleep prevents busy-waiting
