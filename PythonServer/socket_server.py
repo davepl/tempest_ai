@@ -223,16 +223,16 @@ class SocketServer:
             client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             
             # Increase socket buffer sizes for better performance
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)  # 128KB
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)  # 128KB
             
-            buffer_size = 32768
+            buffer_size = 65536  # 64KB
             
             # --- Initial Ping Handshake ---
             ping_ok = False
             try:
                 client_socket.setblocking(True)
-                client_socket.settimeout(2.0)
+                client_socket.settimeout(1.0)  # Reduced from 2.0
                 ping_header = client_socket.recv(2)
                 if not ping_header or len(ping_header) < 2:
                     print(f"Client {client_id} disconnected (no initial ping header)")
@@ -250,7 +250,7 @@ class SocketServer:
             # Main communication loop
             while self.running and not self.shutdown_event.is_set():
                 try:
-                    ready = select.select([client_socket], [], [], 0.01)
+                    ready = select.select([client_socket], [], [], 0.001)  # Reduced from 0.01
                     if not ready[0]:
                         continue
 
@@ -300,7 +300,6 @@ class SocketServer:
                          break # Exit the loop
 
                     # --- End Parameter Count Validation ---
-
 
                     # Parse the full frame data (only if count check passed)
                     frame = parse_frame_data(data)
@@ -353,12 +352,12 @@ class SocketServer:
                          # Ensure agent exists before stepping
                         if hasattr(self, 'agent') and self.agent:
                             self.agent.step(
-                                state['last_state'],
-                                np.array([[state['last_action_idx']]]),
-                                frame.reward,
-                                frame.state,
-                                frame.done
-                            )
+                                 state['last_state'],
+                                 np.array([[state['last_action_idx']]]),
+                                 frame.reward,
+                                 frame.state,
+                                 frame.done
+                             )
                         else:
                              print(f"Client {client_id}: Agent not available for step.")
 
@@ -452,7 +451,7 @@ class SocketServer:
                                 try:
                                     # Expecting (action_idx, inference_time_sec) from worker
                                     # Add timeout to prevent indefinite blocking if worker dies
-                                    action_idx, inference_time_sec = self.action_queue.get(timeout=5.0)
+                                    action_idx, inference_time_sec = self.action_queue.get(timeout=1.0)  # Reduced from 5.0
                                     inference_time_ms = inference_time_sec * 1000
                                     self.metrics.update_dqn_inference_time(inference_time_ms)
 
@@ -514,8 +513,7 @@ class SocketServer:
 
                 except (BlockingIOError, InterruptedError):
                     # Expected with non-blocking socket, short sleep prevents busy-waiting
-                    time.sleep(0.001)
-                    continue
+                    time.sleep(0.0001)  # Reduced from 0.001
                 except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
                     print(f"Client {client_id} connection error: {e}")
                     break # Exit the loop on connection errors

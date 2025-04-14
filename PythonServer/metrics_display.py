@@ -53,12 +53,12 @@ def display_metrics_header():
     # Clear screen first
     # clear_screen()
     
-    # Print header (Increase Frame width, Add TrainQ)
+    # Print header (Adjust widths for scientific notation)
     header = (
-        f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
-        f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
+        f"{'Frame':>11} {'Time':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
+        f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>11} " # Adjusted Loss width
         f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
-        f"{'TrainQ':>7} {'InfTime(ms)':>10}" # Added InfTime column
+        f"{'TrainQ':>7} {'InfTime(ms)':>10}"
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header
@@ -89,20 +89,27 @@ def display_metrics_row(agent, kb_handler):
     
     # Get Training Queue Size
     train_q_size = 0
-    if agent and hasattr(agent, 'train_queue'):
-        train_q_size = agent.train_queue.qsize()
+    if agent and hasattr(agent, 'agent') and hasattr(agent.agent, 'train_queue'): # Adjusted check
+        train_q_size = agent.agent.train_queue.qsize()
     
     # Get Average DQN Inference Time (calculated in stats_reporter)
     avg_inf_time_ms = metrics.avg_dqn_inf_time
 
-    # Format the row (Add InfTime)
+    # Calculate Time (DDd HH:MM @ 30 FPS)
+    total_seconds = metrics.frame_count / 30
+    days = int(total_seconds // 86400)
+    hours = int((total_seconds % 86400) // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    time_str = f"{days:02d}d {hours:02d}:{minutes:02d}"
+
+    # Format the row (Use scientific notation for rewards and loss)
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
-        f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} "
-        f"{latest_loss:>10.2f} {metrics.client_count:>8} "
+        f"{metrics.frame_count:>11,} {time_str:>11} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} "
+        f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2e} {mean_dqn_reward:>12.2e} " # Sci notation
+        f"{latest_loss:>11.2e} {metrics.client_count:>8} " # Sci notation, adjusted width
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
-        f"{train_q_size:>7} {avg_inf_time_ms:>10.2f}" # Added Avg Inf Time value
+        f"{train_q_size:>7} {avg_inf_time_ms:>10.2f}"
     )
     
     print_metrics_line(row)

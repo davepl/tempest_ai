@@ -593,45 +593,42 @@ class SafeMetrics:
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state"""
     try:
-        if not data or len(data) < 10:  # Minimal size check
-            print("ERROR: Received empty or too small data packet", flush=True)
-            sys.exit(1)
+        if not data:
+            print("ERROR: Received empty data packet", flush=True)
+            return None # Return None instead of sys.exit
         
         format_str = ">HdBBBHHHBBBhBhBB"  # Updated to include both score components
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
             print(f"ERROR: Received data too small: {len(data)} bytes, need {header_size}", flush=True)
-            sys.exit(1)
+            return None
             
-        values = struct.unpack(format_str, data[:header_size])
+        # Unpack header values
+        header_values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
-        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
+        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = header_values
         
         # Combine score components
         score = (score_high * 65536) + score_low
         
-        state_data = data[header_size:]
+        # --- State Data Parsing (Optimized) ---
+        state_data_bytes = data[header_size:]
+        expected_state_bytes = num_values * 2 # Each state value is >H (2 bytes)
         
-        # Safely process state values with error handling
-        state_values = []
-        for i in range(0, len(state_data), 2):  # Using 2 bytes per value
-            if i + 1 < len(state_data):
-                try:
-                    value = struct.unpack(">H", state_data[i:i+2])[0]
-                    normalized = (value / 255.0) * 2.0 - 1.0
-                    state_values.append(normalized)
-                except struct.error as e:
-                    print(f"ERROR: Failed to unpack state value at position {i}: {e}", flush=True)
-                    sys.exit(1)
+        # Validate state data length
+        if len(state_data_bytes) != expected_state_bytes:
+            print(f"ERROR: Expected {expected_state_bytes} state bytes ({num_values} values) but got {len(state_data_bytes)}", flush=True)
+            return None
+
+        # Efficiently create NumPy array from buffer
+        # '>u2' matches the struct format '>H' (big-endian unsigned short)
+        state_int_array = np.frombuffer(state_data_bytes, dtype=np.dtype('>u2'))
         
-        state = np.array(state_values, dtype=np.float32)  # Already normalized
+        # Convert to float32 and normalize using vectorized operations
+        state = (state_int_array.astype(np.float32) / 255.0) * 2.0 - 1.0
         
-        # Verify we got the expected number of values
-        if len(state_values) != num_values:
-            print(f"ERROR: Expected {num_values} state values but got {len(state_values)}", flush=True)
-            sys.exit(1)
-                
+        # --- Create FrameData Object (Unchanged) ---
         frame_data = FrameData(
             state=state,
             reward=reward,
@@ -646,9 +643,17 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         )
         
         return frame_data
+        
+    except struct.error as e:
+        print(f"ERROR unpacking header data: {e}", flush=True)
+        return None
+    except ValueError as e:
+        print(f"ERROR during state data processing: {e}", flush=True)
+        return None
     except Exception as e:
         print(f"ERROR parsing frame data: {e}", flush=True)
-        sys.exit(1)
+        traceback.print_exc() # Print full traceback for unexpected errors
+        return None
 
 def display_metrics_header(kb=None):
     """Display header for metrics table"""

@@ -27,22 +27,21 @@ function GameState:new()
     return self
 end
 
-function GameState:update(mem) -- Keep mem parameter for clarity, even if relying on global
+function GameState:update(mem)
     self.gamestate = mem:read_u8(0x0000)
-
-    local mode_read = mem:read_u8(0x0005)
-    if mode_read == nil then
-        print("Warning: Failed to read game_mode (0x0005). Defaulting to 0.")
-        self.game_mode = 0 -- Assign a default value
-    else
-        self.game_mode = mode_read -- Assign the read value
-    end
+    self.game_mode = mem:read_u8(0x0005)
 
     self.countdown_timer = mem:read_u8(0x0004)
     self.credits = mem:read_u8(0x0006)
     self.p1_level = mem:read_u8(0x0046)
     self.p1_lives = mem:read_u8(0x0048)
     self.frame_counter = self.frame_counter + 1
+    
+    -- Calculate time from frames (assuming 60 FPS)
+    local total_seconds = self.frame_counter / 60
+    self.time_days = math.floor(total_seconds / 86400)
+    self.time_hours = math.floor((total_seconds % 86400) / 3600)
+    self.time_mins = math.floor((total_seconds % 3600) / 60)
 end
 
 StateUtils.GameState = GameState
@@ -67,10 +66,19 @@ function LevelState:update(mem) -- Keep mem parameter
     self.is_open_level = (mem:read_u8(0x0111) == 0xFF)
     self.level_shape = self.level_number % 16
     
+    -- Read spike heights using read_range (16 bytes from 0x03AC to 0x03BB)
     self.spike_heights = {}
-    for i = 0, 15 do self.spike_heights[i] = mem:read_u8(0x03AC + i) end
+    local spike_data = mem:read_range(0x03AC, 0x03BB, 8)
+    for i = 1, 16 do
+        self.spike_heights[i] = string.byte(spike_data, i)
+    end
+    
+    -- Read level angles using read_range (16 bytes from 0x03EE to 0x03FD)
     self.level_angles = {}
-    for i = 0, 15 do self.level_angles[i] = mem:read_u8(0x03EE + i) end
+    local angle_data = mem:read_range(0x03EE, 0x03FD, 8)
+    for i = 1, 16 do
+        self.level_angles[i] = string.byte(angle_data, i)
+    end
 end
 
 StateUtils.LevelState = LevelState
@@ -155,21 +163,32 @@ function EnemiesState:new()
     self.active_spikers = 0; self.active_fuseballs = 0; self.pulse_beat = 0;
     self.pulsing = 0; self.pulsar_fliprate = 0; self.num_enemies_in_tube = 0;
     self.num_enemies_on_top = 0; self.enemies_pending = 0;
-    self.nearest_enemy_seg = SegmentUtils.INVALID_SEGMENT;
-    self.nearest_enemy_abs_seg_raw = -1; -- Added in main.lua previously
-    self.is_aligned_with_nearest = 0.0; self.nearest_enemy_depth_raw = 255;
-    self.alignment_error_magnitude = 0.0;
-    self.charging_fuseball_segments = {};
-    self.enemy_type_info = {0,0,0,0,0,0,0}; self.active_enemy_info = {0,0,0,0,0,0,0};
-    self.enemy_segments = {0,0,0,0,0,0,0}; self.enemy_depths = {0,0,0,0,0,0,0};
-    self.enemy_depths_lsb = {0,0,0,0,0,0,0}; 
-    self.enemy_shot_lsb = {0,0,0,0,0,0,0}; -- Keep size 7 for consistency, but only use 1-4
-    self.enemy_core_type = {0,0,0,0,0,0,0}; self.enemy_direction_moving = {0,0,0,0,0,0,0};
-    self.enemy_between_segments = {0,0,0,0,0,0,0}; self.enemy_moving_away = {0,0,0,0,0,0,0};
-    self.enemy_can_shoot = {0,0,0,0,0,0,0}; self.enemy_split_behavior = {0,0,0,0,0,0,0};
-    self.shot_positions = {0, 0, 0, 0};
-    self.pending_vid = {}; self.pending_seg = {};
-    self.enemy_shot_segments = { { address=0x02B5, value=0 }, { address=0x02B6, value=0 }, { address=0x02B7, value=0 }, { address=0x02B8, value=0 } };
+    self.spawn_slots_flippers = 0; self.spawn_slots_pulsars = 0; self.spawn_slots_tankers = 0;
+    self.spawn_slots_spikers = 0; self.spawn_slots_fuseballs = 0;
+    self.shot_positions = {0,0,0,0} -- Enemy shot positions (depth)
+    self.enemy_type_info = {}; self.active_enemy_info = {}
+    self.enemy_segments = {}; self.enemy_depths = {}; self.enemy_depths_lsb = {}
+    self.enemy_shot_lsb = {0,0,0,0,0,0,0} -- Keep size 7 for consistency, only use 1-4
+    self.enemy_core_type = {}; self.enemy_direction_moving = {}
+    self.enemy_between_segments = {}; self.enemy_moving_away = {}
+    self.enemy_can_shoot = {}; self.enemy_split_behavior = {}
+    self.pending_seg = {}; self.pending_vid = {}
+    self.display_list = {}
+    self.nearest_enemy_seg = SegmentUtils.INVALID_SEGMENT
+    self.nearest_enemy_depth_raw = 0
+    self.nearest_enemy_abs_seg_raw = -1 -- Raw absolute segment
+    self.is_aligned_with_nearest = 0.0
+    self.alignment_error_magnitude = 0.0
+    self.charging_fuseball_segments = {} -- Tracks segments with charging fuseballs
+    self.pulsar_lanes = {} -- Tracks segments with active pulsars
+    
+    -- Addresses for enemy shot segments (read later)
+    self.enemy_shot_segments = {
+        { address = 0x02C0, value = SegmentUtils.INVALID_SEGMENT }, -- shot 1 seg
+        { address = 0x02C1, value = SegmentUtils.INVALID_SEGMENT }, -- shot 2 seg
+        { address = 0x02C2, value = SegmentUtils.INVALID_SEGMENT }, -- shot 3 seg
+        { address = 0x02C3, value = SegmentUtils.INVALID_SEGMENT }  -- shot 4 seg
+    }
     return self
 end
 
@@ -198,7 +217,7 @@ end
 
 
 function EnemiesState:update(mem, level_state) -- Needs level_state
-    -- Reset arrays
+    -- Reset arrays/tables that are fully recalculated
     self.enemy_type_info = {0,0,0,0,0,0,0}; self.active_enemy_info = {0,0,0,0,0,0,0}
     self.enemy_segments = {0,0,0,0,0,0,0}; self.enemy_depths = {0,0,0,0,0,0,0}
     self.enemy_depths_lsb = {0,0,0,0,0,0,0}; 
@@ -206,22 +225,45 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
     self.enemy_core_type = {0,0,0,0,0,0,0}; self.enemy_direction_moving = {0,0,0,0,0,0,0}
     self.enemy_between_segments = {0,0,0,0,0,0,0}; self.enemy_moving_away = {0,0,0,0,0,0,0}
     self.enemy_can_shoot = {0,0,0,0,0,0,0}; self.enemy_split_behavior = {0,0,0,0,0,0,0}
-    self.charging_fuseball_segments = {}
+    self.charging_fuseball_segments = {} -- Reset derived tables
+    self.pulsar_lanes = {} -- Reset derived tables
+    -- Initialize derived per-segment tables
+    for i = 1, 16 do
+        self.charging_fuseball_segments[i] = 0
+        self.pulsar_lanes[i] = 0
+    end
 
-    -- Read counts
-    self.active_flippers=mem:read_u8(0x0142); self.active_pulsars=mem:read_u8(0x0143); self.active_tankers=mem:read_u8(0x0144);
-    self.active_spikers=mem:read_u8(0x0145); self.active_fuseballs=mem:read_u8(0x0146); self.pulse_beat=mem:read_u8(0x0147);
-    self.pulsing=mem:read_u8(0x0148); self.pulsar_fliprate=mem:read_u8(0x00B2); self.num_enemies_in_tube=mem:read_u8(0x0108);
-    self.num_enemies_on_top=mem:read_u8(0x0109); self.enemies_pending=mem:read_u8(0x03AB);
-    self.spawn_slots_flippers=mem:read_u8(0x013D); self.spawn_slots_pulsars=mem:read_u8(0x013E);
-    self.spawn_slots_tankers=mem:read_u8(0x013F); self.spawn_slots_spikers=mem:read_u8(0x0140);
-    self.spawn_slots_fuseballs=mem:read_u8(0x0141);
+    -- Read enemy counts (9 bytes from 0x0142 to 0x014A)
+    local counts = mem:read_range(0x0142, 0x014A, 8)
+    self.active_flippers = string.byte(counts, 1)
+    self.active_pulsars = string.byte(counts, 2)
+    self.active_tankers = string.byte(counts, 3)
+    self.active_spikers = string.byte(counts, 4)
+    self.active_fuseballs = string.byte(counts, 5)
+    self.pulse_beat = string.byte(counts, 6)
+    self.pulsing = string.byte(counts, 7)
+    self.pulsar_fliprate = string.byte(counts, 8)
+    -- self.num_enemies_in_tube = string.byte(counts, 9) -- Incorrectly read from 0x014A via batch
+
+    -- Read spawn slots (5 bytes from 0x013D to 0x0141)
+    local spawn_slots = mem:read_range(0x013D, 0x0141, 8)
+    self.spawn_slots_flippers = string.byte(spawn_slots, 1)
+    self.spawn_slots_pulsars = string.byte(spawn_slots, 2)
+    self.spawn_slots_tankers = string.byte(spawn_slots, 3)
+    self.spawn_slots_spikers = string.byte(spawn_slots, 4)
+    self.spawn_slots_fuseballs = string.byte(spawn_slots, 5)
+
+    -- Read additional counts directly
+    self.num_enemies_in_tube = mem:read_u8(0x0108) 
+    self.num_enemies_on_top = mem:read_u8(0x0109) 
+    self.enemies_pending = mem:read_u8(0x03AB)
 
     local player_abs_segment = mem:read_u8(0x0200) & 0x0F
     local is_open = level_state.is_open_level
     
-    -- Read enemy shot positions first
-    for i = 1, 4 do self.shot_positions[i] = mem:read_u8(0x02DB + i - 1) end
+    -- Batch read shot positions (4 bytes from 0x02DB to 0x02DE)
+    local shot_positions = mem:read_range(0x02DB, 0x02DE, 8)
+    for i = 1, 4 do self.shot_positions[i] = string.byte(shot_positions, i) end
 
     -- Update enemy shot segments (now safe to use self.shot_positions)
     for i = 1, 4 do
@@ -233,17 +275,19 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
         end
     end
     
-    -- Read raw enemy data for segment calculations
-    local raw_enemy_abs_segments = {}
+    -- Batch read enemy data (7 bytes from 0x02B9 to 0x02BF)
+    local enemy_data = mem:read_range(0x02B9, 0x02BF, 8)
+    -- Batch read enemy depths (7 bytes from 0x02DF to 0x02E5)
+    local enemy_depths = mem:read_range(0x02DF, 0x02E5, 8)
+    
     for i = 1, 7 do
-        local abs_segment = mem:read_u8(0x02B9 + i - 1)
-        self.enemy_depths[i] = mem:read_u8(0x02DF + i - 1)
-        raw_enemy_abs_segments[i] = abs_segment & 0x0F -- Store masked absolute segment
-
+        local abs_segment = string.byte(enemy_data, i) & 0x0F
+        self.enemy_depths[i] = string.byte(enemy_depths, i)
+        
         if (self.enemy_depths[i] == 0 or abs_segment == 0) then
             self.enemy_segments[i] = SegmentUtils.INVALID_SEGMENT
         else
-            self.enemy_segments[i] = SegmentUtils.absolute_to_relative_segment(player_abs_segment, raw_enemy_abs_segments[i], is_open)
+            self.enemy_segments[i] = SegmentUtils.absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
         end
     end
 
@@ -266,11 +310,17 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
         self.alignment_error_magnitude = math.floor(normalized_error * 10000.0)
     end
 
-    -- Read and decode Type/State bytes
+    -- Batch read enemy type info (7 bytes from 0x0283 to 0x0289)
+    local type_info = mem:read_range(0x0283, 0x0289, 8)
+    -- Batch read active enemy info (7 bytes from 0x028A to 0x0290)
+    local active_info = mem:read_range(0x028A, 0x0290, 8)
+    
     for i = 1, 7 do
-        self.enemy_type_info[i] = mem:read_u8(0x0283 + i - 1) 
-        self.active_enemy_info[i] = mem:read_u8(0x028A + i - 1) 
-        if self.enemy_depths[i] > 0 then
+        self.enemy_type_info[i] = string.byte(type_info, i)
+        self.active_enemy_info[i] = string.byte(active_info, i)
+        local current_abs_segment = string.byte(enemy_data, i) & 0x0F
+
+        if self.enemy_depths[i] > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 then -- Check active and valid segment
             local type_byte = self.enemy_type_info[i]
             local state_byte = self.active_enemy_info[i]
             self.enemy_core_type[i] = type_byte & 0x07
@@ -279,8 +329,15 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
             self.enemy_moving_away[i] = (state_byte & 0x80) ~= 0 and 1 or 0
             self.enemy_can_shoot[i] = (state_byte & 0x40) ~= 0 and 1 or 0
             self.enemy_split_behavior[i] = state_byte & 0x03
-            if self.enemy_core_type[i] == 4 and self.enemy_moving_away[i] == 0 then
-                 self.charging_fuseball_segments[(mem:read_u8(0x02B9 + i - 1) & 0x0F) + 1] = 1
+            
+            -- Update charging fuseball segments
+            if self.enemy_core_type[i] == 4 and self.enemy_moving_away[i] == 0 then -- Type 4 = Fuseball
+                 self.charging_fuseball_segments[current_abs_segment + 1] = 1
+            end
+            
+            -- Update pulsar lanes (Assuming Pulsar core type is 1)
+            if self.enemy_core_type[i] == 1 then 
+                self.pulsar_lanes[current_abs_segment + 1] = 1
             end
         else 
             -- Explicitly zero out decoded info for inactive enemies
@@ -296,21 +353,26 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
     end
     
     -- Read Enemy Shot LSBs (only 4 shots exist)
+    local shot_lsbs = mem:read_range(0x02E6, 0x02E9, 8)
     for i = 1, 4 do -- Loop only 4 times
         if self.shot_positions[i] > 0 then -- Check if the corresponding shot is active
-            self.enemy_shot_lsb[i] = mem:read_u8(0x02E6 + i - 1) 
+            self.enemy_shot_lsb[i] = string.byte(shot_lsbs, i)
         else
             self.enemy_shot_lsb[i] = 0 -- Ensure LSB is 0 for inactive shots
         end
     end
-     -- Ensure remaining LSB slots (5-7) are 0 (already handled by reset at top)
 
-    -- Read pending seg/vid
+    -- Batch read pending seg/vid (64 bytes each)
+    local pending_seg = mem:read_range(0x0203, 0x0242, 8)
+    local pending_vid = mem:read_range(0x0243, 0x0282, 8)
     for i = 1, 64 do
-        local abs_segment = mem:read_u8(0x0203 + i - 1)
-        if abs_segment == 0 then self.pending_seg[i] = SegmentUtils.INVALID_SEGMENT
-        else self.pending_seg[i] = SegmentUtils.absolute_to_relative_segment(player_abs_segment, abs_segment & 0x0F, is_open) end
-        self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
+        local abs_segment = string.byte(pending_seg, i)
+        if abs_segment == 0 then 
+            self.pending_seg[i] = SegmentUtils.INVALID_SEGMENT
+        else 
+            self.pending_seg[i] = SegmentUtils.absolute_to_relative_segment(player_abs_segment, abs_segment & 0x0F, is_open) 
+        end
+        self.pending_vid[i] = string.byte(pending_vid, i)
     end
 
     -- Scan display list
@@ -392,123 +454,175 @@ end
 StateUtils.ControlState = ControlState -- Export the new class
 
 
--- Flatten game state to binary (moved from main.lua)
--- Requires controls object to be passed (Now expecting a ControlState instance)
+-- Flattens the entire game state into a single table of numbers for sending
 function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, controls, bDone, shutdown_requested)
     local data = {}
-    -- Game state (Integers)
-    table.insert(data, game_state.gamestate); table.insert(data, game_state.game_mode); 
-    table.insert(data, game_state.countdown_timer); table.insert(data, game_state.p1_lives); 
-    table.insert(data, game_state.p1_level);
+    
+    -- 1. Game State (Integers)
+    table.insert(data, game_state.gamestate or 0)
+    table.insert(data, game_state.game_mode or 0)
+    table.insert(data, game_state.countdown_timer or 0)
+    table.insert(data, game_state.p1_lives or 0)
+    table.insert(data, game_state.p1_level or 0)
+    table.insert(data, game_state.credits or 0)
 
-    -- Nearest enemy relative segment and delta (Integers)
-    local nearest_relative_seg = enemies_state.nearest_enemy_seg 
-    local segment_delta = (nearest_relative_seg == SegmentUtils.INVALID_SEGMENT) and 0 or nearest_relative_seg
-    table.insert(data, nearest_relative_seg) 
-    table.insert(data, segment_delta)      
-    table.insert(data, enemies_state.nearest_enemy_depth_raw) -- Integer (0-255)
-    -- Convert potential floats to integers before inserting
-    table.insert(data, math.floor(enemies_state.is_aligned_with_nearest)) -- Explicitly floor 0.0/1.0
-    table.insert(data, enemies_state.alignment_error_magnitude) -- Already floored in update
+    -- 2. Level State (Integers/Tables)
+    table.insert(data, level_state.level_number or 0)
+    table.insert(data, level_state.level_shape or 0)
+    table.insert(data, level_state.is_open_level and 1 or 0)
+    for i = 1, 16 do table.insert(data, level_state.spike_heights[i] or 0) end
+    for i = 1, 16 do table.insert(data, level_state.level_angles[i] or 0) end
 
-    -- Player state (Integers/Booleans treated as 0/1 later)
-    table.insert(data, player_state.position); table.insert(data, player_state.alive); 
-    table.insert(data, player_state.player_state); table.insert(data, player_state.player_depth); 
-    table.insert(data, player_state.superzapper_uses); table.insert(data, player_state.superzapper_active); 
-    table.insert(data, player_state.shot_count);
-    for i = 1, 8 do table.insert(data, player_state.shot_positions[i] or 0) end
+    -- 3. Player State (Integers/Tables)
+    table.insert(data, player_state.score or 0)
+    table.insert(data, player_state.position or 0)
+    table.insert(data, player_state.player_depth or 0)
+    table.insert(data, player_state.player_state or 0)
+    table.insert(data, player_state.alive and 1 or 0)
+    table.insert(data, player_state.superzapper_uses or 0)
+    table.insert(data, player_state.superzapper_active and 1 or 0)
+    table.insert(data, player_state.shot_count or 0)
+    table.insert(data, player_state.inferredSpinnerDelta or 0)
     for i = 1, 8 do table.insert(data, player_state.shot_segments[i] or SegmentUtils.INVALID_SEGMENT) end
+    for i = 1, 8 do table.insert(data, player_state.shot_positions[i] or 0) end
 
-    -- Level state (Integers)
-    table.insert(data, level_state.level_number); table.insert(data, level_state.level_shape); 
-    for i = 0, 15 do table.insert(data, level_state.spike_heights[i] or 0) end
-    for i = 0, 15 do table.insert(data, level_state.level_angles[i] or 0) end
-
-    -- Enemies state counts (Integers)
-    table.insert(data, enemies_state.active_flippers); table.insert(data, enemies_state.active_pulsars);
-    table.insert(data, enemies_state.active_tankers); table.insert(data, enemies_state.active_spikers);
-    table.insert(data, enemies_state.active_fuseballs); table.insert(data, enemies_state.spawn_slots_flippers);
-    table.insert(data, enemies_state.spawn_slots_pulsars); table.insert(data, enemies_state.spawn_slots_tankers);
-    table.insert(data, enemies_state.spawn_slots_spikers); table.insert(data, enemies_state.spawn_slots_fuseballs);
-    table.insert(data, enemies_state.num_enemies_in_tube); table.insert(data, enemies_state.num_enemies_on_top);
-    table.insert(data, enemies_state.enemies_pending); table.insert(data, enemies_state.pulsar_fliprate);
-
-    -- Decoded Enemy Info (Integers/Booleans)
-    for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_core_type[i] or 0)
-        table.insert(data, enemies_state.enemy_direction_moving[i] or 0)
-        table.insert(data, enemies_state.enemy_between_segments[i] or 0)
-        table.insert(data, enemies_state.enemy_moving_away[i] or 0)
-        table.insert(data, enemies_state.enemy_can_shoot[i] or 0)
-        table.insert(data, enemies_state.enemy_split_behavior[i] or 0)
-    end
-    -- Enemy relative segments (Integers)
+    -- 4. Enemy State (Counts, Flags, Segments, Depths, etc.)
+    -- Counts
+    table.insert(data, enemies_state.active_flippers or 0)
+    table.insert(data, enemies_state.active_pulsars or 0)
+    table.insert(data, enemies_state.active_tankers or 0)
+    table.insert(data, enemies_state.active_spikers or 0)
+    table.insert(data, enemies_state.active_fuseballs or 0)
+    table.insert(data, enemies_state.num_enemies_in_tube or 0)
+    table.insert(data, enemies_state.num_enemies_on_top or 0)
+    table.insert(data, enemies_state.enemies_pending or 0)
+    -- Spawn Slots
+    table.insert(data, enemies_state.spawn_slots_flippers or 0)
+    table.insert(data, enemies_state.spawn_slots_pulsars or 0)
+    table.insert(data, enemies_state.spawn_slots_tankers or 0)
+    table.insert(data, enemies_state.spawn_slots_spikers or 0)
+    table.insert(data, enemies_state.spawn_slots_fuseballs or 0)
+    -- Pulsar State
+    table.insert(data, enemies_state.pulsar_fliprate or 0)
+    table.insert(data, enemies_state.pulse_beat or 0)
+    table.insert(data, enemies_state.pulsing or 0)
+    -- Nearest Enemy
+    local nearest_relative_seg = enemies_state.nearest_enemy_seg
+    local segment_delta = (nearest_relative_seg == SegmentUtils.INVALID_SEGMENT) and 0 or nearest_relative_seg
+    table.insert(data, nearest_relative_seg or SegmentUtils.INVALID_SEGMENT)
+    table.insert(data, segment_delta)
+    table.insert(data, enemies_state.nearest_enemy_depth_raw or 0)
+    table.insert(data, math.floor(enemies_state.is_aligned_with_nearest or 0.0))
+    table.insert(data, enemies_state.alignment_error_magnitude or 0.0)
+    -- Enemy Segments/Depths (7 enemies)
     for i = 1, 7 do table.insert(data, enemies_state.enemy_segments[i] or SegmentUtils.INVALID_SEGMENT) end
-    -- Top Enemy Segments (Integers)
-    for i = 1, 7 do 
-        if enemies_state.enemy_depths[i] == 0x10 then table.insert(data, enemies_state.enemy_segments[i]) else table.insert(data, SegmentUtils.INVALID_SEGMENT) end 
-    end
-    -- Enemy depths - Remove LSB calculation, just use MSB
-    for i = 1, 7 do 
-        -- Explicitly use the integer depth value
-        table.insert(data, enemies_state.enemy_depths[i] or 0) 
-    end
-    -- Enemy shot positions/segments (Integers)
-    for i = 1, 4 do table.insert(data, enemies_state.shot_positions[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_depths[i] or 0) end
+    -- Enemy Shot Info (4 shots)
     for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_segments[i].value or SegmentUtils.INVALID_SEGMENT) end
-    -- Charging fuseballs (Integers/Booleans)
+    for i = 1, 4 do table.insert(data, enemies_state.shot_positions[i] or 0) end -- Using enemy shot positions here
+    for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_lsb[i] or 0) end
+    -- Enemy Flags (7 enemies)
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_moving_away[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_can_shoot[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_split_behavior[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_core_type[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_direction_moving[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_between_segments[i] or 0) end
+    -- Per-Segment Flags (16 segments)
     for i = 1, 16 do table.insert(data, enemies_state.charging_fuseball_segments[i] or 0) end
-    -- Pulse state (Integers)
-    table.insert(data, enemies_state.pulse_beat or 0); table.insert(data, enemies_state.pulsing or 0);
-    -- Pending vid/seg (Integers)
-    for i = 1, 64 do table.insert(data, enemies_state.pending_vid[i] or 0) end
-    for i = 1, 64 do table.insert(data, enemies_state.pending_seg[i] or SegmentUtils.INVALID_SEGMENT) end
+    for i = 1, 16 do table.insert(data, enemies_state.pulsar_lanes[i] or 0) end
 
-    -- Serialize (as before)
+    -- 5. Pending Spawns (Lookahead)
+    for i = 1, 64 do table.insert(data, enemies_state.pending_seg[i] or SegmentUtils.INVALID_SEGMENT) end
+    for i = 1, 64 do table.insert(data, enemies_state.pending_vid[i] or 0) end
+
+    -- 6. Boolean Flags (Game Control) - Note: some flags moved to OOB header
+    -- table.insert(data, bDone and 1 or 0) -- Moved to OOB
+    -- table.insert(data, shutdown_requested and 1 or 0) -- Implied by save signal logic
+    -- table.insert(data, game_state:should_send_save() and 1 or 0) -- Moved to OOB
+
+    -- 7. Controls (Sent for logging/context, not usually state for agent) - Moved to OOB
+    -- table.insert(data, controls.fire)
+    -- table.insert(data, controls.zap)
+    -- table.insert(data, math.floor(controls.spinner * 10000))
+    
+    -- 8. Reward (Sent for learning) - Moved to OOB
+    -- table.insert(data, math.floor(reward * 10000))
+
+    -- *** Restore OOB Header and Binary Packing Logic ***
+
+    -- Calculate save signal
+    local save_signal = 0
+    if game_state:should_send_save() or shutdown_requested then
+        save_signal = 1
+        game_state.last_save_time = os.time() -- Update timestamp when sending signal
+        print("Save signal triggered (Interval or Shutdown)")
+    end
+
+    -- Prepare values for OOB Header
+    local num_values = #data
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    local is_open_level_oob = level_state.is_open_level
+    local nearest_abs_seg_oob = enemies_state.nearest_enemy_abs_seg_raw 
+    local player_abs_seg_oob = player_state.position & 0x0F 
+    local score_oob = player_state.score or 0
+    local score_high_oob = math.floor(score_oob / 65536)
+    local score_low_oob = score_oob % 65536              
+    local frame_oob = game_state.frame_counter % 65536
+
+    -- Pack OOB header
+    local oob_data = string.pack(">HdBBBHHHBBBhBhBB",
+        num_values,               -- H: Number of state values that follow
+        math.floor(reward*10000), -- d: Reward (scaled integer)
+        0,                        -- B: game_action (placeholder, Python uses controls)
+        game_state.game_mode,     -- B: Game Mode
+        bDone and 1 or 0,         -- B: Done flag
+        frame_oob,                -- H: Frame counter (low 16 bits)
+        score_high_oob,           -- H: Score (high 16 bits)
+        score_low_oob,            -- H: Score (low 16 bits)
+        save_signal,              -- B: Save signal flag
+        controls.fire_commanded,  -- B: Commanded fire (Corrected field name)
+        controls.zap_commanded,   -- B: Commanded zap (Corrected field name)
+        controls.spinner_delta,   -- h: Commanded spinner delta (signed short)
+        is_attract_mode and 1 or 0, -- B: Attract mode flag
+        nearest_abs_seg_oob,      -- B: Nearest enemy absolute segment raw
+        player_abs_seg_oob,       -- B: Player absolute segment raw
+        is_open_level_oob and 1 or 0 -- B: Is open level flag
+    )
+
+    -- Pack the main state data table into a binary string
     local binary_data = ""
     for i, value in ipairs(data) do
         local packed_value
-        -- Ensure value is treated as a number before bitwise op (should be guaranteed now)
-        local num_value = tonumber(value) or 0 
-        if num_value < 0 then
-             -- Handle negative numbers correctly for packing as unsigned short
-             -- Calculate two's complement for 16 bits
+        local num_value = tonumber(value) or 0 -- Ensure numeric
+        if num_value < -32768 or num_value > 65535 then
+            -- Clamp values outside reasonable range for packing as H (unsigned short)
+            -- Especially important for INVALID_SEGMENT (-1000)
+            if num_value == SegmentUtils.INVALID_SEGMENT then
+                 packed_value = 65535 -- Use max unsigned short for invalid segment
+            elseif num_value < -32768 then
+                 packed_value = 0 -- Clamp large negative to 0
+            else 
+                 packed_value = 65535 -- Clamp large positive to max
+            end
+             -- Optional: Print warning about clamping
+             -- print(string.format("Warning: Clamping value %d to %d for packing", num_value, packed_value))
+        elseif num_value < 0 then
+             -- Handle negatives within signed short range via two's complement for unsigned packing
              packed_value = 65536 + num_value 
         else
              packed_value = num_value & 0xFFFF
         end
-        -- Ensure packed_value is within 0-65535 range before packing
-        packed_value = math.max(0, math.min(packed_value, 65535)) 
         binary_data = binary_data .. string.pack(">H", packed_value)
     end
-
-    -- Save signal logic
-    local current_time = os.time()
-    local save_signal = 0
-    if current_time - game_state.last_save_time >= game_state.save_interval or shutdown_requested then
-        save_signal = 1; game_state.last_save_time = current_time
-        print("Sending save signal to Python script")
-        if shutdown_requested then print("SHUTDOWN SAVE: Final save before MAME exits") end
-    end
-
-    -- OOB Data Packing
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    local is_open_level = level_state.is_open_level
-    local nearest_abs_seg_oob = enemies_state.nearest_enemy_abs_seg_raw 
-    local player_abs_seg_oob = player_state.position & 0x0F 
-    local is_enemy_present_oob = (nearest_abs_seg_oob ~= -1) and 1 or 0 
-    local score = player_state.score or 0
-    local score_high = math.floor(score / 65536); local score_low = score % 65536              
-    local frame = game_state.frame_counter % 65536
-
-    -- Use controls object passed as argument
-    local oob_data = string.pack(">HdBBBHHHBBBhBhBB",
-        #data, reward, 0, game_state.game_mode, bDone and 1 or 0, frame, score_high, score_low,
-        save_signal, controls.fire_commanded, controls.zap_commanded, controls.spinner_delta, 
-        is_attract_mode and 1 or 0, nearest_abs_seg_oob, player_abs_seg_oob, is_open_level and 1 or 0)
     
-    return oob_data .. binary_data, #data
+    -- Return combined OOB header and packed binary state data
+    return oob_data .. binary_data
 end
 
+-- Helper function in GameState to check save interval
+function GameState:should_send_save()
+    return (os.time() - self.last_save_time >= self.save_interval)
+end
 
 return StateUtils 

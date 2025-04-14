@@ -46,86 +46,94 @@ class DQN(nn.Module):
 
 def inference_worker(state_queue: Queue, action_queue: Queue, model_path: str):
     setproctitle.setproctitle("python_inference")
-    """
-    Worker process dedicated to running model inference using PyTorch.
-    Loads the model once and then waits for states to predict actions.
-    """
+    # Set process priority (Unix only)
+    try:
+        os.nice(-10)  # Higher priority
+    except:
+        pass  # Ignore if not supported
+
     # Determine device
     device = torch.device("cuda" if torch.cuda.is_available() else
                           "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[InferWorker] Starting. Using device: {device}. Loading model from: {model_path}")
 
-    model = None
-    state_size = RL_CONFIG.state_size # Get state size from config
-    action_size = RL_CONFIG.action_size # Get action size from config
+    # Optimize PyTorch settings
+    torch.set_num_threads(1)  # Use single thread for inference
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner
 
-    # Attempt to load the model
+    model = None
+    state_size = RL_CONFIG.state_size
+    action_size = RL_CONFIG.action_size
+
+    # Pre-allocate tensors
+    state_tensor = torch.zeros((1, state_size), dtype=torch.float32, device=device)
+    
     try:
         if os.path.exists(model_path):
+            # Load and compile model
             model = DQN(state_size, action_size).to(device)
             checkpoint = torch.load(model_path, map_location=device)
             model.load_state_dict(checkpoint['policy_state_dict'])
             model.eval()
-            print("[InferWorker] Model loaded and set to eval mode successfully.")
+            
+            # Compile model for better performance
+            try:
+                model = torch.jit.script(model)
+                print("[InferWorker] Model compiled with torch.jit.script")
+            except Exception as compile_e:
+                print(f"[InferWorker] Model compilation failed: {compile_e}. Using uncompiled model.")
+            
+            print("[InferWorker] Model loaded and optimized successfully.")
+            
+            # Warm up model
+            try:
+                with torch.no_grad():
+                    _ = model(state_tensor)
+                print("[InferWorker] Model warm-up prediction done.")
+            except Exception as warmup_e:
+                print(f"[InferWorker] Model warm-up failed: {warmup_e}")
         else:
-             print(f"[InferWorker] Model file not found at {model_path}. Worker will not predict.")
+            print(f"[InferWorker] Model file not found at {model_path}. Worker will not predict.")
 
         while True:
-            # Wait for state data (or shutdown signal)
             try:
-                state_data_tuple = state_queue.get(timeout=1.0)
-            except mp.queues.Empty:
-                continue
+                state_data = state_queue.get(timeout=1.0)
+                if state_data is None:
+                    print("[InferWorker] Received shutdown signal. Exiting.")
+                    break
 
-            if state_data_tuple is None:
-                print("[InferWorker] Received shutdown signal. Exiting.")
-                break
-
-            state_data = state_data_tuple # Should be a numpy array
-
-            # Perform inference only if model loaded successfully
-            if model is not None:
                 start_time = time.time()
                 action_idx = 0
-                try:
-                    # Convert numpy state to torch tensor
-                    state_tensor = torch.from_numpy(state_data).float().unsqueeze(0).to(device)
+                
+                if model is not None:
+                    try:
+                        # Copy state data directly into pre-allocated tensor
+                        state_tensor.copy_(torch.from_numpy(state_data).float())
+                        
+                        # Run inference
+                        with torch.no_grad():
+                            q_values = model(state_tensor)
+                        
+                        inference_time = time.time() - start_time
+                        action_idx = int(q_values.argmax().item())
+                        
+                        action_queue.put((action_idx, inference_time))
+                        
+                    except Exception as pred_e:
+                        print(f"[InferWorker] Error during prediction: {pred_e}")
+                        traceback.print_exc()
+                        action_queue.put((0, 0.0))
+                else:
+                    action_queue.put((0, 0.0))
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[InferWorker] Error in main loop: {e}")
+                traceback.print_exc()
+                break
 
-                    # Predict Q-values using the loaded model
-                    with torch.no_grad(): # Disable gradient calculations for inference
-                        q_values = model(state_tensor)
-
-                    inference_time = time.time() - start_time
-
-                    # Determine best action index (greedy)
-                    action_idx = int(q_values.argmax().item()) # Use .item() to get Python int
-
-                    # Send action index and inference time back
-                    action_queue.put((action_idx, inference_time))
-
-                except Exception as pred_e:
-                     print(f"[InferWorker] Error during prediction: {pred_e}")
-                     traceback.print_exc()
-                     try:
-                         action_queue.put((0, 0.0)) # Default action index 0, zero time
-                     except Exception as q_put_e:
-                         print(f"[InferWorker] Failed to put error state action: {q_put_e}")
-                         break
-            else:
-                 # Model not loaded, send default action index
-                 try:
-                      action_queue.put((0, 0.0))
-                 except Exception as q_put_e:
-                      print(f"[InferWorker] Failed to put default action (model not loaded): {q_put_e}")
-                      break
-
-    except FileNotFoundError:
-        print(f"[InferWorker] Error: Model file not found during initial load: {model_path}")
-    except ImportError:
-        print("[InferWorker] Error: PyTorch not found or import failed.")
-    except KeyError as ke:
-         print(f"[InferWorker] Error loading model state_dict. Key missing: {ke}. Check save format.")
-         traceback.print_exc()
     except Exception as e:
         print(f"[InferWorker] An unexpected error occurred: {e}")
         traceback.print_exc()
