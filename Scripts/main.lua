@@ -29,7 +29,7 @@
 --]]
 
 -- Define the server address as a global variable
-local SERVER_ADDRESS = "socket.localhost:9999"
+local SERVER_ADDRESS = "socket.m2macpro:9999"
 
 -- Add the Scripts directory to Lua's package path
 package.path = package.path .. ";/Users/dave/source/repos/tempest_ai/Scripts/?.lua"
