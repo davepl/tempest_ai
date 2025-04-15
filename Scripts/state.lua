@@ -399,8 +399,10 @@ ControlState.__index = ControlState
 
 function ControlState:new()
     local self = setmetatable({}, ControlState)
+
     -- Get button ports (needs access to manager)
     -- Assuming 'manager' is accessible globally for now
+    print("DEBUG state.lua: Type of 'manager' in ControlState:new() = ", type(manager)) -- Added Debug Print
     self.button_port = manager.machine.ioport.ports[":BUTTONSP1"]
     self.spinner_port = manager.machine.ioport.ports[":KNOBP1"]
     
