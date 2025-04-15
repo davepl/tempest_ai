@@ -284,7 +284,7 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
         local abs_segment = string.byte(enemy_data, i) & 0x0F
         self.enemy_depths[i] = string.byte(enemy_depths, i)
         
-        if (self.enemy_depths[i] == 0 or abs_segment == 0) then
+        if (self.enemy_depths[i] == 0 or abs_segment == 0) then -- Check abs_segment too
             self.enemy_segments[i] = SegmentUtils.INVALID_SEGMENT
         else
             self.enemy_segments[i] = SegmentUtils.absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
@@ -318,9 +318,9 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
     for i = 1, 7 do
         self.enemy_type_info[i] = string.byte(type_info, i)
         self.active_enemy_info[i] = string.byte(active_info, i)
-        local current_abs_segment = string.byte(enemy_data, i) & 0x0F
+        local current_abs_segment_local = string.byte(enemy_data, i) & 0x0F -- Need local absolute for charging/pulsar update
 
-        if self.enemy_depths[i] > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 then -- Check active and valid segment
+        if self.enemy_depths[i] > 0 and current_abs_segment_local >= 0 and current_abs_segment_local <= 15 then -- Check active and valid segment
             local type_byte = self.enemy_type_info[i]
             local state_byte = self.active_enemy_info[i]
             self.enemy_core_type[i] = type_byte & 0x07
@@ -332,12 +332,12 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
             
             -- Update charging fuseball segments
             if self.enemy_core_type[i] == 4 and self.enemy_moving_away[i] == 0 then -- Type 4 = Fuseball
-                 self.charging_fuseball_segments[current_abs_segment + 1] = 1
+                 self.charging_fuseball_segments[current_abs_segment_local + 1] = 1
             end
             
             -- Update pulsar lanes (Assuming Pulsar core type is 1)
             if self.enemy_core_type[i] == 1 then 
-                self.pulsar_lanes[current_abs_segment + 1] = 1
+                self.pulsar_lanes[current_abs_segment_local + 1] = 1
             end
         else 
             -- Explicitly zero out decoded info for inactive enemies
@@ -347,7 +347,7 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
             self.enemy_moving_away[i] = 0
             self.enemy_can_shoot[i] = 0
             self.enemy_split_behavior[i] = 0
-            -- Also ensure relative segment is invalid if depth is 0
+            -- Also ensure segments are invalid if depth is 0
             self.enemy_segments[i] = SegmentUtils.INVALID_SEGMENT
         end
     end

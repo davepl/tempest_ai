@@ -151,10 +151,40 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                             reward = reward + math.abs(commanded_spinner * 100) 
                         end
                     end
+
+                    if (shot_pos < 0x80) then
+                        reward = reward - (255 - shot_pos) / 10
+                    end
                 end
             end
         end -- End of check for game_state ~= 0x20
 
+        -- Reward shaping for avoiding close Fuseballs moving towards player
+        for i = 1, 7 do
+            -- Check if it's an active Fuseball (type 4) moving towards the player (moving_away == 0)
+            if enemies_state.enemy_core_type[i] == 4 and enemies_state.enemy_moving_away[i] == 0 and enemies_state.enemy_depths[i] > 0 then
+                local fuseball_depth = enemies_state.enemy_depths[i]
+                local fuseball_rel_seg = enemies_state.enemy_segments[i] -- Use RELATIVE segment
+                
+                -- Check if player is aligned with this fuseball (relative segment is 0)
+                if math.abs(fuseball_rel_seg) <= 1 then
+                    -- Apply proximity penalties/rewards similar to shots, slightly stronger
+                    if (fuseball_depth <= 0x24) then 
+                        if (commanded_spinner == 0) then 
+                            reward = reward - 150 -- Penalty for staying still near close fuseball
+                        else
+                            reward = reward + math.abs(commanded_spinner * 150) -- Reward for moving away
+                        end
+                    end
+                    if (fuseball_depth < 0x80) then
+                        reward = reward - (255 - fuseball_depth) / 8 -- General penalty for proximity
+                    end
+                end
+            end
+        end -- End of Fuseball check
+
+        -- Reward for avoiding close fuseballs that are approaching
+        
         if target_segment == SegmentUtils.INVALID_SEGMENT or game_state.gamestate == 0x20 then 
             -- No enemies or zooming: reward staying still more strongly
             reward = reward + (commanded_spinner == 0 and 50 or -20)
@@ -203,6 +233,14 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                  -- Default to no-enemy behavior
                  reward = reward + (commanded_spinner == 0 and 50 or -20) 
             end
+        end
+
+        -- Reward/penalty for being in/out of Pulsar lanes
+        local player_abs_segment = player_state.position & 0x0F
+        if enemies_state.pulsar_lanes[player_abs_segment + 1] == 1 then
+            reward = reward - 20 -- Penalty for being in a pulsar lane
+        else
+            reward = reward + 10 -- Reward for being in a safe lane
         end
 
     else -- Player not alive
