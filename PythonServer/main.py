@@ -74,7 +74,7 @@ def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
 
     agent = None
     last_model_check_time = 0
-    model_check_interval = 30 # seconds
+    model_check_interval = 300 # seconds
 
     try:
         # --- Initialize Agent --- 
@@ -205,9 +205,21 @@ def keyboard_input_handler(agent, keyboard_handler):
                     metrics.global_server.running = False
                     break
                 elif key == 's':
-                    print("Save command received, saving model...")
-                    agent.save(LATEST_MODEL_PATH)
-                    print(f"Model saved to {LATEST_MODEL_PATH}")
+                    print("[Main] 's' pressed. Saving model...")
+                    # Fetch current metrics state under lock
+                    try:
+                        with metrics.lock:
+                            metrics_state_to_save = {
+                                'frame_count': metrics.frame_count,
+                                'epsilon': metrics.epsilon,
+                                'expert_ratio': metrics.expert_ratio,
+                                'last_decay_step': metrics.last_decay_step
+                            }
+                        # Save with the fetched metrics state
+                        agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                        print(f"[Main] Model saved to {LATEST_MODEL_PATH} (Frame: {metrics_state_to_save['frame_count']})")
+                    except Exception as save_err:
+                        print(f"[Main Error] Failed manual save: {save_err}")
                 elif key == 'o':
                     # Toggle override flag directly
                     with metrics.lock:
@@ -465,6 +477,22 @@ def main():
                     shutdown_event.set()
                     socket_server.shutdown()
                     break
+                elif key == 's':
+                    print("[Main] 's' pressed. Saving model...")
+                    # Fetch current metrics state under lock
+                    try:
+                        with metrics.lock:
+                            metrics_state_to_save = {
+                                'frame_count': metrics.frame_count,
+                                'epsilon': metrics.epsilon,
+                                'expert_ratio': metrics.expert_ratio,
+                                'last_decay_step': metrics.last_decay_step
+                            }
+                        # Save with the fetched metrics state
+                        main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                        print(f"[Main] Model saved to {LATEST_MODEL_PATH} (Frame: {metrics_state_to_save['frame_count']})")
+                    except Exception as save_err:
+                        print(f"[Main Error] Failed manual save: {save_err}")
                 elif key == 'o':
                     # Toggle override flag directly
                     with metrics.lock:

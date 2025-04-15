@@ -251,7 +251,7 @@ local function process_frame(rawdata, player_state, reward, bDone, bAttractMode)
     -- Try to read from socket with timeout protection
     local fire, zap, spinner = 0, 0, 0  -- Default values
     local read_start_time = os.clock()
-    local read_timeout = 0.5  -- 500ms timeout for socket read
+    local read_timeout = 10.0  -- 2000ms timeout for socket read
     
     success, err = pcall(function()
         -- Use non-blocking approach with timeout
