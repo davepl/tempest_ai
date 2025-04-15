@@ -215,6 +215,9 @@ class SocketServer:
                     if client_id in self.clients:
                         # print(f"DEBUG: Cleaning up dead client {client_id} during ID generation") # Debug print
                         del self.clients[client_id]
+                    # ADDED BACK: Clean up state immediately before reusing ID
+                    if client_id in self.client_states:
+                        del self.client_states[client_id]
 
             # If we cleaned up any dead clients, update count and return the first ID found
             if disconnected_ids_found:
@@ -613,9 +616,6 @@ class SocketServer:
                 if client_id in self.clients:
                     del self.clients[client_id]
                     cleaned_count += 1
-                # ADDED: Also remove from client_states
-                if client_id in self.client_states:
-                    del self.client_states[client_id]
 
             # Update metrics if needed
             if cleaned_count > 0:

@@ -31,8 +31,15 @@
 -- Define the server address as a global variable
 local SERVER_ADDRESS = "socket.m2macpro:9999"
 
--- Add the Scripts directory to Lua's package path
-package.path = package.path .. ";/Users/dave/source/repos/tempest_ai/Scripts/?.lua"
+-- Get the directory of the current script
+local script_path = debug.getinfo(1,"S").source:match("@?(.*[/\\])")
+if script_path then
+  -- Prepend the script's directory to package.path
+  package.path = script_path .. "?.lua;" .. package.path
+  print("Added script directory to package.path: " .. script_path)
+else
+  print("Warning: Could not determine script directory.")
+end
 
 local AUTO_START_GAME         = true -- flag to control auto-starting during attract mode
 
