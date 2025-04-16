@@ -38,17 +38,18 @@ print(f"[Config] Using PyTorch device: {DEVICE}")
 
 @dataclass
 class ServerConfigData:
-    """Configuration for socket server"""
-    host: str = "0.0.0.0"  # Listen on all interfaces
+    host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
     params_count: int = 315
-    expert_ratio_start: float = 0.75
+    expert_ratio_start: float = 1.0
     expert_ratio_min: float = 0.0
-    expert_ratio_decay: float = 0.999
-    expert_ratio_decay_steps: int = 10000
+    expert_ratio_decay: float = 0.995  
+    expert_ratio_decay_steps: int = 100000
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
+    cpu_inference: bool = False
+
 
 # Create instance of ServerConfigData first
 SERVER_CONFIG = ServerConfigData()
@@ -58,16 +59,16 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 512
+    batch_size: int = 2048
     gamma: float = 0.99
     epsilon: float = 1.0
-    epsilon_start: float = 0.25
-    epsilon_end: float = 0.01
+    epsilon_start: float = 0.75
+    epsilon_end: float = 0.001
     epsilon_min: float = 0.001
-    epsilon_decay_rate: int = 0.9
-    decay_epsilon_frames: int = 1000
-    learning_rate: float = 1.5e-4
-    memory_size: int = 100000
+    epsilon_decay_rate: int = 0.995
+    decay_epsilon_frames: int = 100000
+    learning_rate: float = 1e-4
+    memory_size: int = 200000
     save_interval: int = 50000
     save_interval_seconds: int = 60
     train_freq: int = 4
@@ -75,6 +76,7 @@ class RLConfigData:
     min_buffer_size: int = 10000
     train_queue_size: int = 20
     loss_queue_size: int = 100
+    device_preference: str = "mps"
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -100,3 +102,14 @@ ACTION_MAPPING = {
     13: (1, 0, 0.3),   # Hard right, fire, no zap
     14: (1, 1, 0.0),   # Zap+Fire+Sit
 }
+
+# Determine the primary device
+def get_primary_device():
+    if RL_CONFIG.device_preference == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    elif RL_CONFIG.device_preference == "mps" and torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+DEVICE = get_primary_device() # Global device for training/main agent

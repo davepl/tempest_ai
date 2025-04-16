@@ -4,3 +4,4 @@ Scripts/__pycache__
 cfg
 nvram
 models
+/.venv

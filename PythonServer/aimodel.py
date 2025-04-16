@@ -63,6 +63,7 @@ from stable_baselines3.common.logger import configure
 import socket
 import traceback
 from pathlib import Path
+import math # Import math for isnan/isinf checks
 
 # Platform-specific imports for KeyboardHandler
 import sys
@@ -97,7 +98,8 @@ from config import (
     ACTION_MAPPING,
     metrics as config_metrics,
     ServerConfigData,
-    RLConfigData
+    RLConfigData,
+    DEVICE
 )
 
 # Suppress warnings
@@ -216,24 +218,26 @@ class ReplayMemory:
         return len(self.memory)
 
 class DQN(nn.Module):
-    """Deep Q-Network model."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 256) # Input -> Hidden 1 (256)
-        self.fc2 = nn.Linear(256, 128)        # Hidden 1 -> Hidden 2 (128)
-        self.fc3 = nn.Linear(128, 64)         # Hidden 2 -> Hidden 3 (64)
-        self.out = nn.Linear(64, action_size) # Hidden 3 -> Output
+        self.fc1 = nn.Linear(state_size, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.out = nn.Linear(128, action_size)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x)) # Added ReLU for fc3 output
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
         return self.out(x)
+
 
 class DQNAgent:
     """Deep Q-Network agent"""
-    def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma, 
-                 memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
+    def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma,
+                 memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size, device=None):
         """Initialize agent components"""
         self.state_size = state_size
         self.action_size = action_size
@@ -241,47 +245,47 @@ class DQNAgent:
         self.batch_size = batch_size
         self.gamma = gamma
         self.learning_rate = learning_rate
-        self.is_ready = False # <-- Add readiness flag, initially False
-        
-        # Use defined DEVICE from config
-        self.device = device 
-        print(f"[DQNAgent] Initializing models on device: {self.device}")
-        
+        self.is_ready = False
+
+        # --- Determine and store device AS torch.device object ---
+        # Use the provided device string, or fall back to the global default string
+        device_str = device if device else DEVICE # Get the device string ('cpu', 'cuda', 'mps')
+        self.device = torch.device(device_str) # <<< CONVERT string to torch.device object
+        print(f"[DQNAgent] Initializing models on device: {self.device}") # Now prints the object representation
+
+        # --- Initialize Networks ---
         self.policy_net = DQN(state_size, action_size).to(self.device)
         self.target_net = DQN(state_size, action_size).to(self.device)
 
         # --- Compile the models (PyTorch 2.0+) ---
         try:
-            # Check if torch.compile is available (requires PyTorch >= 2.0)
-            if hasattr(torch, 'compile'): 
-                # *** Add check: Only compile if NOT on MPS device ***
-                if self.device.type != 'mps':
+            # Check if torch.compile is available
+            if hasattr(torch, 'compile'):
+                # Now self.device is a torch.device object, so .type works
+                if self.device.type != 'mps': # <<< THIS CHECK IS NOW VALID
                     print("[DQNAgent] Attempting torch.compile() (Device is not MPS)...")
-                    # Compile policy network (used for training and action selection)
                     self.policy_net = torch.compile(self.policy_net)
-                    # Compile target network (used for target Q-value calculation)
-                    self.target_net = torch.compile(self.target_net) 
+                    self.target_net = torch.compile(self.target_net)
                     print("[DQNAgent] torch.compile() applied successfully.")
                 else:
                     print("[DQNAgent] Skipping torch.compile() because device is MPS.")
             else:
                  print("[DQNAgent] torch.compile() not available in this PyTorch version.")
         except Exception as compile_err:
-             # Catch potential errors during compilation (e.g., unsupported ops)
              print(f"[DQNAgent Warning] torch.compile() failed: {compile_err}")
+             # Optional: Add traceback for compile errors if needed
+             # traceback.print_exc()
         # --- End Compile ---
 
         # Load state AFTER compiling policy net
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval() # Target network is only for inference
+        self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
-        self.loss_fn = nn.SmoothL1Loss() # Huber loss
+        self.loss_fn = nn.SmoothL1Loss()
 
-        # Removed train_queue, training_thread, and related events/locks
-        # Training is now external
         print("[DQNAgent] Initialized. Training will be handled externally.")
-        self.is_ready = True # <-- Set to True after successful initialization
+        self.is_ready = True
 
     def train_step(self, batch):
         """Perform a single training step on a provided batch."""
@@ -751,8 +755,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
 def display_metrics_header(kb=None):
     """Display header for metrics table"""
     if not IS_INTERACTIVE: return
+    # Adjusted widths slightly to accommodate potential scientific notation
     header = (
-        f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
+        f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>11} | {'Loss':>9} | "
         f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
@@ -760,32 +765,50 @@ def display_metrics_header(kb=None):
     print_with_terminal_restore(kb, f"{'-' * len(header)}")
 
 def display_metrics_row(agent, kb=None):
-    """Display current metrics in tabular format"""
+    """Display current metrics in tabular format with conditional scientific notation."""
     if not IS_INTERACTIVE: return
-    mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
-    dqn_reward = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
-    mean_loss = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
+
+    # --- Calculate Metrics ---
+    mean_reward_val = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
+    dqn_reward_val = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
+    mean_loss_val = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
     guided_ratio = metrics.expert_ratio
-    mem_size = len(agent.memory) if agent else 0
-    
-    # Get client count from server if available
-    client_count = 0
-    if hasattr(metrics, 'global_server') and metrics.global_server:
-        with metrics.global_server.client_lock:
-            client_count = len(metrics.global_server.clients)
-            # Update the metrics.client_count value
-            metrics.client_count = client_count
-    
-    # Determine override status
+    mem_size = len(agent.memory) if agent and hasattr(agent, 'memory') else 0 # Add safety check for agent/memory
+
+    client_count = metrics.client_count # Assumes updated by server thread
+
     override_status = "OFF"
     if metrics.override_expert:
         override_status = "SELF"
     elif metrics.expert_mode:
         override_status = "BOT"
-    
+
+    # --- Conditional Formatting ---
+    large_threshold = 1_000_000 # Use underscore for readability
+
+    def format_large_number(value, width, precision=2):
+        """Formats a number, using scientific notation if >= threshold."""
+        if math.isnan(value) or math.isinf(value):
+            # Handle NaN/Inf gracefully to fit width
+            return f"{'NaN':>{width}}" if math.isnan(value) else f"{'Inf':>{width}}"
+            
+        if abs(value) >= large_threshold:
+            # Use scientific notation with specified precision
+            return f"{value:{width}.{precision}e}"
+        else:
+            # Use fixed-point notation
+            return f"{value:{width}.{precision}f}"
+
+    # Format the specific columns using the helper function
+    mean_reward_str = format_large_number(mean_reward_val, width=12)
+    dqn_reward_str = format_large_number(dqn_reward_val, width=11) # Adjusted width
+    mean_loss_str = format_large_number(mean_loss_val, width=9)    # Adjusted width
+
+    # --- Build Row String ---
+    # Use the pre-formatted strings
     row = (
-        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
-        f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
+        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward_str} | {dqn_reward_str} | "
+        f"{mean_loss_str} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
         f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
     )
     print_with_terminal_restore(kb, row)

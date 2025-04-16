@@ -45,27 +45,33 @@ class DQN(nn.Module):
     """Deep Q-Network model (copied for inference worker)."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 256) # Input -> Hidden 1 (256)
-        self.fc2 = nn.Linear(256, 128)        # Hidden 1 -> Hidden 2 (128)
-        self.fc3 = nn.Linear(128, 64)         # Hidden 2 -> Hidden 3 (64)
-        self.out = nn.Linear(64, action_size) # Hidden 3 -> Output
+        self.fc1 = nn.Linear(state_size, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.out = nn.Linear(128, action_size)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
         return self.out(x)
 # +++ End DQN model definition +++
 
-def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue, 
-                     model_path: Path, shutdown_event: mp.Event, 
+def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
+                     model_path: Path, shutdown_event: mp.Event,
                      inference_ready_event: mp.Event,
                      state_size: int, action_size: int):
     """Worker process dedicated to DQN inference."""
     setproctitle.setproctitle("python_inference")
     print("[InferWorker] Starting...")
-    
-    # Limit threads for inference efficiency
+
+    # --- Determine Inference Device ---
+    inference_device_str = 'cpu' if SERVER_CONFIG.cpu_inference else DEVICE
+    print(f"[InferWorker] Determined inference device string: '{inference_device_str}' (cpu_inference={SERVER_CONFIG.cpu_inference}, global DEVICE='{DEVICE}')")
+
+    # Limit threads for inference efficiency (especially relevant for CPU)
     try:
         torch.set_num_threads(1)
         print("[InferWorker] Set torch num_threads=1")
@@ -77,11 +83,14 @@ def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
     model_check_interval = 300 # seconds
 
     try:
-        # --- Initialize Agent --- 
-        agent = DQNAgent(state_size, action_size)
-        print(f"[InferWorker] DQNAgent initialized on device: {agent.device}")
+        # --- Initialize Agent on the chosen device ---
+        print("[InferWorker] Initializing DQNAgent...")
+        # Pass the determined device string to the DQNAgent constructor
+        agent = DQNAgent(state_size, action_size, device=inference_device_str) # Pass specific device string
+        # The DQNAgent init will print its own device confirmation log
 
-        # --- Load Initial Model --- 
+        # --- Load Initial Model ---
+        # agent.load() needs to handle map_location correctly (see step 3)
         if model_path.exists():
             success, _ = agent.load(model_path)
             if success:
@@ -90,12 +99,15 @@ def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
                 print(f"[InferWorker Warning] Failed to load initial model from {model_path}. Using fresh weights.")
         else:
              print(f"[InferWorker Warning] Model file {model_path} not found. Using fresh weights.")
-             
-        # --- Signal Main Process that Worker is Ready --- 
+
+        # Ensure model is in eval mode after loading/initialization
+        agent.policy_net.eval()
+
+        # --- Signal Main Process that Worker is Ready ---
         inference_ready_event.set()
         print("[InferWorker] Signaled ready to main process.")
 
-        # --- Inference Loop --- 
+        # --- Inference Loop ---
         while not shutdown_event.is_set():
             try:
                 # Periodically check for updated model weights
@@ -107,13 +119,13 @@ def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
                           mtime = model_path.stat().st_mtime
                           if mtime > last_model_check_time: # Check if file is newer
                                print(f"[InferWorker] Model file updated (mtime: {mtime:.0f} > last load: {last_model_check_time:.0f}). Reloading...")
-                               success, _ = agent.load(model_path) # Reload weights
+                               success, _ = agent.load(model_path) # Reload weights (load needs map_location)
                                if success:
-                                    agent.policy_net.eval()
-                                    last_model_check_time = mtime # Use mtime as new load time
+                                    agent.policy_net.eval() # Ensure eval mode after reload
+                                    last_model_check_time = mtime
                                else:
                                     print("[InferWorker] Model reload FAILED.")
-                                    last_model_check_time = current_time # Update time anyway to avoid rapid checks
+                                    last_model_check_time = current_time
                           # else: # Optional: print("[InferWorker] Model file unchanged, skipping reload.")
                      # else: Keep using existing weights if file disappeared
                      last_model_check_time = current_time # Update check time even if file missing
@@ -125,9 +137,10 @@ def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
                     print("[InferWorker] Received None state, shutting down.")
                     break
 
-                # Perform inference
+                # Perform inference - agent.act needs to handle device transfer internally
                 inf_start_time = time.time()
-                action_idx = agent.act(state, epsilon=0.0) # Use epsilon=0 for deterministic exploitation
+                # agent.act should handle moving the numpy state to its device
+                action_idx = agent.act(state, epsilon=0.0)
                 inf_end_time = time.time()
                 inference_time_sec = inf_end_time - inf_start_time
                 
@@ -367,26 +380,36 @@ def main():
     inference_ready_event = ctx.Event()
 
     # --- Initialize Main Agent (for Memory, Step, Target Updates) ---
-    num_flattened_values = 315 # UPDATE THIS IF LUA CHANGES
+    num_flattened_values = SERVER_CONFIG.params_count # Use config value
     state_size = num_flattened_values
     action_size = len(ACTION_MAPPING)
     print(f"[Main] State Size: {state_size}, Action Size: {action_size}")
+    print(f"[Main] Global DEVICE determined by config: '{DEVICE}'")
 
-    main_agent = DQNAgent(state_size, action_size)
+    # --- Explicitly initialize main_agent on the global DEVICE ---
+    print("[Main] Initializing main DQNAgent...")
+    main_agent = DQNAgent(state_size, action_size, device=DEVICE) # <<< PASS GLOBAL DEVICE EXPLICITLY
+    # The DQNAgent init will print its own device confirmation log
+
     # Load weights/metrics into main agent
     if LATEST_MODEL_PATH.exists():
         try:
+            # DQNAgent.load now returns success status and metrics_state
             success, loaded_metrics_state = main_agent.load(LATEST_MODEL_PATH)
-            if success and loaded_metrics_state:
-                print("[Main] Restoring metrics from checkpoint...")
-                with metrics.lock:
-                     metrics.frame_count = loaded_metrics_state.get('frame_count', metrics.frame_count)
-                     metrics.epsilon = loaded_metrics_state.get('epsilon', metrics.epsilon)
-                     metrics.expert_ratio = loaded_metrics_state.get('expert_ratio', metrics.expert_ratio)
-                     metrics.last_decay_step = loaded_metrics_state.get('last_decay_step', metrics.last_decay_step)
-                print(f"[Main] Metrics restored: Frame={metrics.frame_count}")
+            if success:
+                print(f"[Main] Loaded main agent model from {LATEST_MODEL_PATH}")
+                if loaded_metrics_state:
+                    print("[Main] Restoring metrics from checkpoint...")
+                    with metrics.lock:
+                         metrics.frame_count = loaded_metrics_state.get('frame_count', metrics.frame_count)
+                         metrics.epsilon = loaded_metrics_state.get('epsilon', metrics.epsilon)
+                         metrics.expert_ratio = loaded_metrics_state.get('expert_ratio', metrics.expert_ratio)
+                         metrics.last_decay_step = loaded_metrics_state.get('last_decay_step', metrics.last_decay_step)
+                    print(f"[Main] Metrics restored: Frame={metrics.frame_count}")
+            else:
+                 print(f"[Main Warning] Loading main agent model from {LATEST_MODEL_PATH} failed (see agent log). Starting fresh.")
         except Exception as e:
-             print(f"[Main] Error processing model load for main agent: {e}. Starting fresh.")
+             print(f"[Main Error] Error processing model load for main agent: {e}. Starting fresh.")
              traceback.print_exc()
     else:
         print(f"[Main] Agent model file not found at {LATEST_MODEL_PATH}. Main agent will start fresh.")

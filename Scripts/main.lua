@@ -244,9 +244,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
 
     else -- Player not alive
-        -- Massive penalty for death to prioritize survival, equal to the cost of a bonus life in points
+        -- Major penalty for death to prioritize survival, equal to the cost of a bonus life in points
         if previous_alive_state == 1 then
-            reward = reward - 20000 * 10
+            reward = reward - 2500 * 5
             bDone = true
         end
     end
