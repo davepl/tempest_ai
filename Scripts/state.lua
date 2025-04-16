@@ -575,7 +575,7 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     -- Pack OOB header
     local oob_data = string.pack(">HdBBBHHHBBBhBhBB",
         num_values,               -- H: Number of state values that follow
-        math.floor(reward*10000), -- d: Reward (scaled integer)
+        math.floor(reward),       -- d: Reward (scaled integer)
         0,                        -- B: game_action (placeholder, Python uses controls)
         game_state.game_mode,     -- B: Game Mode
         bDone and 1 or 0,         -- B: Done flag
@@ -619,7 +619,7 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     end
     
     -- Return combined OOB header and packed binary state data
-    return oob_data .. binary_data
+    return oob_data .. binary_data, num_values
 end
 
 -- Helper function in GameState to check save interval

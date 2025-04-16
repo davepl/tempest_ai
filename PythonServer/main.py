@@ -294,48 +294,30 @@ def loss_reporter_thread(loss_queue, metrics_obj, shutdown_event):
 #     return new_epsilon
 
 def decay_epsilon(metrics_obj, frame_count):
-    """Calculate and update epsilon based on a custom piecewise linear schedule."""
-    # Define milestones (using float for potential large numbers)
-    F_0 = 0.0
-    F_10M = 10_000_000.0
-    F_40M = 40_000_000.0
-    F_41M = 41_000_000.0 # Start of jump decay
-    F_42M = 42_000_000.0 # End of jump decay
-    F_100M = 100_000_000.0
+    """Calculate and update epsilon based on a multiplicative decay schedule."""
+    # Calculate the number of decay intervals that have passed
+    # Use RL_CONFIG.decay_epsilon_frames for the interval length
+    if RL_CONFIG.decay_epsilon_frames <= 0: # Avoid division by zero or infinite loop
+        # Check if metrics_obj has an epsilon attribute first for robustness
+        return getattr(metrics_obj, 'epsilon', RL_CONFIG.epsilon_start) # Return current or start epsilon
+        
+    decay_intervals = frame_count // RL_CONFIG.decay_epsilon_frames 
 
-    # Define epsilon values at milestones
-    E_START = 1.0      # Epsilon at frame 0
-    E_10M = 0.1        # Epsilon at frame 10M
-    E_40M_END = 0.05   # Epsilon target at frame 40M
-    E_JUMP = 0.3       # Epsilon value at frame 40M (start of phase 3 decay)
-    E_42M_END = 0.05   # Epsilon target at frame 42M
-    E_END = 0.01       # Final epsilon target at frame 100M
-
-    new_epsilon = E_END # Default to end value if beyond 100M
-
-    if frame_count < F_10M:
-        # Phase 1: 0 -> 10M (1.0 -> 0.1)
-        progress = frame_count / F_10M
-        new_epsilon = E_START - progress * (E_START - E_10M)
-    elif frame_count < F_40M:
-        # Phase 2: 10M -> 40M (0.1 -> 0.05)
-        progress = (frame_count - F_10M) / (F_40M - F_10M)
-        new_epsilon = E_10M - progress * (E_10M - E_40M_END)
-    elif frame_count < F_42M:
-        # Phase 3: 40M -> 42M (Starts at 0.3, decays to 0.05)
-        # Epsilon is effectively E_JUMP at frame 40M, then decays.
-        progress = (frame_count - F_40M) / (F_42M - F_40M)
-        new_epsilon = E_JUMP - progress * (E_JUMP - E_42M_END)
-    elif frame_count < F_100M:
-        # Phase 4: 42M -> 100M (0.05 -> 0.01)
-        progress = (frame_count - F_42M) / (F_100M - F_42M)
-        new_epsilon = E_42M_END - progress * (E_42M_END - E_END)
-    # Else: frame_count >= F_100M, new_epsilon remains E_END
-
-    # Ensure epsilon doesn't go below the final end value due to float precision
-    new_epsilon = max(E_END, new_epsilon)
-
-    metrics_obj.update_epsilon(new_epsilon)
+    # Calculate the new epsilon using multiplicative decay
+    # Use the correct attribute 'epsilon_decay_rate' from RL_CONFIG
+    decay_factor = RL_CONFIG.epsilon_decay_rate 
+    # Apply the decay factor exponentially based on the number of intervals
+    new_epsilon = RL_CONFIG.epsilon_start * (decay_factor ** decay_intervals)
+    
+    # Clamp the epsilon value to the minimum defined in the config
+    new_epsilon = max(RL_CONFIG.epsilon_end, new_epsilon)
+    
+    # Update the epsilon value in the shared metrics object only if it changed
+    # Use a small tolerance for floating point comparison to avoid unnecessary updates
+    current_epsilon = getattr(metrics_obj, 'epsilon', RL_CONFIG.epsilon_start) 
+    if not np.isclose(current_epsilon, new_epsilon):
+         metrics_obj.update_epsilon(new_epsilon)
+    
     return new_epsilon
 
 def decay_expert_ratio(metrics_obj, frame_count):

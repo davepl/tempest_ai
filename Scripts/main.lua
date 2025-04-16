@@ -29,7 +29,7 @@
 --]]
 
 -- Define the server address as a global variable
-local SERVER_ADDRESS = "socket.ubdellamd:9999"
+local SERVER_ADDRESS = "socket.m2macpro:9999"
 
 -- Get the directory of the current script
 local script_path = debug.getinfo(1,"S").source:match("@?(.*[/\\])")
@@ -512,6 +512,7 @@ local function frame_callback()
     local current_time_high_res = os.clock()
     local should_update_display = (current_time_high_res - last_display_update) >= Display.DISPLAY_UPDATE_INTERVAL 
     if should_update_display and Display.SHOW_DISPLAY then 
+        -- ADD DEBUG PRINT HERE
         -- Pass LastRewardState for both reward params as 'reward' is local to gameplay block
         Display.update_display(status_message, game_state, level_state, player_state, enemies_state, "N/A", num_values, LastRewardState, total_bytes_sent, LastRewardState) 
         last_display_update = current_time_high_res

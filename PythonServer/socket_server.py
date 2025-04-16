@@ -554,7 +554,7 @@ class SocketServer:
 
                     # Use main_agent_ref for target network update
                     current_frame = self.metrics.frame_count # Use metrics frame count
-                    if client_id == 0 and hasattr(self, 'main_agent_ref') and self.main_agent_ref and current_frame % RL_CONFIG.update_target_every == 0:
+                    if client_id == 0 and hasattr(self, 'main_agent_ref') and self.main_agent_ref and current_frame % RL_CONFIG.decay_epsilon_frames == 0:
                         self.main_agent_ref.update_target_network()
 
                     # Periodic model saving is handled by training worker or main process shutdown

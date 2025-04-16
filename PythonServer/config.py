@@ -61,13 +61,13 @@ class RLConfigData:
     batch_size: int = 512
     gamma: float = 0.99
     epsilon: float = 1.0
-    epsilon_start: float = 1.0
+    epsilon_start: float = 0.25
     epsilon_end: float = 0.01
     epsilon_min: float = 0.001
-    epsilon_decay: int = 100000
-    update_target_every: int = 500
-    learning_rate: float = 0.0001
-    memory_size: int = 1000000
+    epsilon_decay_rate: int = 0.9
+    decay_epsilon_frames: int = 1000
+    learning_rate: float = 1.5e-4
+    memory_size: int = 100000
     save_interval: int = 50000
     save_interval_seconds: int = 60
     train_freq: int = 4
@@ -100,13 +100,3 @@ ACTION_MAPPING = {
     13: (1, 0, 0.3),   # Hard right, fire, no zap
     14: (1, 1, 0.0),   # Zap+Fire+Sit
 }
-
-# # Import print_with_terminal_restore from metrics_display to avoid circular imports
-# # # DEF print_with_terminal_restore(kb_handler, *args, **kwargs):
-# # #     \"\"\"Print with terminal restore if in interactive mode\"\"\"
-# # #     if IS_INTERACTIVE and kb_handler:
-# # #         # Import here to avoid circular imports
-# # #         from metrics_display import print_with_terminal_restore as _print
-# # #         _print(*args, **kwargs)
-# # #     else:
-# # #         print(*args, **kwargs) 
