@@ -2,6 +2,10 @@ from collections import deque
 import time
 import threading
 import numpy as np
+from typing import Deque
+
+# Define a max length for the deques holding recent values
+METRICS_DEQUE_SIZE = 1000
 
 class Metrics:
     """Track various metrics for the session"""
@@ -20,16 +24,16 @@ class Metrics:
         self.override_expert = False # Manual override flag
         self.expert_mode = False # Automatic expert mode flag
         self.client_count = 0
-        self.episode_rewards = deque(maxlen=1000) # Store last 1000 episode rewards
-        self.dqn_rewards = deque(maxlen=1000) # Store DQN-only rewards
-        self.expert_rewards = deque(maxlen=1000) # Store expert-only rewards
-        self.losses = deque(maxlen=10000) # Store recent loss values
+        self.episode_rewards = deque(maxlen=METRICS_DEQUE_SIZE) # Store last 1000 episode rewards
+        self.dqn_rewards = deque(maxlen=METRICS_DEQUE_SIZE) # Store DQN-only rewards
+        self.expert_rewards = deque(maxlen=METRICS_DEQUE_SIZE) # Store expert-only rewards
+        self.losses = deque(maxlen=METRICS_DEQUE_SIZE * 2) # Store recent loss values
         self.guided_count = 0
         self.total_controls = 0
         self.avg_dqn_inf_time = 0.0 # Will store the interval average
         self.avg_expert_inf_time = 0.0 # Could do the same for expert if needed
-        self.dqn_inf_times = deque(maxlen=100) # Keep for potential other uses
-        self.expert_inf_times = deque(maxlen=100)
+        self.dqn_inf_times = deque(maxlen=METRICS_DEQUE_SIZE) # Keep for potential other uses
+        self.expert_inf_times = deque(maxlen=METRICS_DEQUE_SIZE)
         # Inference Time interval tracking
         self.interval_inf_time_sum = 0.0
         self.interval_inf_time_count = 0
@@ -42,6 +46,8 @@ class Metrics:
         self.open_level = False
         # Reference to server instance (optional, for client count)
         self.global_server = None
+        # --- Add deque for inference times ---
+        self.dqn_inference_times: Deque[float] = deque(maxlen=METRICS_DEQUE_SIZE)
 
     def update_frame_count(self):
         # Only increment frame count here
@@ -189,6 +195,32 @@ class Metrics:
                  effective_ratio = 1.0
                  
             return effective_ratio, override, expert_mode_active, current_epsilon
+
+    # --- Add method to store inference time ---
+    def add_inference_time(self, time_sec: float):
+        """Add a single DQN inference time measurement."""
+        with self.lock:
+            self.dqn_inference_times.append(time_sec)
+
+    def get_state_for_save(self) -> dict:
+        """Returns a dictionary of metrics relevant for saving checkpoints."""
+        with self.lock:
+            return {
+                'frame_count': self.frame_count,
+                'epsilon': self.epsilon,
+                'expert_ratio': self.expert_ratio,
+                'last_decay_step': self.last_decay_step,
+                # Add other relevant states if needed
+            }
+
+    def restore_state_from_save(self, state: dict):
+        """Restores metrics from a loaded checkpoint state."""
+        with self.lock:
+            self.frame_count = state.get('frame_count', self.frame_count)
+            self.epsilon = state.get('epsilon', self.epsilon)
+            self.expert_ratio = state.get('expert_ratio', self.expert_ratio)
+            self.last_decay_step = state.get('last_decay_step', self.last_decay_step)
+            print(f"[Metrics] Restored state: Frame={self.frame_count}, Epsilon={self.epsilon:.4f}, ExpertRatio={self.expert_ratio:.4f}")
 
 # Global instance
 metrics = Metrics() 

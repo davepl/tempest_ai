@@ -123,30 +123,14 @@ class FrameData:
     """Game state data for a single frame"""
     state: np.ndarray
     reward: float
-    action: Tuple[bool, bool, float]  # fire, zap, spinner
-    mode: int
+    action: Tuple[bool, bool, float]  # fire, zap, spinner (commanded)
+    mode: int # game_mode
     done: bool
-    attract: bool
     save_signal: bool
-    enemy_seg: int
-    player_seg: int
+    enemy_seg: int # nearest_enemy_abs_byte (-1 if invalid)
+    player_seg: int # player_seg_byte (0-15)
     open_level: bool
-    
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'FrameData':
-        """Create FrameData from dictionary"""
-        return cls(
-            state=data["state"],
-            reward=data["reward"],
-            action=data["action"],
-            mode=data["mode"],
-            done=data["done"],
-            attract=data["attract"],
-            save_signal=data["save_signal"],
-            enemy_seg=data["enemy_seg"],
-            player_seg=data["player_seg"],
-            open_level=data["open_level"]
-        )
+    # ... (from_dict method if used) ...
 
 # Configuration constants
 SERVER_CONFIG = server_config
@@ -379,41 +363,69 @@ class DQNAgent:
         self.memory.push(state, action, reward, next_state, done)
         # Note: Removed the trigger to put data in train_queue
 
-    def save(self, filename: Path, metrics_state: Optional[Dict] = None):
-        """Save model weights and optionally metrics state using an atomic pattern."""
-        # Define a temporary filename
-        tmp_filename = filename.parent / (filename.name + ".tmp")
-        
+    def save(self, filepath: Path, metrics_state: Optional[Dict] = None):
+        """
+        Saves the model weights and optionally metrics state using an atomic pattern,
+        keeping the previous file as a backup (.bak).
+        """
+        # Define filenames
+        filename = Path(filepath) # Ensure Path object
+        backup_filename = filename.with_suffix(filename.suffix + ".bak")
+        tmp_filename = filename.with_suffix(filename.suffix + ".tmp")
+
+        print(f"[DQNAgent] Attempting save: Target={filename}, Backup={backup_filename}, Temp={tmp_filename}") # Debug log
+
         try:
-            # Ensure the directory exists
+            # Ensure the target directory exists
             filename.parent.mkdir(parents=True, exist_ok=True)
+
+            # --- Prepare data to save ---
+            # Ensure networks are on CPU before getting state_dict for broader compatibility? Optional.
+            # policy_state = self.policy_net.cpu().state_dict()
+            # target_state = self.target_net.cpu().state_dict()
+            # Move back to original device if needed after getting state_dict
+            # self.policy_net.to(self.device)
+            # self.target_net.to(self.device)
+            # For simplicity, let's keep saving directly from the current device for now.
             
             save_data = {
                 'policy_net_state_dict': self.policy_net.state_dict(),
                 'target_net_state_dict': self.target_net.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
             }
-            # Include metrics state if provided
             if metrics_state:
                  save_data['metrics_state'] = metrics_state
-                 
-            # 1. Save to the temporary file
-            torch.save(save_data, str(tmp_filename))
-            
-            # 2. Atomically replace the old file with the new one
-            # os.replace() is generally atomic on POSIX and Windows
+
+            # 1. Save current state to the temporary file
+            torch.save(save_data, tmp_filename)
+
+            # 2. Rename existing file to backup (if it exists)
+            # This overwrites any previous .bak file atomically.
+            if filename.exists():
+                try:
+                    os.replace(filename, backup_filename)
+                    print(f"[DQNAgent] Backed up existing model '{filename}' to '{backup_filename}'")
+                except OSError as e:
+                    # Log a warning but proceed with replacing the target file
+                    print(f"[DQNAgent Warning] Could not create backup '{backup_filename}' from '{filename}': {e}")
+                    # Consider if this failure should halt the save process? For now, we proceed.
+
+            # 3. Atomically replace the target file with the temporary file
             os.replace(tmp_filename, filename)
-            
-            # print(f"[DQNAgent] Model saved atomically to {filename}") # Optional success log
+            print(f"[DQNAgent] Model saved successfully to '{filename}'")
+            return True # Indicate success
+
         except Exception as e:
-             print(f"[DQNAgent Error] Failed during atomic save to {filename}: {e}")
+             print(f"[DQNAgent Error] Failed during save operation for '{filename}': {e}")
              traceback.print_exc()
-             # Clean up temporary file if rename failed
+             # Clean up temporary file if it still exists after an error
              if tmp_filename.exists():
                   try:
                        tmp_filename.unlink()
+                       print(f"[DQNAgent] Removed temporary file '{tmp_filename}' after error.")
                   except OSError as rm_err:
-                       print(f"[DQNAgent Error] Failed to remove temporary file {tmp_filename}: {rm_err}")
+                       print(f"[DQNAgent Error] Failed to remove temporary file '{tmp_filename}' after error: {rm_err}")
+             return False # Indicate failure
 
     def load(self, filename):
         """Load model weights and return success status and metrics state if available."""
@@ -688,68 +700,99 @@ class SafeMetrics:
             return self.metrics.fps
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
-    """Parse binary frame data from Lua into game state"""
+    """Parse binary frame data from Lua into game state, unpacking OOB field by field."""
     try:
         if not data:
             print("ERROR: Received empty data packet", flush=True)
-            return None # Return None instead of sys.exit
-        
-        format_str = ">HdBBBHHHBBBhBhBB"  # Updated to include both score components
-        header_size = struct.calcsize(format_str)
-        
-        if len(data) < header_size:
-            print(f"ERROR: Received data too small: {len(data)} bytes, need {header_size}", flush=True)
-            return None
-            
-        # Unpack header values
-        header_values = struct.unpack(format_str, data[:header_size])
-        num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
-        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = header_values
-        
-        # Combine score components
-        score = (score_high * 65536) + score_low
-        
-        # --- State Data Parsing (Optimized) ---
-        state_data_bytes = data[header_size:]
-        expected_state_bytes = num_values * 2 # Each state value is >H (2 bytes)
-        
-        # Validate state data length
-        if len(state_data_bytes) != expected_state_bytes:
-            print(f"ERROR: Expected {expected_state_bytes} state bytes ({num_values} values) but got {len(state_data_bytes)}", flush=True)
             return None
 
-        # Efficiently create NumPy array from buffer
-        # '>u2' matches the struct format '>H' (big-endian unsigned short)
-        state_int_array = np.frombuffer(state_data_bytes, dtype=np.dtype('>u2'))
-        
-        # Convert to float32 and normalize using vectorized operations
-        state = (state_int_array.astype(np.float32) / 255.0) * 2.0 - 1.0
-        
-        # --- Create FrameData Object (Unchanged) ---
+        # --- Unpack OOB Header Field by Field ---
+        oob_fields = []
+        current_offset = 0
+        field_formats = [
+            ('>H', 'num_total_values'),       # 1
+            ('>d', 'reward'),                 # 2
+            ('>B', 'game_mode'),              # 3
+            ('>B', 'done_byte'),              # 4
+            ('>B', 'save_signal_byte'),       # 5
+            ('>B', 'fire_byte'),              # 6
+            ('>B', 'zap_byte'),               # 7
+            ('>h', 'spinner_commanded'),      # 8
+            ('>b', 'nearest_enemy_abs_byte'), # 9
+            ('>B', 'player_seg_byte'),        # 10
+            ('>B', 'is_open_byte')            # 11
+        ]
+
+        for fmt, name in field_formats:
+            try:
+                field_size = struct.calcsize(fmt)
+                if current_offset + field_size > len(data):
+                     print(f"ERROR: Not enough data for field '{name}' (format '{fmt}')...", flush=True) # Keep error print
+                     return None
+
+                value = struct.unpack_from(fmt, data, current_offset)[0]
+                oob_fields.append(value)
+                current_offset += field_size
+            except struct.error as e:
+                print(f"ERROR unpacking field '{name}' (format '{fmt}') at offset {current_offset}: {e}", flush=True)
+                traceback.print_exc()
+                return None
+            except Exception as e_inner:
+                print(f"Unexpected error unpacking field '{name}' (format '{fmt}'): {e_inner}", flush=True)
+                traceback.print_exc()
+                return None
+
+        # --- Verification ---
+        oob_header_size_calculated = current_offset
+
+        if len(oob_fields) != 11:
+            print(f"ERROR: Expected 11 OOB fields, but unpacked {len(oob_fields)} field-by-field.", flush=True) # Keep error print
+            return None
+
+        # Assign unpacked values to variables
+        (num_total_values, reward, game_mode, done_byte,
+         save_signal_byte, fire_byte, zap_byte, spinner_commanded,
+         nearest_enemy_abs_byte, player_seg_byte, is_open_byte) = oob_fields
+
+        # --- State Data Parsing (Uniform Signed Short) ---
+        state_data_bytes = data[oob_header_size_calculated:] # Use calculated size
+        expected_total_state_bytes = num_total_values * 2 # Each value is '>h' (2 bytes)
+
+        if len(state_data_bytes) != expected_total_state_bytes:
+            print(f"ERROR: Expected {expected_total_state_bytes} total state bytes ({num_total_values} values) but got {len(state_data_bytes)} (OOB size was {oob_header_size_calculated})", flush=True)
+            return None
+
+        # Unpack ALL state data as SIGNED SHORT '>h'
+        state_int = np.frombuffer(state_data_bytes, dtype=np.dtype('>h'))
+
+        # Apply UNIFORM normalization for range [-128, 255] -> [-1.0, 1.0]
+        midpoint = 63.5
+        half_width = 191.5
+        final_state = (state_int.astype(np.float32) - midpoint) / half_width
+        final_state = np.clip(final_state, -1.0, 1.0) # Clamp result
+
+        # Verify final state vector size
+        if len(final_state) != num_total_values:
+            print(f"ERROR: Final state vector length {len(final_state)} != expected {num_total_values}", flush=True)
+            return None
+
+        # --- Create FrameData Object ---
         frame_data = FrameData(
-            state=state,
+            state=final_state,
             reward=reward,
-            action=(bool(fire), bool(zap), spinner),
+            action=(bool(fire_byte), bool(zap_byte), spinner_commanded),
             mode=game_mode,
-            done=bool(done),
-            attract=bool(is_attract),
-            save_signal=bool(save_signal),
-            enemy_seg=nearest_enemy,
-            player_seg=player_seg,
-            open_level=bool(is_open)
+            done=bool(done_byte),
+            save_signal=bool(save_signal_byte),
+            enemy_seg=nearest_enemy_abs_byte,
+            player_seg=player_seg_byte,
+            open_level=bool(is_open_byte)
         )
-        
         return frame_data
-        
-    except struct.error as e:
-        print(f"ERROR unpacking header data: {e}", flush=True)
-        return None
-    except ValueError as e:
-        print(f"ERROR during state data processing: {e}", flush=True)
-        return None
+
     except Exception as e:
         print(f"ERROR parsing frame data: {e}", flush=True)
-        traceback.print_exc() # Print full traceback for unexpected errors
+        traceback.print_exc()
         return None
 
 def display_metrics_header(kb=None):
@@ -788,24 +831,23 @@ def display_metrics_row(agent, kb=None):
 
     def format_large_number(value, width, precision=2):
         """Formats a number, using scientific notation if >= threshold."""
+        # Check for NaN or Inf first
         if math.isnan(value) or math.isinf(value):
-            # Handle NaN/Inf gracefully to fit width
             return f"{'NaN':>{width}}" if math.isnan(value) else f"{'Inf':>{width}}"
             
+        # Check magnitude for scientific notation
         if abs(value) >= large_threshold:
-            # Use scientific notation with specified precision
             return f"{value:{width}.{precision}e}"
         else:
-            # Use fixed-point notation
+            # Use fixed-point notation otherwise
             return f"{value:{width}.{precision}f}"
 
     # Format the specific columns using the helper function
     mean_reward_str = format_large_number(mean_reward_val, width=12)
-    dqn_reward_str = format_large_number(dqn_reward_val, width=11) # Adjusted width
-    mean_loss_str = format_large_number(mean_loss_val, width=9)    # Adjusted width
+    dqn_reward_str = format_large_number(dqn_reward_val, width=11) # Adjusted width from previous header
+    mean_loss_str = format_large_number(mean_loss_val, width=9)    # Adjusted width from previous header
 
     # --- Build Row String ---
-    # Use the pre-formatted strings
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward_str} | {dqn_reward_str} | "
         f"{mean_loss_str} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "

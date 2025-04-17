@@ -41,7 +41,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 315
+    params_count: int = 311
     expert_ratio_start: float = 1.0
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.995  

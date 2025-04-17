@@ -104,7 +104,7 @@ end
 
 
 -- Function to calculate reward for the current frame
-local function calculate_reward(game_state, level_state, player_state, enemies_state, commanded_spinner)
+local function calculate_reward(game_state, level_state, player_state, enemies_state)
     local reward = 0
     local bDone = false
 
@@ -145,10 +145,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
                     -- Comparison line (approx 206)
                     if (shot_pos <= 0x24) then 
-                        if (commanded_spinner == 0) then 
+                        if (player_state.spinner_commanded == 0) then 
                             reward = reward - 100
                         else
-                            reward = reward + math.abs(commanded_spinner * 100) 
+                            reward = reward + math.abs(player_state.spinner_commanded * 100) 
                         end
                     end
 
@@ -170,10 +170,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if math.abs(fuseball_rel_seg) <= 1 then
                     -- Apply proximity penalties/rewards similar to shots, slightly stronger
                     if (fuseball_depth <= 0x24) then 
-                        if (commanded_spinner == 0) then 
+                        if (player_state.spinner_commanded == 0) then 
                             reward = reward - 150 -- Penalty for staying still near close fuseball
                         else
-                            reward = reward + math.abs(commanded_spinner * 150) -- Reward for moving away
+                            reward = reward + math.abs(player_state.spinner_commanded * 150) -- Reward for moving away
                         end
                     end
                     if (fuseball_depth < 0x80) then
@@ -187,7 +187,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         
         if target_segment == SegmentUtils.INVALID_SEGMENT or game_state.gamestate == 0x20 then 
             -- No enemies or zooming: reward staying still more strongly
-            reward = reward + (commanded_spinner == 0 and 50 or -20)
+            reward = reward + (player_state.spinner_commanded == 0 and 50 or -20)
         else
             -- Get absolute segment and depth of nearest enemy (stored during EnemiesState:update)
             local nearest_abs_seg = enemies_state.nearest_enemy_abs_seg_raw 
@@ -217,7 +217,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                         end
                     end
                     reward = reward + (10 - segment_distance) -- Proximity reward
-                    if desired_spinner * commanded_spinner < 0 then -- Movement penalty
+                    if desired_spinner * player_state.spinner_commanded < 0 then -- Movement penalty
                         reward = reward - 50
                     end
                 end
@@ -231,7 +231,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             else
                  -- Handle case where nearest_abs_seg might be -1 (e.g., if enemy just died)
                  -- Default to no-enemy behavior
-                 reward = reward + (commanded_spinner == 0 and 50 or -20) 
+                 reward = reward + (player_state.spinner_commanded == 0 and 50 or -20) 
             end
         end
 
@@ -263,7 +263,7 @@ end
 
 -- Function to send parameters and get action each frame
 -- Remove unused 'controls' parameter
-local function process_frame(rawdata, player_state, reward, bDone, bAttractMode) 
+local function process_frame(rawdata) 
     -- Increment frame count after processing
     frame_count = frame_count + 1
 
@@ -453,12 +453,6 @@ local function frame_callback()
 
     -- Handle Attract Mode vs Gameplay Mode
     if is_attract_mode then
-        -- Zero score if dead or zooming
-        if game_state.gamestate == 0x06 or game_state.gamestate == 0x20 then
-            mem:write_direct_u8(0x0040, 0x00)
-            mem:write_direct_u8(0x0041, 0x00)
-            mem:write_direct_u8(0x0042, 0x00)
-        end
         -- Auto-start logic
         if AUTO_START_GAME then 
             local port = manager.machine.ioport.ports[":IN2"]
@@ -480,32 +474,32 @@ local function frame_callback()
                 print("Error: Could not find port :IN2")
             end
         end
+    end 
+
         -- In attract mode, we don't need to calculate reward or get actions from Python
         -- We can potentially return early after handling display updates
         
-    else 
-        -- Gameplay Mode Logic
-        local reward, bDoneCurrent = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.inferredSpinnerDelta)
-        bDone = bDoneCurrent
+    -- Gameplay Mode Logic
+    local reward, bDoneCurrent = calculate_reward(game_state, level_state, player_state, enemies_state)
+    bDone = bDoneCurrent
 
-        -- Flatten state using StateUtils function, passing controls
-        local frame_data
-        frame_data, num_values = StateUtils.flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, controls, bDone, shutdown_requested)
+    -- Flatten state using StateUtils function, passing controls
+    local frame_data
+    frame_data, num_values = StateUtils.flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, controls, bDone, shutdown_requested)
 
-        -- Send state and get action (remove controls argument)
-        local fire, zap, spinner = process_frame(frame_data, player_state, reward, bDone, is_attract_mode)
+    -- Send state and get action (remove controls argument)
+    local fire, zap, spinner = process_frame(frame_data)
 
-        -- Update player_state with commanded actions
-        player_state.fire_commanded = fire
-        player_state.zap_commanded = zap
-        player_state.SpinnerDelta = spinner 
+    -- Update player_state with commanded actions
+    player_state.fire_commanded = fire
+    player_state.zap_commanded = zap
+    player_state.spinner_commanded = spinner 
 
-        total_bytes_sent = total_bytes_sent + #frame_data
+    total_bytes_sent = total_bytes_sent + #frame_data
 
-        -- Apply actions, passing mem to the controls object method
-        if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then
-            controls:apply_action(mem, fire, zap, spinner, game_state, player_state) 
-        end
+    -- Apply actions, passing mem to the controls object method
+    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then
+        controls:apply_action(mem, fire, zap, spinner, game_state, player_state) 
     end
 
     -- Update Display
@@ -528,13 +522,13 @@ local function on_mame_exit()
     shutdown_requested = true
         
     if game_state and level_state and player_state and enemies_state then
-        local reward = calculate_reward(game_state, level_state, player_state, enemies_state, 0) 
+        local reward = calculate_reward(game_state, level_state, player_state, enemies_state) 
         -- Use StateUtils flatten, passing controls and true for shutdown
         local frame_data, num_values = StateUtils.flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, controls, true, true) 
         
         if socket then
             -- Use updated process_frame call signature
-            local result = process_frame(frame_data, player_state, reward, true, false) 
+            local result = process_frame(frame_data) 
             print("Final save complete, response: " .. (result or "none"))
         end
     end

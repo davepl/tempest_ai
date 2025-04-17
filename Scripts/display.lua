@@ -132,7 +132,7 @@ function Display.update_display(status, game_state, level_state, player_state, e
     print("")
 
     -- Format and print player state
-    print("--[ Player State ]------------------------------------")
+    print("--[ Player State (Detected) ]---------------------------")
     
     -- Pre-format player metrics
     local player_metrics = {
@@ -143,7 +143,6 @@ function Display.update_display(status, game_state, level_state, player_state, e
         -- {"Level", player_state.level}, -- Remove
         {"Shot Count", player_state.shot_count},
         {"Superzapper", player_state.superzapper_active},
-        {"Inferred Spinner", player_state.inferredSpinnerDelta}
     }
     
     -- Build player state lines
@@ -173,7 +172,7 @@ function Display.update_display(status, game_state, level_state, player_state, e
     local control_lines = {
         string.format("  %-25s: %d", "Fire Commanded", player_state.fire_commanded),
         string.format("  %-25s: %d", "Superzapper Commanded", player_state.zap_commanded),
-        string.format("  %-25s: %d", "Spinner Delta Commanded", player_state.SpinnerDelta),
+        string.format("  %-25s: %d", "Spinner Delta Commanded", player_state.spinner_commanded),
         string.format("  %-25s: %s", "Attract Mode", (game_state.game_mode & 0x80) == 0 and "Active" or "Inactive")
     }
     print(table.concat(control_lines, "\n"))

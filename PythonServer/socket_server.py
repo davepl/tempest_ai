@@ -326,7 +326,7 @@ class SocketServer:
                         # Send empty response on parsing failure
                         client_socket.sendall(struct.pack("bbb", 0, 0, 0))
                         continue
-                    
+
                     # Get client state
                     with self.client_lock:
                         # Check if client_id still exists before accessing state
@@ -501,10 +501,18 @@ class SocketServer:
                                    # 2. Get action and inference time back (if put succeeded)
                                    try:
                                        # Block waiting for result (with timeout)
-                                       action_idx, inference_time_sec = self.action_queue.get(timeout=1.0) 
+                                       # --- This is where we get the inference time ---
+                                       action_idx, inference_time_sec = self.action_queue.get(timeout=1.0)
+
+                                       # ---> ADD THIS LINE HERE <---
+                                       if self.metrics:
+                                            self.metrics.add_inference_time(inference_time_sec)
+
+                                       # --- Continue processing ---
                                        inference_time_ms = inference_time_sec * 1000
-                                       self.metrics.update_dqn_inference_time(inference_time_ms)
-                                       
+                                       # We already added the raw time, update_dqn_inference_time calculates average over interval, which is redundant here
+                                       # self.metrics.update_dqn_inference_time(inference_time_ms) # Remove this redundant call if it exists
+
                                        # Get fire, zap, spinner from action_idx
                                        if action_idx is not None and action_idx in ACTION_MAPPING:
                                            fire, zap, spinner = ACTION_MAPPING[action_idx]
@@ -512,7 +520,7 @@ class SocketServer:
                                            print(f"Client {client_id}: Invalid action_idx {action_idx} from queue. Using default.")
                                            action_idx = 0
                                            fire, zap, spinner = ACTION_MAPPING[action_idx]
-                                  
+
                                    except Empty:
                                        print(f"Client {client_id}: Timeout waiting for action from inference worker. Using default.")
                                        action_idx = 0
@@ -539,6 +547,8 @@ class SocketServer:
                                 state = self.client_states[client_id]
                                 state['last_state'] = frame.state
                                 state['last_action_idx'] = action_idx
+                                # ---> STORE Full Last Action Tuple for Debugging <---
+                                state['last_action'] = (fire, zap, spinner) # Store commanded action
                             else:
                                  print(f"Client {client_id}: State disappeared before storing last_state/action. Disconnecting.")
                                  break # Exit loop

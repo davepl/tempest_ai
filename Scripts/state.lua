@@ -97,8 +97,8 @@ function PlayerState:new()
     self.shot_positions = {0, 0, 0, 0, 0, 0, 0, 0}
     self.shot_count = 0; self.debounce = 0
     self.fire_detected = 0; self.zap_detected = 0
-    self.SpinnerAccum = 0; self.SpinnerDelta = 0
-    self.prevSpinnerAccum = 0; self.inferredSpinnerDelta = 0
+    self.SpinnerAccum = 0; self.spinner_commanded = 0
+    self.prevSpinnerAccum = 0;
     self.fire_commanded = 0; self.zap_commanded = 0
     return self
 end
@@ -143,10 +143,11 @@ function PlayerState:update(mem, level_state) -- Needs level_state
     self.zap_detected = (self.debounce & 0x08) ~= 0 and 1 or 0
     
     local currentSpinnerAccum = mem:read_u8(0x0051)
-    self.SpinnerDelta = mem:read_u8(0x0050)
     local rawDelta = currentSpinnerAccum - self.prevSpinnerAccum
     if rawDelta > 127 then rawDelta = rawDelta - 256 elseif rawDelta < -128 then rawDelta = rawDelta + 256 end
-    self.inferredSpinnerDelta = rawDelta
+
+    self.spinner_commanded = rawDelta
+
     self.SpinnerAccum = currentSpinnerAccum
     self.prevSpinnerAccum = currentSpinnerAccum
 end
@@ -178,7 +179,6 @@ function EnemiesState:new()
     self.nearest_enemy_depth_raw = 0
     self.nearest_enemy_abs_seg_raw = -1 -- Raw absolute segment
     self.is_aligned_with_nearest = 0.0
-    self.alignment_error_magnitude = 0.0
     self.charging_fuseball_segments = {} -- Tracks segments with charging fuseballs
     self.pulsar_lanes = {} -- Tracks segments with active pulsars
     
@@ -299,15 +299,11 @@ function EnemiesState:update(mem, level_state) -- Needs level_state
     -- Update relative nearest segment and engineered features
     if nearest_abs_seg == -1 then
         self.nearest_enemy_seg = SegmentUtils.INVALID_SEGMENT
-        self.is_aligned_with_nearest = 0.0; self.alignment_error_magnitude = 0.0;
+        self.is_aligned_with_nearest = 0.0; 
     else
         local nearest_rel_seg = SegmentUtils.absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, is_open)
         self.nearest_enemy_seg = nearest_rel_seg
         self.is_aligned_with_nearest = (nearest_rel_seg == 0) and 1.0 or 0.0
-        local error_abs = math.abs(nearest_rel_seg)
-        local max_dist = is_open and 15.0 or 8.0
-        local normalized_error = (error_abs > 0 and max_dist > 0) and (error_abs / max_dist) or 0.0
-        self.alignment_error_magnitude = math.floor(normalized_error * 10000.0)
     end
 
     -- Batch read enemy type info (7 bytes from 0x0283 to 0x0289)
@@ -414,7 +410,6 @@ function ControlState:new()
     -- Track commanded states (These are also in player_state, consider consolidation)
     self.fire_commanded = 0
     self.zap_commanded = 0
-    self.spinner_delta = 0
     
     -- Keep validation prints for now
     print("Button port found: " .. (self.button_port and "Yes" or "No"))
@@ -432,25 +427,14 @@ end
 
 -- Updated to accept 'mem' argument
 function ControlState:apply_action(mem, fire, zap, spinner, game_state, player_state) 
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    
-    if is_attract_mode then
-        player_state.fire_commanded = 1 
-        if self.fire_field then self.fire_field:set_value(1) end
-        player_state.zap_commanded = 0
-        if self.zap_field then self.zap_field:set_value(0) end
-        player_state.SpinnerDelta = player_state.inferredSpinnerDelta 
-    else
-        player_state.fire_commanded = fire
-        player_state.zap_commanded = zap
-        player_state.SpinnerDelta = spinner 
+    -- Directly apply commanded actions
+    player_state.fire_commanded = fire
+    player_state.zap_commanded = zap
+    player_state.spinner_commanded = spinner 
 
-        if self.fire_field then self.fire_field:set_value(fire) end
-        if self.zap_field then self.zap_field:set_value(zap) end
-        
-        -- Use the passed 'mem' object to write spinner delta
-        if self.spinner_field then mem:write_u8(0x0050, spinner) end 
-    end
+    if self.fire_field then self.fire_field:set_value(fire) end
+    if self.zap_field then self.zap_field:set_value(zap) end
+    if self.spinner_field then mem:write_u8(0x0050, spinner) end 
 end
 
 StateUtils.ControlState = ControlState -- Export the new class
@@ -458,168 +442,127 @@ StateUtils.ControlState = ControlState -- Export the new class
 
 -- Flattens the entire game state into a single table of numbers for sending
 function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, controls, bDone, shutdown_requested)
+    -- Use a single table for all state data
     local data = {}
-    
-    -- 1. Game State (Integers)
-    table.insert(data, game_state.gamestate or 0)
-    table.insert(data, game_state.game_mode or 0)
-    table.insert(data, game_state.countdown_timer or 0)
-    table.insert(data, game_state.p1_lives or 0)
-    table.insert(data, game_state.p1_level or 0)
-    table.insert(data, game_state.credits or 0)
 
-    -- 2. Level State (Integers/Tables)
-    table.insert(data, level_state.level_number or 0)
-    table.insert(data, level_state.level_shape or 0)
+    -- 1. Game State
+    table.insert(data, game_state.gamestate)
+    table.insert(data, game_state.game_mode)
+    table.insert(data, game_state.countdown_timer)
+    table.insert(data, game_state.p1_lives)
+    table.insert(data, game_state.p1_level)
+    table.insert(data, game_state.credits)
+
+    -- 2. Level State
+    table.insert(data, level_state.level_number)
+    table.insert(data, level_state.level_shape)
     table.insert(data, level_state.is_open_level and 1 or 0)
-    for i = 1, 16 do table.insert(data, level_state.spike_heights[i] or 0) end
-    for i = 1, 16 do table.insert(data, level_state.level_angles[i] or 0) end
+    for i = 1, 16 do table.insert(data, level_state.spike_heights[i]) end
+    for i = 1, 16 do table.insert(data, level_state.level_angles[i]) end
 
-    -- 3. Player State (Integers/Tables)
-    table.insert(data, player_state.score or 0)
-    table.insert(data, player_state.position or 0)
-    table.insert(data, player_state.player_depth or 0)
-    table.insert(data, player_state.player_state or 0)
+    -- 3. Player State
+    table.insert(data, player_state.position)
+    table.insert(data, player_state.player_depth)
+    table.insert(data, player_state.player_state)
     table.insert(data, player_state.alive and 1 or 0)
-    table.insert(data, player_state.superzapper_uses or 0)
+    table.insert(data, player_state.superzapper_uses)
     table.insert(data, player_state.superzapper_active and 1 or 0)
-    table.insert(data, player_state.shot_count or 0)
-    table.insert(data, player_state.inferredSpinnerDelta or 0)
-    for i = 1, 8 do table.insert(data, player_state.shot_segments[i] or SegmentUtils.INVALID_SEGMENT) end
-    for i = 1, 8 do table.insert(data, player_state.shot_positions[i] or 0) end
+    table.insert(data, player_state.shot_count)
+    table.insert(data, player_state.inferredSpinnerDelta)
 
-    -- 4. Enemy State (Counts, Flags, Segments, Depths, etc.)
-    -- Counts
-    table.insert(data, enemies_state.active_flippers or 0)
-    table.insert(data, enemies_state.active_pulsars or 0)
-    table.insert(data, enemies_state.active_tankers or 0)
-    table.insert(data, enemies_state.active_spikers or 0)
-    table.insert(data, enemies_state.active_fuseballs or 0)
-    table.insert(data, enemies_state.num_enemies_in_tube or 0)
-    table.insert(data, enemies_state.num_enemies_on_top or 0)
-    table.insert(data, enemies_state.enemies_pending or 0)
-    -- Spawn Slots
-    table.insert(data, enemies_state.spawn_slots_flippers or 0)
-    table.insert(data, enemies_state.spawn_slots_pulsars or 0)
-    table.insert(data, enemies_state.spawn_slots_tankers or 0)
-    table.insert(data, enemies_state.spawn_slots_spikers or 0)
-    table.insert(data, enemies_state.spawn_slots_fuseballs or 0)
-    -- Pulsar State
-    table.insert(data, enemies_state.pulsar_fliprate or 0)
-    table.insert(data, enemies_state.pulse_beat or 0)
-    table.insert(data, enemies_state.pulsing or 0)
+    for i = 1, 8 do table.insert(data, player_state.shot_segments[i]) end
+    for i = 1, 8 do table.insert(data, player_state.shot_positions[i]) end
+
+    -- 4. Enemy State
+    table.insert(data, enemies_state.active_flippers)
+    table.insert(data, enemies_state.active_pulsars)
+    table.insert(data, enemies_state.active_tankers)
+    table.insert(data, enemies_state.active_spikers)
+    table.insert(data, enemies_state.active_fuseballs)
+    table.insert(data, enemies_state.num_enemies_in_tube)
+    table.insert(data, enemies_state.num_enemies_on_top)
+    table.insert(data, enemies_state.enemies_pending)
+    table.insert(data, enemies_state.spawn_slots_flippers)
+    table.insert(data, enemies_state.spawn_slots_pulsars)
+    table.insert(data, enemies_state.spawn_slots_tankers)
+    table.insert(data, enemies_state.spawn_slots_spikers)
+    table.insert(data, enemies_state.spawn_slots_fuseballs)
+    table.insert(data, enemies_state.pulsar_fliprate)
+    table.insert(data, enemies_state.pulse_beat)
+    table.insert(data, enemies_state.pulsing)
+
     -- Nearest Enemy
-    local nearest_relative_seg = enemies_state.nearest_enemy_seg
-    local segment_delta = (nearest_relative_seg == SegmentUtils.INVALID_SEGMENT) and 0 or nearest_relative_seg
-    table.insert(data, nearest_relative_seg or SegmentUtils.INVALID_SEGMENT)
-    table.insert(data, segment_delta)
-    table.insert(data, enemies_state.nearest_enemy_depth_raw or 0)
-    table.insert(data, math.floor(enemies_state.is_aligned_with_nearest or 0.0))
-    table.insert(data, enemies_state.alignment_error_magnitude or 0.0)
+    table.insert(data, enemies_state.nearest_enemy_seg)
+    table.insert(data, enemies_state.nearest_enemy_depth_raw)
+    table.insert(data, enemies_state.is_aligned_with_nearest)
+
     -- Enemy Segments/Depths (7 enemies)
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_segments[i] or SegmentUtils.INVALID_SEGMENT) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_depths[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_segments[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_depths[i]) end
+
     -- Enemy Shot Info (4 shots)
-    for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_segments[i].value or SegmentUtils.INVALID_SEGMENT) end
-    for i = 1, 4 do table.insert(data, enemies_state.shot_positions[i] or 0) end -- Using enemy shot positions here
-    for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_lsb[i] or 0) end
+    for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_segments[i].value) end
+    for i = 1, 4 do table.insert(data, enemies_state.shot_positions[i]) end
+    for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_lsb[i]) end
+
     -- Enemy Flags (7 enemies)
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_moving_away[i] or 0) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_can_shoot[i] or 0) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_split_behavior[i] or 0) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_core_type[i] or 0) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_direction_moving[i] or 0) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_between_segments[i] or 0) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_moving_away[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_can_shoot[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_split_behavior[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_core_type[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_direction_moving[i]) end
+    for i = 1, 7 do table.insert(data, enemies_state.enemy_between_segments[i]) end
+
     -- Per-Segment Flags (16 segments)
-    for i = 1, 16 do table.insert(data, enemies_state.charging_fuseball_segments[i] or 0) end
-    for i = 1, 16 do table.insert(data, enemies_state.pulsar_lanes[i] or 0) end
+    for i = 1, 16 do table.insert(data, enemies_state.charging_fuseball_segments[i]) end
+    for i = 1, 16 do table.insert(data, enemies_state.pulsar_lanes[i]) end
 
     -- 5. Pending Spawns (Lookahead)
-    for i = 1, 64 do table.insert(data, enemies_state.pending_seg[i] or SegmentUtils.INVALID_SEGMENT) end
-    for i = 1, 64 do table.insert(data, enemies_state.pending_vid[i] or 0) end
+    for i = 1, 64 do table.insert(data, enemies_state.pending_seg[i]) end
+    for i = 1, 64 do table.insert(data, enemies_state.pending_vid[i]) end
 
-    -- 6. Boolean Flags (Game Control) - Note: some flags moved to OOB header
-    -- table.insert(data, bDone and 1 or 0) -- Moved to OOB
-    -- table.insert(data, shutdown_requested and 1 or 0) -- Implied by save signal logic
-    -- table.insert(data, game_state:should_send_save() and 1 or 0) -- Moved to OOB
 
-    -- 7. Controls (Sent for logging/context, not usually state for agent) - Moved to OOB
-    -- table.insert(data, controls.fire)
-    -- table.insert(data, controls.zap)
-    -- table.insert(data, math.floor(controls.spinner * 10000))
-    
-    -- 8. Reward (Sent for learning) - Moved to OOB
-    -- table.insert(data, math.floor(reward * 10000))
+    local num_total_values = #data
 
-    -- *** Restore OOB Header and Binary Packing Logic ***
+    -- Prepare OOB Header values
+    local nearest_enemy_byte_val = (enemies_state.nearest_enemy_abs_seg_raw == SegmentUtils.INVALID_SEGMENT) and -1 or enemies_state.nearest_enemy_abs_seg_raw
+    local player_abs_seg_oob = player_state.position & 0x0F
+    local is_open_level_byte_val = level_state.is_open_level and 1 or 0
+    local reward_val = math.floor(reward)
+    local game_mode_val = game_state.game_mode
+    local bDone_val = bDone and 1 or 0
+    local save_signal_val = (game_state:should_send_save() or shutdown_requested) and 1 or 0
+    local fire_cmd_val = player_state.fire_commanded
+    local zap_cmd_val = player_state.zap_commanded
+    local spinner_cmd_val = player_state.spinner_commanded
 
-    -- Calculate save signal
-    local save_signal = 0
-    if game_state:should_send_save() or shutdown_requested then
-        save_signal = 1
-        game_state.last_save_time = os.time() -- Update timestamp when sending signal
-        print("Save signal triggered (Interval or Shutdown)")
-    end
+    local oob_format_str = ">HdBBBBBhbBB" -- The correct 11-field format
 
-    -- Prepare values for OOB Header
-    local num_values = #data
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    local is_open_level_oob = level_state.is_open_level
-    local nearest_abs_seg_oob = enemies_state.nearest_enemy_abs_seg_raw 
-    local player_abs_seg_oob = player_state.position & 0x0F 
-    local score_oob = player_state.score or 0
-    local score_high_oob = math.floor(score_oob / 65536)
-    local score_low_oob = score_oob % 65536              
-    local frame_oob = game_state.frame_counter % 65536
-
-    -- Pack OOB header
-    local oob_data = string.pack(">HdBBBHHHBBBhBhBB",
-        num_values,               -- H: Number of state values that follow
-        math.floor(reward),       -- d: Reward (scaled integer)
-        0,                        -- B: game_action (placeholder, Python uses controls)
-        game_state.game_mode,     -- B: Game Mode
-        bDone and 1 or 0,         -- B: Done flag
-        frame_oob,                -- H: Frame counter (low 16 bits)
-        score_high_oob,           -- H: Score (high 16 bits)
-        score_low_oob,            -- H: Score (low 16 bits)
-        save_signal,              -- B: Save signal flag
-        controls.fire_commanded,  -- B: Commanded fire (Corrected field name)
-        controls.zap_commanded,   -- B: Commanded zap (Corrected field name)
-        controls.spinner_delta,   -- h: Commanded spinner delta (signed short)
-        is_attract_mode and 1 or 0, -- B: Attract mode flag
-        nearest_abs_seg_oob,      -- B: Nearest enemy absolute segment raw
-        player_abs_seg_oob,       -- B: Player absolute segment raw
-        is_open_level_oob and 1 or 0 -- B: Is open level flag
+    -- Pack OOB header directly using variables
+    local oob_data = string.pack(oob_format_str,
+        num_total_values,
+        reward_val,
+        game_mode_val,
+        bDone_val,
+        save_signal_val,
+        fire_cmd_val,
+        zap_cmd_val,
+        spinner_cmd_val,
+        nearest_enemy_byte_val,
+        player_abs_seg_oob,
+        is_open_level_byte_val
     )
 
-    -- Pack the main state data table into a binary string
+    -- Pack the main state data table into a binary string using SIGNED SHORT '>h'
     local binary_data = ""
     for i, value in ipairs(data) do
-        local packed_value
-        local num_value = tonumber(value) or 0 -- Ensure numeric
-        if num_value < -32768 or num_value > 65535 then
-            -- Clamp values outside reasonable range for packing as H (unsigned short)
-            -- Especially important for INVALID_SEGMENT (-1000)
-            if num_value == SegmentUtils.INVALID_SEGMENT then
-                 packed_value = 65535 -- Use max unsigned short for invalid segment
-            elseif num_value < -32768 then
-                 packed_value = 0 -- Clamp large negative to 0
-            else 
-                 packed_value = 65535 -- Clamp large positive to max
-            end
-             -- Optional: Print warning about clamping
-             -- print(string.format("Warning: Clamping value %d to %d for packing", num_value, packed_value))
-        elseif num_value < 0 then
-             -- Handle negatives within signed short range via two's complement for unsigned packing
-             packed_value = 65536 + num_value 
-        else
-             packed_value = num_value & 0xFFFF
-        end
-        binary_data = binary_data .. string.pack(">H", packed_value)
+        local num_value = tonumber(value)
+        assert(num_value >= -128 and num_value <= 255, string.format("Value out of range at index %d: %s", i, tostring(value)))
+        local packed_value = math.max(-32768, math.min(32767, math.floor(num_value)))
+        binary_data = binary_data .. string.pack(">h", packed_value)
     end
-    
-    -- Return combined OOB header and packed binary state data
-    return oob_data .. binary_data, num_values
+
+    return oob_data .. binary_data, num_total_values
 end
 
 -- Helper function in GameState to check save interval

@@ -3,7 +3,7 @@
 local SegmentUtils = {}
 
 -- Define and export constants
-SegmentUtils.INVALID_SEGMENT = -32768
+SegmentUtils.INVALID_SEGMENT = -128
 
 -- Function to get the relative distance to a target segment
 -- Exported as it's used by various state update functions

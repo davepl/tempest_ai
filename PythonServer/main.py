@@ -481,16 +481,16 @@ def main():
 
     # --- Start Stats Reporter Thread ---
     # This runs in the main process, reading shared metrics
-    # Pass kb_handler if interactive
-    stats_thread_args = (metrics,) if not IS_INTERACTIVE else (metrics, kb_handler)
+    print("[Main] Starting stats reporter thread...")
     stats_thread = threading.Thread(
-        target=run_stats_reporter, 
-        args=stats_thread_args, 
-        name="StatsReporterThread", 
+        target=run_stats_reporter,
+        # Pass metrics, shutdown_event, main_agent reference, and kb_handler
+        args=(metrics, shutdown_event, main_agent, kb_handler), # <<< ADD shutdown_event
+        name="StatsReporterThread",
         daemon=True
     )
     stats_thread.start()
-    print("[Main] Stats reporter thread started.")
+    # print("[Main] Stats reporter thread started.") # Redundant
 
     # --- Keyboard Handling Loop Setup (Moved after kb_handler init) ---
     # Setup only needed if kb_handler was created
