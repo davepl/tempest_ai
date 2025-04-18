@@ -348,47 +348,6 @@ class SocketServer:
                             state['frames_last_second'] = 0
                             state['last_fps_update'] = current_time
                     
-                    # Handle save signal from game
-                    if frame.save_signal:
-                        try:
-                            # Ensure agent exists before saving
-                            if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
-                                # --> ADD Check if agent is ready <--
-                                if self.main_agent_ref.is_ready:
-                                    current_time = time.time()
-                                    save_allowed = False
-                                    metrics_state_to_save = None
-                                    
-                                    # Check and update last save time atomically under lock
-                                    with self.metrics.lock:
-                                        time_since_last_save = current_time - self.metrics.last_agent_save_time
-                                        if time_since_last_save >= 60.0: # 60 second cooldown
-                                            save_allowed = True
-                                            self.metrics.last_agent_save_time = current_time # Update time *before* save
-                                            # Prepare metrics state while holding lock
-                                            metrics_state_to_save = {
-                                                'frame_count': self.metrics.frame_count,
-                                                'epsilon': self.metrics.epsilon,
-                                                'expert_ratio': self.metrics.expert_ratio,
-                                                'last_decay_step': self.metrics.last_decay_step
-                                            }
-                                        # else: save_allowed remains False
-                                    
-                                    # Perform save outside the lock if allowed
-                                    if save_allowed:
-                                        self.main_agent_ref.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
-                                        print(f"[SocketServer Client {client_id}] Save signal processed. Saved model and metrics (Frame: {metrics_state_to_save['frame_count']}).")
-                                    # else: # Optional debug print for skipped saves
-                                    #     print(f"[SocketServer Client {client_id}] Save signal received, but skipped (Cooldown). Last save was {time_since_last_save:.1f}s ago.")
-                                else:
-                                    # Agent exists but is not ready (still initializing/loading)
-                                    print(f"[SocketServer Client {client_id}] Save signal received, but skipped (Agent not ready).")
-                            else:
-                                print(f"Client {client_id}: Agent not available for saving.")
-                        except Exception as e:
-                            print(f"Client {client_id}: ERROR saving model: {e}")
-                            traceback.print_exc()
-                    
                     # Update global metrics
                     current_frame = self.metrics.update_frame_count()
                     self.metrics.update_epsilon()
@@ -574,6 +533,17 @@ class SocketServer:
                     # Call agent step if we have previous state/action
                     if last_state_for_step is not None and last_action_idx_for_step is not None:
                         if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
+                            # Retrieve the actual fire/zap/spinner values from client state
+                            last_action_tuple = None
+                            with self.client_lock:
+                                if client_id in self.client_states:
+                                    last_action_tuple = self.client_states[client_id].get('last_action')
+                            
+                            # Debug print for replay buffer commits
+                            if last_action_tuple is not None:
+                                last_fire, last_zap, last_spinner = last_action_tuple
+                                # print(f"[ReplayAdd] Client {client_id}: Adding experience - Action={last_action_idx_for_step}, Fire={last_fire}, Zap={last_zap}, Spinner={last_spinner:+0.2f}, Reward={frame.reward:.1f}")
+                            
                             self.main_agent_ref.step(
                                 last_state_for_step,
                                 np.array([[last_action_idx_for_step]]),

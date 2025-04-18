@@ -531,7 +531,7 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     local reward_val = math.floor(reward)
     local game_mode_val = game_state.game_mode
     local bDone_val = bDone and 1 or 0
-    local save_signal_val = (game_state:should_send_save() or shutdown_requested) and 1 or 0
+    local save_signal_val = (shutdown_requested) and 1 or 0
     local fire_cmd_val = player_state.fire_commanded
     local zap_cmd_val = player_state.zap_commanded
     local spinner_cmd_val = player_state.spinner_commanded
@@ -563,11 +563,6 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     end
 
     return oob_data .. binary_data, num_total_values
-end
-
--- Helper function in GameState to check save interval
-function GameState:should_send_save()
-    return (os.time() - self.last_save_time >= self.save_interval)
 end
 
 return StateUtils 

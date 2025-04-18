@@ -510,6 +510,8 @@ def main():
     # --- Main Loop (Keep alive, handle keyboard) ---
     try:
         frame_counter_cache = 0 # Cache frame count locally for decay checks
+        last_save_frame = -1 # Track the frame number of the last save
+        
         while not shutdown_event.is_set():
             # --- Periodic Updates --- 
             # Update decay values based on frame count (use cached value)
@@ -520,6 +522,29 @@ def main():
                  decay_expert_ratio(metrics, current_frame_count)
                  frame_counter_cache = current_frame_count
 
+            # --- Periodic Save based on frame count --- 
+            # Check if we crossed a save interval boundary
+            if RL_CONFIG.save_interval > 0 and current_frame_count // RL_CONFIG.save_interval > last_save_frame // RL_CONFIG.save_interval:
+                 # Check if agent is ready before saving
+                 if 'main_agent' in locals() and main_agent.is_ready:
+                     print(f"[Main] Frame {current_frame_count}: Triggering periodic save (Interval: {RL_CONFIG.save_interval})...")
+                     try:
+                          with metrics.lock:
+                              metrics_state_to_save = {
+                                  'frame_count': metrics.frame_count,
+                                  'epsilon': metrics.epsilon,
+                                  'expert_ratio': metrics.expert_ratio,
+                                  'last_decay_step': metrics.last_decay_step
+                              }
+                          # Save with the fetched metrics state
+                          main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                          print(f"[Main] Periodic save complete to {LATEST_MODEL_PATH} (Frame: {metrics_state_to_save['frame_count']})")
+                          last_save_frame = current_frame_count # Update last save frame
+                     except Exception as save_err:
+                          print(f"[Main Error] Failed periodic save: {save_err}")
+                 else:
+                     print(f"[Main] Frame {current_frame_count}: Skipped periodic save (Agent not ready)...")
+            
             # --- Keyboard Input --- 
             if kb_handler:
                 key = kb_handler.check_key()

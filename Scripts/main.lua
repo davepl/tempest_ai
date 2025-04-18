@@ -427,18 +427,6 @@ local function frame_callback()
         return true
     end
 
-    -- Check if socket is open, try to reopen if not
-    if not socket then
-        if not open_socket() then
-            if Display.SHOW_DISPLAY then 
-                -- Pass reward=nil explicitly when waiting
-                Display.update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, 0, nil, total_bytes_sent, LastRewardState) 
-            end
-            return true 
-        end
-    end
-
-    -- If we reach here, the socket should be open.
     local num_values = 0 
     local bDone = false
     local status_message = ""
@@ -495,6 +483,19 @@ local function frame_callback()
     player_state.zap_commanded = zap
     player_state.spinner_commanded = spinner 
 
+    -- Check if socket is open, try to reopen if not
+    if not socket then
+        if not open_socket() then
+            if Display.SHOW_DISPLAY then 
+                -- Pass reward=nil explicitly when waiting
+                Display.update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, 0, nil, total_bytes_sent, LastRewardState) 
+            end
+            return true 
+        end
+    end
+
+    -- If we reach here, the socket should be open.
+    
     total_bytes_sent = total_bytes_sent + #frame_data
 
     -- Apply actions, passing mem to the controls object method

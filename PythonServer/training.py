@@ -129,10 +129,6 @@ def training_worker(train_batch_queue: mp.Queue, loss_queue: mp.Queue,
                 time.sleep(0.5)
 
         print("[TrainingWorker] Shutdown event set or loop exited.")
-        # Final save before exiting
-        if batches_processed > 0: # Only save if training happened since last save
-             print("[TrainingWorker] Performing final model save...")
-             agent.save(LATEST_MODEL_PATH)
         print("[TrainingWorker] Exiting.")
 
     except Exception as init_err:
