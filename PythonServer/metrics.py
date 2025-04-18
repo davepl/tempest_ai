@@ -40,6 +40,14 @@ class Metrics:
         
         self.last_agent_save_time = 0.0 # Timestamp of last save triggered by Lua
         
+        # DQN frame reward tracking (Cumulative)
+        self.dqn_frame_count = 0
+        self.dqn_total_reward_on_frames = 0.0
+        # ---> Add Interval-specific DQN frame reward tracking <---
+        self.interval_dqn_frame_count = 0
+        self.interval_dqn_total_reward = 0.0
+        self.avg_dqn_reward_per_frame = float('nan') # Stores the last interval average
+        
         self.lock = threading.Lock()
         # Add placeholders for state values needed by metrics display
         self.enemy_seg = -1
@@ -222,5 +230,31 @@ class Metrics:
             self.last_decay_step = state.get('last_decay_step', self.last_decay_step)
             print(f"[Metrics] Restored state: Frame={self.frame_count}, Epsilon={self.epsilon:.4f}, ExpertRatio={self.expert_ratio:.4f}")
 
+    # --- Method to add reward specifically for DQN-controlled frames --- 
+    def add_dqn_frame_reward(self, reward: float):
+        """Increment count and total reward for DQN frames."""
+        with self.lock:
+            self.dqn_frame_count += 1
+            self.dqn_total_reward_on_frames += reward
+            # ---> Increment interval counters as well <---            
+            self.interval_dqn_frame_count += 1
+            self.interval_dqn_total_reward += reward
+    # --- End method ---
+
+    # ---> Add method to calculate and reset interval average <--- 
+    def calculate_interval_avg_dqn_frame_reward(self) -> float:
+        """Calculate avg reward per DQN frame for the interval and reset counters."""
+        with self.lock:
+            if self.interval_dqn_frame_count > 0:
+                self.avg_dqn_reward_per_frame = self.interval_dqn_total_reward / self.interval_dqn_frame_count
+            else:
+                self.avg_dqn_reward_per_frame = float('nan') # Or 0.0 if preferred for no DQN frames
+            
+            # Reset for the next interval
+            self.interval_dqn_frame_count = 0
+            self.interval_dqn_total_reward = 0.0
+            
+            return self.avg_dqn_reward_per_frame
+            
 # Global instance
 metrics = Metrics() 

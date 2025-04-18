@@ -190,54 +190,6 @@ def stats_reporter(agent, kb_handler):
             traceback.print_exc()
             break
 
-def keyboard_input_handler(agent, keyboard_handler):
-    """Thread function to handle keyboard input"""
-    print("Starting keyboard input handler thread...")
-    
-    while True:
-        try:
-            # Check for keyboard input
-            key = keyboard_handler.check_key()
-            
-            if key:
-                # Handle different keys
-                if key == 'q':
-                    print("Quit command received, shutting down...")
-                    metrics.global_server.running = False
-                    break
-                elif key == 's':
-                    print("[Main] 's' pressed. Saving model...")
-                    # Fetch current metrics state under lock
-                    try:
-                        with metrics.lock:
-                            metrics_state_to_save = {
-                                'frame_count': metrics.frame_count,
-                                'epsilon': metrics.epsilon,
-                                'expert_ratio': metrics.expert_ratio,
-                                'last_decay_step': metrics.last_decay_step
-                            }
-                        # Save with the fetched metrics state
-                        agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
-                        print(f"[Main] Model saved to {LATEST_MODEL_PATH} (Frame: {metrics_state_to_save['frame_count']})")
-                    except Exception as save_err:
-                        print(f"[Main Error] Failed manual save: {save_err}")
-                elif key == 'o':
-                    # Toggle override flag directly
-                    with metrics.lock:
-                        metrics.override_expert = not metrics.override_expert
-                    # Use clearer terminology
-                    print_with_terminal_restore(kb_handler, f"Inference Override Toggled: {'ON' if metrics.override_expert else 'OFF'}")
-                elif key == 'e':
-                    # Toggle expert mode flag directly
-                    with metrics.lock:
-                         metrics.expert_mode = not metrics.expert_mode
-                    print_with_terminal_restore(kb_handler, f"Expert Mode Toggled: {'ON' if metrics.expert_mode else 'OFF'}")
-            
-            time.sleep(0.1)
-        except Exception as e:
-            print(f"Error in keyboard input handler: {e}")
-            break
-
 def batch_sampler_thread(replay_memory, batch_queue, shutdown_event, batch_size, min_buffer_size):
     """Samples batches from memory and puts them in the queue for the trainer."""
     print("[BatchSampler] Starting...")
@@ -492,11 +444,6 @@ def main():
     stats_thread.start()
     # print("[Main] Stats reporter thread started.") # Redundant
 
-    # --- Keyboard Handling Loop Setup (Moved after kb_handler init) ---
-    # Setup only needed if kb_handler was created
-    # if kb_handler:
-    #     print("[Main] Setting up keyboard loop logic...") # Logic moved to main loop
-
     # --- Graceful Shutdown Handling ---
     def signal_handler(sig, frame):
         print(f"\n[Main] Signal {sig} received. Initiating graceful shutdown...")
@@ -536,9 +483,10 @@ def main():
                                   'expert_ratio': metrics.expert_ratio,
                                   'last_decay_step': metrics.last_decay_step
                               }
-                          # Save with the fetched metrics state
+                          # ---> Add context to save call <---                          
+                          # print("[Main Periodic Save] Calling agent.save()...") # Add context
                           main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
-                          print(f"[Main] Periodic save complete to {LATEST_MODEL_PATH} (Frame: {metrics_state_to_save['frame_count']})")
+                          # Log success after the save method prints its own message
                           last_save_frame = current_frame_count # Update last save frame
                      except Exception as save_err:
                           print(f"[Main Error] Failed periodic save: {save_err}")
@@ -564,9 +512,10 @@ def main():
                                 'expert_ratio': metrics.expert_ratio,
                                 'last_decay_step': metrics.last_decay_step
                             }
-                        # Save with the fetched metrics state
+                        # ---> Add context to save call <---   
+                        # print("[Main Manual Save] Calling agent.save()...") # Add context                     
                         main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
-                        print(f"[Main] Model saved to {LATEST_MODEL_PATH} (Frame: {metrics_state_to_save['frame_count']})")
+                        # Log success after the save method prints its own message
                     except Exception as save_err:
                         print(f"[Main Error] Failed manual save: {save_err}")
                 elif key == 'o':
@@ -580,6 +529,18 @@ def main():
                     with metrics.lock:
                          metrics.expert_mode = not metrics.expert_mode
                     print_with_terminal_restore(kb_handler, f"Expert Mode Toggled: {'ON' if metrics.expert_mode else 'OFF'}")
+                elif key == ' ': # Spacebar
+                    # print("[Main] SPACE pressed. Displaying current stats...")
+                    # Manually trigger calculations for immediate display
+                    # Note: This reads the *current* interval data, reporter thread resets it.
+                    current_avg_inf = metrics.calculate_interval_avg_inf_time()
+                    current_avg_dqn_f_reward = metrics.calculate_interval_avg_dqn_frame_reward()
+                    # FPS is calculated frequently, just read the latest
+                    # current_fps = metrics.calculate_interval_fps() # Or just metrics.get_fps()
+                    
+                    # Display the row (pass necessary args, kb_handler for restore)
+                    display_metrics_row(metrics, main_agent, kb_handler)
+                    # No need to pass avg_dqn_reward_per_frame as display_metrics_row reads it
             
             # --- Health Checks ---
             # Check if essential threads/processes are alive
@@ -656,8 +617,10 @@ def main():
                          'expert_ratio': metrics.expert_ratio,
                          'last_decay_step': metrics.last_decay_step
                      }
+                 # ---> Add context to save call <---                    
+                 # print("[Main Final Save] Calling agent.save()...") # Add context
                  main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
-                 print(f"[Main] Final save complete (Frame: {metrics_state_to_save['frame_count']}).")
+                 # Log success after the save method prints its own message
             except Exception as final_save_err:
                  print(f"[Main Error] Failed final save: {final_save_err}")
 

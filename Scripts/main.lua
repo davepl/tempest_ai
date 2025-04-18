@@ -209,7 +209,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     if (segment_distance < 2) then 
                         -- Check depth separately using the stored enemy_depth
                         if (enemy_depth <= 0x20) then 
-                            if player_state.fire_commanded == 1 then
+                            if player_state.fire_commanded ~= 0 then
                                 reward = reward + 250
                             else
                                 reward = reward - 50
@@ -420,11 +420,9 @@ local function frame_callback()
             controls.fire_field:set_value(0)
             print("Releasing Fire")
         end
-        return true
     elseif game_state.gamestate == 0x16 then
         -- Game is in level select mode, advance selection 
         -- controls:apply_action(mem, 0, 0, 9, game_state, player_state)
-        return true
     end
 
     local num_values = 0 
@@ -434,9 +432,10 @@ local function frame_callback()
 
     -- NOPs and game state massage
     mem:write_u8(0x0006, 2) -- Credits
-    mem:write_u8(0x0004, 0) -- Countdown timer
-    mem:write_direct_u8(0xCA6F, 0xEA); mem:write_direct_u8(0xCA70, 0xEA) -- Skip score NOP
+    -- mem:write_direct_u8(0xCA6F, 0xEA); mem:write_direct_u8(0xCA70, 0xEA) -- Skip score NOP
     mem:write_direct_u8(0xA591, 0xEA); mem:write_direct_u8(0xA592, 0xEA) -- Copy protection NOP
+
+    mem:write_u8(0x0004, 0) -- Countdown timer to zero, forces us through the attract mode stages
     if game_state.countdown_timer > 0 then game_state.countdown_timer = 0 end
 
     -- Handle Attract Mode vs Gameplay Mode
@@ -450,9 +449,9 @@ local function frame_callback()
                                    port.fields["Start 1"]
                 
                 if startField then
-                    if game_state.frame_counter % 60 == 0 then
+                    if game_state.frame_counter % 10 == 0 then
                         startField:set_value(1)
-                    elseif game_state.frame_counter % 60 == 5 then
+                    elseif game_state.frame_counter % 10 == 5 then
                         startField:set_value(0)
                     end
                 else
@@ -490,7 +489,6 @@ local function frame_callback()
                 -- Pass reward=nil explicitly when waiting
                 Display.update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, 0, nil, total_bytes_sent, LastRewardState) 
             end
-            return true 
         end
     end
 

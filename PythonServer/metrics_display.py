@@ -63,8 +63,8 @@ def get_metrics_header_string() -> str:
     """Returns the header string for metrics."""
     # Change header to Inf(ms) and reduce width (e.g., from 11 to 7)
     return (
-        f"{'Frame':>8} | {'FPS':>5} | {'Clnts':>5} | {'Mean Reward':>11} | {'DQN Reward':>10} | {'Loss':>9} | "
-        f"{'Epsilon':>7} | {'Inf(ms)':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}" # Changed header text and width
+        f"{'Frame':>8} | {'FPS':>5} | {'Clnts':>5} | {'Mean Reward':>11} | {'DQN Reward':>10} | {'DQN/f':>9} | {'Loss':>9} | "
+        f"{'Epsilon':>7} | {'Inf(ms)':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
     )
 
 def display_metrics_header(kb_handler=None, log_file_handle: Optional[TextIO] = None):
@@ -84,11 +84,10 @@ def display_metrics_header(kb_handler=None, log_file_handle: Optional[TextIO] = 
         except Exception as e:
             print(f"[StatsReporter Warning] Failed to write header to log file {LOG_FILE_PATH}: {e}")
 
-def display_metrics_row(metrics_obj, agent_ref=None, kb_handler=None, log_file_handle: Optional[TextIO] = None):
-    """Display current metrics, log the row, and increment row counter."""
+def display_metrics_row(metrics_obj, agent_ref, kb_handler, log_file_handle=None):
+    """Display current metrics in tabular format with conditional scientific notation."""
     global row_counter
-    if not IS_INTERACTIVE and not log_file_handle:
-        return
+    if not IS_INTERACTIVE and log_file_handle is None: return
 
     # --- Safely read metrics ---
     with metrics_obj.lock:
@@ -107,6 +106,8 @@ def display_metrics_row(metrics_obj, agent_ref=None, kb_handler=None, log_file_h
         open_level = metrics_obj.open_level
         override_expert = metrics_obj.override_expert
         expert_mode = metrics_obj.expert_mode
+        # ---> Read the pre-calculated average from metrics_obj <---        
+        avg_dqn_reward_per_frame = metrics_obj.avg_dqn_reward_per_frame
 
         override_status = "OFF"
         if override_expert:
@@ -139,6 +140,7 @@ def display_metrics_row(metrics_obj, agent_ref=None, kb_handler=None, log_file_h
     mean_reward_str = format_large_number(mean_reward_val, width=11, force_int=True) # Adjusted width
     dqn_reward_str = format_large_number(dqn_reward_val, width=10, force_int=True) # Adjusted width
     mean_loss_str = format_large_number(mean_loss_val, width=9) # Keep loss potentially float
+    dqn_per_frame_str = format_large_number(avg_dqn_reward_per_frame, width=9) # Format the new metric
 
     # --- Format FPS as integer ---
     # Handle potential NaN before converting to int
@@ -151,8 +153,8 @@ def display_metrics_row(metrics_obj, agent_ref=None, kb_handler=None, log_file_h
 
     # --- Build Row String ---
     row = (
-        f"{frame_count:8d} | {fps_int:5d} | {client_count:5d} | {mean_reward_str} | {dqn_reward_str} | " # Adjusted client width
-        f"{mean_loss_str} | {epsilon:7.3f} | {inf_time_str} | {guided_ratio*100:7.2f}% | " # Updated width reflected here
+        f"{frame_count:8d} | {fps_int:5d} | {client_count:5d} | {mean_reward_str} | {dqn_reward_str} | {dqn_per_frame_str} | {mean_loss_str} | " # Adjusted client width & moved DQN/f
+        f"{epsilon:7.3f} | {inf_time_str} | {guided_ratio*100:7.2f}% | " # Updated width reflected here
         f"{mem_size:8d} | {'Open' if open_level else 'Closed':10} | {override_status:10}"
     )
 
@@ -175,7 +177,7 @@ def run_stats_reporter(metrics_obj, shutdown_event: Union[threading.Event, mp.Ev
     global row_counter
     print(f"[StatsReporter] Starting stats reporter thread. Logging to: {LOG_FILE_PATH.resolve()}")
     last_report_time = time.time()
-    report_interval = 10.0
+    report_interval = 60.0 # Default 10.0 * 3
 
     # --- Variables for FPS calculation (ideally should be in Metrics class) ---
     last_fps_update_time = time.time()
@@ -237,6 +239,9 @@ def run_stats_reporter(metrics_obj, shutdown_event: Union[threading.Event, mp.Ev
                                  metrics_obj.avg_dqn_inf_time = float('nan')
                         else:
                             metrics_obj.avg_dqn_inf_time = float('nan')
+
+                    # --- Calculate DQN reward per frame for the interval <---                 
+                    avg_dqn_reward_per_frame = metrics_obj.calculate_interval_avg_dqn_frame_reward()
 
                     # --- Display Row (Console and Log) ---
                     display_metrics_row(metrics_obj, agent_ref, kb_handler, log_file_handle=log_file)

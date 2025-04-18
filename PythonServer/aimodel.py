@@ -352,6 +352,7 @@ class DQNAgent:
             state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 q_values = self.policy_net(state)
+                print(f"[DQN Q-Values]: {q_values.cpu().numpy()}") 
             return q_values.max(1)[1].item() # Return action index
 
     def step(self, state, action, reward, next_state, done):
@@ -373,7 +374,7 @@ class DQNAgent:
         backup_filename = filename.with_suffix(filename.suffix + ".bak")
         tmp_filename = filename.with_suffix(filename.suffix + ".tmp")
 
-        print(f"[DQNAgent] Attempting save: Target={filename}, Backup={backup_filename}, Temp={tmp_filename}") # Debug log
+        # print(f"[DQNAgent] Attempting save: Target={filename}, Backup={backup_filename}, Temp={tmp_filename}") # Commented out
 
         try:
             # Ensure the target directory exists
@@ -404,7 +405,7 @@ class DQNAgent:
             if filename.exists():
                 try:
                     os.replace(filename, backup_filename)
-                    print(f"[DQNAgent] Backed up existing model '{filename}' to '{backup_filename}'")
+                    # print(f"[DQNAgent] Backed up existing model '{filename}' to '{backup_filename}'") # Commented out
                 except OSError as e:
                     # Log a warning but proceed with replacing the target file
                     print(f"[DQNAgent Warning] Could not create backup '{backup_filename}' from '{filename}': {e}")

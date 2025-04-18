@@ -99,8 +99,8 @@ def training_worker(train_batch_queue: mp.Queue, loss_queue: mp.Queue,
                 current_time = time.time()
                 if current_time - last_save_time >= RL_CONFIG.save_interval_seconds:
                      if batches_processed > 0: # Only save if training happened
-                          # print(f"[TrainingWorker] Saving model after {batches_processed} batches...")
                           agent.save(LATEST_MODEL_PATH)
+                          # Log success after the save method prints its own message                          
                           last_save_time = current_time
                           batches_processed = 0 # Reset counter after save
                      else:

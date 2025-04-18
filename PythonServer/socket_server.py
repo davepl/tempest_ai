@@ -484,6 +484,8 @@ class SocketServer:
                                        # Get fire, zap, spinner from action_idx
                                        if action_idx is not None and action_idx in ACTION_MAPPING:
                                            fire, zap, spinner = ACTION_MAPPING[action_idx]
+                                           # ---> Add log for DQN action choice <---                                    
+                                           print(f"[DQN Action] Client {client_id}: Chose Index={action_idx} -> Fire={fire}, Zap={zap}, Spinner={spinner:.2f}")
                                        else:
                                            print(f"Client {client_id}: Invalid action_idx {action_idx} from queue. Using default.")
                                            action_idx = 0
@@ -532,6 +534,12 @@ class SocketServer:
                     # --- Perform step and metrics updates AFTER sending response ---
                     # Call agent step if we have previous state/action
                     if last_state_for_step is not None and last_action_idx_for_step is not None:
+                        # ---> Add reward to DQN frame totals if applicable <--- 
+                        # Check the action source from the *previous* step (which led to this reward)
+                        if self.metrics and self.metrics.last_action_source == "dqn":
+                             self.metrics.add_dqn_frame_reward(frame.reward)
+                        # ---> End Add <--- 
+                        
                         if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
                             # Retrieve the actual fire/zap/spinner values from client state
                             last_action_tuple = None
