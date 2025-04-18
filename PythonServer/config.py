@@ -59,7 +59,7 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 2048
+    batch_size: int = 256
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 0.75

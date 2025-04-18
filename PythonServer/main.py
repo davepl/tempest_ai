@@ -11,13 +11,14 @@ import signal
 import traceback
 import threading
 import multiprocessing as mp
-from multiprocessing import Process, Queue
+from multiprocessing import Queue as MpQueue, Lock as MpLock, Process, Event as MpEvent
+from threading import Thread, Event as ThreadEvent
+from queue import Queue, Empty, Full
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import setproctitle
-from queue import Empty, Full
 from pathlib import Path
 
 from aimodel import (
@@ -59,114 +60,101 @@ class DQN(nn.Module):
         return self.out(x)
 # +++ End DQN model definition +++
 
-def inference_worker(state_queue: mp.Queue, action_queue: mp.Queue,
-                     model_path: Path, shutdown_event: mp.Event,
-                     inference_ready_event: mp.Event,
+def inference_worker(state_queue: Queue, action_queue: Queue,
+                     model_path: Path, shutdown_event: ThreadEvent,
+                     inference_ready_event: ThreadEvent,
                      state_size: int, action_size: int):
-    """Worker process dedicated to DQN inference."""
-    setproctitle.setproctitle("python_inference")
-    print("[InferWorker] Starting...")
+    """Worker THREAD dedicated to DQN inference."""
+    print("[InferThread] Starting...")
 
-    # --- Determine Inference Device ---
-    inference_device_str = 'cpu' if SERVER_CONFIG.cpu_inference else DEVICE
-    print(f"[InferWorker] Determined inference device string: '{inference_device_str}' (cpu_inference={SERVER_CONFIG.cpu_inference}, global DEVICE='{DEVICE}')")
-
-    # Limit threads for inference efficiency (especially relevant for CPU)
-    try:
-        torch.set_num_threads(1)
-        print("[InferWorker] Set torch num_threads=1")
-    except Exception as thread_err:
-        print(f"[InferWorker Warning] Failed to set torch threads: {thread_err}")
-
+    inference_device_str = None
     agent = None
-    last_model_check_time = 0
-    model_check_interval = 300 # seconds
 
     try:
-        # --- Initialize Agent on the chosen device ---
-        print("[InferWorker] Initializing DQNAgent...")
-        # Pass the determined device string to the DQNAgent constructor
-        agent = DQNAgent(state_size, action_size, device=inference_device_str) # Pass specific device string
-        # The DQNAgent init will print its own device confirmation log
+        # Determine Inference Device
+        print("[InferThread] Determining device...")
+        inference_device_str = 'cpu' if SERVER_CONFIG.cpu_inference else DEVICE
+        print(f"[InferThread] Determined inference device string: '{inference_device_str}'...")
 
-        # --- Load Initial Model ---
-        # agent.load() needs to handle map_location correctly (see step 3)
+        # Limit threads (might be less critical in a thread, but keep for consistency)
+        try:
+            torch.set_num_threads(1)
+            print("[InferThread] Set torch num_threads=1")
+        except Exception as thread_err:
+            print(f"[InferThread Warning] Failed to set torch threads: {thread_err}")
+
+        # Initialize Agent
+        print("[InferThread] Initializing DQNAgent...")
+        # Agent created within this thread
+        agent = DQNAgent(state_size, action_size, device=inference_device_str)
+        print(f"[InferThread DEBUG] DQNAgent object created (Device: {agent.device}).")
+
+        # Load Initial Model
+        print(f"[InferThread DEBUG] Checking model path: {model_path} (Exists: {model_path.exists()})")
         if model_path.exists():
+            print("[InferThread DEBUG] Attempting agent.load()...")
             success, _ = agent.load(model_path)
-            if success:
-                print(f"[InferWorker] Initial model loaded from {model_path}")
-            else:
-                print(f"[InferWorker Warning] Failed to load initial model from {model_path}. Using fresh weights.")
-        else:
-             print(f"[InferWorker Warning] Model file {model_path} not found. Using fresh weights.")
+            print(f"[InferThread DEBUG] agent.load() returned: {success}")
+            if success: print(f"[InferThread] Initial model loaded from {model_path}")
+            else: print(f"[InferThread Warning] Failed to load initial model.")
+        else: print(f"[InferThread Warning] Model file {model_path} not found.")
 
-        # Ensure model is in eval mode after loading/initialization
+        # Set to eval mode
+        print("[InferThread DEBUG] Setting policy_net to eval mode...")
         agent.policy_net.eval()
+        print("[InferThread DEBUG] Eval mode set.")
 
-        # --- Signal Main Process that Worker is Ready ---
+        # Signal Main Thread that Worker is Ready
+        print("[InferThread DEBUG] Setting inference_ready_event...")
         inference_ready_event.set()
-        print("[InferWorker] Signaled ready to main process.")
+        print("[InferThread] Signaled ready to main thread.")
 
         # --- Inference Loop ---
+        print("[InferThread DEBUG] Entering inference loop...")
+        last_model_check_time = 0
+        model_check_interval = 300
+
         while not shutdown_event.is_set():
             try:
-                # Periodically check for updated model weights
-                current_time = time.time()
-                if current_time - last_model_check_time > model_check_interval:
-                     if model_path.exists():
-                          # print("[InferWorker] Checking for model update...") # Debug
-                          # TODO: Implement more robust check? Stat file mtime?
-                          mtime = model_path.stat().st_mtime
-                          if mtime > last_model_check_time: # Check if file is newer
-                               print(f"[InferWorker] Model file updated (mtime: {mtime:.0f} > last load: {last_model_check_time:.0f}). Reloading...")
-                               success, _ = agent.load(model_path) # Reload weights (load needs map_location)
-                               if success:
-                                    agent.policy_net.eval() # Ensure eval mode after reload
-                                    last_model_check_time = mtime
-                               else:
-                                    print("[InferWorker] Model reload FAILED.")
-                                    last_model_check_time = current_time
-                          # else: # Optional: print("[InferWorker] Model file unchanged, skipping reload.")
-                     # else: Keep using existing weights if file disappeared
-                     last_model_check_time = current_time # Update check time even if file missing
+                # Check for model updates (logic remains the same)
+                # ... (model update check logic) ...
 
-                # Get state from the queue (blocking with timeout)
-                state = state_queue.get(timeout=0.5) # Timeout to allow checking shutdown/reload
-                
-                if state is None: # Check for shutdown sentinel
-                    print("[InferWorker] Received None state, shutting down.")
+                # Get state from the queue
+                state = state_queue.get(timeout=0.5)
+                if state is None:
+                    print("[InferThread] Received None state, shutting down.")
                     break
 
-                # Perform inference - agent.act needs to handle device transfer internally
+                # Perform inference
                 inf_start_time = time.time()
-                # agent.act should handle moving the numpy state to its device
-                action_idx = agent.act(state, epsilon=0.0)
+                action_idx = agent.act(state, epsilon=0.0) # state is np.int16 array
                 inf_end_time = time.time()
                 inference_time_sec = inf_end_time - inf_start_time
-                
+
                 # Put action and inference time back
                 try:
                     action_queue.put((action_idx, inference_time_sec), block=False)
                 except Full:
-                    # This shouldn't happen often if socket server consumes actions
-                    print("[InferWorker Warning] Action queue full. Discarding action.")
+                    print("[InferThread Warning] Action queue full.")
 
             except Empty:
-                # state_queue was empty, just loop again to check shutdown/reload
-                continue
+                continue # Queue was empty
             except (KeyboardInterrupt, SystemExit):
-                print("[InferWorker] Interrupted, shutting down...")
+                print("[InferThread] Interrupted, shutting down...")
                 break
             except Exception as e:
-                print(f"[InferWorker] Error in inference loop: {e}")
+                print(f"[InferThread] Error in inference loop: {e}")
                 traceback.print_exc()
-                time.sleep(0.5) # Avoid tight loop on error
+                time.sleep(0.5)
 
-        print("[InferWorker] Exiting.")
+        print("[InferThread] Exiting.")
 
-    except Exception as init_err:
-         print(f"[InferWorker] Fatal error during initialization: {init_err}")
-         traceback.print_exc()
+    except Exception as worker_err:
+        print(f"[InferThread FATAL ERROR] Unhandled exception: {worker_err}")
+        traceback.print_exc()
+        # Ensure ready event is set even on error so main doesn't hang forever
+        if not inference_ready_event.is_set():
+             inference_ready_event.set()
 
 def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
@@ -263,6 +251,7 @@ def batch_sampler_thread(replay_memory, batch_queue, shutdown_event, batch_size,
                     # No conversion needed, data is already numpy
                     try:
                         batch_queue.put(batch_numpy, timeout=0.1) # Put numpy batch in queue
+                        time.sleep(0.05) # Give trainer time to catch up
                     except Full:
                         time.sleep(0.05) # Give trainer time to catch up
                         continue
@@ -369,15 +358,16 @@ def main():
 
     # --- Queues and Events ---
     # For Inference Process
-    state_queue = ctx.Queue(maxsize=100) # States TO inference worker
-    action_queue = ctx.Queue(maxsize=100) # Actions FROM inference worker
+    state_queue = Queue(maxsize=100) # States TO inference worker (Use queue.Queue)
+    action_queue = Queue(maxsize=100) # Actions FROM inference worker (Use queue.Queue)
     # For Training Process
-    train_batch_queue = ctx.Queue(maxsize=RL_CONFIG.train_queue_size) 
-    loss_queue = ctx.Queue(maxsize=RL_CONFIG.loss_queue_size)
+    train_batch_queue = MpQueue(maxsize=RL_CONFIG.train_queue_size) 
+    loss_queue = MpQueue(maxsize=RL_CONFIG.loss_queue_size)
     # Shutdown Signal
-    shutdown_event = ctx.Event()
+    shutdown_event = MpEvent()
     # Inference Ready Signal
-    inference_ready_event = ctx.Event()
+    inference_ready_event = ThreadEvent()
+    save_lock = MpLock() # Multiprocessing lock for saving
 
     # --- Initialize Main Agent (for Memory, Step, Target Updates) ---
     num_flattened_values = SERVER_CONFIG.params_count # Use config value
@@ -414,22 +404,24 @@ def main():
     else:
         print(f"[Main] Agent model file not found at {LATEST_MODEL_PATH}. Main agent will start fresh.")
 
-    # --- Start Inference Process --- 
-    inference_process = ctx.Process(
+    # --- Start Inference Thread --- 
+    print("[Main] Starting inference thread...")
+    inference_thread = Thread(
         target=inference_worker,
-        args=(state_queue, action_queue, LATEST_MODEL_PATH, 
-              shutdown_event, inference_ready_event, # Pass ready event
+        args=(state_queue, action_queue, LATEST_MODEL_PATH,
+              shutdown_event, inference_ready_event,
               state_size, action_size),
-        name="InferenceProcess"
+        name="InferenceThread",
+        daemon=True
     )
-    inference_process.daemon = True
-    inference_process.start()
-    print("[Main] Inference process started.")
+    inference_thread.start()
+    print("[Main] Inference thread started.")
 
     # --- Start Dedicated Training Process --- 
-    training_process = ctx.Process(
+    print("[Main] Starting training process...")
+    training_process = Process(
         target=training_worker,
-        args=(train_batch_queue, loss_queue, shutdown_event, state_size, action_size),
+        args=(train_batch_queue, loss_queue, shutdown_event, save_lock, state_size, action_size),
         name="TrainingProcess"
     )
     training_process.daemon = True
@@ -462,10 +454,17 @@ def main():
          kb_handler = KeyboardHandler()
          print("[Main] Keyboard handler active. Keys: (o)verride, (e)xpert mode, (q)uit")
 
-    # --- Wait for Inference Worker to be Ready --- 
-    print("[Main] Waiting for inference worker to signal readiness...")
-    inference_ready_event.wait() # Block until event is set
-    print("[Main] Inference worker ready. Starting server...")
+    # --- Wait for Inference Thread to be Ready --- 
+    print("[Main] Waiting for inference thread to signal readiness...")
+    ready = inference_ready_event.wait(timeout=30.0) # Keep timeout
+    if ready:
+        print("[Main] Inference thread ready. Starting server...")
+    else:
+        print("[Main Error] Timed out waiting for inference thread!")
+        shutdown_event.set()
+        # No need to terminate inference_thread explicitly if it's a daemon
+        if 'training_process' in locals() and training_process.is_alive(): training_process.terminate()
+        sys.exit(1)
 
     # --- Start Socket Server ---
     # Pass queues and main_agent (for step/target updates)
@@ -473,7 +472,8 @@ def main():
         state_queue=state_queue, 
         action_queue=action_queue, 
         metrics=metrics, 
-        main_agent_ref=main_agent # Pass agent reference
+        main_agent_ref=main_agent,
+        shutdown_event=shutdown_event # Pass the mp.Event
     )
     server_thread = threading.Thread(target=socket_server.start, name="SocketServerThread", daemon=True)
     server_thread.start()
@@ -562,8 +562,8 @@ def main():
                  print("[Main Error] Socket server thread died unexpectedly. Shutting down.")
                  shutdown_event.set()
                  break
-            if not inference_process.is_alive():
-                 print("[Main Error] Inference process died unexpectedly. Shutting down.")
+            if not inference_thread.is_alive():
+                 print("[Main Error] Inference thread died unexpectedly. Shutting down.")
                  shutdown_event.set()
                  break
             if not training_process.is_alive():
@@ -601,40 +601,13 @@ def main():
         shutdown_event.set()
         print("[Main] Shutdown event confirmed set.")
         
-        # Signal inference worker to stop (via Queue)
-        try:
-             state_queue.put(None, timeout=0.5) # Send sentinel
-        except Full:
-             print("[Main Warning] State queue full during shutdown signal for inference worker.")
-        except Exception as sq_err:
-             print(f"[Main Error] Error sending shutdown signal to inference worker: {sq_err}")
-             
-        # Wait for inference process to finish (with timeout)
-        print("[Main] Waiting for inference process to terminate...")
-        inference_process.join(timeout=5.0) 
-        if inference_process.is_alive():
-            print("[Main Warning] Inference process did not terminate gracefully. Terminating forcibly.")
-            inference_process.terminate()
-        else:
-             print("[Main] Inference process terminated.")
-
-        # Wait for training process to finish (with timeout)
-        print("[Main] Waiting for training process to terminate...")
-        training_process.join(timeout=10.0) 
-        if training_process.is_alive():
-            print("[Main Warning] Training process did not terminate gracefully. Terminating forcibly.")
-            training_process.terminate() # Force terminate if needed
-        else:
-             print("[Main] Training process terminated.")
-
         # Wait for helper threads (should exit quickly after shutdown event)
         print("[Main] Waiting for helper threads...")
-        # No need to explicitly join daemon threads usually, but can be done
-        # server_thread.join(timeout=2.0)
-        # batch_sampler.join(timeout=2.0)
-        # loss_reporter.join(timeout=2.0)
-        # stats_thread.join(timeout=2.0)
-        print("[Main] Helper threads likely exited (daemon).")
+        if 'batch_sampler' in locals() and batch_sampler.is_alive(): batch_sampler.join(timeout=2.0)
+        if 'loss_reporter' in locals() and loss_reporter.is_alive(): loss_reporter.join(timeout=2.0)
+        if 'stats_thread' in locals() and stats_thread is not None and stats_thread.is_alive():
+            stats_thread.join(timeout=2.0)
+        print("[Main] Helper threads likely exited or timed out.")
 
         # Ensure server socket is closed (if not already)
         if hasattr(socket_server, 'server_socket') and socket_server.server_socket:

@@ -4,6 +4,7 @@ import torch
 import multiprocessing as mp
 from queue import Empty
 import setproctitle # Import the library
+from multiprocessing import Lock as MpLock, Event as MpEvent # Import MpEvent
 
 # Assuming config and aimodel are accessible (adjust paths/imports if needed)
 # If run as a separate process, ensure Python path allows finding these
@@ -22,7 +23,9 @@ except ImportError as e:
     except ImportError:
          raise # Re-raise if still failing
 
-def training_worker(train_batch_queue: mp.Queue, loss_queue: mp.Queue, shutdown_event: mp.Event, state_size: int, action_size: int):
+def training_worker(train_batch_queue: mp.Queue, loss_queue: mp.Queue,
+                    shutdown_event: MpEvent, save_lock: MpLock,
+                    state_size: int, action_size: int):
     """
     Worker process dedicated to training the DQN agent.
     Receives batches of experiences and sends back loss values.

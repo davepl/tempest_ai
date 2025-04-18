@@ -45,7 +45,7 @@ class SocketServer:
     """Socket-based server to handle multiple clients"""
     def __init__(self, state_queue=None, action_queue=None, 
                  metrics=None, main_agent_ref=None, 
-                 host=SERVER_CONFIG.host, port=SERVER_CONFIG.port):
+                 host=SERVER_CONFIG.host, port=SERVER_CONFIG.port, shutdown_event=None):
         print(f"Initializing SocketServer on {host}:{port}")
         self.host = host
         self.port = port
@@ -57,7 +57,7 @@ class SocketServer:
         self.clients = {}  # Dictionary to track active clients (thread objects or None)
         self.client_states = {}  # Dictionary to store per-client state
         self.client_lock = threading.Lock()  # Lock for client dictionaries
-        self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
+        self.shutdown_event = shutdown_event  # Event to signal shutdown to client threads
         
         # Use passed metrics object
         if self.metrics is None:
@@ -396,18 +396,26 @@ class SocketServer:
                     self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
                     
                     # Process previous step's results if available
+                    last_state_for_step = None # Keep track of state/action for step call after send
+                    last_action_idx_for_step = None
+                    # ---> MOVE step call to after sendall <---
+                    # if state.get('last_state') is not None and state.get('last_action_idx') is not None:
+                    #      # Ensure agent exists before stepping
+                    #     if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
+                    #         self.main_agent_ref.step(
+                    #              state['last_state'],
+                    #              np.array([[state['last_action_idx']]]),
+                    #              frame.reward,
+                    #              frame.state,
+                    #              frame.done
+                    #          )
+                    #     else:
+                    #          print(f"Client {client_id}: Agent not available for step.")
+
+                    # ---> Store state/action for step call later <---
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:
-                         # Ensure agent exists before stepping
-                        if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
-                            self.main_agent_ref.step(
-                                 state['last_state'],
-                                 np.array([[state['last_action_idx']]]),
-                                 frame.reward,
-                                 frame.state,
-                                 frame.done
-                             )
-                        else:
-                             print(f"Client {client_id}: Agent not available for step.")
+                        last_state_for_step = state['last_state']
+                        last_action_idx_for_step = state['last_action_idx']
 
 
                         # Track rewards
@@ -505,8 +513,9 @@ class SocketServer:
                                        action_idx, inference_time_sec = self.action_queue.get(timeout=1.0)
 
                                        # ---> ADD THIS LINE HERE <---
-                                       if self.metrics:
-                                            self.metrics.add_inference_time(inference_time_sec)
+                                       # ---> MOVE add_inference_time to after sendall <---
+                                       # if self.metrics:
+                                       #      self.metrics.add_inference_time(inference_time_sec)
 
                                        # --- Continue processing ---
                                        inference_time_ms = inference_time_sec * 1000
@@ -561,6 +570,24 @@ class SocketServer:
                         print(f"Client {client_id}: Connection lost when sending action.")
                         break # Exit loop if connection is lost
 
+                    # --- Perform step and metrics updates AFTER sending response ---
+                    # Call agent step if we have previous state/action
+                    if last_state_for_step is not None and last_action_idx_for_step is not None:
+                        if hasattr(self, 'main_agent_ref') and self.main_agent_ref:
+                            self.main_agent_ref.step(
+                                last_state_for_step,
+                                np.array([[last_action_idx_for_step]]),
+                                frame.reward,
+                                frame.state,
+                                frame.done
+                            )
+                        else:
+                             print(f"Client {client_id}: Agent not available for step (post-send).")
+
+                    # Log inference time if applicable (DQN path)
+                    if self.metrics and hasattr(self, 'metrics') and self.metrics.last_action_source == "dqn" and 'inference_time_sec' in locals():
+                         self.metrics.add_inference_time(inference_time_sec)
+                    # --- End Post-Send Updates ---
 
                     # Use main_agent_ref for target network update
                     current_frame = self.metrics.frame_count # Use metrics frame count
