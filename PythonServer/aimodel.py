@@ -121,6 +121,7 @@ state_size = rl_config.state_size
 @dataclass
 class FrameData:
     """Game state data for a single frame"""
+    lua_frame_count: int # Frame counter from Lua
     state: np.ndarray
     reward: float
     action: Tuple[bool, bool, float]  # fire, zap, spinner (commanded)
@@ -713,6 +714,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         oob_fields = []
         current_offset = 0
         field_formats = [
+            ('>I', 'lua_frame_count'),       # 0 (NEW)
             ('>H', 'num_total_values'),       # 1
             ('>d', 'reward'),                 # 2
             ('>B', 'game_mode'),              # 3
@@ -748,12 +750,12 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         # --- Verification ---
         oob_header_size_calculated = current_offset
 
-        if len(oob_fields) != 11:
-            print(f"ERROR: Expected 11 OOB fields, but unpacked {len(oob_fields)} field-by-field.", flush=True) # Keep error print
+        if len(oob_fields) != 12:
+            print(f"ERROR: Expected 12 OOB fields, but unpacked {len(oob_fields)} field-by-field.", flush=True)
             return None
 
         # Assign unpacked values to variables
-        (num_total_values, reward, game_mode, done_byte,
+        (lua_frame_count, num_total_values, reward, game_mode, done_byte,
          save_signal_byte, fire_byte, zap_byte, spinner_commanded,
          nearest_enemy_abs_byte, player_seg_byte, is_open_byte) = oob_fields
 
@@ -781,6 +783,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
 
         # --- Create FrameData Object ---
         frame_data = FrameData(
+            lua_frame_count=lua_frame_count,
             state=final_state,
             reward=reward,
             action=(bool(fire_byte), bool(zap_byte), spinner_commanded),

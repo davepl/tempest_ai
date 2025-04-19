@@ -315,6 +315,7 @@ class SocketServer:
                         raise ConnectionError("Client disconnected (failed to read length)")
 
                     data_length = struct.unpack(">H", length_data)[0]
+                    
                     data = b""
                     remaining = data_length
 
@@ -333,17 +334,21 @@ class SocketServer:
                     # --- Parameter Count Validation ---
                     # Peek at the number of values from the OOB header *before* full parsing
                     try:
-                        # Expected header format includes num_values as the first H (unsigned short)
-                        header_format_peek = ">H" # Only need the first value
+                        # Parameter count (H) starts after the 4-byte frame count (I)
+                        header_format_peek = ">H" # Format of the count field itself
                         peek_size = struct.calcsize(header_format_peek)
-                        if len(data) >= peek_size:
-                            num_values_received = struct.unpack(header_format_peek, data[:peek_size])[0]
+                        oob_count_offset = 4 # Offset of the count field (after >I)
+                        if len(data) >= oob_count_offset + peek_size:
+                            # Unpack starting from the offset
+                            num_values_received = struct.unpack(header_format_peek, data[oob_count_offset:oob_count_offset+peek_size])[0]
+                            # expected_count = SERVER_CONFIG.params_count # Redundant check now?
+                            # print(f"Client {client_id}: Parameter Count Check - Received={num_values_received}, Expected={expected_count}") # DEBUG
                             if num_values_received != SERVER_CONFIG.params_count:
                                 # Raise a specific error if count mismatches config
                                 raise ValueError(f"Parameter count mismatch! Expected {SERVER_CONFIG.params_count}, received {num_values_received}")
                         else:
                              # This should ideally not happen if length check above is correct
-                             raise ConnectionError("Data too short to read parameter count")
+                             raise ConnectionError(f"Data too short ({len(data)} bytes) to read parameter count at offset {oob_count_offset}")
                     except ValueError as ve:
                          # Catch the specific ValueError for parameter count mismatch
                          print(f"Client {client_id}: {ve}. Closing connection.")
@@ -566,10 +571,10 @@ class SocketServer:
                                 if client_id in self.client_states:
                                     last_action_tuple = self.client_states[client_id].get('last_action')
                             
-                            # Debug print for replay buffer commits
-                            if last_action_tuple is not None:
-                                last_fire, last_zap, last_spinner = last_action_tuple
-                                # print(f"[ReplayAdd] Client {client_id}: Adding experience - Action={last_action_idx_for_step}, Fire={last_fire}, Zap={last_zap}, Spinner={last_spinner:+0.2f}, Reward={frame.reward:.1f}")
+                            # ---> Print Replay Buffer Add Info <--- 
+                            # if last_action_idx_for_step is not None and frame is not None:
+                            #   print(f"[ReplayBuffer] Frame(s'): {frame.lua_frame_count}, Action(a): {last_action_idx_for_step}, Reward(r): {frame.reward:.2f}")
+                            # ---> End Print <--- 
                             
                             self.main_agent_ref.step(
                                 last_state_for_step,

@@ -525,6 +525,7 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     local num_total_values = #data
 
     -- Prepare OOB Header values
+    local lua_frame_count_val = game_state.frame_counter -- Get the frame counter
     local nearest_enemy_byte_val = (enemies_state.nearest_enemy_abs_seg_raw == SegmentUtils.INVALID_SEGMENT) and -1 or enemies_state.nearest_enemy_abs_seg_raw
     local player_abs_seg_oob = player_state.position & 0x0F
     local is_open_level_byte_val = level_state.is_open_level and 1 or 0
@@ -536,18 +537,20 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     local zap_cmd_val = player_state.zap_commanded
     local spinner_cmd_val = player_state.spinner_commanded
 
-    local oob_format_str = ">HdBBBBBhbBB" -- The correct 11-field format
+    -- Prepend '>I' for the 32-bit unsigned frame counter
+    local oob_format_str = ">IHdBBBBBhbBB" -- New 12-field format
 
     -- Pack OOB header directly using variables
     local oob_data = string.pack(oob_format_str,
-        num_total_values,
-        reward_val,
-        game_mode_val,
-        bDone_val,
-        save_signal_val,
-        fire_cmd_val,
-        zap_cmd_val,
-        spinner_cmd_val,
+        lua_frame_count_val, -- 1. Lua frame count (New)
+        num_total_values,    -- 2. State vector size
+        reward_val,          -- 3. Reward
+        game_mode_val,       -- 4. Game Mode
+        bDone_val,           -- 5. Done flag
+        save_signal_val,     -- 6. Save signal
+        fire_cmd_val,        -- 7. Fire commanded
+        zap_cmd_val,         -- 8. Zap commanded
+        spinner_cmd_val,     -- 9. Spinner commanded
         nearest_enemy_byte_val,
         player_abs_seg_oob,
         is_open_level_byte_val
