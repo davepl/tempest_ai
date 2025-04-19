@@ -378,22 +378,8 @@ def main():
             print("[Main] Final save skipped (Agent not found or not ready).")
         # ---> End Final Save <--- 
 
-        # Wait for essential threads - Removing join for daemon threads
-        print("[Main] Waiting for essential threads (longer timeout)...")
-        join_timeout = 10.0
-        if 'training_thread' in locals() and training_thread.is_alive():
-            print("[Main] Joining TrainingThread...")
-            training_thread.join(timeout=join_timeout)
-            if training_thread.is_alive(): print("[Main Warning] TrainingThread did not exit after join timeout!")
-        if 'stats_thread' in locals() and stats_thread is not None and stats_thread.is_alive():
-            print("[Main] Joining StatsReporterThread...")
-            stats_thread.join(timeout=join_timeout)
-            if stats_thread.is_alive(): print("[Main Warning] StatsReporterThread did not exit after join timeout!")
-        # Optionally join server thread too, though less likely needed if sockets closed
-        # if 'server_thread' in locals() and server_thread.is_alive():
-        #     print("[Main] Joining SocketServerThread...")
-        #     server_thread.join(timeout=join_timeout)
-        #     if server_thread.is_alive(): print("[Main Warning] SocketServerThread did not exit after join timeout!")
+        # Wait for essential threads (longer timeout)...
+        print("[Main] Signaling essential threads to exit (if not already). Relying on daemon status for cleanup.")
 
         # Server socket closure is handled by the SocketServer thread's finally block.
 
