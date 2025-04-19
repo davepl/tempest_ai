@@ -183,8 +183,9 @@ def main():
     if LATEST_MODEL_PATH.exists():
         try:
             success, loaded_metrics_state = main_agent.load(LATEST_MODEL_PATH)
+            # Print status AFTER attempting load
             if success:
-                # print(f"[Main] Loaded agent model from {LATEST_MODEL_PATH}") # Commented out
+                print(f"[Main] Initial agent state loaded successfully from {LATEST_MODEL_PATH}")
                 if loaded_metrics_state:
                     print("[Main] Restoring metrics from checkpoint...")
                     with metrics.lock:
@@ -199,7 +200,7 @@ def main():
              print(f"[Main Error] Error processing model load: {e}. Starting fresh.")
              traceback.print_exc()
     else:
-        print(f"[Main] Agent model file not found at {LATEST_MODEL_PATH}. Agent will start fresh.")
+        print(f"[Main] Agent model file not found ({LATEST_MODEL_PATH}). Starting agent with fresh weights.")
 
     # --- Start Training Thread ---
     print("[Main] Starting training thread...")
@@ -371,9 +372,23 @@ def main():
             print("[Main] Final save skipped (Agent not found or not ready).")
         # ---> End Final Save <--- 
 
-        # Daemon threads should exit automatically after main thread finishes.
-        # No explicit joins needed here.
-        
+        # Wait for essential threads - Removing join for daemon threads
+        print("[Main] Waiting for essential threads (longer timeout)...")
+        join_timeout = 10.0
+        if 'training_thread' in locals() and training_thread.is_alive():
+            print("[Main] Joining TrainingThread...")
+            training_thread.join(timeout=join_timeout)
+            if training_thread.is_alive(): print("[Main Warning] TrainingThread did not exit after join timeout!")
+        if 'stats_thread' in locals() and stats_thread is not None and stats_thread.is_alive():
+            print("[Main] Joining StatsReporterThread...")
+            stats_thread.join(timeout=join_timeout)
+            if stats_thread.is_alive(): print("[Main Warning] StatsReporterThread did not exit after join timeout!")
+        # Optionally join server thread too, though less likely needed if sockets closed
+        # if 'server_thread' in locals() and server_thread.is_alive():
+        #     print("[Main] Joining SocketServerThread...")
+        #     server_thread.join(timeout=join_timeout)
+        #     if server_thread.is_alive(): print("[Main Warning] SocketServerThread did not exit after join timeout!")
+
         # Server socket closure is handled by the SocketServer thread's finally block.
 
         print("[Main] Shutdown complete.")
