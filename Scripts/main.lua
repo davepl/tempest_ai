@@ -207,11 +207,13 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                             end
                         end
                     end
-                    reward = reward + (8 - segment_distance) * 25 -- Scaled Proximity Reward
+                    reward = reward + (8 - segment_distance) * 10 -- Scaled Proximity Reward
                     if desired_spinner * player_state.spinner_commanded < 0 then -- Movement penalty
                         reward = reward - 50
                     elseif desired_spinner ~= 0 and player_state.spinner_commanded == 0 then -- Inaction penalty when misaligned
                         reward = reward - 75 -- Discourage sitting still when movement needed
+                    elseif desired_spinner * player_state.spinner_commanded > 0 then -- Correct movement reward (smaller bonus)
+                        reward = reward + 75
                     end
                 end
                 
