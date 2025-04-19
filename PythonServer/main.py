@@ -303,10 +303,12 @@ def main():
                     try:
                         # Acquire lock for saving
                         with save_lock:
-                            print("[Main DEBUG] Acquired save_lock. Calling main_agent.save() without metrics...")
-                            # Save agent state only, skip metrics during final shutdown save for stability
-                            main_agent.save(LATEST_MODEL_PATH, metrics_state=None)
-                            print("[Main DEBUG] main_agent.save() completed. Releasing save_lock.")
+                            # Get metrics state *under the metrics lock*
+                            with metrics.lock:
+                                metrics_state_to_save = metrics.get_state_for_save()
+                            print("[Main DEBUG] Calling main_agent.save() with metrics state...")
+                            main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                            print("[Main DEBUG] main_agent.save() completed.")
                     except Exception as save_err:
                         print(f"[Main Error] Failed manual save: {save_err}")
                         traceback.print_exc()
@@ -363,8 +365,12 @@ def main():
         if 'main_agent' in locals() and main_agent.is_ready:
             try:
                  with save_lock:
-                     # Save agent state only, skip metrics during final shutdown save for stability
-                     main_agent.save(LATEST_MODEL_PATH, metrics_state=None)
+                     # Get metrics state *under the metrics lock*
+                     with metrics.lock:
+                         metrics_state_to_save = metrics.get_state_for_save()
+                     print("[Main DEBUG] Calling main_agent.save() with metrics state...")
+                     main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                     print("[Main DEBUG] main_agent.save() completed.")
             except Exception as final_save_err:
                  print(f"[Main Error] Failed final save: {final_save_err}")
                  traceback.print_exc()
