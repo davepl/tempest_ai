@@ -449,16 +449,16 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     table.insert(data, game_state.gamestate)
     table.insert(data, game_state.game_mode)
     table.insert(data, game_state.countdown_timer)
-    table.insert(data, game_state.p1_lives)
+    -- table.insert(data, game_state.p1_lives)
     table.insert(data, game_state.p1_level)
-    table.insert(data, game_state.credits)
+    -- table.insert(data, game_state.credits)
 
     -- 2. Level State
     table.insert(data, level_state.level_number)
-    table.insert(data, level_state.level_shape)
+    -- table.insert(data, level_state.level_shape)
     table.insert(data, level_state.is_open_level and 1 or 0)
     for i = 1, 16 do table.insert(data, level_state.spike_heights[i]) end
-    for i = 1, 16 do table.insert(data, level_state.level_angles[i]) end
+    --for i = 1, 16 do table.insert(data, level_state.level_angles[i]) end
 
     -- 3. Player State
     table.insert(data, player_state.position)
@@ -474,22 +474,22 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     for i = 1, 8 do table.insert(data, player_state.shot_positions[i]) end
 
     -- 4. Enemy State
-    table.insert(data, enemies_state.active_flippers)
-    table.insert(data, enemies_state.active_pulsars)
-    table.insert(data, enemies_state.active_tankers)
-    table.insert(data, enemies_state.active_spikers)
-    table.insert(data, enemies_state.active_fuseballs)
-    table.insert(data, enemies_state.num_enemies_in_tube)
-    table.insert(data, enemies_state.num_enemies_on_top)
-    table.insert(data, enemies_state.enemies_pending)
-    table.insert(data, enemies_state.spawn_slots_flippers)
-    table.insert(data, enemies_state.spawn_slots_pulsars)
-    table.insert(data, enemies_state.spawn_slots_tankers)
-    table.insert(data, enemies_state.spawn_slots_spikers)
-    table.insert(data, enemies_state.spawn_slots_fuseballs)
-    table.insert(data, enemies_state.pulsar_fliprate)
-    table.insert(data, enemies_state.pulse_beat)
-    table.insert(data, enemies_state.pulsing)
+    -- table.insert(data, enemies_state.active_flippers)
+    -- table.insert(data, enemies_state.active_pulsars)
+    -- table.insert(data, enemies_state.active_tankers)
+    -- table.insert(data, enemies_state.active_spikers)
+    -- table.insert(data, enemies_state.active_fuseballs)
+    -- table.insert(data, enemies_state.num_enemies_in_tube)
+    -- table.insert(data, enemies_state.num_enemies_on_top)
+    -- table.insert(data, enemies_state.enemies_pending)
+    -- table.insert(data, enemies_state.spawn_slots_flippers)
+    -- table.insert(data, enemies_state.spawn_slots_pulsars)
+    -- table.insert(data, enemies_state.spawn_slots_tankers)
+    -- table.insert(data, enemies_state.spawn_slots_spikers)
+    -- table.insert(data, enemies_state.spawn_slots_fuseballs)
+    -- table.insert(data, enemies_state.pulsar_fliprate)
+    -- table.insert(data, enemies_state.pulse_beat)
+    -- table.insert(data, enemies_state.pulsing)
 
     -- Nearest Enemy
     table.insert(data, enemies_state.nearest_enemy_seg)
@@ -503,23 +503,22 @@ function StateUtils.flatten_game_state_to_binary(reward, game_state, level_state
     -- Enemy Shot Info (4 shots)
     for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_segments[i].value) end
     for i = 1, 4 do table.insert(data, enemies_state.shot_positions[i]) end
-    for i = 1, 4 do table.insert(data, enemies_state.enemy_shot_lsb[i]) end
 
     -- Enemy Flags (7 enemies)
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_moving_away[i]) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_can_shoot[i]) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_split_behavior[i]) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_core_type[i]) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_direction_moving[i]) end
-    for i = 1, 7 do table.insert(data, enemies_state.enemy_between_segments[i]) end
+    -- for i = 1, 7 do table.insert(data, enemies_state.enemy_moving_away[i]) end
+    -- for i = 1, 7 do table.insert(data, enemies_state.enemy_can_shoot[i]) end
+    -- for i = 1, 7 do table.insert(data, enemies_state.enemy_split_behavior[i]) end
+    -- for i = 1, 7 do table.insert(data, enemies_state.enemy_core_type[i]) end
+    -- for i = 1, 7 do table.insert(data, enemies_state.enemy_direction_moving[i]) end
+    -- for i = 1, 7 do table.insert(data, enemies_state.enemy_between_segments[i]) end
 
     -- Per-Segment Flags (16 segments)
-    for i = 1, 16 do table.insert(data, enemies_state.charging_fuseball_segments[i]) end
-    for i = 1, 16 do table.insert(data, enemies_state.pulsar_lanes[i]) end
+    -- for i = 1, 16 do table.insert(data, enemies_state.charging_fuseball_segments[i]) end
+    -- for i = 1, 16 do table.insert(data, enemies_state.pulsar_lanes[i]) end
 
     -- 5. Pending Spawns (Lookahead)
-    for i = 1, 64 do table.insert(data, enemies_state.pending_seg[i]) end
-    for i = 1, 64 do table.insert(data, enemies_state.pending_vid[i]) end
+    -- for i = 1, 64 do table.insert(data, enemies_state.pending_seg[i]) end
+    -- for i = 1, 64 do table.insert(data, enemies_state.pending_vid[i]) end
 
 
     local num_total_values = #data
