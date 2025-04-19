@@ -110,21 +110,16 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
     if player_state.alive == 1 then
 
-        -- Stronger reward for maintaining lives
-        if player_state.player_lives ~= nil then
-            reward = reward + (player_state.player_lives)
-        end
-
         -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta < 5000 then
-            reward = reward + (score_delta * 5)  -- Amplify score impact
+            reward = reward + (score_delta)  -- Amplify score impact
         end
 
         -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
         if (game_state.gamestate == 0x04) then
             if (player_state.superzapper_active ~= 0) then
-                reward = reward - 250
+                reward = reward - 100
             end
         end
                 
@@ -150,10 +145,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                         else
                             reward = reward + math.abs(player_state.spinner_commanded * 100) 
                         end
-                    end
-
-                    if (shot_pos < 0x80) then
-                        reward = reward - (255 - shot_pos) / 10
                     end
                 end
             end
@@ -240,15 +231,13 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         -- Reward/penalty for being in/out of Pulsar lanes
         local player_abs_segment = player_state.position & 0x0F
         if enemies_state.pulsar_lanes[player_abs_segment + 1] == 1 then
-            reward = reward - 20 -- Penalty for being in a pulsar lane
-        else
-            reward = reward + 10 -- Reward for being in a safe lane
+            reward = reward - 50 -- Penalty for being in a pulsar lane
         end
 
     else -- Player not alive
         -- Major penalty for death to prioritize survival, equal to the cost of a bonus life in points
         if previous_alive_state == 1 then
-            reward = reward - 2500 * 5
+            reward = reward - 2500
             bDone = true
         end
     end
