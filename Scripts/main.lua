@@ -219,6 +219,8 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     reward = reward + (10 - segment_distance) -- Proximity reward
                     if desired_spinner * player_state.spinner_commanded < 0 then -- Movement penalty
                         reward = reward - 50
+                    elseif desired_spinner * player_state.spinner_commanded > 0 then -- Moving in the correct direction
+                        reward = reward + 150 -- Significant bonus for correct spinner action
                     end
                 end
                 
