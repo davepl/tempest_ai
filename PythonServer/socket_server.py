@@ -42,17 +42,17 @@ from aimodel import (
 )
 
 class SocketServer:
-    """Socket-based server to handle multiple clients"""
-    def __init__(self, state_queue=None, action_queue=None, 
-                 metrics=None, main_agent_ref=None, 
-                 host=SERVER_CONFIG.host, port=SERVER_CONFIG.port, shutdown_event=None):
+    """Socket-based server to handle multiple clients (Single Process Version)"""
+    def __init__(self, metrics=None, main_agent_ref=None,
+                 host=SERVER_CONFIG.host, port=SERVER_CONFIG.port,
+                 shutdown_event=None, training_job_queue=None): # Add training_job_queue
         print(f"Initializing SocketServer on {host}:{port}")
         self.host = host
         self.port = port
-        self.state_queue = state_queue # Queue to send states TO inference process
-        self.action_queue = action_queue # Queue to receive actions FROM inference process
-        self.main_agent_ref = main_agent_ref # Reference to main agent for step/target updates
+        # Removed state_queue and action_queue
+        self.main_agent_ref = main_agent_ref # Reference to the single agent
         self.metrics = metrics # Shared metrics object
+        self.training_job_queue = training_job_queue # Queue to signal training thread
         self.running = True
         self.clients = {}  # Dictionary to track active clients (thread objects or None)
         self.client_states = {}  # Dictionary to store per-client state
@@ -91,6 +91,7 @@ class SocketServer:
                     
                     # Initialize client state
                     client_state = {
+                        'socket': client_socket,
                         'address': client_address,
                         'last_state': None,
                         'last_action_idx': None,
@@ -158,6 +159,42 @@ class SocketServer:
         print("[SocketServer] Shutdown requested.")
         self.running = False # Stop accepting new connections
         self.shutdown_event.set() # Signal client threads to stop
+        
+        # --- Forcefully close active client sockets --- 
+        with self.client_lock:
+            client_sockets_to_close = []
+            # Iterate over a copy of items in case the dictionary changes
+            for client_id, thread_or_socket in self.clients.items():
+                # In the single-process model, self.clients holds threads
+                # We need to find the actual socket. Let's assume client_states holds it if thread is alive?
+                # This is a bit messy. Let's refine the client tracking first.
+                # For now, let's assume we need a way to get the socket associated with the client_id.
+                # We'll need to modify handle_client to store the socket reference perhaps.
+                # --- TEMPORARY APPROACH: Requires client_socket stored in client_states ---
+                if client_id in self.client_states:
+                    client_state = self.client_states[client_id]
+                    if 'socket' in client_state:
+                         client_sockets_to_close.append(client_state['socket'])
+
+            print(f"[SocketServer] Attempting to close {len(client_sockets_to_close)} active client sockets...")
+            for sock in client_sockets_to_close:
+                try:
+                    # Shutdown both read/write ends
+                    sock.shutdown(socket.SHUT_RDWR)
+                except (OSError, socket.error) as shut_err:
+                    # Ignore errors if socket is already closed/invalid
+                    # print(f"[SocketServer] Info: Error shutting down socket: {shut_err}") 
+                    pass 
+                finally:
+                    try:
+                        # Ensure close is called
+                        sock.close()
+                    except (OSError, socket.error) as close_err:
+                        # print(f"[SocketServer] Info: Error closing socket: {close_err}")
+                        pass
+        print("[SocketServer] Client socket close attempts complete.")
+        # --- End forceful close --- 
+
         # Closing the server socket is handled in the finally block of start()
         # after threads have been potentially joined/signaled.
 
@@ -425,7 +462,7 @@ class SocketServer:
                     self.metrics.increment_total_controls()
                     
                     # Decide between expert system and DQN
-                    action_idx = None # Initialize action_idx
+                    action_idx = None
                     fire, zap, spinner = 0, 0, 0.0 # Default actions
                     inference_time_ms = 0.0 # Initialize inference time
 
@@ -436,7 +473,11 @@ class SocketServer:
                          effective_ratio, override_active, expert_mode_active, current_epsilon = self.metrics.get_decision_params()
                          
                          # Decide between expert system and DQN based on effective ratio
-                         if random.random() < effective_ratio and not override_active: # Use effective ratio
+                         # Also check epsilon for exploration during DQN choice
+                         use_expert = random.random() < effective_ratio and not override_active
+                         explore = random.random() < current_epsilon # Check for epsilon-greedy exploration
+
+                         if use_expert:
                               # --- Use expert system (No change here) ---
                               start_expert_time = time.time()
                               fire, zap, spinner = get_expert_action(
@@ -448,60 +489,38 @@ class SocketServer:
                               self.metrics.update_action_source("expert")
                               self.metrics.update_expert_inference_time(expert_time_ms)
                               # --- End Expert System ---
+                         elif explore:
+                              # --- Epsilon-Greedy Exploration --- 
+                              self.metrics.update_action_source("explore")
+                              action_idx = random.randrange(self.main_agent_ref.action_size)
+                              fire, zap, spinner = ACTION_MAPPING[action_idx]
+                              # No specific inference time for random action
+                              # print(f"[Explore Action] Client {client_id}: Chose Index={action_idx}") # Optional log
+                              # --- End Exploration ---
                          else:
-                              # --- Use Inference Worker via Queues ---
+                              # --- Use DQN Agent Directly ---
                               start_dqn_time = time.time()
                               self.metrics.update_action_source("dqn")
                               
-                              # 1. Send state to inference worker
-                              try:
-                                   self.state_queue.put(frame.state, timeout=0.1) # Timeout if queue full
-                              except Full:
-                                   print(f"Client {client_id}: State queue full, using default action.")
-                                   action_idx = 0
-                                   fire, zap, spinner = ACTION_MAPPING[action_idx]
-                              except Exception as sq_put_e:
-                                   print(f"Client {client_id}: Error putting state in queue: {sq_put_e}. Using default.")
-                                   action_idx = 0
-                                   fire, zap, spinner = ACTION_MAPPING[action_idx]
+                              # Ensure agent is ready and in eval mode for inference
+                              if self.main_agent_ref.is_ready:
+                                  self.main_agent_ref.policy_net.eval() # Set to eval mode
+                                  # Direct call to the agent's act method
+                                  action_idx = self.main_agent_ref.act(frame.state, epsilon=0.0) # Use epsilon=0 for exploitation
                               else:
-                                   # 2. Get action and inference time back (if put succeeded)
-                                   try:
-                                       # Block waiting for result (with timeout)
-                                       # --- This is where we get the inference time ---
-                                       action_idx, inference_time_sec = self.action_queue.get(timeout=1.0)
+                                  print(f"Client {client_id}: Agent not ready, using default action.")
+                                  action_idx = 0 # Default action
 
-                                       # ---> ADD THIS LINE HERE <---
-                                       # ---> MOVE add_inference_time to after sendall <---
-                                       # if self.metrics:
-                                       #      self.metrics.add_inference_time(inference_time_sec)
+                              # Get action details
+                              fire, zap, spinner = ACTION_MAPPING[action_idx]
 
-                                       # --- Continue processing ---
-                                       inference_time_ms = inference_time_sec * 1000
-                                       # We already added the raw time, update_dqn_inference_time calculates average over interval, which is redundant here
-                                       # self.metrics.update_dqn_inference_time(inference_time_ms) # Remove this redundant call if it exists
+                              # Calculate inference time
+                              inference_time_sec = time.time() - start_dqn_time
+                              inference_time_ms = inference_time_sec * 1000
 
-                                       # Get fire, zap, spinner from action_idx
-                                       if action_idx is not None and action_idx in ACTION_MAPPING:
-                                           fire, zap, spinner = ACTION_MAPPING[action_idx]
-                                           # ---> Add log for DQN action choice <---                                    
-                                           print(f"[DQN Action] Client {client_id}: Chose Index={action_idx} -> Fire={fire}, Zap={zap}, Spinner={spinner:.2f}")
-                                       else:
-                                           print(f"Client {client_id}: Invalid action_idx {action_idx} from queue. Using default.")
-                                           action_idx = 0
-                                           fire, zap, spinner = ACTION_MAPPING[action_idx]
+                              self.metrics.add_inference_time(inference_time_sec)
 
-                                   except Empty:
-                                       print(f"Client {client_id}: Timeout waiting for action from inference worker. Using default.")
-                                       action_idx = 0
-                                       fire, zap, spinner = ACTION_MAPPING[action_idx]
-                                   except Exception as aq_get_e:
-                                       print(f"Client {client_id}: Error getting action from queue: {aq_get_e}. Using default.")
-                                       action_idx = 0
-                                       fire, zap, spinner = ACTION_MAPPING[action_idx]
-                                       traceback.print_exc()
-
-                              # --- End Inference Worker via Queues --- 
+                              # --- End DQN Agent --- 
                     else:
                          # Handle case where main_agent_ref might be None (though unlikely now)
                          print(f"Client {client_id}: Main agent reference not available for action generation.")
@@ -567,12 +586,14 @@ class SocketServer:
                          self.metrics.add_inference_time(inference_time_sec)
                     # --- End Post-Send Updates ---
 
-                    # Use main_agent_ref for target network update
-                    current_frame = self.metrics.frame_count # Use metrics frame count
-                    if client_id == 0 and hasattr(self, 'main_agent_ref') and self.main_agent_ref and current_frame % RL_CONFIG.decay_epsilon_frames == 0:
-                        self.main_agent_ref.update_target_network()
-
-                    # Periodic model saving is handled by training worker or main process shutdown
+                    # ---> Trigger training thread periodically <--- 
+                    if current_frame % RL_CONFIG.train_freq == 0:
+                        try:
+                            # Send a signal (e.g., True) to the training queue
+                            self.training_job_queue.put(True, block=False)
+                        except Full:
+                            # print("[SocketServer] Training job queue full, skipping trigger.") # Optional log
+                            pass
 
                 except (BlockingIOError, InterruptedError):
                     # Expected with non-blocking socket, short sleep prevents busy-waiting

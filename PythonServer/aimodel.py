@@ -204,17 +204,13 @@ class ReplayMemory:
 class DQN(nn.Module):
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, 256)
-        self.fc4 = nn.Linear(256, 128)
-        self.out = nn.Linear(128, action_size)
+        self.fc1 = nn.Linear(state_size, 256)
+        self.fc2 = nn.Linear(256, 64)
+        self.out = nn.Linear(64, action_size)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
         return self.out(x)
 
 
@@ -268,7 +264,7 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
         self.loss_fn = nn.SmoothL1Loss()
 
-        print("[DQNAgent] Initialized. Training will be handled externally.")
+        print("[DQNAgent] Initialized.")
         self.is_ready = True
 
     def train_step(self, batch):
@@ -280,13 +276,13 @@ class DQNAgent:
         try:
             states_np, actions_np, rewards_np, next_states_np, dones_np = batch
         except ValueError as e:
-             print(f"[DQNAgent Error] Failed to unpack batch: {e}. Batch type: {type(batch)}") 
+             print(f"[DQNAgent Error] Failed to unpack batch: {e}. Batch type: {type(batch)}")
              return None # Cannot proceed if batch is malformed
 
         # Convert NumPy arrays to tensors and move to the configured device
         try:
             states = torch.tensor(states_np, dtype=torch.float32).to(self.device)
-            
+
             # Actions need to be [batch_size, 1] for gather
             actions = torch.tensor(actions_np, dtype=torch.int64).to(self.device)
             # --> Explicitly reshape/squeeze to ensure [batch_size, 1] <--
@@ -300,9 +296,9 @@ class DQNAgent:
 
             rewards = torch.tensor(rewards_np, dtype=torch.float32).to(self.device)
             if rewards.ndim == 1: rewards = rewards.unsqueeze(-1)
-                
+
             next_states = torch.tensor(next_states_np, dtype=torch.float32).to(self.device)
-            
+
             # Ensure dones are boolean and correct shape
             dones = torch.tensor(dones_np.astype(np.bool_), dtype=torch.bool).to(self.device)
             if dones.ndim == 1: dones = dones.unsqueeze(-1)
@@ -313,10 +309,14 @@ class DQNAgent:
              return None
 
         # --- Q-value prediction and target calculation ---
+        # Ensure policy net is in training mode
+        self.policy_net.train()
+
         # Get current Q values from policy network
         current_q_values = self.policy_net(states).gather(1, actions)
 
         # Get next Q values from target network
+        # Target net should remain in eval mode, used within no_grad context
         with torch.no_grad(): # No gradients needed for target calculation
             next_q_values = self.target_net(next_states).max(1)[0].unsqueeze(-1)
             # Zero out Q values for terminal states
@@ -350,9 +350,10 @@ class DQNAgent:
         else:
             # Exploit
             state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            self.policy_net.eval()
             with torch.no_grad():
                 q_values = self.policy_net(state)
-                print(f"[DQN Q-Values]: {q_values.cpu().numpy()}") 
+                # print(f"[DQN Q-Values]: {q_values.cpu().numpy()}")
             return q_values.max(1)[1].item() # Return action index
 
     def step(self, state, action, reward, next_state, done):
@@ -413,7 +414,7 @@ class DQNAgent:
 
             # 3. Atomically replace the target file with the temporary file
             os.replace(tmp_filename, filename)
-            print(f"[DQNAgent] Model saved successfully to '{filename}'")
+            # print(f"[DQNAgent] Model saved successfully to '{filename}'") # Commented out
             return True # Indicate success
 
         except Exception as e:
@@ -455,12 +456,13 @@ class DQNAgent:
                  print("[DQNAgent Warning] Optimizer state not found in checkpoint, optimizer not loaded.")
             
             self.target_net.eval() # Ensure target net is in eval mode
-            print(f"[DQNAgent] Model weights loaded from {filename}")
+            # print(f"[DQNAgent] Model weights loaded from {filename}") # Commented out
             
             # Load metrics state if present
             loaded_metrics_state = checkpoint.get('metrics_state', None)
             if loaded_metrics_state:
-                 print(f"[DQNAgent] Found metrics state in checkpoint.")
+                 # print(f"[DQNAgent] Found metrics state in checkpoint.") # Commented out
+                 pass # Keep structure
                  
             self.is_ready = True # <-- Set ready flag only on SUCCESSFUL load
             return True, loaded_metrics_state # Return success=True, metrics_state (or None)

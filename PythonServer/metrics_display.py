@@ -177,7 +177,7 @@ def run_stats_reporter(metrics_obj, shutdown_event: Union[threading.Event, mp.Ev
     global row_counter
     print(f"[StatsReporter] Starting stats reporter thread. Logging to: {LOG_FILE_PATH.resolve()}")
     last_report_time = time.time()
-    report_interval = 60.0 # Default 10.0 * 3
+    report_interval = 10.0  
 
     # --- Variables for FPS calculation (ideally should be in Metrics class) ---
     last_fps_update_time = time.time()
