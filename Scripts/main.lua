@@ -200,7 +200,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
                 -- Check alignment based on actual segment distance
                 if segment_distance == 0 then 
-                    reward = reward + 500
+                    reward = reward + 250
                     if player_state.shot_count > 0 then
                         reward = reward + 100
                     end
@@ -210,7 +210,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                         -- Check depth separately using the stored enemy_depth
                         if (enemy_depth <= 0x20) then 
                             if player_state.fire_commanded ~= 0 then
-                                reward = reward + 250
+                                rewardq = reward + 250
                             else
                                 reward = reward - 50
                             end
