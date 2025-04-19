@@ -200,7 +200,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
                 -- Check alignment based on actual segment distance
                 if segment_distance == 0 then 
-                    reward = reward + 250
+                    reward = reward + 500
                     if player_state.shot_count > 0 then
                         reward = reward + 100
                     end
@@ -216,7 +216,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                             end
                         end
                     end
-                    reward = reward + (10 - segment_distance) -- Proximity reward
+                    reward = reward + (8 - segment_distance) * 25 -- Scaled Proximity Reward
                     if desired_spinner * player_state.spinner_commanded < 0 then -- Movement penalty
                         reward = reward - 50
                     elseif desired_spinner * player_state.spinner_commanded > 0 then -- Moving in the correct direction

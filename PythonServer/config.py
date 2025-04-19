@@ -67,7 +67,7 @@ class RLConfigData:
     epsilon_min: float = 0.001
     epsilon_decay_rate: float = 0.995
     decay_epsilon_frames: int = 100000
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     memory_size: int = 200000
     save_interval: int = 500000
     save_interval_seconds: int = 300
