@@ -157,37 +157,14 @@ class SocketServer:
     def shutdown(self):
         """Initiates the server shutdown sequence."""
         print("[SocketServer] Shutdown requested.")
-        self.running = False  # Stop accepting new connections in start() loop
-        self.shutdown_event.set() # Signal client threads to stop
         
-        # --- Forcefully close active client sockets --- 
-        with self.client_lock:
-            sockets_to_close = [
-                state['socket'] for state in self.client_states.values() if 'socket' in state
-            ]
-
-            print(f"[SocketServer] Attempting to close {len(sockets_to_close)} active client sockets...")
-            for sock in sockets_to_close:
-                try:
-                    # Shutdown both read/write ends
-                    sock.shutdown(socket.SHUT_RDWR)
-                except (OSError, socket.error) as shut_err:
-                    # Ignore errors if socket is already closed/invalid
-                    # print(f"[SocketServer] Info: Error shutting down socket: {shut_err}") 
-                    pass 
-                finally:
-                    try:
-                        # Ensure close is called
-                        sock.close()
-                    except (OSError, socket.error) as close_err:
-                        # print(f"[SocketServer] Info: Error closing socket: {close_err}")
-                        pass
-        print("[SocketServer] Client socket close attempts complete.")
-        # --- End forceful close --- 
-
-        # Closing the server socket is handled in the finally block of start()
-        # after threads have been potentially joined/signaled.
-
+        # 1. Signal threads to stop
+        self.running = False
+        self.shutdown_event.set()
+        
+        # 2. Brief pause to allow threads to potentially exit gracefully
+        time.sleep(0.1)
+        
     def cleanup_all_clients(self):
         """Clean up all client threads and resources"""
         with self.client_lock:

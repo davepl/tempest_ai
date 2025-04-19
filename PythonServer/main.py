@@ -362,6 +362,7 @@ def main():
 
         # ---> Perform Final Save BEFORE joining threads <--- 
         print("[Main] Performing final save...") # Shortened message
+        sys.stdout.flush() # Ensure this is printed before potential hang
         if 'main_agent' in locals() and main_agent.is_ready:
             try:
                  with save_lock:
