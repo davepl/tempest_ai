@@ -302,11 +302,10 @@ def main():
                     try:
                         # Acquire lock for saving
                         with save_lock:
-                            with metrics.lock:
-                                metrics_state_to_save = metrics.get_state_for_save()
-                            # Call save on the single main_agent
-                            main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
-                            # DQNAgent.save prints its own success/failure message
+                            print("[Main DEBUG] Acquired save_lock. Calling main_agent.save() without metrics...")
+                            # Save agent state only, skip metrics during final shutdown save for stability
+                            main_agent.save(LATEST_MODEL_PATH, metrics_state=None)
+                            print("[Main DEBUG] main_agent.save() completed. Releasing save_lock.")
                     except Exception as save_err:
                         print(f"[Main Error] Failed manual save: {save_err}")
                         traceback.print_exc()
@@ -362,12 +361,12 @@ def main():
         print("[Main] Performing final save of agent and metrics...")
         if 'main_agent' in locals() and main_agent.is_ready:
             try:
-                 # Use lock for final save
+                 print("[Main DEBUG] Attempting to acquire save_lock...")
                  with save_lock:
-                     with metrics.lock:
-                         metrics_state_to_save = metrics.get_state_for_save()
-                     # print("[Main Final Save] Calling agent.save()...") # Commented out
-                     main_agent.save(LATEST_MODEL_PATH, metrics_state=metrics_state_to_save)
+                     print("[Main DEBUG] Acquired save_lock. Calling main_agent.save() without metrics...")
+                     # Save agent state only, skip metrics during final shutdown save for stability
+                     main_agent.save(LATEST_MODEL_PATH, metrics_state=None)
+                     print("[Main DEBUG] main_agent.save() completed. Releasing save_lock.")
             except Exception as final_save_err:
                  print(f"[Main Error] Failed final save: {final_save_err}")
                  traceback.print_exc()
@@ -375,21 +374,23 @@ def main():
             print("[Main] Final save skipped (Agent not found or not ready).")
         # ---> End Final Save <--- 
 
-        # Wait for essential threads
-        print("[Main] Waiting for essential threads...")
-        if 'training_thread' in locals() and training_thread.is_alive(): training_thread.join(timeout=3.0)
-        if 'stats_thread' in locals() and stats_thread is not None and stats_thread.is_alive(): stats_thread.join(timeout=2.0)
-        # Server thread should be joined by socket_server.shutdown() implicitly or main exit
+        # Wait for essential threads - Removing join for daemon threads
+        print("[Main] Signaling essential threads to exit (if not already). Relying on daemon status for cleanup.")
+        # if 'training_thread' in locals() and training_thread.is_alive(): training_thread.join(timeout=3.0) # Commented out
+        # if 'stats_thread' in locals() and stats_thread is not None and stats_thread.is_alive(): stats_thread.join(timeout=2.0) # Commented out
+        # Server thread should exit after socket_server.shutdown() / socket close
 
-        # Ensure server socket is closed (if not already)
-        if hasattr(socket_server, 'server_socket') and socket_server.server_socket:
-            try:
-                socket_server.server_socket.close()
-                print("[Main] Server socket closed.")
-            except Exception as sock_err:
-                 print(f"[Main Error] Error closing server socket: {sock_err}")
+        # Ensure server socket is closed (if not already) - COMMENTING OUT (redundant)
+        # if hasattr(socket_server, 'server_socket') and socket_server.server_socket:
+        #     try:
+        #         socket_server.server_socket.close()
+        #         print("[Main] Server socket closed.")
+        #     except Exception as sock_err:
+        #          print(f"[Main Error] Error closing server socket: {sock_err}")
 
         print("[Main] Shutdown complete.")
+        sys.stdout.flush() # Explicitly flush output
+        sys.stderr.flush()
         sys.exit(0) # Explicit exit
 
 if __name__ == "__main__":

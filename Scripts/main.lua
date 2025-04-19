@@ -29,7 +29,7 @@
 --]]
 
 -- Define the server address as a global variable
-local SERVER_ADDRESS = "socket.m2macpro:9999"
+local SERVER_ADDRESS = "socket.ubdellamd:9999"
 
 -- Get the directory of the current script
 local script_path = debug.getinfo(1,"S").source:match("@?(.*[/\\])")
