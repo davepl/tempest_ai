@@ -44,8 +44,8 @@ def training_loop(training_job_queue: Queue, agent: DQNAgent, metrics_obj, shutd
     print("[TrainingThread] Starting...")
     try:
         # Limit PyTorch CPU threads for *this specific thread*
-        torch.set_num_threads(8)
-        print("[TrainingThread] Set torch num_threads=1")
+        # torch.set_num_threads(8)
+        print("[TrainingThread] Set torch num_threads=any")
     except Exception as thread_err:
         print(f"[TrainingThread Warning] Failed to set torch threads: {thread_err}")
         
@@ -281,7 +281,7 @@ def main():
                     print(f"[Main] Frame {current_frame_count}: Skipped target update (Agent not ready).")
 
 
-            # --- Optional Periodic Save (less critical now trainer saves) ---
+            # --- Optional Periodic Save (less critical now trainer saves) --- REMOVING BLOCK
             # Keep manual save via 's' key
             # if RL_CONFIG.save_interval > 0 and current_frame_count // RL_CONFIG.save_interval > last_save_frame // RL_CONFIG.save_interval:
             #      if main_agent.is_ready:
@@ -351,22 +351,19 @@ def main():
         print("[Main] Entering shutdown sequence...")
         if kb_handler:
             kb_handler.restore_terminal()
-            print("[Main] Terminal restored.")
+            # print("[Main] Terminal restored.") # Less critical message
 
         # Ensure shutdown event is set
         shutdown_event.set()
-        print("[Main] Shutdown event confirmed set.")
+        # print("[Main] Shutdown event confirmed set.") # Less critical message
 
         # ---> Perform Final Save BEFORE joining threads <--- 
-        print("[Main] Performing final save of agent and metrics...")
+        print("[Main] Performing final save...") # Shortened message
         if 'main_agent' in locals() and main_agent.is_ready:
             try:
-                 print("[Main DEBUG] Attempting to acquire save_lock...")
                  with save_lock:
-                     print("[Main DEBUG] Acquired save_lock. Calling main_agent.save() without metrics...")
                      # Save agent state only, skip metrics during final shutdown save for stability
                      main_agent.save(LATEST_MODEL_PATH, metrics_state=None)
-                     print("[Main DEBUG] main_agent.save() completed. Releasing save_lock.")
             except Exception as final_save_err:
                  print(f"[Main Error] Failed final save: {final_save_err}")
                  traceback.print_exc()
@@ -374,19 +371,10 @@ def main():
             print("[Main] Final save skipped (Agent not found or not ready).")
         # ---> End Final Save <--- 
 
-        # Wait for essential threads - Removing join for daemon threads
-        print("[Main] Signaling essential threads to exit (if not already). Relying on daemon status for cleanup.")
-        # if 'training_thread' in locals() and training_thread.is_alive(): training_thread.join(timeout=3.0) # Commented out
-        # if 'stats_thread' in locals() and stats_thread is not None and stats_thread.is_alive(): stats_thread.join(timeout=2.0) # Commented out
-        # Server thread should exit after socket_server.shutdown() / socket close
-
-        # Ensure server socket is closed (if not already) - COMMENTING OUT (redundant)
-        # if hasattr(socket_server, 'server_socket') and socket_server.server_socket:
-        #     try:
-        #         socket_server.server_socket.close()
-        #         print("[Main] Server socket closed.")
-        #     except Exception as sock_err:
-        #          print(f"[Main Error] Error closing server socket: {sock_err}")
+        # Daemon threads should exit automatically after main thread finishes.
+        # No explicit joins needed here.
+        
+        # Server socket closure is handled by the SocketServer thread's finally block.
 
         print("[Main] Shutdown complete.")
         sys.stdout.flush() # Explicitly flush output

@@ -237,27 +237,7 @@ class DQNAgent:
         self.policy_net = DQN(state_size, action_size).to(self.device)
         self.target_net = DQN(state_size, action_size).to(self.device)
 
-        # --- Compile the models (PyTorch 2.0+) ---
-        try:
-            # Check if torch.compile is available
-            if hasattr(torch, 'compile'):
-                # Now self.device is a torch.device object, so .type works
-                if self.device.type != 'mps': # <<< THIS CHECK IS NOW VALID
-                    print("[DQNAgent] Attempting torch.compile() (Device is not MPS)...")
-                    self.policy_net = torch.compile(self.policy_net)
-                    self.target_net = torch.compile(self.target_net)
-                    print("[DQNAgent] torch.compile() applied successfully.")
-                else:
-                    print("[DQNAgent] Skipping torch.compile() because device is MPS.")
-            else:
-                 print("[DQNAgent] torch.compile() not available in this PyTorch version.")
-        except Exception as compile_err:
-             print(f"[DQNAgent Warning] torch.compile() failed: {compile_err}")
-             # Optional: Add traceback for compile errors if needed
-             # traceback.print_exc()
-        # --- End Compile ---
-
-        # Load state AFTER compiling policy net
+        # Load target state dict directly after initializing networks
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -332,8 +312,6 @@ class DQNAgent:
         # Optimize the model
         self.optimizer.zero_grad()
         loss.backward()
-        # Optional: Gradient clipping
-        # torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
         self.optimizer.step()
 
         return loss # Return the calculated loss tensor
@@ -358,10 +336,6 @@ class DQNAgent:
 
     def step(self, state, action, reward, next_state, done):
         """Store experience in replay memory."""
-        # Reward scaling/clipping can be done here before pushing
-        # reward = np.sign(reward) # Example: clipping reward
-        # reward = reward / 1000.0 # Example: scaling reward
-        
         self.memory.push(state, action, reward, next_state, done)
         # Note: Removed the trigger to put data in train_queue
 
@@ -430,9 +404,8 @@ class DQNAgent:
              return False # Indicate failure
 
     def load(self, filename):
-        """Load model weights and return success status and metrics state if available."""
-        # Reset readiness before attempting load
-        self.is_ready = False 
+        """Load model weights and optimizer state. Return success status and metrics state if available."""
+        self.is_ready = False # Reset readiness before attempting load
         if not Path(filename).is_file():
             print(f"[DQNAgent] Model file not found at {filename}. Cannot load.")
             return False, None # Return success=False, metrics=None

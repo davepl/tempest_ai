@@ -36,7 +36,7 @@ local script_path = debug.getinfo(1,"S").source:match("@?(.*[/\\])")
 if script_path then
   -- Prepend the script's directory to package.path
   package.path = script_path .. "?.lua;" .. package.path
-  print("Added script directory to package.path: " .. script_path)
+  -- print("Added script directory to package.path: " .. script_path)
 else
   print("Warning: Could not determine script directory.")
 end
@@ -84,7 +84,7 @@ local function open_socket()
         
         if result == nil then
             print("Successfully opened socket connection to " .. SERVER_ADDRESS) 
-            -- Send initial 4-byte ping for handshake
+            -- Send initial 2-byte ping for handshake
             local ping_data = string.pack(">H", 0)  -- 2-byte integer with value 0
             socket:write(ping_data)
         else
@@ -96,7 +96,7 @@ local function open_socket()
     
     if not socket_success or not socket then
         print("Error opening socket connection: " .. tostring(err or "unknown error"))
-        return false
+        return false -- Indicate failure
     end
     
     return true
@@ -415,10 +415,10 @@ local function frame_callback()
     if game_state.game_mode == 0x80 then
         if game_state.frame_counter % 60 == 0 then
             controls.fire_field:set_value(1)
-            print("Pressing Fire")
+            -- print("Pressing Fire")
         elseif game_state.frame_counter % 60 == 30 then
             controls.fire_field:set_value(0)
-            print("Releasing Fire")
+            -- print("Releasing Fire")
         end
     elseif game_state.gamestate == 0x16 then
         -- Game is in level select mode, advance selection 
@@ -449,7 +449,8 @@ local function frame_callback()
                                    port.fields["Start 1"]
                 
                 if startField then
-                    if game_state.frame_counter % 10 == 0 then
+                    -- Press start every 10 frames if needed
+                    if game_state.frame_counter % 10 == 0 then 
                         startField:set_value(1)
                     elseif game_state.frame_counter % 10 == 5 then
                         startField:set_value(0)
@@ -508,6 +509,7 @@ local function frame_callback()
         -- ADD DEBUG PRINT HERE
         -- Pass LastRewardState for both reward params as 'reward' is local to gameplay block
         Display.update_display(status_message, game_state, level_state, player_state, enemies_state, "N/A", num_values, LastRewardState, total_bytes_sent, LastRewardState) 
+        -- print(string.format("Updated display at frame %d", game_state.frame_counter)) -- Optional debug
         last_display_update = current_time_high_res
     end
 
@@ -538,7 +540,7 @@ end
 
 -- Register callbacks
 print("Registering callbacks with MAME")
-callback_ref = emu.add_machine_frame_notifier(frame_callback)
+emu.add_machine_frame_notifier(frame_callback)
 emu.register_stop(on_mame_exit)
 
 print("Tempest AI Script Initialized.")

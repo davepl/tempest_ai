@@ -396,9 +396,7 @@ ControlState.__index = ControlState
 function ControlState:new()
     local self = setmetatable({}, ControlState)
 
-    -- Get button ports (needs access to manager)
     -- Assuming 'manager' is accessible globally for now
-    print("DEBUG state.lua: Type of 'manager' in ControlState:new() = ", type(manager)) -- Added Debug Print
     self.button_port = manager.machine.ioport.ports[":BUTTONSP1"]
     self.spinner_port = manager.machine.ioport.ports[":KNOBP1"]
     
@@ -411,17 +409,6 @@ function ControlState:new()
     self.fire_commanded = 0
     self.zap_commanded = 0
     
-    -- Keep validation prints for now
-    print("Button port found: " .. (self.button_port and "Yes" or "No"))
-    if self.button_port then
-        print("  Fire field found: " .. (self.fire_field and "Yes" or "No"))
-        print("  Zap field found: " .. (self.zap_field and "Yes" or "No"))
-    end
-    print("Spinner port found: " .. (self.spinner_port and "Yes" or "No"))
-    if self.spinner_port then
-        print("  Dial field found: " .. (self.spinner_field and "Yes" or "No"))
-    end
-
     return self
 end
 

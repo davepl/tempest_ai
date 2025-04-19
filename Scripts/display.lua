@@ -270,15 +270,16 @@ function Display.update_display(status, game_state, level_state, player_state, e
     print(table.concat(pending_vid_lines, "\n"))
     print(" ")
     print("  Pending SEG   : ")
-    local pending_seg_lines = {}
-    for i = 1, 64, 16 do
-        local line = {}
-        for j = 0, 15 do
-            table.insert(line, format_segment(enemies_state.pending_seg[i + j]) .. " ")
-        end
-        table.insert(pending_seg_lines, "  " .. table.concat(line))
-    end
-    print(table.concat(pending_seg_lines, "\n"))
+    -- Removing Pending SEG display as it's less useful than VID and clutters
+    -- local pending_seg_lines = {}
+    -- for i = 1, 64, 16 do
+    --     local line = {}
+    --     for j = 0, 15 do
+    --         table.insert(line, format_segment(enemies_state.pending_seg[i + j]) .. " ")
+    --     end
+    --     table.insert(pending_seg_lines, "  " .. table.concat(line))
+    -- end
+    -- print(table.concat(pending_seg_lines, "\n"))
 end
 
 return Display 

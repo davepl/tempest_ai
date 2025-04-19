@@ -54,8 +54,8 @@ class SocketServer:
         self.metrics = metrics # Shared metrics object
         self.training_job_queue = training_job_queue # Queue to signal training thread
         self.running = True
-        self.clients = {}  # Dictionary to track active clients (thread objects or None)
-        self.client_states = {}  # Dictionary to store per-client state
+        self.clients = {}  # Stores client thread objects: { client_id: Thread }
+        self.client_states = {}  # Stores client state: { client_id: { ... state ... } }
         self.client_lock = threading.Lock()  # Lock for client dictionaries
         self.shutdown_event = shutdown_event  # Event to signal shutdown to client threads
         
@@ -157,27 +157,17 @@ class SocketServer:
     def shutdown(self):
         """Initiates the server shutdown sequence."""
         print("[SocketServer] Shutdown requested.")
-        self.running = False # Stop accepting new connections
+        self.running = False  # Stop accepting new connections in start() loop
         self.shutdown_event.set() # Signal client threads to stop
         
         # --- Forcefully close active client sockets --- 
         with self.client_lock:
-            client_sockets_to_close = []
-            # Iterate over a copy of items in case the dictionary changes
-            for client_id, thread_or_socket in self.clients.items():
-                # In the single-process model, self.clients holds threads
-                # We need to find the actual socket. Let's assume client_states holds it if thread is alive?
-                # This is a bit messy. Let's refine the client tracking first.
-                # For now, let's assume we need a way to get the socket associated with the client_id.
-                # We'll need to modify handle_client to store the socket reference perhaps.
-                # --- TEMPORARY APPROACH: Requires client_socket stored in client_states ---
-                if client_id in self.client_states:
-                    client_state = self.client_states[client_id]
-                    if 'socket' in client_state:
-                         client_sockets_to_close.append(client_state['socket'])
+            sockets_to_close = [
+                state['socket'] for state in self.client_states.values() if 'socket' in state
+            ]
 
-            print(f"[SocketServer] Attempting to close {len(client_sockets_to_close)} active client sockets...")
-            for sock in client_sockets_to_close:
+            print(f"[SocketServer] Attempting to close {len(sockets_to_close)} active client sockets...")
+            for sock in sockets_to_close:
                 try:
                     # Shutdown both read/write ends
                     sock.shutdown(socket.SHUT_RDWR)
@@ -492,10 +482,10 @@ class SocketServer:
                          elif explore:
                               # --- Epsilon-Greedy Exploration --- 
                               self.metrics.update_action_source("explore")
+                              # print(f"[Explore Action] Client {client_id}: Chose Index={action_idx}") # Optional log
                               action_idx = random.randrange(self.main_agent_ref.action_size)
                               fire, zap, spinner = ACTION_MAPPING[action_idx]
                               # No specific inference time for random action
-                              # print(f"[Explore Action] Client {client_id}: Chose Index={action_idx}") # Optional log
                               # --- End Exploration ---
                          else:
                               # --- Use DQN Agent Directly ---
@@ -567,16 +557,16 @@ class SocketServer:
                                     last_action_tuple = self.client_states[client_id].get('last_action')
                             
                             # Debug print for replay buffer commits
-                            if last_action_tuple is not None:
-                                last_fire, last_zap, last_spinner = last_action_tuple
-                                # print(f"[ReplayAdd] Client {client_id}: Adding experience - Action={last_action_idx_for_step}, Fire={last_fire}, Zap={last_zap}, Spinner={last_spinner:+0.2f}, Reward={frame.reward:.1f}")
+                            # if last_action_tuple is not None:
+                            #     last_fire, last_zap, last_spinner = last_action_tuple
+                            #     # print(f"[ReplayAdd] Client {client_id}: Adding experience - Action={last_action_idx_for_step}, Fire={last_fire}, Zap={last_zap}, Spinner={last_spinner:+0.2f}, Reward={frame.reward:.1f}")
                             
                             self.main_agent_ref.step(
-                                last_state_for_step,
+                                last_state_for_step, # Previous state
                                 np.array([[last_action_idx_for_step]]),
-                                frame.reward,
-                                frame.state,
-                                frame.done
+                                frame.reward, # Reward received AFTER taking action
+                                frame.state, # State observed AFTER taking action (s')
+                                frame.done # Whether s' is terminal
                             )
                         else:
                              print(f"Client {client_id}: Agent not available for step (post-send).")
@@ -589,11 +579,9 @@ class SocketServer:
                     # ---> Trigger training thread periodically <--- 
                     if current_frame % RL_CONFIG.train_freq == 0:
                         try:
-                            # Send a signal (e.g., True) to the training queue
-                            self.training_job_queue.put(True, block=False)
+                            self.training_job_queue.put(True, block=False) # Signal trainer
                         except Full:
-                            # print("[SocketServer] Training job queue full, skipping trigger.") # Optional log
-                            pass
+                            pass # Ignore if queue is full, trainer is busy
 
                 except (BlockingIOError, InterruptedError):
                     # Expected with non-blocking socket, short sleep prevents busy-waiting
