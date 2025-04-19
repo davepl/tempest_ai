@@ -44,7 +44,7 @@ def training_loop(training_job_queue: Queue, agent: DQNAgent, metrics_obj, shutd
     print("[TrainingThread] Starting...")
     try:
         # Limit PyTorch CPU threads for *this specific thread*
-        torch.set_num_threads(8)
+        torch.set_num_threads(2)
         print("[TrainingThread] Set torch num_threads=1")
     except Exception as thread_err:
         print(f"[TrainingThread Warning] Failed to set torch threads: {thread_err}")
