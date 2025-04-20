@@ -185,7 +185,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             local enemy_depth = enemies_state.nearest_enemy_depth_raw -- Get stored depth
 
             -- Check if nearest_abs_seg is valid before proceeding (-1 means none found)
-            if nearest_abs_seg ~= -1 then 
+            if nearest_abs_seg >= 0 then 
                  -- Calculate desired spinner and segment distance using ABSOLUTE segments
                 local desired_spinner, segment_distance = SegmentUtils.calculate_direction_intensity(player_segment, nearest_abs_seg, level_state.is_open_level)
 
@@ -195,31 +195,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     if player_state.shot_count > 0 then
                         reward = reward + 100
                     end
-                else 
-                    -- MISALIGNED CASE 
-                    if (segment_distance < 2) then 
-                        -- Check depth separately using the stored enemy_depth
-                        if (enemy_depth <= 0x20) then 
-                            if player_state.fire_commanded ~= 0 then
-                                reward = reward + 250
-                            else
-                                reward = reward - 50
-                            end
-                        end
-                    end
-                    reward = reward + (8 - segment_distance) * 10 -- Scaled Proximity Reward
-                    if desired_spinner * player_state.spinner_commanded < 0 then -- Movement penalty
-                        reward = reward - 50
-                    elseif desired_spinner ~= 0 and player_state.spinner_commanded == 0 then -- Inaction penalty when misaligned
-                        reward = reward - 25 -- Reduced inaction penalty
-                    end
-                end
-                
-                -- Encourage maintaining shots in reserve (outside alignment check)
-                if player_state.shot_count < 2 or player_state.shot_count > 7 then
-                    reward = reward - 20
-                elseif player_state.shot_count >= 5 then
-                    reward = reward + 20
                 end
             else
                  -- Handle case where nearest_abs_seg might be -1 (e.g., if enemy just died)
@@ -228,6 +203,13 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             end
         end
 
+        -- Encourage maintaining shots in reserve (outside alignment check)
+        if player_state.shot_count < 2 or player_state.shot_count > 7 then
+            reward = reward - 20
+        elseif player_state.shot_count >= 5 then
+            reward = reward + 20
+        end
+        
         -- Reward/penalty for being in/out of Pulsar lanes
         local player_abs_segment = player_state.position & 0x0F
         if enemies_state.pulsar_lanes[player_abs_segment + 1] == 1 then
