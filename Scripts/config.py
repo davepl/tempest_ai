@@ -51,9 +51,9 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_min: float = 0.001
-    epsilon_decay: int = 10000
+    epsilon_decay: int = 217147
     update_target_every: int = 500
-    learning_rate: float = 0.0001
+    learning_rate: float = 0.001
     memory_size: int = 200000
     save_interval: int = 50000
     train_freq: int = 4
