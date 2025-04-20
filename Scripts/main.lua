@@ -213,7 +213,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
                 if valid_dodge then
                     -- Reward successful dodge attempt, proportional to speed
-                    reward = reward + math.abs(commanded_spinner) * 20
+                    reward = reward + math.abs(commanded_spinner) * 200
                 -- else
                     -- Optional: Penalize attempting to move off edge?
                 end
@@ -221,7 +221,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
         -- *** End Combined Threat Dodging Logic ***
 
-        if target_segment < 0 or game_state.gamestate == 0x20 then
+    if game_state.gamestate == 0x20 then    -- In tube zoom
+        -- Award bonus based on how short the spike in this lane is
+        reward = reward + 50 - (level_state.spike_heights[player_segment] / 5)
+    elseif target_segment < 0 then
             -- No enemies: reward staying still more strongly
             -- Use commanded_spinner here to check if model *intended* to stay still
             reward = reward + (commanded_spinner == 0 and 150 or -20)

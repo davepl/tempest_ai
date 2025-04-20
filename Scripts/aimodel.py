@@ -96,7 +96,8 @@ from config import (
     ACTION_MAPPING,
     metrics as config_metrics,
     ServerConfigData,
-    RLConfigData
+    RLConfigData,
+    RESET_METRICS
 )
 
 # Suppress warnings
@@ -330,7 +331,8 @@ class DQNAgent:
                 'epsilon': metrics.epsilon,
                 'frame_count': metrics.frame_count,
                 'expert_ratio': metrics.expert_ratio,
-                'last_decay_step': metrics.last_decay_step
+                'last_decay_step': metrics.last_decay_step,
+                'last_epsilon_decay_step': metrics.last_epsilon_decay_step
             }, filename)
             
             # Update last save time ONLY on successful save
@@ -353,9 +355,19 @@ class DQNAgent:
                 
                 # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
-                metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
-                metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
-                metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
+                # Load or reset metrics based on RESET_METRICS flag from config
+                if RESET_METRICS:
+                    print("RESET_METRICS flag is True. Resetting epsilon/expert_ratio.")
+                    metrics.epsilon = RL_CONFIG.epsilon_start
+                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                    metrics.last_decay_step = 0
+                    metrics.last_epsilon_decay_step = 0 # Reset epsilon step tracker
+                else:
+                    # Load metrics from checkpoint
+                    metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
+                    metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
+                    metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
+                    metrics.last_epsilon_decay_step = checkpoint.get('last_epsilon_decay_step', 0) # Load epsilon step tracker
                                 
                 print(f"Loaded model from {filename}")
                 print(f"  - Resuming from frame: {metrics.frame_count}")
@@ -744,10 +756,24 @@ def encode_action_to_game(fire, zap, spinner):
     return int(fire), int(zap), int(spinner_val)
 
 def decay_epsilon(frame_count):
-    """Calculate decayed exploration rate"""
-    return max(RL_CONFIG.epsilon_end, 
-               RL_CONFIG.epsilon_start * 
-               np.exp(-frame_count / RL_CONFIG.epsilon_decay))
+    """Calculate decayed exploration rate using step-based decay."""
+    step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
+
+    # Only decay if a new step interval is reached
+    if step_interval > metrics.last_epsilon_decay_step:
+        # Apply decay multiplicatively for the number of steps missed
+        num_steps_to_apply = step_interval - metrics.last_epsilon_decay_step
+        decay_multiplier = RL_CONFIG.epsilon_decay_factor ** num_steps_to_apply
+        metrics.epsilon *= decay_multiplier
+        
+        # Update the last step tracker
+        metrics.last_epsilon_decay_step = step_interval
+
+        # Ensure epsilon doesn't go below the minimum effective exploration rate
+        metrics.epsilon = max(RL_CONFIG.epsilon_end, metrics.epsilon)
+
+    # Always return the current epsilon value (which might have just been decayed)
+    return metrics.epsilon
 
 def decay_expert_ratio(current_step):
     """Update expert ratio based on 10,000 frame intervals"""
