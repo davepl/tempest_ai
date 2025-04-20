@@ -204,7 +204,7 @@ class DQN(nn.Module):
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
     def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma, 
-                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, epsilon_decay=RL_CONFIG.epsilon_decay, 
+                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, 
                  memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
         self.state_size = state_size
         self.action_size = action_size

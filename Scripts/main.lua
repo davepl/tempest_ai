@@ -240,7 +240,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if player_state.fire_commanded then
                     reward = reward + 20
                 end
-                -- REMOVED penalty for movement when aligned; the alignment bonus incentivizes staying put.
+                -- NEW: Penalize moving when already aligned
+                if commanded_spinner ~= 0 then
+                    reward = reward - 20 -- Apply a penalty for unnecessary movement
+                end
             else 
                 -- MISALIGNED CASE (segment_distance > 0)
                 -- Enemies at the top of tube should be shot when close (using segment distance)
