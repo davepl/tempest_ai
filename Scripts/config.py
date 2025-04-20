@@ -54,10 +54,10 @@ class RLConfigData:
     epsilon_decay: int = 10000
     update_target_every: int = 500
     learning_rate: float = 0.0001
-    memory_size: int = 1000000
+    memory_size: int = 200000
     save_interval: int = 50000
     train_freq: int = 4
-    target_update: int = 10000
+    target_update: int = 20000
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()

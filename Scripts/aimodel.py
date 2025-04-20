@@ -329,7 +329,8 @@ class DQNAgent:
                 'memory_size': len(self.memory),
                 'epsilon': metrics.epsilon,
                 'frame_count': metrics.frame_count,
-                'expert_ratio': metrics.expert_ratio
+                'expert_ratio': metrics.expert_ratio,
+                'last_decay_step': metrics.last_decay_step
             }, filename)
             
             # Update last save time ONLY on successful save
@@ -350,14 +351,18 @@ class DQNAgent:
                 self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 
-                # Load frame count and epsilon (for exploration)
-                metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
+                # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
-                
-                # Always set the expert ratio to the start value
-                metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
-                metrics.last_decay_step = 0
-                
+                metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
+                metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
+                metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
+                                
+                print(f"Loaded model from {filename}")
+                print(f"  - Resuming from frame: {metrics.frame_count}")
+                print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
+                print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
+                print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")
+
                 return True
             except Exception as e:
                 print(f"Error loading model: {e}")
