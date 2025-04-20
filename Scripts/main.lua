@@ -128,7 +128,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta < 1000 then
-            reward = reward + (score_delta * 5)  -- Amplify score impact
+            reward = reward + (score_delta)  -- Amplify score impact
         end
 
         -- Level completion bonus removed since it would come after end of the episode
@@ -141,7 +141,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         if (game_state.gamestate == 0x04) then
             if (player_state.superzapper_active ~= 0) then
-                reward = reward - 250
+                reward = reward - 50
             end
         end
                 
@@ -190,7 +190,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         if immediate_threat_in_lane then
             if commanded_spinner == 0 then
                 -- Penalty for not moving when a threat is incoming
-                reward = reward - 100
+                reward = reward - 20
             else
                 -- Player commanded a move. Check if it's a valid dodge.
                 local valid_dodge = false
@@ -213,7 +213,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
                 if valid_dodge then
                     -- Reward successful dodge attempt, proportional to speed
-                    reward = reward + math.abs(commanded_spinner) * 100
+                    reward = reward + math.abs(commanded_spinner) * 20
                 -- else
                     -- Optional: Penalize attempting to move off edge?
                 end
@@ -232,10 +232,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             -- Check alignment based on actual segment distance
             if segment_distance == 0 then 
                 -- Big reward for alignment + firing incentive
-                reward = reward + 250
+                reward = reward + 50
                 -- Bonus for shooting when aligned
                 if player_state.fire_commanded then
-                    reward = reward + 100
+                    reward = reward + 20
                 end
                 -- REMOVED penalty for movement when aligned; the alignment bonus incentivizes staying put.
             else 
@@ -246,10 +246,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     if (enemy_depth <= 0x20) then 
                         if player_state.fire_commanded == 1 then
                             -- Strong reward for firing at close enemies
-                            reward = reward + 250
+                            reward = reward + 50
                         else
                             -- Moderate penalty for not firing at close enemies
-                            reward = reward - 50
+                            reward = reward - 10
                         end
                     end
                 end
@@ -261,16 +261,16 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Penalize if the COMMANDED movement (commanded_spinner) is OPPOSITE to the desired direction.
                 if desired_spinner * commanded_spinner < 0 then
                     -- Strong penalty for moving AWAY from the target.
-                    reward = reward - 50
+                    reward = reward - 10
                 -- No explicit reward for moving towards, let proximity handle that.
                 -- No penalty for staying still when misaligned (proximity reward decreases naturally).
                 end
                 
                 -- Encourage maintaining shots in reserve
                 if player_state.shot_count < 2 or player_state.shot_count > 7 then
-                    reward = reward - 20  -- Penalty for not having shots ready
+                    reward = reward - 5  -- Penalty for not having shots ready
                 elseif player_state.shot_count >= 5 then
-                    reward = reward + 20  -- Bonus for good ammo management
+                    reward = reward + 5  -- Bonus for good ammo management
                 end
             end
         end
