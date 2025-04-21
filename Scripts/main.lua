@@ -295,7 +295,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 end
                 -- NEW: Penalize moving when already aligned
                 if commanded_spinner ~= 0 then
-                    reward = reward - 20 -- Apply a penalty for unnecessary movement
+                    reward = reward - 75 -- Apply a stronger penalty for unnecessary movement
                 end
             else 
                 -- MISALIGNED CASE (segment_distance > 0)
