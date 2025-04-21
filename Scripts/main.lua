@@ -111,6 +111,67 @@ local shutdown_requested = false
 
 local last_display_update = 0  -- Timestamp of last display update
 
+
+-- NEW Function: Find the topmost entity (enemy or shot) in a specific absolute segment
+-- Returns: depth (0-255) and type (0-7 for enemies, 8 for shots, -1 if lane clear)
+function top_enemy_in_segment(target_abs_segment, level_state, enemies_state) -- Removed mem
+    local min_depth = 256 -- Initialize with a value greater than max depth
+    local found_type = -1 -- Sentinel for 'nothing found'
+
+    -- Determine level type internally
+    local is_open_level = (level_state.level_type == 0xFF)
+
+    -- Validate segment based on level type BEFORE masking/wrapping
+    if is_open_level then
+        if target_abs_segment < 0 or target_abs_segment > 15 then
+            return 255, 0
+        end
+    end
+
+    -- Ensure target segment is valid (handles wrapping for closed levels)
+    target_abs_segment = target_abs_segment & 0x0F
+
+    -- 1. Check Enemies (Slots 1-7)
+    for i = 1, 7 do
+        -- Use pre-calculated absolute segment and depth
+        local enemy_abs_segment = enemies_state.enemy_abs_segments[i]
+        local enemy_depth = enemies_state.enemy_depths[i]
+        -- Use pre-calculated moving away status (0 means moving towards)
+        local is_moving_towards = (enemies_state.enemy_moving_away[i] == 0)
+
+        -- Consider only active enemies (segment ~= INVALID) in the target segment *and* moving towards the player
+        if enemy_abs_segment ~= INVALID_SEGMENT and enemy_abs_segment == target_abs_segment and is_moving_towards then
+            if enemy_depth < min_depth then
+                min_depth = enemy_depth
+                found_type = enemies_state.enemy_core_type[i]
+            end
+        end
+    end
+
+    -- 2. Check Enemy Shots (Slots 1-4)
+    for i = 1, 4 do
+        -- Use pre-calculated absolute segment and depth
+        local shot_abs_segment = enemies_state.enemy_shot_abs_segments[i]
+        local shot_depth = enemies_state.shot_positions[i]
+
+        -- Consider only active shots (segment ~= INVALID) in the target segment
+        if shot_abs_segment ~= INVALID_SEGMENT and shot_abs_segment == target_abs_segment then
+             if shot_depth < min_depth then
+                min_depth = shot_depth
+                found_type = 8 -- Assign type 8 for enemy shots
+             end
+        end
+    end
+
+    -- 3. Return results
+    if min_depth > 255 then -- If min_depth wasn't updated, nothing was found
+        return 255, 0
+    else
+        return min_depth, found_type
+    end
+end
+
+
 -- Function to calculate reward for the current frame
 local function calculate_reward(game_state, level_state, player_state, enemies_state, commanded_spinner)
     local reward = 0
@@ -131,66 +192,33 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             reward = reward + (score_delta)  -- Amplify score impact
         end
 
-        -- Level completion bonus removed since it would come after end of the episode
-        -- if level_state.level_number ~= previous_level then
-        --     reward = reward + (500 * previous_level)  -- Increased bonus for progression
-        --     bDone = true
-        -- end
-
+        -- Encourage maintaining shots in reserve
+        if player_state.shot_count < 2 or player_state.shot_count > 7 then
+            reward = reward - 5  -- Penalty for not having shots ready
+        elseif player_state.shot_count >= 5 then
+            reward = reward + 5  -- Bonus for good ammo management
+        end
+        
         -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
 
         if (game_state.gamestate == 0x04) then
             if (player_state.superzapper_active ~= 0) then
-                reward = reward - 50
+                reward = reward - 250
             end
         end
                 
         -- Enemy targeting logic
         local target_segment = enemies_state:nearest_enemy_segment()
         local player_segment = player_state.position & 0x0F
-
-        -- Check to see if any enemy shots are active in our lane, and if so check the distance.
         local player_abs_segment = player_state.position & 0x0F
         local is_open = level_state.level_type == 0xFF
 
-        -- *** Combined Threat Dodging Logic ***
-        local immediate_threat_in_lane = false
-
-        -- 1. Check for close enemy shots (depth <= 0x24)
-        for i = 1, 4 do
-            local shot_abs_segment = mem:read_u8(enemies_state.enemy_shot_segments[i].address) & 0x0F
-            local shot_depth = enemies_state.shot_positions[i]
-            if shot_depth > 0 and shot_depth <= 0x24 and shot_abs_segment == player_abs_segment then
-                immediate_threat_in_lane = true
-                -- print("Threat: Close Shot") -- Debug
-                break -- Found a shot threat
-            end
-        end
-
-        -- 2. If no shot threat, check for close charging Fuseballs (depth <= 0x40)
-        if not immediate_threat_in_lane then
-            for i = 1, 7 do
-                -- Is it a Fuseball (type 4) moving towards player (bit 7 clear) and close enough?
-                if enemies_state.enemy_core_type[i] == 4 and 
-                   (enemies_state.active_enemy_info[i] & 0x80) == 0 and
-                   enemies_state.enemy_depths[i] <= 0x40 then
-                    
-                    -- Is it in the player's current absolute segment?
-                    local fuseball_abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F
-                    if fuseball_abs_segment == player_abs_segment then
-                        immediate_threat_in_lane = true
-                        -- print("Threat: Close Fuseball") -- Debug
-                        break -- Found a fuseball threat
-                    end
-                end
-            end
-        end
-
-        -- 3. Apply reward/penalty if there is an immediate threat
-        if immediate_threat_in_lane then
+        local mindepth, enemy_type = top_enemy_in_segment(player_abs_segment, level_state, enemies_state)
+        if (mindepth <= 0x40) then
+            -- Immediate thread approaching in this lane
             if commanded_spinner == 0 then
                 -- Penalty for not moving when a threat is incoming
-                reward = reward - 20
+                reward = reward - 50
             else
                 -- Player commanded a move. Check if it's a valid dodge.
                 local valid_dodge = false
@@ -213,18 +241,34 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
                 if valid_dodge then
                     -- Reward successful dodge attempt, proportional to speed
-                    reward = reward + math.abs(commanded_spinner) * 200
-                -- else
-                    -- Optional: Penalize attempting to move off edge?
+                    reward = reward + math.abs(commanded_spinner) * 250
                 end
             end
         end
         -- *** End Combined Threat Dodging Logic ***
 
-    if game_state.gamestate == 0x20 then    -- In tube zoom
-        -- Award bonus based on how short the spike in this lane is
-        reward = reward + 50 - (level_state.spike_heights[player_segment] / 5)
-    elseif target_segment < 0 then
+        local leftDepth, leftType = top_enemy_in_segment(player_abs_segment - 1, level_state, enemies_state)
+        local rightDepth, rightType = top_enemy_in_segment(player_abs_segment + 1, level_state, enemies_state)
+
+        -- If the left enemy is below 0x40, and can split or is a fuseball, we should move right
+        if (leftDepth <= 0x40 and (leftType == 0x01 or leftType == 0x02)) then
+            if commanded_spinner < 0 then
+                reward = reward + 100
+            end
+        end
+
+        -- Same for the right
+        if (rightDepth <= 0x40 and (rightType == 0x01 or rightType == 0x02)) then
+            if commanded_spinner > 0 then
+                reward = reward + 100   
+            end
+        end
+
+
+        if game_state.gamestate == 0x20 then    -- In tube zoom
+            -- Award bonus based on how short the spike in this lane is
+            reward = reward + 150 - (level_state.spike_heights[player_segment] / 3)
+        elseif target_segment < 0 then
             -- No enemies: reward staying still more strongly
             -- Use commanded_spinner here to check if model *intended* to stay still
             reward = reward + (commanded_spinner == 0 and 150 or -20)
@@ -270,14 +314,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     reward = reward - 10
                 -- No explicit reward for moving towards, let proximity handle that.
                 -- No penalty for staying still when misaligned (proximity reward decreases naturally).
-                end
-                
-                -- Encourage maintaining shots in reserve
-                if player_state.shot_count < 2 or player_state.shot_count > 7 then
-                    reward = reward - 5  -- Penalty for not having shots ready
-                elseif player_state.shot_count >= 5 then
-                    reward = reward + 5  -- Bonus for good ammo management
-                end
+                end               
             end
         end
 
@@ -660,6 +697,9 @@ function EnemiesState:new()
     self.num_enemies_on_top = 0
     self.enemies_pending = 0
     self.nearest_enemy_seg = INVALID_SEGMENT  -- Initialize relative nearest enemy segment with sentinel
+    self.enemy_abs_segments = {} -- NEW: Store absolute segments for enemies
+    self.enemy_shot_abs_segments = {} -- NEW: Store absolute segments for enemy shots
+    
     -- NEW Engineered Features for Targeting/Aiming
     self.is_aligned_with_nearest = 0.0
     self.nearest_enemy_depth_raw = 255 -- Sentinel value (max depth)
@@ -708,9 +748,11 @@ function EnemiesState:update(mem)
     self.enemy_type_info = {0, 0, 0, 0, 0, 0, 0}
     self.active_enemy_info = {0, 0, 0, 0, 0, 0, 0}
     self.enemy_segments = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_abs_segments = {INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT} -- Reset new table
     self.enemy_depths = {0, 0, 0, 0, 0, 0, 0}
     self.enemy_depths_lsb = {0, 0, 0, 0, 0, 0, 0}
     self.enemy_shot_lsb = {0, 0, 0, 0, 0, 0, 0}
+    self.enemy_shot_abs_segments = {INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT, INVALID_SEGMENT} -- Reset new table
     self.enemy_move_vectors = {0, 0, 0, 0, 0, 0, 0} -- Keep this reset if used elsewhere
     self.enemy_state_flags = {0, 0, 0, 0, 0, 0, 0}  -- Keep this reset if used elsewhere
     -- NEW: Reset decoded tables
@@ -741,10 +783,12 @@ function EnemiesState:update(mem)
     for i = 1, 4 do
         local abs_segment = mem:read_u8(self.enemy_shot_segments[i].address)
         if abs_segment == 0 then
-            self.enemy_shot_segments[i].value = INVALID_SEGMENT  -- Not active, use sentinel
+            self.enemy_shot_segments[i].value = INVALID_SEGMENT  -- Relative segment (for display/OOB)
+            self.enemy_shot_abs_segments[i] = INVALID_SEGMENT -- Absolute segment (for internal use)
         else
             local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
-            self.enemy_shot_segments[i].value = absolute_to_relative_segment(player_abs_segment, segment, is_open)
+            self.enemy_shot_segments[i].value = absolute_to_relative_segment(player_abs_segment, segment, is_open) -- Relative
+            self.enemy_shot_abs_segments[i] = segment -- Absolute
         end
     end
 
@@ -763,15 +807,17 @@ function EnemiesState:update(mem)
     
     -- Read standard enemy segments and depths first, store relative segments
     for i = 1, 7 do
-        local abs_segment = mem:read_u8(0x02B9 + i - 1)
+        local abs_segment_raw = mem:read_u8(0x02B9 + i - 1)
         self.enemy_depths[i] = mem:read_u8(0x02DF + i - 1)
 
-        if (self.enemy_depths[i] == 0 or abs_segment == 0) then
-            self.enemy_segments[i] = INVALID_SEGMENT  -- Not active, use sentinel
+        if (self.enemy_depths[i] == 0 or abs_segment_raw == 0) then
+            self.enemy_segments[i] = INVALID_SEGMENT  -- Relative segment
+            self.enemy_abs_segments[i] = INVALID_SEGMENT -- Absolute segment
         else
-            local segment = abs_segment & 0x0F  -- Mask to ensure 0-15
+            local abs_segment = abs_segment_raw & 0x0F  -- Mask to ensure 0-15
+            self.enemy_abs_segments[i] = abs_segment -- Store absolute segment
             -- Store relative segment distance
-            self.enemy_segments[i] = absolute_to_relative_segment(player_abs_segment, segment, is_open)
+            self.enemy_segments[i] = absolute_to_relative_segment(player_abs_segment, abs_segment, is_open)
         end
     end
 
@@ -1431,7 +1477,7 @@ local function frame_callback()
         return true
     elseif game_state.gamestate == 0x16 then
         -- Game is in level select mode
-        controls:apply_action(0, 0, 9, game_state, player_state)
+        -- controls:apply_action(0, 0, 9, game_state, player_state)
         return true
     end
 
@@ -1620,7 +1666,7 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         {"Bytes Sent", total_bytes_sent},
         {"FPS", string.format("%.2f", game_state.current_fps)},
         {"Payload Size", num_values},
-        {"Last Reward", string.format("%.2f", LastRewardState)},
+        {"Last Reward", string.format("%d", math.floor(LastRewardState + 0.5))}, -- Changed format to integer
     }
     
     -- Calculate how many rows we need (ceiling of items/3)
@@ -1632,8 +1678,8 @@ function update_display(status, game_state, level_state, player_state, enemies_s
             local idx = (row - 1) * 3 + col
             if idx <= #game_metrics then
                 local key, value = table.unpack(game_metrics[idx])
-                -- Format each metric with fixed width to fit in 80 columns
-                line = line .. string.format("%-14s: %-10s", key, tostring(value))
+                -- Format each metric with fixed width, right-align value
+                line = line .. string.format("%-12s: %10s   ", key, tostring(value)) -- Changed to right-align value
             end
         end
         print(line)
@@ -1897,3 +1943,8 @@ function absolute_to_relative_segment(current_abs_segment, target_abs_segment, i
         end
     end
 end
+
+--[[
+    Main Frame Callback Logic
+--]]
+local frame_counter = 0
