@@ -250,7 +250,16 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         local leftDepth, leftType = top_enemy_in_segment(player_abs_segment - 1, level_state, enemies_state)
         local rightDepth, rightType = top_enemy_in_segment(player_abs_segment + 1, level_state, enemies_state)
 
+        -- Be sure to shoot at flippers when they're on the top rail and right next to you
+
+        if (leftDepth == 0x10 and leftType == 00) or (rightDepth == 0x10 and rightType == 00) then
+            if (player_state.fire_commanded == 1 and player_state.shot_count < 8) then
+                reward = reward + 500
+            end
+        end
+    
         -- If the left enemy is below 0x40, and can split or is a fuseball, we should move right
+
         if (leftDepth <= 0x40 and (leftType == 0x01 or leftType == 0x02)) then
             if commanded_spinner < 0 then
                 reward = reward + 100
@@ -258,12 +267,12 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
 
         -- Same for the right
+
         if (rightDepth <= 0x40 and (rightType == 0x01 or rightType == 0x02)) then
             if commanded_spinner > 0 then
                 reward = reward + 100   
             end
         end
-
 
         if game_state.gamestate == 0x20 then    -- In tube zoom
             -- Award bonus based on how short the spike in this lane is
