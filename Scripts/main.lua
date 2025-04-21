@@ -181,11 +181,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     
     if player_state.alive == 1 then
 
-        -- Stronger reward for maintaining lives
-        if player_state.player_lives ~= nil then
-            reward = reward + (player_state.player_lives) 
-        end
-
         -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta < 1000 then
@@ -1045,9 +1040,10 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
     -- Set spinner direction based on the sign of the relative distance
     -- The absolute_to_relative_segment function handles open/closed logic correctly
     if is_open then
-        -- Open Level: Positive relative distance means enemy is clockwise (higher segment index)
-        -- We want to move counter-clockwise (negative spinner) towards it.
-        spinner = enemy_relative_dist > 0 and -intensity or intensity
+        -- Open Level: Positive relative distance means enemy is clockwise (higher segment index).
+        -- We want to move clockwise (positive spinner) towards it.
+        -- Corrected logic: same as closed level
+        spinner = enemy_relative_dist > 0 and intensity or -intensity
     else
         -- Closed Level: Positive relative distance means enemy is clockwise.
         -- We want to move clockwise (positive spinner) towards it.
