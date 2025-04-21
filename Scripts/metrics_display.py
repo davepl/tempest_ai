@@ -53,12 +53,12 @@ def display_metrics_header():
     # Clear screen first
     # clear_screen()
     
-    # Print header (Increase Frame width, Add TrainQ)
+    # Print header (Remove TrainQ)
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
-        f"{'TrainQ':>7}" # Added TrainQ column
+        f"{'AvgInf(ms)':>11}" # Removed TrainQ column
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header
@@ -87,19 +87,28 @@ def display_metrics_row(agent, kb_handler):
     # Get the latest loss value
     latest_loss = metrics.losses[-1] if metrics.losses else 0
     
-    # Get Training Queue Size
-    train_q_size = 0
-    if agent and hasattr(agent, 'train_queue'):
-        train_q_size = agent.train_queue.qsize()
+    # Get Training Queue Size (Removed - no longer needed)
+    # train_q_size = 0
+    # if agent and hasattr(agent, 'train_queue'):
+    #     train_q_size = agent.train_queue.qsize()
 
-    # Format the row (Increase Frame width, add comma formatting, add TrainQ)
+    # Calculate Average Inference Time (ms) and reset counters
+    avg_inference_time_ms = 0.0
+    with metrics.lock:
+        if metrics.total_inference_requests > 0:
+            avg_inference_time_ms = (metrics.total_inference_time / metrics.total_inference_requests) * 1000
+        # Reset counters for the next interval
+        metrics.total_inference_time = 0.0
+        metrics.total_inference_requests = 0
+
+    # Format the row (Remove TrainQ)
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
-        f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} "
-        f"{latest_loss:>10.2f} {metrics.client_count:>8} "
+        f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
+        f"{int(latest_loss):>10} {metrics.client_count:>8} " # Format loss as integer
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
-        f"{train_q_size:>7}" # Added TrainQ value
+        f"{avg_inference_time_ms:>11.2f}" # Removed TrainQ value
     )
     
     print_metrics_line(row)

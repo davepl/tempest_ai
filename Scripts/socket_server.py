@@ -427,7 +427,16 @@ class SocketServer:
                             action_idx = expert_action_to_index(fire, zap, spinner)
                         else:
                             # Use DQN with current epsilon
+                            start_time = time.perf_counter()
                             action_idx = self.agent.act(frame.state, self.metrics.get_epsilon())
+                            end_time = time.perf_counter()
+                            inference_time = end_time - start_time
+                            
+                            # Update inference metrics
+                            with self.metrics.lock:
+                                self.metrics.total_inference_time += inference_time
+                                self.metrics.total_inference_requests += 1
+                                
                             fire, zap, spinner = ACTION_MAPPING[action_idx]
                             # self.metrics.update_action_source("dqn") # Remove global update
                             action_source = "dqn" # Store local source

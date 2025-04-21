@@ -183,8 +183,8 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
-        if score_delta > 0 and score_delta < 1000 then
-            reward = reward + (score_delta)  -- Amplify score impact
+        if score_delta > 0 and score_delta <= 1000 then
+            reward = reward + (score_delta)  
         end
 
         -- Encourage maintaining shots in reserve
@@ -235,8 +235,10 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 end
 
                 if valid_dodge then
-                    -- Reward successful dodge attempt, proportional to speed
-                    reward = reward + math.abs(commanded_spinner) * 250
+                    -- Limit the spinner magnitude used for reward calculation
+                    local reward_spinner_magnitude = math.min(math.abs(commanded_spinner), 4) -- Cap at 4
+                    -- Reward successful dodge attempt, proportional to capped speed
+                    reward = reward + reward_spinner_magnitude * 100
                 end
             end
         end
@@ -343,6 +345,9 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
     LastRewardState = reward
 
+    if (reward > 1000) then
+        print("Reward: " .. reward)
+    end
     return reward, bDone
 end
 

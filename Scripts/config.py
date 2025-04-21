@@ -91,6 +91,8 @@ class MetricsData:
     fps: float = 0.0
     client_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    total_inference_time: float = 0.0
+    total_inference_requests: int = 0
     
     def update_frame_count(self):
         """Update frame count and FPS tracking"""
