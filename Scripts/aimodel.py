@@ -323,6 +323,12 @@ class DQNAgent:
         
         # Proceed with save if forced or interval elapsed
         try:
+            # Determine the actual expert ratio to save (not the override value)
+            if metrics.expert_mode or metrics.override_expert:
+                ratio_to_save = metrics.saved_expert_ratio
+            else:
+                ratio_to_save = metrics.expert_ratio
+
             torch.save({
                 'policy_state_dict': self.qnetwork_local.state_dict(),
                 'target_state_dict': self.qnetwork_target.state_dict(),
@@ -330,7 +336,7 @@ class DQNAgent:
                 'memory_size': len(self.memory),
                 'epsilon': metrics.epsilon,
                 'frame_count': metrics.frame_count,
-                'expert_ratio': metrics.expert_ratio,
+                'expert_ratio': ratio_to_save, # Save the determined ratio
                 'last_decay_step': metrics.last_decay_step,
                 'last_epsilon_decay_step': metrics.last_epsilon_decay_step
             }, filename)
@@ -340,7 +346,7 @@ class DQNAgent:
             
             # Only print on forced exit/shutdown saves
             if is_forced_save:
-                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
+                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {ratio_to_save:.2f})")
         except Exception as e:
             print(f"ERROR saving model to {filename}: {e}")
 

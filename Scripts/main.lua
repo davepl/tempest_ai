@@ -1431,7 +1431,7 @@ local function frame_callback()
         return true
     elseif game_state.gamestate == 0x16 then
         -- Game is in level select mode
-        -- controls:apply_action(0, 0, 9, game_state, player_state)
+        controls:apply_action(0, 0, 9, game_state, player_state)
         return true
     end
 

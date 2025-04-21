@@ -20,7 +20,7 @@ from collections import deque
 IS_INTERACTIVE = sys.stdin.isatty()
 
 # Flag to control metric reset on load
-RESET_METRICS = True # Set to True to ignore saved epsilon/expert ratio
+RESET_METRICS = False # Set to True to ignore saved epsilon/expert ratio
 
 # Directory paths
 MODEL_DIR = "models"
