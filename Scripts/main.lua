@@ -288,7 +288,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             -- Check alignment based on actual segment distance
             if segment_distance == 0 then 
                 -- Big reward for alignment + firing incentive
-                reward = reward + 50
+                reward = reward + 150
                 -- Bonus for shooting when aligned
                 if player_state.fire_commanded then
                     reward = reward + 20
@@ -321,8 +321,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if desired_spinner * commanded_spinner < 0 then
                     -- Strong penalty for moving AWAY from the target.
                     reward = reward - 10
-                -- No explicit reward for moving towards, let proximity handle that.
-                -- No penalty for staying still when misaligned (proximity reward decreases naturally).
                 end               
             end
         end
