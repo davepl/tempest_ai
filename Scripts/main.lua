@@ -317,10 +317,17 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 reward = reward + (10 - segment_distance) -- Simple linear reward for proximity
                 
                 -- Movement incentives (using desired_spinner direction and commanded_spinner)
-                -- Penalize if the COMMANDED movement (commanded_spinner) is OPPOSITE to the desired direction.
-                if desired_spinner * commanded_spinner < 0 then
-                    -- Strong penalty for moving AWAY from the target.
-                    reward = reward - 10
+                -- Reward if the COMMANDED movement (commanded_spinner) is IN THE SAME direction as the desired direction.
+                if desired_spinner * commanded_spinner > 0 then
+                    -- Reward for moving TOWARDS the target.
+                    reward = reward + 15 
+                -- Penalize if the COMMANDED movement is OPPOSITE to the desired direction.
+                elseif desired_spinner * commanded_spinner < 0 then
+                    -- Stronger penalty for moving AWAY from the target.
+                    reward = reward - 25 -- Increased penalty
+                -- Penalize staying still when misaligned
+                elseif commanded_spinner == 0 and desired_spinner ~= 0 then
+                     reward = reward - 5 -- Small penalty for staying still when misaligned
                 end               
             end
         end
