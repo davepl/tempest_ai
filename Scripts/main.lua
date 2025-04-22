@@ -187,18 +187,27 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             reward = reward + (score_delta)  
         end
 
-        -- Encourage maintaining shots in reserve
-        if player_state.shot_count < 2 or player_state.shot_count > 7 then
-            reward = reward - 5  -- Penalty for not having shots ready
-        elseif player_state.shot_count >= 5 then
-            reward = reward + 5  -- Bonus for good ammo management
+        -- Encourage maintaining shots in reserve.  Penalize 0 or 8, graduated reward for 1-7
+        local sc = player_state.shot_count
+        if sc == 0 then
+            reward = reward - 50
+        elseif sc == 4 then
+            reward = reward + 5
+        elseif sc == 5 then
+            reward = reward + 10
+        elseif sc == 6 then
+            reward = reward + 15
+        elseif sc == 7 then
+            reward = reward + 20
+        elseif sc >= 8 then -- Max shots is 8, handle this case
+            reward = reward - 50
         end
         
         -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
 
         if (game_state.gamestate == 0x04) then
             if (player_state.superzapper_active ~= 0) then
-                reward = reward - 250
+                reward = reward - 500
             end
         end
                 
@@ -209,7 +218,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         local is_open = level_state.level_type == 0xFF
 
         local mindepth, enemy_type = top_enemy_in_segment(player_abs_segment, level_state, enemies_state)
-        if (mindepth <= 0x40) then
+        if (mindepth <= 0x60) then
             -- Immediate thread approaching in this lane
             if commanded_spinner == 0 then
                 -- Penalty for not moving when a threat is incoming
@@ -249,7 +258,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
         -- Be sure to shoot at flippers when they're on the top rail and right next to you
 
-        if (leftDepth == 0x10 and leftType == 00) or (rightDepth == 0x10 and rightType == 00) then
+        if (leftDepth <= 0x10 and leftType == 00) or (rightDepth <= 0x10 and rightType == 00) then
             if (player_state.fire_commanded == 1 and player_state.shot_count < 8) then
                 reward = reward + 500
             end
@@ -257,35 +266,39 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
     
         -- If the left enemy is below 0x40, and is a Tanker or Fuseball, reward moving right, penalize moving left
 
-        if (leftDepth <= 0x40 and (leftType == 0x02 or leftType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
+        if (leftDepth <= 0x60 and (leftType == 0x02 or leftType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
             if commanded_spinner < 0 then -- Moving right (away)
-                reward = reward + 100
+                reward = reward + 500
             elseif commanded_spinner > 0 then -- Moving left (towards)
-                reward = reward - 100 -- Fixed typo: reard -> reward, Corrected syntax
+                reward = reward - 100 -- Penalize moving left
+            else
+                reward = reward - 75  -- Penalize staying still
             end
         end
 
         -- Same for the right: If right enemy is Tanker/Fuseball, reward moving left, penalize moving right
 
-        if (rightDepth <= 0x40 and (rightType == 0x02 or rightType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
+        if (rightDepth <= 0x60 and (rightType == 0x02 or rightType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
             if commanded_spinner > 0 then -- Moving left (away)
-                reward = reward + 100   
+                reward = reward + 500   
             elseif commanded_spinner < 0 then -- Moving right (towards)
                 reward = reward - 100 -- Corrected syntax
+            else
+                reward = reward - 75
             end
         end
 
         -- Don't walk into shots: Penalize moving towards an adjacent lane with a SHOT (type 8) CLOSE to the player (depth <= 0x30)
 
-        if (leftDepth <= 0x30 and leftType == 0x08) then -- Check for CLOSE shot (depth <= 30)
+        if (leftDepth <= 0x60 and leftType == 0x08) then -- Check for CLOSE shot (depth <= 30)
             if (commanded_spinner > 0) then -- Moving left (towards shot)
-                reward = reward - 250
+                reward = reward - 1000
             end
         end
         
-        if(rightDepth <= 0x30 and rightType == 0x08) then -- Check for CLOSE shot (depth <= 30)
+        if(rightDepth <= 0x60 and rightType == 0x08) then -- Check for CLOSE shot (depth <= 30)
             if (commanded_spinner < 0) then -- Moving right (towards shot)
-                reward = reward - 250
+                reward = reward - 1000
             end
         end
 
@@ -298,11 +311,11 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Scale reward: Max 150 for no spike (height 0 -> length 255), less for longer spikes
                 reward = reward + math.max(0, (effective_spike_length / 2) - 27.5) -- Scaled reward
             else
-                reward = reward + 150 -- Max reward if no spike
+                reward = reward + (commanded_spinner == 0 and 250 or -50) -- Max reward if no spike
             end
-            -- Reward staying still when zooming and shooting
-            if (commanded_spinner == 0 and player_state.fire_commanded == 1) then
-                reward = reward + 100
+            -- Reward shooting at all times, replace anything deducted for not managing shots below 8
+            if (player_state.fire_commanded == 1) then
+                reward = reward + 200
             end
         elseif target_segment < 0 then
             -- No enemies: reward staying still more strongly
@@ -315,14 +328,14 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             -- Check alignment based on actual segment distance
             if segment_distance == 0 then 
                 -- Big reward for alignment + firing incentive
-                reward = reward + 150
-                -- Bonus for shooting when aligned
-                if player_state.fire_commanded then
-                    reward = reward + 20
+                if commanded_spinner == 0 then
+                    reward = reward + 250
+                else
+                    reward = reward - 100
                 end
-                -- NEW: Penalize moving when already aligned
-                if commanded_spinner ~= 0 then
-                    reward = reward - 75 -- Apply a stronger penalty for unnecessary movement
+
+                if player_state.fire_commanded then
+                    reward = reward + 50
                 end
             else 
                 -- MISALIGNED CASE (segment_distance > 0)
@@ -332,29 +345,29 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                     if (enemy_depth <= 0x20) then 
                         if player_state.fire_commanded == 1 then
                             -- Strong reward for firing at close enemies
-                            reward = reward + 50
+                            reward = reward + 150
                         else
                             -- Moderate penalty for not firing at close enemies
-                            reward = reward - 10
+                            reward = reward - 50
                         end
                     end
                 end
 
                 -- Graduated reward for proximity (higher reward for smaller segment distance)
-                reward = reward + (10 - segment_distance) -- Simple linear reward for proximity
+                reward = reward + (10 - segment_distance) * 5 -- Simple linear reward for proximity
                 
                 -- Movement incentives (using desired_spinner direction and commanded_spinner)
                 -- Reward if the COMMANDED movement (commanded_spinner) is IN THE SAME direction as the desired direction.
                 if desired_spinner * commanded_spinner > 0 then
                     -- Reward for moving TOWARDS the target.
-                    reward = reward + 15 
+                    reward = reward + 25 
                 -- Penalize if the COMMANDED movement is OPPOSITE to the desired direction.
                 elseif desired_spinner * commanded_spinner < 0 then
                     -- Stronger penalty for moving AWAY from the target.
-                    reward = reward - 25 -- Increased penalty
+                    reward = reward - 50 -- Increased penalty
                 -- Penalize staying still when misaligned
                 elseif commanded_spinner == 0 and desired_spinner ~= 0 then
-                     reward = reward - 5 -- Small penalty for staying still when misaligned
+                     reward = reward - 15 -- Small penalty for staying still when misaligned
                 end               
             end
         end
@@ -1174,11 +1187,6 @@ function Controls:new()
     else
         print("Warning: Could not find :IN2 port for Start button.")
     end
-    
-    -- Track commanded states
-    self.fire_commanded = 0
-    self.zap_commanded = 0
-    self.spinner_delta = 0
     
     return self
 end
