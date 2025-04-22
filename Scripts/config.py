@@ -48,13 +48,13 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 512
+    batch_size: int = 1024
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_min: float = 0.001
-    epsilon_decay_factor: float = 0.9954 # Multiplicative factor per step
+    epsilon_decay_factor: float = 0.9969 # Multiplicative factor per step (Adjusted for ~15M frames)
     epsilon_decay_steps: int = 10000   # Frames per decay step
     update_target_every: int = 500
     learning_rate: float = 0.001

@@ -255,25 +255,55 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             end
         end
     
-        -- If the left enemy is below 0x40, and can split or is a fuseball, we should move right
+        -- If the left enemy is below 0x40, and is a Tanker or Fuseball, reward moving right, penalize moving left
 
-        if (leftDepth <= 0x40 and (leftType == 0x01 or leftType == 0x02)) then
-            if commanded_spinner < 0 then
+        if (leftDepth <= 0x40 and (leftType == 0x02 or leftType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
+            if commanded_spinner < 0 then -- Moving right (away)
+                reward = reward + 100
+            elseif commanded_spinner > 0 then -- Moving left (towards)
+                reward = reward - 100 -- Fixed typo: reard -> reward, Corrected syntax
+            end
+        end
+
+        -- Same for the right: If right enemy is Tanker/Fuseball, reward moving left, penalize moving right
+
+        if (rightDepth <= 0x40 and (rightType == 0x02 or rightType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
+            if commanded_spinner > 0 then -- Moving left (away)
+                reward = reward + 100   
+            elseif commanded_spinner < 0 then -- Moving right (towards)
+                reward = reward - 100 -- Corrected syntax
+            end
+        end
+
+        -- Don't walk into shots: Penalize moving towards an adjacent lane with a SHOT (type 8) CLOSE to the player (depth <= 0x30)
+
+        if (leftDepth <= 0x30 and leftType == 0x08) then -- Check for CLOSE shot (depth <= 30)
+            if (commanded_spinner > 0) then -- Moving left (towards shot)
+                reward = reward - 250
+            end
+        end
+        
+        if(rightDepth <= 0x30 and rightType == 0x08) then -- Check for CLOSE shot (depth <= 30)
+            if (commanded_spinner < 0) then -- Moving right (towards shot)
+                reward = reward - 250
+            end
+        end
+
+        -- Tube Zoom logic adjustment
+        if game_state.gamestate == 0x20 then    -- In tube zoom
+            -- Reward based on inverse spike height (higher reward for shorter spikes)
+            local spike_h = level_state.spike_heights[player_segment] or 0
+            if spike_h > 0 then
+                local effective_spike_length = 255 - spike_h -- Shorter spike = higher value
+                -- Scale reward: Max 150 for no spike (height 0 -> length 255), less for longer spikes
+                reward = reward + math.max(0, (effective_spike_length / 2) - 27.5) -- Scaled reward
+            else
+                reward = reward + 150 -- Max reward if no spike
+            end
+            -- Reward staying still when zooming and shooting
+            if (commanded_spinner == 0 and player_state.fire_commanded == 1) then
                 reward = reward + 100
             end
-        end
-
-        -- Same for the right
-
-        if (rightDepth <= 0x40 and (rightType == 0x01 or rightType == 0x02)) then
-            if commanded_spinner > 0 then
-                reward = reward + 100   
-            end
-        end
-
-        if game_state.gamestate == 0x20 then    -- In tube zoom
-            -- Award bonus based on how short the spike in this lane is
-            reward = reward + 150 - (level_state.spike_heights[player_segment] / 3)
         elseif target_segment < 0 then
             -- No enemies: reward staying still more strongly
             -- Use commanded_spinner here to check if model *intended* to stay still
@@ -330,10 +360,11 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
 
     else
-        -- Massive penalty for death to prioritize survival
+        
+        -- Large penalty for death to prioritize survival
 
         if previous_alive_state == 1 then
-            reward = reward - 5000
+            reward = reward - 7500
             bDone = true
         end
     end

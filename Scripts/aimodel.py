@@ -62,6 +62,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure
 import socket
 import traceback
+from torch.nn import SmoothL1Loss # Import SmoothL1Loss
 
 # Platform-specific imports for KeyboardHandler
 import sys
@@ -269,7 +270,8 @@ class DQNAgent:
             Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
         
         # Compute loss and perform optimization
-        loss = F.mse_loss(Q_expected, Q_targets)
+        criterion = SmoothL1Loss()
+        loss = criterion(Q_expected, Q_targets)
         self.optimizer.zero_grad()
         loss.backward() 
         self.optimizer.step() 
