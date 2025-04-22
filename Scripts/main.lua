@@ -1161,6 +1161,20 @@ function Controls:new()
     -- Set up spinner field
     self.spinner_field = self.spinner_port and self.spinner_port.fields["Dial"] or nil
     
+    -- Get Start button port and field
+    self.in2_port = manager.machine.ioport.ports[":IN2"]
+    self.p1_start_field = nil
+    if self.in2_port then
+        self.p1_start_field = self.in2_port.fields["1 Player Start"] or 
+                               self.in2_port.fields["P1 Start"] or 
+                               self.in2_port.fields["Start 1"]
+        if not self.p1_start_field then
+            print("Warning: Could not find P1 Start button field in :IN2 port.")
+        end
+    else
+        print("Warning: Could not find :IN2 port for Start button.")
+    end
+    
     -- Track commanded states
     self.fire_commanded = 0
     self.zap_commanded = 0
@@ -1169,40 +1183,24 @@ function Controls:new()
     return self
 end
 
-function Controls:apply_action(fire, zap, spinner, game_state, player_state)
-    -- Fix the attract mode check - bit 0x80 being CLEAR indicates attract mode
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0 
-    
-    if is_attract_mode then
-        -- In attract mode:
-        self.fire_commanded = 1
-        if self.fire_field then self.fire_field:set_value(1) end
-        self.zap_commanded = 0 -- Ensure zap is off
-        if self.zap_field then self.zap_field:set_value(0) end
-        
-        -- Use the DETECTED spinner delta for display/state in attract mode
-        self.spinner_delta = player_state.spinner_detected -- Use renamed field
-        -- Do NOT write the model's spinner to memory in attract mode
-        
-    else
-        -- In actual gameplay:
-        -- Use the DETECTED spinner delta for display/state
-        self.spinner_delta = player_state.spinner_detected -- Use renamed field
-        
-        -- Apply the model's commanded actions
-        self.fire_commanded = fire
-        self.zap_commanded = zap
-        self.spinner_commanded = spinner -- This should probably be set here too if used elsewhere
+-- Apply received AI action (fire, zap, spinner) and p1_start to game controls
+function Controls:apply_action(fire, zap, spinner, p1_start, game_state, player_state)
 
-        if self.fire_field then self.fire_field:set_value(fire) end
-        if self.zap_field then self.zap_field:set_value(zap) end
-        
-        -- Apply the model's commanded spinner value to the game's hardware register
+    player_state.fire_commanded = fire
+    player_state.zap_commanded = zap
+    player_state.spinner_commanded = spinner
+
+    if self.fire_field then self.fire_field:set_value(fire) end
+    if self.zap_field then self.zap_field:set_value(zap) end
+    if self.p1_start_field then self.p1_start_field:set_value(p1_start) end 
+
+    -- Write AI spinner value to memory only if non-zero to potentially reduce noise/interference
+    if spinner ~= 0 then
         mem:write_u8(0x0050, spinner)
     end
 end
 
--- Instantiate state objects - AFTER defining all classes
+-- Instantiate state objects - AFTER defining all classes but BEFORE functions using them
 local game_state = GameState:new()
 local level_state = LevelState:new()
 local player_state = PlayerState:new()
@@ -1443,9 +1441,9 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         score_high,                     -- H score high 16 bits
         score_low,                      -- H score low 16 bits
         save_signal,                    -- B save_signal
-        controls.fire_commanded,        -- B fire_commanded
-        controls.zap_commanded,         -- B zap_commanded
-        controls.spinner_delta,         -- h spinner_delta (model output, int8 range but packed as int16)
+        player_state.fire_commanded,    -- B fire_commanded
+        player_state.zap_commanded,     -- B zap_commanded
+        player_state.spinner_commanded, -- h spinner_delta (model output, int8 range but packed as int16)
         is_attract_mode and 1 or 0,     -- B is_attract_mode
         nearest_abs_seg_oob,            -- h nearest_enemy_segment (ABSOLUTE, -1 sentinel, packed as int16)
         player_abs_seg_oob,             -- B player_segment (ABSOLUTE 0-15)
@@ -1511,21 +1509,6 @@ local function frame_callback()
     -- Update enemies state last to ensure all references are correct
     enemies_state:update(mem)
     
-    -- Check if the game mode is in high score entry, mash AAA if it is
-    if game_state.game_mode == 0x80 then
-        if game_state.frame_counter % 60 == 0 then
-            controls.fire_field:set_value(1)
-            print("Pressing Fire")
-        elseif game_state.frame_counter % 60 == 30 then
-            controls.fire_field:set_value(0)
-            print("Releasing Fire")
-        end
-        return true
-    elseif game_state.gamestate == 0x16 then
-        -- Game is in level select mode
-        -- controls:apply_action(0, 0, 9, game_state, player_state)
-        return true
-    end
 
     -- Declare num_values at the start of the function
     local num_values = 0
@@ -1537,7 +1520,6 @@ local function frame_callback()
             -- If socket isn't open yet, just update the display without sending data
             -- Update the display with empty controls
             update_display("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, nil, num_values)
-            return true
         end
     end
 
@@ -1557,38 +1539,8 @@ local function frame_callback()
     local status_message = ""
 
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    local is_level_select = (game_state.game_state == 0x16)
 
-    -- In attract mode, zero the score if we're dead or zooming down the tube
-
-    if is_attract_mode then
-
-        local port = manager.machine.ioport.ports[":IN2"]
-        -- Press P1 Start in MAME with proper press/release simulation
-        if game_state.frame_counter % 60 == 0 then
-            -- Try different possible field names
-            local startField = port.fields["1 Player Start"] or 
-                                port.fields["P1 Start"] or 
-                                port.fields["Start 1"]
-            
-            if startField then
-                -- Press the button
-                startField:set_value(1)
-                print("Pressing 1 Player Start button in attract mode")
-            else
-                print("Error: Could not find start button field")
-            end
-        elseif game_state.frame_counter % 60 == 5 then
-            -- Release the button 5 frames later
-            local startField = port.fields["1 Player Start"] or 
-                                port.fields["P1 Start"] or 
-                                port.fields["Start 1"]
-            
-            if startField then
-                startField:set_value(0)
-                print("Releasing 1 Player Start button")
-            end
-        end
-    end
     -- Calculate the reward for the current frame - do this ONCE per frame
     -- Note: We calculate reward *before* getting the commanded spinner for *this* frame.
     --       To use the commanded spinner *in* the reward calculation, we need to get it first.
@@ -1653,31 +1605,35 @@ local function frame_callback()
     -- BOT: Example override (commented out)
     -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
-    player_state.fire_commanded = fire
-    player_state.zap_commanded = zap
-    player_state.spinner_commanded = spinner -- Assign to renamed field
-
     -- Update total bytes sent
     total_bytes_sent = total_bytes_sent + #frame_data
-
-
     local current_time_high_res = os.clock()
     local should_update_display = (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
 
+    -- Apply the action to the controls, which will also update the player_state to reflect the commanded values
+
+    if game_state.gamestate == 0x16 then                                                -- Level Select Mode    
+        controls:apply_action(frame_count % 2, 0, -31, 0, game_state, player_state)
+    elseif game_state.gamestate == 0x12 then                                                -- High Score Entry Mode                
+        print("High Score Entry Mode")
+        if (frame_count % 30 == 0) then
+            controls:apply_action(1, 0, 0, 0, game_state, player_state)
+        elseif (frame_count % 30 == 15) then
+            controls:apply_action(0, 0, -9, 0, game_state, player_state)
+        end
+    elseif (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
+        controls:apply_action(0, 0, 0, frame_count % 2, game_state, player_state)
+    elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then  -- AI Modes
+        controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
+    end
+
+    -- Update the display with the current action and metrics
     if should_update_display and SHOW_DISPLAY then
         -- Update the display with the current action and metrics
         update_display(status_message, game_state, level_state, player_state, enemies_state, action, num_values, reward)
         last_display_update = current_time_high_res
     end
 
-    -- We only control the game in regular play mode (04), zooming down the tube (20), AND High Score Entry (24)
-    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then -- Added 0x24
-        -- Apply the action determined by the AI (Python script) to MAME controls
-        controls:apply_action(fire, zap, spinner, game_state, player_state)
-    elseif game_state.gamestate == 0x12 then -- This state might need verification too, but 
-        -- Apply the action to MAME controls for entering initials(Seems like hardcoded zap?)
-        controls:apply_action(0, frame_count % 2, 0, game_state, player_state)
-    end
 
     return true
 end
@@ -1785,25 +1741,24 @@ function update_display(status, game_state, level_state, player_state, enemies_s
     
     print("")  -- Empty line after section
 
-    -- Format and print player controls
-    print("--[ Player Controls (Game Inferred Values) ]----------")
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    print(string.format("  %-25s: %d", "Fire (Inferred)", controls.fire_commanded))
-    print(string.format("  %-25s: %d", "Superzapper (Inferred)", controls.zap_commanded))
-    -- This uses the value from the Controls object, which is now set to spinner_detected
-    print(string.format("  %-25s: %d", "Spinner Delta (Detected)", controls.spinner_delta))
-    print(string.format("  %-25s: %s", "Attract Mode", is_attract_mode and "Active" or "Inactive"))
-    print("")
+    -- Level State Section
+    print("--[ Level State ]--------------------------------------------------------------------")
+    local spike_heights_str = ""
+    for i = 0, 15 do
+        spike_heights_str = spike_heights_str .. string.format("%02X ", level_state.spike_heights[i] or 0)
+    end
+    print("  Spike Heights: " .. spike_heights_str)
+    print(string.format("  Level Num: %d Type: %s Shape: %d", level_state.level_number, (level_state.level_type == 0xFF and "Open" or "Closed"), level_state.level_shape))
+    print("") -- Empty line after section
 
-    -- Add Model State section
-    print("--[ Model Output ]------------------------------------")
+    -- Controls/AI State Section
+    print("--[ Controls & AI ]--------------------------------------------------------------")
     print(string.format("  %-25s: %d", "Model Fire", player_state.fire_commanded))
     print(string.format("  %-25s: %d", "Model Zap", player_state.zap_commanded))
     print(string.format("  %-25s: %d", "Model Spinner", player_state.spinner_commanded))
     print("")
 
-    -- Format and print level state at row 31
-    move_cursor_to_row(31)
+    -- move_cursor_to_row(21)
     local enemy_types = {}
     local enemy_states = {}
     local enemy_segs = {}
@@ -1831,7 +1786,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         ["Pulse State"] = string.format("beat:%02X charge:%02X/FF", enemies_state.pulse_beat, enemies_state.pulsing),
         ["Flip Rate"] = string.format("%02X", enemies_state.pulsar_fliprate), -- NEW: Display Pulsar Flip Rate
         ["In Tube"] = string.format("%d enemies", enemies_state.num_enemies_in_tube),
-        -- Display relative nearest enemy segment using format_segment
         ["Nearest Enemy"] = string.format("segment %s", format_segment(enemies_state.nearest_enemy_seg)),
         ["On Top"] = string.format("%d enemies", enemies_state.num_enemies_on_top),
         ["Pending"] = string.format("%d enemies", enemies_state.enemies_pending),
@@ -1854,7 +1808,6 @@ function update_display(status, game_state, level_state, player_state, enemies_s
         end
     end
     print("  Enemies On Top: " .. table.concat(top_enemy_segs, " "))
-
     print("  Enemy Depths  : " .. table.concat(enemy_depths, " "))
     
     -- NEW: Display decoded enemy info tables
