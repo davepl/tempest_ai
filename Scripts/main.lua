@@ -377,7 +377,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         -- Large penalty for death to prioritize survival
 
         if previous_alive_state == 1 then
-            reward = reward - 7500
+            reward = reward - 20000
             bDone = true
         end
     end
@@ -1627,7 +1627,7 @@ local function frame_callback()
         if (frame_count % 30 == 0) then
             controls:apply_action(1, 0, 0, 0, game_state, player_state)
         elseif (frame_count % 30 == 15) then
-            controls:apply_action(0, 0, -9, 0, game_state, player_state)
+            controls:apply_action(0, 0, 0, 0, game_state, player_state)
         end
     elseif (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
         controls:apply_action(0, 0, 0, frame_count % 2, game_state, player_state)
