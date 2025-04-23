@@ -1644,6 +1644,8 @@ local last_timer_value = nil
 local method_fps_counter = {0, 0, 0}  -- For 3 different methods
 local method_start_time = os.clock()
 local last_frame_counter = 0  -- Initialize counter for FPS calculation
+local frames_to_wait = math.random(0, 50)
+local frames_waited = 0
 
 local function frame_callback()
     -- Check the time counter at address 0x0003
@@ -1654,7 +1656,12 @@ local function frame_callback()
         return true
     end
     lastTimer = currentTimer
-    
+
+    frames_waited = frames_waited + 1
+    if frames_waited <= frames_to_wait then
+        return true
+    end
+
     -- Track FPS using frame_counter instead of separate frame_count
     local current_time = os.time()
     
