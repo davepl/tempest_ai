@@ -419,11 +419,14 @@ class SocketServer:
                         if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
                             # Use expert system
                             fire, zap, spinner = get_expert_action(
-                                frame.enemy_seg, frame.player_seg, frame.open_level
+                                frame.enemy_seg,
+                                frame.player_seg,
+                                frame.open_level,
+                                frame.expert_fire,
+                                frame.expert_zap
                             )
                             self.metrics.increment_guided_count()
-                            # self.metrics.update_action_source("expert") # Remove global update
-                            action_source = "expert" # Store local source
+                            action_source = "expert"
                             action_idx = expert_action_to_index(fire, zap, spinner)
                         else:
                             # Use DQN with current epsilon
@@ -438,8 +441,7 @@ class SocketServer:
                                 self.metrics.total_inference_requests += 1
                                 
                             fire, zap, spinner = ACTION_MAPPING[action_idx]
-                            # self.metrics.update_action_source("dqn") # Remove global update
-                            action_source = "dqn" # Store local source
+                            action_source = "dqn"
                     else:
                          print(f"Client {client_id}: Agent not available for action generation.")
                          # Keep default action (0,0,0)

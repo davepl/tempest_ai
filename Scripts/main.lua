@@ -36,7 +36,7 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 
 local SHOW_DISPLAY            = true
-local DISPLAY_UPDATE_INTERVAL = 0.05  
+local DISPLAY_UPDATE_INTERVAL = 0.02  
 
 -- Access the main CPU and memory space
 local mainCpu = nil
@@ -212,7 +212,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
                 
         -- Enemy targeting logic
-        local target_segment = enemies_state:nearest_enemy_segment()
+        local target_segment = enemies_state:target_segment(game_state, player_state, level_state)
         local player_segment = player_state.position & 0x0F
         local player_abs_segment = player_state.position & 0x0F
         local is_open = level_state.level_type == 0xFF
@@ -281,6 +281,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         if (rightDepth <= 0x60 and (rightType == 0x02 or rightType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
             if commanded_spinner > 0 then -- Moving left (away)
                 reward = reward + 500   
+                print("Tanker/Fuseball right reward: " .. 500)
             elseif commanded_spinner < 0 then -- Moving right (towards)
                 reward = reward - 100 -- Corrected syntax
             else
@@ -799,7 +800,7 @@ function EnemiesState:new()
     return self
 end
 
-function EnemiesState:update(mem)
+function EnemiesState:update(mem, game_state, player_state, level_state)
     -- First, initialize/reset all arrays at the beginning
     -- Reset enemy arrays
     -- Keep resetting original raw arrays
@@ -982,7 +983,7 @@ function EnemiesState:update(mem)
 
     -- Calculate and store the relative nearest enemy segment for internal use
     -- Capture BOTH return values: absolute segment and depth
-    local nearest_abs_seg, nearest_depth = self:nearest_enemy_segment()
+    local nearest_abs_seg, nearest_depth = self:target_segment(game_state, player_state, level_state)
     if nearest_abs_seg == -1 then
         self.nearest_enemy_seg = INVALID_SEGMENT
         -- Set default values for engineered features when no enemy
@@ -1015,57 +1016,110 @@ end
 -- Find the *absolute* segment and depth of the enemy closest to the top of the tube
 -- This is used primarily for OOB data packing and targeting decisions that need absolute values.
 -- If multiple enemies share the minimum depth, it chooses the one closest in segment distance.
-function EnemiesState:nearest_enemy_segment()
-    local min_depth = 255
-    local closest_absolute_segment = -1 -- Use -1 as sentinel for *absolute* segment not found
-    local min_relative_distance_abs = 17 -- Sentinel for minimum absolute relative distance (max possible is 15 or 8)
+function EnemiesState:target_segment(game_state, player_state, level_state)
+    -- Initialize variables for tracking the best target
+    local best_segment = -1  -- Sentinel value
+    local best_depth = 255   -- Max depth
+    local best_priority = 999 -- Higher than any valid priority
+    local best_rel_dist = 17 -- Higher than max possible relative distance
+
+    -- During tube transition, check for better lanes
+    if game_state and game_state.gamestate == 0x20 then
+        local current_segment = player_state.position & 0x0F
+        local current_spike = level_state.spike_heights[current_segment] or 0
+        local is_open = level_state.level_type == 0xFF
+        local spinner = 0
+
+        -- Look left if not at segment 0 (or if in closed level)
+        if current_segment > 0 or not is_open then
+            local left_segment = (current_segment - 1) & 0x0F
+            local left_spike = level_state.spike_heights[left_segment] or 0
+            if left_spike < current_spike then
+                spinner = -9  -- Move left
+            end
+        end
+
+        -- Look right if not at segment 15 (or if in closed level)
+        if (current_segment < 15 or not is_open) and spinner == 0 then
+            local right_segment = (current_segment + 1) & 0x0F
+            local right_spike = level_state.spike_heights[right_segment] or 0
+            if right_spike < current_spike then
+                spinner = 9   -- Move right
+            end
+        end
+
+        -- Return INVALID_SEGMENT during tube transitions, but include movement recommendation
+        player_state.spinner_commanded = spinner
+        return INVALID_SEGMENT, 255
+    end
 
     -- Get player state needed for relative calculations
-    local player_abs_segment = mem:read_u8(0x0200) & 0x0F
-    local is_open = mem:read_u8(0x0111) == 0xFF
+    local player_abs_segment = player_state.position & 0x0F
+    local is_open = level_state.level_type == 0xFF
 
-    -- Check standard enemy table (7 slots)
+    -- Priority order: Flipper (0) > Pulsar (1) > Tanker (2) > Non-charging Fuseball (4) > Spiker (3)
+    local priority_map = {
+        [0] = 1,  -- Flipper (highest priority)
+        [1] = 2,  -- Pulsar
+        [2] = 3,  -- Tanker
+        [4] = 4,  -- Fuseball (only if not charging)
+        [3] = 5   -- Spiker (lowest priority)
+    }
+
+    -- Check each enemy slot
     for i = 1, 7 do
-        -- Read the absolute segment and depth directly from memory for this calculation
-        local current_abs_segment = mem:read_u8(0x02B9 + i - 1) & 0x0F -- Mask to 0-15
-        local current_depth = mem:read_u8(0x02DF + i - 1)
+        local current_depth = self.enemy_depths[i]
+        local current_abs_segment = self.enemy_abs_segments[i]
+        local enemy_type = self.enemy_core_type[i]
+        local is_moving_away = self.enemy_moving_away[i] == 1
 
-        -- Only consider active enemies with valid segments (0-15)
+        -- Only consider active enemies with valid segments
         if current_depth > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 then
-            -- Calculate relative distance for this enemy
-            local current_relative_distance = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
-            local current_relative_distance_abs = math.abs(current_relative_distance)
+            local priority = priority_map[enemy_type]
+            if priority then -- If it's a recognized enemy type
+                -- Special case for Fuseballs: skip if charging (moving towards player)
+                if enemy_type == 4 and not is_moving_away then
+                    -- Skip this fuseball as it's charging
+                    goto continue
+                end
 
-            -- Priority 1: Closer depth always wins
-            if current_depth < min_depth then
-                min_depth = current_depth
-                closest_absolute_segment = current_abs_segment
-                min_relative_distance_abs = current_relative_distance_abs
-            -- Priority 2: Same depth, closer segment wins
-            elseif current_depth == min_depth then
-                if current_relative_distance_abs < min_relative_distance_abs then
-                    closest_absolute_segment = current_abs_segment
-                    min_relative_distance_abs = current_relative_distance_abs
+                -- Calculate relative distance for position comparison
+                local current_rel_dist = math.abs(absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open))
+
+                -- Decision logic for best target:
+                -- 1. Prefer higher priority enemies (lower priority number)
+                -- 2. For same priority, prefer closer depth
+                -- 3. For same depth, prefer closer segment
+                if priority < best_priority or
+                   (priority == best_priority and current_depth < best_depth) or
+                   (priority == best_priority and current_depth == best_depth and 
+                    current_rel_dist < best_rel_dist) then
+                    best_priority = priority
+                    best_depth = current_depth
+                    best_segment = current_abs_segment
+                    best_rel_dist = current_rel_dist
                 end
             end
         end
+        ::continue::
     end
 
-    -- Return the absolute segment (-1 if none found) and its depth
-    return closest_absolute_segment, min_depth
+    -- Return the best target found (or -1 if none found)
+    return best_segment, best_depth
 end
 
--- function EnemiesState:depth_of_top_enemy() -- This will be removed later
-
 function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-    -- Get the *absolute* segment AND depth of nearest enemy from the dedicated function
-    local enemy_abs_seg, enemy_depth = enemies_state:nearest_enemy_segment()
+    -- Get the player's current absolute segment
     local player_abs_seg = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
+    -- Get the nearest enemy segment from the OOB data (already prioritized by our smarter targeting)
+    local enemy_abs_seg = enemies_state.nearest_enemy_seg  -- This is already set from nearest_abs_seg_oob
+    local enemy_depth = enemies_state.nearest_enemy_depth_raw
+
     -- If no enemy was found (absolute segment is -1)
-    if enemy_abs_seg == -1 then
-        return 0, 0, 255 -- No enemy, return spinner 0, distance 0, max depth
+    if enemy_abs_seg == INVALID_SEGMENT then
+        return 0, 0, 255  -- No enemy, return spinner 0, distance 0, max depth
     end
 
     -- Calculate the relative segment distance using the helper function
@@ -1073,33 +1127,18 @@ function direction_to_nearest_enemy(game_state, level_state, player_state, enemi
 
     -- If already aligned (relative distance is 0)
     if enemy_relative_dist == 0 then
-        return 0, 0, enemy_depth -- Aligned, return spinner 0, distance 0, current depth
+        return 0, 0, enemy_depth  -- Aligned, return spinner 0, distance 0, current depth
     end
 
-    local intensity
-    local spinner
-    local actual_segment_distance
-
-    -- Calculate actual segment distance based on relative distance
-    actual_segment_distance = math.abs(enemy_relative_dist)
-
-    -- Set intensity based on distance
-    intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
+    -- Calculate actual segment distance and intensity
+    local actual_segment_distance = math.abs(enemy_relative_dist)
+    local intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
 
     -- Set spinner direction based on the sign of the relative distance
     -- The absolute_to_relative_segment function handles open/closed logic correctly
-    if is_open then
-        -- Open Level: Positive relative distance means enemy is clockwise (higher segment index).
-        -- We want to move clockwise (positive spinner) towards it.
-        -- Corrected logic: same as closed level
-        spinner = enemy_relative_dist > 0 and intensity or -intensity
-    else
-        -- Closed Level: Positive relative distance means enemy is clockwise.
-        -- We want to move clockwise (positive spinner) towards it.
-        spinner = enemy_relative_dist > 0 and intensity or -intensity
-    end
+    local spinner = enemy_relative_dist > 0 and intensity or -intensity
 
-    return spinner, actual_segment_distance, enemy_depth -- Return spinner, distance, AND depth
+    return spinner, actual_segment_distance, enemy_depth
 end
 
 
@@ -1198,9 +1237,9 @@ function Controls:apply_action(fire, zap, spinner, p1_start, game_state, player_
     player_state.zap_commanded = zap
     player_state.spinner_commanded = spinner
 
-    if self.fire_field then self.fire_field:set_value(fire) end
-    if self.zap_field then self.zap_field:set_value(zap) end
-    if self.p1_start_field then self.p1_start_field:set_value(p1_start) end 
+    self.fire_field:set_value(fire) 
+    self.zap_field:set_value(zap) 
+    self.p1_start_field:set_value(p1_start)  
 
     -- Write AI spinner value to memory only if non-zero to potentially reduce noise/interference
     if spinner ~= 0 then
@@ -1421,10 +1460,49 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     local is_open_level = level_state.level_type == 0xFF
 
     -- Get the ABSOLUTE nearest enemy segment (-1 sentinel) and depth for OOB packing
-    local nearest_abs_seg_oob, enemy_depth_oob = enemies_state:nearest_enemy_segment()
+    local nearest_abs_seg_oob, enemy_depth_oob = enemies_state:target_segment(game_state, player_state, level_state)
     local player_abs_seg_oob = player_state.position & 0x0F -- Use absolute player segment 0-15
 
     local is_enemy_present_oob = (nearest_abs_seg_oob ~= -1) and 1 or 0 -- Check against -1 sentinel
+
+    -- Calculate expert recommendations
+    local should_fire = 1  -- Always fire by default
+    local should_zap = 0
+
+    -- Fire if:
+    -- 1. Enemy is aligned and close
+    if nearest_abs_seg_oob == player_abs_seg_oob and enemy_depth_oob <= 0x60 then
+        should_fire = 1
+    end
+    -- 2. Flippers on top rail next to us
+    local leftDepth, leftType = top_enemy_in_segment(player_abs_seg_oob - 1, level_state, enemies_state)
+    local rightDepth, rightType = top_enemy_in_segment(player_abs_seg_oob + 1, level_state, enemies_state)
+    if (leftDepth <= 0x10 and leftType == 0) or (rightDepth <= 0x10 and rightType == 0) then
+        should_fire = 1
+    end
+
+    -- Zap if:
+    -- 1. Multiple enemies at close range
+    local close_enemies = 0
+    for i = 1, 7 do
+        if enemies_state.enemy_depths[i] <= 0x40 then
+            close_enemies = close_enemies + 1
+            if close_enemies >= 3 then
+                should_zap = 1
+                break
+            end
+        end
+    end
+
+    -- Never zap during tube transitions
+    if game_state.gamestate == 0x20 then
+        should_zap = 0
+    end
+
+    -- Never zap if we don't have it available
+    if player_state.superzapper_uses == 0 then
+        should_zap = 0
+    end
 
     -- Pack header data using 2-byte integers where possible
     local score = player_state.score or 0
@@ -1439,7 +1517,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- d = double
     -- B = unsigned char (uint8)
     -- h = signed short (int16)
-    local oob_data = string.pack(">HdBBBHHHBBBhBhBB",
+    local oob_data = string.pack(">HdBBBHHHBBBhBhBBBB",
         #data,                          -- H num_values (size of main payload in 16-bit words)
         reward,                         -- d reward
         0,                              -- B game_action (placeholder)
@@ -1453,9 +1531,11 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         player_state.zap_commanded,     -- B zap_commanded
         player_state.spinner_commanded, -- h spinner_delta (model output, int8 range but packed as int16)
         is_attract_mode and 1 or 0,     -- B is_attract_mode
-        nearest_abs_seg_oob,            -- h nearest_enemy_segment (ABSOLUTE, -1 sentinel, packed as int16)
+        nearest_abs_seg_oob,            -- h target_segment (ABSOLUTE, -1 sentinel, packed as int16)
         player_abs_seg_oob,             -- B player_segment (ABSOLUTE 0-15)
-        is_open_level and 1 or 0        -- B is_open_level
+        is_open_level and 1 or 0,       -- B is_open_level
+        should_fire,                    -- B expert fire recommendation
+        should_zap                      -- B expert zap recommendation
     )
     -- --- End OOB Data Packing ---
 
@@ -1482,6 +1562,7 @@ local last_player_position = nil
 local last_timer_value = nil
 local method_fps_counter = {0, 0, 0}  -- For 3 different methods
 local method_start_time = os.clock()
+local last_frame_counter = 0  -- Initialize counter for FPS calculation
 
 local function frame_callback()
     -- Check the time counter at address 0x0003
@@ -1493,15 +1574,14 @@ local function frame_callback()
     end
     lastTimer = currentTimer
     
-    -- Increment frame count and track FPS
-    frame_count = frame_count + 1
+    -- Track FPS using frame_counter instead of separate frame_count
     local current_time = os.time()
     
     -- Calculate FPS every second
     if current_time > last_fps_time then
-        -- Update the FPS display only when we calculate it
-        game_state.current_fps = frame_count  -- Update in GameState for display
-        frame_count = 0
+        -- Update the FPS display using frame_counter
+        game_state.current_fps = game_state.frame_counter - last_frame_counter
+        last_frame_counter = game_state.frame_counter
         last_fps_time = current_time
     end
     
@@ -1515,7 +1595,7 @@ local function frame_callback()
     player_state:update(mem)
     
     -- Update enemies state last to ensure all references are correct
-    enemies_state:update(mem)
+    enemies_state:update(mem, game_state, player_state, level_state)
     
 
     -- Declare num_values at the start of the function
@@ -1619,18 +1699,12 @@ local function frame_callback()
     local should_update_display = (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
 
     -- Apply the action to the controls, which will also update the player_state to reflect the commanded values
-
-    if game_state.gamestate == 0x16 then                                                -- Level Select Mode    
-        controls:apply_action(frame_count % 2, 0, -31, 0, game_state, player_state)
-    elseif game_state.gamestate == 0x12 then                                                -- High Score Entry Mode                
-        print("High Score Entry Mode")
-        if (frame_count % 30 == 0) then
-            controls:apply_action(1, 0, 0, 0, game_state, player_state)
-        elseif (frame_count % 30 == 15) then
-            controls:apply_action(0, 0, 0, 0, game_state, player_state)
-        end
+    if game_state.gamestate == 0x12 then                                                -- High Score Entry Mode (0x12 = 18)               
+        controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
+    elseif game_state.gamestate == 0x16 then                                            -- Level Select Mode    
+        controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
     elseif (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
-        controls:apply_action(0, 0, 0, frame_count % 2, game_state, player_state)
+        controls:apply_action(0, 0, 0, game_state.frame_counter % 2, game_state, player_state)
     elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then  -- AI Modes
         controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
     end

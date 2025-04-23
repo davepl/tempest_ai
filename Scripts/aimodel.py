@@ -130,6 +130,8 @@ class FrameData:
     enemy_seg: int
     player_seg: int
     open_level: bool
+    expert_fire: bool  # Added: Expert system fire recommendation
+    expert_zap: bool   # Added: Expert system zap recommendation
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -144,7 +146,9 @@ class FrameData:
             save_signal=data["save_signal"],
             enemy_seg=data["enemy_seg"],
             player_seg=data["player_seg"],
-            open_level=data["open_level"]
+            open_level=data["open_level"],
+            expert_fire=data["expert_fire"],
+            expert_zap=data["expert_zap"]
         )
 
 # Configuration constants
@@ -622,7 +626,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">HdBBBHHHBBBhBhBB"  # Updated to include both score components
+        format_str = ">HdBBBHHHBBBhBhBBBB"  # Updated format string
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
@@ -631,7 +635,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             
         values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
-        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
+        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open, \
+        expert_fire, expert_zap = values  # Added expert recommendations
         
         # Combine score components
         score = (score_high * 65536) + score_low
@@ -656,7 +661,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         if len(state_values) != num_values:
             print(f"ERROR: Expected {num_values} state values but got {len(state_values)}", flush=True)
             sys.exit(1)
-                
+        
         frame_data = FrameData(
             state=state,
             reward=reward,
@@ -667,7 +672,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             save_signal=bool(save_signal),
             enemy_seg=nearest_enemy,
             player_seg=player_seg,
-            open_level=bool(is_open)
+            open_level=bool(is_open),
+            expert_fire=bool(expert_fire),
+            expert_zap=bool(expert_zap)
         )
         
         return frame_data
@@ -717,29 +724,37 @@ def display_metrics_row(agent, kb=None):
     )
     print_with_terminal_restore(kb, row)
 
-def get_expert_action(enemy_seg, player_seg, is_open_level):
-    """Calculate expert-guided action based on game state"""
- 
-    if enemy_seg == -1:
-        return 1, 0, 0  # No enemies, might as well fire
-
-    if enemy_seg == player_seg:
-        return 1, 0, 0  # Fire when aligned
+def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
+    """Calculate expert-guided action based on game state and Lua recommendations"""
+    # Check for INVALID_SEGMENT (-32768) which indicates no valid target (like during tube transitions)
+    if enemy_seg == -32768:  # INVALID_SEGMENT
+        return expert_fire, expert_zap, 0  # Use Lua's recommendations with no movement
         
-    # Calculate movement based on level type
+    # Convert absolute segments to relative distance
     if is_open_level:
-        distance = abs(enemy_seg - player_seg)
-        intensity = min(0.9, 0.1 + (distance * 0.25))  # Lower base intensity
-        spinner = -intensity if enemy_seg > player_seg else intensity
+        # Open level: direct distance calculation (-15 to +15)
+        relative_dist = enemy_seg - player_seg
     else:
-        # Calculate shortest path with wraparound
+        # Closed level: find shortest path around the circle (-7 to +8)
         clockwise = (enemy_seg - player_seg) % 16
         counter = (player_seg - enemy_seg) % 16
-        min_dist = min(clockwise, counter)
-        intensity = min(0.9, 0.1 + (min_dist * 0.25))  # Lower base intensity
-        spinner = -intensity if clockwise < counter else intensity
+        if clockwise <= 8:
+            relative_dist = clockwise  # Move clockwise
+        else:
+            relative_dist = -counter  # Move counter-clockwise
+
+    if relative_dist == 0:
+        return expert_fire, expert_zap, 0  # Use Lua's recommendations when aligned
+        
+    # Calculate intensity based on distance
+    distance = abs(relative_dist)
+    intensity = min(0.9, 0.3 + (distance * 0.05))  # Match Lua intensity calculation
     
-    return 1, 0, spinner  # Fire while moving
+    # For positive relative_dist (need to move clockwise), use negative spinner
+    spinner = -intensity if relative_dist > 0 else intensity
+    
+    # Always use Lua's recommendations for fire/zap while moving
+    return expert_fire, expert_zap, spinner
 
 def expert_action_to_index(fire, zap, spinner):
     """Convert continuous expert actions to discrete action index"""
