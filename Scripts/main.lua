@@ -1669,6 +1669,12 @@ local function frame_callback()
     -- Update game state first
     game_state:update(mem)
     
+    -- Reset start_delay when entering attract mode
+    if (game_state.game_mode & 0x80) == 0 and game_state.start_delay ~= nil then
+        game_state.start_delay = nil  -- Reset delay so it will be regenerated
+        print("Reset start delay for new attract mode session")
+    end
+    
     -- Update level state next
     level_state:update(mem)
     
