@@ -57,7 +57,7 @@ class RLConfigData:
     epsilon_decay_factor: float = 0.9969 # Multiplicative factor per step (Adjusted for ~15M frames)
     epsilon_decay_steps: int = 10000   # Frames per decay step
     update_target_every: int = 500
-    learning_rate: float = 0.0001
+    learning_rate: float = 0.001
     memory_size: int = 200000
     save_interval: int = 50000
     train_freq: int = 4

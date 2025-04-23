@@ -1057,6 +1057,26 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
     local player_abs_segment = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
+    -- First, check for charging Fuseballs at the top rail (0x10)
+    -- If found, we want to move away from them
+    for i = 1, 7 do
+        local current_depth = self.enemy_depths[i]
+        local current_abs_segment = self.enemy_abs_segments[i]
+        local enemy_type = self.enemy_core_type[i]
+        local is_moving_away = self.enemy_moving_away[i] == 1
+
+        -- If we find a charging Fuseball at the top rail
+        if enemy_type == 4 and current_depth == 0x10 and not is_moving_away then
+            local rel_dist = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
+            if rel_dist ~= 0 then  -- If we're not in the same segment
+                -- Move in the opposite direction of the Fuseball
+                local spinner = rel_dist > 0 and -9 or 9  -- Move away from Fuseball
+                player_state.spinner_commanded = spinner
+                return INVALID_SEGMENT, 255  -- Don't target anything, just move away
+            end
+        end
+    end
+
     -- Priority order: Flipper (0) > Pulsar (1) > Tanker (2) > Non-charging Fuseball (4) > Spiker (3)
     local priority_map = {
         [0] = 1,  -- Flipper (highest priority)
@@ -1073,8 +1093,14 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
         local enemy_type = self.enemy_core_type[i]
         local is_moving_away = self.enemy_moving_away[i] == 1
 
-        -- Only consider active enemies with valid segments
-        if current_depth > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 then
+        -- Skip Fuseballs at depth 0x10 as they're invincible there
+        if enemy_type == 4 and current_depth == 0x10 then
+            goto continue
+        end
+
+        -- Only consider active enemies with valid segments AND either at top rail (0x10) or below danger zone (>0x30)
+        if current_depth > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 and
+           (current_depth == 0x10 or current_depth > 0x30) then
             local priority = priority_map[enemy_type]
             if priority then -- If it's a recognized enemy type
                 -- Special case for Fuseballs: skip if charging (moving towards player)
@@ -1083,8 +1109,21 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
                     goto continue
                 end
 
-                -- Calculate relative distance for position comparison
-                local current_rel_dist = math.abs(absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open))
+                -- For enemies at 0x10, adjust the target segment one closer to player
+                local target_abs_segment = current_abs_segment
+                if current_depth == 0x10 then   -- Top Rail
+                    -- Calculate relative distance to determine adjustment direction
+                    local rel_dist = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
+                    -- Move one segment closer to player
+                    if rel_dist > 0 then
+                        target_abs_segment = (current_abs_segment - 1) & 0x0F  -- Move one left
+                    elseif rel_dist < 0 then
+                        target_abs_segment = (current_abs_segment + 1) & 0x0F  -- Move one right
+                    end
+                end
+
+                -- Calculate relative distance using adjusted target segment
+                local current_rel_dist = math.abs(absolute_to_relative_segment(player_abs_segment, target_abs_segment, is_open))
 
                 -- Decision logic for best target:
                 -- 1. Prefer higher priority enemies (lower priority number)
@@ -1096,7 +1135,7 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
                     current_rel_dist < best_rel_dist) then
                     best_priority = priority
                     best_depth = current_depth
-                    best_segment = current_abs_segment
+                    best_segment = target_abs_segment  -- Store adjusted target segment
                     best_rel_dist = current_rel_dist
                 end
             end
