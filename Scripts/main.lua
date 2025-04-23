@@ -35,7 +35,7 @@ package.path = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
 -- Define constants
 local INVALID_SEGMENT = -32768  -- Used as sentinel value for invalid segments
 
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local DISPLAY_UPDATE_INTERVAL = 0.02  
 
 -- Access the main CPU and memory space
@@ -59,6 +59,9 @@ local frame_count = 0  -- Initialize frame counter
 
 -- Global variables for tracking bytes sent and FPS
 local total_bytes_sent = 0
+
+-- Add near the top with other global variables
+local level_select_counter = 0
 
 -- Function to open socket connection
 local function open_socket()
@@ -214,94 +217,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         -- Enemy targeting logic
         local target_segment = enemies_state:target_segment(game_state, player_state, level_state)
         local player_segment = player_state.position & 0x0F
-        local player_abs_segment = player_state.position & 0x0F
-        local is_open = level_state.level_type == 0xFF
-
-        local mindepth, enemy_type = top_enemy_in_segment(player_abs_segment, level_state, enemies_state)
-        if (mindepth <= 0x60) then
-            -- Immediate thread approaching in this lane
-            if commanded_spinner == 0 then
-                -- Penalty for not moving when a threat is incoming
-                reward = reward - 50
-            else
-                -- Player commanded a move. Check if it's a valid dodge.
-                local valid_dodge = false
-                if not is_open then
-                    -- Closed level: any non-zero move is a dodge
-                    valid_dodge = true
-                else
-                    -- Open level: check edges
-                    if player_abs_segment == 0 then
-                        -- At left edge (0), only moving towards seg 1 (negative spinner) is valid
-                        if commanded_spinner < 0 then valid_dodge = true end
-                    elseif player_abs_segment == 15 then
-                        -- At right edge (15), only moving towards seg 14 (positive spinner) is valid
-                        if commanded_spinner > 0 then valid_dodge = true end
-                    else
-                        -- Not at an edge (1-14), any non-zero move is valid
-                        valid_dodge = true
-                    end
-                end
-
-                if valid_dodge then
-                    -- Limit the spinner magnitude used for reward calculation
-                    local reward_spinner_magnitude = math.min(math.abs(commanded_spinner), 4) -- Cap at 4
-                    -- Reward successful dodge attempt, proportional to capped speed
-                    reward = reward + reward_spinner_magnitude * 100
-                end
-            end
-        end
-        -- *** End Combined Threat Dodging Logic ***
-
-        local leftDepth, leftType = top_enemy_in_segment(player_abs_segment - 1, level_state, enemies_state)
-        local rightDepth, rightType = top_enemy_in_segment(player_abs_segment + 1, level_state, enemies_state)
-
-        -- Be sure to shoot at flippers when they're on the top rail and right next to you
-
-        if (leftDepth <= 0x10 and leftType == 00) or (rightDepth <= 0x10 and rightType == 00) then
-            if (player_state.fire_commanded == 1 and player_state.shot_count < 8) then
-                reward = reward + 500
-            end
-        end
-    
-        -- If the left enemy is below 0x40, and is a Tanker or Fuseball, reward moving right, penalize moving left
-
-        if (leftDepth <= 0x60 and (leftType == 0x02 or leftType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
-            if commanded_spinner < 0 then -- Moving right (away)
-                reward = reward + 500
-            elseif commanded_spinner > 0 then -- Moving left (towards)
-                reward = reward - 100 -- Penalize moving left
-            else
-                reward = reward - 75  -- Penalize staying still
-            end
-        end
-
-        -- Same for the right: If right enemy is Tanker/Fuseball, reward moving left, penalize moving right
-
-        if (rightDepth <= 0x60 and (rightType == 0x02 or rightType == 0x04)) then -- Check for Tanker (2) or Fuseball (4)
-            if commanded_spinner > 0 then -- Moving left (away)
-                reward = reward + 500   
-                print("Tanker/Fuseball right reward: " .. 500)
-            elseif commanded_spinner < 0 then -- Moving right (towards)
-                reward = reward - 100 -- Corrected syntax
-            else
-                reward = reward - 75
-            end
-        end
-
-        -- Don't walk into shots: Penalize moving towards an adjacent lane with a SHOT (type 8) CLOSE to the player (depth <= 0x30)
-
-        if (leftDepth <= 0x60 and leftType == 0x08) then -- Check for CLOSE shot (depth <= 30)
-            if (commanded_spinner > 0) then -- Moving left (towards shot)
-                reward = reward - 1000
-            end
-        end
-        
-        if(rightDepth <= 0x60 and rightType == 0x08) then -- Check for CLOSE shot (depth <= 30)
-            if (commanded_spinner < 0) then -- Moving right (towards shot)
-                reward = reward - 1000
-            end
-        end
 
         -- Tube Zoom logic adjustment
         if game_state.gamestate == 0x20 then    -- In tube zoom
@@ -314,7 +229,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             else
                 reward = reward + (commanded_spinner == 0 and 250 or -50) -- Max reward if no spike
             end
-            -- Reward shooting at all times, replace anything deducted for not managing shots below 8
+            
             if (player_state.fire_commanded == 1) then
                 reward = reward + 200
             end
@@ -324,7 +239,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             reward = reward + (commanded_spinner == 0 and 150 or -20)
         else
             -- Get desired spinner direction, segment distance, AND enemy depth
-            local desired_spinner, segment_distance, enemy_depth = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
+            local desired_spinner, segment_distance, enemy_depth = direction_to_nearest_enemy(game_state, level_state, player_state, target_segment)
 
             -- Check alignment based on actual segment distance
             if segment_distance == 0 then 
@@ -332,7 +247,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 if commanded_spinner == 0 then
                     reward = reward + 250
                 else
-                    reward = reward - 100
+                    reward = reward - segment_distance + 10
                 end
 
                 if player_state.fire_commanded then
@@ -1029,63 +944,83 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
         local current_segment = player_state.position & 0x0F
         local current_spike = level_state.spike_heights[current_segment] or 0
         local is_open = level_state.level_type == 0xFF
-        local spinner = 0
+        
+        -- Initialize best segment as current segment
+        local best_segment = current_segment
+        local best_spike = current_spike
 
         -- Look left if not at segment 0 (or if in closed level)
         if current_segment > 0 or not is_open then
             local left_segment = (current_segment - 1) & 0x0F
             local left_spike = level_state.spike_heights[left_segment] or 0
-            if left_spike < current_spike then
-                spinner = -9  -- Move left
+            if left_spike < best_spike then
+                best_segment = left_segment
+                best_spike = left_spike
             end
         end
 
         -- Look right if not at segment 15 (or if in closed level)
-        if (current_segment < 15 or not is_open) and spinner == 0 then
+        if current_segment < 15 or not is_open then
             local right_segment = (current_segment + 1) & 0x0F
             local right_spike = level_state.spike_heights[right_segment] or 0
-            if right_spike < current_spike then
-                spinner = 9   -- Move right
+            -- Compare against current best_spike, which might be from left side
+            if right_spike < best_spike then
+                best_segment = right_segment
+                best_spike = right_spike
             end
         end
 
-        -- Return INVALID_SEGMENT during tube transitions, but include movement recommendation
-        player_state.spinner_commanded = spinner
-        return INVALID_SEGMENT, 255
+        -- Debug output to see what's happening
+        print(string.format("Tube transition - Current: %d (spike: %d), Best: %d (spike: %d)", 
+            current_segment, current_spike, best_segment, best_spike))
+
+        return best_segment, 255
     end
 
-    -- Get player state needed for relative calculations
+    -- Normal gameplay enemy targeting starts here
     local player_abs_segment = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
-    -- First, check for charging Fuseballs at the top rail (0x10) or in our current lane
+    -- First check for dangerous Fuseballs (at top rail or close and approaching)
     for i = 1, 7 do
-        local current_depth = self.enemy_depths[i]
-        local current_abs_segment = self.enemy_abs_segments[i]
-        local enemy_type = self.enemy_core_type[i]
-        local is_moving_away = self.enemy_moving_away[i] == 1
-
-        -- If we find a charging Fuseball (type 4 and moving towards us)
-        if enemy_type == 4 and not is_moving_away and current_depth > 0 then
-            local rel_dist = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
-            if rel_dist == 0 or current_depth == 0x10 then
-                -- If Fuseball is at the top rail, move away from it based on relative distance
-                if current_depth == 0x10 then
-                    -- If rel_dist > 0, Fuseball is to our right, so move left
-                    -- If rel_dist < 0, Fuseball is to our left, so move right
-                    local spinner = (rel_dist > 0) and -9 or 9
-                    player_state.spinner_commanded = spinner
-                    return INVALID_SEGMENT, 255
+        if self.enemy_core_type[i] == 4 and                    -- Is Fuseball
+           ((self.enemy_depths[i] == 0x10) or                  -- At top rail
+            (self.enemy_depths[i] < 0x40 and                   -- OR close and
+             self.enemy_moving_away[i] == 0)) then             -- moving towards us
+            local fuseball_segment = self.enemy_abs_segments[i]
+            if fuseball_segment >= 0 and fuseball_segment <= 15 then
+                -- Found a dangerous Fuseball, move to furthest safe segment
+                if is_open then
+                    -- For open level, go to either end (0 or 15) depending on which is further
+                    -- BUT don't cross over the Fuseball to get there
+                    local rel_dist = absolute_to_relative_segment(player_abs_segment, fuseball_segment, true)
+                    -- If Fuseball is to our right, go to segment 0, if to our left, go to segment 15
+                    return rel_dist > 0 and 0 or 15, 255
                 else
-                    -- Fuseball in our lane but not at top rail, move right by default
-                    player_state.spinner_commanded = 9
-                    return INVALID_SEGMENT, 255
+                    -- For closed level, go to opposite segment (segment + 8 mod 16)
+                    return (fuseball_segment + 8) & 0x0F, 255
                 end
             end
         end
     end
 
-    -- Priority order: Flipper (0) > Pulsar (1) > Tanker (2) > Non-charging Fuseball (4) > Spiker (3)
+    -- Then check for any enemies at the top rail (0x10)
+    for i = 1, 7 do
+        if self.enemy_depths[i] == 0x10 then                   -- Any enemy at top rail
+            local enemy_segment = self.enemy_abs_segments[i]
+            if enemy_segment >= 0 and enemy_segment <= 15 then
+                -- Found a top rail enemy, move to furthest safe segment
+                if is_open then
+                    local rel_dist = absolute_to_relative_segment(player_abs_segment, enemy_segment, true)
+                    return rel_dist > 0 and 0 or 15, 255
+                else
+                    return (enemy_segment + 8) & 0x0F, 255
+                end
+            end
+        end
+    end
+
+    -- Priority order for remaining enemies: Flipper (0) > Pulsar (1) > Tanker (2) > Non-charging Fuseball (4) > Spiker (3)
     local priority_map = {
         [0] = 1,  -- Flipper (highest priority)
         [1] = 2,  -- Pulsar
@@ -1094,6 +1029,12 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
         [3] = 5   -- Spiker (lowest priority)
     }
 
+    -- Initialize best target tracking
+    local best_segment = -1
+    local best_depth = 255
+    local best_priority = 999
+    local best_rel_dist = 17
+
     -- Check each enemy slot
     for i = 1, 7 do
         local current_depth = self.enemy_depths[i]
@@ -1101,49 +1042,34 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
         local enemy_type = self.enemy_core_type[i]
         local is_moving_away = self.enemy_moving_away[i] == 1
 
-        -- Skip Fuseballs at depth 0x10 as they're invincible there
-        if enemy_type == 4 and current_depth == 0x10 then
+        -- Skip inactive enemies or invalid segments
+        if current_depth == 0 or current_abs_segment < 0 or current_abs_segment > 15 then
             goto continue
         end
 
-        -- Only consider active enemies with valid segments AND either at top rail (0x10) or below danger zone (>0x30)
-        if current_depth > 0 and current_abs_segment >= 0 and current_abs_segment <= 15 and
-           (current_depth == 0x10 or current_depth > 0x30) then
+        -- Skip enemies at top rail as they're handled above
+        if current_depth == 0x10 then
+            goto continue
+        end
+
+        -- Skip charging Fuseballs as they're handled above
+        if enemy_type == 4 and not is_moving_away then
+            goto continue
+        end
+
+        -- Only consider enemies below danger zone (>0x30)
+        if current_depth > 0x30 then
             local priority = priority_map[enemy_type]
-            if priority then -- If it's a recognized enemy type
-                -- Special case for Fuseballs: skip if charging (moving towards player)
-                if enemy_type == 4 and not is_moving_away then
-                    -- Skip this fuseball as it's charging
-                    goto continue
-                end
+            if priority then
+                local current_rel_dist = math.abs(absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open))
 
-                -- For enemies at 0x10, adjust the target segment one closer to player
-                local target_abs_segment = current_abs_segment
-                if current_depth == 0x10 then   -- Top Rail
-                    -- Calculate relative distance to determine adjustment direction
-                    local rel_dist = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
-                    -- Move one segment closer to player
-                    if rel_dist > 0 then
-                        target_abs_segment = (current_abs_segment - 1) & 0x0F  -- Move one left
-                    elseif rel_dist < 0 then
-                        target_abs_segment = (current_abs_segment + 1) & 0x0F  -- Move one right
-                    end
-                end
-
-                -- Calculate relative distance using adjusted target segment
-                local current_rel_dist = math.abs(absolute_to_relative_segment(player_abs_segment, target_abs_segment, is_open))
-
-                -- Decision logic for best target:
-                -- 1. Prefer higher priority enemies (lower priority number)
-                -- 2. For same priority, prefer closer depth
-                -- 3. For same depth, prefer closer segment
                 if priority < best_priority or
                    (priority == best_priority and current_depth < best_depth) or
                    (priority == best_priority and current_depth == best_depth and 
                     current_rel_dist < best_rel_dist) then
                     best_priority = priority
                     best_depth = current_depth
-                    best_segment = target_abs_segment  -- Store adjusted target segment
+                    best_segment = current_abs_segment
                     best_rel_dist = current_rel_dist
                 end
             end
@@ -1151,62 +1077,36 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
         ::continue::
     end
 
-    -- Return the best target found (or -1 if none found)
-    -- Before returning, check if there's a deep shot in the target lane
-    if best_segment ~= -1 then
-        -- Check all enemy shots
-        for i = 1, 4 do
-            local shot_depth = self.shot_positions[i]
-            local shot_abs_segment = self.enemy_shot_abs_segments[i]
-            
-            -- If there's a deep shot in our target lane
-            if shot_depth > 0 and shot_depth < 0x40 and shot_abs_segment == best_segment then
-                -- Calculate relative distance to determine which way to adjust
-                local rel_dist = absolute_to_relative_segment(player_state.position & 0x0F, best_segment, level_state.level_type == 0xFF)
-                -- Move one segment away from the original target
-                if rel_dist > 0 then
-                    best_segment = (best_segment - 1) & 0x0F  -- Move one left
-                elseif rel_dist < 0 then
-                    best_segment = (best_segment + 1) & 0x0F  -- Move one right
-                end
-                break  -- Found a shot, no need to check others
-            end
-        end
-    end
     return best_segment, best_depth
 end
 
-function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
+function direction_to_nearest_enemy(game_state, level_state, player_state, target_abs_segment)
     -- Get the player's current absolute segment
     local player_abs_seg = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
-    -- Get the nearest enemy segment from the OOB data (already prioritized by our smarter targeting)
-    local enemy_abs_seg = enemies_state.nearest_enemy_seg  -- This is already set from nearest_abs_seg_oob
-    local enemy_depth = enemies_state.nearest_enemy_depth_raw
-
-    -- If no enemy was found (absolute segment is -1)
-    if enemy_abs_seg == INVALID_SEGMENT then
-        return 0, 0, 255  -- No enemy, return spinner 0, distance 0, max depth
+    -- If no target was provided (target_abs_segment is -1)
+    if target_abs_segment == -1 then
+        return 0, 0, 255  -- No target, return spinner 0, distance 0, max depth
     end
 
     -- Calculate the relative segment distance using the helper function
-    local enemy_relative_dist = absolute_to_relative_segment(player_abs_seg, enemy_abs_seg, is_open)
+    local relative_dist = absolute_to_relative_segment(player_abs_seg, target_abs_segment, is_open)
 
     -- If already aligned (relative distance is 0)
-    if enemy_relative_dist == 0 then
-        return 0, 0, enemy_depth  -- Aligned, return spinner 0, distance 0, current depth
+    if relative_dist == 0 then
+        return 0, 0, 0  -- Aligned, return spinner 0, distance 0, depth 0
     end
 
     -- Calculate actual segment distance and intensity
-    local actual_segment_distance = math.abs(enemy_relative_dist)
+    local actual_segment_distance = math.abs(relative_dist)
     local intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
 
     -- Set spinner direction based on the sign of the relative distance
     -- The absolute_to_relative_segment function handles open/closed logic correctly
-    local spinner = enemy_relative_dist > 0 and intensity or -intensity
+    local spinner = relative_dist > 0 and intensity or -intensity
 
-    return spinner, actual_segment_distance, enemy_depth
+    return spinner, actual_segment_distance, 0  -- Return spinner, distance, and depth 0 (depth no longer relevant)
 end
 
 
@@ -1792,30 +1692,34 @@ local function frame_callback()
     local current_time_high_res = os.clock()
     local should_update_display = (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL
 
+    controls:apply_action(0, 0, 0, 0, game_state, player_state)
+
     -- Apply the action to the controls, which will also update the player_state to reflect the commanded values
     if game_state.gamestate == 0x12 then                                                -- High Score Entry Mode (0x12 = 18)               
-        controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
+        -- Press fire only every 30 frames instead of every other frame
+        controls:apply_action((game_state.frame_counter % 10) == 0 and 1 or 0, 0, 0, 0, game_state, player_state)
     elseif game_state.gamestate == 0x16 then                                            -- Level Select Mode    
-        controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
-        frames_to_wait = math.random(0, 50)
-    elseif (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
-        -- Only push start after our random delay
-        local should_push_start = game_state.frame_counter % 2
-        controls:apply_action(0, 0, 0, should_push_start, game_state, player_state)
-        frames_to_wait = math.random(0, 20)
-    else  -- Play mode and other states
-        -- In play mode, always fire if we have 6 or fewer shots
-        if player_state.shot_count <= 6 then
-            fire = 1
+        if level_select_counter < 60 then  -- Spin for 60 frames
+            controls:apply_action(0, 0, 31, 0, game_state, player_state)  -- No fire, no P1 Start during spin
+            level_select_counter = level_select_counter + 1
+        elseif level_select_counter == 60 then  -- Press fire exactly once
+            controls:apply_action(1, 0, 0, 0, game_state, player_state)  -- Press fire once, no P1 Start
+            level_select_counter = 0
+        else
+            controls:apply_action(0, 0, 0, 0, game_state, player_state)  -- No inputs after fire pressed
         end
-        
-        -- Debug output every 60 frames
-        if game_state.frame_counter % 60 == 0 then
-            print(string.format("Game state: 0x%02X, Game mode: 0x%02X, Shots: %d, Fire: %d", 
-                game_state.gamestate, game_state.game_mode, player_state.shot_count, fire))
+    else
+        if (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
+            -- Only push start after our random delay
+            local should_push_start = (game_state.frame_counter % 50 == 0) and 1 or 0
+            controls:apply_action(0, 0, 0, should_push_start, game_state, player_state)
+        elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then-- Play mode and other states
+            -- In play mode, always fire if we have 6 or fewer shots
+            if player_state.shot_count <= 6 then
+                fire = 1
+            end
+            controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
         end
-        
-        controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
     end
 
     -- Update the display with the current action and metrics
