@@ -1644,7 +1644,7 @@ local last_timer_value = nil
 local method_fps_counter = {0, 0, 0}  -- For 3 different methods
 local method_start_time = os.clock()
 local last_frame_counter = 0  -- Initialize counter for FPS calculation
-local frames_to_wait = math.random(0, 50)
+local frames_to_wait = 0
 local frames_waited = 0
 
 local function frame_callback()
@@ -1797,22 +1797,12 @@ local function frame_callback()
         controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
     elseif game_state.gamestate == 0x16 then                                            -- Level Select Mode    
         controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
+        frames_to_wait = math.random(0, 50)
     elseif (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
-        -- Generate a random delay between 0-59 frames if we haven't already
-        if not game_state.start_delay then
-            -- Use the current frame counter as additional entropy
-            math.randomseed(os.time() + game_state.frame_counter)
-            game_state.start_delay = math.random(0, 59)
-            print("Random start delay: " .. game_state.start_delay .. " frames")
-        end
-        
         -- Only push start after our random delay
         local should_push_start = game_state.frame_counter % 2
-        if game_state.frame_counter <= game_state.start_delay then
-            should_push_start = 0
-        end
-        
         controls:apply_action(0, 0, 0, should_push_start, game_state, player_state)
+        frames_to_wait = math.random(0, 20)
     else  -- Play mode and other states
         -- In play mode, always fire if we have 6 or fewer shots
         if player_state.shot_count <= 6 then
