@@ -1057,22 +1057,21 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
     local player_abs_segment = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
-    -- First, check for charging Fuseballs at the top rail (0x10)
-    -- If found, we want to move away from them
+    -- First, check for charging Fuseballs at the top rail (0x10) or in our current lane
     for i = 1, 7 do
         local current_depth = self.enemy_depths[i]
         local current_abs_segment = self.enemy_abs_segments[i]
         local enemy_type = self.enemy_core_type[i]
         local is_moving_away = self.enemy_moving_away[i] == 1
 
-        -- If we find a charging Fuseball at the top rail
-        if enemy_type == 4 and current_depth == 0x10 and not is_moving_away then
+        -- If we find a charging Fuseball (type 4 and moving towards us)
+        if enemy_type == 4 and not is_moving_away and current_depth > 0 then
             local rel_dist = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
-            if rel_dist ~= 0 then  -- If we're not in the same segment
-                -- Move in the opposite direction of the Fuseball
-                local spinner = rel_dist > 0 and -9 or 9  -- Move away from Fuseball
+            if rel_dist == 0 or current_depth == 0x10 then
+                -- Move right by default, left if in right half of open level
+                local spinner = (is_open and player_abs_segment > 7) and -9 or 9
                 player_state.spinner_commanded = spinner
-                return INVALID_SEGMENT, 255  -- Don't target anything, just move away
+                return INVALID_SEGMENT, 255
             end
         end
     end
@@ -1144,6 +1143,27 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
     end
 
     -- Return the best target found (or -1 if none found)
+    -- Before returning, check if there's a deep shot in the target lane
+    if best_segment ~= -1 then
+        -- Check all enemy shots
+        for i = 1, 4 do
+            local shot_depth = self.shot_positions[i]
+            local shot_abs_segment = self.enemy_shot_abs_segments[i]
+            
+            -- If there's a deep shot in our target lane
+            if shot_depth > 0 and shot_depth < 0x40 and shot_abs_segment == best_segment then
+                -- Calculate relative distance to determine which way to adjust
+                local rel_dist = absolute_to_relative_segment(player_state.position & 0x0F, best_segment, level_state.level_type == 0xFF)
+                -- Move one segment away from the original target
+                if rel_dist > 0 then
+                    best_segment = (best_segment - 1) & 0x0F  -- Move one left
+                elseif rel_dist < 0 then
+                    best_segment = (best_segment + 1) & 0x0F  -- Move one right
+                end
+                break  -- Found a shot, no need to check others
+            end
+        end
+    end
     return best_segment, best_depth
 end
 
