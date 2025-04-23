@@ -557,6 +557,7 @@ function GameState:new()
     self.frame_counter = 0  -- Frame counter for tracking progress
     self.last_save_time = os.time()  -- Track when we last sent save signal
     self.save_interval = 300  -- Send save signal every 5 minutes (300 seconds)
+    self.start_delay = nil  -- Will be set to a random value between 0-59 in attract mode
     
     -- FPS tracking (now handled at global level, not in GameState)
     self.current_fps = 0  -- Store the FPS value for display
@@ -1068,10 +1069,18 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
         if enemy_type == 4 and not is_moving_away and current_depth > 0 then
             local rel_dist = absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open)
             if rel_dist == 0 or current_depth == 0x10 then
-                -- Move right by default, left if in right half of open level
-                local spinner = (is_open and player_abs_segment > 7) and -9 or 9
-                player_state.spinner_commanded = spinner
-                return INVALID_SEGMENT, 255
+                -- If Fuseball is at the top rail, move away from it based on relative distance
+                if current_depth == 0x10 then
+                    -- If rel_dist > 0, Fuseball is to our right, so move left
+                    -- If rel_dist < 0, Fuseball is to our left, so move right
+                    local spinner = (rel_dist > 0) and -9 or 9
+                    player_state.spinner_commanded = spinner
+                    return INVALID_SEGMENT, 255
+                else
+                    -- Fuseball in our lane but not at top rail, move right by default
+                    player_state.spinner_commanded = 9
+                    return INVALID_SEGMENT, 255
+                end
             end
         end
     end
@@ -1525,19 +1534,32 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     local is_enemy_present_oob = (nearest_abs_seg_oob ~= -1) and 1 or 0 -- Check against -1 sentinel
 
     -- Calculate expert recommendations
-    local should_fire = 1  -- Always fire by default
+    local should_fire = 0  -- Default to not firing
     local should_zap = 0
 
-    -- Fire if:
-    -- 1. Enemy is aligned and close
-    if nearest_abs_seg_oob == player_abs_seg_oob and enemy_depth_oob <= 0x60 then
-        should_fire = 1
-    end
-    -- 2. Flippers on top rail next to us
-    local leftDepth, leftType = top_enemy_in_segment(player_abs_seg_oob - 1, level_state, enemies_state)
-    local rightDepth, rightType = top_enemy_in_segment(player_abs_seg_oob + 1, level_state, enemies_state)
-    if (leftDepth <= 0x10 and leftType == 0) or (rightDepth <= 0x10 and rightType == 0) then
-        should_fire = 1
+    -- Only consider firing if we have 6 or fewer shots active
+    if player_state.shot_count <= 6 then
+        -- Fire if:
+        -- 1. Enemy is aligned and close (but not at top rail)
+        if nearest_abs_seg_oob == player_abs_seg_oob and enemy_depth_oob <= 0x60 and enemy_depth_oob ~= 0x10 then
+            should_fire = 1
+        end
+
+        -- 2. We're one segment away from a top rail enemy
+        if enemy_depth_oob == 0x10 then
+            local rel_dist = absolute_to_relative_segment(player_abs_seg_oob, nearest_abs_seg_oob, is_open_level)
+            -- Fire if we're exactly one segment away
+            if math.abs(rel_dist) == 1 then
+                should_fire = 1
+            end
+        end
+
+        -- 3. Flippers on top rail next to us (this is redundant now but keeping for safety)
+        local leftDepth, leftType = top_enemy_in_segment(player_abs_seg_oob - 1, level_state, enemies_state)
+        local rightDepth, rightType = top_enemy_in_segment(player_abs_seg_oob + 1, level_state, enemies_state)
+        if (leftDepth <= 0x10 and leftType == 0) or (rightDepth <= 0x10 and rightType == 0) then
+            should_fire = 1
+        end
     end
 
     -- Zap if:
@@ -1763,7 +1785,21 @@ local function frame_callback()
     elseif game_state.gamestate == 0x16 then                                            -- Level Select Mode    
         controls:apply_action(game_state.frame_counter % 2, 0, 0, 0, game_state, player_state)
     elseif (game_state.game_mode & 0x80) == 0 then                                      -- Attract Mode
-        controls:apply_action(0, 0, 0, game_state.frame_counter % 2, game_state, player_state)
+        -- Generate a random delay between 0-59 frames if we haven't already
+        if not game_state.start_delay then
+            -- Use the current frame counter as additional entropy
+            math.randomseed(os.time() + game_state.frame_counter)
+            game_state.start_delay = math.random(0, 59)
+            print("Random start delay: " .. game_state.start_delay .. " frames")
+        end
+        
+        -- Only push start after our random delay
+        local should_push_start = game_state.frame_counter % 2
+        if game_state.frame_counter <= game_state.start_delay then
+            should_push_start = 0
+        end
+        
+        controls:apply_action(0, 0, 0, should_push_start, game_state, player_state)
     elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then  -- AI Modes
         controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
     end
@@ -2088,3 +2124,4 @@ end
     Main Frame Callback Logic
 --]]
 local frame_counter = 0
+
