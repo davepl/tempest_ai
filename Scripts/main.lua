@@ -1806,7 +1806,18 @@ local function frame_callback()
         end
         
         controls:apply_action(0, 0, 0, should_push_start, game_state, player_state)
-    elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x24 then  -- AI Modes
+    else  -- Play mode and other states
+        -- In play mode, always fire if we have 6 or fewer shots
+        if player_state.shot_count <= 6 then
+            fire = 1
+        end
+        
+        -- Debug output every 60 frames
+        if game_state.frame_counter % 60 == 0 then
+            print(string.format("Game state: 0x%02X, Game mode: 0x%02X, Shots: %d, Fire: %d", 
+                game_state.gamestate, game_state.game_mode, player_state.shot_count, fire))
+        end
+        
         controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
     end
 
