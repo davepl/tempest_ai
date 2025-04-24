@@ -117,10 +117,7 @@ local last_display_update = 0  -- Timestamp of last display update
 
 -- NEW Function: Find the topmost entity (enemy or shot) in a specific absolute segment
 -- Returns: depth (0-255) and type (0-7 for enemies, 8 for shots, -1 if lane clear)
-function top_enemy_in_segment(target_abs_segment, level_state, enemies_state) -- Removed mem
-    local min_depth = 256 -- Initialize with a value greater than max depth
-    local found_type = -1 -- Sentinel for 'nothing found'
-
+function top_enemy_in_segment(target_abs_segment, level_state, enemies_state)
     -- Determine level type internally
     local is_open_level = (level_state.level_type == 0xFF)
 
@@ -134,24 +131,10 @@ function top_enemy_in_segment(target_abs_segment, level_state, enemies_state) --
     -- Ensure target segment is valid (handles wrapping for closed levels)
     target_abs_segment = target_abs_segment & 0x0F
 
-    -- 1. Check Enemies (Slots 1-7)
-    for i = 1, 7 do
-        -- Use pre-calculated absolute segment and depth
-        local enemy_abs_segment = enemies_state.enemy_abs_segments[i]
-        local enemy_depth = enemies_state.enemy_depths[i]
-        -- Use pre-calculated moving away status (0 means moving towards)
-        local is_moving_towards = (enemies_state.enemy_moving_away[i] == 0)
+    -- 1. Check Enemy Shots first (they're highest priority)
+    local min_depth = 256 -- Initialize with a value greater than max depth
+    local found_type = -1 -- Sentinel for 'nothing found'
 
-        -- Consider only active enemies (segment ~= INVALID) in the target segment *and* moving towards the player
-        if enemy_abs_segment ~= INVALID_SEGMENT and enemy_abs_segment == target_abs_segment and is_moving_towards then
-            if enemy_depth < min_depth then
-                min_depth = enemy_depth
-                found_type = enemies_state.enemy_core_type[i]
-            end
-        end
-    end
-
-    -- 2. Check Enemy Shots (Slots 1-4)
     for i = 1, 4 do
         -- Use pre-calculated absolute segment and depth
         local shot_abs_segment = enemies_state.enemy_shot_abs_segments[i]
@@ -159,17 +142,36 @@ function top_enemy_in_segment(target_abs_segment, level_state, enemies_state) --
 
         -- Consider only active shots (segment ~= INVALID) in the target segment
         if shot_abs_segment ~= INVALID_SEGMENT and shot_abs_segment == target_abs_segment then
-             if shot_depth < min_depth then
-                min_depth = shot_depth
-                found_type = 8 -- Assign type 8 for enemy shots
-             end
+            print(string.format("TOP_ENEMY: Found shot in segment %d at depth %02X", shot_abs_segment, shot_depth))
+            min_depth = shot_depth
+            found_type = 8 -- Assign type 8 for enemy shots
+        end
+    end
+
+    -- 2. Then check Enemies (Slots 1-7)
+    for i = 1, 7 do
+        -- Use pre-calculated absolute segment and depth
+        local enemy_abs_segment = enemies_state.enemy_abs_segments[i]
+        local enemy_depth = enemies_state.enemy_depths[i]
+        local enemy_type = enemies_state.enemy_core_type[i]
+
+        -- Consider all active enemies in the target segment
+        if enemy_abs_segment ~= INVALID_SEGMENT and enemy_abs_segment == target_abs_segment then
+            print(string.format("TOP_ENEMY: Found enemy type %d in segment %d at depth %02X", enemy_type, enemy_abs_segment, enemy_depth))
+            -- If we haven't found anything yet, or if this enemy is closer
+            if found_type == -1 or enemy_depth < min_depth then
+                min_depth = enemy_depth
+                found_type = enemy_type
+            end
         end
     end
 
     -- 3. Return results
     if min_depth > 255 then -- If min_depth wasn't updated, nothing was found
+        print("TOP_ENEMY: Nothing found in segment")
         return 255, 0
     else
+        print(string.format("TOP_ENEMY: Returning depth %02X, type %d", min_depth, found_type))
         return min_depth, found_type
     end
 end
@@ -179,11 +181,10 @@ end
 local function calculate_reward(game_state, level_state, player_state, enemies_state, commanded_spinner)
     local reward = 0
     local bDone = false
+    local should_fire = false
 
     -- Base survival reward - make staying alive more valuable
-    
     if player_state.alive == 1 then
-
         -- Score-based reward (keep this as a strong motivator).  Filter out large bonus awards.
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta <= 1000 then
@@ -207,7 +208,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
         
         -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
-
         if (game_state.gamestate == 0x04) then
             if (player_state.superzapper_active ~= 0) then
                 reward = reward - 500
@@ -215,7 +215,8 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
         end
                 
         -- Enemy targeting logic
-        local target_segment = enemies_state:target_segment(game_state, player_state, level_state)
+        local target_segment, target_depth, target_should_fire = enemies_state:target_segment(game_state, player_state, level_state)
+        should_fire = target_should_fire  -- Capture the firing recommendation
         local player_segment = player_state.position & 0x0F
 
         -- Tube Zoom logic adjustment
@@ -287,11 +288,8 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 end               
             end
         end
-
     else
-        
         -- Large penalty for death to prioritize survival
-
         if previous_alive_state == 1 then
             reward = reward - 20000
             bDone = true
@@ -305,10 +303,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
     LastRewardState = reward
 
-    if (reward > 1000) then
-        print("Reward: " .. reward)
-    end
-    return reward, bDone
+    return reward, bDone, should_fire
 end
 
 -- Function to send parameters and get action each frame
@@ -929,59 +924,45 @@ function EnemiesState:update(mem, game_state, player_state, level_state)
     end
 end
 
--- Find the *absolute* segment and depth of the enemy closest to the top of the tube
--- This is used primarily for OOB data packing and targeting decisions that need absolute values.
--- If multiple enemies share the minimum depth, it chooses the one closest in segment distance.
-function EnemiesState:target_segment(game_state, player_state, level_state)
-    -- Initialize variables for tracking the best target
-    local best_segment = -1  -- Sentinel value
-    local best_depth = 255   -- Max depth
-    local best_priority = 999 -- Higher than any valid priority
-    local best_rel_dist = 17 -- Higher than max possible relative distance
+-- Function to check if we should fire at a segment
+local function check_segment_threat(segment, level_state, enemies_state)
+    local depth, enemy_type = top_enemy_in_segment(segment, level_state, enemies_state)
+    
+    -- If nothing found in segment
+    if depth == 255 then
+        return false
+    end
+    
+    -- Never aim at fuseballs
+    if enemy_type == 4 then
+        return false
+    end
 
+    -- Always fire at enemy shots (type 8)
+    if enemy_type == 8 then
+        return true
+    end
+    
+    -- Fire at any enemy in our segment (except fuseballs)
+    return true
+end
+
+function EnemiesState:target_segment(game_state, player_state, level_state)
+    -- Initialize return values
+    local best_segment = -1  -- Use -1 as sentinel for no target
+    local best_depth = 255   -- Use 255 as sentinel for max depth
+    local should_fire = false
+    
     -- During tube transition, check for better lanes
     if game_state and game_state.gamestate == 0x20 then
-        local current_segment = player_state.position & 0x0F
-        local current_spike = level_state.spike_heights[current_segment] or 0
-        local is_open = level_state.level_type == 0xFF
-        
-        -- Initialize best segment as current segment
-        local best_segment = current_segment
-        local best_spike = current_spike
-
-        -- Look left if not at segment 0 (or if in closed level)
-        if current_segment > 0 or not is_open then
-            local left_segment = (current_segment - 1) & 0x0F
-            local left_spike = level_state.spike_heights[left_segment] or 0
-            if left_spike < best_spike then
-                best_segment = left_segment
-                best_spike = left_spike
-            end
-        end
-
-        -- Look right if not at segment 15 (or if in closed level)
-        if current_segment < 15 or not is_open then
-            local right_segment = (current_segment + 1) & 0x0F
-            local right_spike = level_state.spike_heights[right_segment] or 0
-            -- Compare against current best_spike, which might be from left side
-            if right_spike < best_spike then
-                best_segment = right_segment
-                best_spike = right_spike
-            end
-        end
-
-        -- Debug output to see what's happening
-        print(string.format("Tube transition - Current: %d (spike: %d), Best: %d (spike: %d)", 
-            current_segment, current_spike, best_segment, best_spike))
-
-        return best_segment, 255
+        return best_segment, best_depth, should_fire
     end
 
     -- Normal gameplay enemy targeting starts here
     local player_abs_segment = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
-    -- First check for dangerous Fuseballs (at top rail or close and approaching)
+    -- First check for dangerous Fuseballs
     for i = 1, 7 do
         if self.enemy_core_type[i] == 4 and                    -- Is Fuseball
            ((self.enemy_depths[i] == 0x10) or                  -- At top rail
@@ -989,95 +970,49 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
              self.enemy_moving_away[i] == 0)) then             -- moving towards us
             local fuseball_segment = self.enemy_abs_segments[i]
             if fuseball_segment >= 0 and fuseball_segment <= 15 then
-                -- Found a dangerous Fuseball, move to furthest safe segment
-                if is_open then
-                    -- For open level, go to either end (0 or 15) depending on which is further
-                    -- BUT don't cross over the Fuseball to get there
-                    local rel_dist = absolute_to_relative_segment(player_abs_segment, fuseball_segment, true)
-                    -- If Fuseball is to our right, go to segment 0, if to our left, go to segment 15
-                    return rel_dist > 0 and 0 or 15, 255
-                else
-                    -- For closed level, go to opposite segment (segment + 8 mod 16)
-                    return (fuseball_segment + 8) & 0x0F, 255
-                end
+                best_segment = fuseball_segment
+                best_depth = self.enemy_depths[i]
+                should_fire = false  -- Don't fire at fuseballs
+                return best_segment, best_depth, should_fire
             end
         end
     end
 
-    -- Then check for any enemies at the top rail (0x10)
+    -- Check for top rail enemies
     for i = 1, 7 do
-        if self.enemy_depths[i] == 0x10 then                   -- Any enemy at top rail
+        if self.enemy_depths[i] == 0x10 then
             local enemy_segment = self.enemy_abs_segments[i]
             if enemy_segment >= 0 and enemy_segment <= 15 then
-                -- Found a top rail enemy, move to furthest safe segment
-                if is_open then
-                    local rel_dist = absolute_to_relative_segment(player_abs_segment, enemy_segment, true)
-                    return rel_dist > 0 and 0 or 15, 255
-                else
-                    return (enemy_segment + 8) & 0x0F, 255
-                end
+                best_segment = enemy_segment
+                best_depth = self.enemy_depths[i]
+                break
             end
         end
     end
 
-    -- Priority order for remaining enemies: Flipper (0) > Pulsar (1) > Tanker (2) > Non-charging Fuseball (4) > Spiker (3)
-    local priority_map = {
-        [0] = 1,  -- Flipper (highest priority)
-        [1] = 2,  -- Pulsar
-        [2] = 3,  -- Tanker
-        [4] = 4,  -- Fuseball (only if not charging)
-        [3] = 5   -- Spiker (lowest priority)
-    }
-
-    -- Initialize best target tracking
-    local best_segment = -1
-    local best_depth = 255
-    local best_priority = 999
-    local best_rel_dist = 17
-
-    -- Check each enemy slot
-    for i = 1, 7 do
-        local current_depth = self.enemy_depths[i]
-        local current_abs_segment = self.enemy_abs_segments[i]
-        local enemy_type = self.enemy_core_type[i]
-        local is_moving_away = self.enemy_moving_away[i] == 1
-
-        -- Skip inactive enemies or invalid segments
-        if current_depth == 0 or current_abs_segment < 0 or current_abs_segment > 15 then
-            goto continue
-        end
-
-        -- Skip enemies at top rail as they're handled above
-        if current_depth == 0x10 then
-            goto continue
-        end
-
-        -- Skip charging Fuseballs as they're handled above
-        if enemy_type == 4 and not is_moving_away then
-            goto continue
-        end
-
-        -- Only consider enemies below danger zone (>0x30)
-        if current_depth > 0x30 then
-            local priority = priority_map[enemy_type]
-            if priority then
-                local current_rel_dist = math.abs(absolute_to_relative_segment(player_abs_segment, current_abs_segment, is_open))
-
-                if priority < best_priority or
-                   (priority == best_priority and current_depth < best_depth) or
-                   (priority == best_priority and current_depth == best_depth and 
-                    current_rel_dist < best_rel_dist) then
-                    best_priority = priority
-                    best_depth = current_depth
-                    best_segment = current_abs_segment
-                    best_rel_dist = current_rel_dist
-                end
-            end
-        end
-        ::continue::
+    -- Check if we should fire at current or adjacent segments
+    should_fire = check_segment_threat(player_abs_segment, level_state, self)                     -- Current lane
+    if not should_fire and (player_abs_segment > 0 or not is_open) then
+        should_fire = check_segment_threat((player_abs_segment - 1) & 0x0F, level_state, self)   -- Left lane
+    end
+    if not should_fire and (player_abs_segment < 15 or not is_open) then
+        should_fire = check_segment_threat((player_abs_segment + 1) & 0x0F, level_state, self)   -- Right lane
     end
 
-    return best_segment, best_depth
+    -- If we haven't found a best segment yet, look for any enemy
+    if best_segment == -1 then
+        -- Find closest enemy
+        local closest_depth = 255
+        for i = 1, 7 do
+            if self.enemy_depths[i] < closest_depth and self.enemy_abs_segments[i] >= 0 and self.enemy_abs_segments[i] <= 15 then
+                closest_depth = self.enemy_depths[i]
+                best_segment = self.enemy_abs_segments[i]
+                best_depth = self.enemy_depths[i]
+            end
+        end
+    end
+
+    return best_segment, best_depth, should_fire
 end
 
 function direction_to_nearest_enemy(game_state, level_state, player_state, target_abs_segment)
@@ -1248,7 +1183,7 @@ local function move_cursor_to_row(row)
 end
 
 -- Function to flatten and serialize the game state data to signed 16-bit integers
-local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
+local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone, should_fire)
     -- Create a consistent data structure with fixed sizes
     local data = {}
 
@@ -1434,56 +1369,9 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     local is_enemy_present_oob = (nearest_abs_seg_oob ~= -1) and 1 or 0 -- Check against -1 sentinel
 
     -- Calculate expert recommendations
-    local should_fire = 0  -- Default to not firing
+    -- Use the should_fire value passed from calculate_reward
+    local expert_should_fire = should_fire and 1 or 0  -- Convert boolean to 0/1
     local should_zap = 0
-
-    -- Only consider firing if we have 6 or fewer shots active
-    if player_state.shot_count <= 6 then
-        -- Fire if:
-        -- 1. Enemy is aligned and close (but not at top rail)
-        if nearest_abs_seg_oob == player_abs_seg_oob and enemy_depth_oob <= 0x60 and enemy_depth_oob ~= 0x10 then
-            should_fire = 1
-        end
-
-        -- 2. We're one segment away from a top rail enemy
-        if enemy_depth_oob == 0x10 then
-            local rel_dist = absolute_to_relative_segment(player_abs_seg_oob, nearest_abs_seg_oob, is_open_level)
-            -- Fire if we're exactly one segment away
-            if math.abs(rel_dist) == 1 then
-                should_fire = 1
-            end
-        end
-
-        -- 3. Flippers on top rail next to us (this is redundant now but keeping for safety)
-        local leftDepth, leftType = top_enemy_in_segment(player_abs_seg_oob - 1, level_state, enemies_state)
-        local rightDepth, rightType = top_enemy_in_segment(player_abs_seg_oob + 1, level_state, enemies_state)
-        if (leftDepth <= 0x10 and leftType == 0) or (rightDepth <= 0x10 and rightType == 0) then
-            should_fire = 1
-        end
-    end
-
-    -- Zap if:
-    -- 1. Multiple enemies at close range
-    local close_enemies = 0
-    for i = 1, 7 do
-        if enemies_state.enemy_depths[i] <= 0x40 then
-            close_enemies = close_enemies + 1
-            if close_enemies >= 3 then
-                should_zap = 1
-                break
-            end
-        end
-    end
-
-    -- Never zap during tube transitions
-    if game_state.gamestate == 0x20 then
-        should_zap = 0
-    end
-
-    -- Never zap if we don't have it available
-    if player_state.superzapper_uses == 0 then
-        should_zap = 0
-    end
 
     -- Pack header data using 2-byte integers where possible
     local score = player_state.score or 0
@@ -1515,7 +1403,7 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         nearest_abs_seg_oob,            -- h target_segment (ABSOLUTE, -1 sentinel, packed as int16)
         player_abs_seg_oob,             -- B player_segment (ABSOLUTE 0-15)
         is_open_level and 1 or 0,       -- B is_open_level
-        should_fire,                    -- B expert fire recommendation
+        expert_should_fire,             -- B expert fire recommendation (using should_fire from calculate_reward)
         should_zap                      -- B expert zap recommendation
     )
     -- --- End OOB Data Packing ---
@@ -1672,20 +1560,19 @@ local function frame_callback()
     -- TODO: Re-evaluate if calculate_reward *truly* needs commanded_spinner or if previous frame's effect is ok.
 
     -- Calculate reward based on *detected* movement from the previous frame
-    local reward, bDone = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.spinner_detected)
+    local reward, bDone, should_fire = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.spinner_detected)
+    print(string.format("DEBUG FIRE: calculate_reward got should_fire=%s", should_fire and "true" or "false"))
 
     -- Flatten and serialize the game state data (using the calculated reward/bDone for OOB header)
     local frame_data
-    frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
+    frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone, should_fire)  -- Pass should_fire here
 
     -- Send the current state data (s') and reward/done (r, d) to Python,
     -- and get the action (a) for this state (s') back.
     local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
+    print(string.format("DEBUG FIRE: process_frame returned fire=%d", fire))
 
     -- Now we have the commanded spinner for THIS frame (stored in local var 'spinner')
-
-    -- BOT: Example override (commented out)
-    -- spinner = 9 * direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
     -- Update total bytes sent
     total_bytes_sent = total_bytes_sent + #frame_data
@@ -1713,10 +1600,10 @@ local function frame_callback()
             -- Only push start after our random delay
             local should_push_start = (game_state.frame_counter % 50 == 0) and 1 or 0
             controls:apply_action(0, 0, 0, should_push_start, game_state, player_state)
-        elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then-- Play mode and other states
-            -- In play mode, always fire if we have 6 or fewer shots
-            if player_state.shot_count <= 6 then
-                fire = 1
+        elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then       -- Play mode and other states
+            -- Only apply the fire command if we have 6 or fewer shots
+            if player_state.shot_count > 6 then
+                fire = 0  -- Too many shots, don't fire
             end
             controls:apply_action(fire, zap, spinner, 0, game_state, player_state)
         end

@@ -753,7 +753,7 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
     # For positive relative_dist (need to move clockwise), use negative spinner
     spinner = -intensity if relative_dist > 0 else intensity
     
-    # Always use Lua's recommendations for fire/zap while moving
+    # Always use Lua's recommendations for fire/zap
     return expert_fire, expert_zap, spinner
 
 def expert_action_to_index(fire, zap, spinner):
@@ -761,15 +761,16 @@ def expert_action_to_index(fire, zap, spinner):
     if zap:
         return 14  # Special case for zap action
         
-    # Clamp spinner value between -0.9 and 0.9
-    spinner_value = max(-0.9, min(0.9, spinner))
+    # Clamp spinner value between -0.3 and 0.3 to match ACTION_MAPPING
+    spinner_value = max(-0.3, min(0.3, spinner))
     
-    # Map spinner to 0-6 range
-    spinner_idx = int((spinner_value + 0.9) / 0.3)
-    spinner_idx = min(6, spinner_idx)  # Ensure we don't exceed valid range
+    # Map spinner to 0-6 range based on ACTION_MAPPING values
+    # -0.3 -> 0, -0.2 -> 1, -0.1 -> 2, 0.0 -> 3, 0.1 -> 4, 0.2 -> 5, 0.3 -> 6
+    spinner_idx = int((spinner_value + 0.3) / 0.1)
+    spinner_idx = min(6, max(0, spinner_idx))  # Ensure we don't exceed valid range
     
     # If firing, offset by 7 to get into the firing action range (7-13)
-    base_idx = 0 if not fire else 7
+    base_idx = 7 if fire else 0
     
     return base_idx + spinner_idx
 
