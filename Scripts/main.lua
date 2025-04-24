@@ -142,7 +142,6 @@ function top_enemy_in_segment(target_abs_segment, level_state, enemies_state)
 
         -- Consider only active shots (segment ~= INVALID) in the target segment
         if shot_abs_segment ~= INVALID_SEGMENT and shot_abs_segment == target_abs_segment then
-            print(string.format("TOP_ENEMY: Found shot in segment %d at depth %02X", shot_abs_segment, shot_depth))
             min_depth = shot_depth
             found_type = 8 -- Assign type 8 for enemy shots
         end
@@ -157,7 +156,6 @@ function top_enemy_in_segment(target_abs_segment, level_state, enemies_state)
 
         -- Consider all active enemies in the target segment
         if enemy_abs_segment ~= INVALID_SEGMENT and enemy_abs_segment == target_abs_segment then
-            print(string.format("TOP_ENEMY: Found enemy type %d in segment %d at depth %02X", enemy_type, enemy_abs_segment, enemy_depth))
             -- If we haven't found anything yet, or if this enemy is closer
             if found_type == -1 or enemy_depth < min_depth then
                 min_depth = enemy_depth
@@ -168,10 +166,8 @@ function top_enemy_in_segment(target_abs_segment, level_state, enemies_state)
 
     -- 3. Return results
     if min_depth > 255 then -- If min_depth wasn't updated, nothing was found
-        print("TOP_ENEMY: Nothing found in segment")
         return 255, 0
     else
-        print(string.format("TOP_ENEMY: Returning depth %02X, type %d", min_depth, found_type))
         return min_depth, found_type
     end
 end
@@ -933,9 +929,13 @@ local function check_segment_threat(segment, level_state, enemies_state)
         return false
     end
     
-    -- Never aim at fuseballs
+    -- For fuseballs, only avoid firing if they're close or at top rail
     if enemy_type == 4 then
-        return false
+        if depth < 0x80 then  -- Close or at top rail
+            return false
+        else
+            return true  -- Fire at distant fuseballs
+        end
     end
 
     -- Always fire at enemy shots (type 8)
@@ -943,7 +943,7 @@ local function check_segment_threat(segment, level_state, enemies_state)
         return true
     end
     
-    -- Fire at any enemy in our segment (except fuseballs)
+    -- Fire at any other enemy type
     return true
 end
 
@@ -955,34 +955,74 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
     
     -- During tube transition, check for better lanes
     if game_state and game_state.gamestate == 0x20 then
-        return best_segment, best_depth, should_fire
+        -- Get current player segment and check adjacent lanes
+        local player_abs_segment = player_state.position & 0x0F
+        local is_open = level_state.level_type == 0xFF
+        
+        -- Initialize with current lane's spike height
+        local shortest_height = level_state.spike_heights[player_abs_segment] or 255
+        local best_lane = player_abs_segment
+        
+        -- Check left lane
+        if player_abs_segment > 0 or not is_open then
+            local left_segment = (player_abs_segment - 1) & 0x0F
+            local left_height = level_state.spike_heights[left_segment] or 255
+            if left_height < shortest_height then
+                shortest_height = left_height
+                best_lane = left_segment
+            end
+        end
+        
+        -- Check right lane
+        if player_abs_segment < 15 or not is_open then
+            local right_segment = (player_abs_segment + 1) & 0x0F
+            local right_height = level_state.spike_heights[right_segment] or 255
+            if right_height < shortest_height then
+                shortest_height = right_height
+                best_lane = right_segment
+            end
+        end
+        
+        -- Return the best lane and always fire during zoom
+        return best_lane, shortest_height, true
     end
 
     -- Normal gameplay enemy targeting starts here
     local player_abs_segment = player_state.position & 0x0F
     local is_open = level_state.level_type == 0xFF
 
-    -- First check for dangerous Fuseballs
+    -- First identify dangerous fuseballs to avoid
+    local unsafe_segments = {}
     for i = 1, 7 do
         if self.enemy_core_type[i] == 4 and                    -- Is Fuseball
-           ((self.enemy_depths[i] == 0x10) or                  -- At top rail
-            (self.enemy_depths[i] < 0x40 and                   -- OR close and
-             self.enemy_moving_away[i] == 0)) then             -- moving towards us
+           self.enemy_depths[i] < 0x80 then                    -- Close or at top rail
             local fuseball_segment = self.enemy_abs_segments[i]
             if fuseball_segment >= 0 and fuseball_segment <= 15 then
-                best_segment = fuseball_segment
-                best_depth = self.enemy_depths[i]
-                should_fire = false  -- Don't fire at fuseballs
-                return best_segment, best_depth, should_fire
+                -- Mark segments within 3 distance as unsafe
+                for offset = -3, 3 do
+                    local unsafe_seg
+                    if is_open then
+                        unsafe_seg = fuseball_segment + offset
+                        if unsafe_seg >= 0 and unsafe_seg <= 15 then
+                            unsafe_segments[unsafe_seg] = true
+                        end
+                    else
+                        unsafe_seg = (fuseball_segment + offset) & 0x0F
+                        unsafe_segments[unsafe_seg] = true
+                    end
+                end
             end
         end
     end
 
-    -- Check for top rail enemies
+    -- Check for top rail enemies, but only consider safe segments
     for i = 1, 7 do
-        if self.enemy_depths[i] == 0x10 then
+        if self.enemy_depths[i] == 0x10 and                           -- At top rail
+           (self.enemy_core_type[i] ~= 4 or                          -- Not a fuseball
+            (self.enemy_core_type[i] == 4 and                        -- Or a distant fuseball
+             self.enemy_depths[i] >= 0x80)) then
             local enemy_segment = self.enemy_abs_segments[i]
-            if enemy_segment >= 0 and enemy_segment <= 15 then
+            if enemy_segment >= 0 and enemy_segment <= 15 and not unsafe_segments[enemy_segment] then
                 best_segment = enemy_segment
                 best_depth = self.enemy_depths[i]
                 break
@@ -991,23 +1031,57 @@ function EnemiesState:target_segment(game_state, player_state, level_state)
     end
 
     -- Check if we should fire at current or adjacent segments
-    should_fire = check_segment_threat(player_abs_segment, level_state, self)                     -- Current lane
+    -- Only if they're safe from charging fuseballs
+    if not unsafe_segments[player_abs_segment] then
+        should_fire = check_segment_threat(player_abs_segment, level_state, self)                     -- Current lane
+    end
     if not should_fire and (player_abs_segment > 0 or not is_open) then
-        should_fire = check_segment_threat((player_abs_segment - 1) & 0x0F, level_state, self)   -- Left lane
+        local left_segment = (player_abs_segment - 1) & 0x0F
+        if not unsafe_segments[left_segment] then
+            should_fire = check_segment_threat(left_segment, level_state, self)   -- Left lane
+        end
     end
     if not should_fire and (player_abs_segment < 15 or not is_open) then
-        should_fire = check_segment_threat((player_abs_segment + 1) & 0x0F, level_state, self)   -- Right lane
+        local right_segment = (player_abs_segment + 1) & 0x0F
+        if not unsafe_segments[right_segment] then
+            should_fire = check_segment_threat((player_abs_segment + 1) & 0x0F, level_state, self)   -- Right lane
+        end
     end
 
-    -- If we haven't found a best segment yet, look for any enemy
+    -- If we haven't found a best segment yet, look for any enemy in a safe segment
     if best_segment == -1 then
-        -- Find closest enemy
+        -- Find closest enemy in a safe segment
         local closest_depth = 255
         for i = 1, 7 do
-            if self.enemy_depths[i] < closest_depth and self.enemy_abs_segments[i] >= 0 and self.enemy_abs_segments[i] <= 15 then
+            -- Consider the enemy if:
+            -- 1. It's not a close fuseball (either not a fuseball or a distant one)
+            -- 2. It's in a safe segment
+            if (self.enemy_core_type[i] ~= 4 or                          -- Not a fuseball
+                (self.enemy_core_type[i] == 4 and                        -- Or a distant fuseball
+                 self.enemy_depths[i] >= 0x80)) and
+               self.enemy_depths[i] < closest_depth and 
+               self.enemy_abs_segments[i] >= 0 and 
+               self.enemy_abs_segments[i] <= 15 and
+               not unsafe_segments[self.enemy_abs_segments[i]] then
                 closest_depth = self.enemy_depths[i]
                 best_segment = self.enemy_abs_segments[i]
                 best_depth = self.enemy_depths[i]
+            end
+        end
+    end
+
+    -- If we still haven't found a target and we're in an unsafe segment,
+    -- find the nearest safe segment
+    if best_segment == -1 and unsafe_segments[player_abs_segment] then
+        local best_distance = 16
+        for segment = 0, 15 do
+            if not unsafe_segments[segment] then
+                local distance = math.abs(absolute_to_relative_segment(player_abs_segment, segment, is_open))
+                if distance < best_distance then
+                    best_distance = distance
+                    best_segment = segment
+                    best_depth = 0x10  -- Set a reasonable depth for movement
+                end
             end
         end
     end
@@ -1125,8 +1199,8 @@ function Controls:new()
                                self.in2_port.fields["Start 1"]
         if not self.p1_start_field then
             print("Warning: Could not find P1 Start button field in :IN2 port.")
-        end
-    else
+                        end
+                    else
         print("Warning: Could not find :IN2 port for Start button.")
     end
     
@@ -1147,8 +1221,8 @@ function Controls:apply_action(fire, zap, spinner, p1_start, game_state, player_
     -- Write AI spinner value to memory only if non-zero to potentially reduce noise/interference
     if spinner ~= 0 then
         mem:write_u8(0x0050, spinner)
-    end
-end
+            end
+        end
 
 -- Instantiate state objects - AFTER defining all classes but BEFORE functions using them
 local game_state = GameState:new()
@@ -1561,7 +1635,6 @@ local function frame_callback()
 
     -- Calculate reward based on *detected* movement from the previous frame
     local reward, bDone, should_fire = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.spinner_detected)
-    print(string.format("DEBUG FIRE: calculate_reward got should_fire=%s", should_fire and "true" or "false"))
 
     -- Flatten and serialize the game state data (using the calculated reward/bDone for OOB header)
     local frame_data
@@ -1570,7 +1643,6 @@ local function frame_callback()
     -- Send the current state data (s') and reward/done (r, d) to Python,
     -- and get the action (a) for this state (s') back.
     local fire, zap, spinner = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
-    print(string.format("DEBUG FIRE: process_frame returned fire=%d", fire))
 
     -- Now we have the commanded spinner for THIS frame (stored in local var 'spinner')
 
