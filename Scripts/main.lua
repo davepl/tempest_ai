@@ -212,10 +212,14 @@ find_target_segment = function(player_abs_seg, level_state, enemies_state)
 end
 
 -- Function to calculate desired spinner direction and distance to target
-local function direction_to_nearest_enemy(game_state, level_state, player_state, target_abs_segment)
+local function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
     -- Get the player's current absolute segment
     local player_abs_seg = player_state.position & 0x0F
-    local is_open = level_state.level_type == 0xFF
+    -- Use reliable level number pattern to determine if level is open
+    local level_num_zero_based = level_state.level_number - 1
+    local is_open = (level_num_zero_based % 4 == 2)
+    -- Get target directly from enemies_state
+    local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
 
     -- If no target was provided (target_abs_segment is -1)
     if target_abs_segment == -1 then
@@ -227,31 +231,34 @@ local function direction_to_nearest_enemy(game_state, level_state, player_state,
 
     -- If already aligned (relative distance is 0)
     if relative_dist == 0 then
-        -- Find the depth of the enemy in the aligned segment
-        -- We need EnemiesState here, but it's not passed. Let's find the enemy depth.
-        -- This requires re-finding the enemy, which is inefficient.
-        -- TODO: Refactor find_target_segment or this function to pass depth through.
-        -- For now, return 0 depth as it's used for firing logic reward only when aligned.
-        return 0, 0, 0 -- Aligned, return spinner 0, distance 0, depth 0 (temporary)
+         -- Find depth (re-fetch from state)
+         return 0, 0, enemies_state.nearest_enemy_depth_raw -- Returns 0, 0, Number
     end
 
     -- Calculate actual segment distance and intensity
     local actual_segment_distance = math.abs(relative_dist)
     local intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
-
     -- Set spinner direction based on the sign of the relative distance
-    -- The absolute_to_relative_segment function handles open/closed logic correctly
     local spinner = relative_dist > 0 and intensity or -intensity
 
     -- Depth isn't directly relevant when misaligned for spinner calculation
-    return spinner, actual_segment_distance, 0
+    return spinner, actual_segment_distance, 255 -- Returns Number, Number, 255
 end
 
 -- Function to calculate reward for the current frame
-local function calculate_reward(game_state, level_state, player_state, enemies_state, commanded_spinner)
+local function calculate_reward(game_state, level_state, player_state, enemies_state)
     local reward = 0
     local bDone = false
-    local should_fire = false
+    local detected_spinner = player_state.spinner_detected -- Use detected spinner for reward
+
+    -- Safety check for potentially uninitialized state (shouldn't happen in normal flow)
+    if not enemies_state or enemies_state.nearest_enemy_abs_seg_internal == nil then
+        print("WARNING: calculate_reward called with invalid enemies_state or nearest_enemy_abs_seg_internal is nil. Defaulting target.")
+        enemies_state = enemies_state or {}
+        enemies_state.nearest_enemy_abs_seg_internal = -1 -- Default to no target
+        enemies_state.nearest_enemy_depth_raw = 255
+        enemies_state.nearest_enemy_should_fire = false
+    end
 
     -- Base survival reward - make staying alive more valuable
     if player_state.alive == 1 then
@@ -284,10 +291,11 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             end
         end
 
-        -- Enemy targeting logic
-        local player_abs_seg = player_state.position & 0x0F -- Get player segment number
-        local target_segment, target_depth, target_should_fire = find_target_segment(player_abs_seg, level_state, enemies_state)
-        should_fire = target_should_fire -- Capture the firing recommendation
+        -- Enemy targeting logic - Use results stored in enemies_state by its update method
+        local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal -- Use the internally stored absolute segment
+        local target_depth = enemies_state.nearest_enemy_depth_raw
+        local expert_should_fire = enemies_state.nearest_enemy_should_fire -- Get firing recommendation from state
+
         local player_segment = player_state.position & 0x0F
 
         -- Tube Zoom logic adjustment
@@ -296,67 +304,65 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
             local spike_h = level_state.spike_heights[player_segment] or 0
             if spike_h > 0 then
                 local effective_spike_length = 255 - spike_h                       -- Shorter spike = higher value
-                -- Scale reward: Max 150 for no spike (height 0 -> length 255), less for longer spikes
                 reward = reward + math.max(0, (effective_spike_length / 2) - 27.5) -- Scaled reward
             else
-                reward = reward + (commanded_spinner == 0 and 250 or -50)          -- Max reward if no spike
+                -- Use detected spinner for reward calculation
+                reward = reward + (detected_spinner == 0 and 250 or -50)          -- Max reward if no spike
             end
 
-            if (player_state.fire_commanded == 1) then
+            if (player_state.fire_commanded == 1) then -- Keep using commanded for checking fire intent
                 reward = reward + 200
             end
-        elseif target_segment < 0 then
+        elseif target_abs_segment < 0 then -- This comparison should now be safe
             -- No enemies: reward staying still more strongly
-            -- Use commanded_spinner here to check if model *intended* to stay still
-            reward = reward + (commanded_spinner == 0 and 150 or -20)
+            reward = reward + (detected_spinner == 0 and 150 or -20)
+            if player_state.fire_commanded == 1 then reward = reward - 100 end -- Penalize firing at nothing
         else
             -- Get desired spinner direction, segment distance, AND enemy depth
-            -- Pass target_depth instead of recalculating
-            local desired_spinner, segment_distance, _ = direction_to_nearest_enemy(game_state, level_state, player_state, target_segment)
+            local desired_spinner, segment_distance, _ = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
 
             -- Check alignment based on actual segment distance
             if segment_distance == 0 then
                 -- Big reward for alignment + firing incentive
-                if commanded_spinner == 0 then
+                -- Use detected_spinner for checking if player is still
+                if detected_spinner == 0 then
                     reward = reward + 250
                 else
-                    reward = reward - segment_distance + 10 -- Note: segment_distance is 0 here, maybe intended penalty for moving when aligned?
+                    reward = reward - 50 -- Penalize moving when aligned
                 end
 
-                if player_state.fire_commanded then
+                if player_state.fire_commanded then -- Keep checking commanded fire
                     reward = reward + 50
                 end
             else
                 -- MISALIGNED CASE (segment_distance > 0)
                 -- Enemies at the top of tube should be shot when close (using segment distance)
                 if (segment_distance < 2) then -- Check using actual segment distance
-                    -- Use the depth returned by find_target_segment
+                    -- Use the depth stored in enemies_state
                     if (target_depth <= 0x20) then
-                        if player_state.fire_commanded == 1 then
-                            -- Strong reward for firing at close enemies
+                        if player_state.fire_commanded == 1 then -- Check commanded fire
                             reward = reward + 150
                         else
-                            -- Moderate penalty for not firing at close enemies
                             reward = reward - 50
                         end
+                    else -- Close laterally, far depth
+                         if player_state.fire_commanded == 1 then reward = reward - 20 end
                     end
+                else -- Far laterally
+                     if player_state.fire_commanded == 1 then reward = reward - 30 end
                 end
 
                 -- Graduated reward for proximity (higher reward for smaller segment distance)
                 reward = reward + (10 - segment_distance) * 5 -- Simple linear reward for proximity
 
-                -- Movement incentives (using desired_spinner direction and commanded_spinner)
-                -- Reward if the COMMANDED movement (commanded_spinner) is IN THE SAME direction as the desired direction.
-                if desired_spinner * commanded_spinner > 0 then
-                    -- Reward for moving TOWARDS the target.
+                -- Movement incentives (using desired_spinner direction and *detected* spinner)
+                -- Reward if the DETECTED movement (detected_spinner) is IN THE SAME direction as the desired direction.
+                if desired_spinner * detected_spinner > 0 then
                     reward = reward + 25
-                    -- Penalize if the COMMANDED movement is OPPOSITE to the desired direction.
-                elseif desired_spinner * commanded_spinner < 0 then
-                    -- Stronger penalty for moving AWAY from the target.
-                    reward = reward - 50 -- Increased penalty
-                    -- Penalize staying still when misaligned
-                elseif commanded_spinner == 0 and desired_spinner ~= 0 then
-                    reward = reward - 15  -- Small penalty for staying still when misaligned
+                elseif desired_spinner * detected_spinner < 0 then
+                    reward = reward - 50
+                elseif detected_spinner == 0 and desired_spinner ~= 0 then
+                    reward = reward - 15
                 end
             end
         end
@@ -375,11 +381,12 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
     LastRewardState = reward
 
-    return reward, bDone, should_fire
+    -- Return only reward and done flag now
+    return reward, bDone
 end
 
 -- Function to send parameters and get action each frame
-local function process_frame(rawdata, player_state, controls, reward, bDone, bAttractMode)
+local function process_frame(rawdata)
     -- Check if socket is open, try to reopen if not
     if not socket then
         if not open_socket() then
@@ -778,7 +785,9 @@ end
 function EnemiesState:update(mem, game_state, player_state, level_state)
     -- Get player position and level type for relative calculations
     local player_abs_segment = player_state.position & 0x0F -- Get current player absolute segment
-    local is_open = level_state.level_type == 0xFF
+    -- Determine if level is open based on number pattern (more reliable than memory flag)
+    local level_num_zero_based = level_state.level_number - 1
+    local is_open = (level_num_zero_based % 4 == 2)
 
     -- Read active enemy counts and related state
     self.active_flippers         = mem:read_u8(0x0142) -- n_flippers
@@ -901,7 +910,12 @@ function EnemiesState:update(mem, game_state, player_state, level_state)
 
     -- Calculate and store nearest enemy segment and engineered features
     -- Call find_target_segment which now encapsulates hunting logic
-    local nearest_abs_seg, nearest_depth, _ = find_target_segment(player_abs_segment, level_state, self)
+    local nearest_abs_seg, nearest_depth, should_fire = find_target_segment(player_abs_segment, level_state, self)
+
+    -- *** RESTORED LOGIC ***
+    self.nearest_enemy_abs_seg_internal = nearest_abs_seg -- Store the absolute result
+    self.nearest_enemy_should_fire = should_fire
+    self.nearest_enemy_should_zap = false -- Keep default false for now
 
     if nearest_abs_seg == -1 then
         self.nearest_enemy_seg = INVALID_SEGMENT
@@ -909,8 +923,9 @@ function EnemiesState:update(mem, game_state, player_state, level_state)
         self.nearest_enemy_depth_raw = 255 -- Use max depth as sentinel
         self.alignment_error_magnitude = 0.0
     else
+        -- Calculate relative segment using the absolute result
         local nearest_rel_seg = absolute_to_relative_segment(player_abs_segment, nearest_abs_seg, is_open)
-        self.nearest_enemy_seg = nearest_rel_seg     -- Store relative for internal use/display
+        self.nearest_enemy_seg = nearest_rel_seg     -- Store relative segment
         self.nearest_enemy_depth_raw = nearest_depth -- Store raw depth
 
         -- Calculate Is_Aligned
@@ -920,7 +935,7 @@ function EnemiesState:update(mem, game_state, player_state, level_state)
         local error_abs = math.abs(nearest_rel_seg)
         local max_error = is_open and 15.0 or 8.0 -- Max possible distance
         self.alignment_error_magnitude = (error_abs > 0) and (error_abs / max_error) or 0.0
-        -- Scaling to 10000 happens during packing in flatten_game_state_to_binary
+        -- Scaling happens during packing
     end
 end
 
@@ -998,28 +1013,22 @@ end
 
 
 -- Apply received AI action (fire, zap, spinner) and p1_start to game controls
-function Controls:apply_action(fire, zap, spinner, p1_start, game_state, player_state)
-    -- Update player state with commanded actions *before* applying them
-    -- This allows reward calculation etc. to see what the AI intended for this frame
-    player_state.fire_commanded = fire
-    player_state.zap_commanded = zap
-    player_state.spinner_commanded = spinner
+function Controls:apply_action(fire, zap, spinner, p1_start)
+    -- player_state commanded values are now set earlier in frame_callback
+    -- player_state.fire_commanded = fire
+    -- player_state.zap_commanded = zap
+    -- player_state.spinner_commanded = spinner
 
     -- Apply actions to MAME input fields if they exist
-    if self.fire_field then self.fire_field:set_value(fire) end
-    if self.zap_field then self.zap_field:set_value(zap) end
-    if self.p1_start_field then self.p1_start_field:set_value(p1_start) end
+    self.fire_field:set_value(fire)
+    self.zap_field:set_value(zap)
+    self.p1_start_field:set_value(p1_start)
 
-    -- Write AI spinner value directly to memory ($0050)
-    -- This seems to be how the game reads the spinner input delta
-    -- Only write non-zero values to potentially reduce noise/interference? (Keep this behavior)
-    if spinner ~= 0 then
-        mem:write_u8(0x0050, spinner)
-    else
-        -- Explicitly write 0 if spinner is 0 to ensure it stops spinning?
-        -- Or rely on game logic to handle lack of input? Let's try writing 0 explicitly.
-         mem:write_u8(0x0050, 0)
-    end
+    -- Ensure spinner value is within signed byte range (-128 to 127)
+    local spinner_val = math.max(-128, math.min(127, spinner or 0))
+    -- Use write_u8, as write_s8 might not exist. write_u8 handles the byte pattern correctly.
+    mem:write_u8(0x0050, spinner_val) -- *** WRITE TO 0x0050 HAPPENS HERE ***
+    print(string.format("APPLY_ACTION: Wrote spinner_val=%d to 0x0050", spinner_val)) -- CONFIRM WRITE
 end
 
 
@@ -1037,8 +1046,7 @@ local controls = Controls:new() -- Instantiate controls after MAME interface is 
 -- MOVED TO display.lua
 
 -- Function to flatten and serialize the game state data to binary
-local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone,
-                                            should_fire)
+local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone)
     -- Create a consistent data structure with fixed sizes
     local data = {}
 
@@ -1192,55 +1200,16 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
         num_values_packed = num_values_packed + 1
     end
 
-    -- Check if it's time to send a save signal
-    local current_time = os.time()
-    local save_signal = 0
-    if shutdown_requested or current_time - game_state.last_save_time >= game_state.save_interval then
-        save_signal = 1
-        game_state.last_save_time = current_time
-        if shutdown_requested then
-            print("SHUTDOWN SAVE: Sending final save signal before MAME exits")
-        else
-            print("Periodic Save: Sending save signal to Python script")
-        end
-    end
-
     -- --- OOB Data Packing ---
-    -- This MUST remain compatible with the Python receiver.
-    -- Format: num_values(H), reward(d), game_action(B), game_mode(B), done(B), frame(H), score_high(H), score_low(H), save_signal(B), fire_cmd(B), zap_cmd(B), spinner_cmd(h), attract(B), target_seg_abs(h), player_seg_abs(B), open_level(B), expert_fire(B), expert_zap(B)
-    -- Total: 2 + 8 + 1 + 1 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 1 + 1 + 1 + 1 = 31 bytes
-
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
     local is_open_level = level_state.level_type == 0xFF
 
     -- Get ABSOLUTE nearest enemy segment for OOB packing (-1 sentinel if none)
-    local nearest_abs_seg_oob = enemies_state.nearest_enemy_seg -- Start with relative
-    if nearest_abs_seg_oob ~= INVALID_SEGMENT then
-         -- Convert relative back to absolute if valid target exists
-         -- This requires player's absolute segment.
-         local player_abs_seg_oob = player_state.position & 0x0F
-         -- Reverse calculation (tricker for closed levels)
-         -- Simplification: Use the absolute segment calculated during the update phase
-         nearest_abs_seg_oob = -1 -- Reset
-         for i=1,7 do
-             if enemies_state.enemy_segments[i] == enemies_state.nearest_enemy_seg then
-                 nearest_abs_seg_oob = enemies_state.enemy_abs_segments[i]
-                 break
-             end
-         end
-         -- Fallback if the relative segment didn't directly match (e.g. multiple enemies at same relative distance)
-         -- We rely on find_target_segment having found the correct *absolute* segment originally.
-         -- Let's re-fetch it. This is inefficient but ensures correctness for OOB.
-         local temp_abs_seg, _, _ = find_target_segment(player_state.position & 0x0F, level_state, enemies_state)
-         nearest_abs_seg_oob = temp_abs_seg -- Use the absolute segment from the primary targeting function
-    else
-        nearest_abs_seg_oob = -1 -- Ensure -1 sentinel if no relative target
-    end
+    local nearest_abs_seg_oob = enemies_state.nearest_enemy_abs_seg_internal or -1 -- CORRECTED: Use internal absolute value
 
-
-    -- Expert recommendations (passed from reward calculation)
-    local expert_should_fire = should_fire and 1 or 0
-    local should_zap = 0 -- TODO: Implement expert zap logic if needed
+    -- Expert recommendations (use state calculated in EnemiesState:update)
+    local expert_should_fire = enemies_state.nearest_enemy_should_fire and 1 or 0 -- Read from state
+    local expert_should_zap = enemies_state.nearest_enemy_should_zap and 1 or 0   -- Read from state
 
     -- Score packing
     local score = player_state.score or 0
@@ -1250,26 +1219,38 @@ local function flatten_game_state_to_binary(reward, game_state, level_state, pla
     -- Frame counter packing (masked to 16 bits)
     local frame = game_state.frame_counter % 65536
 
-    -- Pack OOB data (Big Endian >)
-    local oob_data = string.pack(">HdBBBHHHBBBhBhBBBB",
-        num_values_packed,              -- H num_values (count of 16-bit words in main payload)
-        reward,                         -- d reward (double)
-        0,                              -- B game_action (placeholder, consider removing if unused)
-        game_state.game_mode,           -- B game_mode
-        bDone and 1 or 0,               -- B done flag
-        frame,                          -- H frame_counter (16-bit)
-        score_high,                     -- H score high 16 bits
-        score_low,                      -- H score low 16 bits
-        save_signal,                    -- B save_signal
-        player_state.fire_commanded,    -- B fire_commanded
-        player_state.zap_commanded,     -- B zap_commanded
-        player_state.spinner_commanded, -- h spinner_commanded (signed 16-bit, even though AI sends 8-bit)
-        is_attract_mode and 1 or 0,     -- B is_attract_mode
-        nearest_abs_seg_oob,            -- h target_segment (ABSOLUTE, -1 sentinel, signed 16-bit)
-        player_state.position & 0x0F,   -- B player_segment (ABSOLUTE 0-15)
-        is_open_level and 1 or 0,       -- B is_open_level
-        expert_should_fire,             -- B expert fire recommendation
-        should_zap                      -- B expert zap recommendation
+    -- Check for save signal (moved near other OOB prep)
+    local current_time = os.time()
+    local save_signal = 0
+    if shutdown_requested or current_time - game_state.last_save_time >= game_state.save_interval then
+        save_signal = 1
+        game_state.last_save_time = current_time
+        if shutdown_requested then print("SHUTDOWN SAVE: Sending final save signal before MAME exits")
+        else print("Periodic Save: Sending save signal to Python script") end
+    end
+
+    -- Pack OOB data using the format string expected by Python: >HdBBBHHHBBBhBhBBBB
+    local oob_format = ">HdBBBHHHBBBhBhBBBB" -- 17 codes
+
+    local oob_data = string.pack(oob_format,
+        num_values_packed,              -- H: ushort (Should be 299)
+        reward,                         -- d: double
+        0,                              -- B: Placeholder (game_action?)
+        game_state.game_mode,           -- B: uchar
+        bDone and 1 or 0,               -- B: uchar (0/1)
+        frame,                          -- H: ushort
+        score_high,                     -- H: ushort
+        score_low,                      -- H: ushort
+        save_signal,                    -- B: uchar (0/1)
+        player_state.fire_commanded,    -- B: uchar
+        player_state.zap_commanded,     -- B: uchar
+        player_state.spinner_commanded, -- h: short
+        is_attract_mode and 1 or 0,     -- B: uchar (0/1)
+        nearest_abs_seg_oob,            -- h: short (-1 to 15, packed as short)
+        player_state.position & 0x0F,   -- B: uchar (0-15)
+        is_open_level and 1 or 0,       -- B: uchar (0/1)
+        expert_should_fire,             -- B: uchar (0/1) - From state
+        expert_should_zap               -- B: uchar (0/1) - From state
     )
 
     -- Combine out-of-band header with game state data
@@ -1348,62 +1329,61 @@ local function frame_callback()
     -- --- AI Interaction ---
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
-    -- Calculate reward based on the *previous* frame's state and the *detected* spinner movement
-    local reward, episode_done, should_fire = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.spinner_detected)
+    -- Calculate reward based on the *current* state and the *detected* spinner movement
+    local reward, episode_done = calculate_reward(game_state, level_state, player_state, enemies_state) -- Removed commanded_spinner arg
     bDone = episode_done -- Capture if the episode ended
 
-    -- Flatten and serialize the *current* game state (s')
-    local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone, should_fire)
+    -- Flatten and serialize the *current* game state (s') including reward info
+    -- The flatten function now reads expert hints directly from enemies_state
+    local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone) -- Removed should_fire arg
 
     -- Send current state (s'), reward (r), done (d) to AI; receive action (a) for s'
-    local fire_cmd, zap_cmd, spinner_cmd = process_frame(frame_data, player_state, controls, reward, bDone, is_attract_mode)
+    local received_fire_cmd, received_zap_cmd, received_spinner_cmd = process_frame(frame_data) -- Correct args
+
+    -- Store received commands in player state immediately
+    player_state.fire_commanded = received_fire_cmd
+    player_state.zap_commanded = received_zap_cmd
+    player_state.spinner_commanded = received_spinner_cmd
 
     -- Update total bytes sent (for display)
     total_bytes_sent = total_bytes_sent + #frame_data
 
-    -- --- Apply AI Action ---
-    local p1_start_cmd = 0 -- Default P1 start to 0
+    -- --- Apply AI/Manual Action ---
+    -- Start with AI commands as base
+    local final_fire_cmd = received_fire_cmd
+    local final_zap_cmd = received_zap_cmd
+    local final_spinner_cmd = received_spinner_cmd
+    local final_p1_start_cmd = 0 -- Default P1 start to 0
 
-    -- Handle specific game states / modes
+    -- Handle specific game states / modes (override final commands)
     if game_state.gamestate == 0x12 then -- High Score Entry Mode
-        -- Press fire periodically to advance through entry
-        fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
-        zap_cmd = 0
-        spinner_cmd = 0
+        final_fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
+        final_zap_cmd = 0
+        final_spinner_cmd = 0
     elseif game_state.gamestate == 0x16 then -- Level Select Mode
-        -- Spin dial for a bit, then press fire once
-        if level_select_counter < 60 then         -- Spin for 60 frames
-            spinner_cmd = 31 -- Spin reasonably fast
-            fire_cmd = 0
-            zap_cmd = 0
+        if level_select_counter < 60 then
+            final_spinner_cmd = 31; final_fire_cmd = 0; final_zap_cmd = 0
             level_select_counter = level_select_counter + 1
-        elseif level_select_counter == 60 then    -- Press fire once
-            fire_cmd = 1
-            spinner_cmd = 0
-            zap_cmd = 0
-            level_select_counter = 0 -- Reset for next time (or set > 60)
-        else -- After fire press
-            fire_cmd = 0
-            zap_cmd = 0
-            spinner_cmd = 0
+        elseif level_select_counter == 60 then
+            final_fire_cmd = 1; final_spinner_cmd = 0; final_zap_cmd = 0
+            level_select_counter = 61 -- Prevent re-pressing fire
+        else
+            final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
+            if level_state.level_number ~= 0 then level_select_counter = 0 end
         end
     elseif is_attract_mode then -- Attract Mode
-        -- Press P1 Start periodically
-        p1_start_cmd = (game_state.frame_counter % 50 == 0) and 1 or 0
-        fire_cmd = 0
-        zap_cmd = 0
-        spinner_cmd = 0
+        final_p1_start_cmd = (game_state.frame_counter % 50 == 0) and 1 or 0
+        final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
+        level_select_counter = 0
     else -- Play Mode (Gamestate 0x04) or Tube Zoom (0x20) or others
-        -- Use AI commands directly
-        -- Apply shot limit: only allow AI fire command if shot count <= 6
-        if player_state.shot_count > 6 then
-             fire_cmd = 0
-        end
-        -- Keep zap_cmd and spinner_cmd from AI
+        print("Play Mode")
+        final_fire_cmd = player_state.fire_commanded
+        final_zap_cmd = player_state.zap_commanded
+        final_spinner_cmd = player_state.spinner_commanded
     end
 
-    -- Apply the determined actions (AI or state-based overrides)
-    controls:apply_action(fire_cmd, zap_cmd, spinner_cmd, p1_start_cmd, game_state, player_state)
+    -- Apply the final determined actions (AI or state-based overrides)
+    controls:apply_action(final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd)
 
     -- --- Update Display ---
     local current_time_high_res = os.clock()
@@ -1438,16 +1418,16 @@ local function on_mame_exit()
         game_state:update(mem)
         level_state:update(mem)
         player_state:update(mem)
-        enemies_state:update(mem, game_state, player_state, level_state)
+        enemies_state:update(mem, game_state, player_state, level_state) -- Pass dependencies
 
         -- Calculate final reward (value might not matter much here)
-        local reward, _, should_fire = calculate_reward(game_state, level_state, player_state, enemies_state, player_state.spinner_detected)
+        local reward, _ = calculate_reward(game_state, level_state, player_state, enemies_state) -- Correct args
 
-        -- Flatten state with shutdown_requested = true (handled inside flatten)
-        local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, true, should_fire)
+        -- Flatten state with shutdown_requested = true (handled inside flatten), bDone=true
+        local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, true) -- Correct args
 
         -- Send one last time using process_frame (ignore received action)
-        local success, err = pcall(process_frame, frame_data, player_state, controls, reward, true, (game_state.game_mode & 0x80 == 0))
+        local success, err = pcall(process_frame, frame_data) -- Correct args
         if success then
              print("Final save frame processed.")
         else
