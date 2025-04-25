@@ -26,10 +26,15 @@
     - Tempest ROM set loaded in MAME.
 --]]
 
--- Add the Scripts directory to Lua's package path
-package.path                  = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua"
+--[[ package.path                  = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua" ]] -- Commented out hardcoded path
+
+-- Dynamically add the script's directory to the package path
+local script_path = debug.getinfo(1,"S").source:sub(2) -- Get source path, remove leading '@'
+local script_dir = script_path:match("(.*/)") or "./" -- Extract directory part, default to ./ if no slash
+package.path = package.path .. ";" .. script_dir .. "?.lua"
+
 -- Now require the module by name only (without path or extension)
-local display = require("display") -- ADDED: Require the new display module
+local display = require("display") -- REVERTED: Require by module name only
 
 -- Define constants
 local INVALID_SEGMENT         = -32768 -- Used as sentinel value for invalid segments
