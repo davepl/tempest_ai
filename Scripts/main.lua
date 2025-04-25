@@ -40,7 +40,7 @@ local state_defs = require("state") -- ADDED: Require the new state module
 -- Define constants
 local INVALID_SEGMENT         = state_defs.INVALID_SEGMENT -- UPDATED: Get from state module
 
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local DISPLAY_UPDATE_INTERVAL = 0.02
 
 -- Access the main CPU and memory space

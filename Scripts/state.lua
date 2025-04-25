@@ -35,8 +35,11 @@ find_nearest_enemy_of_type = function(enemies_state, player_abs_segment, is_open
     local min_distance = 255 -- Use a large initial distance
 
     for i = 1, 7 do
-        -- Check if this is the enemy type we're looking for and if it's active
-        if enemies_state.enemy_core_type[i] == type_id and enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
+        -- Check if this is the enemy type we're looking for and if it's active AND if its depth is > 0x30
+        if enemies_state.enemy_core_type[i] == type_id and 
+           enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and 
+           enemies_state.enemy_depths[i] > 0x30 then -- ADDED > 0x30 condition
+           
             local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
             local enemy_depth = enemies_state.enemy_depths[i]
 
@@ -84,99 +87,131 @@ end
 find_target_segment = function(game_state, player_state, level_state, enemies_state, abs_to_rel_func, is_open)
     local player_abs_seg = player_state.position & 0x0F -- Get segment from player state
 
+    local target_seg_abs
+    local target_depth
+    local should_fire
+    local should_zap = false -- Default zap
+
     -- Check for Tube Zoom state first
     if game_state.gamestate == 0x20 then
         -- Spike heights are depths: 0=clear/no spike, >0 means spike exists, smaller number = longer spike
         local current_spike_h = level_state.spike_heights[player_abs_seg]
-
-        -- Priority 1: If current segment is clear, stay put
-        if current_spike_h == 0 then
-            return player_abs_seg, 0, true, false -- Target self, depth 0, recommend fire, no zap
-        end
-
-        -- Determine neighbours
+        if current_spike_h == 0 then return player_abs_seg, 0, true, false end
         local left_neighbour_seg = -1
         local right_neighbour_seg = -1
         if is_open then
             if player_abs_seg > 0 then left_neighbour_seg = player_abs_seg - 1 end
             if player_abs_seg < 15 then right_neighbour_seg = player_abs_seg + 1 end
-        else -- Closed level
+        else
             left_neighbour_seg = (player_abs_seg - 1 + 16) % 16
             right_neighbour_seg = (player_abs_seg + 1) % 16
         end
-
-        -- Get neighbour heights, invalid neighbours as -1 (unreachable)
-        local left_spike_h = -1
-        if left_neighbour_seg ~= -1 then
-            left_spike_h = level_state.spike_heights[left_neighbour_seg]
-        end
-        local right_spike_h = -1
-        if right_neighbour_seg ~= -1 then
-            right_spike_h = level_state.spike_heights[right_neighbour_seg]
-        end
-
-        -- Priority 2: Move to a completely clear neighbour segment (height 0)
-        if left_spike_h == 0 then
-            return left_neighbour_seg, 0, true, false
-        elseif right_spike_h == 0 then
-            return right_neighbour_seg, 0, true, false
-        end
-
-        -- Priority 3: Move towards neighbour with SHORTER spike (LARGER height value)
-        --              only if that neighbour's spike is shorter than current segment's spike.
-        local target_seg_abs = player_abs_seg -- Default to staying put
-
-        -- Check if left neighbour is valid and better than current
+        local left_spike_h = -1; if left_neighbour_seg ~= -1 then left_spike_h = level_state.spike_heights[left_neighbour_seg] end
+        local right_spike_h = -1; if right_neighbour_seg ~= -1 then right_spike_h = level_state.spike_heights[right_neighbour_seg] end
+        if left_spike_h == 0 then return left_neighbour_seg, 0, true, false end
+        if right_spike_h == 0 then return right_neighbour_seg, 0, true, false end
+        local temp_target = player_abs_seg
         local is_left_better = (left_spike_h > current_spike_h)
-        -- Check if right neighbour is valid and better than current
         local is_right_better = (right_spike_h > current_spike_h)
-
-        if is_left_better and is_right_better then
-            -- Both neighbours are better than current, choose the one with the shortest spike (largest height)
-            if left_spike_h >= right_spike_h then
-                target_seg_abs = left_neighbour_seg
-            else
-                target_seg_abs = right_neighbour_seg
-            end
-        elseif is_left_better then
-            -- Only left is better than current
-            target_seg_abs = left_neighbour_seg
-        elseif is_right_better then
-            -- Only right is better than current
-            target_seg_abs = right_neighbour_seg
+        if is_left_better and is_right_better then temp_target = (left_spike_h >= right_spike_h) and left_neighbour_seg or right_neighbour_seg
+        elseif is_left_better then temp_target = left_neighbour_seg
+        elseif is_right_better then temp_target = right_neighbour_seg
         end
-        -- If neither is better, target_seg_abs remains player_abs_seg (stay put)
-
-        -- Return chosen target, depth 0, recommend fire (since we are moving/staying clear), no zap
-        return target_seg_abs, 0, true, false
-    end
-
-    -- If not gamestate 0x20, proceed with standard enemy hunting
-    -- Use the is_open passed as parameter
-    local target_seg_abs, target_depth = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func)
-
-    local should_fire = false
-    local should_zap = false -- Placeholder for zap logic
-
-    if target_seg_abs ~= -1 then
-        -- An enemy target was found
-        -- Use the is_open passed as parameter
-        local rel_dist = abs_to_rel_func(player_abs_seg, target_seg_abs, is_open)
-        if rel_dist == 0 then
-            should_fire = true -- Fire if aligned
-        end
-        -- Add zap logic here if needed
+        return temp_target, 0, true, false
     else
-        -- No enemies found to hunt
-        target_seg_abs = player_abs_seg
-        target_depth = 0x10 -- Default depth when idle (rim?)
-        should_fire = false
+        -- If not gamestate 0x20, proceed with standard enemy hunting
+        target_seg_abs, target_depth = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func)
+
+        if target_seg_abs ~= -1 then
+            -- An enemy target was found
+            local rel_dist = abs_to_rel_func(player_abs_seg, target_seg_abs, is_open)
+            should_fire = (rel_dist == 0) -- Fire if aligned
+            -- Add zap logic here if needed
+        else
+            -- No enemies found to hunt
+            target_seg_abs = player_abs_seg
+            target_depth = 0x10 -- Default depth when idle (rim?)
+            should_fire = false
+        end
     end
 
-    -- Apply shot count override
-    should_fire = should_fire and player_state.shot_count < 7
+    -- Apply panic braking to prevent walking into the *next adjacent* segment with a hazard
+    local final_target_seg_abs = target_seg_abs -- Start with the original target
 
-    return target_seg_abs, target_depth, should_fire, should_zap
+    if final_target_seg_abs ~= player_abs_seg then -- Only check if movement is intended
+        local initial_relative_dist = abs_to_rel_func(player_abs_seg, final_target_seg_abs, is_open)
+        local next_segment_abs = -1
+
+        if initial_relative_dist > 0 then -- Moving right (positive relative dist)
+            if is_open then
+                if player_abs_seg < 15 then next_segment_abs = player_abs_seg + 1 end
+            else -- Closed
+                next_segment_abs = (player_abs_seg + 1) % 16
+            end
+        elseif initial_relative_dist < 0 then -- Moving left (negative relative dist)
+             if is_open then
+                if player_abs_seg > 0 then next_segment_abs = player_abs_seg - 1 end
+            else -- Closed
+                next_segment_abs = (player_abs_seg - 1 + 16) % 16
+            end
+        end
+
+        -- If there is a valid next segment to check
+        if next_segment_abs ~= -1 then
+            local brake = false
+            -- Check enemy shots in the next segment
+            for i = 1, 4 do
+                if enemies_state.enemy_shot_abs_segments[i] == next_segment_abs and
+                   enemies_state.shot_positions[i] > 0 and
+                   enemies_state.shot_positions[i] <= 0x30 then
+                    brake = true; break
+                end
+            end
+            -- Check Flippers (0) and Pulsars (2) in the next segment if no shot found yet
+            if not brake then
+                for i = 1, 7 do
+                    if (enemies_state.enemy_core_type[i] == 0 or enemies_state.enemy_core_type[i] == 2) and
+                       enemies_state.enemy_abs_segments[i] == next_segment_abs and
+                       enemies_state.enemy_depths[i] > 0 and
+                       enemies_state.enemy_depths[i] <= 0x30 then
+                        brake = true; break
+                    end
+                end
+            end
+
+            -- If brake condition met, override target to stay put
+            if brake then
+                print("Whoa!" .. player_abs_seg .. " " .. next_segment_abs)
+                final_target_seg_abs = player_abs_seg -- Override the target
+                target_depth = player_state.player_depth -- Use current depth (might not matter)
+                should_fire = false -- Don't fire if braking
+                should_zap = false
+            end
+        end
+    end
+
+    -- Apply nearby Flipper firing override (AFTER potential brake)
+    if not should_fire then -- Only check if not already planning to fire
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == 0 and -- Is it a Flipper?
+               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
+                local flipper_abs_seg = enemies_state.enemy_abs_segments[i]
+                if flipper_abs_seg ~= INVALID_SEGMENT then
+                    local flipper_rel_seg = abs_to_rel_func(player_abs_seg, flipper_abs_seg, is_open)
+                    if math.abs(flipper_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
+                        should_fire = true -- Force firing recommendation
+                        break -- Found a dangerous flipper, no need to check others
+                    end
+                end
+            end
+        end
+    end
+
+    -- Apply shot count override (happens last)
+    should_fire = should_fire and player_state.shot_count < 7 -- User changed from < 6
+
+    -- Return the potentially modified target and hints
+    return final_target_seg_abs, target_depth, should_fire, should_zap
 end
 
 
@@ -463,7 +498,6 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- Determine if level is open based *only* on the memory flag now
     local is_open = (level_state.level_type == 0xFF)
     -- Re-enable debug print to monitor memory flag and resulting is_open
-    print(string.format("ENEMY_UPDATE DEBUG: level_num=%d, level_type_mem=0x%02X, is_open=%s", level_state.level_number, level_state.level_type, tostring(is_open)))
 
     -- Read active enemy counts and related state
     self.active_flippers         = mem:read_u8(0x0142) -- n_flippers
