@@ -168,8 +168,8 @@ end
 
 -- Helper function to hunt enemies in preference order
 local function hunt_enemies(enemies_state, player_abs_segment, is_open)
-    -- Hunt in preference order: Pulsars(2), Flippers(1), Tankers(3), Fuseballs(4), Spikers(5)
-    local hunt_order = {2, 1, 3, 4, 5}
+    -- Hunt in preference order: Pulsars(2), Flippers(0), Tankers(3), Fuseballs(4), Spikers(5)
+    local hunt_order = {2, 0, 3, 4, 5}
 
     for _, enemy_type in ipairs(hunt_order) do
         local target_seg, target_depth = find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type)
@@ -184,8 +184,11 @@ local function hunt_enemies(enemies_state, player_abs_segment, is_open)
 end
 
 -- Function to determine target segment, depth, and firing decision
-find_target_segment = function(player_abs_seg, level_state, enemies_state)
-    local is_open = level_state.level_type == 0xFF
+find_target_segment = function(player_state, level_state, enemies_state)
+    local player_abs_seg = player_state.position & 0x0F -- Get segment from player state
+    -- Determine if level is open based on number pattern (more reliable than memory flag)
+    local level_num_zero_based = level_state.level_number - 1
+    local is_open = (level_num_zero_based % 4 == 2)
 
     -- Find the highest priority enemy to hunt
     local target_seg, target_depth = hunt_enemies(enemies_state, player_abs_seg, is_open)
@@ -199,14 +202,14 @@ find_target_segment = function(player_abs_seg, level_state, enemies_state)
         if rel_dist == 0 then
             should_fire = true -- Fire if aligned
         end
-        -- Target segment remains the segment of the hunted enemy
-        -- Target depth is the actual depth of the hunted enemy
     else
         -- No enemies found to hunt, stay in the current segment
         target_seg = player_abs_seg
         target_depth = 0x10 -- Default depth when idle
         should_fire = false
     end
+
+    should_fire = should_fire or player_state.shot_count < 7
 
     return target_seg, target_depth, should_fire
 end
@@ -910,7 +913,7 @@ function EnemiesState:update(mem, game_state, player_state, level_state)
 
     -- Calculate and store nearest enemy segment and engineered features
     -- Call find_target_segment which now encapsulates hunting logic
-    local nearest_abs_seg, nearest_depth, should_fire = find_target_segment(player_abs_segment, level_state, self)
+    local nearest_abs_seg, nearest_depth, should_fire = find_target_segment(player_state, level_state, self)
 
     -- *** RESTORED LOGIC ***
     self.nearest_enemy_abs_seg_internal = nearest_abs_seg -- Store the absolute result
@@ -1028,7 +1031,6 @@ function Controls:apply_action(fire, zap, spinner, p1_start)
     local spinner_val = math.max(-128, math.min(127, spinner or 0))
     -- Use write_u8, as write_s8 might not exist. write_u8 handles the byte pattern correctly.
     mem:write_u8(0x0050, spinner_val) -- *** WRITE TO 0x0050 HAPPENS HERE ***
-    print(string.format("APPLY_ACTION: Wrote spinner_val=%d to 0x0050", spinner_val)) -- CONFIRM WRITE
 end
 
 
@@ -1376,7 +1378,6 @@ local function frame_callback()
         final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
         level_select_counter = 0
     else -- Play Mode (Gamestate 0x04) or Tube Zoom (0x20) or others
-        print("Play Mode")
         final_fire_cmd = player_state.fire_commanded
         final_zap_cmd = player_state.zap_commanded
         final_spinner_cmd = player_state.spinner_commanded
