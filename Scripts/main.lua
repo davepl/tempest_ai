@@ -849,7 +849,7 @@ local function frame_callback()
         final_spinner_cmd = 0
     elseif game_state.gamestate == 0x16 then -- Level Select Mode
         if level_select_counter < 60 then
-            final_spinner_cmd = 31; final_fire_cmd = 0; final_zap_cmd = 0
+            final_spinner_cmd = 0; final_fire_cmd = 0; final_zap_cmd = 0
             level_select_counter = level_select_counter + 1
         elseif level_select_counter == 60 then
             final_fire_cmd = 1; final_spinner_cmd = 0; final_zap_cmd = 0
