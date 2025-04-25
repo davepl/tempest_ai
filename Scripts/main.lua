@@ -39,7 +39,7 @@ local display = require("display") -- REVERTED: Require by module name only
 -- Define constants
 local INVALID_SEGMENT         = -32768 -- Used as sentinel value for invalid segments
 
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local DISPLAY_UPDATE_INTERVAL = 0.02
 
 -- Access the main CPU and memory space
@@ -1370,20 +1370,29 @@ local function frame_callback()
             final_fire_cmd = 1; final_spinner_cmd = 0; final_zap_cmd = 0
             level_select_counter = 61 -- Prevent re-pressing fire
         else
-            final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
-            if level_state.level_number ~= 0 then level_select_counter = 0 end
+            final_fire_cmd = 0; 
+            final_zap_cmd = 0; 
+            final_spinner_cmd = 0
+            level_select_counter = 0
         end
     elseif is_attract_mode then -- Attract Mode
         final_p1_start_cmd = (game_state.frame_counter % 50 == 0) and 1 or 0
         final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
         level_select_counter = 0
-    else -- Play Mode (Gamestate 0x04) or Tube Zoom (0x20) or others
+    elseif (game_state.gamestate == 0x04) or (game_state.gamestate == 0x20) then
         final_fire_cmd = player_state.fire_commanded
         final_zap_cmd = player_state.zap_commanded
         final_spinner_cmd = player_state.spinner_commanded
+    else
+        final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
     end
 
     -- Apply the final determined actions (AI or state-based overrides)
+
+    if (final_p1_start_cmd == 1) then
+        print("PRESSING START with fire=" .. final_fire_cmd .. " zap=" .. final_zap_cmd .. " spinner=" .. final_spinner_cmd)
+    end
+    
     controls:apply_action(final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd)
 
     -- --- Update Display ---
