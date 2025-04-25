@@ -30,7 +30,8 @@
 
 -- Dynamically add the script's directory to the package path
 local script_path = debug.getinfo(1,"S").source:sub(2) -- Get source path, remove leading '@'
-local script_dir = script_path:match("(.*/)") or "./" -- Extract directory part, default to ./ if no slash
+local script_dir = script_path:match("(.*[/\\])") or "./" -- Match up to last / OR \\ 
+print("Detected script directory: " .. script_dir) -- Add print for verification
 package.path = package.path .. ";" .. script_dir .. "?.lua"
 
 -- Now require the module by name only (without path or extension)
@@ -40,7 +41,7 @@ local state_defs = require("state") -- ADDED: Require the new state module
 -- Define constants
 local INVALID_SEGMENT         = state_defs.INVALID_SEGMENT -- UPDATED: Get from state module
 
-local SHOW_DISPLAY            = false
+local SHOW_DISPLAY            = true
 local DISPLAY_UPDATE_INTERVAL = 0.02
 
 -- Access the main CPU and memory space

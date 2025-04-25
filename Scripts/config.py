@@ -77,7 +77,7 @@ class MetricsData:
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = 1.0
-    expert_ratio: float = 0.75
+    expert_ratio: float = 1.0
     last_decay_step: int = 0
     last_epsilon_decay_step: int = 0 # Added tracker for epsilon decay
     enemy_seg: int = -1
