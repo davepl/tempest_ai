@@ -290,7 +290,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 -- Movement incentives (using desired_spinner direction and *detected* spinner)
                 -- Reward if the DETECTED movement (detected_spinner) is IN THE SAME direction as the desired direction.
                 if desired_spinner * detected_spinner > 0 then
-                    reward = reward + 25
+                    reward = reward + 40
                 elseif desired_spinner * detected_spinner < 0 then
                     reward = reward - 50
                 elseif detected_spinner == 0 and desired_spinner ~= 0 then
@@ -850,7 +850,7 @@ local function frame_callback()
         final_spinner_cmd = 0
     elseif game_state.gamestate == 0x16 then -- Level Select Mode
         if level_select_counter < 60 then
-            final_spinner_cmd = 0; final_fire_cmd = 0; final_zap_cmd = 0
+            final_spinner_cmd = 9; final_fire_cmd = 0; final_zap_cmd = 0
             level_select_counter = level_select_counter + 1
         elseif level_select_counter == 60 then
             final_fire_cmd = 1; final_spinner_cmd = 0; final_zap_cmd = 0

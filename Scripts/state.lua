@@ -273,7 +273,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
                 local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
-                should_fire = (rel_dist == 0) -- Initial fire recommendation if aligned
+                should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
                 target_depth = 0x10
