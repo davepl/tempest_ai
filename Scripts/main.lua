@@ -138,10 +138,281 @@ end
 -- MOVED TO state.lua
 
 -- Helper function to hunt enemies in preference order
--- MOVED TO state.lua
+-- Needs abs_to_rel_func, is_open, and forbidden_segments passed in
+hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
+    -- Corrected Hunt Order: Fuseball(4), Pulsar(1), Flipper(0), Tanker(2), Spiker(3)
+    local hunt_order = {
+        M.ENEMY_TYPE_FUSEBALL, -- 4
+        M.ENEMY_TYPE_PULSAR,   -- 1
+        M.ENEMY_TYPE_FLIPPER,  -- 0
+        M.ENEMY_TYPE_TANKER,   -- 2
+        M.ENEMY_TYPE_SPIKER    -- 3
+    }
+
+    for _, enemy_type in ipairs(hunt_order) do
+        local target_seg_abs, target_depth = find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func, forbidden_segments)
+
+        if target_seg_abs ~= -1 then
+            -- Check for Top Rail Avoidance Logic (ONLY for Flipper/Pulsar now)
+            if target_depth <= 0x10 and (enemy_type == M.ENEMY_TYPE_FLIPPER or enemy_type == M.ENEMY_TYPE_PULSAR) then
+                local rel_dist = abs_to_rel_func(player_abs_segment, target_seg_abs, is_open)
+                if math.abs(rel_dist) <= 1 then -- If aligned or adjacent
+                    local safe_adjacent_seg
+                    if rel_dist <= 0 then safe_adjacent_seg = (player_abs_segment + 1) % 16 -- Move Right
+                    else safe_adjacent_seg = (player_abs_segment - 1 + 16) % 16 end -- Move Left
+
+                    if forbidden_segments[safe_adjacent_seg] then
+                        print(string.format("AVOID F/P: Adjacent safe %d forbidden! Staying put.", safe_adjacent_seg))
+                        return player_abs_segment, target_depth, true -- Stay put
+                    else
+                        print(string.format("AVOID F/P: Top Type %d at %d (Rel %d). Targeting adjacent safe %d", enemy_type, target_seg_abs, rel_dist, safe_adjacent_seg))
+                        return safe_adjacent_seg, target_depth, true -- Target safe adjacent
+                    end
+                end
+            end -- End Top Rail Flipper/Pulsar Check
+
+            -- If no F/P avoidance was triggered, return the original hunt target
+            -- Fuseball avoidance is handled globally before this function is called
+            return target_seg_abs, target_depth, false
+
+        end -- End if target_seg_abs ~= -1
+    end -- End hunt_order loop
+
+    -- If no enemies from the hunt order are found
+    return -1, 255, false
+end
 
 -- Function to determine target segment, depth, and firing decision
--- MOVED TO state.lua
+find_target_segment = function(game_state, player_state, level_state, enemies_state, abs_to_rel_func, is_open)
+    local player_abs_seg = player_state.position & 0x0F
+
+    local initial_target_seg_abs
+    local target_depth
+    local should_fire = false
+    local should_zap = false
+    local did_flee = false
+    local hunting_target_info = "N/A"
+    local forbidden_segments = {} -- Define upfront for later use
+
+    -- === HIGHEST PRIORITY: Check for immediate Fuseball threat ===
+    if game_state.gamestate == 0x04 then -- Only check during normal gameplay
+        local min_fuseball_dist = 3 -- Target distance is >= 3 (meaning <= 2 is too close)
+        local fuseball_threat_nearby = false
+        local escape_target_seg = -1
+
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == M.ENEMY_TYPE_FUSEBALL and
+               enemies_state.enemy_depths[i] <= 0x10 and -- Top rail only
+               enemies_state.enemy_abs_segments[i] ~= M.INVALID_SEGMENT then
+
+                local fuseball_abs_seg = enemies_state.enemy_abs_segments[i]
+                local rel_dist = abs_to_rel_func(player_abs_seg, fuseball_abs_seg, is_open)
+
+                if math.abs(rel_dist) <= 2 then -- Is player currently within 2 segments?
+                    fuseball_threat_nearby = true
+                    print(string.format("!!! FUSEBALL ALERT: Player at %d too close (Rel %d) to Fuseball at %d", player_abs_seg, rel_dist, fuseball_abs_seg))
+
+                    -- Calculate escape segment (3 steps away)
+                    if rel_dist <= 0 then -- Fuseball left or aligned, target 3 steps right
+                        escape_target_seg = (player_abs_seg + 3) % 16
+                    else -- Fuseball right, target 3 steps left
+                         escape_target_seg = (player_abs_seg - 3 + 16) % 16
+                    end
+                    break -- Found a threat, no need to check further fuseballs
+                end
+            end
+        end
+
+        -- If a threat was found, determine the actual target (escape or stay put)
+        if fuseball_threat_nearby then
+            forbidden_segments = find_forbidden_segments(enemies_state, level_state, player_state) -- Need forbidden segments now
+            if forbidden_segments[escape_target_seg] then
+                 print(string.format("FUSEBALL AVOID: Escape seg %d forbidden! Staying put at %d.", escape_target_seg, player_abs_seg))
+                 return player_abs_seg, 0, false, false -- Stay put, don't fire/zap
+            else
+                 print(string.format("FUSEBALL AVOID: Targeting escape seg %d.", escape_target_seg))
+                 return escape_target_seg, 0, false, false -- Target escape, don't fire/zap
+            end
+        end
+        -- If no immediate fuseball threat, continue to regular logic...
+    end
+    -- === END FUSEBALL PRIORITY CHECK ===
+
+
+    -- Check for Tube Zoom state first
+    if game_state.gamestate == 0x20 then
+        -- ... (existing spike logic remains the same) ...
+        local current_spike_h = level_state.spike_heights[player_abs_seg]
+        if current_spike_h == 0 then return player_abs_seg, 0, true, false end
+        local left_neighbour_seg = -1
+        local right_neighbour_seg = -1
+        if is_open then
+            if player_abs_seg > 0 then left_neighbour_seg = player_abs_seg - 1 end
+            if player_abs_seg < 15 then right_neighbour_seg = player_abs_seg + 1 end
+        else
+            left_neighbour_seg = (player_abs_seg - 1 + 16) % 16
+            right_neighbour_seg = (player_abs_segment + 1) % 16
+        end
+        local left_spike_h = -1; if left_neighbour_seg ~= -1 then left_spike_h = level_state.spike_heights[left_neighbour_seg] end
+        local right_spike_h = -1; if right_neighbour_seg ~= -1 then right_spike_h = level_state.spike_heights[right_neighbour_seg] end
+        if left_spike_h == 0 then return left_neighbour_seg, 0, true, false end
+        if right_spike_h == 0 then return right_neighbour_seg, 0, true, false end
+        local temp_target = player_abs_seg
+        local is_left_better = (left_spike_h > current_spike_h)
+        local is_right_better = (right_spike_h > current_spike_h)
+        if is_left_better and is_right_better then temp_target = (left_spike_h >= right_spike_h) and left_neighbour_seg or right_neighbour_seg
+        elseif is_left_better then temp_target = left_neighbour_seg
+        elseif is_right_better then temp_target = right_neighbour_seg
+        end
+        initial_target_seg_abs, target_depth, should_fire, should_zap = (function()
+           return temp_target, 0, true, false
+        end)()
+    -- Check Flee/Hunt Logic (only in normal play mode, if no fuseball threat caused early return)
+    elseif game_state.gamestate == 0x04 then
+        -- Calculate forbidden segments if not already done by fuseball check
+        if not next(forbidden_segments) then -- Check if table is empty
+             forbidden_segments = find_forbidden_segments(enemies_state, level_state, player_state)
+        end
+        local current_segment_is_forbidden = forbidden_segments[player_abs_seg] or false
+
+        if current_segment_is_forbidden then
+            did_flee = true
+            initial_target_seg_abs = find_nearest_safe_segment(player_abs_seg, is_open, forbidden_segments, abs_to_rel_func)
+            target_depth = 0 -- Depth isn't the focus when fleeing
+            should_fire = false
+            should_zap = false
+        else -- Current segment is SAFE, proceed to HUNT
+            -- hunt_enemies now only handles Flipper/Pulsar top-rail avoidance
+            local hunt_target_seg, hunt_target_depth, did_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X, Avoid=%s", hunt_target_seg, hunt_target_depth, tostring(did_avoid)) -- DEBUG
+
+            if hunt_target_seg ~= -1 then
+                initial_target_seg_abs = hunt_target_seg
+                target_depth = hunt_target_depth
+                -- Only recommend firing initially if NOT avoiding and aligned
+                if not did_avoid then
+                    local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
+                    should_fire = (rel_dist == 0)
+                else
+                    should_fire = false -- Don't fire if avoidance maneuver was chosen
+                end
+            else
+                initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
+                target_depth = 0x10
+                should_fire = false
+            end
+        end
+    else -- Other game states: Stay put
+        initial_target_seg_abs = player_abs_seg
+        target_depth = player_state.player_depth
+        should_fire = false
+        should_zap = false
+    end
+
+    -- Apply panic braking (Checks next segment for Flipper/Pulsar/Shots/Fuseballs)
+    local final_target_seg_abs = initial_target_seg_abs
+    local did_brake = false
+    if final_target_seg_abs ~= player_abs_seg and game_state.gamestate == 0x04 then
+        local initial_relative_dist = abs_to_rel_func(player_abs_seg, final_target_seg_abs, is_open)
+        local next_segment_abs = -1
+
+        if initial_relative_dist > 0 then -- Moving right
+            if is_open then
+                if player_abs_seg < 15 then next_segment_abs = player_abs_seg + 1 end
+            else next_segment_abs = (player_abs_seg + 1) % 16 end
+        elseif initial_relative_dist < 0 then -- Moving left
+             if is_open then
+                if player_abs_seg > 0 then next_segment_abs = player_abs_seg - 1 end
+            else next_segment_abs = (player_abs_seg - 1 + 16) % 16 end
+        end
+
+        if next_segment_abs ~= -1 then
+            local brake_condition_met = false
+            local braking_enemy_type = -1 -- For debugging
+
+            -- Check enemy shots
+            if not brake_condition_met then
+                for i = 1, 4 do
+                    if enemies_state.enemy_shot_abs_segments[i] == next_segment_abs and
+                       enemies_state.shot_positions[i] > 0 and
+                       enemies_state.shot_positions[i] <= 0x30 then
+                        brake_condition_met = true; braking_enemy_type = -2; break -- Indicate shot
+                    end
+                end
+            end
+
+            -- Check Enemies (Flippers, Pulsars, AND top-rail Fuseballs)
+            if not brake_condition_met then
+                for i = 1, 7 do
+                    local enemy_type = enemies_state.enemy_core_type[i]
+                    local enemy_seg = enemies_state.enemy_abs_segments[i]
+                    local enemy_depth = enemies_state.enemy_depths[i]
+
+                    -- Check if enemy is in the next segment and close vertically
+                    if enemy_seg == next_segment_abs and enemy_depth > 0 and enemy_depth <= 0x30 then
+                        -- Brake for Flippers OR Pulsars at this depth
+                        if (enemy_type == M.ENEMY_TYPE_FLIPPER or enemy_type == M.ENEMY_TYPE_PULSAR) then
+                            brake_condition_met = true; braking_enemy_type = enemy_type; break
+                        -- Brake for Fuseballs ONLY if they are very close (e.g., <= 0x10)
+                        elseif (enemy_type == M.ENEMY_TYPE_FUSEBALL and enemy_depth <= 0x10) then
+                            brake_condition_met = true; braking_enemy_type = enemy_type; break
+                        end
+                    end
+                end
+            end
+
+            -- Apply brake if condition met
+            if brake_condition_met then
+                did_brake = true
+                final_target_seg_abs = player_abs_seg
+                target_depth = player_state.player_depth
+                should_fire = false
+                should_zap = false
+                print(string.format("PANIC BRAKE triggered! Reason: Type %d in next segment %d", braking_enemy_type, next_segment_abs)) -- DEBUG
+            end
+        end
+    end
+
+    -- Apply nearby Flipper firing override (if not braking or avoiding)
+    local initial_should_fire_flag = should_fire -- Capture should_fire before override
+    if not initial_should_fire_flag and not did_brake and game_state.gamestate == 0x04 then
+         -- Check if Hunt decided to avoid (might be redundant if fuseball check returned early, but safe)
+         local _, _, did_avoid_hunt = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+         if not did_avoid_hunt then
+             for i = 1, 7 do
+                 if enemies_state.enemy_core_type[i] == M.ENEMY_TYPE_FLIPPER and
+                    enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                     local flipper_abs_seg = enemies_state.enemy_abs_segments[i]
+                     if flipper_abs_seg ~= M.INVALID_SEGMENT then
+                         local flipper_rel_seg = abs_to_rel_func(player_abs_seg, flipper_abs_seg, is_open)
+                         if math.abs(flipper_rel_seg) <= 1 then
+                             should_fire = true
+                             print("FLIPPER OVERRIDE: Firing due to nearby flipper.")
+                             break
+                         end
+                     end
+                 end
+             end
+         end
+    end
+
+    -- Apply shot count override (happens last, only if not braking/avoiding)
+    if game_state.gamestate == 0x04 and not did_brake then
+        -- Check if Hunt decided to avoid
+        local _, _, did_avoid_hunt = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+        -- Also check if the initial Fuseball check forced an avoidance (which sets should_fire=false)
+        -- We can infer this if the initial_should_fire_flag is false and the target is not the player's current segment
+        -- Or simply check if the initial_should_fire_flag was already true
+        if not did_avoid_hunt and not initial_should_fire_flag then
+             should_fire = should_fire or player_state.shot_count < 5
+        elseif initial_should_fire_flag then -- If hunt logic decided to fire, allow override
+             should_fire = should_fire or player_state.shot_count < 5
+        end
+        -- If initial fuseball check or hunt avoidance happened, should_fire remains false
+    end
+
+    return final_target_seg_abs, target_depth, should_fire, should_zap
+end
 
 -- Function to calculate desired spinner direction and distance to target
 local function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
@@ -283,9 +554,6 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
                 else -- Far laterally
                      if player_state.fire_commanded == 1 then reward = reward - 30 end
                 end
-
-                -- Graduated reward for proximity (higher reward for smaller segment distance)
-                reward = reward + (10 - segment_distance) * 5 -- Simple linear reward for proximity
 
                 -- Movement incentives (using desired_spinner direction and *detected* spinner)
                 -- Reward if the DETECTED movement (detected_spinner) is IN THE SAME direction as the desired direction.
@@ -850,7 +1118,7 @@ local function frame_callback()
         final_spinner_cmd = 0
     elseif game_state.gamestate == 0x16 then -- Level Select Mode
         if level_select_counter < 60 then
-            final_spinner_cmd = 9; final_fire_cmd = 0; final_zap_cmd = 0
+            final_spinner_cmd = 18; final_fire_cmd = 0; final_zap_cmd = 0
             level_select_counter = level_select_counter + 1
         elseif level_select_counter == 60 then
             final_fire_cmd = 1; final_spinner_cmd = 0; final_zap_cmd = 0

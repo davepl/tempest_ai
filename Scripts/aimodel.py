@@ -195,15 +195,19 @@ class DQN(nn.Module):
     """Deep Q-Network model."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 256) # Input -> Hidden 1 (256)
-        self.fc2 = nn.Linear(256, 128)        # Hidden 1 -> Hidden 2 (128)
-        self.fc3 = nn.Linear(128, 64)         # Hidden 2 -> Hidden 3 (64)
-        self.out = nn.Linear(64, action_size) # Hidden 3 -> Output
+        self.fc1 = nn.Linear(state_size, 768) 
+        self.fc2 = nn.Linear(768, 512)  
+        self.fc3 = nn.Linear(512, 256)        
+        self.fc4 = nn.Linear(256, 128)        
+        self.fc5 = nn.Linear(128, 64)         
+        self.out = nn.Linear(64, action_size) 
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x)) # Added ReLU for fc3 output
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))      
+        x = F.relu(self.fc5(x))
         return self.out(x)
 
 class DQNAgent:
