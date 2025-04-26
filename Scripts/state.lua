@@ -10,6 +10,14 @@ local M = {} -- Module table to hold exported classes and functions
 local INVALID_SEGMENT = -32768 -- Used as sentinel value for invalid segments
 M.INVALID_SEGMENT = INVALID_SEGMENT -- Export if needed elsewhere
 
+-- Correct Enemy Type Constants (from assembly)
+local ENEMY_TYPE_FLIPPER  = 0
+local ENEMY_TYPE_PULSAR   = 1
+local ENEMY_TYPE_TANKER   = 2
+local ENEMY_TYPE_SPIKER   = 3
+local ENEMY_TYPE_FUSEBALL = 4
+local ENEMY_TYPE_MASK = 0x07 -- <<< ADDED THIS DEFINITION (%00000111)
+
 -- Helper function for BCD conversion (local to this module)
 local function bcd_to_decimal(bcd)
     -- Handle potential non-number inputs gracefully
@@ -33,6 +41,7 @@ local find_nearest_safe_segment
 find_forbidden_segments = function(enemies_state, level_state, player_state)
     local forbidden = {} -- Use a table as a set (keys are forbidden segments 0-15)
     local is_pulsing = enemies_state.pulsing ~= 0
+    -- print(string.format("FIND_FORBIDDEN: Pulsing active = %s", tostring(is_pulsing))) -- DEBUG
 
     -- Check enemies
     for i = 1, 7 do
@@ -41,13 +50,15 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
         local depth = enemies_state.enemy_depths[i]
 
         if abs_seg ~= INVALID_SEGMENT and depth > 0 then
-            -- 1. Pulsing Pulsar Lane
-            if core_type == 2 and is_pulsing then
+            -- 1. Pulsing Pulsar Lane (Check for Pulsar type 1)
+            if core_type == ENEMY_TYPE_PULSAR and is_pulsing then -- <<< CORRECTED TYPE
+                -- print(string.format("  -> FORBIDDEN (Pulsing Pulsar): Slot %d, Seg %d", i, abs_seg)) -- DEBUG
                 forbidden[abs_seg] = true
             end
-            -- 2. Top-level enemies/fuseballs (depth <= 0x20)
+            -- 2. Top-level enemies (depth <= 0x20)
+            -- Includes Flippers, Pulsars, Tankers, Fuseballs, Spikers if they are close
             if depth <= 0x20 then
-                 -- Mark any enemy this close as forbidden for safety
+                 -- print(string.format("  -> FORBIDDEN (Top Enemy): Slot %d, Type %d, Seg %d, Depth %02X", i, core_type, abs_seg, depth)) -- DEBUG
                  forbidden[abs_seg] = true
             end
         end
@@ -55,12 +66,14 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
 
     -- Check enemy shots
     local has_ammo = player_state.shot_count < 8 -- Check if player can shoot back
+    -- print(string.format("FIND_FORBIDDEN: Player can shoot = %s (Shot count %d)", tostring(has_ammo), player_state.shot_count)) -- DEBUG
     for i = 1, 4 do
-        local abs_seg = enemies_state.enemy_shot_abs_segments[i]
-        local depth = enemies_state.shot_positions[i]
+        local shot_abs_seg = enemies_state.enemy_shot_abs_segments[i]
+        local shot_depth = enemies_state.shot_positions[i]
         -- Mark forbidden if shot is close AND player cannot shoot back
-        if abs_seg ~= INVALID_SEGMENT and depth > 0 and depth <= 0x20 and not has_ammo then
-            forbidden[abs_seg] = true
+        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= 0x20 and not has_ammo then
+            -- print(string.format("  -> FORBIDDEN (Enemy Shot): Shot %d, Seg %d, Depth %02X", i, shot_abs_seg, shot_depth)) -- DEBUG
+            forbidden[shot_abs_seg] = true
         end
     end
     return forbidden
@@ -108,17 +121,30 @@ find_nearest_enemy_of_type = function(enemies_state, player_abs_segment, is_open
     local nearest_depth = 255
     local min_distance = 255 -- Use a large initial distance
 
+    -- if type_id == ENEMY_TYPE_TANKER then print(string.format("FIND_NEAREST DEBUG: Hunting Tankers (Type %d)", type_id)) end -- DEBUG
+
     for i = 1, 7 do
         local core_type = enemies_state.enemy_core_type[i]
         local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
         local enemy_depth = enemies_state.enemy_depths[i]
+        local is_forbidden = (enemy_abs_seg ~= INVALID_SEGMENT) and forbidden_segments[enemy_abs_seg] or false
+
+        --[[ DEBUG specific to Tankers
+        if type_id == ENEMY_TYPE_TANKER then
+            print(string.format(
+                "  Slot %d: Type=%d, AbsSeg=%s, Depth=%02X, IsForbidden=%s, PassesChecks=%s",
+                i, core_type, tostring(enemy_abs_seg), enemy_depth, tostring(is_forbidden),
+                tostring(core_type == type_id and enemy_abs_seg ~= INVALID_SEGMENT and enemy_depth > 0x30 and not is_forbidden)
+            ))
+        end
+        --]]
 
         -- Check if this is the enemy type we're looking for, if it's active,
         -- if its depth is > 0x30, AND if the segment is NOT forbidden
         if core_type == type_id and
            enemy_abs_seg ~= INVALID_SEGMENT and
            enemy_depth > 0x30 and
-           not forbidden_segments[enemy_abs_seg] then -- ADDED check for forbidden segment
+           not is_forbidden then
 
             -- Calculate distance using the provided function
             local rel_dist = abs_to_rel_func(player_abs_segment, enemy_abs_seg, is_open)
@@ -143,19 +169,48 @@ end
 -- Helper function to hunt enemies in preference order
 -- Needs abs_to_rel_func, is_open, and forbidden_segments passed in
 hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
-    -- Hunt in preference order: Pulsars(2), Flippers(0), Tankers(3), Fuseballs(4), Spikers(5)
-    local hunt_order = {2, 0, 3, 4, 5} -- Use 0 for Flippers
+    -- Corrected Hunt Order (based on assembly types): Fuseball(4), Pulsar(1), Tanker(2), Flipper(0), Spiker(3)
+    local hunt_order = {
+        ENEMY_TYPE_FUSEBALL, -- 4
+        ENEMY_TYPE_PULSAR,   -- 1
+        ENEMY_TYPE_TANKER,   -- 2
+        ENEMY_TYPE_FLIPPER,  -- 0
+        ENEMY_TYPE_SPIKER    -- 3
+    }
 
     for _, enemy_type in ipairs(hunt_order) do
-        local target_seg_abs, target_depth = find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func, forbidden_segments) -- Pass forbidden_segments
-        -- If an enemy of this type is found, target it immediately
+        local target_seg_abs, target_depth = find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func, forbidden_segments)
         if target_seg_abs ~= -1 then
-            return target_seg_abs, target_depth
+            -- Check for Top Rail Flipper(0)/Pulsar(1) Avoidance
+            if (enemy_type == ENEMY_TYPE_FLIPPER or enemy_type == ENEMY_TYPE_PULSAR) and target_depth <= 0x10 then -- <<< CORRECTED TYPE
+                local rel_dist = abs_to_rel_func(player_abs_segment, target_seg_abs, is_open)
+                if math.abs(rel_dist) <= 1 then -- If aligned or adjacent
+                    local safe_adjacent_seg
+                    if rel_dist <= 0 then -- Threat is left or aligned, move right
+                        safe_adjacent_seg = (player_abs_segment + 1) % 16
+                    else -- Threat is right, move left
+                        safe_adjacent_seg = (player_abs_segment - 1 + 16) % 16
+                    end
+                    -- print(string.format("HUNT AVOID: Top Type %d at %d (Rel %d). Targeting adjacent safe %d", enemy_type, target_seg_abs, rel_dist, safe_adjacent_seg))
+                    if forbidden_segments[safe_adjacent_seg] then
+                         -- print("HUNT AVOID: Adjacent safe segment " .. safe_adjacent_seg .. " is forbidden! Staying put.")
+                         return player_abs_segment, target_depth, true -- Stay put, but mark as avoiding
+                    else
+                         return safe_adjacent_seg, target_depth, true -- Target safe adjacent, mark as avoiding
+                    end
+                else
+                    -- Top Flipper/Pulsar is not adjacent, target directly
+                    return target_seg_abs, target_depth, false
+                end
+            else
+                -- Not a top-rail Flipper/Pulsar, target directly
+                return target_seg_abs, target_depth, false
+            end
         end
     end
 
     -- If no enemies from the hunt order are found
-    return -1, 255  -- Return invalid segment and max depth
+    return -1, 255, false
 end
 
 -- Function to determine target segment, depth, and firing decision
@@ -211,7 +266,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
@@ -264,10 +319,11 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                     brake_condition_met = true; break
                 end
             end
-            -- Check Flippers (0) and Pulsars (2) in the next segment if no shot found yet
+            -- Check Flippers (0) and Pulsars (1) in the next segment if no shot found yet
             if not brake_condition_met then
                 for i = 1, 7 do
-                    if (enemies_state.enemy_core_type[i] == 0 or enemies_state.enemy_core_type[i] == 2) and
+                    -- Check for Flipper OR Pulsar if close
+                    if (enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER or enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR) and -- <<< CORRECTED TYPE
                        enemies_state.enemy_abs_segments[i] == next_segment_abs and
                        enemies_state.enemy_depths[i] > 0 and
                        enemies_state.enemy_depths[i] <= 0x30 then
@@ -294,7 +350,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     -- Check if the current target is too close to a top-level fuseball
     local too_close = false
     for i = 1, 7 do
-        if enemies_state.enemy_core_type[i] == 4 and -- Is it a Fuseball?
+        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and -- Is it a Fuseball? (Correct type 4)
            enemies_state.enemy_depths[i] <= 0x10 and -- Is it at the top?
            enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then
 
@@ -338,7 +394,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                 local is_seg_safe = true
                 -- Check this segment against ALL top-level fuseballs
                 for i = 1, 7 do
-                     if enemies_state.enemy_core_type[i] == 4 and enemies_state.enemy_depths[i] <= 0x10 and enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+                     if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and enemies_state.enemy_depths[i] <= 0x10 and enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then -- Correct type 4
                         local fuseball_abs_seg = enemies_state.enemy_abs_segments[i]
                         local dist = math.abs(abs_to_rel_func(check_seg, fuseball_abs_seg, is_open))
                         if dist < min_fuseball_dist then
@@ -372,7 +428,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     local initial_should_fire = should_fire -- Store initial recommendation before override
     if not initial_should_fire then -- Only override if not already firing
         for i = 1, 7 do
-            if enemies_state.enemy_core_type[i] == 0 and -- Is it a Flipper?
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and -- Is it a Flipper? (Correct type 0)
                enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
                 local flipper_abs_seg = enemies_state.enemy_abs_segments[i]
                 if flipper_abs_seg ~= INVALID_SEGMENT then
@@ -612,7 +668,7 @@ function M.EnemiesState:new()
     self.enemy_depths = {}    -- Enemy depth/position ($02DF + i - 1)
 
     -- Decoded Enemy Info Tables (Size 7)
-    self.enemy_core_type = {}      -- Bits 0-2 from type byte
+    self.enemy_core_type = {}      -- Bits 0-2 from type byte (0-4 based on assembly)
     self.enemy_direction_moving = {} -- Bit 6 from type byte (0/1)
     self.enemy_between_segments = {} -- Bit 7 from type byte (0/1)
     self.enemy_moving_away = {}    -- Bit 7 from state byte (0/1)
@@ -730,8 +786,8 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.enemy_type_info[i] = type_byte
             self.active_enemy_info[i] = state_byte
 
-            -- Decode Type Byte
-            self.enemy_core_type[i] = type_byte & 0x07
+            -- Decode Type Byte (Use assembly mask)
+            self.enemy_core_type[i] = type_byte & ENEMY_TYPE_MASK -- Apply the mask to get 0-4
             self.enemy_direction_moving[i] = (type_byte & 0x40) ~= 0 and 1 or 0 -- Bit 6: Segment increasing?
             self.enemy_between_segments[i] = (type_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Between segments?
 
@@ -746,7 +802,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
-        if self.enemy_core_type[i] == 4 and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then
+        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
             local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
             if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
                  self.charging_fuseball_segments[abs_segment_idx] = 1
@@ -834,7 +890,7 @@ end
 
 -- Helper functions for display (can be called on an instance)
 function M.EnemiesState:decode_enemy_type(type_byte)
-    local enemy_type = type_byte & 0x07
+    local enemy_type = type_byte & ENEMY_TYPE_MASK -- Use the mask
     local between_segments = (type_byte & 0x80) ~= 0
     local segment_increasing = (type_byte & 0x40) ~= 0
     return string.format("%d%s%s",
