@@ -428,14 +428,12 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     local initial_should_fire = should_fire -- Store initial recommendation before override
     if not initial_should_fire then -- Only override if not already firing
         for i = 1, 7 do
-            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and -- Is it a Flipper? (Correct type 0)
-               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
+            if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
                 local flipper_abs_seg = enemies_state.enemy_abs_segments[i]
                 if flipper_abs_seg ~= INVALID_SEGMENT then
                     local flipper_rel_seg = abs_to_rel_func(player_abs_seg, flipper_abs_seg, is_open)
                     if math.abs(flipper_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
                         should_fire = true -- Force firing recommendation
-                        print("FLIPPER OVERRIDE: Firing due to nearby flipper.") -- DEBUG
                         break -- Found a dangerous flipper, no need to check others
                     end
                 end
