@@ -408,198 +408,241 @@ end
 
 find_target_segment = function(game_state, player_state, level_state, enemies_state, abs_to_rel_func, is_open)
     local player_abs_seg = player_state.position & 0x0F
-    if game_state.gamestate ~= 0x04 then
-        return player_abs_seg, 0, false, false
-    end
-    local shot_count = player_state.shot_count or 0
-    local fallback_safe = nil
-    local fallback_priority = 100
-    local best_target = player_abs_seg
-    local best_priority = 100
-    local fire_priority = 4 -- Start with default priority
-    local found = false
-    local reason = "stay_put" -- Default reason
-    local should_fire = false -- Default fire state
-    local fire_debug_printed = false -- Flag to track if FIRE DEBUG was printed
 
-    -- Calculate base fire priority based on nearby enemies
-    for i = 1, 7 do
-        if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
-            local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
-            local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
-            
-            -- Enemy in current segment?
-            if rel_dist == 0 then
-                fire_priority = math.max(fire_priority, 6)
-            end
-            
-            -- Top-rail enemy adjacent?
-            if math.abs(rel_dist) <= 1 and enemies_state.enemy_depths[i] == 0x10 then
-                local new_priority = math.max(fire_priority, 8)
-                if new_priority == 8 and fire_priority < 8 then -- Print only when priority is newly raised to 8
-                    print(string.format("[FIRE DEBUG] Adjacent top-rail enemy detected! Prio=8, Shots=%d", shot_count))
-                    fire_debug_printed = true -- Set the flag
+    -- Handle Tube Zoom state first
+    if game_state.gamestate == 0x20 then
+        return zoom_down_tube(player_abs_seg, level_state, is_open)
+    
+    -- Handle Normal Gameplay state
+    elseif game_state.gamestate == 0x04 then
+        local shot_count = player_state.shot_count or 0
+        local fallback_safe = nil
+        local fallback_priority = 100
+        local best_target = player_abs_seg
+        local best_priority = 4 -- Start with default priority
+        local found = false
+        local reason = "stay_put" -- Default reason
+        local should_fire = false -- Default fire state
+
+        -- Flags for new priority logic
+        local any_top_rail_enemy_exists = false
+        local adjacent_or_current_top_rail_enemy_exists = false
+        local enemy_in_current_lane = false
+        local shot_in_current_lane = false -- New flag for shots
+
+        -- First pass: check enemy locations AND SHOTS for priority flags
+        for i = 1, 7 do
+            if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
+                local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
+                local enemy_depth = enemies_state.enemy_depths[i]
+                local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
+
+                -- Check if any enemy is at top rail
+                if enemy_depth == 0x10 then
+                    any_top_rail_enemy_exists = true
                 end
-                fire_priority = new_priority
-            end
-        end
-    end
 
-    -- If current lane is danger, seek first safe lane (sets priority 8 explicitly)
-    if is_danger_lane(player_abs_seg, enemies_state) then
-        reason = "escape"
-        fire_priority = 8 -- Highest priority when escaping danger
-        local best_safe_left = -1
-        local best_safe_right = -1
-        local min_safe_dist_left = 16
-        local min_safe_dist_right = 16
-        local stop_left_search = false
-        local stop_right_search = false
-
-        for d = 1, 15 do
-            -- Check Left
-            if not stop_left_search then
-                local left_seg = (player_abs_seg - d + 16) % 16
-                if not is_danger_lane(left_seg, enemies_state) then
-                    if d < min_safe_dist_left then
-                        best_safe_left = left_seg
-                        min_safe_dist_left = d
-                        -- Don't stop search yet, closer might exist
-                    end
-                else
-                    stop_left_search = true -- Danger hit, stop searching left
+                -- Check if a top-rail enemy is adjacent or current
+                if enemy_depth == 0x10 and math.abs(rel_dist) <= 1 then
+                    adjacent_or_current_top_rail_enemy_exists = true
+                end
+                
+                -- Check if any enemy is in the current lane
+                if rel_dist == 0 then
+                    enemy_in_current_lane = true
                 end
             end
-
-            -- Check Right
-            if not stop_right_search then
-                local right_seg = (player_abs_seg + d + 16) % 16
-                if not is_danger_lane(right_seg, enemies_state) then
-                     if d < min_safe_dist_right then
-                         best_safe_right = right_seg
-                         min_safe_dist_right = d
-                         -- Don't stop search yet, closer might exist
-                    end
-                else
-                    stop_right_search = true -- Danger hit, stop searching right
-                end
-            end
-            
-            -- Optimization: if both searches stopped, no need to continue distance loop
-            if stop_left_search and stop_right_search then break end
-        end
-
-        -- Decide based on findings
-        if min_safe_dist_left <= min_safe_dist_right and best_safe_left ~= -1 then
-            -- Left is closer or equal (apply left bias in case of tie)
-            best_target = best_safe_left
-        elseif best_safe_right ~= -1 then
-            -- Right is closer
-            best_target = best_safe_right
-        else
-            -- No safe lane found nearby, stay put (best_target remains player_abs_seg)
-            best_target = player_abs_seg
         end
         
-        should_fire = fire_priority > shot_count
-    -- If current lane has enemy, stay and shoot (priority 6)
-    elseif get_enemy_priority(player_abs_seg, enemies_state) then
-        reason = "enemy"
-        fire_priority = math.max(fire_priority, 6) -- Ensure at least 6
-        best_target = player_abs_seg
-        should_fire = fire_priority > shot_count
-    else -- Expand search outwards
-        reason = "search"
-        for sign = -1, 1, 2 do
+        -- Check enemy shots in current lane
+        for i = 1, 4 do
+            if enemies_state.enemy_shot_abs_segments[i] == player_abs_seg and
+               enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then
+                shot_in_current_lane = true
+                break -- Found one, no need to check more
+            end
+        end
+
+        -- Apply new fire priority logic (with added shot check)
+        if adjacent_or_current_top_rail_enemy_exists then
+            fire_priority = 8
+        elseif shot_in_current_lane then -- NEW: Priority 7 for incoming shots
+            fire_priority = 7
+        elseif any_top_rail_enemy_exists then
+            fire_priority = 3               -- Fire a few shots in case stuff is in our lane or adjacent
+        elseif enemy_in_current_lane then
+             fire_priority = 6
+        else
+             fire_priority = 4 -- Default if none of the above apply
+        end
+
+        -- OLD PRIORITY LOGIC REMOVED
+        -- Calculate base fire priority based on nearby enemies
+        -- for i = 1, 7 do
+        --     if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
+        --         local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
+        --         local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
+        --         
+        --         -- Enemy in current segment?
+        --         if rel_dist == 0 then
+        --             fire_priority = math.max(fire_priority, 6)
+        --         end
+        --         
+        --         -- Top-rail enemy adjacent?
+        --         if math.abs(rel_dist) <= 1 and enemies_state.enemy_depths[i] == 0x10 then
+        --             local new_priority = math.max(fire_priority, 8)
+        --             if new_priority == 8 and fire_priority < 8 then -- Print only when priority is newly raised to 8
+        --                 -- print(string.format("[FIRE DEBUG] Adjacent top-rail enemy detected! Prio=8, Shots=%d", shot_count))
+        --                 fire_debug_printed = true -- Set the flag
+        --             end
+        --             fire_priority = new_priority
+        --         end
+        --     end
+        -- end
+
+        -- If current lane is danger, seek first safe lane (sets priority 8 explicitly)
+        if is_danger_lane(player_abs_seg, enemies_state) then
+            reason = "escape"
+            fire_priority = 8 -- Highest priority when escaping danger
+            local best_safe_left = -1
+            local best_safe_right = -1
+            local min_safe_dist_left = 16
+            local min_safe_dist_right = 16
+            local stop_left_search = false
+            local stop_right_search = false
+
             for d = 1, 15 do
-                local seg = (player_abs_seg + sign * d + 16) % 16
-                if is_danger_lane(seg, enemies_state) then
-                    break -- Stop searching further in this direction
-                else
-                    local t2, p2 = get_enemy_priority(seg, enemies_state)
-                    if t2 and p2 < best_priority then
-                        best_target = seg
-                        best_priority = p2
-                        fire_priority = math.max(fire_priority, 6) -- Priority 6 for targeting enemy
-                        reason = "target_enemy"
-                    elseif not t2 and fallback_safe == nil then
-                        fallback_safe = seg
-                        fallback_priority = 4 -- Priority 4 for fallback
-                        reason = "fallback_safe"
+                -- Check Left
+                if not stop_left_search then
+                    local left_seg = (player_abs_seg - d + 16) % 16
+                    if not is_danger_lane(left_seg, enemies_state) then
+                        if d < min_safe_dist_left then
+                            best_safe_left = left_seg
+                            min_safe_dist_left = d
+                            -- Don't stop search yet, closer might exist
+                        end
+                    else
+                        stop_left_search = true -- Danger hit, stop searching left
+                    end
+                end
+
+                -- Check Right
+                if not stop_right_search then
+                    local right_seg = (player_abs_seg + d + 16) % 16
+                    if not is_danger_lane(right_seg, enemies_state) then
+                         if d < min_safe_dist_right then
+                             best_safe_right = right_seg
+                             min_safe_dist_right = d
+                             -- Don't stop search yet, closer might exist
+                        end
+                    else
+                        stop_right_search = true -- Danger hit, stop searching right
+                    end
+                end
+                
+                -- Optimization: if both searches stopped, no need to continue distance loop
+                if stop_left_search and stop_right_search then break end
+            end
+
+            -- Decide based on findings
+            if min_safe_dist_left <= min_safe_dist_right and best_safe_left ~= -1 then
+                -- Left is closer or equal (apply left bias in case of tie)
+                best_target = best_safe_left
+            elseif best_safe_right ~= -1 then
+                -- Right is closer
+                best_target = best_safe_right
+            else
+                -- No safe lane found nearby, stay put (best_target remains player_abs_seg)
+                best_target = player_abs_seg
+            end
+            
+            should_fire = fire_priority > shot_count
+        -- If current lane has enemy, stay and shoot (priority 6)
+        elseif get_enemy_priority(player_abs_seg, enemies_state) then
+            reason = "enemy"
+            fire_priority = math.max(fire_priority, 6) -- Ensure at least 6
+            best_target = player_abs_seg
+            should_fire = fire_priority > shot_count
+        else -- Expand search outwards
+            reason = "search"
+            for sign = -1, 1, 2 do
+                for d = 1, 15 do
+                    local seg = (player_abs_seg + sign * d + 16) % 16
+                    if is_danger_lane(seg, enemies_state) then
+                        break -- Stop searching further in this direction
+                    else
+                        local t2, p2 = get_enemy_priority(seg, enemies_state)
+                        if t2 and p2 < best_priority then
+                            best_target = seg
+                            best_priority = p2
+                            fire_priority = math.max(fire_priority, 6) -- Priority 6 for targeting enemy
+                            reason = "target_enemy"
+                        elseif not t2 and fallback_safe == nil then
+                            fallback_safe = seg
+                            fallback_priority = 4 -- Priority 4 for fallback
+                            reason = "fallback_safe"
+                        end
                     end
                 end
             end
-        end
-        if best_priority < 100 then -- Found a target enemy
-            should_fire = fire_priority > shot_count
-        elseif fallback_safe then -- Found a fallback safe lane
-            best_target = fallback_safe
-        else -- No target, no fallback
-            best_target = player_abs_seg
-            reason = "stay_put"
-        end
-    end
+            if best_priority < 100 then -- Found a target enemy
+                 -- Target Adjustment Logic for top-rail flippers is now inside this block
+                 local target_enemy_type = nil
+                 local target_enemy_depth = 0
+                 for i=1, 7 do -- Find the actual enemy data for the best_target segment
+                      if enemies_state.enemy_abs_segments[i] == best_target and enemies_state.enemy_depths[i] > 0 then
+                          target_enemy_type = enemies_state.enemy_core_type[i]
+                          target_enemy_depth = enemies_state.enemy_depths[i]
+                          break
+                      end
+                 end
 
-    local final_target = player_abs_seg -- Default to staying put
-    local final_reason = reason -- Use the reason determined so far
-
-    if reason == "target_enemy" then
-        -- Check if the target is a top-rail flipper
-        local target_enemy_type = nil
-        local target_enemy_depth = 0
-        for i=1, 7 do -- Find the actual enemy data for the best_target segment
-             if enemies_state.enemy_abs_segments[i] == best_target and enemies_state.enemy_depths[i] > 0 then
-                 -- This assumes get_enemy_priority found the highest priority one, should be safe
-                 target_enemy_type = enemies_state.enemy_core_type[i]
-                 target_enemy_depth = enemies_state.enemy_depths[i]
-                 break
-             end
-        end
-
-        if target_enemy_type == ENEMY_TYPE_FLIPPER and target_enemy_depth == 0x10 then
-            -- Adjust target for top-rail flipper: target segment BEFORE it
-            local rel_dist_flipper = abs_to_rel_func(player_abs_seg, best_target, is_open)
-            local adjusted_target
-            if rel_dist_flipper > 0 then -- Flipper is right
-                adjusted_target = (best_target - 1 + 16) % 16
-            elseif rel_dist_flipper < 0 then -- Flipper is left
-                adjusted_target = (best_target + 1) % 16
-            else -- Flipper is current (shouldn't happen if current isn't danger, but safe default)
-                adjusted_target = player_abs_seg 
+                 if target_enemy_type == ENEMY_TYPE_FLIPPER and target_enemy_depth == 0x10 then
+                     -- Adjust target for top-rail flipper: target segment BEFORE it
+                     local rel_dist_flipper = abs_to_rel_func(player_abs_seg, best_target, is_open)
+                     local adjusted_target
+                     if rel_dist_flipper > 0 then -- Flipper is right
+                         adjusted_target = (best_target - 1 + 16) % 16
+                     elseif rel_dist_flipper < 0 then -- Flipper is left
+                         adjusted_target = (best_target + 1) % 16
+                     else -- Flipper is current (shouldn't happen if current isn't danger, but safe default)
+                         adjusted_target = player_abs_seg 
+                     end
+                     
+                     if not is_danger_lane(adjusted_target, enemies_state) then
+                         best_target = adjusted_target -- Use the adjusted target
+                         reason = "target_top_flipper_adj"
+                     else
+                         best_target = player_abs_seg -- Stay put if adjusted target is dangerous
+                         reason = "target_top_flipper_blocked"
+                     end
+                 end
+                 -- If not a top-rail flipper, best_target remains unchanged from search
+                 should_fire = fire_priority > shot_count
+                 
+            elseif fallback_safe then -- Found a fallback safe lane
+                 best_target = fallback_safe
+                 reason = "fallback_safe" -- Corrected reason assignment
+                 -- should_fire remains false (default)
+            else -- No target, no fallback
+                 best_target = player_abs_seg
+                 reason = "stay_put"
+                 -- should_fire remains false (default)
             end
-            
-            if not is_danger_lane(adjusted_target, enemies_state) then
-                final_target = adjusted_target
-                final_reason = "target_top_flipper_adj"
-            else
-                final_target = player_abs_seg -- Stay put if adjusted target is dangerous
-                final_reason = "target_top_flipper_blocked"
-            end
-        else
-             -- Not a top-rail flipper, use the original best_target
-             final_target = best_target
         end
-    elseif reason == "fallback_safe" then
-         final_target = fallback_safe
-    elseif reason == "escape" or reason == "enemy" then
-         final_target = best_target -- Use target determined by escape/enemy-in-lane logic
-    else -- Stay put (reason == "stay_put" or initial default)
-         final_target = player_abs_seg
-    end 
 
-    -- Recalculate final should_fire based on priority, AFTER potential avoidance adjustments
-    should_fire = fire_priority > shot_count
+        local final_target = best_target -- Assign final target after all adjustments
 
-    -- Print shot count if FIRE DEBUG didn't print
-    if not fire_debug_printed then
-        print(string.format("[SHOT COUNT] Shots=%d", shot_count))
+        -- Recalculate final should_fire based on priority (Important!) 
+        -- This uses the fire_priority determined earlier, which considers top-rail enemies
+        should_fire = fire_priority > shot_count
+
+        return final_target, 0, should_fire, false
+
+    -- Handle any other game state (default: stay put)
+    else
+        return player_abs_seg, 0, false, false
     end
-
-    -- Final Decision Logging (Removed)
-    -- print(string.format("[AI DEBUG] Decision: player=%d, target=%d, danger=%s, reason=%s, fire_prio=%d, shots=%d, should_fire=%s, top_avoid=%s", 
-    --     player_abs_seg, final_target, tostring(is_danger_lane(final_target, enemies_state)), reason, fire_priority, shot_count, tostring(should_fire), tostring(did_top_rail_avoid)))
-
-    return final_target, 0, should_fire, false
 end
 
 -- Function to calculate desired spinner direction and distance to target
@@ -644,7 +687,7 @@ local function calculate_reward(game_state, level_state, player_state, enemies_s
 
     -- Safety check for potentially uninitialized state (shouldn't happen in normal flow)
     if not enemies_state or enemies_state.nearest_enemy_abs_seg_internal == nil then
-        print("WARNING: calculate_reward called with invalid enemies_state or nearest_enemy_abs_seg_internal is nil. Defaulting target.")
+        -- print("WARNING: calculate_reward called with invalid enemies_state or nearest_enemy_abs_seg_internal is nil. Defaulting target.")
         enemies_state = enemies_state or {}
         enemies_state.nearest_enemy_abs_seg_internal = -1 -- Default to no target
         enemies_state.nearest_enemy_depth_raw = 255
@@ -794,7 +837,7 @@ local function process_frame(rawdata)
     end)
 
     if not success then
-        print("Error writing to socket:", err)
+        -- print("Error writing to socket:", err)
         -- Close and attempt to reopen socket
         if socket then
             socket:close(); socket = nil
@@ -828,7 +871,7 @@ local function process_frame(rawdata)
             else
                 -- Ensure we read exactly 3 bytes
                 if #action_bytes ~= 3 then
-                     print("Warning: Expected 3 bytes from socket, received " .. #action_bytes)
+                     -- print("Warning: Expected 3 bytes from socket, received " .. #action_bytes)
                      action_bytes = nil -- Treat as incomplete read
                      -- Sleep briefly before retrying
                      local wait_start = os.clock()
@@ -843,13 +886,13 @@ local function process_frame(rawdata)
             fire, zap, spinner = string.unpack("bbb", action_bytes)
         else
             -- Default action if read fails or times out
-            print("Failed to read action from socket after " .. string.format("%.2f", elapsed) .. "s, got " ..
-                (action_bytes and #action_bytes or 0) .. " bytes. Defaulting action.")
+            -- print("Failed to read action from socket after " .. string.format("%.2f", elapsed) .. "s, got " ..
+            --     (action_bytes and #action_bytes or 0) .. " bytes. Defaulting action.")
             fire, zap, spinner = 0, 0, 0
 
             -- If we timed out, attempt to reconnect
             if elapsed >= read_timeout then
-                print("Socket read timeout exceeded, attempting reconnect...")
+                -- print("Socket read timeout exceeded, attempting reconnect...")
                 if socket then socket:close(); socket = nil end
                 open_socket() -- Attempt reconnect immediately
             end
@@ -857,7 +900,7 @@ local function process_frame(rawdata)
     end)
 
     if not success then
-        print("Error reading from socket:", err)
+        -- print("Error reading from socket:", err)
         -- Close and attempt to reopen socket
         if socket then
             socket:close(); socket = nil
@@ -884,8 +927,8 @@ local success, err = pcall(function()
 end)
 
 if not success then
-    print("Error accessing MAME machine via manager: " .. tostring(err))
-    print("Attempting alternative access method...")
+    -- print("Error accessing MAME machine via manager: " .. tostring(err))
+    -- print("Attempting alternative access method...")
     success, err = pcall(function()
         if not machine then error("Neither manager.machine nor machine is available") end
         mainCpu = machine.devices[":maincpu"]
@@ -895,8 +938,8 @@ if not success then
     end)
 
     if not success then
-        print("Error with alternative access method: " .. tostring(err))
-        print("FATAL: Cannot access MAME memory")
+        -- print("Error with alternative access method: " .. tostring(err))
+        -- print("FATAL: Cannot access MAME memory")
         -- Potentially add emu.pause() or similar if running directly causes issues
         return -- Stop script execution if memory isn't accessible
     end
@@ -1306,7 +1349,7 @@ local function frame_callback()
 
     -- Send current state (s'), reward (r), done (d) to AI; receive action (a) for s'
     local received_fire_cmd, received_zap_cmd, received_spinner_cmd = process_frame(frame_data) -- Correct args
-    print(string.format("[RECV DEBUG] Received from Python: fire=%d, zap=%d, spinner=%d", received_fire_cmd, received_zap_cmd, received_spinner_cmd))
+    -- print(string.format("[RECV DEBUG] Received from Python: fire=%d, zap=%d, spinner=%d", received_fire_cmd, received_zap_cmd, received_spinner_cmd))
 
     -- Store received commands in player state immediately
     player_state.fire_commanded = received_fire_cmd
@@ -1368,7 +1411,7 @@ local function frame_callback()
     -- Apply the final determined actions (AI or state-based overrides)
 
     if (final_p1_start_cmd == 1) then
-        print("PRESSING START with fire=" .. final_fire_cmd .. " zap=" .. final_zap_cmd .. " spinner=" .. final_spinner_cmd)
+        -- print("PRESSING START with fire=" .. final_fire_cmd .. " zap=" .. final_zap_cmd .. " spinner=" .. final_spinner_cmd)
     end
     
     controls:apply_action(final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd)
