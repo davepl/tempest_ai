@@ -12,10 +12,11 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local SAFE_DISTANCE = 2
+local SAFE_DISTANCE = 1
 local FREEZE_FIRE_PRIO_LOW = 4
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 4
+local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance
 
 local M = {} -- Module table
 
@@ -248,6 +249,18 @@ local function find_nearest_safe_segment(start_seg, enemies_state, is_open)
     return start_seg -- Fallback: stay put if no safe found nearby
 end
 
+-- NEW Helper: Check if a segment contains an active Pulsar
+local function is_pulsar_lane(segment, enemies_state)
+    for i = 1, 7 do
+        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+           enemies_state.enemy_abs_segments[i] == segment and
+           enemies_state.enemy_depths[i] > 0 then
+            return true
+        end
+    end
+    return false
+end
+
 -- NEW Helper: Find nearest safe segment that also respects distance from a constraint segment
 local function find_nearest_constrained_safe_segment(start_seg, enemies_state, is_open, constraint_seg, abs_to_rel_func)
     -- Search outwards from the start segment
@@ -279,24 +292,33 @@ end
 
 -- Function to find the target segment and recommended action (expert policy)
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
-    -- Define is_open based on the passed level_state
     local is_open = (level_state.level_type == 0xFF)
-
     local player_abs_seg = player_state.position & 0x0F
     local shot_count = player_state.shot_count or 0
-    local best_target = player_abs_seg -- Default target
-    local should_fire = false -- Default fire state
-    local fire_priority = 1 -- Default fire priority
+
+    -- Default return values
+    local proposed_target_seg = player_abs_seg
+    local proposed_fire_prio = 6 -- Default fire priority
+    local final_should_fire = false
 
     if game_state.gamestate == 0x20 then -- Tube Zoom
-        return M.zoom_down_tube(player_abs_seg, level_state, is_open)
+        proposed_target_seg, _, final_should_fire, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
+        -- In tube zoom, fire priority isn't calculated the same way, should_fire is directly returned
+        -- We will bypass the final Pulsar check for Tube Zoom state
+        return proposed_target_seg, 0, final_should_fire, false
 
     elseif game_state.gamestate == 0x04 then -- Normal Gameplay
-        -- --- Presence-Based Top Rail Logic --- Priority 1
-        local nl_seg, nr_seg = nil, nil -- Nearest top-rail enemy left/right segment
-        local nl_dist, nr_dist = 100, 100 -- Min absolute distance left/right
+        -- === Step 1: Determine proposed target based on Top Rail / Hunt ===
+
+        -- Scan Top Rail Enemies
+        local nl_seg, nr_seg = nil, nil
+        local nl_dist, nr_dist = 100, 100
         local enemy_left_exists, enemy_right_exists = false, false
-        local any_enemy_proximate = false -- Is any top-rail enemy <= dist 1?
+        local any_enemy_proximate = false
+        local top_rail_enemies = {}
+        local nearest_flipper_seg = nil -- Specifically track nearest flipper
+        local nearest_flipper_rel = nil
+        local min_flipper_abs_rel = 100
 
         for i = 1, 7 do
             local depth = enemies_state.enemy_depths[i]
@@ -305,146 +327,153 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 if seg ~= INVALID_SEGMENT then
                     local rel = abs_to_rel_func(player_abs_seg, seg, is_open)
                     local abs_rel = math.abs(rel)
+                    local core_type = enemies_state.enemy_core_type[i]
 
                     if abs_rel <= 1 then any_enemy_proximate = true end
+                    table.insert(top_rail_enemies, {seg = seg, rel = rel, abs_rel = abs_rel, type = core_type})
 
-                    if rel > 0 and abs_rel < nr_dist then -- Enemy strictly to the right
-                        nr_dist = abs_rel
-                        nr_seg = seg
-                        enemy_right_exists = true
-                    elseif rel < 0 and abs_rel < nl_dist then -- Enemy strictly to the left
-                        nl_dist = abs_rel
-                        nl_seg = seg
-                        enemy_left_exists = true
+                    -- Update nearest overall left/right
+                    if rel > 0 and abs_rel < nr_dist then nr_dist, nr_seg, enemy_right_exists = abs_rel, seg, true end
+                    if rel < 0 and abs_rel < nl_dist then nl_dist, nl_seg, enemy_left_exists = abs_rel, seg, true end
+
+                    -- Update nearest flipper specifically
+                    if core_type == ENEMY_TYPE_FLIPPER then
+                        if abs_rel < min_flipper_abs_rel then
+                             min_flipper_abs_rel = abs_rel
+                             nearest_flipper_seg = seg
+                             nearest_flipper_rel = rel
+                        end
                     end
                 end
             end
         end
 
-        local target_calculated = false -- Flag to know if we need to run standard hunt
-        local target_seg = player_abs_seg -- Default if logic below doesn't set it
+        -- === Step 1A: High Priority Flipper Avoidance ===
+        if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
+            print(string.format("[Flipper Avoid] Flipper at %d too close (Dist %d < %d). Avoiding.", nearest_flipper_seg, min_flipper_abs_rel, SAFE_DISTANCE))
 
-        -- Calculate base fire priority based *only* on proximity
+            -- Calculate target D segments away from the flipper, in the direction opposite the player
+            local direction_away_from_player = (nearest_flipper_rel == 0) and 1 or (nearest_flipper_rel > 0 and -1 or 1)
+            local target_seg = (nearest_flipper_seg + direction_away_from_player * SAFE_DISTANCE + 16) % 16
+
+            -- Safety Check for the calculated avoidance target
+            if M.is_danger_lane(target_seg, enemies_state) then
+                 print(string.format("[Flipper Avoid Safety Override] Avoidance target %d unsafe. Finding constrained safe.", target_seg))
+                 target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nearest_flipper_seg, abs_to_rel_func)
+            end
+            local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
+            local should_fire = fire_priority > shot_count
+            return target_seg, 0, should_fire, false -- Return early
+        end
+
+        -- === Step 1B: Determine proposed target based on Top Rail (Presence) / Hunt ===
         local base_fire_priority = any_enemy_proximate and FREEZE_FIRE_PRIO_HIGH or FREEZE_FIRE_PRIO_LOW
-        fire_priority = base_fire_priority -- Start with base priority
+        proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
 
         if enemy_left_exists and enemy_right_exists then
-            -- Case 1: Enemies on Both Sides -> Midpoint or adjacent
-            local midpoint_target
-            if is_open then -- Linear midpoint for open levels
-                midpoint_target = math.floor((nl_seg + nr_seg) / 2)
-                target_seg = any_enemy_proximate and midpoint_target or math.min(15, midpoint_target + 1) -- Target midpoint if proximate, else adjacent (right bias)
-                print(string.format("[DEBUG TopRail] Both Sides (Open): L=%d, R=%d -> Midpoint=%d, Target=%d", nl_seg, nr_seg, midpoint_target, target_seg))
-            else -- Circular midpoint for closed levels
-                local dist = (nr_seg - nl_seg + 16) % 16
-                local offset = math.floor(dist / 2)
-                target_seg = (nl_seg + offset + 16) % 16 -- Target midpoint directly
-                print(string.format("[DEBUG TopRail] Both Sides (Closed): L=%d, R=%d -> Midpoint/Target=%d", nl_seg, nr_seg, target_seg))
-            end
-             -- Safety Check
-            if M.is_danger_lane(target_seg, enemies_state) then
-                print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding simple nearest safe", target_seg))
-                target_seg = find_nearest_safe_segment(target_seg, enemies_state, is_open)
-                fire_priority = AVOID_FIRE_PRIORITY -- Override fire priority for safety maneuver
-            end
-            should_fire = fire_priority > shot_count
-            return target_seg, 0, should_fire, false -- Return early
-        elseif enemy_right_exists then
-            -- Case 2: Enemies Only Right -> Edge/Adjacent or Safe Distance
-            if is_open then
-                target_seg = any_enemy_proximate and 0 or 1 -- Retreat to 0 if proximate, else target 1
-                print(string.format("[DEBUG TopRail] Right Only (Open): R=%d -> Target=%d (Prox=%s)", nr_seg, target_seg, tostring(any_enemy_proximate)))
-            else -- Closed Level
-                if nr_dist < SAFE_DISTANCE then
-                    target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16
-                    print(string.format("[DEBUG TopRail] Right Only (Closed): R=%d (PlayerDist %d < %d) -> Target=%d (Moving Left)", nr_seg, nr_dist, SAFE_DISTANCE, target_seg))
-                else
-                    target_seg = player_abs_seg -- Stay put
-                    print(string.format("[DEBUG TopRail] Right Only (Closed): R=%d (PlayerDist %d >= %d) -> Target=%d (Stay Put)", nr_seg, nr_dist, SAFE_DISTANCE, target_seg))
+            -- Case 1: Both Sides - Find nearest threat, target inside or midpoint fallback
+            local nearest_threat_seg, nearest_threat_rel, min_threat_abs_rel = nil, nil, 100
+            for _, enemy in ipairs(top_rail_enemies) do
+                if enemy.type == ENEMY_TYPE_FLIPPER or enemy.type == ENEMY_TYPE_PULSAR then
+                    if enemy.abs_rel < min_threat_abs_rel then min_threat_abs_rel, nearest_threat_seg, nearest_threat_rel = enemy.abs_rel, enemy.seg, enemy.rel end
                 end
             end
-            -- Safety Check
-            if M.is_danger_lane(target_seg, enemies_state) then
-                 print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding constrained safe >=%d from R=%d", target_seg, SAFE_DISTANCE, nr_seg))
-                 target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nr_seg, abs_to_rel_func)
-                 fire_priority = AVOID_FIRE_PRIORITY -- Override fire priority for safety maneuver
+            if nearest_threat_seg then
+                if nearest_threat_rel > 0 then proposed_target_seg = (nearest_threat_seg - 1 + 16) % 16
+                elseif nearest_threat_rel < 0 then proposed_target_seg = (nearest_threat_seg + 1 + 16) % 16
+                else proposed_target_seg = player_abs_seg end
+            else -- Fallback: No Flippers/Pulsars, use midpoint
+                 if is_open then local mid = math.floor((nl_seg + nr_seg) / 2); proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
+                 else local dist = (nr_seg - nl_seg + 16) % 16; proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16 end
             end
-            should_fire = fire_priority > shot_count
-            return target_seg, 0, should_fire, false -- Return early
+        elseif enemy_right_exists then
+            -- Case 2: Right Only
+            if is_open then proposed_target_seg = (nr_dist <= 1) and 0 or 1
+            else if nr_dist < SAFE_DISTANCE then proposed_target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16 else proposed_target_seg = player_abs_seg end end
         elseif enemy_left_exists then
-            -- Case 3: Enemies Only Left -> Edge/Adjacent or Safe Distance
-            if is_open then
-                 target_seg = any_enemy_proximate and 15 or 14 -- Retreat to 15 if proximate, else target 14
-                 print(string.format("[DEBUG TopRail] Left Only (Open): L=%d -> Target=%d (Prox=%s)", nl_seg, target_seg, tostring(any_enemy_proximate)))
-            else -- Closed Level
-                 if nl_dist < SAFE_DISTANCE then
-                    target_seg = (nl_seg + SAFE_DISTANCE) % 16
-                    print(string.format("[DEBUG TopRail] Left Only (Closed): L=%d (PlayerDist %d < %d) -> Target=%d (Moving Right)", nl_seg, nl_dist, SAFE_DISTANCE, target_seg))
-                 else
-                    target_seg = player_abs_seg -- Stay put
-                    print(string.format("[DEBUG TopRail] Left Only (Closed): L=%d (PlayerDist %d >= %d) -> Target=%d (Stay Put)", nl_seg, nl_dist, SAFE_DISTANCE, target_seg))
-                 end
+             -- Case 3: Left Only
+            if is_open then proposed_target_seg = (nl_dist <= 1) and 15 or 14
+            else if nl_dist < SAFE_DISTANCE then proposed_target_seg = (nl_seg + SAFE_DISTANCE) % 16 else proposed_target_seg = player_abs_seg end end
+        else
+            -- Case 4: No Top Rail -> Standard Hunt Logic
+            if M.is_danger_lane(player_abs_seg, enemies_state) then
+                 proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                 proposed_fire_prio = AVOID_FIRE_PRIORITY -- Lower priority when escaping
+            elseif M.get_enemy_priority(player_abs_seg, enemies_state) then
+                 proposed_target_seg = player_abs_seg
+                 proposed_fire_prio = 6
+            else -- Search outwards
+                local fallback_safe, best_enemy_prio, found_target = nil, 100, false
+                local search_target = player_abs_seg
+                for sign = -1, 1, 2 do
+                    for d = 1, 8 do
+                        local seg = (player_abs_seg + sign * d + 16) % 16
+                        if M.is_danger_lane(seg, enemies_state) then break end
+                        local type, prio = M.get_enemy_priority(seg, enemies_state)
+                        if type and prio < best_enemy_prio then search_target, best_enemy_prio, found_target, proposed_fire_prio = seg, prio, true, 6 end
+                        if not type and not found_target and fallback_safe == nil then fallback_safe = seg end
+                    end
+                end
+                if not found_target and fallback_safe then proposed_target_seg = fallback_safe; proposed_fire_prio = 4
+                elseif not found_target then proposed_target_seg = player_abs_seg; proposed_fire_prio = 4
+                else proposed_target_seg = search_target end -- Use found target
             end
-            -- Safety Check
-            if M.is_danger_lane(target_seg, enemies_state) then
-                  print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding constrained safe >=%d from L=%d", target_seg, SAFE_DISTANCE, nl_seg))
-                  target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nl_seg, abs_to_rel_func)
-                  fire_priority = AVOID_FIRE_PRIORITY -- Override fire priority for safety maneuver
-            end
-            should_fire = fire_priority > shot_count
-            return target_seg, 0, should_fire, false -- Return early
         end
 
-        -- Case 4: No Top Rail Enemies -> Proceed to Standard Hunt Logic
-        print("[DEBUG TopRail] No top rail enemies detected, proceeding to standard hunt.")
-        -- fire_priority is still the default (4) here unless overridden by hunt logic below
+        -- === Step 2: Apply Safety Overrides (including Pulsar) ===
+        local final_target_seg = proposed_target_seg
+        local final_fire_priority = proposed_fire_prio
+        local pulsar_override_active = false
 
-        -- --- Standard Gameplay Logic (Danger Check, Hunt, Search) ---
-        -- 1. Check for Immediate Danger in Current Lane
-        if M.is_danger_lane(player_abs_seg, enemies_state) then
-            fire_priority = 8 -- Max priority when escaping
-            best_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-            should_fire = false -- Don't fire when escaping
-            return best_target, 0, should_fire, false -- Return early
-
-        -- 2. Check for Enemy in Current Lane (if not danger)
-        elseif M.get_enemy_priority(player_abs_seg, enemies_state) then
-            fire_priority = 6 -- High priority to shoot enemy in current lane
-            best_target = player_abs_seg -- Stay and shoot
-            should_fire = fire_priority > shot_count
-            return best_target, 0, should_fire, false -- Return early
-
-        -- 3. Search Outwards for Targets or Safe Lanes
-        else
-            local fallback_safe, best_enemy_prio, found_target = nil, 100, false
-            best_target = player_abs_seg -- Default to stay put if search fails
-            for sign = -1, 1, 2 do
-                for d = 1, 8 do -- Search radius
-                    local seg = (player_abs_seg + sign * d + 16) % 16
-                    if M.is_danger_lane(seg, enemies_state) then break end -- Stop searching this direction
-
-                    local type, prio = M.get_enemy_priority(seg, enemies_state)
-                    if type and prio < best_enemy_prio then -- Found a better enemy target
-                        best_target, best_enemy_prio = seg, prio
-                        fire_priority = 6 -- Target enemy priority
-                        found_target = true
-                    elseif not type and not found_target and fallback_safe == nil then -- Found a potential safe fallback
-                        fallback_safe = seg
+        -- ** Pulsar Check (Highest Priority) **
+        if enemies_state.pulsing > PULSAR_THRESHOLD then
+            if is_pulsar_lane(player_abs_seg, enemies_state) then -- Currently ON a pulsar lane
+                local safe_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                print(string.format("[Pulsar Avoid] ON pulsar lane %d! Finding nearest safe -> %d.", player_abs_seg, safe_target))
+                final_target_seg = safe_target
+                final_fire_priority = AVOID_FIRE_PRIORITY
+                pulsar_override_active = true
+            elseif final_target_seg ~= player_abs_seg then -- Moving, check path
+                local original_proposed_target = final_target_seg -- Store original proposed target before path check
+                local relative_dist = abs_to_rel_func(player_abs_seg, original_proposed_target, is_open)
+                local dir = (relative_dist > 0) and 1 or -1
+                local steps = math.abs(relative_dist)
+                for d = 1, steps do
+                    local check_seg = (player_abs_seg + dir * d + 16) % 16
+                    if is_pulsar_lane(check_seg, enemies_state) then
+                        local safe_stop_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
+                        print(string.format("[Pulsar Avoid] Path from %d to %d blocked by pulsar at %d. Stopping at %d.", player_abs_seg, original_proposed_target, check_seg, safe_stop_seg))
+                        final_target_seg = safe_stop_seg
+                        final_fire_priority = AVOID_FIRE_PRIORITY
+                        pulsar_override_active = true
+                        break
                     end
                 end
             end
-            if not found_target and fallback_safe then -- No enemy found, use fallback
-                best_target = fallback_safe
-                fire_priority = 4 -- Default priority for fallback
-            elseif not found_target then -- No enemy, no fallback nearby
-                 best_target = player_abs_seg -- Stay put
-                 fire_priority = 4
-            end
         end
 
-        -- Final calculation for firing (only for standard hunt path)
-        should_fire = fire_priority > shot_count
-        return best_target, 0, should_fire, false
+        -- ** General Danger Lane Check (Lower priority than Pulsar) **
+        -- Apply only if Pulsar override didn't happen AND the proposed target requires moving
+        if not pulsar_override_active and final_target_seg ~= player_abs_seg and M.is_danger_lane(final_target_seg, enemies_state) then
+            print(string.format("[Danger Override] Proposed target %d unsafe, finding nearest safe.", final_target_seg))
+            -- Determine if original decision was top-rail avoid/midpoint needing constraint
+            local constraint_seg = nil
+            if target_calculated then -- Was a top-rail case
+                if enemy_right_exists and not enemy_left_exists then constraint_seg = nr_seg
+                elseif enemy_left_exists and not enemy_right_exists then constraint_seg = nl_seg end
+            end
+
+            if constraint_seg then
+                 final_target_seg = find_nearest_constrained_safe_segment(final_target_seg, enemies_state, is_open, constraint_seg, abs_to_rel_func)
+            else -- Midpoint or Hunt target was unsafe
+                 final_target_seg = find_nearest_safe_segment(final_target_seg, enemies_state, is_open)
+            end
+            final_fire_priority = AVOID_FIRE_PRIORITY
+        end
+
+        -- === Step 3: Final Return ===
+        final_should_fire = final_fire_priority > shot_count
+        return final_target_seg, 0, final_should_fire, false
 
     else -- Other game states
         return player_abs_seg, 0, false, false

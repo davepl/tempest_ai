@@ -18,7 +18,9 @@ local logic = require("logic") -- ADDED: Require the new logic module
 local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
+local START_ADVANCED          = true
+local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
@@ -415,7 +417,8 @@ local function determine_final_actions()
         final_zap_cmd, final_spinner_cmd = 0, 0
     elseif game_state.gamestate == 0x16 then -- Level Select
         if level_select_counter < 60 then
-            final_spinner_cmd = 18; final_fire_cmd, final_zap_cmd = 0, 0
+            final_spinner_cmd = START_ADVANCED and 18 or 0 
+            final_fire_cmd, final_zap_cmd = 0, 0
             level_select_counter = level_select_counter + 1
         elseif level_select_counter == 60 then
             final_fire_cmd = 1; final_spinner_cmd, final_zap_cmd = 0, 0
@@ -427,10 +430,6 @@ local function determine_final_actions()
     elseif is_attract_mode then -- Attract Mode
         -- DEBUG: Print frame and modulo check
         local should_press_start = (game_state.frame_counter % 50 == 0)
-        print(string.format("[DEBUG attract] Frame: %d, Frame %% 50 == 0: %s",
-            game_state.frame_counter,
-            tostring(should_press_start)))
-
         final_p1_start_cmd = should_press_start and 1 or 0
         final_fire_cmd, final_zap_cmd, final_spinner_cmd = 0, 0, 0
         level_select_counter = 0 -- Reset level select counter here
@@ -457,7 +456,7 @@ local function apply_overrides(memory)
     memory:write_u8(0x0006, 2) -- Credits
     memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
     memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
-    -- if CHEAT_START_LEVEL then memory:write_u8(0x0126, CHEAT_START_LEVEL) end -- Start Level (optional)
+    if START_LEVEL_MIN then memory:write_u8(0x0126, START_LEVEL_MIN) end -- Start Level (optional)
 end
 
 
