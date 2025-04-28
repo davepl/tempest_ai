@@ -429,7 +429,6 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         if enemies_state.pulsing > PULSAR_THRESHOLD then
             if is_pulsar_lane(player_abs_seg, enemies_state) then -- Currently ON a pulsar lane
                 local safe_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-                print(string.format("[Pulsar Avoid] ON pulsar lane %d! Finding nearest safe -> %d.", player_abs_seg, safe_target))
                 final_target_seg = safe_target
                 final_fire_priority = AVOID_FIRE_PRIORITY
                 pulsar_override_active = true
@@ -442,7 +441,6 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     local check_seg = (player_abs_seg + dir * d + 16) % 16
                     if is_pulsar_lane(check_seg, enemies_state) then
                         local safe_stop_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
-                        print(string.format("[Pulsar Avoid] Path from %d to %d blocked by pulsar at %d. Stopping at %d.", player_abs_seg, original_proposed_target, check_seg, safe_stop_seg))
                         final_target_seg = safe_stop_seg
                         final_fire_priority = AVOID_FIRE_PRIORITY
                         pulsar_override_active = true
