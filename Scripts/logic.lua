@@ -350,7 +350,6 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
         -- === Step 1A: High Priority Flipper Avoidance ===
         if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
-            print(string.format("[Flipper Avoid] Flipper at %d too close (Dist %d < %d). Avoiding.", nearest_flipper_seg, min_flipper_abs_rel, SAFE_DISTANCE))
 
             -- Calculate target D segments away from the flipper, in the direction opposite the player
             local direction_away_from_player = (nearest_flipper_rel == 0) and 1 or (nearest_flipper_rel > 0 and -1 or 1)
@@ -358,7 +357,6 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
             -- Safety Check for the calculated avoidance target
             if M.is_danger_lane(target_seg, enemies_state) then
-                 print(string.format("[Flipper Avoid Safety Override] Avoidance target %d unsafe. Finding constrained safe.", target_seg))
                  target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nearest_flipper_seg, abs_to_rel_func)
             end
             local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
