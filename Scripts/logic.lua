@@ -324,66 +324,87 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local target_calculated = false -- Flag to know if we need to run standard hunt
         local target_seg = player_abs_seg -- Default if logic below doesn't set it
 
-        if (any_enemy_proximate) then
-            fire_priority = 8
-        end
+        -- Calculate base fire priority based *only* on proximity
+        local base_fire_priority = any_enemy_proximate and FREEZE_FIRE_PRIO_HIGH or FREEZE_FIRE_PRIO_LOW
+        fire_priority = base_fire_priority -- Start with base priority
 
         if enemy_left_exists and enemy_right_exists then
-            -- Case 1: Enemies on Both Sides -> Midpoint
+            -- Case 1: Enemies on Both Sides -> Midpoint or adjacent
+            local midpoint_target
             if is_open then -- Linear midpoint for open levels
-                target_seg = math.floor((nl_seg + nr_seg) / 2)
-                 print(string.format("[DEBUG TopRail] Both Sides (Open): L=%d, R=%d -> Midpoint=%d", nl_seg, nr_seg, target_seg))
+                midpoint_target = math.floor((nl_seg + nr_seg) / 2)
+                target_seg = any_enemy_proximate and midpoint_target or math.min(15, midpoint_target + 1) -- Target midpoint if proximate, else adjacent (right bias)
+                print(string.format("[DEBUG TopRail] Both Sides (Open): L=%d, R=%d -> Midpoint=%d, Target=%d", nl_seg, nr_seg, midpoint_target, target_seg))
             else -- Circular midpoint for closed levels
                 local dist = (nr_seg - nl_seg + 16) % 16
                 local offset = math.floor(dist / 2)
-                target_seg = (nl_seg + offset + 16) % 16
-                 print(string.format("[DEBUG TopRail] Both Sides (Closed): L=%d, R=%d -> Midpoint=%d", nl_seg, nr_seg, target_seg))
+                target_seg = (nl_seg + offset + 16) % 16 -- Target midpoint directly
+                print(string.format("[DEBUG TopRail] Both Sides (Closed): L=%d, R=%d -> Midpoint/Target=%d", nl_seg, nr_seg, target_seg))
+            end
+             -- Safety Check
+            if M.is_danger_lane(target_seg, enemies_state) then
+                print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding simple nearest safe", target_seg))
+                target_seg = find_nearest_safe_segment(target_seg, enemies_state, is_open)
+                fire_priority = AVOID_FIRE_PRIORITY -- Override fire priority for safety maneuver
             end
             should_fire = fire_priority > shot_count
             return target_seg, 0, should_fire, false -- Return early
         elseif enemy_right_exists then
-            -- Case 2: Enemies Only Right
+            -- Case 2: Enemies Only Right -> Edge/Adjacent or Safe Distance
             if is_open then
-                target_seg = any_enemy_proximate and 0 or 1
-                print(string.format("[DEBUG TopRail] Right Only (Open): R=%d -> Target=0 (Edge)", nr_seg))
-            else
-                target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16
-                print(string.format("[DEBUG TopRail] Right Only (Closed): R=%d -> Target=%d (SafeDist Left)", nr_seg, target_seg))
+                target_seg = any_enemy_proximate and 0 or 1 -- Retreat to 0 if proximate, else target 1
+                print(string.format("[DEBUG TopRail] Right Only (Open): R=%d -> Target=%d (Prox=%s)", nr_seg, target_seg, tostring(any_enemy_proximate)))
+            else -- Closed Level
+                if nr_dist < SAFE_DISTANCE then
+                    target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16
+                    print(string.format("[DEBUG TopRail] Right Only (Closed): R=%d (PlayerDist %d < %d) -> Target=%d (Moving Left)", nr_seg, nr_dist, SAFE_DISTANCE, target_seg))
+                else
+                    target_seg = player_abs_seg -- Stay put
+                    print(string.format("[DEBUG TopRail] Right Only (Closed): R=%d (PlayerDist %d >= %d) -> Target=%d (Stay Put)", nr_seg, nr_dist, SAFE_DISTANCE, target_seg))
+                end
             end
-
+            -- Safety Check
+            if M.is_danger_lane(target_seg, enemies_state) then
+                 print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding constrained safe >=%d from R=%d", target_seg, SAFE_DISTANCE, nr_seg))
+                 target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nr_seg, abs_to_rel_func)
+                 fire_priority = AVOID_FIRE_PRIORITY -- Override fire priority for safety maneuver
+            end
             should_fire = fire_priority > shot_count
-            print(string.format("[DEBUG TopRail] Right only Final -> Target=%d, FirePrio=%d", target_seg, fire_priority)) -- Corrected print
             return target_seg, 0, should_fire, false -- Return early
         elseif enemy_left_exists then
-             -- Case 3: Enemies Only Left
+            -- Case 3: Enemies Only Left -> Edge/Adjacent or Safe Distance
             if is_open then
-                if any_enemy_proximate then target_seg = 15 else target_seg = 14 end
-                print(string.format("[DEBUG TopRail] Left Only (Open): L=%d -> Target=15 (Edge)", nl_seg))
-            else
-                target_seg = (nl_seg + SAFE_DISTANCE) % 16
-                print(string.format("[DEBUG TopRail] Left Only (Closed): L=%d -> Target=%d (SafeDist Right)", nl_seg, target_seg))
+                 target_seg = any_enemy_proximate and 15 or 14 -- Retreat to 15 if proximate, else target 14
+                 print(string.format("[DEBUG TopRail] Left Only (Open): L=%d -> Target=%d (Prox=%s)", nl_seg, target_seg, tostring(any_enemy_proximate)))
+            else -- Closed Level
+                 if nl_dist < SAFE_DISTANCE then
+                    target_seg = (nl_seg + SAFE_DISTANCE) % 16
+                    print(string.format("[DEBUG TopRail] Left Only (Closed): L=%d (PlayerDist %d < %d) -> Target=%d (Moving Right)", nl_seg, nl_dist, SAFE_DISTANCE, target_seg))
+                 else
+                    target_seg = player_abs_seg -- Stay put
+                    print(string.format("[DEBUG TopRail] Left Only (Closed): L=%d (PlayerDist %d >= %d) -> Target=%d (Stay Put)", nl_seg, nl_dist, SAFE_DISTANCE, target_seg))
+                 end
             end
-            -- Safety Check for this case
+            -- Safety Check
             if M.is_danger_lane(target_seg, enemies_state) then
-                 print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding constrained safe >=%d from L=%d", target_seg, SAFE_DISTANCE, nl_seg))
-                 target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nl_seg, abs_to_rel_func)
+                  print(string.format("[DEBUG TopRail Safety Override] Target %d unsafe, finding constrained safe >=%d from L=%d", target_seg, SAFE_DISTANCE, nl_seg))
+                  target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nl_seg, abs_to_rel_func)
+                  fire_priority = AVOID_FIRE_PRIORITY -- Override fire priority for safety maneuver
             end
             should_fire = fire_priority > shot_count
-            print(string.format("[DEBUG TopRail] Left only Final -> Target=%d, FirePrio=%d", target_seg, fire_priority)) -- Corrected print
             return target_seg, 0, should_fire, false -- Return early
         end
 
         -- Case 4: No Top Rail Enemies -> Proceed to Standard Hunt Logic
-        -- This block is reached only if target_calculated remained false
         print("[DEBUG TopRail] No top rail enemies detected, proceeding to standard hunt.")
+        -- fire_priority is still the default (4) here unless overridden by hunt logic below
 
         -- --- Standard Gameplay Logic (Danger Check, Hunt, Search) ---
         -- 1. Check for Immediate Danger in Current Lane
         if M.is_danger_lane(player_abs_seg, enemies_state) then
             fire_priority = 8 -- Max priority when escaping
             best_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-            -- Escaping takes priority, don't worry about firing usually
-            should_fire = false
+            should_fire = false -- Don't fire when escaping
             return best_target, 0, should_fire, false -- Return early
 
         -- 2. Check for Enemy in Current Lane (if not danger)
@@ -396,6 +417,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         -- 3. Search Outwards for Targets or Safe Lanes
         else
             local fallback_safe, best_enemy_prio, found_target = nil, 100, false
+            best_target = player_abs_seg -- Default to stay put if search fails
             for sign = -1, 1, 2 do
                 for d = 1, 8 do -- Search radius
                     local seg = (player_abs_seg + sign * d + 16) % 16
@@ -418,7 +440,6 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                  best_target = player_abs_seg -- Stay put
                  fire_priority = 4
             end
-             -- If found_target is true, best_target and fire_priority=6 are already set
         end
 
         -- Final calculation for firing (only for standard hunt path)
