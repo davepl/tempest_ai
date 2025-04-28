@@ -145,19 +145,12 @@ end
 
 -- Apply received AI action and overrides to game controls
 function Controls:apply_action(fire, zap, spinner, p1_start, memory)
-    -- Debug values just before setting (simplified)
-    print(string.format("[DEBUG apply_action] p1_start_val=%s, p1_start_field_valid=%s",
-        tostring(p1_start),
-        tostring(self.p1_start_field ~= nil)))
 
     if self.fire_field then self.fire_field:set_value(fire) end
     if self.zap_field then self.zap_field:set_value(zap) end
 
     if self.p1_start_field then
         -- Debug print *only* when attempting to set start=1
-        if p1_start == 1 then
-            print("[DEBUG apply_action] Attempting to set P1 Start = 1")
-        end
         self.p1_start_field:set_value(p1_start)
     end
 
@@ -357,8 +350,6 @@ local function update_game_states(memory)
     level_state:update(memory)
     player_state:update(memory, logic.absolute_to_relative_segment) -- Pass helper from logic module
     enemies_state:update(memory, game_state, player_state, level_state, logic.absolute_to_relative_segment) -- Pass dependencies & helper
-    -- DEBUG: Print game_mode immediately after update
-    print(string.format("[DEBUG state update] Frame: %d, game_mode: 0x%02X", game_state.frame_counter, game_state.game_mode))
 end
 
 -- Perform AI interaction (calculate reward, expert advice, send state, receive action)
