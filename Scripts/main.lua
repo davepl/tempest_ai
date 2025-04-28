@@ -1,1285 +1,486 @@
 --[[
-    Tempest AI Lua Script for MAME
+    Tempest AI Lua Script for MAME - Refactored
     Author: Dave Plummer (davepl) and various AI assists
-    Date: [2025-03-06]
+    Date: [2025-03-06] (Refactored Date)
 
-    Overview:
-    This script is part of an AI project to play the classic arcade game Tempest using reinforcement learning.
-    It runs within MAME's Lua environment, collecting game state data each frame and applying actions to control the game.
-    The script uses a class-based structure (game, level, player, enemy, controls) for modularity and extensibility.
-
-    Key Features:
-    - Captures game state (credits, level, player position, alive status, enemy count) from MAME memory.
-    - Applies actions received from an external process via sockets.
-    - Outputs a concise frame-by-frame summary of key stats for debugging and analysis.
-
-    Usage:
-    - Launch with MAME: `mame tempest -autoboot_script main.lua`
-    - Ensure the Python AI server is running and accessible at socket.m2macpro.local:9999.
-    - Memory addresses and input field names are based on the original Tempest ROM set.
-
-    Notes:
-    - Designed for educational use; extendable for full AI integration (e.g., RL model).
-
-    Dependencies:
-    - MAME with Lua scripting support enabled.
-    - Tempest ROM set loaded in MAME.
+    Overview: Refactored version focusing on modularity and clarity.
 --]]
 
---[[ package.path                  = package.path .. ";/Users/dave/source/repos/tempest/Scripts/?.lua" ]] -- Commented out hardcoded path
-
 -- Dynamically add the script's directory to the package path
-local script_path = debug.getinfo(1,"S").source:sub(2) -- Get source path, remove leading '@'
-local script_dir = script_path:match("(.*[/\\])") or "./" -- Match up to last / OR \\ 
-print("Detected script directory: " .. script_dir) -- Add print for verification
+local script_path = debug.getinfo(1,"S").source:sub(2)
+local script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = package.path .. ";" .. script_dir .. "?.lua"
 
--- Now require the module by name only (without path or extension)
-local display = require("display") -- REVERTED: Require by module name only
-local state_defs = require("state") -- ADDED: Require the new state module
+-- Require modules
+local display = require("display")
+local state_defs = require("state")
+local logic = require("logic") -- ADDED: Require the new logic module
+local unpack = table.unpack or unpack -- Compatibility for unpack function
 
--- Define enemy type constants
-local ENEMY_TYPE_FLIPPER = 0
-local ENEMY_TYPE_PULSAR = 1
-local ENEMY_TYPE_TANKER = 2
-local ENEMY_TYPE_SPIKER = 3
-local ENEMY_TYPE_FUSEBALL = 4
-
--- Define constants
-local INVALID_SEGMENT         = state_defs.INVALID_SEGMENT -- UPDATED: Get from state module
-
+-- Constants
 local SHOW_DISPLAY            = false
 local DISPLAY_UPDATE_INTERVAL = 0.02
+local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
+local SOCKET_READ_TIMEOUT_S   = 0.5
+local SOCKET_RETRY_WAIT_S     = 0.01
+local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
+-- local CHEAT_START_LEVEL       = 17 -- Optional: uncomment to force start level
 
--- Access the main CPU and memory space
+-- MAME Interface Globals (initialized later)
 local mainCpu                 = nil
 local mem                     = nil
 
--- Global socket variable
-local socket = nil
-
--- Global variables for tracking bytes sent and FPS
+-- Global State
+local current_socket = nil 
 local total_bytes_sent = 0
-
--- Level select counter
 local level_select_counter = 0
+local shutdown_requested = false
+local last_display_update = 0 -- Timestamp of last display update
+local last_connection_attempt_time = 0 -- Timestamp of last connection attempt
 
--- Function to open socket connection
-local function open_socket()
-    -- Try to open socket connection
-    local socket_success, err = pcall(function()
-        -- Close existing socket if any
-        if socket then
-            socket:close()
-            socket = nil
+-- Frame Skipping State
+local last_timer_tick = -1
+local frames_to_wait = 0 -- Process every tick by default
+local frames_waited = 0
+
+-- FPS Calculation State
+local last_fps_time = os.time()
+local last_frame_counter_for_fps = 0
+
+-- Initialize MAME Interface (CPU and Memory)
+local function initialize_mame_interface()
+    local success, err = pcall(function()
+        if not manager or not manager.machine then error("MAME manager.machine not available") end
+        mainCpu = manager.machine.devices[":maincpu"]
+        if not mainCpu then error("Main CPU not found") end
+        mem = mainCpu.spaces["program"]
+        if not mem then error("Program memory space not found") end
+    end)
+
+    if not success then
+        print("Error accessing MAME via manager: " .. tostring(err))
+        print("Attempting alternative access...")
+        success, err = pcall(function()
+            if not machine then error("Neither manager.machine nor machine is available") end
+            mainCpu = machine.devices[":maincpu"]
+            if not mainCpu then error("Main CPU not found via machine") end
+            mem = mainCpu.spaces["program"]
+            if not mem then error("Program memory space not found via machine") end
+        end)
+
+        if not success then
+            print("Error with alternative access: " .. tostring(err))
+            print("FATAL: Cannot access MAME memory.")
+            return false -- Indicate failure
         end
+    end
+    print("MAME interface initialized successfully.")
+    return true -- Indicate success
+end
 
-        -- Create a new socket connection
-        socket = emu.file("rw") -- "rw" mode for read/write
-        local result = socket:open("socket.m2macpro.local:9999")
+-- Socket Management
+local function close_socket()
+    if current_socket then
+        current_socket:close()
+        current_socket = nil
+        -- print("Socket closed.") -- Optional: uncomment for debug
+    end
+end
 
+local function open_socket()
+    close_socket() -- Ensure any existing socket is closed first
+
+    local socket_success, err = pcall(function()
+        local sock = emu.file("rw")
+        local result = sock:open(SOCKET_ADDRESS)
         if result == nil then
-            -- Send initial 4-byte ping for handshake
-            local ping_data = string.pack(">H", 0) -- 2-byte integer with value 0
-            socket:write(ping_data)
+            -- Send initial 2-byte handshake message (required by server)
+            local handshake_data = string.pack(">H", 0) -- 2-byte unsigned short, big-endian, value 0
+            sock:write(handshake_data)
+
+            current_socket = sock -- Assign to global only on success
+            print("Socket connection opened to " .. SOCKET_ADDRESS)
+            return true
         else
             print("Failed to open socket connection: " .. tostring(result))
-            socket = nil
+            sock:close() -- Close the file handle if open failed
             return false
         end
     end)
 
-    if not socket_success or not socket then
-        print("Error opening socket connection: " .. tostring(err or "unknown error"))
+    if not socket_success or not current_socket then
+        print("Error during socket opening: " .. tostring(err or "unknown error"))
+        close_socket() -- Ensure cleanup
         return false
     end
-
-
     return true
 end
 
--- Declare global variables for reward calculation
-local previous_score = 0
-local previous_level = 0
-local previous_alive_state = 1 -- Track previous alive state, initialize as alive
-
--- Declare a global variable to store the last reward state
-local LastRewardState = 0
-
-local shutdown_requested = false
-
-local last_display_update = 0 -- Timestamp of last display update
-
--- Function to get the relative distance to a target segment
-local function absolute_to_relative_segment(current_abs_segment, target_abs_segment, is_open_level)
-    -- Ensure inputs are numbers, not tables
-    current_abs_segment = tonumber(current_abs_segment) or 0
-    target_abs_segment = tonumber(target_abs_segment) or 0
-
-    -- Mask inputs to ensure they are within 0-15 range
-    current_abs_segment = current_abs_segment & 0x0F
-    target_abs_segment = target_abs_segment & 0x0F
-
-    -- Get segment distance based on level type
-    if is_open_level then
-        -- Open level: simple distance calculation (-15 to +15)
-        return target_abs_segment - current_abs_segment
-    else
-        -- Closed level: find shortest path around the circle (-7 to +8)
-        local diff = target_abs_segment - current_abs_segment
-        if diff > 8 then
-            return diff - 16 -- Wrap around (e.g., 1 -> 15 is -2)
-        elseif diff <= -8 then
-            return diff + 16 -- Wrap around (e.g., 15 -> 1 is +2)
-        else
-            return diff
-        end
-    end
-end
-
--- Forward declaration needed because calculate_reward uses find_target_segment,
--- which uses hunt_enemies, which uses find_nearest_enemy_of_type.
--- MOVED TO state.lua
-
--- Helper function to find nearest enemy of a specific type
--- MOVED TO state.lua
-
--- Helper function to hunt enemies in preference order
--- Needs abs_to_rel_func, is_open, and forbidden_segments passed in
-hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
-    -- Corrected Hunt Order: Fuseball(4), Flipper(0), Tanker(2), Spiker(3)
-    -- REMOVED PULSAR from hunt order
-    local hunt_order = {
-        ENEMY_TYPE_FUSEBALL, -- 4
-        ENEMY_TYPE_FLIPPER,  -- 0
-        ENEMY_TYPE_TANKER,   -- 2
-        ENEMY_TYPE_SPIKER    -- 3
-    }
-
-    for _, enemy_type in ipairs(hunt_order) do
-        local target_seg_abs, target_depth = find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func, forbidden_segments)
-
-        if target_seg_abs ~= -1 then
-            -- Check for Top Rail Avoidance Logic (ONLY for Flipper now)
-            if target_depth <= 0x10 and enemy_type == ENEMY_TYPE_FLIPPER then
-                local rel_dist = abs_to_rel_func(player_abs_segment, target_seg_abs, is_open)
-                if math.abs(rel_dist) <= 1 then -- If aligned or adjacent
-                    local safe_adjacent_seg
-                    if rel_dist <= 0 then safe_adjacent_seg = (player_abs_segment + 1) % 16 -- Move Right
-                    else safe_adjacent_seg = (player_abs_segment - 1 + 16) % 16 end -- Move Left
-
-                    if forbidden_segments[safe_adjacent_seg] then
-                        return player_abs_segment, target_depth, true -- Stay put
-                    else
-                        return safe_adjacent_seg, target_depth, true -- Target safe adjacent
-                    end
-                end
-            end -- End Top Rail Flipper Check
-
-            -- If no Flipper avoidance was triggered, return the original hunt target
-            -- Fuseball avoidance is handled globally before this function is called
-            return target_seg_abs, target_depth, false
-
-        end -- End if target_seg_abs ~= -1
-    end -- End hunt_order loop
-
-    -- If no enemies from the hunt order are found
-    return -1, 255, false
-end
-
--- Function to handle tube zoom state (0x20)
-local function zoom_down_tube(player_abs_seg, level_state, is_open)
-    local current_spike_h = level_state.spike_heights[player_abs_seg]
-    if current_spike_h == 0 then return player_abs_seg, 0, true, false end
-    
-    local left_neighbour_seg = -1
-    local right_neighbour_seg = -1
-    if is_open then
-        if player_abs_seg > 0 then left_neighbour_seg = player_abs_seg - 1 end
-        if player_abs_seg < 15 then right_neighbour_seg = player_abs_seg + 1 end
-    else
-        left_neighbour_seg = (player_abs_seg - 1 + 16) % 16
-        right_neighbour_seg = (player_abs_seg + 1) % 16
-    end
-    
-    local left_spike_h = -1; if left_neighbour_seg ~= -1 then left_spike_h = level_state.spike_heights[left_neighbour_seg] end
-    local right_spike_h = -1; if right_neighbour_seg ~= -1 then right_spike_h = level_state.spike_heights[right_neighbour_seg] end
-    
-    if left_spike_h == 0 then return left_neighbour_seg, 0, true, false end
-    if right_spike_h == 0 then return right_neighbour_seg, 0, true, false end
-    
-    local temp_target = player_abs_seg
-    local is_left_better = (left_spike_h > current_spike_h)
-    local is_right_better = (right_spike_h > current_spike_h)
-    
-    if is_left_better and is_right_better then 
-        temp_target = (left_spike_h >= right_spike_h) and left_neighbour_seg or right_neighbour_seg
-    elseif is_left_better then 
-        temp_target = left_neighbour_seg
-    elseif is_right_better then 
-        temp_target = right_neighbour_seg
-    end
-    
-    return temp_target, 0, true, false
-end
-
--- Function to check for fuseball threats
-local function fuseball_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func)
-    local min_fuseball_dist = 3
-    local fuseball_threat_nearby = false
-    local escape_target_seg = -1
-
-    for i = 1, 7 do
-        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and
-           enemies_state.enemy_depths[i] <= 0x10 and
-           enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then
-
-            local fuseball_abs_seg = enemies_state.enemy_abs_segments[i]
-            local rel_dist = abs_to_rel_func(player_abs_seg, fuseball_abs_seg, is_open)
-
-            if math.abs(rel_dist) <= 2 then
-                fuseball_threat_nearby = true
-                escape_target_seg = (rel_dist <= 0) and ((player_abs_seg + 3) % 16) or ((player_abs_seg - 3 + 16) % 16)
-                break
-            end
-        end
-    end
-
-    return fuseball_threat_nearby, escape_target_seg
-end
-
--- Function to check for pulsar threats
-local function pulsar_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func, forbidden_segments)
-    if enemies_state.pulsing <= 0xE0 then
-        return false, player_abs_seg, 0, false, false
-    end
-
-    -- Check if we're in a pulsar lane
-    local is_in_pulsar_lane = false
-    local current_pulsar_depth = 0
-    for i = 1, 7 do
-        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and 
-           enemies_state.enemy_abs_segments[i] == player_abs_seg and 
-           enemies_state.enemy_depths[i] > 0 then
-            is_in_pulsar_lane = true
-            current_pulsar_depth = enemies_state.enemy_depths[i]
-            break
-        end
-    end
-
-    if not is_in_pulsar_lane then
-        return false, player_abs_seg, 0, false, false
-    end
-
-    -- Find nearest non-pulsar lane
-    local nearest_safe = -1
-    local min_dist = 255
-    local best_direction = 0
-    
-    for target_seg = 0, 15 do
-        local is_safe = true
-        for i = 1, 7 do
-            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and 
-               enemies_state.enemy_abs_segments[i] == target_seg and 
-               enemies_state.enemy_depths[i] > 0 then
-                is_safe = false
-                break
-            end
-        end
-        
-        if is_safe then
-            local rel_dist = abs_to_rel_func(player_abs_seg, target_seg, is_open)
-            local abs_dist = math.abs(rel_dist)
-            if abs_dist < min_dist then
-                min_dist = abs_dist
-                nearest_safe = target_seg
-                best_direction = rel_dist > 0 and 1 or -1
-            end
-        end
-    end
-
-    if nearest_safe ~= -1 then
-        return true, nearest_safe, 0, false, false
-    else
-        return true, player_abs_seg, 0, false, false
-    end
-end
-
--- Function to check for immediate threats in a segment
-local function check_segment_threat(segment, enemies_state, level_state)
-    -- Check enemy shots
-    for i = 1, 4 do
-        if enemies_state.enemy_shot_abs_segments[i] == segment and
-           enemies_state.shot_positions[i] > 0 and
-           enemies_state.shot_positions[i] <= 0x30 then
-            return true
-        end
-    end
-
-    -- Check enemies
-    for i = 1, 7 do
-        if enemies_state.enemy_abs_segments[i] == segment and
-           enemies_state.enemy_depths[i] > 0 and
-           enemies_state.enemy_depths[i] <= 0x30 then
-            return true
-        end
-    end
-
-    -- Check pulsars (now checking regardless of pulsing state)
-    for i = 1, 7 do
-        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-           enemies_state.enemy_abs_segments[i] == segment and
-           enemies_state.enemy_depths[i] > 0 then
-            return true
-        end
-    end
-
-    return false
-end
-
--- Returns true if the segment is a danger lane
-local function is_danger_lane(segment, enemies_state)
-    -- print("Is Danger Lane: " .. segment)
-    -- Danger if pulsar present and pulsing > 0xE0
-    if enemies_state.pulsing > 0x00 then
-        for i = 1, 7 do
-            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-               enemies_state.enemy_abs_segments[i] == segment and
-               enemies_state.enemy_depths[i] > 0 then
-                return true
-            end
-        end
-    end
-    -- Danger if any enemy at depth <= 0x20 (but not 0)
-    for i = 1, 7 do
-        if enemies_state.enemy_abs_segments[i] == segment and
-           enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x20 then
-            return true
-        end
-    end
-    -- Danger if any enemy shot at depth <= 0x30 in this lane
-    for i = 1, 4 do
-        if enemies_state.enemy_shot_abs_segments[i] == segment and
-           enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then
-            return true
-        end
-    end
-    return false
-end
-
--- Helper function to find the segment of the nearest enemy at depth 0x10
-local function find_nearest_top_rail_enemy_seg(player_abs_seg, enemies_state, abs_to_rel_func, is_open)
-    local nearest_enemy_seg = -1
-    local min_dist = 255
-
-    for i = 1, 7 do
-        if enemies_state.enemy_depths[i] == 0x10 then
-            local enemy_seg = enemies_state.enemy_abs_segments[i]
-            if enemy_seg ~= INVALID_SEGMENT then
-                local rel_dist = abs_to_rel_func(player_abs_seg, enemy_seg, is_open)
-                local abs_dist = math.abs(rel_dist)
-                if abs_dist < min_dist then
-                    min_dist = abs_dist
-                    nearest_enemy_seg = enemy_seg
-                end
-            end
-        end
-    end
-    return nearest_enemy_seg
-end
-
--- Returns the highest priority enemy type in a segment, or nil if none
-local function get_enemy_priority(segment, enemies_state)
-    -- Priority: Pulsar(1), Flipper(0), Tanker(2), Fuseball(4), Spiker(3)
-    local best_priority = 100
-    local best_type = nil
-    for i = 1, 7 do
-        if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then
-            local t = enemies_state.enemy_core_type[i]
-            local p = ({[1]=1, [0]=2, [2]=3, [4]=4, [3]=5})[t] or 99
-            if p < best_priority then
-                best_priority = p
-                best_type = t
-            end
-        end
-    end
-    return best_type, best_priority
-end
-
-find_target_segment = function(game_state, player_state, level_state, enemies_state, abs_to_rel_func, is_open)
-    local player_abs_seg = player_state.position & 0x0F
-
-    -- Handle Tube Zoom state first
-    if game_state.gamestate == 0x20 then
-        return zoom_down_tube(player_abs_seg, level_state, is_open)
-    
-    -- Handle Normal Gameplay state
-    elseif game_state.gamestate == 0x04 then
-        local shot_count = player_state.shot_count or 0
-        local fallback_safe = nil
-        local fallback_priority = 100
-        local best_target = player_abs_seg
-        local best_priority = 4 -- Start with default priority
-        local found = false
-        local reason = "stay_put" -- Default reason
-        local should_fire = false -- Default fire state
-
-        -- Flags for new priority logic
-        local any_top_rail_enemy_exists = false
-        local adjacent_or_current_top_rail_enemy_exists = false
-        local enemy_in_current_lane = false
-        local shot_in_current_lane = false -- New flag for shots
-
-        -- First pass: check enemy locations AND SHOTS for priority flags
-        for i = 1, 7 do
-            if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
-                local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
-                local enemy_depth = enemies_state.enemy_depths[i]
-                local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
-
-                -- Check if any enemy is at top rail
-                if enemy_depth == 0x10 then
-                    any_top_rail_enemy_exists = true
-                end
-
-                -- Check if a top-rail enemy is adjacent or current
-                if enemy_depth == 0x10 and math.abs(rel_dist) <= 1 then
-                    adjacent_or_current_top_rail_enemy_exists = true
-                end
-                
-                -- Check if any enemy is in the current lane
-                if rel_dist == 0 then
-                    enemy_in_current_lane = true
-                end
-            end
-        end
-        
-        -- Check enemy shots in current lane
-        for i = 1, 4 do
-            if enemies_state.enemy_shot_abs_segments[i] == player_abs_seg and
-               enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then
-                shot_in_current_lane = true
-                break -- Found one, no need to check more
-            end
-        end
-
-        -- Apply new fire priority logic (with added shot check)
-        if adjacent_or_current_top_rail_enemy_exists then
-            fire_priority = 8
-        elseif shot_in_current_lane then -- NEW: Priority 7 for incoming shots
-            fire_priority = 7
-        elseif any_top_rail_enemy_exists then
-            fire_priority = 3               -- Fire a few shots in case stuff is in our lane or adjacent
-        elseif enemy_in_current_lane then
-             fire_priority = 6
-        else
-             fire_priority = 4 -- Default if none of the above apply
-        end
-
-        -- OLD PRIORITY LOGIC REMOVED
-        -- Calculate base fire priority based on nearby enemies
-        -- for i = 1, 7 do
-        --     if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
-        --         local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
-        --         local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
-        --         
-        --         -- Enemy in current segment?
-        --         if rel_dist == 0 then
-        --             fire_priority = math.max(fire_priority, 6)
-        --         end
-        --         
-        --         -- Top-rail enemy adjacent?
-        --         if math.abs(rel_dist) <= 1 and enemies_state.enemy_depths[i] == 0x10 then
-        --             local new_priority = math.max(fire_priority, 8)
-        --             if new_priority == 8 and fire_priority < 8 then -- Print only when priority is newly raised to 8
-        --                 -- print(string.format("[FIRE DEBUG] Adjacent top-rail enemy detected! Prio=8, Shots=%d", shot_count))
-        --                 fire_debug_printed = true -- Set the flag
-        --             end
-        --             fire_priority = new_priority
-        --         end
-        --     end
-        -- end
-
-        -- If current lane is danger, seek first safe lane (sets priority 8 explicitly)
-        if is_danger_lane(player_abs_seg, enemies_state) then
-            reason = "escape"
-            fire_priority = 8 -- Highest priority when escaping danger
-            local best_safe_left = -1
-            local best_safe_right = -1
-            local min_safe_dist_left = 16
-            local min_safe_dist_right = 16
-            local stop_left_search = false
-            local stop_right_search = false
-
-            for d = 1, 15 do
-                -- Check Left
-                if not stop_left_search then
-                    local left_seg = (player_abs_seg - d + 16) % 16
-                    if not is_danger_lane(left_seg, enemies_state) then
-                        if d < min_safe_dist_left then
-                            best_safe_left = left_seg
-                            min_safe_dist_left = d
-                            -- Don't stop search yet, closer might exist
-                        end
-                    else
-                        stop_left_search = true -- Danger hit, stop searching left
-                    end
-                end
-
-                -- Check Right
-                if not stop_right_search then
-                    local right_seg = (player_abs_seg + d + 16) % 16
-                    if not is_danger_lane(right_seg, enemies_state) then
-                         if d < min_safe_dist_right then
-                             best_safe_right = right_seg
-                             min_safe_dist_right = d
-                             -- Don't stop search yet, closer might exist
-                        end
-                    else
-                        stop_right_search = true -- Danger hit, stop searching right
-                    end
-                end
-                
-                -- Optimization: if both searches stopped, no need to continue distance loop
-                if stop_left_search and stop_right_search then break end
-            end
-
-            -- Decide based on findings
-            if min_safe_dist_left <= min_safe_dist_right and best_safe_left ~= -1 then
-                -- Left is closer or equal (apply left bias in case of tie)
-                best_target = best_safe_left
-            elseif best_safe_right ~= -1 then
-                -- Right is closer
-                best_target = best_safe_right
-            else
-                -- No safe lane found nearby, stay put (best_target remains player_abs_seg)
-                best_target = player_abs_seg
-            end
-            
-            should_fire = fire_priority > shot_count
-        -- If current lane has enemy, stay and shoot (priority 6)
-        elseif get_enemy_priority(player_abs_seg, enemies_state) then
-            reason = "enemy"
-            fire_priority = math.max(fire_priority, 6) -- Ensure at least 6
-            best_target = player_abs_seg
-            should_fire = fire_priority > shot_count
-        else -- Expand search outwards
-            reason = "search"
-            for sign = -1, 1, 2 do
-                for d = 1, 15 do
-                    local seg = (player_abs_seg + sign * d + 16) % 16
-                    if is_danger_lane(seg, enemies_state) then
-                        break -- Stop searching further in this direction
-                    else
-                        local t2, p2 = get_enemy_priority(seg, enemies_state)
-                        if t2 and p2 < best_priority then
-                            best_target = seg
-                            best_priority = p2
-                            fire_priority = math.max(fire_priority, 6) -- Priority 6 for targeting enemy
-                            reason = "target_enemy"
-                        elseif not t2 and fallback_safe == nil then
-                            fallback_safe = seg
-                            fallback_priority = 4 -- Priority 4 for fallback
-                            reason = "fallback_safe"
-                        end
-                    end
-                end
-            end
-            if best_priority < 100 then -- Found a target enemy
-                 -- Target Adjustment Logic for top-rail flippers is now inside this block
-                 local target_enemy_type = nil
-                 local target_enemy_depth = 0
-                 for i=1, 7 do -- Find the actual enemy data for the best_target segment
-                      if enemies_state.enemy_abs_segments[i] == best_target and enemies_state.enemy_depths[i] > 0 then
-                          target_enemy_type = enemies_state.enemy_core_type[i]
-                          target_enemy_depth = enemies_state.enemy_depths[i]
-                          break
-                      end
-                 end
-
-                 if target_enemy_type == ENEMY_TYPE_FLIPPER and target_enemy_depth == 0x10 then
-                     -- Adjust target for top-rail flipper: target segment BEFORE it
-                     local rel_dist_flipper = abs_to_rel_func(player_abs_seg, best_target, is_open)
-                     local adjusted_target
-                     if rel_dist_flipper > 0 then -- Flipper is right
-                         adjusted_target = (best_target - 1 + 16) % 16
-                     elseif rel_dist_flipper < 0 then -- Flipper is left
-                         adjusted_target = (best_target + 1) % 16
-                     else -- Flipper is current (shouldn't happen if current isn't danger, but safe default)
-                         adjusted_target = player_abs_seg 
-                     end
-                     
-                     if not is_danger_lane(adjusted_target, enemies_state) then
-                         best_target = adjusted_target -- Use the adjusted target
-                         reason = "target_top_flipper_adj"
-                     else
-                         best_target = player_abs_seg -- Stay put if adjusted target is dangerous
-                         reason = "target_top_flipper_blocked"
-                     end
-                 end
-                 -- If not a top-rail flipper, best_target remains unchanged from search
-                 should_fire = fire_priority > shot_count
-                 
-            elseif fallback_safe then -- Found a fallback safe lane
-                 best_target = fallback_safe
-                 reason = "fallback_safe" -- Corrected reason assignment
-                 -- should_fire remains false (default)
-            else -- No target, no fallback
-                 best_target = player_abs_seg
-                 reason = "stay_put"
-                 -- should_fire remains false (default)
-            end
-        end
-
-        local final_target = best_target -- Assign final target after all adjustments
-
-        -- Recalculate final should_fire based on priority (Important!) 
-        -- This uses the fire_priority determined earlier, which considers top-rail enemies
-        should_fire = fire_priority > shot_count
-
-        return final_target, 0, should_fire, false
-
-    -- Handle any other game state (default: stay put)
-    else
-        return player_abs_seg, 0, false, false
-    end
-end
-
--- Function to calculate desired spinner direction and distance to target
-local function direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-    -- Get the player's current absolute segment
-    local player_abs_seg = player_state.position & 0x0F
-    -- Use reliable level number pattern to determine if level is open
-    local level_num_zero_based = level_state.level_number - 1
-    local is_open = (level_num_zero_based % 4 == 2)
-    -- Get target directly from enemies_state
-    local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
-
-    -- If no target was provided (target_abs_segment is -1)
-    if target_abs_segment == -1 then
-        return 0, 0, 255 -- No target, return spinner 0, distance 0, max depth
-    end
-
-    -- Calculate the relative segment distance using the helper function
-    local relative_dist = absolute_to_relative_segment(player_abs_seg, target_abs_segment, is_open)
-
-    -- If already aligned (relative distance is 0)
-    if relative_dist == 0 then
-         -- Find depth (re-fetch from state)
-         return 0, 0, enemies_state.nearest_enemy_depth_raw -- Returns 0, 0, Number
-    end
-
-    -- Calculate actual segment distance and intensity
-    local actual_segment_distance = math.abs(relative_dist)
-    local intensity = math.min(0.9, 0.3 + (actual_segment_distance * 0.05))
-    -- Set spinner direction based on the sign of the relative distance
-    local spinner = relative_dist > 0 and intensity or -intensity
-
-    -- Depth isn't directly relevant when misaligned for spinner calculation
-    return spinner, actual_segment_distance, 255 -- Returns Number, Number, 255
-end
-
--- Function to calculate reward for the current frame
-local function calculate_reward(game_state, level_state, player_state, enemies_state)
-    local reward = 0
-    local bDone = false
-    local detected_spinner = player_state.spinner_detected -- Use detected spinner for reward
-
-    -- Safety check for potentially uninitialized state (shouldn't happen in normal flow)
-    if not enemies_state or enemies_state.nearest_enemy_abs_seg_internal == nil then
-        -- print("WARNING: calculate_reward called with invalid enemies_state or nearest_enemy_abs_seg_internal is nil. Defaulting target.")
-        enemies_state = enemies_state or {}
-        enemies_state.nearest_enemy_abs_seg_internal = -1 -- Default to no target
-        enemies_state.nearest_enemy_depth_raw = 255
-        enemies_state.nearest_enemy_should_fire = false
-    end
-
-    -- Base survival reward - make staying alive more valuable
-    if player_state.alive == 1 then
-        -- Score-based reward (keep this as a strong motivator). Filter out large bonus awards.
-        local score_delta = player_state.score - previous_score
-        if score_delta > 0 and score_delta <= 1000 then
-            reward = reward + (score_delta)
-        end
-
-        -- Encourage maintaining shots in reserve. Penalize 0 or 8, graduated reward for 1-7
-        local sc = player_state.shot_count
-        if sc == 0 then
-            reward = reward - 50
-        elseif sc == 4 then
-            reward = reward + 5
-        elseif sc == 5 then
-            reward = reward + 10
-        elseif sc == 6 then
-            reward = reward + 15
-        elseif sc == 7 then
-            reward = reward + 20
-        elseif sc >= 8 then -- Max shots is 8, handle this case
-            reward = reward - 50
-        end
-
-        -- Penalize using superzapper; only in play mode, since it's also set during zoom (0x020)
-        if (game_state.gamestate == 0x04) then
-            if (player_state.superzapper_active ~= 0) then
-                reward = reward - 500
-            end
-        end
-
-        -- Enemy targeting logic - Use results stored in enemies_state by its update method
-        local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal -- Use the internally stored absolute segment
-        local target_depth = enemies_state.nearest_enemy_depth_raw
-        local expert_should_fire = enemies_state.nearest_enemy_should_fire -- Get firing recommendation from state
-
-        local player_segment = player_state.position & 0x0F
-
-        -- Tube Zoom logic adjustment
-        if game_state.gamestate == 0x20 then -- In tube zoom
-            -- Reward based on inverse spike height (higher reward for shorter spikes)
-            local spike_h = level_state.spike_heights[player_segment] or 0
-            if spike_h > 0 then
-                local effective_spike_length = 255 - spike_h                       -- Shorter spike = higher value
-                reward = reward + math.max(0, (effective_spike_length / 2) - 27.5) -- Scaled reward
-            else
-                -- Use detected spinner for reward calculation
-                reward = reward + (detected_spinner == 0 and 250 or -50)          -- Max reward if no spike
-            end
-
-            if (player_state.fire_commanded == 1) then -- Keep using commanded for checking fire intent
-                reward = reward + 200
-            end
-        elseif target_abs_segment < 0 then -- This comparison should now be safe
-            -- No enemies: reward staying still more strongly
-            reward = reward + (detected_spinner == 0 and 150 or -20)
-            if player_state.fire_commanded == 1 then reward = reward - 100 end -- Penalize firing at nothing
-        else
-            -- Get desired spinner direction, segment distance, AND enemy depth
-            local desired_spinner, segment_distance, _ = direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state)
-
-            -- Check alignment based on actual segment distance
-            if segment_distance == 0 then
-                -- Big reward for alignment + firing incentive
-                -- Use detected_spinner for checking if player is still
-                if detected_spinner == 0 then
-                    reward = reward + 250
-                else
-                    reward = reward - 50 -- Penalize moving when aligned
-                end
-
-                if player_state.fire_commanded then -- Keep checking commanded fire
-                    reward = reward + 50
-                end
-            else
-                -- MISALIGNED CASE (segment_distance > 0)
-                -- Enemies at the top of tube should be shot when close (using segment distance)
-                if (segment_distance < 2) then -- Check using actual segment distance
-                    -- Use the depth stored in enemies_state
-                    if (target_depth <= 0x20) then
-                        if player_state.fire_commanded == 1 then -- Check commanded fire
-                            reward = reward + 150
-                        else
-                            reward = reward - 50
-                        end
-                    else -- Close laterally, far depth
-                         if player_state.fire_commanded == 1 then reward = reward - 20 end
-                    end
-                else -- Far laterally
-                     if player_state.fire_commanded == 1 then reward = reward - 30 end
-                end
-
-                -- Movement incentives (using desired_spinner direction and *detected* spinner)
-                -- Reward if the DETECTED movement (detected_spinner) is IN THE SAME direction as the desired direction.
-                if desired_spinner * detected_spinner > 0 then
-                    reward = reward + 40
-                elseif desired_spinner * detected_spinner < 0 then
-                    reward = reward - 50
-                elseif detected_spinner == 0 and desired_spinner ~= 0 then
-                    reward = reward - 15
-                end
-            end
-        end
-    else
-        -- Large penalty for death to prioritize survival
-        if previous_alive_state == 1 then
-            reward = reward - 20000
-            bDone = true
-        end
-    end
-
-    -- Update previous values
-    previous_score = player_state.score
-    previous_level = level_state.level_number
-    previous_alive_state = player_state.alive
-
-    LastRewardState = reward
-
-    -- Return only reward and done flag now
-    return reward, bDone
-end
-
--- Function to send parameters and get action each frame
-local function process_frame(rawdata)
-    -- Check if socket is open, try to reopen if not
-    if not socket then
-        if not open_socket() then
-            return 0, 0, 0 -- Return zeros for fire, zap, spinner_delta on socket error
-        end
-    end
-
-    -- Try to write to socket, handle errors
-    local success, err = pcall(function()
-        -- Add 4-byte length header to rawdata
-        local data_length = #rawdata
-        local length_header = string.pack(">H", data_length)
-
-        -- Write length header followed by data
-        socket:write(length_header)
-        socket:write(rawdata)
-    end)
-
-    if not success then
-        -- print("Error writing to socket:", err)
-        -- Close and attempt to reopen socket
-        if socket then
-            socket:close(); socket = nil
-        end
-        open_socket()
-        return 0, 0, 0 -- Return zeros for fire, zap, spinner_delta on write error
-    end
-
-    -- Try to read from socket with timeout protection
-    local fire, zap, spinner = 0, 0, 0 -- Default values
-    local read_start_time = os.clock()
-    local read_timeout = 0.5           -- 500ms timeout for socket read
-
-    success, err = pcall(function()
-        -- Use non-blocking approach with timeout
-        local action_bytes = nil
-        local elapsed = 0
-
-        while not action_bytes and elapsed < read_timeout do
-            action_bytes = socket:read(3)
-
-            if not action_bytes or #action_bytes < 3 then
-                -- If read fails, sleep a tiny bit and try again
-                -- Use non-blocking sleep
-                local wait_start = os.clock()
-                while os.clock() - wait_start < 0.01 do
-                    -- Busy wait instead of os.execute which can freeze MAME
-                end
-                elapsed = os.clock() - read_start_time
-                action_bytes = nil -- Ensure loop condition check uses updated elapsed
-            else
-                -- Ensure we read exactly 3 bytes
-                if #action_bytes ~= 3 then
-                     -- print("Warning: Expected 3 bytes from socket, received " .. #action_bytes)
-                     action_bytes = nil -- Treat as incomplete read
-                     -- Sleep briefly before retrying
-                     local wait_start = os.clock()
-                     while os.clock() - wait_start < 0.01 do end
-                     elapsed = os.clock() - read_start_time
-                end
-            end
-        end
-
-        if action_bytes and #action_bytes == 3 then
-            -- Unpack the three signed 8-bit integers
-            fire, zap, spinner = string.unpack("bbb", action_bytes)
-        else
-            -- Default action if read fails or times out
-            -- print("Failed to read action from socket after " .. string.format("%.2f", elapsed) .. "s, got " ..
-            --     (action_bytes and #action_bytes or 0) .. " bytes. Defaulting action.")
-            fire, zap, spinner = 0, 0, 0
-
-            -- If we timed out, attempt to reconnect
-            if elapsed >= read_timeout then
-                -- print("Socket read timeout exceeded, attempting reconnect...")
-                if socket then socket:close(); socket = nil end
-                open_socket() -- Attempt reconnect immediately
-            end
-        end
-    end)
-
-    if not success then
-        -- print("Error reading from socket:", err)
-        -- Close and attempt to reopen socket
-        if socket then
-            socket:close(); socket = nil
-        end
-        open_socket()
-        return 0, 0, 0 -- Return zeros for fire, zap, spinner_delta on read error
-    end
-
-    -- Return the three components directly
-    return fire, zap, spinner
-end
-
--- Seed the random number generator once at script start
-math.randomseed(os.time())
-
--- Try to access machine using the manager API with proper error handling
-local success, err = pcall(function()
-    if not manager then error("MAME manager API not available") end
-    if not manager.machine then error("manager.machine not available") end
-    mainCpu = manager.machine.devices[":maincpu"]
-    if not mainCpu then error("Main CPU not found") end
-    mem = mainCpu.spaces["program"]
-    if not mem then error("Program memory space not found") end
-end)
-
-if not success then
-    -- print("Error accessing MAME machine via manager: " .. tostring(err))
-    -- print("Attempting alternative access method...")
-    success, err = pcall(function()
-        if not machine then error("Neither manager.machine nor machine is available") end
-        mainCpu = machine.devices[":maincpu"]
-        if not mainCpu then error("Main CPU not found via machine") end
-        mem = mainCpu.spaces["program"]
-        if not mem then error("Program memory space not found via machine") end
-    end)
-
-    if not success then
-        -- print("Error with alternative access method: " .. tostring(err))
-        -- print("FATAL: Cannot access MAME memory")
-        -- Potentially add emu.pause() or similar if running directly causes issues
-        return -- Stop script execution if memory isn't accessible
-    end
-end
-
--- **GameState Class**
--- MOVED TO state.lua
-
--- **LevelState Class**
--- MOVED TO state.lua
-
--- **PlayerState Class**
--- MOVED TO state.lua
-
--- **EnemiesState Class**
--- MOVED TO state.lua
-
--- **Controls Class**
-Controls = {}
+-- Controls Class (Simplified initialization)
+local Controls = {}
 Controls.__index = Controls
 
-function Controls:new()
+function Controls:new(mame_manager)
     local self = setmetatable({}, Controls)
+    local ioport = mame_manager.machine.ioport
 
-    -- Find required input ports and fields
-    self.button_port = manager.machine.ioport.ports[":BUTTONSP1"]
-    self.spinner_port = manager.machine.ioport.ports[":KNOBP1"]
-    self.in2_port = manager.machine.ioport.ports[":IN2"]
-
-    -- Error checking for ports
-    if not self.button_port then print("Warning: Could not find :BUTTONSP1 port.") end
-    if not self.spinner_port then print("Warning: Could not find :KNOBP1 port.") end
-    if not self.in2_port then print("Warning: Could not find :IN2 port.") end
-
-    -- Find button fields
-    self.fire_field = self.button_port and self.button_port.fields["P1 Button 1"] or nil
-    self.zap_field = self.button_port and self.button_port.fields["P1 Button 2"] or nil
-
-    -- Find spinner field
-    self.spinner_field = self.spinner_port and self.spinner_port.fields["Dial"] or nil
-
-    -- Find Start button field (try common names)
-    self.p1_start_field = nil
-    if self.in2_port then
-        self.p1_start_field = self.in2_port.fields["1 Player Start"] or
-            self.in2_port.fields["P1 Start"] or
-            self.in2_port.fields["Start 1"]
+    local function find_port_field(port_name, field_name_options)
+        local port = ioport.ports[port_name]
+        if not port then print("Warning: Could not find port: " .. port_name); return nil end
+        for _, field_name in ipairs(field_name_options) do
+            local field = port.fields[field_name]
+            if field then return field end
+        end
+        print("Warning: Could not find field " .. table.concat(field_name_options, "/") .. " in port " .. port_name)
+        return nil
     end
 
-    -- Error checking for fields
-    if not self.fire_field then print("Warning: Could not find 'P1 Button 1' field in :BUTTONSP1 port.") end
-    if not self.zap_field then print("Warning: Could not find 'P1 Button 2' field in :BUTTONSP1 port.") end
-    if not self.spinner_field then print("Warning: Could not find 'Dial' field in :KNOBP1 port.") end
-    if not self.p1_start_field then print("Warning: Could not find P1 Start button field in :IN2 port.") end
+    self.fire_field = find_port_field(":BUTTONSP1", {"P1 Button 1"})
+    self.zap_field = find_port_field(":BUTTONSP1", {"P1 Button 2"})
+    self.spinner_field = find_port_field(":KNOBP1", {"Dial"}) -- Spinner value is written directly to memory
+    self.p1_start_field = find_port_field(":IN2", {"1 Player Start", "P1 Start", "Start 1"})
 
     return self
 end
 
+-- Apply received AI action and overrides to game controls
+function Controls:apply_action(fire, zap, spinner, p1_start, memory)
+    -- Debug values just before setting (simplified)
+    print(string.format("[DEBUG apply_action] p1_start_val=%s, p1_start_field_valid=%s",
+        tostring(p1_start),
+        tostring(self.p1_start_field ~= nil)))
 
--- Apply received AI action (fire, zap, spinner) and p1_start to game controls
-function Controls:apply_action(fire, zap, spinner, p1_start)
-    -- player_state commanded values are now set earlier in frame_callback
-    -- player_state.fire_commanded = fire
-    -- player_state.zap_commanded = zap
-    -- player_state.spinner_commanded = spinner
+    if self.fire_field then self.fire_field:set_value(fire) end
+    if self.zap_field then self.zap_field:set_value(zap) end
 
-    -- Apply actions to MAME input fields if they exist
-    self.fire_field:set_value(fire)
-    self.zap_field:set_value(zap)
-    self.p1_start_field:set_value(p1_start)
+    if self.p1_start_field then
+        -- Debug print *only* when attempting to set start=1
+        if p1_start == 1 then
+            print("[DEBUG apply_action] Attempting to set P1 Start = 1")
+        end
+        self.p1_start_field:set_value(p1_start)
+    end
 
-    -- Ensure spinner value is within signed byte range (-128 to 127)
+    -- Apply spinner value directly to memory (as before)
     local spinner_val = math.max(-128, math.min(127, spinner or 0))
-    -- Use write_u8, as write_s8 might not exist. write_u8 handles the byte pattern correctly.
-    mem:write_u8(0x0050, spinner_val) -- *** WRITE TO 0x0050 HAPPENS HERE ***
+    memory:write_u8(0x0050, spinner_val)
 end
 
-
--- Instantiate state objects - AFTER defining all classes but BEFORE functions using them
--- UPDATED to use state_defs from require('state')
+-- Instantiate state objects using state_defs
 local game_state = state_defs.GameState:new()
 local level_state = state_defs.LevelState:new()
 local player_state = state_defs.PlayerState:new()
 local enemies_state = state_defs.EnemiesState:new()
-local controls = Controls:new() -- Instantiate controls after MAME interface is confirmed
+local controls = nil -- Initialized after MAME interface confirmed
 
--- Function to format section for display
--- MOVED TO display.lua
-
--- Function to move the cursor to a specific row (using ANSI escape code)
--- MOVED TO display.lua
-
--- Function to flatten and serialize the game state data to binary
-local function flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
-    -- Create a consistent data structure with fixed sizes
+-- Flatten game state to binary format for sending over socket
+local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
     local data = {}
+    local insert = table.insert -- Local alias for performance
 
-    -- Game state (5 values)
-    table.insert(data, game_state.gamestate)
-    table.insert(data, game_state.game_mode)
-    table.insert(data, game_state.countdown_timer)
-    table.insert(data, game_state.p1_lives)
-    table.insert(data, game_state.p1_level)
+    -- Game state (5)
+    insert(data, gs.gamestate); insert(data, gs.game_mode); insert(data, gs.countdown_timer); insert(data, gs.p1_lives); insert(data, gs.p1_level)
+    -- Targeting / Engineered Features (5)
+    insert(data, es.nearest_enemy_seg)
+    insert(data, (es.nearest_enemy_seg ~= state_defs.INVALID_SEGMENT) and es.nearest_enemy_seg or 0)
+    insert(data, es.nearest_enemy_depth_raw)
+    insert(data, es.is_aligned_with_nearest > 0 and 10000 or 0)
+    insert(data, math.floor(es.alignment_error_magnitude * 10000.0))
+    -- Player state (7 + 8 + 8 = 23)
+    insert(data, ps.position); insert(data, ps.alive); insert(data, ps.player_state); insert(data, ps.player_depth); insert(data, ps.superzapper_uses); insert(data, ps.superzapper_active); insert(data, ps.shot_count)
+    for i = 1, 8 do insert(data, ps.shot_positions[i]) end
+    for i = 1, 8 do insert(data, ps.shot_segments[i]) end
+    -- Level state (3 + 16 + 16 = 35)
+    insert(data, ls.level_number); insert(data, ls.level_type); insert(data, ls.level_shape)
+    for i = 0, 15 do insert(data, ls.spike_heights[i] or 0) end
+    for i = 0, 15 do insert(data, ls.level_angles[i] or 0) end
+    -- Enemies state (counts: 10 + other: 6 = 16)
+    insert(data, es.active_flippers); insert(data, es.active_pulsars); insert(data, es.active_tankers); insert(data, es.active_spikers); insert(data, es.active_fuseballs)
+    insert(data, es.spawn_slots_flippers); insert(data, es.spawn_slots_pulsars); insert(data, es.spawn_slots_tankers); insert(data, es.spawn_slots_spikers); insert(data, es.spawn_slots_fuseballs)
+    insert(data, es.num_enemies_in_tube); insert(data, es.num_enemies_on_top); insert(data, es.enemies_pending); insert(data, es.pulsar_fliprate); insert(data, es.pulse_beat); insert(data, es.pulsing)
+    -- Decoded Enemy Info (7 * 6 = 42)
+    for i = 1, 7 do insert(data, es.enemy_core_type[i]); insert(data, es.enemy_direction_moving[i]); insert(data, es.enemy_between_segments[i]); insert(data, es.enemy_moving_away[i]); insert(data, es.enemy_can_shoot[i]); insert(data, es.enemy_split_behavior[i]) end
+    -- Enemy segments (7)
+    for i = 1, 7 do insert(data, es.enemy_segments[i]) end
+    -- Enemy depths (7)
+    for i = 1, 7 do insert(data, es.enemy_depths[i]) end
+    -- Top Enemy Segments (7)
+    for i = 1, 7 do insert(data, (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or state_defs.INVALID_SEGMENT) end
+    -- Enemy shot positions (4)
+    for i = 1, 4 do insert(data, es.shot_positions[i]) end
+    -- Enemy shot segments (4)
+    for i = 1, 4 do insert(data, es.enemy_shot_segments[i]) end
+    -- Charging Fuseball flags (16)
+    for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
+    -- Pending Vid (64)
+    for i = 1, 64 do insert(data, es.pending_vid[i]) end
+    -- Pending Seg (64)
+    for i = 1, 64 do insert(data, es.pending_seg[i]) end
 
-    -- Targeting Info / Engineered Features (5 values)
-    table.insert(data, enemies_state.nearest_enemy_seg)           -- Relative segment (-7..8 / -15..15 or INVALID)
-    table.insert(data, (enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT) and enemies_state.nearest_enemy_seg or 0) -- Relative delta (use 0 if no target)
-    table.insert(data, enemies_state.nearest_enemy_depth_raw)     -- Raw depth (0-255)
-    -- Pack alignment as 0 or 10000 for integer representation
-    table.insert(data, enemies_state.is_aligned_with_nearest > 0 and 10000 or 0)
-    -- Pack error magnitude scaled to 0-10000 integer
-    table.insert(data, math.floor(enemies_state.alignment_error_magnitude * 10000.0))
+    -- Total main payload size should be: 5+5+23+35+16+42+7+7+7+4+4+16+64+64 = 299
 
-    -- Player state (7 values + arrays)
-    table.insert(data, player_state.position) -- Absolute player position/segment byte
-    table.insert(data, player_state.alive)
-    table.insert(data, player_state.player_state)
-    table.insert(data, player_state.player_depth)
-    table.insert(data, player_state.superzapper_uses)
-    table.insert(data, player_state.superzapper_active)
-    table.insert(data, player_state.shot_count)
-
-    -- Player shot positions (fixed size: 8) - Absolute depth
-    for i = 1, 8 do
-        table.insert(data, player_state.shot_positions[i]) -- Already initialized to 0 if unused
-    end
-
-    -- Player shot segments (fixed size: 8) - Relative segments
-    for i = 1, 8 do
-        table.insert(data, player_state.shot_segments[i]) -- Already initialized to INVALID_SEGMENT
-    end
-
-    -- Level state (3 values + arrays)
-    table.insert(data, level_state.level_number)
-    table.insert(data, level_state.level_type)
-    table.insert(data, level_state.level_shape)
-
-    -- Spike heights (fixed size: 16) - Absolute heights indexed 0-15
-    for i = 0, 15 do
-        table.insert(data, level_state.spike_heights[i] or 0)
-    end
-
-    -- Level angles (fixed size: 16) - Absolute angles indexed 0-15
-    for i = 0, 15 do
-        table.insert(data, level_state.level_angles[i] or 0)
-    end
-
-    -- Enemies state (counts: 10 values + other state)
-    table.insert(data, enemies_state.active_flippers)
-    table.insert(data, enemies_state.active_pulsars)
-    table.insert(data, enemies_state.active_tankers)
-    table.insert(data, enemies_state.active_spikers)
-    table.insert(data, enemies_state.active_fuseballs)
-    table.insert(data, enemies_state.spawn_slots_flippers)
-    table.insert(data, enemies_state.spawn_slots_pulsars)
-    table.insert(data, enemies_state.spawn_slots_tankers)
-    table.insert(data, enemies_state.spawn_slots_spikers)
-    table.insert(data, enemies_state.spawn_slots_fuseballs)
-    table.insert(data, enemies_state.num_enemies_in_tube)
-    table.insert(data, enemies_state.num_enemies_on_top)
-    table.insert(data, enemies_state.enemies_pending)
-    table.insert(data, enemies_state.pulsar_fliprate)
-    table.insert(data, enemies_state.pulse_beat)
-    table.insert(data, enemies_state.pulsing)
-
-    -- Decoded Enemy Info (Size 7 slots * 6 fields = 42 values) - Absolute info
-    for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_core_type[i])
-        table.insert(data, enemies_state.enemy_direction_moving[i])
-        table.insert(data, enemies_state.enemy_between_segments[i])
-        table.insert(data, enemies_state.enemy_moving_away[i])
-        table.insert(data, enemies_state.enemy_can_shoot[i])
-        table.insert(data, enemies_state.enemy_split_behavior[i])
-    end
-
-    -- Enemy segments (fixed size: 7) - Relative segments
-    for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_segments[i]) -- Already INVALID_SEGMENT if inactive
-    end
-
-    -- Enemy depths (fixed size: 7) - Absolute depth
-    -- Combining MSB/LSB logic removed as LSB seemed unused/unverified
-    for i = 1, 7 do
-        table.insert(data, enemies_state.enemy_depths[i]) -- Already 0 if inactive
-    end
-
-    -- Top Enemy Segments (fixed size: 7) - Relative segments only for enemies at depth 0x10
-    for i = 1, 7 do
-        if enemies_state.enemy_depths[i] == 0x10 then
-            table.insert(data, enemies_state.enemy_segments[i]) -- Insert the relative segment
-        else
-            table.insert(data, INVALID_SEGMENT)                 -- Use sentinel if not at depth 0x10 or inactive
-        end
-    end
-
-    -- Enemy shot positions (fixed size: 4) - Absolute depth
-    for i = 1, 4 do
-        table.insert(data, enemies_state.shot_positions[i]) -- Already 0 if inactive
-    end
-
-    -- Enemy shot segments (fixed size: 4) - Relative segments
-    for i = 1, 4 do
-        table.insert(data, enemies_state.enemy_shot_segments[i]) -- Already INVALID_SEGMENT if inactive
-    end
-
-    -- Charging Fuseball flags per absolute segment (fixed size: 16, indexed 1-16)
-    for i = 1, 16 do
-        table.insert(data, enemies_state.charging_fuseball_segments[i]) -- Already 0 if not charging
-    end
-
-    -- Add pending_vid (64 bytes) - Absolute info
-    for i = 1, 64 do
-        table.insert(data, enemies_state.pending_vid[i]) -- Already 0 if unused
-    end
-
-    -- Add pending_seg (64 bytes) - Relative segments
-    for i = 1, 64 do
-        table.insert(data, enemies_state.pending_seg[i]) -- Already INVALID_SEGMENT if unused
-    end
-
-    -- Serialize the main data payload to a binary string. Convert all values to signed 16-bit integers.
-    local binary_data = ""
-    local num_values_packed = 0
-    for i, value in ipairs(data) do
-        local packed_value
-        -- Ensure value is a number, default to 0 if not
+    -- Serialize main data to binary string (signed 16-bit big-endian)
+    local binary_data_parts = {}
+    for _, value in ipairs(data) do
         local num_value = tonumber(value) or 0
-
-        -- Pack as signed 16-bit integer (little endian short 'h')
-        -- Need to handle range: -32768 to 32767
-        if num_value > 32767 then
-            -- print(string.format("Warning: Value %d at index %d exceeds int16 max. Clamping.", num_value, i))
-            packed_value = 32767
-        elseif num_value < -32768 then
-             -- print(string.format("Warning: Value %d at index %d exceeds int16 min. Clamping.", num_value, i))
-             packed_value = -32768
-        else
-             packed_value = num_value
-        end
-
-        -- Use format '<h' for signed 16-bit little-endian
-        -- NOTE: The original format was '>H' (unsigned big-endian). Keeping big-endian for compatibility, but using signed '<h' logic for packing.
-        -- Let's stick to '>h' (signed big-endian) for consistency if Python expects that. Assuming '>h'.
-        binary_data = binary_data .. string.pack(">h", packed_value)
-        num_values_packed = num_values_packed + 1
+        -- Clamp to signed 16-bit range
+        num_value = math.max(-32768, math.min(32767, num_value))
+        insert(binary_data_parts, string.pack(">h", num_value)) -- >h: signed short, big-endian
     end
+    local binary_data = table.concat(binary_data_parts)
+    local num_values_packed = #data
 
     -- --- OOB Data Packing ---
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-    local is_open_level = level_state.level_type == 0xFF
+    local is_attract_mode = (gs.game_mode & 0x80) == 0
+    local is_open_level = ls.level_type == 0xFF
+    local score = ps.score or 0
+    local score_high = math.floor(score / 65536)
+    local score_low = score % 65536
+    local frame = gs.frame_counter % 65536
 
-    -- Use the EXPERT target segment passed from frame_callback
-    local nearest_abs_seg_oob = expert_target_seg or -1 -- Use calculated expert target
-
-    -- Use the EXPERT fire/zap commands passed from frame_callback
-    local expert_should_fire = expert_fire_packed -- Use calculated expert fire (0/1)
-    local expert_should_zap = expert_zap_packed   -- Use calculated expert zap (0/1)
-
-    -- Score packing
-    local score = player_state.score or 0
-    local score_high = math.floor(score / 65536) -- High 16 bits
-    local score_low = score % 65536              -- Low 16 bits
-
-    -- Frame counter packing (masked to 16 bits)
-    local frame = game_state.frame_counter % 65536
-
-    -- Check for save signal (moved near other OOB prep)
+    -- Save signal logic
     local current_time = os.time()
     local save_signal = 0
-    if shutdown_requested or current_time - game_state.last_save_time >= game_state.save_interval then
+    if shutdown_requested or current_time - gs.last_save_time >= gs.save_interval then
         save_signal = 1
-        game_state.last_save_time = current_time
-        if shutdown_requested then print("SHUTDOWN SAVE: Sending final save signal before MAME exits")
-        else print("Periodic Save: Sending save signal to Python script") end
+        gs.last_save_time = current_time
+        if shutdown_requested then print("SHUTDOWN SAVE: Sending final save signal.")
+        else print("Periodic Save: Sending save signal.") end
     end
 
-    -- Pack OOB data using the format string expected by Python: >HdBBBHHHBBBhBhBBBB
-    local oob_format = ">HdBBBHHHBBBhBhBBBB" -- 17 codes
-
+    -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 4 UByte)
+    local oob_format = ">HdBBBHHHBBBhBhBBBB"
     local oob_data = string.pack(oob_format,
-        num_values_packed,              -- H: ushort (Should be 299)
-        reward,                         -- d: double
-        0,                              -- B: Placeholder (game_action?)
-        game_state.game_mode,           -- B: uchar
-        bDone and 1 or 0,               -- B: uchar (0/1)
-        frame,                          -- H: ushort
-        score_high,                     -- H: ushort
-        score_low,                      -- H: ushort
-        save_signal,                    -- B: uchar (0/1)
-        player_state.fire_commanded,    -- B: uchar
-        player_state.zap_commanded,     -- B: uchar
-        player_state.spinner_commanded, -- h: short
-        is_attract_mode and 1 or 0,     -- B: uchar (0/1)
-        nearest_abs_seg_oob,            -- h: short (-1 to 15, packed as short) <-- EXPERT TARGET SEGMENT
-        player_state.position & 0x0F,   -- B: uchar (0-15)
-        is_open_level and 1 or 0,       -- B: uchar (0/1)
-        expert_should_fire,             -- B: uchar (0/1) <-- EXPERT FIRE
-        expert_should_zap               -- B: uchar (0/1) <-- EXPERT ZAP
+        num_values_packed,          -- H: Number of values in main payload (ushort)
+        reward,                     -- d: Reward (double)
+        0,                          -- B: Placeholder (uchar)
+        gs.game_mode,               -- B: Game Mode (uchar)
+        bDone and 1 or 0,           -- B: Done flag (uchar)
+        frame,                      -- H: Frame counter (ushort)
+        score_high,                 -- H: Score High (ushort)
+        score_low,                  -- H: Score Low (ushort)
+        save_signal,                -- B: Save Signal (uchar)
+        ps.fire_commanded,          -- B: Commanded Fire (uchar)
+        ps.zap_commanded,           -- B: Commanded Zap (uchar)
+        ps.spinner_commanded,       -- h: Commanded Spinner (short)
+        is_attract_mode and 1 or 0, -- B: Is Attract Mode (uchar)
+        expert_target_seg or -1,    -- h: Expert Target Segment (short)
+        ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
+        is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
+        expert_fire_packed,         -- B: Expert Fire (uchar)
+        expert_zap_packed           -- B: Expert Zap (uchar)
     )
 
-    -- Combine out-of-band header with game state data
+    -- Combine OOB header + main data
     local final_data = oob_data .. binary_data
 
-    return final_data, num_values_packed -- Return the combined data and the size of the main payload
+    -- DEBUG: Verify length (OOB=30 bytes, Main=299*2=598 bytes -> Total=628)
+    -- if #final_data ~= 628 then
+    --     print(string.format("WARNING: Packed data length mismatch! Expected 628, got %d. Num values: %d", #final_data, num_values_packed))
+    -- end
+
+    return final_data, num_values_packed
 end
 
 
--- Variables for frame timing and FPS calculation
-local lastTimer = -1 -- Initialize to -1 to ensure first frame runs
-local last_fps_time = os.time()
-local last_frame_counter_for_fps = 0 -- Use a separate counter for FPS calc
+-- Send state and receive action via socket
+local function process_frame_via_socket(rawdata)
+    -- Ensure socket connection
+    if not current_socket then
+        if not open_socket() then
+            return 0, 0, 0, false -- Return zeros and error flag
+        end
+    end
 
+    -- Attempt to write data with length header
+    local write_success, write_err = pcall(function()
+        local data_length = #rawdata
+        local length_header = string.pack(">H", data_length) -- Unsigned short, big-endian length
+        current_socket:write(length_header)
+        current_socket:write(rawdata)
+    end)
 
--- Variables for frame skipping logic
-local frames_to_wait = 0 -- How many timer ticks to wait before processing a frame (0 = process every tick)
-local frames_waited = 0
+    if not write_success then
+        print("Error writing to socket: " .. tostring(write_err) .. ". Attempting reconnect.")
+        close_socket()
+        open_socket() -- Try immediate reconnect
+        return 0, 0, 0, false -- Return zeros and error flag
+    end
+
+    -- Attempt to read action with timeout
+    local fire, zap, spinner = 0, 0, 0
+    local read_success, read_result = pcall(function()
+        local action_bytes = nil
+        local read_start_time = os.clock()
+        local elapsed = 0
+
+        while elapsed < SOCKET_READ_TIMEOUT_S do
+            -- Try reading 3 bytes for the action (b, b, b)
+            action_bytes = current_socket:read(3)
+
+            if action_bytes and #action_bytes == 3 then
+                -- Successfully read 3 bytes
+                 return { string.unpack("bbb", action_bytes) } -- Return unpacked values
+            end
+
+            -- If read failed or got partial data, just loop and rely on main timeout
+            -- No explicit wait here; os.clock() check handles timing.
+            elapsed = os.clock() - read_start_time
+        end
+
+        -- Loop finished without getting 3 bytes (Timeout)
+        print("Socket read timeout after " .. string.format("%.3f", elapsed) .. "s. Expected 3 bytes.")
+        if elapsed >= SOCKET_READ_TIMEOUT_S then
+             print("Socket read timeout exceeded, attempting reconnect...")
+             close_socket()
+             open_socket()
+        end
+        return { 0, 0, 0 } -- Default action on timeout
+
+    end)
+
+    if not read_success then
+        print("Error reading from socket: " .. tostring(read_result) .. ". Attempting reconnect.")
+        close_socket()
+        open_socket()
+        return 0, 0, 0, false -- Return zeros and error flag
+    end
+
+    -- Return the received action values and success flag
+    fire, zap, spinner = unpack(read_result) -- Unpack results from the table returned by pcall
+    return fire, zap, spinner, true
+end
+
+-- Update all game state objects
+local function update_game_states(memory)
+    game_state:update(memory)
+    level_state:update(memory)
+    player_state:update(memory, logic.absolute_to_relative_segment) -- Pass helper from logic module
+    enemies_state:update(memory, game_state, player_state, level_state, logic.absolute_to_relative_segment) -- Pass dependencies & helper
+    -- DEBUG: Print game_mode immediately after update
+    print(string.format("[DEBUG state update] Frame: %d, game_mode: 0x%02X", game_state.frame_counter, game_state.game_mode))
+end
+
+-- Perform AI interaction (calculate reward, expert advice, send state, receive action)
+local function handle_ai_interaction()
+    -- Calculate reward based on current state and detected actions
+    local reward, episode_done = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
+
+    -- Calculate expert advice (target segment, fire, zap)
+    local is_open_level = (level_state.level_number - 1) % 4 == 2
+    local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = logic.find_target_segment(
+        game_state, player_state, level_state, enemies_state, logic.absolute_to_relative_segment, is_open_level
+    )
+    local expert_fire_packed = expert_should_fire_lua and 1 or 0
+    local expert_zap_packed = expert_should_zap_lua and 1 or 0
+
+    -- Default values if socket is not connected
+    local received_fire_cmd, received_zap_cmd, received_spinner_cmd = 0, 0, 0
+    local socket_ok = false
+    local num_values = 0 -- Default if not sending
+
+    -- Only attempt network ops if socket exists and seems valid
+    if current_socket then
+        -- Flatten current state (s') including reward (r) and done (d)
+        local frame_data -- Declare frame_data here
+        frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, episode_done, expert_target_seg, expert_fire_packed, expert_zap_packed)
+
+        -- Send s', r, d; Receive action a for s'
+        received_fire_cmd, received_zap_cmd, received_spinner_cmd, socket_ok = process_frame_via_socket(frame_data)
+
+        -- Update total bytes sent (only if socket write was likely successful)
+        if socket_ok then -- Assuming socket_ok implies write likely succeeded before read attempt
+            total_bytes_sent = total_bytes_sent + #frame_data
+        end
+    else
+        -- Socket doesn't exist, attempt to open it periodically
+        local current_time = os.time()
+        if current_time - last_connection_attempt_time > CONNECTION_RETRY_INTERVAL_S then
+            print(string.format("[handle_ai_interaction] No active socket, attempting connect retry (Last attempt: %ds ago).", current_time - last_connection_attempt_time))
+            last_connection_attempt_time = current_time -- Update time *before* attempting
+            open_socket() -- Attempt connection
+        end
+    end
+
+    -- Store received commands (will be 0s if no socket or read failed)
+    player_state.fire_commanded = received_fire_cmd
+    player_state.zap_commanded = received_zap_cmd
+    player_state.spinner_commanded = received_spinner_cmd
+
+    return episode_done, socket_ok, num_values -- Return done flag, socket status, and num_values for display
+end
+
+-- Determine the final action based on game state and AI commands (Returns: fire, zap, spinner, start)
+local function determine_final_actions()
+    local final_fire_cmd = player_state.fire_commanded -- Start with AI command
+    local final_zap_cmd = player_state.zap_commanded
+    local final_spinner_cmd = player_state.spinner_commanded
+    local final_p1_start_cmd = 0
+    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+
+    -- Override based on game state
+    if game_state.gamestate == 0x12 then -- High Score Entry
+        final_fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
+        final_zap_cmd, final_spinner_cmd = 0, 0
+    elseif game_state.gamestate == 0x16 then -- Level Select
+        if level_select_counter < 60 then
+            final_spinner_cmd = 18; final_fire_cmd, final_zap_cmd = 0, 0
+            level_select_counter = level_select_counter + 1
+        elseif level_select_counter == 60 then
+            final_fire_cmd = 1; final_spinner_cmd, final_zap_cmd = 0, 0
+            level_select_counter = 61
+        else
+            final_fire_cmd, final_zap_cmd, final_spinner_cmd = 0, 0, 0
+            -- Reset counter handled below if attract mode kicks in
+        end
+    elseif is_attract_mode then -- Attract Mode
+        -- DEBUG: Print frame and modulo check
+        local should_press_start = (game_state.frame_counter % 50 == 0)
+        print(string.format("[DEBUG attract] Frame: %d, Frame %% 50 == 0: %s",
+            game_state.frame_counter,
+            tostring(should_press_start)))
+
+        final_p1_start_cmd = should_press_start and 1 or 0
+        final_fire_cmd, final_zap_cmd, final_spinner_cmd = 0, 0, 0
+        level_select_counter = 0 -- Reset level select counter here
+
+    end
+
+    -- Apply the final determined actions -- REMOVED FROM HERE
+    -- ctrl_instance:apply_action(final_fire, final_zap, final_spinner, final_p1_start_cmd, memory)
+
+    return final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd
+end
+
+-- Update the console display if enabled and interval has passed
+local function update_display_if_needed(num_values_packed)
+    local current_time_high_res = os.clock()
+    if SHOW_DISPLAY and (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL then
+        display.update("Running", game_state, level_state, player_state, enemies_state, num_values_packed, logic.getLastReward(), total_bytes_sent)
+        last_display_update = current_time_high_res
+    end
+end
+
+-- Apply cheats/overrides
+local function apply_overrides(memory)
+    memory:write_u8(0x0006, 2) -- Credits
+    memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
+    memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
+    -- if CHEAT_START_LEVEL then memory:write_u8(0x0126, CHEAT_START_LEVEL) end -- Start Level (optional)
+end
+
 
 -- Main frame callback for MAME
 local function frame_callback()
-    -- Frame skipping logic based on timer ticks at $0003
+    -- Frame skipping logic
     local currentTimer = mem:read_u8(0x0003)
-    if currentTimer == lastTimer then
-        -- Timer hasn't changed, do nothing for this MAME frame
-        return true
-    end
-    -- Timer has changed, update lastTimer
-    lastTimer = currentTimer
-
-    -- Increment wait counter and check if we should process this tick
+    if currentTimer == last_timer_tick then return true end
+    last_timer_tick = currentTimer
     frames_waited = frames_waited + 1
-    if frames_waited <= frames_to_wait then
-        -- Skip processing this timer tick
-        return true
-    end
-    -- Reset wait counter if we process this tick
+    if frames_waited <= frames_to_wait then return true end
     frames_waited = 0
 
-    -- --- Start Processing Game Frame ---
-
-    -- Calculate FPS (once per second)
+    -- Calculate FPS
     local current_time = os.time()
     if current_time > last_fps_time then
         game_state.current_fps = game_state.frame_counter - last_frame_counter_for_fps
@@ -1287,201 +488,69 @@ local function frame_callback()
         last_fps_time = current_time
     end
 
-    -- Update game state objects (Order: Game -> Level -> Player -> Enemies)
-    game_state:update(mem)
-    level_state:update(mem)
-    player_state:update(mem, absolute_to_relative_segment) -- Pass helper function
-    enemies_state:update(mem, game_state, player_state, level_state, absolute_to_relative_segment) -- Pass dependencies & helper
+    -- Update state from MAME memory
+    update_game_states(mem)
+  
+    -- Apply overrides/cheats
+    apply_overrides(mem)
 
-    -- Check for dangerous pulsars in player's segment
-    local player_segment = player_state.position & 0x0F
-    for j = 1, 7 do
-        if enemies_state.enemy_core_type[j] == ENEMY_TYPE_PULSAR and 
-           enemies_state.enemy_abs_segments[j] == player_segment and 
-           enemies_state.enemy_depths[j] > 0 and 
-           enemies_state.pulsing > 0xE0 then
-            break
-        end
-    end
+    -- Handle AI Interaction (Send state s', get action a)
+    local episode_done, socket_ok, num_values_packed = handle_ai_interaction()
 
-    local bDone = false -- Indicates if the episode ended this frame
+    -- Determine final action based on AI input and game state
+    local final_fire, final_zap, final_spinner, final_p1_start = determine_final_actions()
 
-    -- Ensure socket connection is open
-    if not socket then
-        if not open_socket() then
-            -- Socket failed, potentially update display and skip AI interaction
-            display.update("Waiting for Python connection...", game_state, level_state, player_state, enemies_state, 0, 0, 0)
-            -- Decide how to handle controls when no AI: maybe do nothing? Or basic attract mode logic?
-            -- For now, just return without applying actions.
-            return true
-        end
-    end
+    -- print("Applying actions to controls")
+    -- Apply actions to controls
+    controls:apply_action(final_fire, final_zap, final_spinner, final_p1_start, mem)
 
-    -- --- Overrides / Cheats ---
-    -- Set credits to 2 (prevents needing coins)
-    mem:write_u8(0x0006, 2)
-    -- NOP out copy protection memory corruption ($A591/$A592)
-    mem:write_direct_u8(0xA591, 0xEA) -- NOP
-    mem:write_direct_u8(0xA592, 0xEA) -- NOP
-
-    -- Start on level 17 at least
-    mem:write_u8(0x0126, 17)
-    -- --- AI Interaction ---
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
-
-    -- Calculate reward based on the *current* state and the *detected* spinner movement
-    local reward, episode_done = calculate_reward(game_state, level_state, player_state, enemies_state) -- Correct args
-    bDone = episode_done -- Capture if the episode ended
-
-    -- Calculate expert advice using find_target_segment
-    local is_open_level = (level_state.level_number - 1) % 4 == 2
-    local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = find_target_segment(
-        game_state, player_state, level_state, enemies_state, absolute_to_relative_segment, is_open_level
-    )
-    
-    -- Convert boolean fire/zap to 0/1 for packing
-    local expert_fire_packed = expert_should_fire_lua and 1 or 0
-    local expert_zap_packed = expert_should_zap_lua and 1 or 0
-
-    -- Flatten and serialize the *current* game state (s') including reward info
-    -- Pass the calculated expert advice to the flatten function
-    local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
-
-    -- Send current state (s'), reward (r), done (d) to AI; receive action (a) for s'
-    local received_fire_cmd, received_zap_cmd, received_spinner_cmd = process_frame(frame_data) -- Correct args
-    -- print(string.format("[RECV DEBUG] Received from Python: fire=%d, zap=%d, spinner=%d", received_fire_cmd, received_zap_cmd, received_spinner_cmd))
-
-    -- Store received commands in player state immediately
-    player_state.fire_commanded = received_fire_cmd
-    player_state.zap_commanded = received_zap_cmd
-    player_state.spinner_commanded = received_spinner_cmd
-
-    -- Debug logging for spinner commands during pulsar danger
-    if enemies_state.pulsing > 0xE0 then
-        local player_segment = player_state.position & 0x0F
-        for j = 1, 7 do
-            if enemies_state.enemy_core_type[j] == ENEMY_TYPE_PULSAR and 
-               enemies_state.enemy_abs_segments[j] == player_segment and 
-               enemies_state.enemy_depths[j] > 0 then
-                local oob_target = enemies_state.nearest_enemy_abs_seg_internal or -1
-            end
-        end
-    end
-
-    -- Update total bytes sent (for display)
-    total_bytes_sent = total_bytes_sent + #frame_data
-
-    -- --- Apply AI/Manual Action ---
-    -- Start with AI commands as base
-    local final_fire_cmd = received_fire_cmd
-    local final_zap_cmd = received_zap_cmd
-    local final_spinner_cmd = received_spinner_cmd
-    local final_p1_start_cmd = 0 -- Default P1 start to 0
-
-    -- Handle specific game states / modes (override final commands)
-    if game_state.gamestate == 0x12 then -- High Score Entry Mode
-        final_fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
-        final_zap_cmd = 0
-        final_spinner_cmd = 0
-    elseif game_state.gamestate == 0x16 then -- Level Select Mode
-        if level_select_counter < 60 then
-            final_spinner_cmd = 18; final_fire_cmd = 0; final_zap_cmd = 0
-            level_select_counter = level_select_counter + 1
-        elseif level_select_counter == 60 then
-            final_fire_cmd = 1; final_spinner_cmd = 0; final_zap_cmd = 0
-            level_select_counter = 61 -- Prevent re-pressing fire
-        else
-            final_fire_cmd = 0; 
-            final_zap_cmd = 0; 
-            final_spinner_cmd = 0
-            level_select_counter = 0
-        end
-    elseif is_attract_mode then -- Attract Mode
-        final_p1_start_cmd = (game_state.frame_counter % 50 == 0) and 1 or 0
-        final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
-        level_select_counter = 0
-    elseif (game_state.gamestate == 0x04) or (game_state.gamestate == 0x20) then
-        final_fire_cmd = player_state.fire_commanded
-        final_zap_cmd = player_state.zap_commanded
-        final_spinner_cmd = player_state.spinner_commanded
-    else
-        final_fire_cmd = 0; final_zap_cmd = 0; final_spinner_cmd = 0
-    end
-
-    -- Apply the final determined actions (AI or state-based overrides)
-
-    if (final_p1_start_cmd == 1) then
-        -- print("PRESSING START with fire=" .. final_fire_cmd .. " zap=" .. final_zap_cmd .. " spinner=" .. final_spinner_cmd)
-    end
-    
-    controls:apply_action(final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd)
-
-    -- --- Update Display ---
-    local current_time_high_res = os.clock()
-    if SHOW_DISPLAY and (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL then
-        -- Use LastRewardState which was updated in calculate_reward
-        -- Call the update function from the display module
-        display.update("Running", game_state, level_state, player_state, enemies_state, num_values, LastRewardState, total_bytes_sent)
-        last_display_update = current_time_high_res
-    end
+    -- Update console display periodically
+    update_display_if_needed(num_values_packed)
 
     return true -- Indicate success to MAME
 end
 
-
--- Helper function to format segment values for display
--- MOVED TO display.lua
-
--- Function to update the console display
--- MOVED TO display.lua
-
--- Function to be called when MAME is shutting down
+-- Function called when MAME is shutting down
 local function on_mame_exit()
-    print("MAME is shutting down - Sending final save signal")
+    print("MAME is shutting down...")
+    shutdown_requested = true -- Signal for final save
 
-    -- Set shutdown flag to trigger save signal in flatten_game_state_to_binary
-    shutdown_requested = true
-
-    -- Try to process one final frame to send the save signal
-    if mainCpu and mem and game_state and level_state and player_state and enemies_state and controls and socket then
-        print("Processing final frame for save...")
-        -- Update state objects one last time
-        game_state:update(mem)
-        level_state:update(mem)
-        player_state:update(mem, absolute_to_relative_segment) -- Pass helper
-        enemies_state:update(mem, game_state, player_state, level_state, absolute_to_relative_segment) -- Pass dependencies & helper
-
-        -- Calculate final reward (value might not matter much here)
-        local reward, _ = calculate_reward(game_state, level_state, player_state, enemies_state) -- Correct args
-
-        -- Flatten state with shutdown_requested = true (handled inside flatten), bDone=true
-        local frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, true) -- Correct args
-
-        -- Send one last time using process_frame (ignore received action)
-        local success, err = pcall(process_frame, frame_data) -- Correct args
-        if success then
-             print("Final save frame processed.")
-        else
-             print("Error processing final save frame: " .. tostring(err))
-        end
+    -- Try to process one final frame to send save signal if possible
+    if mainCpu and mem and controls and current_socket then
+        print("Processing final frame for save signal...")
+        update_game_states(mem) -- Get final state
+        -- Call AI handler - this calculates reward and flattens state with save signal
+        handle_ai_interaction() -- Ignore return values, just need to send state
+        print("Final frame processed and sent.")
     else
-         print("Could not process final frame: required objects or socket not available.")
+         print("Could not process final frame: MAME interface, controls, or socket not available.")
     end
 
-    -- Close socket
-    if socket then
-        socket:close()
-        socket = nil
-        print("Socket closed during MAME shutdown.")
-    end
+    close_socket() -- Ensure socket is closed
+    print("Shutdown complete.")
 end
 
+-- --- Script Initialization ---
+math.randomseed(os.time())
+
+-- Initialize MAME interface first
+if not initialize_mame_interface() then
+    return -- Stop script if MAME interface failed
+end
+
+-- Initialize controls now that MAME interface is confirmed
+controls = Controls:new(manager)
+
+-- Attempt initial socket connection
+open_socket()
+
 -- Register callbacks with MAME
--- Keep references to prevent garbage collection
-callback_ref = emu.add_machine_frame_notifier(frame_callback)
+-- Store reference globally like original script, in case of MAME GC quirks
+global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
 emu.add_machine_stop_notifier(on_mame_exit)
 
 print("Tempest AI script initialized and callbacks registered.")
-
 --[[ End of main.lua ]]--
+
+
 
