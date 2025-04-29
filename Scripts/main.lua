@@ -483,8 +483,8 @@ local function apply_overrides(memory)
     memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
 
     -- NOP out the start level check
-    memory:write_direct_u8(0x90CD, 0xEA) -- NOP
-    memory:write_direct_u8(0x90CE, 0xEA) -- NOP
+    -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
+    -- memory:write_direct_u8(0x90CE, 0xEA) -- NOP
 end
 
 
