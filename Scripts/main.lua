@@ -481,7 +481,11 @@ local function apply_overrides(memory)
     memory:write_u8(0x0006, 2) -- Credits
     memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
     memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
-    if START_LEVEL_MIN then memory:write_u8(0x0126, START_LEVEL_MIN) end -- Start Level (optional)
+    if START_LEVEL_MIN then 
+        if (memory:read_u8(0x0126) < START_LEVEL_MIN) then
+            memory:write_u8(0x0126, START_LEVEL_MIN) 
+        end -- Start Level (optional)
+    end
 end
 
 
