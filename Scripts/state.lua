@@ -678,6 +678,9 @@ function M.EnemiesState:new()
     self.enemy_shot_segments = {}     -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
     self.enemy_shot_abs_segments = {} -- Absolute segment (0-15, or INVALID_SEGMENT)
 
+    -- More Enemy Info (Size 7, from $02CC-$02D2)
+    self.more_enemy_info = {}
+
     -- Pending enemy data (Size 64)
     self.pending_vid = {}              -- ($0243 + i - 1)
     self.pending_seg = {}              -- Relative segment ($0203 + i - 1, or INVALID_SEGMENT)
@@ -713,12 +716,15 @@ function M.EnemiesState:new()
         self.enemy_shot_segments[i] = INVALID_SEGMENT
         self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
     end
-     for i = 1, 64 do
+    for i = 1, 64 do
         self.pending_vid[i] = 0
         self.pending_seg[i] = INVALID_SEGMENT
     end
     for i = 1, 16 do
         self.charging_fuseball_segments[i] = 0
+    end
+    for i = 1, 7 do
+        self.more_enemy_info[i] = 0
     end
 
     return self
@@ -795,6 +801,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.enemy_split_behavior[i] = state_byte & 0x03                -- Bits 0-1: Split Behavior
         end -- End if enemy active
     end -- End enemy slot loop
+
+    -- Read More Enemy Info ($02CC - $02D2)
+    for i = 1, 7 do
+        self.more_enemy_info[i] = mem:read_u8(0x02CC + i - 1)
+    end
 
     -- Calculate charging Fuseball segments (reset first)
     for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end

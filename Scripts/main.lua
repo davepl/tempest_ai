@@ -18,7 +18,7 @@ local logic = require("logic") -- ADDED: Require the new logic module
 local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
-local SHOW_DISPLAY            = false
+local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
@@ -201,7 +201,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     insert(data, es.spawn_slots_flippers); insert(data, es.spawn_slots_pulsars); insert(data, es.spawn_slots_tankers); insert(data, es.spawn_slots_spikers); insert(data, es.spawn_slots_fuseballs)
     insert(data, es.num_enemies_in_tube); insert(data, es.num_enemies_on_top); insert(data, es.enemies_pending); insert(data, es.pulsar_fliprate); insert(data, es.pulse_beat); insert(data, es.pulsing)
     -- Decoded Enemy Info (7 * 6 = 42)
-    for i = 1, 7 do insert(data, es.enemy_core_type[i]); insert(data, es.enemy_direction_moving[i]); insert(data, es.enemy_between_segments[i]); insert(data, es.enemy_moving_away[i]); insert(data, es.enemy_can_shoot[i]); insert(data, es.enemy_split_behavior[i]) end
+    for i = 1, 7 do insert(data, es.enemy_core_type[i]); insert(data, es.more_enemy_info[i]); insert(data, es.enemy_direction_moving[i]); insert(data, es.enemy_between_segments[i]); insert(data, es.enemy_moving_away[i]); insert(data, es.enemy_can_shoot[i]); insert(data, es.enemy_split_behavior[i]) end
     -- Enemy segments (7)
     for i = 1, 7 do insert(data, es.enemy_segments[i]) end
     -- Enemy depths (7)
@@ -461,7 +461,7 @@ local function determine_final_actions()
         -- Start remains 0
     else
         -- Unknown state, all commands default to 0
-        print(string.format("[WARN] Unknown game state 0x%02X encountered in determine_final_actions", game_state.gamestate))
+        -- print(string.format("[WARN] Unknown game state 0x%02X encountered in determine_final_actions", game_state.gamestate))
     end
 
     return final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd

@@ -7,6 +7,7 @@ local M = {} -- Module table for export
 
 -- Constants (Copied from main.lua's original display logic context)
 local INVALID_SEGMENT = -32768
+local is_first_display = true -- Flag to clear screen only on first update
 
 -- Helper function to format segment values for display
 local function format_segment(value)
@@ -55,6 +56,11 @@ end
 -- Main display update function (exported as M.update)
 -- Signature matches the call in the original main.lua frame_callback
 function M.update(status_message, game_state, level_state, player_state, enemies_state, num_values, last_reward) -- Note: Original didn't pass total_bytes_sent
+
+    if is_first_display then
+        io.write("\027[2J") -- ANSI code to clear screen
+        is_first_display = false
+    end
 
     move_cursor_to_row(1) -- Move to top-left corner
 
@@ -161,6 +167,20 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     end
     display_str = display_str .. "Enemy Shots Pos:" .. e_shots_pos_str .. "\n"
     display_str = display_str .. "Enemy Shots Seg:" .. e_shots_seg_str .. "\n\n"
+
+    -- More Enemy Info Details
+    local more_info_str = ""
+    for i = 1, 7 do
+        local value = enemies_state.more_enemy_info[i]
+        if (value & 0x80) ~= 0 then -- Check top bit
+            -- Valid: show lower 7 bits as 2-digit hex
+            more_info_str = more_info_str .. string.format(" %02X", value & 0x7F)
+        else
+            -- Invalid: show --
+            more_info_str = more_info_str .. " --"
+        end
+    end
+    display_str = display_str .. "More Enemy Info:" .. more_info_str .. "\n\n"
 
     -- Charging Fuseballs
     local charging_fuseball_str = {}

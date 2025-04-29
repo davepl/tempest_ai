@@ -494,8 +494,20 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         elseif sc == 4 then reward = reward + 5; elseif sc == 5 then reward = reward + 10
         elseif sc == 6 then reward = reward + 15; elseif sc == 7 then reward = reward + 20 end
 
-        if game_state.gamestate == 0x04 and player_state.superzapper_active ~= 0 then reward = reward - 500 end
+        -- Reward matching the expert policy on when to fire
+        if (player_state.fire_commanded == 1 and enemies_state.nearest_enemy_should_fire == 1) then 
+            reward = reward + 200 
+        else
+            reward = reward - 200
+        end
 
+        -- Reward staying away from danger lanes
+        if (M.is_danger_lane(player_state.position & 0x0F, enemies_state)) then
+            reward = reward - 100
+            if (detected_spinner == 0) then reward = reward - 100 else reward = reward + 50 end
+        end
+        if game_state.gamestate == 0x04 and player_state.superzapper_active ~= 0 then reward = reward - 500 end
+    
         local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
         local target_depth = enemies_state.nearest_enemy_depth_raw
         local player_segment = player_state.position & 0x0F
