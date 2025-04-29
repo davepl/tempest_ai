@@ -20,7 +20,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 -- Constants
 local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
-local START_LEVEL_MIN         = 9
+local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
@@ -147,13 +147,20 @@ end
 
 -- Apply received AI action and overrides to game controls
 function Controls:apply_action(fire, zap, spinner, p1_start, memory)
+    -- Debug values just before setting (simplified)
+    -- print(string.format("[DEBUG apply_action] p1_start_val=%s, p1_start_field_valid=%s",
+    --    tostring(p1_start),
+    --    tostring(self.p1_start_field ~= nil)))
 
     if self.fire_field then self.fire_field:set_value(fire) end
     if self.zap_field then self.zap_field:set_value(zap) end
 
     if self.p1_start_field then
         -- Debug print *only* when attempting to set start=1
-        self.p1_start_field:set_value(p1_start)
+        -- if p1_start == 1 then
+        --    print("[DEBUG apply_action] Attempting to set P1 Start = 1")
+        -- end
+    self.p1_start_field:set_value(p1_start)
     end
 
     -- Apply spinner value directly to memory (as before)
@@ -352,6 +359,8 @@ local function update_game_states(memory)
     level_state:update(memory)
     player_state:update(memory, logic.absolute_to_relative_segment) -- Pass helper from logic module
     enemies_state:update(memory, game_state, player_state, level_state, logic.absolute_to_relative_segment) -- Pass dependencies & helper
+    -- DEBUG: Print game_mode immediately after update
+    -- print(string.format("[DEBUG state update] Frame: %d, game_mode: 0x%02X", game_state.frame_counter, game_state.game_mode))
 end
 
 -- Perform AI interaction (calculate reward, expert advice, send state, receive action)
@@ -389,7 +398,7 @@ local function handle_ai_interaction()
         -- Socket doesn't exist, attempt to open it periodically
         local current_time = os.time()
         if current_time - last_connection_attempt_time > CONNECTION_RETRY_INTERVAL_S then
-            print(string.format("[handle_ai_interaction] No active socket, attempting connect retry (Last attempt: %ds ago).", current_time - last_connection_attempt_time))
+            -- print(string.format("[handle_ai_interaction] No active socket, attempting connect retry (Last attempt: %ds ago).", current_time - last_connection_attempt_time))
             last_connection_attempt_time = current_time -- Update time *before* attempting
             open_socket() -- Attempt connection
         end
@@ -405,39 +414,55 @@ end
 
 -- Determine the final action based on game state and AI commands (Returns: fire, zap, spinner, start)
 local function determine_final_actions()
-    local final_fire_cmd = player_state.fire_commanded -- Start with AI command
-    local final_zap_cmd = player_state.zap_commanded
-    local final_spinner_cmd = player_state.spinner_commanded
+    -- Initialize all commands to 0, apply overrides below
+    local final_fire_cmd = 0
+    local final_zap_cmd = 0
+    local final_spinner_cmd = 0
     local final_p1_start_cmd = 0
     local is_attract_mode = (game_state.game_mode & 0x80) == 0
 
     -- Override based on game state
     if game_state.gamestate == 0x12 then -- High Score Entry
         final_fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
-        final_zap_cmd, final_spinner_cmd = 0, 0
+        -- Zap, Spinner, Start remain 0
     elseif game_state.gamestate == 0x16 then -- Level Select
+        -- DEBUG: Log Level Select State
+        -- print(string.format("[DEBUG LevelSelect] Frame: %d, Timer: %d, Counter: %d", game_state.frame_counter, mem and mem:read_u8(0x0003) or -1, level_select_counter))
+
         if level_select_counter < 60 then
-            final_spinner_cmd = START_ADVANCED and 18 or 0 
-            final_fire_cmd, final_zap_cmd = 0, 0
+            final_spinner_cmd = 18; -- Fire, Zap, Start remain 0
             level_select_counter = level_select_counter + 1
+            -- print("  -> Spinning knob (Counter now " .. level_select_counter .. ")")
         elseif level_select_counter == 60 then
-            final_fire_cmd = 1; final_spinner_cmd, final_zap_cmd = 0, 0
-            level_select_counter = 61
-        else
-            final_fire_cmd, final_zap_cmd, final_spinner_cmd = 0, 0, 0
-            -- Reset counter handled below if attract mode kicks in
+            final_fire_cmd = 1; -- Spinner, Zap, Start remain 0
+            level_select_counter = level_select_counter + 1 -- Increment past 60 immediately
+            -- print("  -> Pressing Fire! (Counter now " .. level_select_counter .. ")")
+        else -- Counter is > 60, just do nothing, don't reset here
+             -- All commands remain 0
+             -- print("  -> Level selected, doing nothing.")
         end
+        -- Resetting the counter should ONLY happen in attract mode.
     elseif is_attract_mode then -- Attract Mode
-        -- DEBUG: Print frame and modulo check
         local should_press_start = (game_state.frame_counter % 50 == 0)
         final_p1_start_cmd = should_press_start and 1 or 0
-        final_fire_cmd, final_zap_cmd, final_spinner_cmd = 0, 0, 0
+        -- Fire, Zap, Spinner remain 0
+
+        -- DEBUG: Log counter reset
+        -- if level_select_counter ~= 0 then
+        --    print("[DEBUG Attract] Resetting level_select_counter from " .. level_select_counter .. " to 0")
+        -- end
         level_select_counter = 0 -- Reset level select counter here
 
+    elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x20 then -- Normal Play or Tube Zoom
+        -- Use AI commands stored in player_state
+        final_fire_cmd = player_state.fire_commanded
+        final_zap_cmd = player_state.zap_commanded
+        final_spinner_cmd = player_state.spinner_commanded
+        -- Start remains 0
+    else
+        -- Unknown state, all commands default to 0
+        print(string.format("[WARN] Unknown game state 0x%02X encountered in determine_final_actions", game_state.gamestate))
     end
-
-    -- Apply the final determined actions -- REMOVED FROM HERE
-    -- ctrl_instance:apply_action(final_fire, final_zap, final_spinner, final_p1_start_cmd, memory)
 
     return final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd
 end
@@ -490,7 +515,10 @@ local function frame_callback()
     -- Determine final action based on AI input and game state
     local final_fire, final_zap, final_spinner, final_p1_start = determine_final_actions()
 
-    -- print("Applying actions to controls")
+    -- DEBUG: Print final commands before applying
+    -- print(string.format("[DEBUG Final Apply] Frame=%d, State=0x%02X, Fire=%d, Zap=%d, Spin=%d, Start=%d",
+    --    game_state.frame_counter, game_state.gamestate, final_fire, final_zap, final_spinner, final_p1_start))
+
     -- Apply actions to controls
     controls:apply_action(final_fire, final_zap, final_spinner, final_p1_start, mem)
 

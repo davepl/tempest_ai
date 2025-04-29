@@ -286,7 +286,6 @@ local function find_nearest_constrained_safe_segment(start_seg, enemies_state, i
     end
 
     -- Fallback: If no segment satisfies both, return the simple nearest safe segment
-    print(string.format("[WARN Constrained Search] No segment found safe AND >=%d from constraint %d. Falling back to original target %d.", SAFE_DISTANCE, constraint_seg, start_seg))
     return start_seg -- NEW FALLBACK: Prefer original unsafe target over potentially worse simple safe target
 end
 
@@ -451,19 +450,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         -- ** General Danger Lane Check (Lower priority than Pulsar) **
         -- Apply only if Pulsar override didn't happen AND the proposed target requires moving
         if not pulsar_override_active and final_target_seg ~= player_abs_seg and M.is_danger_lane(final_target_seg, enemies_state) then
-            print(string.format("[Danger Override] Proposed target %d unsafe, finding nearest safe.", final_target_seg))
-            -- Determine if original decision was top-rail avoid/midpoint needing constraint
-            local constraint_seg = nil
-            if target_calculated then -- Was a top-rail case
-                if enemy_right_exists and not enemy_left_exists then constraint_seg = nr_seg
-                elseif enemy_left_exists and not enemy_right_exists then constraint_seg = nl_seg end
-            end
-
-            if constraint_seg then
-                 final_target_seg = find_nearest_constrained_safe_segment(final_target_seg, enemies_state, is_open, constraint_seg, abs_to_rel_func)
-            else -- Midpoint or Hunt target was unsafe
-                 final_target_seg = find_nearest_safe_segment(final_target_seg, enemies_state, is_open)
-            end
+            final_target_seg = find_nearest_safe_segment(final_target_seg, enemies_state, is_open)
             final_fire_priority = AVOID_FIRE_PRIORITY
         end
 
