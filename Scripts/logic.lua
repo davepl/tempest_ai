@@ -496,9 +496,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         -- Reward matching the expert policy on when to fire
         if (player_state.fire_commanded == 1 and enemies_state.nearest_enemy_should_fire == 1) then 
-            reward = reward + 200 
-        else
-            reward = reward - 200
+            reward = reward + 25 
         end
 
         -- Reward staying away from danger lanes
