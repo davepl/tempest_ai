@@ -716,7 +716,7 @@ function M.EnemiesState:new()
         self.enemy_shot_segments[i] = INVALID_SEGMENT
         self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
     end
-    for i = 1, 64 do
+     for i = 1, 64 do
         self.pending_vid[i] = 0
         self.pending_seg[i] = INVALID_SEGMENT
     end

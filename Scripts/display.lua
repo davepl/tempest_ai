@@ -33,7 +33,7 @@ local function format_multi_column_section(title, metrics_list, num_cols, col_co
     local width = 80 -- Adjusted width for standard terminal
     local title_padding = math.floor((width - #title - 4) / 2)
     local separator = string.rep("-", width)
-    local result = string.format("%s--[ %s ]%s\\n", string.rep("-", title_padding), title, string.rep("-", width - title_padding - #title - 4))
+    local result = string.format("%s--[ %s ]%s\n", string.rep("-", title_padding), title, string.rep("-", width - title_padding - #title - 4))
 
     -- Pre-calculate column format strings and total width
     local col_formats = {}
@@ -41,7 +41,7 @@ local function format_multi_column_section(title, metrics_list, num_cols, col_co
     for i = 1, num_cols do
         local cfg = col_config[i]
         -- Format: Left-aligned label (width cfg.label), Right-aligned value (width cfg.value)
-        col_formats[i] = string.format("%%-%ds : %%ds", cfg.label, cfg.value)
+        col_formats[i] = "%-" .. cfg.label .. "s : %" .. cfg.value .. "s"
         total_line_width = total_line_width + cfg.label + 3 + cfg.value -- label + " : " + value
     end
     total_line_width = total_line_width + (num_cols - 1) * 2 -- Add "  " padding between columns
@@ -66,21 +66,21 @@ local function format_multi_column_section(title, metrics_list, num_cols, col_co
             else
                 -- Add padding if last row is not full for this column
                 table.insert(line_parts, string.rep(" ", col_width))
-            end
+    end
         end
         -- Join columns with "  " padding and add to result
-        result = result .. table.concat(line_parts, "  ") .. "\\n"
+        result = result .. table.concat(line_parts, "  ") .. "\n"
     end
 
     -- Add padding line to ensure previous content is overwritten if needed (though fixed widths should handle it)
-    -- result = result .. string.rep(" ", 80) .. "\\n"
+    -- result = result .. string.rep(" ", 80) .. "\n"
 
-    return result .. separator .. "\\n"
+    return result .. separator .. "\n"
 end
 
 -- Function to move the cursor to a specific row (using ANSI escape code)
 local function move_cursor_to_row(row)
-    io.write(string.format("\\027[%d;1H", row)) -- Use 1H for column 1
+    io.write(string.format("\027[%d;1H", row)) -- Use 1H for column 1
 end
 
 -- Main display update function (exported as M.update)
@@ -88,7 +88,7 @@ end
 function M.update(status_message, game_state, level_state, player_state, enemies_state, num_values, last_reward) -- Note: Original didn't pass total_bytes_sent
 
     if is_first_display then
-        io.write("\\027[2J") -- ANSI code to clear screen
+        io.write("\027[2J") -- ANSI code to clear screen
         is_first_display = false
     end
 
@@ -142,8 +142,8 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         shots_pos_str = shots_pos_str .. string.format(" %02X", player_state.shot_positions[i])
         shots_seg_str = shots_seg_str .. " " .. format_segment(player_state.shot_segments[i])
     end
-    display_str = display_str .. string.format("%-16s:%s\\n", "Player Shots Pos", shots_pos_str)
-    display_str = display_str .. string.format("%-16s:%s\\n\\n", "Player Shots Seg", shots_seg_str)
+    display_str = display_str .. string.format("%-16s:%s\n", "Player Shots Pos", shots_pos_str)
+    display_str = display_str .. string.format("%-16s:%s\n\n", "Player Shots Seg", shots_seg_str)
 
     -- Level State Section (Keep single column for now or make 2-col?)
     -- Let's keep it simpler for now.
@@ -157,7 +157,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
 
     local spike_heights_str = ""
     for i = 0, 15 do spike_heights_str = spike_heights_str .. string.format("%02X ", level_state.spike_heights[i] or 0) end
-    display_str = display_str .. string.format("%-16s: %s\\n\\n", "Spike Heights", spike_heights_str)
+    display_str = display_str .. string.format("%-16s: %s\n\n", "Spike Heights", spike_heights_str)
 
     -- Enemies State Section (List format for multi-column)
     local enemies_metrics_list = {
@@ -183,8 +183,8 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     -- Enemy Slots Details (Keep multi-line format for clarity)
     local enemy_details_title = "--[ Enemy Slots (1-7) ]"
     local title_pad_len = math.floor((80 - #enemy_details_title) / 2)
-    display_str = display_str .. string.rep("-", title_pad_len) .. enemy_details_title .. string.rep("-", 80 - title_pad_len - #enemy_details_title) .. "\\n"
-    local enemy_details = { "Slot: ", "Type: ", "State:", "AbsSeg:", "RelSeg:", "Depth:" }
+    display_str = display_str .. string.rep("-", title_pad_len) .. enemy_details_title .. string.rep("-", 80 - title_pad_len - #enemy_details_title) .. "\n"
+    local enemy_details = { "Slot: ", "Type:  ", "State: ", "AbsSeg:", "RelSeg:", "Depth:   " }
     local field_width = 6 -- Adjusted width for enemy details columns
     for i = 1, 7 do
         enemy_details[1] = enemy_details[1] .. string.format(" %" .. field_width .. "d", i)
@@ -198,7 +198,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         -- Pad depth to match field_width approx
         enemy_details[6] = enemy_details[6] .. string.rep(" ", field_width - 4)
     end
-    display_str = display_str .. table.concat(enemy_details, "\\n") .. "\\n" .. string.rep("-", 80) .. "\\n" -- Separator after
+    display_str = display_str .. table.concat(enemy_details, "\n") .. "\n" .. string.rep("-", 80) .. "\n" -- Separator after
 
     -- Enemy Shots Details (Keep as is)
     local e_shots_pos_str = ""
@@ -207,8 +207,8 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         e_shots_pos_str = e_shots_pos_str .. string.format(" %02X ", enemies_state.shot_positions[i])
         e_shots_seg_str = e_shots_seg_str .. " " .. format_segment(enemies_state.enemy_shot_segments[i])
     end
-    display_str = display_str .. string.format("%-16s:%s\\n", "Enemy Shots Pos", e_shots_pos_str)
-    display_str = display_str .. string.format("%-16s:%s\\n\\n", "Enemy Shots Seg", e_shots_seg_str)
+    display_str = display_str .. string.format("%-16s:%s\n", "Enemy Shots Pos", e_shots_pos_str)
+    display_str = display_str .. string.format("%-16s:%s\n\n", "Enemy Shots Seg", e_shots_seg_str)
 
     -- More Enemy Info Details (Keep as is)
     local more_info_str = ""
@@ -220,12 +220,12 @@ function M.update(status_message, game_state, level_state, player_state, enemies
             more_info_str = more_info_str .. " --"
         end
     end
-    display_str = display_str .. string.format("%-16s:%s\\n\\n", "More Enemy Info", more_info_str)
+    display_str = display_str .. string.format("%-16s:%s\n\n", "More Enemy Info", more_info_str)
 
     -- Charging Fuseballs (Keep as is)
     local charging_fuseball_str = {}
     for i = 1, 16 do table.insert(charging_fuseball_str, enemies_state.charging_fuseball_segments[i] == 1 and "*" or "-") end
-    display_str = display_str .. string.format("%-16s: %s\\n\\n", "Fuseball Chrg", table.concat(charging_fuseball_str, " "))
+    display_str = display_str .. string.format("%-16s: %s\n\n", "Fuseball Chrg", table.concat(charging_fuseball_str, " "))
 
     -- Pending Data (Keep as is, maybe shorten label)
     local pending_vid_str = ""
@@ -234,8 +234,8 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         pending_vid_str = pending_vid_str .. string.format("%02X ", enemies_state.pending_vid[i])
         pending_seg_str = pending_seg_str .. " " .. format_segment(enemies_state.pending_seg[i])
     end
-    display_str = display_str .. string.format("%-16s: %s...\\n", "Pending VID", pending_vid_str)
-    display_str = display_str .. string.format("%-16s: %s...\\n", "Pending SEG", pending_seg_str)
+    display_str = display_str .. string.format("%-16s: %s...\n", "Pending VID", pending_vid_str)
+    display_str = display_str .. string.format("%-16s: %s...\n", "Pending SEG", pending_seg_str)
 
     -- Add padding to overwrite previous longer lines at the end
     display_str = display_str .. string.rep(" ", 80 * 3) -- Add blank lines to clear potential leftover lines
