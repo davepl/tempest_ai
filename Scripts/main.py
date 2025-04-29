@@ -91,7 +91,6 @@ def main():
         gamma=RL_CONFIG.gamma,
         epsilon=RL_CONFIG.epsilon,
         epsilon_min=RL_CONFIG.epsilon_min,
-        epsilon_decay=RL_CONFIG.epsilon_decay,
         memory_size=RL_CONFIG.memory_size,
         batch_size=RL_CONFIG.batch_size
     )

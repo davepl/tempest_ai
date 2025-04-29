@@ -82,6 +82,7 @@ class SocketServer:
                         'address': client_address,
                         'last_state': None,
                         'last_action_idx': None,
+                        'last_action_source': None,
                         'total_reward': 0,
                         'was_done': False,
                         'episode_dqn_reward': 0,
@@ -363,12 +364,13 @@ class SocketServer:
                         # Track rewards
                         state['total_reward'] = state.get('total_reward', 0) + frame.reward
 
-                        # Track which system's rewards
-                        if hasattr(metrics, 'last_action_source'):
-                            if metrics.last_action_source == "expert":
-                                state['episode_expert_reward'] = state.get('episode_expert_reward', 0) + frame.reward
-                            else:
-                                state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0) + frame.reward
+                        # Track which system's rewards based on the *previous* action source
+                        prev_action_source = state.get('last_action_source')
+                        if prev_action_source == "dqn":
+                            state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0) + frame.reward
+                        elif prev_action_source == "expert":
+                            state['episode_expert_reward'] = state.get('episode_expert_reward', 0) + frame.reward
+                        # If prev_action_source is None or unknown, we don't add to either specific reward accumulator
                     
                     # Handle episode completion
                     if frame.done:
@@ -410,30 +412,46 @@ class SocketServer:
                     # Decide between expert system and DQN
                     action_idx = None # Initialize action_idx
                     fire, zap, spinner = 0, 0, 0.0 # Default actions
+                    action_source = "unknown" # Track source for this frame
 
                     # Ensure agent exists before deciding action
                     if hasattr(self, 'agent') and self.agent:
                         if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
                             # Use expert system
                             fire, zap, spinner = get_expert_action(
-                                frame.enemy_seg, frame.player_seg, frame.open_level
+                                frame.enemy_seg,
+                                frame.player_seg,
+                                frame.open_level,
+                                frame.expert_fire,
+                                frame.expert_zap
                             )
                             self.metrics.increment_guided_count()
-                            self.metrics.update_action_source("expert")
+                            action_source = "expert"
                             action_idx = expert_action_to_index(fire, zap, spinner)
                         else:
                             # Use DQN with current epsilon
+                            start_time = time.perf_counter()
                             action_idx = self.agent.act(frame.state, self.metrics.get_epsilon())
+                            end_time = time.perf_counter()
+                            inference_time = end_time - start_time
+                            
+                            # Update inference metrics
+                            with self.metrics.lock:
+                                self.metrics.total_inference_time += inference_time
+                                self.metrics.total_inference_requests += 1
+                                
                             fire, zap, spinner = ACTION_MAPPING[action_idx]
-                            self.metrics.update_action_source("dqn")
+                            action_source = "dqn"
                     else:
                          print(f"Client {client_id}: Agent not available for action generation.")
                          # Keep default action (0,0,0)
+                         action_source = "none" # No action generated
 
                     # Store state and action for next iteration (only if action was generated)
                     if action_idx is not None:
                         state['last_state'] = frame.state
                         state['last_action_idx'] = action_idx
+                        state['last_action_source'] = action_source # Store the source with the state
 
                     # Send action to game
                     game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
