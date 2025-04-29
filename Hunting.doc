@@ -1,0 +1,23 @@
+Shooting priority begins at 4
+
+A danger lane is defined as a segment where a pulsar exists and pulsing >E0, or where an enemy is at depth 0x20 or less (but not 0).  Or if a shot is at depth 0x30 or less
+
+When hunting the process begins in lane player_abs_segment and expands outwards one lane at a time.  So if spinner is at 5, it will search 4/6, 3/7, 2/8, 1/9, -/10, -/11, etc
+If the current lane is a danger lane, we move to safety with shooting priority 8
+else If the current player_abs_segment contains an enemy, we stay and shoot
+else If the current segment does not contain an enemy, then we expand the search one step at a time
+
+    - For each segment current-X and current+X for X=0-15, where segment is a valid result (0-15), we look at the left lane and the right lane
+    - If we hit a danger lane in our search, we ignore this segment and abandon FURTHER searching in this direction (left or right)
+    - When we look one segment left, if target exists, and lane is safe, then we target the left lane with priority 6.  Then same for right
+    - If no target but no danger, and current lane is dangerous, we target the safe lane
+    - Our search expands outwards from the current segment, looking only at valid segments
+
+When looking for targets in a lane, the priority is pulsar, flipper, tanker, fuseball, spiker, nothing (where nothing is safety lane)
+
+Once a segment to move to is selected, we look at the priority.  If the priority is greater than the current shot count, we flipper
+
+So, if there is danger in the current lane, the spinner seeks the first safe segment it can find in its expanding search.
+If it finds a safe lane but no target, it remembers the safe lane
+If it finds a safe target, it targets that lane
+

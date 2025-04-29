@@ -19,6 +19,9 @@ from collections import deque
 # Global flags
 IS_INTERACTIVE = sys.stdin.isatty()
 
+# Flag to control metric reset on load
+RESET_METRICS = False # Set to True to ignore saved epsilon/expert ratio
+
 # Directory paths
 MODEL_DIR = "models"
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
@@ -30,7 +33,7 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 299
-    expert_ratio_start: float = 0.75
+    expert_ratio_start: float = 1.0
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.999
     expert_ratio_decay_steps: int = 10000
@@ -45,19 +48,20 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 512
+    batch_size: int = 1024
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_min: float = 0.001
-    epsilon_decay: int = 217147
+    epsilon_decay_factor: float = 0.9969 # Multiplicative factor per step (Adjusted for ~15M frames)
+    epsilon_decay_steps: int = 10000   # Frames per decay step
     update_target_every: int = 500
     learning_rate: float = 0.001
     memory_size: int = 200000
     save_interval: int = 50000
     train_freq: int = 4
-    target_update: int = 20000
+    target_update: int = 10000
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -73,8 +77,9 @@ class MetricsData:
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = 1.0
-    expert_ratio: float = 0.75
+    expert_ratio: float = 1.0
     last_decay_step: int = 0
+    last_epsilon_decay_step: int = 0 # Added tracker for epsilon decay
     enemy_seg: int = -1
     open_level: bool = False
     override_expert: bool = False
@@ -86,6 +91,8 @@ class MetricsData:
     fps: float = 0.0
     client_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    total_inference_time: float = 0.0
+    total_inference_requests: int = 0
     
     def update_frame_count(self):
         """Update frame count and FPS tracking"""

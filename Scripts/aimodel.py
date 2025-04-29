@@ -62,6 +62,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure
 import socket
 import traceback
+from torch.nn import SmoothL1Loss # Import SmoothL1Loss
 
 # Platform-specific imports for KeyboardHandler
 import sys
@@ -96,7 +97,8 @@ from config import (
     ACTION_MAPPING,
     metrics as config_metrics,
     ServerConfigData,
-    RLConfigData
+    RLConfigData,
+    RESET_METRICS
 )
 
 # Suppress warnings
@@ -128,6 +130,8 @@ class FrameData:
     enemy_seg: int
     player_seg: int
     open_level: bool
+    expert_fire: bool  # Added: Expert system fire recommendation
+    expert_zap: bool   # Added: Expert system zap recommendation
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -142,7 +146,9 @@ class FrameData:
             save_signal=data["save_signal"],
             enemy_seg=data["enemy_seg"],
             player_seg=data["player_seg"],
-            open_level=data["open_level"]
+            open_level=data["open_level"],
+            expert_fire=data["expert_fire"],
+            expert_zap=data["expert_zap"]
         )
 
 # Configuration constants
@@ -189,21 +195,25 @@ class DQN(nn.Module):
     """Deep Q-Network model."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 256) # Input -> Hidden 1 (256)
-        self.fc2 = nn.Linear(256, 128)        # Hidden 1 -> Hidden 2 (128)
-        self.fc3 = nn.Linear(128, 64)         # Hidden 2 -> Hidden 3 (64)
-        self.out = nn.Linear(64, action_size) # Hidden 3 -> Output
+        self.fc1 = nn.Linear(state_size, 768) 
+        self.fc2 = nn.Linear(768, 512)  
+        self.fc3 = nn.Linear(512, 256)        
+        self.fc4 = nn.Linear(256, 128)        
+        self.fc5 = nn.Linear(128, 64)         
+        self.out = nn.Linear(64, action_size) 
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x)) # Added ReLU for fc3 output
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))      
+        x = F.relu(self.fc5(x))
         return self.out(x)
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
     def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma, 
-                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, epsilon_decay=RL_CONFIG.epsilon_decay, 
+                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, 
                  memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
         self.state_size = state_size
         self.action_size = action_size
@@ -268,7 +278,8 @@ class DQNAgent:
             Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
         
         # Compute loss and perform optimization
-        loss = F.mse_loss(Q_expected, Q_targets)
+        criterion = SmoothL1Loss()
+        loss = criterion(Q_expected, Q_targets)
         self.optimizer.zero_grad()
         loss.backward() 
         self.optimizer.step() 
@@ -322,6 +333,12 @@ class DQNAgent:
         
         # Proceed with save if forced or interval elapsed
         try:
+            # Determine the actual expert ratio to save (not the override value)
+            if metrics.expert_mode or metrics.override_expert:
+                ratio_to_save = metrics.saved_expert_ratio
+            else:
+                ratio_to_save = metrics.expert_ratio
+
             torch.save({
                 'policy_state_dict': self.qnetwork_local.state_dict(),
                 'target_state_dict': self.qnetwork_target.state_dict(),
@@ -329,8 +346,9 @@ class DQNAgent:
                 'memory_size': len(self.memory),
                 'epsilon': metrics.epsilon,
                 'frame_count': metrics.frame_count,
-                'expert_ratio': metrics.expert_ratio,
-                'last_decay_step': metrics.last_decay_step
+                'expert_ratio': ratio_to_save, # Save the determined ratio
+                'last_decay_step': metrics.last_decay_step,
+                'last_epsilon_decay_step': metrics.last_epsilon_decay_step
             }, filename)
             
             # Update last save time ONLY on successful save
@@ -338,7 +356,7 @@ class DQNAgent:
             
             # Only print on forced exit/shutdown saves
             if is_forced_save:
-                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {metrics.expert_ratio:.2f})")
+                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {ratio_to_save:.2f})")
         except Exception as e:
             print(f"ERROR saving model to {filename}: {e}")
 
@@ -353,9 +371,19 @@ class DQNAgent:
                 
                 # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
-                metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
-                metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
-                metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
+                # Load or reset metrics based on RESET_METRICS flag from config
+                if RESET_METRICS:
+                    print("RESET_METRICS flag is True. Resetting epsilon/expert_ratio.")
+                    metrics.epsilon = RL_CONFIG.epsilon_start
+                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                    metrics.last_decay_step = 0
+                    metrics.last_epsilon_decay_step = 0 # Reset epsilon step tracker
+                else:
+                    # Load metrics from checkpoint
+                    metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
+                    metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
+                    metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
+                    metrics.last_epsilon_decay_step = checkpoint.get('last_epsilon_decay_step', 0) # Load epsilon step tracker
                                 
                 print(f"Loaded model from {filename}")
                 print(f"  - Resuming from frame: {metrics.frame_count}")
@@ -602,7 +630,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">HdBBBHHHBBBhBhBB"  # Updated to include both score components
+        format_str = ">HdBBBHHHBBBhBhBBBB"  # Updated format string
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
@@ -611,7 +639,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             
         values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
-        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open = values
+        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open, \
+        expert_fire, expert_zap = values  # Added expert recommendations
         
         # Combine score components
         score = (score_high * 65536) + score_low
@@ -636,7 +665,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         if len(state_values) != num_values:
             print(f"ERROR: Expected {num_values} state values but got {len(state_values)}", flush=True)
             sys.exit(1)
-                
+        
         frame_data = FrameData(
             state=state,
             reward=reward,
@@ -647,7 +676,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             save_signal=bool(save_signal),
             enemy_seg=nearest_enemy,
             player_seg=player_seg,
-            open_level=bool(is_open)
+            open_level=bool(is_open),
+            expert_fire=bool(expert_fire),
+            expert_zap=bool(expert_zap)
         )
         
         return frame_data
@@ -697,44 +728,53 @@ def display_metrics_row(agent, kb=None):
     )
     print_with_terminal_restore(kb, row)
 
-def get_expert_action(enemy_seg, player_seg, is_open_level):
-    """Calculate expert-guided action based on game state"""
- 
-    if enemy_seg == -1:
-        return 1, 0, 0  # No enemies, might as well fire
-
-    if enemy_seg == player_seg:
-        return 1, 0, 0  # Fire when aligned
+def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
+    """Calculate expert-guided action based on game state and Lua recommendations"""
+    # Check for INVALID_SEGMENT (-32768) which indicates no valid target (like during tube transitions)
+    if enemy_seg == -32768:  # INVALID_SEGMENT
+        return expert_fire, expert_zap, 0  # Use Lua's recommendations with no movement
         
-    # Calculate movement based on level type
+    # Convert absolute segments to relative distance
     if is_open_level:
-        distance = abs(enemy_seg - player_seg)
-        intensity = min(0.9, 0.1 + (distance * 0.25))  # Lower base intensity
-        spinner = -intensity if enemy_seg > player_seg else intensity
+        # Open level: direct distance calculation (-15 to +15)
+        relative_dist = enemy_seg - player_seg
     else:
-        # Calculate shortest path with wraparound
+        # Closed level: find shortest path around the circle (-7 to +8)
         clockwise = (enemy_seg - player_seg) % 16
         counter = (player_seg - enemy_seg) % 16
-        min_dist = min(clockwise, counter)
-        intensity = min(0.9, 0.1 + (min_dist * 0.25))  # Lower base intensity
-        spinner = -intensity if clockwise < counter else intensity
+        if clockwise <= 8:
+            relative_dist = clockwise  # Move clockwise
+        else:
+            relative_dist = -counter  # Move counter-clockwise
+
+    if relative_dist == 0:
+        return expert_fire, expert_zap, 0  # Use Lua's recommendations when aligned
+        
+    # Calculate intensity based on distance
+    distance = abs(relative_dist)
+    intensity = min(0.9, 0.3 + (distance * 0.05))  # Match Lua intensity calculation
     
-    return 1, 0, spinner  # Fire while moving
+    # For positive relative_dist (need to move clockwise), use negative spinner
+    spinner = -intensity if relative_dist > 0 else intensity
+    
+    # Always use Lua's recommendations for fire/zap
+    return expert_fire, expert_zap, spinner
 
 def expert_action_to_index(fire, zap, spinner):
     """Convert continuous expert actions to discrete action index"""
     if zap:
         return 14  # Special case for zap action
         
-    # Clamp spinner value between -0.9 and 0.9
-    spinner_value = max(-0.9, min(0.9, spinner))
+    # Clamp spinner value between -0.3 and 0.3 to match ACTION_MAPPING
+    spinner_value = max(-0.3, min(0.3, spinner))
     
-    # Map spinner to 0-6 range
-    spinner_idx = int((spinner_value + 0.9) / 0.3)
-    spinner_idx = min(6, spinner_idx)  # Ensure we don't exceed valid range
+    # Map spinner to 0-6 range based on ACTION_MAPPING values
+    # -0.3 -> 0, -0.2 -> 1, -0.1 -> 2, 0.0 -> 3, 0.1 -> 4, 0.2 -> 5, 0.3 -> 6
+    spinner_idx = int((spinner_value + 0.3) / 0.1)
+    spinner_idx = min(6, max(0, spinner_idx))  # Ensure we don't exceed valid range
     
     # If firing, offset by 7 to get into the firing action range (7-13)
-    base_idx = 0 if not fire else 7
+    base_idx = 7 if fire else 0
     
     return base_idx + spinner_idx
 
@@ -744,10 +784,24 @@ def encode_action_to_game(fire, zap, spinner):
     return int(fire), int(zap), int(spinner_val)
 
 def decay_epsilon(frame_count):
-    """Calculate decayed exploration rate"""
-    return max(RL_CONFIG.epsilon_end, 
-               RL_CONFIG.epsilon_start * 
-               np.exp(-frame_count / RL_CONFIG.epsilon_decay))
+    """Calculate decayed exploration rate using step-based decay."""
+    step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
+
+    # Only decay if a new step interval is reached
+    if step_interval > metrics.last_epsilon_decay_step:
+        # Apply decay multiplicatively for the number of steps missed
+        num_steps_to_apply = step_interval - metrics.last_epsilon_decay_step
+        decay_multiplier = RL_CONFIG.epsilon_decay_factor ** num_steps_to_apply
+        metrics.epsilon *= decay_multiplier
+        
+        # Update the last step tracker
+        metrics.last_epsilon_decay_step = step_interval
+
+        # Ensure epsilon doesn't go below the minimum effective exploration rate
+        metrics.epsilon = max(RL_CONFIG.epsilon_end, metrics.epsilon)
+
+    # Always return the current epsilon value (which might have just been decayed)
+    return metrics.epsilon
 
 def decay_expert_ratio(current_step):
     """Update expert ratio based on 10,000 frame intervals"""
