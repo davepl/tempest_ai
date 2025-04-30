@@ -23,7 +23,7 @@ def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
     print("Starting stats reporter thread...")
     last_report = time.time()
-    report_interval = 10.0  # Report every 10 seconds
+    report_interval = 300.0  # Report every 300 seconds
     
     # Display the header once at the beginning
     display_metrics_header()
@@ -70,6 +70,9 @@ def keyboard_input_handler(agent, keyboard_handler):
                     display_metrics_row(agent, keyboard_handler)
                 elif key == 'e':
                     metrics.toggle_expert_mode(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == ' ':  # Handle spacebar
+                    print("Metrics snapshot requested...")
                     display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)
@@ -154,4 +157,4 @@ def main():
         print("Application shutdown complete")
 
 if __name__ == "__main__":
-    main() 
+    main()

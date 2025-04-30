@@ -21,7 +21,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 17
-local DISPLAY_UPDATE_INTERVAL = 0.02
+local DISPLAY_UPDATE_INTERVAL = 0.2 -- Changed from 0.02 to 0.2 to reduce update frequency by 10x
 local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
 local SOCKET_RETRY_WAIT_S     = 0.01
@@ -48,6 +48,38 @@ local frames_waited = 0
 -- FPS Calculation State
 local last_fps_time = os.time()
 local last_frame_counter_for_fps = 0
+
+-- Keyboard input handling
+local last_key_state = {}
+local force_display_update = false
+
+-- Function to check for keyboard input (non-blocking)
+local function check_keyboard_input()
+    -- Check if the keyboard input API is available
+    if not manager or not manager.machine or not manager.machine.ioport or not manager.machine.ioport.ports then
+        return -- No keyboard access
+    end
+    
+    local ports = manager.machine.ioport.ports
+    
+    -- Look for keyboard port
+    local keyboard_port = ports[":kbd"] or ports[":KEY0"] or ports[":KEY1"] or ports[":IN0"] or ports[":KEY"] or ports[":keyboard"]
+    if not keyboard_port then return end -- No keyboard port found
+    
+    -- Check for spacebar (most common key code)
+    for code, field in pairs(keyboard_port.fields) do
+        if code:find("SPACE") or code:find("Space") or code:find(" ") then
+            local current_state = field.pressed
+            -- Detect rising edge (key was up, now down)
+            if current_state and not last_key_state[code] then
+                -- Space bar pressed, trigger immediate display update
+                force_display_update = true
+                print("Spacebar pressed - forcing display update")
+            end
+            last_key_state[code] = current_state
+        end
+    end
+end
 
 -- Initialize MAME Interface (CPU and Memory)
 local function initialize_mame_interface()
@@ -470,9 +502,10 @@ end
 -- Update the console display if enabled and interval has passed
 local function update_display_if_needed(num_values_packed)
     local current_time_high_res = os.clock()
-    if SHOW_DISPLAY and (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL then
+    if SHOW_DISPLAY and ((current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL or force_display_update) then
         display.update("Running", game_state, level_state, player_state, enemies_state, num_values_packed, logic.getLastReward(), total_bytes_sent)
         last_display_update = current_time_high_res
+        force_display_update = false -- Reset the flag after update
     end
 end
 
@@ -497,6 +530,9 @@ local function frame_callback()
     frames_waited = frames_waited + 1
     if frames_waited <= frames_to_wait then return true end
     frames_waited = 0
+
+    -- Check for keyboard input
+    check_keyboard_input()
 
     -- Calculate FPS
     local current_time = os.time()

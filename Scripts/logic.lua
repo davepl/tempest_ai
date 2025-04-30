@@ -389,7 +389,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             else if nr_dist < SAFE_DISTANCE then proposed_target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16 else proposed_target_seg = player_abs_seg end end
         elseif enemy_left_exists then
              -- Case 3: Left Only
-            if is_open then proposed_target_seg = (nl_dist <= 1) and 15 or 14
+            if is_open then proposed_target_seg = (nl_dist <= 1) and 14 or 13
             else if nl_dist < SAFE_DISTANCE then proposed_target_seg = (nl_seg + SAFE_DISTANCE) % 16 else proposed_target_seg = player_abs_seg end end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
@@ -456,7 +456,36 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
         -- === Step 3: Final Return ===
         final_should_fire = final_fire_priority > shot_count
-        return final_target_seg, 0, final_should_fire, false
+
+        -- Final urgent firing check: Fire if enemy/shot is in our lane and closer than the spike
+        do
+            local player_segment = player_state.position & 0x0F
+            local spike_height = level_state.spike_heights[player_segment]
+            
+            -- Check for enemies in our lane (either no spike or closer than spike)
+            for i = 1, 7 do
+                if enemies_state.enemy_abs_segments[i] == player_segment and 
+                   enemies_state.enemy_depths[i] > 0 and
+                   enemies_state.enemy_depths[i] < 0x40 then
+                    final_should_fire = true
+                    break
+                end
+            end
+            
+            -- Check shots if still not firing
+            if not final_should_fire then
+                for i = 1, 4 do
+                    if enemies_state.enemy_shot_abs_segments[i] == player_segment and 
+                       enemies_state.shot_positions[i] > 0 and
+                       enemies_state.shot_positions[i] < 0x40 then
+                        final_should_fire = true
+                        break
+                    end
+                end
+            end
+        end
+    
+        return final_target_seg, 0, final_should_fire, false        
 
     else -- Other game states
         return player_abs_seg, 0, false, false
