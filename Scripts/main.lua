@@ -519,7 +519,9 @@ local function apply_overrides(memory)
     memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
     memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
 
-    memory:write_direct_u8(0x0126, 17) -- Set level to 1-7
+    if (memory:read_u8(0x126) < 17) then
+        memory:write_direct_u8(0x0126, 17) -- Set level to 1-7
+    end
     -- NOP out the start level check
     -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
     -- memory:write_direct_u8(0x90CE, 0xEA) -- NOP
