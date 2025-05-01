@@ -32,7 +32,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 306
+    params_count: int = 338
     expert_ratio_start: float = 1.0
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.999
@@ -246,13 +246,3 @@ ACTION_MAPPING = {
 
 # Create instances of config classes
 metrics = MetricsData()
-
-# # Import print_with_terminal_restore from metrics_display to avoid circular imports
-# # # DEF print_with_terminal_restore(kb_handler, *args, **kwargs):
-# # #     \"\"\"Print with terminal restore if in interactive mode\"\"\"
-# # #     if IS_INTERACTIVE and kb_handler:
-# # #         # Import here to avoid circular imports
-# # #         from metrics_display import print_with_terminal_restore as _print
-# # #         _print(*args, **kwargs)
-# # #     else:
-# # #         print(*args, **kwargs) 

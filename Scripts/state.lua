@@ -266,13 +266,13 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
-                local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
+                local rel_dist = abs_to_rel_func(player_abs_segment, initial_target_seg_abs, is_open)
                 should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
@@ -687,6 +687,8 @@ function M.EnemiesState:new()
 
     -- Charging Fuseball Tracking (Size 16, indexed 1-16 for abs seg 0-15)
     self.charging_fuseball_segments = {} -- 1 if charging in segment, 0 otherwise
+    self.pulsar_rotation_segments = {}   -- Table for Pulsar rotation segments (1-16)
+    self.pulsar_depth_segments = {}   -- Table for Pulsar depth per segment (1-16)
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -722,6 +724,8 @@ function M.EnemiesState:new()
     end
     for i = 1, 16 do
         self.charging_fuseball_segments[i] = 0
+        self.pulsar_rotation_segments[i] = 0
+        self.pulsar_depth_segments[i] = 0
     end
     for i = 1, 7 do
         self.more_enemy_info[i] = 0
@@ -809,90 +813,32 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
     -- Calculate charging Fuseball segments (reset first)
     for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
+    -- Reset pulsar_rotation_segments
+    for i = 1, 16 do self.pulsar_rotation_segments[i] = 0 end
+    for i = 1, 16 do self.pulsar_depth_segments[i] = 0 end
     for i = 1, 7 do
-        -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
-        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
-            local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
+        -- If it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
+        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then
+            local abs_segment_idx = self.enemy_abs_segments[i] + 1
             if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
-                 self.charging_fuseball_segments[abs_segment_idx] = 1
+                 self.charging_fuseball_segments[abs_segment_idx] = self.enemy_depths[i] -- Store depth, not just 1
             end
         end
-    end
 
-    -- Read and process enemy shots (1-4)
-    for i = 1, 4 do
-        -- Read shot depth/position first
-        self.shot_positions[i] = mem:read_u8(0x02DB + i - 1) -- EnemyShotPositions ($02DB-$02DE)
-
-        -- If shot position is 0, it's inactive
-        if self.shot_positions[i] == 0 then
-            self.enemy_shot_segments[i] = INVALID_SEGMENT
-            self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
-        else
-            -- Read shot segment byte
-            local abs_segment_raw = mem:read_u8(0x02B5 + i - 1) -- EnemyShotSegments ($02B5-$02B8)
-             -- Also inactive if segment byte is 0
-            if abs_segment_raw == 0 then
-                self.enemy_shot_segments[i] = INVALID_SEGMENT
-                self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
-                self.shot_positions[i] = 0 -- Ensure position is zeroed
-            else
-                local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
-                self.enemy_shot_abs_segments[i] = abs_segment
-                self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
+        -- After updating more_enemy_info[i]:
+        -- Pulsar lane logic
+        if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+            local abs_segment_idx = self.enemy_abs_segments[i] + 1
+            if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
+                local info = self.more_enemy_info[i] or 0
+                if (info & 0x80) ~= 0 then
+                    self.pulsar_rotation_segments[abs_segment_idx] = info & 0x7F
+                else
+                    self.pulsar_rotation_segments[abs_segment_idx] = 0
+                end
+                self.pulsar_depth_segments[abs_segment_idx] = self.enemy_depths[i]
             end
         end
-    end
-
-    -- Read pending_seg (64 bytes starting at 0x0203), store relative
-    for i = 1, 64 do
-        local abs_segment_raw = mem:read_u8(0x0203 + i - 1)
-        if abs_segment_raw == 0 then
-            self.pending_seg[i] = INVALID_SEGMENT -- Not active, use sentinel
-        else
-            local segment = abs_segment_raw & 0x0F    -- Mask to ensure 0-15
-            self.pending_seg[i] = abs_to_rel_func(player_abs_segment, segment, is_open)
-        end
-    end
-
-    -- Read pending_vid (64 bytes starting at 0x0243)
-    for i = 1, 64 do
-        self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
-    end
-
-    -- === Calculate and store nearest enemy segment and engineered features ===
-    -- Reset zap recommendation before calculation
-    self.nearest_enemy_should_zap = false
-    -- Use the internal helper function find_target_segment, passing the calculated is_open
-    local nearest_abs_seg, nearest_depth, should_fire_target, should_zap_target = find_target_segment(game_state, player_state, level_state, self, abs_to_rel_func, is_open)
-
-    -- Store results in the object's fields
-    self.nearest_enemy_abs_seg_internal = nearest_abs_seg -- Store absolute segment (-1 if none)
-    self.nearest_enemy_should_fire = should_fire_target   -- Store firing recommendation
-    self.nearest_enemy_should_zap = should_zap_target     -- Store zapping recommendation
-
-    -- Add debug print for hints
-    -- print(string.format("STATE HINTS DEBUG: Abs=%d, Fire=%s, Zap=%s", self.nearest_enemy_abs_seg_internal, tostring(self.nearest_enemy_should_fire), tostring(self.nearest_enemy_should_zap)))
-
-    if nearest_abs_seg == -1 then -- No target found
-        self.nearest_enemy_seg = INVALID_SEGMENT
-        self.is_aligned_with_nearest = 0.0
-        self.nearest_enemy_depth_raw = 255 -- Use max depth as sentinel
-        self.alignment_error_magnitude = 0.0
-    else -- Valid target found
-        -- Use the is_open calculated at the start of this function
-        local nearest_rel_seg = abs_to_rel_func(player_abs_segment, nearest_abs_seg, is_open)
-        self.nearest_enemy_seg = nearest_rel_seg     -- Store relative segment
-        self.nearest_enemy_depth_raw = nearest_depth -- Store raw depth
-
-        -- Calculate Is_Aligned
-        self.is_aligned_with_nearest = (nearest_rel_seg == 0) and 1.0 or 0.0
-
-        -- Calculate Alignment_Error_Magnitude (Normalized 0.0-1.0)
-        local error_abs = math.abs(nearest_rel_seg)
-        local max_error = is_open and 15.0 or 8.0 -- Max possible distance
-        self.alignment_error_magnitude = (error_abs > 0) and (error_abs / max_error) or 0.0
-        -- Scaling happens during packing
     end
 end
 
@@ -926,4 +872,4 @@ function M.EnemiesState:get_total_active()
 end
 
 -- Return the module table
-return M 
+return M

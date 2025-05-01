@@ -66,7 +66,7 @@ local function format_multi_column_section(title, metrics_list, num_cols, col_co
             else
                 -- Add padding if last row is not full for this column
                 table.insert(line_parts, string.rep(" ", col_width))
-    end
+            end
         end
         -- Join columns with "  " padding and add to result
         result = result .. table.concat(line_parts, "  ") .. "\n"
@@ -223,9 +223,40 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     display_str = display_str .. string.format("%-16s:%s\n\n", "More Enemy Info", more_info_str)
 
     -- Charging Fuseballs (Keep as is)
-    local charging_fuseball_str = {}
-    for i = 1, 16 do table.insert(charging_fuseball_str, enemies_state.charging_fuseball_segments[i] == 1 and "*" or "-") end
-    display_str = display_str .. string.format("%-16s: %s\n\n", "Fuseball Chrg", table.concat(charging_fuseball_str, " "))
+    local fuseball_str = {}
+    for i = 1, 16 do
+        local depth = enemies_state.charging_fuseball_segments[i] or 0
+        if depth == 0 then
+            table.insert(fuseball_str, "--")
+        else
+            table.insert(fuseball_str, string.format("%02X", depth))
+        end
+    end
+    display_str = display_str .. string.format("%-16s: %s\n", "Fuseball Chrg", table.concat(fuseball_str, " "))
+
+    -- Pulsar Rotations (NEW)
+    local pulsar_rot_str = {}
+    for i = 1, 16 do
+        local rot = enemies_state.pulsar_rotation_segments and enemies_state.pulsar_rotation_segments[i] or 0
+        if rot == 0 then
+            table.insert(pulsar_rot_str, "--")
+        else
+            table.insert(pulsar_rot_str, string.format("%02X", rot))
+        end
+    end
+    display_str = display_str .. string.format("%-16s: %s\n", "Pulsar Rot", table.concat(pulsar_rot_str, " "))
+
+    -- Pulsar Depths (NEW)
+    local pulsar_depth_str = {}
+    for i = 1, 16 do
+        local depth = enemies_state.pulsar_depth_segments and enemies_state.pulsar_depth_segments[i] or 0
+        if depth == 0 then
+            table.insert(pulsar_depth_str, "--")
+        else
+            table.insert(pulsar_depth_str, string.format("%02X", depth))
+        end
+    end
+    display_str = display_str .. string.format("%-16s: %s\n", "Pulsar Depth", table.concat(pulsar_depth_str, " "))
 
     -- Pending Data (Keep as is, maybe shorten label)
     local pending_vid_str = ""
@@ -245,4 +276,4 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     io.flush() -- Ensure output is written immediately
 end
 
-return M 
+return M

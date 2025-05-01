@@ -246,6 +246,10 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 4 do insert(data, es.enemy_shot_segments[i]) end
     -- Charging Fuseball flags (16)
     for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
+    -- Pulsar Rotation Segments (16)
+    for i = 1, 16 do insert(data, es.pulsar_rotation_segments[i]) end
+    -- Pulsar Depth Segments (16)
+    for i = 1, 16 do insert(data, es.pulsar_depth_segments[i]) end
     -- Pending Vid (64)
     for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
@@ -515,6 +519,7 @@ local function apply_overrides(memory)
     memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
     memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
 
+    memory:write_direct_u8(0x0126, 17) -- Set level to 1-7
     -- NOP out the start level check
     -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
     -- memory:write_direct_u8(0x90CE, 0xEA) -- NOP
