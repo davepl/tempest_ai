@@ -20,7 +20,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 -- Constants
 local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
-local START_LEVEL_MIN         = 17
+local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.2 -- Changed from 0.02 to 0.2 to reduce update frequency by 10x
 local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
@@ -519,8 +519,8 @@ local function apply_overrides(memory)
     memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
     memory:write_direct_u8(0xA592, 0xEA) -- NOP Copy Prot
 
-    if (memory:read_u8(0x126) < 17) then
-        memory:write_direct_u8(0x0126, 17) -- Set level to 1-7
+    if (memory:read_u8(0x126) < START_LEVEL_MIN) then
+        memory:write_direct_u8(0x0126, START_LEVEL_MIN) -- Set level to 1-7
     end
     -- NOP out the start level check
     -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
