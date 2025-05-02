@@ -1,19 +1,19 @@
-local state_defs = require("state") -- Assuming state.lua is in the same dir
+local helpers = require("helpers")
 
 -- Define enemy type constants (copy from main.lua)
-local ENEMY_TYPE_FLIPPER = 0
-local ENEMY_TYPE_PULSAR = 1
-local ENEMY_TYPE_TANKER = 2
-local ENEMY_TYPE_SPIKER = 3
-local ENEMY_TYPE_FUSEBALL = 4
+local ENEMY_TYPE_FLIPPER = helpers.ENEMY_TYPE_FLIPPER
+local ENEMY_TYPE_PULSAR = helpers.ENEMY_TYPE_PULSAR
+local ENEMY_TYPE_TANKER = helpers.ENEMY_TYPE_TANKER
+local ENEMY_TYPE_SPIKER = helpers.ENEMY_TYPE_SPIKER
+local ENEMY_TYPE_FUSEBALL = helpers.ENEMY_TYPE_FUSEBALL
 
 -- Define constants (copy from main.lua)
-local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
+local INVALID_SEGMENT = helpers.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local SAFE_DISTANCE = 1.0
-local FIRE_PRIO_LOW = 4
+local SAFE_DISTANCE = 0.5
+local FIRE_PRIO_LOW = 3
 local FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 4
 local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance
@@ -303,14 +303,14 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Default return values
     local proposed_target_seg = player_abs_seg
-    local proposed_fire_prio = 6 -- Default fire priority
+    local proposed_fire_prio = 3 -- Default fire priority
     local final_should_fire = false
 
     if game_state.gamestate == 0x20 then -- Tube Zoom
         proposed_target_seg, _, final_should_fire, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
         -- In tube zoom, fire priority isn't calculated the same way, should_fire is directly returned
         -- We will bypass the final Pulsar check for Tube Zoom state
-        return proposed_target_seg, 0, final_should_fire, false
+        return proposed_target_seg, 0, final_should_fire, false, false
 
     elseif game_state.gamestate == 0x04 then -- Normal Gameplay
         -- === Step 1: Determine proposed target based on Top Rail / Hunt ===
@@ -324,6 +324,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local nearest_flipper_seg = nil -- Specifically track nearest flipper
         local nearest_flipper_rel = nil
         local min_flipper_abs_rel = 100
+        local top_rail_enemy_count = 0 -- Count of top rail enemies
 
         for i = 1, 7 do
             local depth = enemies_state.enemy_depths[i]
@@ -334,23 +335,20 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     error(string.format("get_fractional_segment_for_enemy(%d) returned nil (abs=%s, more_info=%s)", i, tostring(enemies_state.enemy_abs_segments[i]), tostring(enemies_state.more_enemy_info and enemies_state.more_enemy_info[i] or 'nil')))
                 end
                 -- Ensure integer for all logic that expects an int (bitwise ops, array indices, etc)
-                local seg = math.floor(frac_seg + 0.5) -- round to nearest int for segment logic
+                local seg = math.floor(frac_seg)
                 local rel = abs_to_rel_func(player_abs_seg, frac_seg, is_open)
                 local abs_rel = math.abs(rel)
                 local core_type = enemies_state.enemy_core_type[i]
 
-                if abs_rel <= 1 then any_enemy_proximate = true end
+                if abs_rel <= SAFE_DISTANCE then any_enemy_proximate = true end
                 table.insert(top_rail_enemies, {seg = frac_seg, rel = rel, abs_rel = abs_rel, type = core_type})
+                top_rail_enemy_count = top_rail_enemy_count + 1
 
-                -- Print debug info with correct function call for fractional segment
                 local frac = frac_seg
-                local more_info = enemies_state.more_enemy_info and enemies_state.more_enemy_info[i] or 0
-                local more_info_val = more_info & 0x7F -- mask off $80
-                -- Update nearest overall left/right
                 if rel > 0 and abs_rel < nr_dist then nr_dist, nr_seg, enemy_right_exists = abs_rel, frac, true end
                 if rel < 0 and abs_rel < nl_dist then nl_dist, nl_seg, enemy_left_exists = abs_rel, frac, true end
 
-                -- Update nearest flipper specifically
+                -- Update nearest flipper/pulsar specifically
                 if core_type == ENEMY_TYPE_FLIPPER or core_type == ENEMY_TYPE_PULSAR then
                     if abs_rel < min_flipper_abs_rel then
                          min_flipper_abs_rel = abs_rel
@@ -360,6 +358,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 end
             end
         end
+        -- should_superzap is true if 3 or more top rail enemies
+        local should_superzap = (top_rail_enemy_count >= 3)
+
         -- === Step 1A: High Priority Flipper Avoidance ===
         if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
 
@@ -381,7 +382,6 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
 
         if enemy_left_exists and enemy_right_exists then
-            proposed_fire_prio = FIRE_PRIO_HIGH -- Both sides have enemies, higher fire priority
             -- Case 1: Both Sides - Find nearest threat, target inside or midpoint fallback
             local nearest_threat_seg, nearest_threat_rel, min_threat_abs_rel = nil, nil, 100
             for _, enemy in ipairs(top_rail_enemies) do
@@ -389,6 +389,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     if enemy.abs_rel < min_threat_abs_rel then min_threat_abs_rel, nearest_threat_seg, nearest_threat_rel = enemy.abs_rel, enemy.seg, enemy.rel end
                 end
             end
+            if nearest_threat_rel <= 1.0 then proposed_fire_prio = 8 end -- High priority if within 1.0 distance
             if nearest_threat_seg then
                 if nearest_threat_rel > 0 then proposed_target_seg = (nearest_threat_seg - 1 + 16) % 16
                 elseif nearest_threat_rel < 0 then proposed_target_seg = (nearest_threat_seg + 1 + 16) % 16
@@ -398,15 +399,27 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                  else local dist = (nr_seg - nl_seg + 16) % 16; proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16 end
             end
         elseif enemy_right_exists then
-            proposed_fire_prio = FIRE_PRIO_HIGH
             -- Case 2: Right Only
-            if is_open then proposed_target_seg = (nr_dist <= 1) and 0 or 1
-            else if nr_dist < 1 then proposed_target_seg = (nr_seg - 1 + 16) % 16 else proposed_target_seg = player_abs_seg end end
+            if (nr_dist <= 1.0) then proposed_fire_prio = 8 end
+            if is_open then 
+                proposed_target_seg = (nr_dist <= 1.0) and 0 or 1
+            else if nr_dist < 1 then 
+                proposed_target_seg = (nr_seg - 1 + 16) % 16 
+            else 
+                proposed_target_seg = player_abs_seg 
+            end 
+        end
         elseif enemy_left_exists then
-            proposed_fire_prio = FIRE_PRIO_HIGH
+            print("Left Only: " .. player_abs_seg .. " " .. nl_seg .. " " .. nl_dist)
              -- Case 3: Left Only
-            if is_open then proposed_target_seg = (nl_dist <= 1) and 14 or 13
-            else if nl_dist <= 1 then proposed_target_seg = (nl_seg + 1) % 16 else proposed_target_seg = player_abs_seg end end
+             if (nl_dist <= 1.0) then proposed_fire_prio = 8 end
+             if is_open then 
+                proposed_target_seg = (nl_dist <= 1.0) and 14 or 13
+             else 
+                if nl_dist <= 1 then 
+                    proposed_target_seg = (nl_seg + 1) % 16 
+                else 
+                    proposed_target_seg = player_abs_seg end end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
             if M.is_danger_lane(player_abs_seg, enemies_state) then
@@ -470,12 +483,34 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             final_fire_priority = AVOID_FIRE_PRIORITY
         end
 
+        -- Check for shallow enemy shots in the path before final pulsar check
+        if final_target_seg ~= player_abs_seg then
+            local original_proposed_target = final_target_seg
+            local relative_dist = abs_to_rel_func(player_abs_seg, original_proposed_target, is_open)
+            local dir = (relative_dist > 0) and 1 or -1
+            local steps = math.abs(relative_dist)
+            for d = 1, steps do
+                local check_seg = (player_abs_seg + dir * d + 16) % 16
+                for i = 1, 4 do
+                    if enemies_state.enemy_shot_abs_segments[i] == math.floor(check_seg + 0.5)
+                        and enemies_state.shot_positions[i] > 0
+                        and enemies_state.shot_positions[i] <= 0x40 then
+                        -- Found a shallow shot in the path, stop before entering
+                        final_target_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
+                        final_fire_priority = AVOID_FIRE_PRIORITY
+                        break
+                    end
+                end
+                if final_target_seg ~= original_proposed_target then break end
+            end
+        end
+
         -- === Step 3: Final Return ===
         final_should_fire = final_fire_priority > shot_count
-        return final_target_seg, 0, final_should_fire, false
+        return final_target_seg, 0, final_should_fire, false, should_superzap
 
     else -- Other game states
-        return player_abs_seg, 0, false, false
+        return player_abs_seg, 0, false, false, false
     end
 end
 
