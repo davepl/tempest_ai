@@ -687,7 +687,7 @@ function M.EnemiesState:new()
 
     -- Charging Fuseball Tracking (Size 16, indexed 1-16 for abs seg 0-15)
     self.charging_fuseball_segments = {} -- 1 if charging in segment, 0 otherwise
-    self.pulsar_rotation_segments = {}   -- Table for Pulsar rotation segments (1-16)
+    self.enemy_rotation_segments = {}   -- Table for Pulsar rotation segments (1-16)
     self.pulsar_depth_segments = {}   -- Table for Pulsar depth per segment (1-16)
 
     -- Engineered Features for AI (Calculated in update)
@@ -724,7 +724,7 @@ function M.EnemiesState:new()
     end
     for i = 1, 16 do
         self.charging_fuseball_segments[i] = 0
-        self.pulsar_rotation_segments[i] = 0
+        self.enemy_rotation_segments[i] = 0
         self.pulsar_depth_segments[i] = 0
     end
     for i = 1, 7 do
@@ -813,8 +813,8 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
     -- Calculate charging Fuseball segments (reset first)
     for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
-    -- Reset pulsar_rotation_segments
-    for i = 1, 16 do self.pulsar_rotation_segments[i] = 0 end
+    -- Reset enemy_rotation_segments
+    for i = 1, 16 do self.enemy_rotation_segments[i] = 0 end
     for i = 1, 16 do self.pulsar_depth_segments[i] = 0 end
     for i = 1, 7 do
         -- If it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
@@ -827,14 +827,14 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
         -- After updating more_enemy_info[i]:
         -- Pulsar lane logic
-        if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+        if self.enemy_abs_segments[i] ~= INVALID_SEGMENT then
             local abs_segment_idx = self.enemy_abs_segments[i] + 1
             if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
                 local info = self.more_enemy_info[i] or 0
                 if (info & 0x80) ~= 0 then
-                    self.pulsar_rotation_segments[abs_segment_idx] = info & 0x7F
+                    self.enemy_rotation_segments[abs_segment_idx] = info & 0x7F
                 else
-                    self.pulsar_rotation_segments[abs_segment_idx] = 0
+                    self.enemy_rotation_segments[abs_segment_idx] = 0
                 end
                 self.pulsar_depth_segments[abs_segment_idx] = self.enemy_depths[i]
             end

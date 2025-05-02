@@ -9,7 +9,7 @@ Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
 
 # Prevent direct execution
 if __name__ == "__main__":
-    print("This is not the main application, run 'main.py' instead")
+    # print("This is not the main application, run 'main.py' instead")
     exit(1)
 
 # Global debug flag - set to False to disable debug output

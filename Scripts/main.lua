@@ -21,7 +21,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 9
-local DISPLAY_UPDATE_INTERVAL = 0.2 -- Changed from 0.02 to 0.2 to reduce update frequency by 10x
+local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
 local SOCKET_RETRY_WAIT_S     = 0.01
@@ -247,7 +247,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Charging Fuseball flags (16)
     for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
     -- Pulsar Rotation Segments (16)
-    for i = 1, 16 do insert(data, es.pulsar_rotation_segments[i]) end
+    for i = 1, 16 do insert(data, es.enemy_rotation_segments[i]) end
     -- Pulsar Depth Segments (16)
     for i = 1, 16 do insert(data, es.pulsar_depth_segments[i]) end
     -- Pending Vid (64)
@@ -522,6 +522,9 @@ local function apply_overrides(memory)
     if (memory:read_u8(0x126) < START_LEVEL_MIN) then
         memory:write_direct_u8(0x0126, START_LEVEL_MIN) -- Set level to 1-7
     end
+
+    memory:write_direct_u8(0x03EE, memory:read_u8(0x03EE) + 1 % 255)
+
     -- NOP out the start level check
     -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
     -- memory:write_direct_u8(0x90CE, 0xEA) -- NOP

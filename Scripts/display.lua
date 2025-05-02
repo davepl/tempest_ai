@@ -237,14 +237,14 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     -- Pulsar Rotations (NEW)
     local pulsar_rot_str = {}
     for i = 1, 16 do
-        local rot = enemies_state.pulsar_rotation_segments and enemies_state.pulsar_rotation_segments[i] or 0
+        local rot = enemies_state.enemy_rotation_segments and enemies_state.enemy_rotation_segments[i] or 0
         if rot == 0 then
             table.insert(pulsar_rot_str, "--")
         else
             table.insert(pulsar_rot_str, string.format("%02X", rot))
         end
     end
-    display_str = display_str .. string.format("%-16s: %s\n", "Pulsar Rot", table.concat(pulsar_rot_str, " "))
+    display_str = display_str .. string.format("%-16s: %s\n", "Enemy Rot", table.concat(pulsar_rot_str, " "))
 
     -- Pulsar Depths (NEW)
     local pulsar_depth_str = {}

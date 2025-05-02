@@ -297,7 +297,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Default return values
     local proposed_target_seg = player_abs_seg
-    local proposed_fire_prio = 6 -- Default fire priority
+    local proposed_fire_priority = 4 -- Default fire priority
     local final_should_fire = false
 
     if game_state.gamestate == 0x20 then -- Tube Zoom
@@ -365,7 +365,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
         -- === Step 1B: Determine proposed target based on Top Rail (Presence) / Hunt ===
         local base_fire_priority = any_enemy_proximate and FREEZE_FIRE_PRIO_HIGH or FREEZE_FIRE_PRIO_LOW
-        proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
+        proposed_fire_priority = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
 
         if enemy_left_exists and enemy_right_exists then
             -- Case 1: Both Sides - Find nearest threat, target inside or midpoint fallback
@@ -390,15 +390,15 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_left_exists then
              -- Case 3: Left Only
             if is_open then proposed_target_seg = (nl_dist <= 1) and 14 or 13
-            else if nl_dist < SAFE_DISTANCE then proposed_target_seg = (nl_seg + SAFE_DISTANCE) % 16 else proposed_target_seg = player_abs_seg end end
+            else if nl_dist < SAFE_DISTANCE then proposed_target_seg = (nl_seg + SAFE_DISTANCE + 16) % 16 else proposed_target_seg = player_abs_seg end end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
             if M.is_danger_lane(player_abs_seg, enemies_state) then
                  proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-                 proposed_fire_prio = AVOID_FIRE_PRIORITY -- Lower priority when escaping
+                 proposed_fire_priority = AVOID_FIRE_PRIORITY -- Lower priority when escaping
             elseif M.get_enemy_priority(player_abs_seg, enemies_state) then
                  proposed_target_seg = player_abs_seg
-                 proposed_fire_prio = 6
+                 proposed_fire_priority = 6
             else -- Search outwards
                 local fallback_safe, best_enemy_prio, found_target = nil, 100, false
                 local search_target = player_abs_seg
@@ -407,19 +407,19 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                         local seg = (player_abs_seg + sign * d + 16) % 16
                         if M.is_danger_lane(seg, enemies_state) then break end
                         local type, prio = M.get_enemy_priority(seg, enemies_state)
-                        if type and prio < best_enemy_prio then search_target, best_enemy_prio, found_target, proposed_fire_prio = seg, prio, true, 6 end
+                        if type and prio < best_enemy_prio then search_target, best_enemy_prio, found_target, proposed_fire_priority = seg, prio, true, 6 end
                         if not type and not found_target and fallback_safe == nil then fallback_safe = seg end
                     end
                 end
-                if not found_target and fallback_safe then proposed_target_seg = fallback_safe; proposed_fire_prio = 4
-                elseif not found_target then proposed_target_seg = player_abs_seg; proposed_fire_prio = 4
+                if not found_target and fallback_safe then proposed_target_seg = fallback_safe; proposed_fire_priority = 4
+                elseif not found_target then proposed_target_seg = player_abs_seg; proposed_fire_priority = 4
                 else proposed_target_seg = search_target end -- Use found target
             end
         end
 
         -- === Step 2: Apply Safety Overrides (including Pulsar) ===
         local final_target_seg = proposed_target_seg
-        local final_fire_priority = proposed_fire_prio
+        local final_fire_priority = proposed_fire_priority
         local pulsar_override_active = false
 
         -- ** Pulsar Check (Highest Priority) **

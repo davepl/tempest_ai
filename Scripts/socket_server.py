@@ -42,7 +42,7 @@ from aimodel import (
 class SocketServer:
     """Socket-based server to handle multiple clients"""
     def __init__(self, host, port, agent, safe_metrics):
-        print(f"Initializing SocketServer on {host}:{port}")
+        # print(f"Initializing SocketServer on {host}:{port}")
         self.host = host
         self.port = port
         self.agent = agent
@@ -213,6 +213,7 @@ class SocketServer:
     
     def handle_client(self, client_socket, client_id):
         """Handle communication with a client"""
+        e = None  # Ensure 'e' is always defined for use in finally
         try:
             # Set socket to non-blocking mode
             client_socket.setblocking(False)
@@ -386,9 +387,11 @@ class SocketServer:
                         # Send empty action on 'done' frame to prevent issues
                         try:
                             client_socket.sendall(struct.pack("bbb", 0, 0, 0))
-                        except (BrokenPipeError, ConnectionResetError):
-                             print(f"Client {client_id}: Connection lost when sending done confirmation.")
-                             break # Exit loop if connection is lost
+                        except (BrokenPipeError, ConnectionResetError) as e:
+                            # Only print serious errors, not normal disconnects
+                            if not (isinstance(e, ConnectionResetError) or (isinstance(e, ConnectionError) and "disconnected" in str(e))):
+                                print(f"Client {client_id}: Connection lost when sending done confirmation: {e}")
+                            break # Exit loop if connection is lost
 
 
                         # Reset state for next episode
@@ -457,8 +460,10 @@ class SocketServer:
                     game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
                     try:
                         client_socket.sendall(struct.pack("bbb", game_fire, game_zap, game_spinner))
-                    except (BrokenPipeError, ConnectionResetError):
-                        print(f"Client {client_id}: Connection lost when sending action.")
+                    except (BrokenPipeError, ConnectionResetError) as e:
+                        # Only print serious errors, not normal disconnects
+                        if not (isinstance(e, ConnectionResetError) or (isinstance(e, ConnectionError) and "disconnected" in str(e))):
+                            print(f"Client {client_id}: Connection lost when sending action: {e}")
                         break # Exit loop if connection is lost
 
 
@@ -475,16 +480,25 @@ class SocketServer:
                     # Expected with non-blocking socket, short sleep prevents busy-waiting
                     time.sleep(0.001)
                     continue
-                except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
-                    print(f"Client {client_id} connection error: {e}")
+                except (ConnectionResetError, BrokenPipeError, ConnectionError) as exc:
+                    e = exc
+                    # Only print serious errors, not normal disconnects
+                    if not (isinstance(e, ConnectionResetError) or (isinstance(e, ConnectionError) and "disconnected" in str(e))):
+                        print(f"Client {client_id} connection error: {e}")
                     break # Exit the loop on connection errors
-                except Exception as e:
-                    print(f"Error handling client {client_id}: {e}")
+                except Exception as exc:
+                    e = exc
+                    # Only print serious errors, not normal disconnects
+                    if not (isinstance(e, ConnectionResetError) or (isinstance(e, ConnectionError) and "disconnected" in str(e))):
+                        print(f"Fatal error handling client {client_id}: {e}")
                     traceback.print_exc()
                     break # Exit the loop on other errors
 
-        except Exception as e:
-            print(f"Fatal error handling client {client_id}: {e}")
+        except Exception as exc:
+            e = exc
+            # Only print serious errors, not normal disconnects
+            if not (isinstance(e, ConnectionResetError) or (isinstance(e, ConnectionError) and "disconnected" in str(e))):
+                print(f"Fatal error handling client {client_id}: {e}")
             traceback.print_exc()
         finally:
             # Ensure proper cleanup in all cases
@@ -508,7 +522,8 @@ class SocketServer:
 
                 # Update metrics after cleanup
                 metrics.client_count = len([c for c in self.clients.values() if c is not None])
-                if client_exists:
+                # Only print serious errors, not normal disconnects
+                if e is not None and not (isinstance(e, ConnectionResetError) or (isinstance(e, ConnectionError) and "disconnected" in str(e))):
                     print(f"Client {client_id} cleanup complete. Active clients: {metrics.client_count}")
 
             # Schedule cleanup of disconnected clients (thread safe)
@@ -533,7 +548,7 @@ class SocketServer:
             # Update metrics if needed
             if cleaned_count > 0:
                 metrics.client_count = len(self.clients)
-                print(f"Background cleanup removed {cleaned_count} disconnected clients. Active: {metrics.client_count}")
+                # print(f"Background cleanup removed {cleaned_count} disconnected clients. Active: {metrics.client_count}")
 
     def is_override_active(self):
         with self.client_lock:
@@ -541,4 +556,4 @@ class SocketServer:
             
     def get_fps(self):
         with self.client_lock:
-            return self.metrics.fps 
+            return self.metrics.fps
