@@ -653,7 +653,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             if i + 1 < len(state_data):
                 try:
                     value = struct.unpack(">H", state_data[i:i+2])[0]
-                    normalized = (value / 255.0) * 2.0 - 1.0
+                    # Normalize signed 16-bit values to [-1, 1]
+                    normalized = max(-1.0, min(1.0, value / 32767.0))
                     state_values.append(normalized)
                 except struct.error as e:
                     print(f"ERROR: Failed to unpack state value at position {i}: {e}", flush=True)

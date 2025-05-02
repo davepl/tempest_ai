@@ -18,7 +18,7 @@ local logic = require("logic") -- ADDED: Require the new logic module
 local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
-local SHOW_DISPLAY            = false
+local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
@@ -219,6 +219,10 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Pending Seg (64)
     for i = 1, 64 do insert(data, es.pending_seg[i]) end
 
+    -- Add new synthetic tables to game parameters
+    for i = 1, 16 do insert(data, es.charging_fuseball_segments[i] or 0) end
+    for i = 1, 16 do insert(data, es.pulsar_depth_by_segment[i] or 0) end
+
     -- Total main payload size should be: 5+5+23+35+16+42+7+7+7+4+4+16+64+64 = 299
 
     -- Serialize main data to binary string (signed 16-bit big-endian)
@@ -373,6 +377,12 @@ local function handle_ai_interaction()
     local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = logic.find_target_segment(
         game_state, player_state, level_state, enemies_state, logic.absolute_to_relative_segment, is_open_level
     )
+    -- Ensure expert_target_seg is always an integer for packing
+    if expert_target_seg ~= nil then
+        expert_target_seg = math.floor(expert_target_seg + 0.5)
+    else
+        expert_target_seg = -1
+    end
     local expert_fire_packed = expert_should_fire_lua and 1 or 0
     local expert_zap_packed = expert_should_zap_lua and 1 or 0
 
@@ -461,7 +471,6 @@ local function determine_final_actions()
         -- Start remains 0
     else
         -- Unknown state, all commands default to 0
-        print(string.format("[WARN] Unknown game state 0x%02X encountered in determine_final_actions", game_state.gamestate))
     end
 
     return final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd
