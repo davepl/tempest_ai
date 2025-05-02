@@ -523,8 +523,6 @@ local function apply_overrides(memory)
         memory:write_direct_u8(0x0126, START_LEVEL_MIN) -- Set level to 1-7
     end
 
-    memory:write_direct_u8(0x03EE, memory:read_u8(0x03EE) + 1 % 255)
-
     -- NOP out the start level check
     -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
     -- memory:write_direct_u8(0x90CE, 0xEA) -- NOP
