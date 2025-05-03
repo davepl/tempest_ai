@@ -452,64 +452,36 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     end
                 end
             end
-
-            -- Set high fire priority if the nearest threat is very close
-            if min_threat_abs_rel <= 1.0 then proposed_fire_prio = 8 end
-
+            if nearest_threat_rel <= 1.5 then proposed_fire_prio = 8 end -- High priority if within 1.0 distance
             if nearest_threat_seg then
-                -- Determine the offset based on distance: 1 if close, 2 if further
-                local offset = (min_threat_abs_rel <= 1.0) and 1 or 2
-                local threat_int_seg = math.floor(nearest_threat_seg) -- Use integer part for segment calculation
-
-                if is_open then
-                    if nearest_threat_rel >= 0 then -- Threat is right or aligned, move left
-                        proposed_target_seg = math.max(0, threat_int_seg - offset)
-                    else -- Threat is left, move right
-                        proposed_target_seg = math.min(15, threat_int_seg + offset)
-                    end
-                else -- Closed level
-                    if nearest_threat_rel >= 0 then -- Threat is right or aligned, move left
-                        proposed_target_seg = (threat_int_seg - offset + 16) % 16
-                    else -- Threat is left, move right
-                        proposed_target_seg = (threat_int_seg + offset + 16) % 16
-                    end
-                end
-            else
-                -- Fallback if no Flipper/Pulsar found (e.g., only Tankers/Spikers present)
-                -- Revert to original midpoint logic in this specific sub-case
-                 if is_open then
-                     local mid = math.floor((nl_seg + nr_seg) / 2)
-                     proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
-                 else
-                     local dist = (nr_seg - nl_seg + 16) % 16
-                     proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16
-                 end
+                if nearest_threat_rel > 0 then proposed_target_seg = (nearest_threat_seg - 1.5 + 16) % 16
+                elseif nearest_threat_rel < 0 then proposed_target_seg = (nearest_threat_seg + 1.5 + 16) % 16
+                else proposed_target_seg = player_abs_seg end
+            else -- Fallback: No Flippers/Pulsars, use midpoint
+                 if is_open then local mid = math.floor((nl_seg + nr_seg) / 2); proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
+                 else local dist = (nr_seg - nl_seg + 16) % 16; proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16 end
             end
         elseif enemy_right_exists then
             -- Case 2: Right Only
-            if (nr_dist <= 1.6) then proposed_fire_prio = 8 end
-            if is_open then
-                proposed_target_seg = (nr_dist <= 1.6) and 0 or 1
-            else -- Closed level
-                if nr_dist <= 1.0 then
-                    proposed_target_seg = (math.floor(nr_seg) - 1 + 16) % 16
-                else
-                    proposed_target_seg = (math.floor(nr_seg) - 2 + 16) % 16 -- Target segment - 2 if distance > 1.0
-                end
-            end
+            if (nr_dist <= 1.25) then proposed_fire_prio = 8 end
+            if is_open then 
+                proposed_target_seg = (nr_dist <= 1.25) and 0 or 1
+            else if nr_dist < 1.5 then 
+                proposed_target_seg = (nr_seg - 1.25 + 16) % 16 
+            else 
+                proposed_target_seg = player_abs_seg 
+            end 
+        end
         elseif enemy_left_exists then
-            print("Left Only: " .. player_abs_seg .. " " .. nl_seg .. " " .. nl_dist)
              -- Case 3: Left Only
-             if (nl_dist <= 1.0) then proposed_fire_prio = 8 end
-             if is_open then
-                proposed_target_seg = (nl_dist <= 1.0) and 14 or 13
-             else -- Closed level
-                if nl_dist <= 1.0 then
-                    proposed_target_seg = (math.floor(nl_seg) + 1) % 16
-                else
-                    proposed_target_seg = (math.floor(nl_seg) + 2) % 16 -- Target segment + 2 if distance > 1.0
-                end
-             end
+             if (nl_dist <= 1.25) then proposed_fire_prio = 8 end
+             if is_open then 
+                proposed_target_seg = (nl_dist <= 1.25) and 14 or 13
+             else 
+                if nl_dist <= 1.5 then 
+                    proposed_target_seg = (nl_seg + 1.25) % 16 
+                else 
+                    proposed_target_seg = player_abs_seg end end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
             if M.is_danger_lane(player_abs_seg, enemies_state) then
@@ -595,8 +567,24 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             end
         end
 
+        -- === NEW CHECK: Lane Shot Depth and Shot Count ===
+        for i = 1, 4 do
+            if enemies_state.enemy_shot_abs_segments[i] == player_abs_seg and
+               enemies_state.shot_positions[i] > 0 and
+               enemies_state.shot_positions[i] < 0x05 and
+               shot_count >= 4 then
+                print("Lane shot detected, moving away from current lane")
+                -- Move one segment away from the current lane
+                local direction = (player_abs_seg % 2 == 0) and 1 or -1 -- Alternate direction based on segment parity
+                final_target_seg = (player_abs_seg + direction + 16) % 16
+                final_fire_priority = 8
+                break
+            end
+        end
+
         -- === Step 3: Final Return ===
         final_should_fire = final_fire_priority > shot_count
+        final_should_fire = shot_count <= 6 or final_should_fire -- Don't fire if shot count is too high
         return final_target_seg, 0, final_should_fire, false, should_superzap
 
     else -- Other game states

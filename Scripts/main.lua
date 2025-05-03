@@ -20,9 +20,9 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 -- Constants
 local SHOW_DISPLAY            = false
 local START_ADVANCED          = true
-local START_LEVEL_MIN         = 9
+local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
-local SOCKET_ADDRESS          = "socket.m2macpro.local:9999"
+local SOCKET_ADDRESS          = "socket.m2macpro:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
