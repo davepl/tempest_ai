@@ -192,23 +192,47 @@ class ReplayMemory:
         return len(self.memory)
 
 class DQN(nn.Module):
-    """Deep Q-Network model."""
+    """Deep Q-Network model (Dueling Architecture)."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 768) 
-        self.fc2 = nn.Linear(768, 512)  
-        self.fc3 = nn.Linear(512, 256)        
-        self.fc4 = nn.Linear(256, 128)        
-        self.fc5 = nn.Linear(128, 64)         
-        self.out = nn.Linear(64, action_size) 
+        # Shared input layer
+        self.fc1 = nn.Linear(state_size, 512)
+        self.ln1 = nn.LayerNorm(512)
+
+        # Dense layers with skip connections
+        self.fc2 = nn.Linear(512 + state_size, 512)
+        self.ln2 = nn.LayerNorm(512)
+
+        self.fc3 = nn.Linear(512 + state_size, 256)
+        self.ln3 = nn.LayerNorm(256)
+
+        # Value Stream
+        self.value_fc = nn.Linear(256, 128)
+        self.value = nn.Linear(128, 1)
+
+        # Advantage Stream
+        self.adv_fc = nn.Linear(256, 128)
+        self.advantage = nn.Linear(128, action_size)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))      
-        x = F.relu(self.fc5(x))
-        return self.out(x)
+        # Initial input pass
+        x1 = F.relu(self.ln1(self.fc1(x)))
+
+        # Dense skip connections concatenating original input
+        x2 = F.relu(self.ln2(self.fc2(torch.cat([x1, x], dim=1))))
+        x3 = F.relu(self.ln3(self.fc3(torch.cat([x2, x], dim=1))))
+
+        # Value Stream
+        val = F.relu(self.value_fc(x3))
+        val = self.value(val)
+
+        # Advantage Stream
+        adv = F.relu(self.adv_fc(x3))
+        adv = self.advantage(adv)
+
+        # Combine streams for final Q-values
+        q_vals = val + adv - adv.mean(dim=1, keepdim=True)
+        return q_vals
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
@@ -653,7 +677,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             if i + 1 < len(state_data):
                 try:
                     value = struct.unpack(">H", state_data[i:i+2])[0]
-                    normalized = (value / 255.0) * 2.0 - 1.0
+                    # Normalize signed 16-bit values to [-1, 1]
+                    normalized = max(-1.0, min(1.0, value / 32767.0))
                     state_values.append(normalized)
                 except struct.error as e:
                     print(f"ERROR: Failed to unpack state value at position {i}: {e}", flush=True)
