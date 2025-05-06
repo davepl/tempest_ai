@@ -684,6 +684,10 @@ function M.EnemiesState:new()
     self.charging_fuseball_segments = {}
     -- Pulsar Depth Lanes (Size 16, indexed 1-16 for abs seg 0-15)
     self.pulsar_depth_lanes = {}
+    -- ADDED: Fuseball Lane Depths (Size 16, indexed 1-16 for abs seg 0-15)
+    self.fuseball_lane_depths = {}
+    -- ADDED: Enemy Shot Lane Depths (Size 16, indexed 1-16 for abs seg 0-15)
+    self.enemy_shot_depths_by_lane = {}
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -720,6 +724,9 @@ function M.EnemiesState:new()
     for i = 1, 16 do
         self.charging_fuseball_segments[i] = 0
         self.pulsar_depth_lanes[i] = 0
+        -- ADDED: Initialize new lane depth tables
+        self.fuseball_lane_depths[i] = 0
+        self.enemy_shot_depths_by_lane[i] = 0
     end
 
     return self
@@ -885,22 +892,53 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         -- Scaling happens during packing
     end
 
+    -- Calculate fuseball_lane_depths (reset first)
+    for seg = 1, 16 do self.fuseball_lane_depths[seg] = 0 end
+    for seg_abs = 0, 15 do -- Iterate through absolute segments 0-15
+        local min_depth_for_lane = 0 -- 0 means no fuseball in this lane yet or closest is at rim
+        for i = 1, 7 do -- Iterate through enemy slots
+            if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and
+               self.enemy_abs_segments[i] == seg_abs and
+               self.enemy_depths[i] > 0 then
+                if min_depth_for_lane == 0 or self.enemy_depths[i] < min_depth_for_lane then
+                    min_depth_for_lane = self.enemy_depths[i]
+                end
+            end
+        end
+        self.fuseball_lane_depths[seg_abs + 1] = min_depth_for_lane
+    end
+
     -- Calculate pulsar_depth_lanes (reset first)
     for seg = 1, 16 do self.pulsar_depth_lanes[seg] = 0 end
-    for seg = 0, 15 do
+    for seg_abs = 0, 15 do
         local min_depth = nil
         for i = 1, 7 do
-            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] == seg and self.enemy_depths[i] > 0 then
+            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] == seg_abs and self.enemy_depths[i] > 0 then
                 if not min_depth or self.enemy_depths[i] < min_depth then
                     min_depth = self.enemy_depths[i]
                 end
             end
         end
         if min_depth then
-            self.pulsar_depth_lanes[seg+1] = min_depth
+            self.pulsar_depth_lanes[seg_abs+1] = min_depth
         else
-            self.pulsar_depth_lanes[seg+1] = 0
+            self.pulsar_depth_lanes[seg_abs+1] = 0
         end
+    end
+
+    -- Calculate enemy_shot_depths_by_lane (reset first)
+    for seg = 1, 16 do self.enemy_shot_depths_by_lane[seg] = 0 end
+    for seg_abs = 0, 15 do -- Iterate through absolute segments 0-15
+        local min_depth_for_lane = 0 -- 0 means no shot in this lane yet or closest is at rim
+        for i = 1, 4 do -- Iterate through enemy shot slots
+            if self.enemy_shot_abs_segments[i] == seg_abs and
+               self.shot_positions[i] > 0 then
+                if min_depth_for_lane == 0 or self.shot_positions[i] < min_depth_for_lane then
+                    min_depth_for_lane = self.shot_positions[i]
+                end
+            end
+        end
+        self.enemy_shot_depths_by_lane[seg_abs + 1] = min_depth_for_lane
     end
 end
 

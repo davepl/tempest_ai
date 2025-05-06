@@ -232,13 +232,18 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     add_custom_line("Enemy Shots Seg:" .. e_shots_seg_str)
     add_blank_line()
 
-    -- Charging Fuseballs
-    local charging_fuseball_parts = {}
-    for i = 1, 16 do -- Assuming 16 segments for fuseball charging
-        table.insert(charging_fuseball_parts, (enemies_state.charging_fuseball_segments and enemies_state.charging_fuseball_segments[i] == 1) and "*" or "-")
+    -- Fuseball Lane Depths
+    local fuseball_lane_depth_parts = {}
+    for i = 1, 16 do -- Assuming 16 lanes
+        -- Assuming enemies_state.fuseball_lane_depths is a 1-indexed table
+        local depth = (enemies_state.fuseball_lane_depths and enemies_state.fuseball_lane_depths[i]) or 0
+        if depth == 0 then
+            table.insert(fuseball_lane_depth_parts, "--")
+        else
+            table.insert(fuseball_lane_depth_parts, string.format("%02X", depth))
+        end
     end
-    add_custom_line("Fuseball Chrg: " .. table.concat(charging_fuseball_parts, " "))
-    add_blank_line()
+    add_custom_line("Fuseball Lanes: " .. table.concat(fuseball_lane_depth_parts, " "))
 
     -- Pulsar Depths
     local pulsar_depth_parts = {}
@@ -251,7 +256,20 @@ function M.update(status_message, game_state, level_state, player_state, enemies
             table.insert(pulsar_depth_parts, string.format("%02X", depth))
         end
     end
-    add_custom_line("Pulsar Depths: " .. table.concat(pulsar_depth_parts, " "))
+    add_custom_line("Pulsar Depths : " .. table.concat(pulsar_depth_parts, " "))
+
+    -- Enemy Shot Lane Depths
+    local enemy_shot_lane_depth_parts = {}
+    for i = 1, 16 do -- Assuming 16 lanes for enemy shots
+        -- Assuming enemies_state.enemy_shot_depths_by_lane is a 1-indexed table
+        local depth = (enemies_state.enemy_shot_depths_by_lane and enemies_state.enemy_shot_depths_by_lane[i]) or 0
+        if depth == 0 then
+            table.insert(enemy_shot_lane_depth_parts, "--")
+        else
+            table.insert(enemy_shot_lane_depth_parts, string.format("%02X", depth))
+        end
+    end
+    add_custom_line("Enemy Shot Ln : " .. table.concat(enemy_shot_lane_depth_parts, " "))
     add_blank_line()
 
     -- Pending Data (Show first 16 for brevity)
