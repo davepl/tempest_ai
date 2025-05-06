@@ -266,13 +266,13 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
-                local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
+                local rel_dist = abs_to_rel_func(player_abs_segment, initial_target_seg_abs, is_open)
                 should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
@@ -366,7 +366,6 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
 
     -- If too close, find the nearest segment >= min_fuseball_dist away from ALL top fuseballs
     if too_close then
-        print("FUSEBALL AVOID: Target " .. final_target_seg_abs .. " too close. Finding alternative.")
         local best_safe_seg = -1
         local search_max_dist = is_open and 15 or 8
 
@@ -413,7 +412,6 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
         ::found_safe_segment::
 
         if best_safe_seg ~= -1 then
-            print("FUSEBALL AVOID: New target = " .. best_safe_seg)
             final_target_seg_abs = best_safe_seg
             target_depth = 0 -- Reset depth indication
             should_fire = false -- Don't fire when avoiding
@@ -683,7 +681,9 @@ function M.EnemiesState:new()
     self.pending_seg = {}              -- Relative segment ($0203 + i - 1, or INVALID_SEGMENT)
 
     -- Charging Fuseball Tracking (Size 16, indexed 1-16 for abs seg 0-15)
-    self.charging_fuseball_segments = {} -- 1 if charging in segment, 0 otherwise
+    self.charging_fuseball_segments = {}
+    -- Pulsar Depth Lanes (Size 16, indexed 1-16 for abs seg 0-15)
+    self.pulsar_depth_lanes = {}
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -719,6 +719,7 @@ function M.EnemiesState:new()
     end
     for i = 1, 16 do
         self.charging_fuseball_segments[i] = 0
+        self.pulsar_depth_lanes[i] = 0
     end
 
     return self
@@ -883,6 +884,24 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.alignment_error_magnitude = (error_abs > 0) and (error_abs / max_error) or 0.0
         -- Scaling happens during packing
     end
+
+    -- Calculate pulsar_depth_lanes (reset first)
+    for seg = 1, 16 do self.pulsar_depth_lanes[seg] = 0 end
+    for seg = 0, 15 do
+        local min_depth = nil
+        for i = 1, 7 do
+            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] == seg and self.enemy_depths[i] > 0 then
+                if not min_depth or self.enemy_depths[i] < min_depth then
+                    min_depth = self.enemy_depths[i]
+                end
+            end
+        end
+        if min_depth then
+            self.pulsar_depth_lanes[seg+1] = min_depth
+        else
+            self.pulsar_depth_lanes[seg+1] = 0
+        end
+    end
 end
 
 
@@ -915,4 +934,4 @@ function M.EnemiesState:get_total_active()
 end
 
 -- Return the module table
-return M 
+return M
