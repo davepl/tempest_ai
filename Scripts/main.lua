@@ -19,7 +19,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
 local SHOW_DISPLAY            = true
-local START_ADVANCED          = true
+local START_ADVANCED          = false
 local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
@@ -438,7 +438,8 @@ local function determine_final_actions()
         -- print(string.format("[DEBUG LevelSelect] Frame: %d, Timer: %d, Counter: %d", game_state.frame_counter, mem and mem:read_u8(0x0003) or -1, level_select_counter))
 
         if level_select_counter < 60 then
-            final_spinner_cmd = 18; -- Fire, Zap, Start remain 0
+            final_spinner_cmd = START_ADVANCED and 18 or 0 
+            -- Fire, Zap, Start remain 0
             level_select_counter = level_select_counter + 1
             -- print("  -> Spinning knob (Counter now " .. level_select_counter .. ")")
         elseif level_select_counter == 60 then
