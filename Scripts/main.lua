@@ -493,6 +493,10 @@ local function apply_overrides(memory)
     -- NOP out the start level check
     -- memory:write_direct_u8(0x90CD, 0xEA) -- NOP
     -- memory:write_direct_u8(0x90CE, 0xEA) -- NOP
+
+    if (memory:read_u8(0x0126) < START_LEVEL_MIN) then
+        memory:write_u8(0x0126, START_LEVEL_MIN) -- Set to 1 to avoid infinite loop
+    end
 end
 
 
