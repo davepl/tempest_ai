@@ -1071,15 +1071,6 @@ local function format_fractional_segments(fractional_segments)
     return table.concat(display, " ")
 end
 
--- Example usage in the display update function
-function display.update(status, gs, ls, ps, es, num_values_packed, last_reward, total_bytes_sent)
-    -- ... existing display logic ...
-
-    -- Display Fractional Enemy Segments
-    lines[#lines + 1] = "Fractional Segments: " .. format_fractional_segments(es.fractional_enemy_segments)
-
-    -- ... rest of the display logic ...
-end
 
 -- Return the module table
 return M
