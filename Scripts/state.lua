@@ -729,6 +729,12 @@ function M.EnemiesState:new()
         self.enemy_shot_depths_by_lane[i] = 0
     end
 
+    -- Fractional enemy segments (16 elements, indexed 1-16 for abs seg 0-15)
+    self.fractional_enemy_segments = {}
+    for i = 1, 16 do
+        self.fractional_enemy_segments[i] = 0 -- Default to 0
+    end
+
     return self
 end
 
