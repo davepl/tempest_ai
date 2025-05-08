@@ -212,22 +212,37 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 4 do insert(data, es.shot_positions[i]) end
     -- Enemy shot segments (4)
     for i = 1, 4 do insert(data, es.enemy_shot_segments[i]) end
-    -- Charging Fuseball flags (16)
-    for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
-    -- ADDED: Fuseball Lane Depths (16)
-    for i = 1, 16 do insert(data, es.fuseball_lane_depths[i] or 0) end -- Ensure 0 if nil
-    -- Pulsar Depth Lanes (16)
-    for i = 1, 16 do insert(data, es.pulsar_depth_lanes[i] or 0) end -- Ensure 0 if nil
-    -- ADDED: Enemy Shot Lane Depths (16)
-    for i = 1, 16 do insert(data, es.enemy_shot_depths_by_lane[i] or 0) end -- Ensure 0 if nil
+
+    -- Add Pulsar Depth Table (16)
+    for i = 1, 16 do
+        local pulsar_depth = es.pulsar_depth_lanes[i] or 0 -- Ensure 0 if nil
+        insert(data, pulsar_depth)
+    end
+
+    -- Add Fuseball Charging Depth Table (16)
+    for i = 1, 16 do
+        local fuseball_depth = es.charging_fuseball_segments[i] or 0 -- Ensure 0 if nil
+        insert(data, fuseball_depth)
+    end
+
+    -- Add Fractional Segment Table (16)
+    for i = 1, 16 do
+        local fractional_segment = es.fractional_enemy_segments[i] or 0 -- Ensure 0 if nil
+        -- Convert fractional segment to a 12-bit value
+        local scaled_value = math.floor(fractional_segment * 4096) -- Scale to 12 bits
+        scaled_value = math.max(0, math.min(4095, scaled_value)) -- Clamp to 12-bit range
+        insert(data, scaled_value)
+    end
+
     -- Pending Vid (64)
     for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
     for i = 1, 64 do insert(data, es.pending_seg[i]) end
 
-    -- Total main payload size should be: 5+5+23+35+16+42+7+7+7+4+4+16+16+16+16+64+64 = 331
-    -- Old: 5+5+23+35+16+42+7+7+7+4+4+16+16+64+64 = 299 (charging_fuseball_segments + pulsar_depth_lanes)
-    -- New: Added fuseball_lane_depths (16) and enemy_shot_depths_by_lane (16)
+    -- Total main payload size should be updated to reflect the new additions
+    -- Old: 5+5+23+35+16+42+7+7+7+4+4+16+16+64+64 = 299
+    -- New: Added pulsar_depth_lanes (16), charging_fuseball_segments (16), fractional_enemy_segments (16)
+    -- New Total: 5+5+23+35+16+42+7+7+7+4+4+16+16+16+16+64+64 = 331
 
     -- Serialize main data to binary string (signed 16-bit big-endian)
     local binary_data_parts = {}
@@ -285,7 +300,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     local final_data = oob_data .. binary_data
 
     -- DEBUG: Verify length (OOB=30 bytes, Main=331*2=662 bytes -> Total=692)
-    -- if #final_data ~= 692 then -- UPDATED EXPECTED LENGTH
+    -- if #final_data ~= 692 then
     --     print(string.format("WARNING: Packed data length mismatch! Expected 692, got %d. Num values: %d", #final_data, num_values_packed))
     -- end
 

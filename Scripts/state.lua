@@ -808,10 +808,12 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
-        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
+        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and 
+           self.enemy_abs_segments[i] ~= INVALID_SEGMENT and 
+           (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
             local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
             if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
-                 self.charging_fuseball_segments[abs_segment_idx] = 1
+                self.charging_fuseball_segments[abs_segment_idx] = self.enemy_depths[i] -- Set to the depth of the fuseball
             end
         end
     end
@@ -940,6 +942,21 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         end
         self.enemy_shot_depths_by_lane[seg_abs + 1] = min_depth_for_lane
     end
+
+    -- Calculate fractional enemy segments (scaled to 12 bits)
+    for i = 1, 16 do
+        local seg_abs = i - 1 -- Convert to 0-based index
+        local fractional_segment = self.nearest_enemy_seg -- Use the calculated nearest enemy segment
+
+        if fractional_segment == INVALID_SEGMENT then
+            self.fractional_enemy_segments[i] = INVALID_SEGMENT -- Keep as invalid
+        else
+            -- Convert fractional segment to a 12-bit value
+            local scaled_value = math.floor(fractional_segment * 4096) -- Scale to 12 bits
+            scaled_value = math.max(0, math.min(4095, scaled_value)) -- Clamp to 12-bit range
+            self.fractional_enemy_segments[i] = scaled_value
+        end
+    end
 end
 
 
@@ -969,6 +986,99 @@ end
 function M.EnemiesState:get_total_active()
     return self.active_flippers + self.active_pulsars + self.active_tankers +
         self.active_spikers + self.active_fuseballs
+end
+function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
+    local reward, bDone = 0, false
+    local detected_spinner = player_state.spinner_detected
+
+    if player_state.alive == 1 then
+        local score_delta = player_state.score - previous_score
+        if score_delta > 0 and score_delta <= 1000 then reward = reward + score_delta end
+
+        local sc = player_state.shot_count
+        if sc == 0 or sc >= 8 then reward = reward - 50
+        elseif sc == 4 then reward = reward + 5; elseif sc == 5 then reward = reward + 10
+        elseif sc == 6 then reward = reward + 15; elseif sc == 7 then reward = reward + 20 end
+
+        if game_state.gamestate == 0x04 and player_state.superzapper_active ~= 0 then reward = reward - 500 end
+
+        local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
+        local target_depth = enemies_state.nearest_enemy_depth_raw
+        local player_segment = player_state.position & 0x0F
+
+        -- === Penalize being in a dangerous pulsar lane ===
+        if enemies_state.pulsing > 0xE0 then
+            for i = 1, 7 do
+                if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+                   enemies_state.enemy_abs_segments[i] == player_segment and
+                   enemies_state.enemy_depths[i] > 0 then
+                    reward = reward - 50 -- Penalty for being in a dangerous pulsar lane
+                    break
+                end
+            end
+        end
+
+        -- === Penalize being in a charging fuseball segment ===
+        if enemies_state.charging_fuseball_segments[player_segment + 1] > 0 then
+            reward = reward - 50 -- Penalty for being in a charging fuseball segment
+        end
+
+        if game_state.gamestate == 0x20 then -- Tube Zoom Reward
+            local spike_h = level_state.spike_heights[player_segment] or 0
+            if spike_h > 0 then reward = reward + math.max(0, ((255 - spike_h) / 2) - 27.5)
+            else reward = reward + (detected_spinner == 0 and 250 or -50) end
+            if player_state.fire_commanded == 1 then reward = reward + 200 end
+
+        elseif target_abs_segment < 0 then -- No Enemies Reward
+            reward = reward + (detected_spinner == 0 and 150 or -20)
+            if player_state.fire_commanded == 1 then reward = reward - 100 end
+
+        else -- Enemies Present Reward
+            local desired_spinner, segment_distance, _ = M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
+            if segment_distance == 0 then -- Aligned Reward
+                reward = reward + (detected_spinner == 0 and 250 or -50)
+                if player_state.fire_commanded == 1 then reward = reward + 50 end
+            else -- Misaligned Reward
+                if segment_distance < 2 and target_depth <= 0x20 then reward = reward + (player_state.fire_commanded == 1 and 150 or -50)
+                else if player_state.fire_commanded == 1 then reward = reward - (segment_distance < 2 and 20 or 30) end end
+                -- Movement reward
+                if desired_spinner * detected_spinner > 0 then reward = reward + 40
+                elseif desired_spinner * detected_spinner < 0 then reward = reward - 50
+                elseif detected_spinner == 0 and desired_spinner ~= 0 then reward = reward - 15 end
+            end
+        end
+    else -- Player Died Penalty
+        if previous_alive_state == 1 then reward = reward - 20000; bDone = true end
+    end
+
+    previous_score = player_state.score
+    previous_level = level_state.level_number
+    previous_alive_state = player_state.alive
+    LastRewardState = reward
+
+    return reward, bDone
+end
+-- Display fractional enemy segments
+local function format_fractional_segments(fractional_segments)
+    local display = {}
+    for i = 1, 16 do
+        if fractional_segments[i] == INVALID_SEGMENT then
+            table.insert(display, "-----")
+        else
+            table.insert(display, string.format("%5.2f", fractional_segments[i]))
+        end
+    end
+    return table.concat(display, " ")
+end
+
+-- Example usage in the display update function
+function display.update(status, gs, ls, ps, es, num_values_packed, last_reward, total_bytes_sent)
+    -- ... existing display logic ...
+
+    -- Display Fractional Enemy Segments
+    lines[#lines + 1] = "Fractional Segments: " .. format_fractional_segments(es.fractional_enemy_segments)
+
+    -- ... rest of the display logic ...
 end
 
 -- Return the module table

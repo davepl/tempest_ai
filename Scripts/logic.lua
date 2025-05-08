@@ -500,6 +500,19 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local target_depth = enemies_state.nearest_enemy_depth_raw
         local player_segment = player_state.position & 0x0F
 
+        -- === NEW: Penalize being in a dangerous pulsar lane ===
+        if enemies_state.pulsing > 0xE0 then
+            -- Check if the player is in a lane with a dangerous pulsar
+            for i = 1, 7 do
+                if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+                   enemies_state.enemy_abs_segments[i] == player_segment and
+                   enemies_state.enemy_depths[i] > 0 then
+                    reward = reward - 50 -- Penalty for being in a dangerous pulsar lane
+                    break
+                end
+            end
+        end
+
         if game_state.gamestate == 0x20 then -- Tube Zoom Reward
             local spike_h = level_state.spike_heights[player_segment] or 0
             if spike_h > 0 then reward = reward + math.max(0, ((255 - spike_h) / 2) - 27.5)
@@ -541,4 +554,4 @@ function M.getLastReward()
     return LastRewardState
 end
 
-return M 
+return M
