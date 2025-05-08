@@ -212,36 +212,16 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 4 do insert(data, es.shot_positions[i]) end
     -- Enemy shot segments (4)
     for i = 1, 4 do insert(data, es.enemy_shot_segments[i]) end
-
     -- Add Pulsar Depth Table (16)
-    for i = 1, 16 do
-        local pulsar_depth = es.pulsar_depth_lanes[i] or 0 -- Ensure 0 if nil
-        insert(data, pulsar_depth)
-    end
-
+    for i = 1, 16 do insert(data, es.pulsar_depth_lanes[i]) end
     -- Add Fuseball Charging Depth Table (16)
-    for i = 1, 16 do
-        local fuseball_depth = es.charging_fuseball_segments[i] or 0 -- Ensure 0 if nil
-        insert(data, fuseball_depth)
-    end
-
+    for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
     -- Add Fuseball Lane Depths (16)
-    for i = 1, 16 do
-        local fuseball_depth = es.fuseball_lane_depths[i]
-        insert(data, fuseball_depth)
-    end
-
+    for i = 1, 16 do insert(data, es.fuseball_lane_depths[i]) end
     -- Add Fractional Segment Table (16)
-    for i = 1, 16 do
-        local fractional_segment = es.fractional_enemy_segments[i] or 0 -- Ensure 0 if nil
-        insert(data, fractional_segment) -- Already scaled to 12 bits in enemies_state:update
-    end
-
+    for i = 1, 16 do insert(data, es.fractional_enemy_segments[i]) end
     -- Add Enemy Shot Depths by Lane (16)
-    for i = 1, 16 do
-        local shot_depth = es.enemy_shot_depths_by_lane[i] or 0 -- Ensure 0 if nil
-        insert(data, shot_depth)
-    end
+    for i = 1, 16 do insert(data, es.enemy_shot_depths_by_lane[i]) end
 
     -- Pending Vid (64)
     for i = 1, 64 do insert(data, es.pending_vid[i]) end
@@ -253,7 +233,9 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for _, value in ipairs(data) do
         local num_value = tonumber(value) or 0
         -- Clamp to signed 16-bit range
-        num_value = math.max(-32768, math.min(32767, num_value))
+        if (num_value < -32768) or (num_value > 32767) then
+            print(string.format("Warning: Value %d out of range for signed 16-bit. Clamping to range.", num_value))
+        end
         insert(binary_data_parts, string.pack(">h", num_value)) -- >h: signed short, big-endian
     end
     local binary_data = table.concat(binary_data_parts)
