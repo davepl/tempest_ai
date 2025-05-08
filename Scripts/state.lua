@@ -919,18 +919,21 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- Calculate pulsar_depth_lanes (reset first)
     for seg = 1, 16 do self.pulsar_depth_lanes[seg] = 0 end
     for seg_abs = 0, 15 do
-        local min_depth = nil
+        local min_depth = 255 -- Initialize to a high value (no pulsar found yet)
         for i = 1, 7 do
-            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] == seg_abs and self.enemy_depths[i] > 0 then
-                if not min_depth or self.enemy_depths[i] < min_depth then
+            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+               self.enemy_abs_segments[i] == seg_abs and
+               self.enemy_depths[i] > 0 then -- Ignore depths of 0 (no pulsar)
+                if self.enemy_depths[i] < min_depth then
                     min_depth = self.enemy_depths[i]
                 end
             end
         end
-        if min_depth then
-            self.pulsar_depth_lanes[seg_abs+1] = min_depth
+        -- If min_depth is still 255, no pulsar was found in this segment
+        if min_depth < 255 then
+            self.pulsar_depth_lanes[seg_abs + 1] = min_depth
         else
-            self.pulsar_depth_lanes[seg_abs+1] = 0
+            self.pulsar_depth_lanes[seg_abs + 1] = 0 -- No pulsar in this segment
         end
     end
 

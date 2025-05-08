@@ -18,7 +18,7 @@ local logic = require("logic") -- ADDED: Require the new logic module
 local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02

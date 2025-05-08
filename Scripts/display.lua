@@ -248,8 +248,8 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     -- Pulsar Depths
     local pulsar_depth_parts = {}
     for i = 1, 16 do -- Assuming 16 segments for pulsar depths
-        -- Assuming enemies_state.pulsar_depths is a 1-indexed table
-        local depth = (enemies_state.pulsar_depths and enemies_state.pulsar_depths[i]) or 0
+        -- Use the correct table name: pulsar_depth_lanes
+        local depth = (enemies_state.pulsar_depth_lanes and enemies_state.pulsar_depth_lanes[i]) or 0
         if depth == 0 then
             table.insert(pulsar_depth_parts, "--")
         else
