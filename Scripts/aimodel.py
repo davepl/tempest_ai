@@ -243,7 +243,8 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         
         # Replay memory
-        self.memory = ReplayMemory(memory_size)
+        # self.memory = ReplayMemory(memory_size)
+        self.memory = PrioritizedReplayMemory(memory_size)
         
         # Initialize target network with same weights as local network
         self.update_target_network()
@@ -285,22 +286,30 @@ class DQNAgent:
         """Perform a single training step on one batch"""
         if len(self.memory) < RL_CONFIG.batch_size:
             return
-            
-        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
-        
-        Q_expected = self.qnetwork_local(states).gather(1, actions)
-        
+        # Use PER sampling
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(RL_CONFIG.batch_size, beta=0.4)
+        states = torch.from_numpy(states).float().to(device)
+        actions = torch.from_numpy(actions).long().to(device)
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(1)        
+        rewards = torch.from_numpy(rewards).float().to(device)
+        next_states = torch.from_numpy(next_states).float().to(device)
+        dones = torch.from_numpy(dones).float().to(device)
+        weights = torch.from_numpy(weights).float().to(device)
+
+        Q_expected = self.qnetwork_local(states).gather(1, actions).squeeze(1)
         with torch.no_grad():
             best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
-            Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
+            Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions).squeeze(1)
             Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
-        
-        # Compute loss and perform optimization
-        criterion = SmoothL1Loss()
-        loss = criterion(Q_expected, Q_targets)
+        td_errors = Q_targets - Q_expected
+        loss = (weights * td_errors.pow(2)).mean()
         self.optimizer.zero_grad()
-        loss.backward() 
-        self.optimizer.step() 
+        loss.backward()
+        self.optimizer.step()
+        # Update priorities
+        priorities = td_errors.abs().detach().cpu().numpy() + 1e-6
+        self.memory.update_priorities(indices, priorities)
         metrics.losses.append(loss.item())
 
     def update_target_network(self):
@@ -844,3 +853,56 @@ def decay_expert_ratio(current_step):
         metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
         
     return metrics.expert_ratio
+
+# --- Prioritized Experience Replay ---
+class PrioritizedReplayMemory:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.memory = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.position = 0
+
+    def push(self, state, action, reward, next_state, done):
+        # Ensure action is always stored as a scalar integer
+        action_scalar = int(action) if not isinstance(action, int) else action
+        max_priority = self.priorities.max() if self.memory else 1.0
+        if len(self.memory) < self.capacity:
+            self.memory.append((state, action_scalar, reward, next_state, done))
+        else:
+            self.memory[self.position] = (state, action_scalar, reward, next_state, done)
+        self.priorities[self.position] = max_priority
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size, beta=0.4):
+        if len(self.memory) == self.capacity:
+            priorities = self.priorities
+        else:
+            priorities = self.priorities[:self.position]
+        probabilities = priorities ** self.alpha
+        probabilities /= probabilities.sum()
+        indices = np.random.choice(len(probabilities), batch_size, p=probabilities)
+        experiences = [self.memory[idx] for idx in indices]
+        total = len(self.memory)
+        weights = (total * probabilities[indices]) ** (-beta)
+        weights /= weights.max()
+        states, actions, rewards, next_states, dones = zip(*experiences)
+        # Ensure actions are shape (batch_size, 1)
+        actions = np.array(actions).reshape(-1, 1)
+        return (
+            np.array(states),
+            actions,
+            np.array(rewards),
+            np.array(next_states),
+            np.array(dones),
+            indices,
+            np.array(weights, dtype=np.float32)
+        )
+
+    def update_priorities(self, indices, priorities):
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority
+
+    def __len__(self):
+        return len(self.memory)
+# --- End PER ---

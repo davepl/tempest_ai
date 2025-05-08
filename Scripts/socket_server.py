@@ -154,8 +154,6 @@ class SocketServer:
                     del self.clients[client_id]
                 if client_id in self.client_states:
                     del self.client_states[client_id]
-            
-            print(f"Cleaned up all {len(client_ids)} clients during shutdown")
     
     def generate_client_id(self):
         """Generate a unique client ID"""
@@ -508,8 +506,6 @@ class SocketServer:
 
                 # Update metrics after cleanup
                 metrics.client_count = len([c for c in self.clients.values() if c is not None])
-                if client_exists:
-                    print(f"Client {client_id} cleanup complete. Active clients: {metrics.client_count}")
 
             # Schedule cleanup of disconnected clients (thread safe)
             threading.Timer(1.0, self.cleanup_disconnected_clients).start()
@@ -533,7 +529,6 @@ class SocketServer:
             # Update metrics if needed
             if cleaned_count > 0:
                 metrics.client_count = len(self.clients)
-                print(f"Background cleanup removed {cleaned_count} disconnected clients. Active: {metrics.client_count}")
 
     def is_override_active(self):
         with self.client_lock:
@@ -541,4 +536,4 @@ class SocketServer:
             
     def get_fps(self):
         with self.client_lock:
-            return self.metrics.fps 
+            return self.metrics.fps
