@@ -72,9 +72,9 @@ class MetricsData:
     frame_count: int = 0
     guided_count: int = 0
     total_controls: int = 0
-    episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = 1.0
     expert_ratio: float = 1.0
