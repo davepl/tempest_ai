@@ -225,6 +225,12 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         insert(data, fuseball_depth)
     end
 
+    -- Add Fuseball Lane Depths (16)
+    for i = 1, 16 do
+        local fuseball_depth = es.fuseball_lane_depths[i]
+        insert(data, fuseball_depth)
+    end
+
     -- Add Fractional Segment Table (16)
     for i = 1, 16 do
         local fractional_segment = es.fractional_enemy_segments[i] or 0 -- Ensure 0 if nil
@@ -241,11 +247,6 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
     for i = 1, 64 do insert(data, es.pending_seg[i]) end
-
-    -- Total main payload size should be updated to reflect the new additions
-    -- Old: 5+5+23+35+16+42+7+7+7+4+4+16+16+16+16+64+64 = 331
-    -- New: Added enemy_shot_depths_by_lane (16)
-    -- New Total: 5+5+23+35+16+42+7+7+7+4+4+16+16+16+16+16+64+64 = 347
 
     -- Serialize main data to binary string (signed 16-bit big-endian)
     local binary_data_parts = {}
@@ -301,11 +302,6 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
 
     -- Combine OOB header + main data
     local final_data = oob_data .. binary_data
-
-    -- DEBUG: Verify length (OOB=30 bytes, Main=347*2=694 bytes -> Total=724)
-    -- if #final_data ~= 724 then
-    --     print(string.format("WARNING: Packed data length mismatch! Expected 724, got %d. Num values: %d", #final_data, num_values_packed))
-    -- end
 
     return final_data, num_values_packed
 end
