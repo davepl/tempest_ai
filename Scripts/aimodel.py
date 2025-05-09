@@ -192,41 +192,23 @@ class ReplayMemory:
         return len(self.memory)
 
 class DQN(nn.Module):
-    """Deep Q-Network model with dueling architecture and layer normalization."""
+    """Deep Q-Network model."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        # Shared feature layers
-        self.fc1 = nn.Linear(state_size, 2048)  # Scaled for 363 inputs
-        self.ln1 = nn.LayerNorm(2048)
-        self.fc2 = nn.Linear(2048, 1024)
-        self.ln2 = nn.LayerNorm(1024)
-        self.fc3 = nn.Linear(1024, 512)
-        self.ln3 = nn.LayerNorm(512)
-        
-        # Value stream
-        self.value_fc = nn.Linear(512, 256)
-        self.value = nn.Linear(256, 1)
-        
-        # Advantage stream
-        self.adv_fc = nn.Linear(512, 256)
-        self.advantage = nn.Linear(256, action_size)
+        self.fc1 = nn.Linear(state_size, 768) 
+        self.fc2 = nn.Linear(768, 512)  
+        self.fc3 = nn.Linear(512, 256)        
+        self.fc4 = nn.Linear(256, 128)        
+        self.fc5 = nn.Linear(128, 64)         
+        self.out = nn.Linear(64, action_size) 
 
     def forward(self, x):
-        x = F.relu(self.ln1(self.fc1(x)))
-        x = F.relu(self.ln2(self.fc2(x)))
-        x = F.relu(self.ln3(self.fc3(x)))
-        
-        # Value stream
-        val = F.relu(self.value_fc(x))
-        val = self.value(val)
-        
-        # Advantage stream
-        adv = F.relu(self.adv_fc(x))
-        adv = self.advantage(adv)
-        
-        # Combine for Q-values
-        q_vals = val + adv - adv.mean(dim=1, keepdim=True)
-        return q_vals
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))      
+        x = F.relu(self.fc5(x))
+        return self.out(x)
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
