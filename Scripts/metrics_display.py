@@ -76,13 +76,13 @@ def display_metrics_row(agent, kb_handler):
     mean_reward = 0
     if metrics.episode_rewards:
         rewards_list = list(metrics.episode_rewards)
-        mean_reward = sum(rewards_list[-100:]) / min(len(rewards_list), 100)
+        mean_reward = sum(rewards_list[-1000:]) / min(len(rewards_list), 1000)
     
     # Calculate mean DQN reward
     mean_dqn_reward = 0
     if metrics.dqn_rewards:
         dqn_rewards_list = list(metrics.dqn_rewards)
-        mean_dqn_reward = sum(dqn_rewards_list[-100:]) / min(len(dqn_rewards_list), 100)
+        mean_dqn_reward = sum(dqn_rewards_list[-1000:]) / min(len(dqn_rewards_list), 1000)
     
     # Get the latest loss value
     latest_loss = metrics.losses[-1] if metrics.losses else 0
