@@ -91,7 +91,8 @@ class SocketServer:
                         'frames_processed': 0,
                         'fps': 0.0,  # Track per-client FPS
                         'frames_last_second': 0,  # Frames in current second
-                        'last_fps_update': time.time()  # Last FPS calculation time
+                        'last_fps_update': time.time(),  # Last FPS calculation time
+                        'level_number': 0  # Track level number for each client
                     }
                     
                     # Store client information
@@ -318,16 +319,18 @@ class SocketServer:
                         state = self.client_states[client_id]
                         state['frames_processed'] += 1
                         
-                        # Update client-specific FPS tracking
-                        current_time = time.time()
-                        state['frames_last_second'] += 1
-                        elapsed = current_time - state['last_fps_update']
+                        # Store level number from frame
+                        state['level_number'] = frame.level_number
                         
-                        # Calculate client FPS every second
+                        # Calculate client's FPS
+                        now = time.time()
+                        elapsed = now - state['last_frame_time']
                         if elapsed >= 1.0:
-                            state['fps'] = state['frames_last_second'] / elapsed
-                            state['frames_last_second'] = 0
-                            state['last_fps_update'] = current_time
+                            state['fps'] = 1.0 / elapsed
+                            state['last_frame_time'] = now
+                    
+                    # Calculate average level (updates metrics.average_level)
+                    self.calculate_average_level()
                     
                     # Handle save signal from game
                     if frame.save_signal:
@@ -541,4 +544,33 @@ class SocketServer:
             
     def get_fps(self):
         with self.client_lock:
-            return self.metrics.fps 
+            return self.metrics.fps
+    
+    def calculate_average_level(self):
+        """Calculate average level across all connected clients"""
+        with self.client_lock:
+            # Filter out clients with level_number == 0 (not in a level yet)
+            valid_levels = [state['level_number'] for state in self.client_states.values() 
+                           if state.get('level_number', 0) > 0]
+            
+            if valid_levels:
+                avg_level = sum(valid_levels) / len(valid_levels)
+                # Update metrics with average level
+                self.metrics.average_level = avg_level
+                return avg_level
+            else:
+                self.metrics.average_level = 0
+                return 0
+
+    def update_metrics(self, frame):
+        """Update global metrics based on the current frame"""
+        with self.metrics.lock:
+            # Update game state metrics
+            self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
+            
+            # Update epsilon and expert ratio
+            self.metrics.update_epsilon()
+            self.metrics.update_expert_ratio()
+            
+            # Increment total control actions
+            self.metrics.increment_total_controls()

@@ -132,6 +132,7 @@ class FrameData:
     open_level: bool
     expert_fire: bool  # Added: Expert system fire recommendation
     expert_zap: bool   # Added: Expert system zap recommendation
+    level_number: int  # Added: Current level number from Lua
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -148,7 +149,8 @@ class FrameData:
             player_seg=data["player_seg"],
             open_level=data["open_level"],
             expert_fire=data["expert_fire"],
-            expert_zap=data["expert_zap"]
+            expert_zap=data["expert_zap"],
+            level_number=data.get("level_number", 0)  # Default to 0 if not provided
         )
 
 # Configuration constants
@@ -630,7 +632,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">HdBBBHHHBBBhBhBBBB"  # Updated format string
+        format_str = ">HdBBBHHHBBBhBhBBBBB"  # Updated format string with level_number field at the end
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
@@ -640,7 +642,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open, \
-        expert_fire, expert_zap = values  # Added expert recommendations
+        expert_fire, expert_zap, level_number = values  # Added level_number
         
         # Combine score components
         score = (score_high * 65536) + score_low
@@ -678,7 +680,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             player_seg=player_seg,
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
-            expert_zap=bool(expert_zap)
+            expert_zap=bool(expert_zap),
+            level_number=level_number  # Use the received level_number from OOB data
         )
         
         return frame_data
@@ -691,7 +694,7 @@ def display_metrics_header(kb=None):
     if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -724,7 +727,7 @@ def display_metrics_row(agent, kb=None):
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
+        f"{mem_size:8d} | {metrics.average_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
     )
     print_with_terminal_restore(kb, row)
 

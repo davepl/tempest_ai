@@ -57,8 +57,8 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
-        f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11}" # Removed TrainQ column
+        f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
+        f"{'AvgInf(ms)':>11}" # Added Avg Level column
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header
@@ -87,11 +87,6 @@ def display_metrics_row(agent, kb_handler):
     # Get the latest loss value
     latest_loss = metrics.losses[-1] if metrics.losses else 0
     
-    # Get Training Queue Size (Removed - no longer needed)
-    # train_q_size = 0
-    # if agent and hasattr(agent, 'train_queue'):
-    #     train_q_size = agent.train_queue.qsize()
-
     # Calculate Average Inference Time (ms) and reset counters
     avg_inference_time_ms = 0.0
     with metrics.lock:
@@ -105,10 +100,11 @@ def display_metrics_row(agent, kb_handler):
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
-        f"{int(latest_loss):>10} {metrics.client_count:>8} " # Format loss as integer
+        f"{int(latest_loss):>10} {metrics.client_count:>8} "  
+        f"{metrics.average_level:>10.1f} " # Added average level column
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
-        f"{avg_inference_time_ms:>11.2f}" # Removed TrainQ value
+        f"{avg_inference_time_ms:>11.2f}" 
     )
     
     print_metrics_line(row)
@@ -123,4 +119,4 @@ def run_stats_reporter(metrics):
             display_metrics_row(None, None)
         except Exception as e:
             print(f"Error in stats reporter: {e}")
-            time.sleep(1)  # Wait a bit before retrying 
+            time.sleep(1)  # Wait a bit before retrying
