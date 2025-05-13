@@ -169,27 +169,167 @@ metrics.global_server = None
 # Experience replay memory
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
 
+# PER hyperparameters
+PER_ALPHA = 0.6  # Priority exponent
+PER_BETA_START = 0.4  # Initial importance sampling weight
+PER_BETA_FRAMES = 100000  # Frames over which to anneal beta to 1.0
+PER_EPSILON = 1e-5  # Small constant to ensure non-zero priorities
+TARGET_UPDATE_FREQUENCY = 1000  # Update target network every N training steps
+
 class ReplayMemory:
-    """Replay buffer to store and sample experiences for training"""
+    """Prioritized Experience Replay buffer to store and sample experiences for training"""
     def __init__(self, capacity):
+        self.capacity = capacity
         self.memory = deque(maxlen=capacity)
+        self.priorities = deque(maxlen=capacity)  # Store priorities for each experience
+        self.alpha = PER_ALPHA
+        self.epsilon = PER_EPSILON
+        self.max_priority = 1.0  # Initial max priority for new experiences
+        self.lock = threading.Lock()  # Lock for thread safety
         
     def push(self, state, action, reward, next_state, done):
-        """Add experience to memory"""
-        self.memory.append(Experience(state, action, reward, next_state, done))
+        """Add experience to memory with maximum priority"""
+        # Ensure action is an integer (index in the action space)
+        if not isinstance(action, int) and not isinstance(action, np.int64) and not isinstance(action, np.int32):
+            try:
+                action = int(action)  # Try to convert to int if possible
+            except (TypeError, ValueError):
+                print(f"Warning: Expected action to be an integer, got {type(action)}. Converting to int.")
+                action = 0  # Default action if conversion fails
         
-    def sample(self, batch_size):
-        """Sample random batch of experiences"""
-        experiences = random.sample(self.memory, min(batch_size, len(self.memory)))
-        states = torch.from_numpy(np.vstack([e.state for e in experiences])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
-        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences]).astype(np.uint8)).float().to(device)
-        return states, actions, rewards, next_states, dones
+        experience = Experience(state, action, reward, next_state, done)
+        
+        # Acquire lock when modifying shared data structures
+        with self.lock:
+            self.memory.append(experience)
+            self.priorities.append(self.max_priority)  # New experiences get max priority
+        
+    def sample(self, batch_size, beta=PER_BETA_START):
+        """Sample batch of experiences based on priorities with importance sampling weights"""
+        with self.lock:
+            if len(self.memory) < batch_size:
+                return None, None, None, None, None, None, None
+                
+            # Calculate sampling probabilities - ensure memory and priorities have same length
+            memory_len = len(self.memory)
+            
+            # Check if lengths match - they should, but just in case
+            if len(self.priorities) != memory_len:
+                print(f"Warning: Memory length ({memory_len}) doesn't match priorities length ({len(self.priorities)}). Fixing.")
+                # Adjust priorities to match memory length - take the most recent ones or pad with max_priority
+                if len(self.priorities) > memory_len:
+                    # If priorities is larger, trim it to match memory
+                    self.priorities = deque(list(self.priorities)[-memory_len:], maxlen=self.capacity)
+                else:
+                    # If priorities is smaller, pad with max_priority
+                    while len(self.priorities) < memory_len:
+                        self.priorities.append(self.max_priority)
+            
+            # Make a copy of priorities and memory to work with outside the lock
+            priorities_array = np.array(self.priorities)
+            memory_snapshot = list(self.memory)
+            indices_range = memory_len
+        
+        # Release the lock before doing the expensive sampling operations
+        # Calculate sampling probabilities
+        probabilities = priorities_array ** self.alpha
+        
+        # Normalize probabilities to sum to 1
+        sum_probs = np.sum(probabilities)
+        if sum_probs == 0:  # Avoid division by zero
+            print("Warning: All priorities are zero. Using uniform sampling.")
+            probabilities = np.ones_like(priorities_array) / indices_range
+        else:
+            probabilities = probabilities / sum_probs
+            
+        # Double-check sizes before sampling to prevent numpy error
+        if len(probabilities) != indices_range:
+            print(f"Error: Probability length ({len(probabilities)}) doesn't match memory length ({indices_range}). Using uniform sampling.")
+            # Fall back to uniform sampling
+            indices = np.random.choice(indices_range, batch_size, replace=False)
+        else:
+            # Sample indices based on priorities
+            try:
+                indices = np.random.choice(indices_range, batch_size, p=probabilities, replace=False)
+            except ValueError as e:
+                print(f"Sampling error: {e}. Falling back to uniform sampling.")
+                # Fall back to uniform sampling if there's an issue with weighted sampling
+                indices = np.random.choice(indices_range, batch_size, replace=False)
+        
+        experiences = [memory_snapshot[i] for i in indices]
+        
+        try:
+            # Calculate importance sampling weights
+            weights = (indices_range * probabilities[indices]) ** -beta
+            weights /= weights.max()  # Normalize weights
+            
+            # Prepare batch data for training - with more explicit conversion and error handling
+            # Convert state batch
+            states = np.vstack([e.state for e in experiences])
+            
+            # Convert action batch - ensure each action is a scalar
+            actions = np.array([int(e.action) for e in experiences]).reshape(-1, 1)
+            
+            # Convert reward batch
+            rewards = np.array([e.reward for e in experiences]).reshape(-1, 1)
+            
+            # Convert next_state batch
+            next_states = np.vstack([e.next_state for e in experiences])
+            
+            # Convert done flags
+            dones = np.array([e.done for e in experiences], dtype=np.uint8).reshape(-1, 1)
+            
+            # Convert to tensors
+            states_tensor = torch.from_numpy(states).float().to(device)
+            actions_tensor = torch.from_numpy(actions).long().to(device)
+            rewards_tensor = torch.from_numpy(rewards).float().to(device)
+            next_states_tensor = torch.from_numpy(next_states).float().to(device)
+            dones_tensor = torch.from_numpy(dones).float().to(device)
+            weights_tensor = torch.from_numpy(weights).float().unsqueeze(1).to(device)
+            
+            return states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor, weights_tensor, indices
+            
+        except (ValueError, TypeError) as e:
+            print(f"Error creating batch: {e}")
+            # Debug information to identify which part of the batch is causing issues
+            shapes = {
+                "states": [e.state.shape if hasattr(e.state, 'shape') else None for e in experiences],
+                "actions": [type(e.action) for e in experiences],
+                "rewards": [type(e.reward) for e in experiences],
+                "next_states": [e.next_state.shape if hasattr(e.next_state, 'shape') else None for e in experiences],
+                "dones": [type(e.done) for e in experiences]
+            }
+            print(f"Batch shapes: {shapes}")
+            return None, None, None, None, None, None, None
+    
+    def update_priorities(self, indices, td_errors):
+        """Update priorities based on TD errors"""
+        with self.lock:
+            for idx, error in zip(indices, td_errors):
+                if idx >= len(self.priorities):
+                    print(f"Warning: Index {idx} out of range for priorities list with length {len(self.priorities)}. Skipping.")
+                    continue
+                    
+                # Convert to float if not already and get absolute value
+                error_value = float(abs(error)) if not isinstance(error, float) else abs(error)
+                
+                # Add epsilon to prevent zero priority
+                raw_priority = error_value + self.epsilon
+                
+                # Clip priority to prevent extreme values from dominating sampling
+                # A reasonable upper bound based on typical TD error magnitudes
+                max_allowed_priority = 10.0  # Maximum allowed priority
+                raw_priority = min(raw_priority, max_allowed_priority)
+                
+                # Store priority (without alpha exponent - alpha is applied during sampling)
+                self.priorities[idx] = raw_priority
+                
+                # Update max_priority for new experiences
+                self.max_priority = max(self.max_priority, raw_priority)
         
     def __len__(self):
-        return len(self.memory)
+        with self.lock:
+            return len(self.memory)
 
 class DQN(nn.Module):
     """Deep Q-Network model."""
@@ -218,6 +358,16 @@ class DQNAgent:
         self.state_size = state_size
         self.action_size = action_size
         self.last_save_time = 0.0 # Initialize last save time
+        
+        # PER parameters
+        self.beta = PER_BETA_START
+        # Use a slower annealing rate for beta - adjust based on expected total training time
+        # This ensures beta increases more gradually throughout the entire training process
+        total_expected_frames = 20000000  # Adjust based on your expected total training duration
+        self.beta_increment = (1.0 - PER_BETA_START) / min(total_expected_frames, PER_BETA_FRAMES * 5)
+        
+        self.train_steps_count = 0  # Counter for target network updates
+        self.batch_size = batch_size  # Store batch size locally
         
         # Q-Networks (online and target)
         self.qnetwork_local = DQN(state_size, action_size).to(device)
@@ -265,25 +415,54 @@ class DQNAgent:
 
     def train_step(self):
         """Perform a single training step on one batch"""
-        if len(self.memory) < RL_CONFIG.batch_size:
+        if len(self.memory) < self.batch_size:
             return
             
-        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
+        # Get a batch using PER sampling with current beta value
+        states, actions, rewards, next_states, dones, weights, indices = self.memory.sample(self.batch_size, self.beta)
         
+        # If sample returned None (shouldn't happen due to our length check above, but just in case)
+        if states is None:
+            return
+            
+        # Calculate Q values from local network for the actions taken
         Q_expected = self.qnetwork_local(states).gather(1, actions)
         
+        # Calculate target Q values using Double DQN approach
         with torch.no_grad():
             best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
             Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
             Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
         
-        # Compute loss and perform optimization
-        criterion = SmoothL1Loss()
-        loss = criterion(Q_expected, Q_targets)
+        # Calculate TD errors for updating priorities
+        td_errors = (Q_targets - Q_expected).detach().cpu().numpy()
+        
+        # Update priorities in replay memory (using absolute TD errors)
+        self.memory.update_priorities(indices, np.abs(td_errors))
+        
+        # Compute loss using importance sampling weights
+        criterion = SmoothL1Loss(reduction='none')
+        elementwise_loss = criterion(Q_expected, Q_targets)
+        
+        # Ensure shapes match for weights and elementwise_loss before multiplication
+        # weights should be [batch_size, 1] and elementwise_loss should be [batch_size, 1]
+        weighted_loss = (weights * elementwise_loss).mean()
+        
+        # Perform optimization
         self.optimizer.zero_grad()
-        loss.backward() 
+        weighted_loss.backward() 
         self.optimizer.step() 
-        metrics.losses.append(loss.item())
+        metrics.losses.append(weighted_loss.item())
+        
+        # Anneal beta for importance sampling - slower increment for more stable training
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        
+        # Increment training step counter and update target network if needed
+        self.train_steps_count += 1
+        if self.train_steps_count % TARGET_UPDATE_FREQUENCY == 0:
+            self.update_target_network()
+            if DEBUG_MODE:
+                print(f"Target network updated at step {self.train_steps_count}, beta: {self.beta:.4f}")
 
     def update_target_network(self):
         """Update target network with weights from local network"""
@@ -317,6 +496,9 @@ class DQNAgent:
         # Add training task to queue if not full
         if not self.train_queue.full():
             self.train_queue.put(True)
+        
+        # Note: Target network updates are now handled exclusively in train_step
+        # based on training step count, not here based on frame count
             
     def save(self, filename):
         """Save model weights, rate-limited unless forced."""

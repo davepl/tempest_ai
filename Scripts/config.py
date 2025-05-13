@@ -63,6 +63,12 @@ class RLConfigData:
     train_freq: int = 4
     target_update: int = 10000
 
+    # PER parameters
+    per_alpha: float = 0.6  # Prioritization exponent
+    per_beta_start: float = 0.4  # Initial IS exponent
+    per_beta_frames: int = 1000000  # Frames to anneal beta to 1.0 (e.g., over 1M frames)
+    per_epsilon: float = 0.01  # Small constant added to priorities to ensure non-zero probability
+
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
 
@@ -255,4 +261,4 @@ metrics = MetricsData()
 # # #         from metrics_display import print_with_terminal_restore as _print
 # # #         _print(*args, **kwargs)
 # # #     else:
-# # #         print(*args, **kwargs) 
+# # #         print(*args, **kwargs)

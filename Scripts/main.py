@@ -86,13 +86,7 @@ def main():
     # Initialize the DQN agent
     agent = DQNAgent(
         state_size=RL_CONFIG.state_size,
-        action_size=RL_CONFIG.action_size,
-        learning_rate=RL_CONFIG.learning_rate,
-        gamma=RL_CONFIG.gamma,
-        epsilon=RL_CONFIG.epsilon,
-        epsilon_min=RL_CONFIG.epsilon_min,
-        memory_size=RL_CONFIG.memory_size,
-        batch_size=RL_CONFIG.batch_size
+        action_size=RL_CONFIG.action_size
     )
     
     # Load the model if it exists
@@ -154,4 +148,4 @@ def main():
         print("Application shutdown complete")
 
 if __name__ == "__main__":
-    main() 
+    main()
