@@ -11,13 +11,12 @@ from datetime import datetime
 import traceback
 
 from aimodel import (
-    DQNAgent, KeyboardHandler
+    DQNAgent, KeyboardHandler, display_metrics_header, display_metrics_row
 )
 from config import (
     RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
 )
 from socket_server import SocketServer
-from metrics_display import display_metrics_header, display_metrics_row
 
 def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
@@ -154,4 +153,4 @@ def main():
         print("Application shutdown complete")
 
 if __name__ == "__main__":
-    main() 
+    main()

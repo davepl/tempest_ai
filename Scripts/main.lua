@@ -250,8 +250,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         else print("Periodic Save: Sending save signal.") end
     end
 
-    -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 4 UByte)
-    local oob_format = ">HdBBBHHHBBBhBhBBBB"
+    -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 5 UByte)
+    local oob_format = ">HdBBBHHHBBBhBhBBBBB"
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
@@ -270,7 +270,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
-        expert_zap_packed           -- B: Expert Zap (uchar)
+        expert_zap_packed,          -- B: Expert Zap (uchar)
+        ls.level_number            -- B: Current Level Number (uchar)
     )
 
     -- Combine OOB header + main data
