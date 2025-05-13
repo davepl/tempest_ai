@@ -93,6 +93,7 @@ class MetricsData:
     lock: threading.Lock = field(default_factory=threading.Lock)
     total_inference_time: float = 0.0
     total_inference_requests: int = 0
+    average_level: float = 0.0 # Average level across connected clients
     
     def update_frame_count(self):
         """Update frame count and FPS tracking"""
@@ -255,4 +256,4 @@ metrics = MetricsData()
 # # #         from metrics_display import print_with_terminal_restore as _print
 # # #         _print(*args, **kwargs)
 # # #     else:
-# # #         print(*args, **kwargs) 
+# # #         print(*args, **kwargs)

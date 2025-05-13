@@ -132,6 +132,7 @@ class FrameData:
     open_level: bool
     expert_fire: bool  # Added: Expert system fire recommendation
     expert_zap: bool   # Added: Expert system zap recommendation
+    level_number: int  # Added: Current level number from Lua
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -148,7 +149,8 @@ class FrameData:
             player_seg=data["player_seg"],
             open_level=data["open_level"],
             expert_fire=data["expert_fire"],
-            expert_zap=data["expert_zap"]
+            expert_zap=data["expert_zap"],
+            level_number=data.get("level_number", 0)  # Default to 0 if not provided
         )
 
 # Configuration constants
@@ -196,15 +198,13 @@ class DQN(nn.Module):
         super(DQN, self).__init__()
         self.fc1 = nn.Linear(state_size, 768) 
         self.fc2 = nn.Linear(768, 512)  
-        self.fc3 = nn.Linear(512, 512)        
-        self.fc4 = nn.Linear(512, 192)        
-        self.out = nn.Linear(192, action_size) 
+        self.fc3 = nn.Linear(512, 256)        
+        self.out = nn.Linear(256, action_size)        
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
         return self.out(x)
 
 class DQNAgent:
@@ -627,7 +627,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">HdBBBHHHBBBhBhBBBB"  # Updated format string
+        format_str = ">HdBBBHHHBBBhBhBBBB"  # Updated format string with level_number field at the end
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
@@ -637,7 +637,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open, \
-        expert_fire, expert_zap = values  # Added expert recommendations
+        expert_fire, expert_zap, level_number = values  # Added level_number
         
         # Combine score components
         score = (score_high * 65536) + score_low
@@ -675,7 +675,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             player_seg=player_seg,
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
-            expert_zap=bool(expert_zap)
+            expert_zap=bool(expert_zap),
+            level_number=level_number  # Added level_number
         )
         
         return frame_data
@@ -688,7 +689,8 @@ def display_metrics_header(kb=None):
     if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Level Type':>10} | {'Override':>10}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'AvgLevel':>8} | {'Level Type':>10} | {'Override':>10} | "
+        f"{'PER Beta':>8} | {'Avg Prio':>8}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -710,6 +712,8 @@ def display_metrics_row(agent, kb=None):
             client_count = len(metrics.global_server.clients)
             # Update the metrics.client_count value
             metrics.client_count = client_count
+            # Calculate average level
+            metrics.global_server.calculate_average_level()
     
     # Determine override status
     override_status = "OFF"
@@ -721,7 +725,8 @@ def display_metrics_row(agent, kb=None):
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
+        f"{mem_size:8d} | {metrics.average_level:8.1f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | "
+        f"{metrics.beta:8.2f} | {metrics.average_priority:8.2f}"
     )
     print_with_terminal_restore(kb, row)
 

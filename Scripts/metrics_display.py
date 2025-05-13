@@ -58,7 +58,7 @@ def display_metrics_header():
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11}" # Removed TrainQ column
+        f"{'AvgInf(ms)':>11} {'AvgLevel':>9}" # Removed TrainQ column
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header
@@ -108,7 +108,7 @@ def display_metrics_row(agent, kb_handler):
         f"{int(latest_loss):>10} {metrics.client_count:>8} " # Format loss as integer
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
-        f"{avg_inference_time_ms:>11.2f}" # Removed TrainQ value
+        f"{avg_inference_time_ms:>11.2f} {metrics.average_level:>9.1f}" # Removed TrainQ value
     )
     
     print_metrics_line(row)
@@ -123,4 +123,4 @@ def run_stats_reporter(metrics):
             display_metrics_row(None, None)
         except Exception as e:
             print(f"Error in stats reporter: {e}")
-            time.sleep(1)  # Wait a bit before retrying 
+            time.sleep(1)  # Wait a bit before retrying

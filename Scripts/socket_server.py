@@ -91,7 +91,8 @@ class SocketServer:
                         'frames_processed': 0,
                         'fps': 0.0,  # Track per-client FPS
                         'frames_last_second': 0,  # Frames in current second
-                        'last_fps_update': time.time()  # Last FPS calculation time
+                        'last_fps_update': time.time(),  # Last FPS calculation time
+                        'level_number': 0   # Track current level number from client
                     }
                     
                     # Store client information
@@ -318,6 +319,10 @@ class SocketServer:
                         state = self.client_states[client_id]
                         state['frames_processed'] += 1
                         
+                        # Store level number from frame
+                        state['level_number'] = frame.level_number
+                        state['level_number'] = frame.level_number
+                        
                         # Update client-specific FPS tracking
                         current_time = time.time()
                         state['frames_last_second'] += 1
@@ -541,4 +546,20 @@ class SocketServer:
             
     def get_fps(self):
         with self.client_lock:
-            return self.metrics.fps 
+            return self.metrics.fps
+    
+    def calculate_average_level(self):
+        """Calculate average level across all connected clients"""
+        with self.client_lock:
+            # Filter out clients with level_number == 0 (not in a level yet)
+            valid_levels = [state['level_number'] for state in self.client_states.values() 
+                           if state.get('level_number', 0) > 0]
+            
+            if valid_levels:
+                avg_level = sum(valid_levels) / len(valid_levels)
+                # Update metrics with average level
+                metrics.average_level = avg_level
+                return avg_level
+            else:
+                metrics.average_level = 0
+                return 0
