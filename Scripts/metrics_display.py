@@ -95,13 +95,16 @@ def display_metrics_row(agent, kb_handler):
         # Reset counters for the next interval
         metrics.total_inference_time = 0.0
         metrics.total_inference_requests = 0
+    
+    # Display average level as 1-based instead of 0-based
+    display_level = metrics.average_level + 1.0
 
     # Format the row (Remove TrainQ)
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
         f"{int(latest_loss):>10} {metrics.client_count:>8} "  
-        f"{metrics.average_level:>10.1f} " # Added average level column
+        f"{display_level:>10.1f} " # Added average level column, displayed as 1-based
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
         f"{avg_inference_time_ms:>11.2f}" 

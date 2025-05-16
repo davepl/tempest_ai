@@ -197,12 +197,12 @@ class DQN(nn.Module):
     """Deep Q-Network model."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 768) 
-        self.fc2 = nn.Linear(768, 512)  
-        self.fc3 = nn.Linear(512, 256)        
-        self.fc4 = nn.Linear(256, 128)        
-        self.fc5 = nn.Linear(128, 64)         
-        self.out = nn.Linear(64, action_size) 
+        self.fc1 = nn.Linear(state_size, 1024) 
+        self.fc2 = nn.Linear(1024, 1024)  
+        self.fc3 = nn.Linear(1024, 768)        
+        self.fc4 = nn.Linear(768,  512)        
+        self.fc5 = nn.Linear(512, 256)         
+        self.out = nn.Linear(256, action_size) 
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -724,10 +724,13 @@ def display_metrics_row(agent, kb=None):
     elif metrics.expert_mode:
         override_status = "BOT"
     
+    # Display average level as 1-based instead of 0-based
+    display_level = metrics.average_level + 1.0
+    
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {metrics.average_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
+        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
     )
     print_with_terminal_restore(kb, row)
 
