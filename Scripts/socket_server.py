@@ -92,7 +92,8 @@ class SocketServer:
                         'fps': 0.0,  # Track per-client FPS
                         'frames_last_second': 0,  # Frames in current second
                         'last_fps_update': time.time(),  # Last FPS calculation time
-                        'level_number': 0  # Track level number for each client
+                        'level_number': 0,  # Track level number for each client
+                        'last_frame_time': time.time()  # Ensure this is initialized
                     }
                     
                     # Store client information
