@@ -18,6 +18,16 @@ local function format_segment(value)
     end
 end
 
+-- Helper function to format a fixed-width segment value for our enemy tables
+local function format_enemy_segment(value)
+    if value == 0 then
+        return "---"
+    else
+        -- Use %+03d: always show sign, pad with 0 to total width 3
+        return string.format("%+03d", value)
+    end
+end
+
 -- Function to format section for display
 local function format_section(title, metrics)
     local width = 80 -- Adjusted width for standard terminal
@@ -162,10 +172,27 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     display_str = display_str .. "Enemy Shots Pos:" .. e_shots_pos_str .. "\n"
     display_str = display_str .. "Enemy Shots Seg:" .. e_shots_seg_str .. "\n\n"
 
-    -- Charging Fuseballs
-    local charging_fuseball_str = {}
-    for i = 1, 16 do table.insert(charging_fuseball_str, enemies_state.charging_fuseball_segments[i] == 1 and "*" or "-") end
-    display_str = display_str .. "Fuseball Chrg: " .. table.concat(charging_fuseball_str, " ") .. "\n\n"
+    -- Display our three enemy tables with consistent formatting
+    -- Charging Fuseballs array (7 entries)
+    local charging_fuseball_str = "Charging Fuseball: "
+    for i = 1, 7 do
+        charging_fuseball_str = charging_fuseball_str .. format_enemy_segment(enemies_state.charging_fuseball[i]) .. " "
+    end
+    display_str = display_str .. charging_fuseball_str .. "\n"
+    
+    -- Active Pulsars array (7 entries)
+    local active_pulsar_str = "Active Pulsars:    "
+    for i = 1, 7 do
+        active_pulsar_str = active_pulsar_str .. format_enemy_segment(enemies_state.active_pulsar[i]) .. " "
+    end
+    display_str = display_str .. active_pulsar_str .. "\n"
+    
+    -- Top Rail Enemies array (7 entries)
+    local top_rail_enemies_str = "Top Rail Enemies:  "
+    for i = 1, 7 do
+        top_rail_enemies_str = top_rail_enemies_str .. format_enemy_segment(enemies_state.active_top_rail_enemies[i]) .. " "
+    end
+    display_str = display_str .. top_rail_enemies_str .. "\n\n"
 
     -- Pending Data (Show first 16 for brevity)
     local pending_vid_str = ""
@@ -185,4 +212,4 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     io.flush() -- Ensure output is written immediately
 end
 
-return M 
+return M

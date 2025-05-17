@@ -18,11 +18,11 @@ local logic = require("logic") -- ADDED: Require the new logic module
 local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
-local SHOW_DISPLAY            = false
+local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 17
 local DISPLAY_UPDATE_INTERVAL = 0.02
-local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
+local SOCKET_ADDRESS          = "socket.localhost:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
@@ -212,8 +212,12 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 4 do insert(data, es.shot_positions[i]) end
     -- Enemy shot segments (4)
     for i = 1, 4 do insert(data, es.enemy_shot_segments[i]) end
-    -- Charging Fuseball flags (16)
-    for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
+    -- Charging Fuseball segments (7 entries showing relative segment to player for each charging fuseball)
+    for i = 1, 7 do insert(data, es.charging_fuseball[i]) end
+    -- Active Pulsar segments (7 entries showing relative segment to player for each pulsar)
+    for i = 1, 7 do insert(data, es.active_pulsar[i]) end
+    -- Top Rail Enemy segments (7 entries showing relative segment to player for each top rail pulsar/flipper)
+    for i = 1, 7 do insert(data, es.active_top_rail_enemies[i]) end
     -- Pending Vid (64)
     for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
