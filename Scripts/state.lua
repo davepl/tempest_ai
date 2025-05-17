@@ -682,8 +682,17 @@ function M.EnemiesState:new()
     self.pending_vid = {}              -- ($0243 + i - 1)
     self.pending_seg = {}              -- Relative segment ($0203 + i - 1, or INVALID_SEGMENT)
 
-    -- Charging Fuseball Tracking (Size 16, indexed 1-16 for abs seg 0-15)
-    self.charging_fuseball_segments = {} -- 1 if charging in segment, 0 otherwise
+    -- Charging Fuseball Tracking (Size 7, one per enemy slot that can be a fuseball)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no charging fuseball)
+    self.charging_fuseball = {} -- Relative segments of charging fuseballs
+    
+    -- Pulsar Tracking (Size 7, one per enemy slot that can be a pulsar)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no pulsar)
+    self.active_pulsar = {} -- Relative segments of pulsars
+    
+    -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper at depth 0x20)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no valid enemy)
+    self.active_top_rail_enemies = {} -- Relative segments of pulsars/flippers at the top rail
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -717,8 +726,10 @@ function M.EnemiesState:new()
         self.pending_vid[i] = 0
         self.pending_seg[i] = INVALID_SEGMENT
     end
-    for i = 1, 16 do
-        self.charging_fuseball_segments[i] = 0
+    for i = 1, 7 do
+        self.charging_fuseball[i] = 0
+        self.active_pulsar[i] = 0
+        self.active_top_rail_enemies[i] = 0
     end
 
     return self
@@ -797,14 +808,26 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     end -- End enemy slot loop
 
     -- Calculate charging Fuseball segments (reset first)
-    for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
+    for i = 1, 7 do 
+        self.charging_fuseball[i] = 0
+        self.active_pulsar[i] = 0
+        self.active_top_rail_enemies[i] = 0
+    end
+    
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
         if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
-            local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
-            if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
-                 self.charging_fuseball_segments[abs_segment_idx] = 1
-            end
+            self.charging_fuseball[i] = self.enemy_segments[i]
+        end
+        
+        -- Check if it's an active Pulsar (type 1)
+        if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then -- Pulsar type 1
+            self.active_pulsar[i] = self.enemy_segments[i]
+        end
+
+        -- Check if it's a top rail Pulsar or Flipper at depth 0x20
+        if (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] == 0x10 then
+            self.active_top_rail_enemies[i] = self.enemy_segments[i]
         end
     end
 
@@ -915,4 +938,4 @@ function M.EnemiesState:get_total_active()
 end
 
 -- Return the module table
-return M 
+return M
