@@ -20,7 +20,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 -- Constants
 local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
-local START_LEVEL_MIN         = 9
+local START_LEVEL_MIN         = 33
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
