@@ -192,7 +192,19 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     for i = 1, 7 do
         top_rail_enemies_str = top_rail_enemies_str .. format_enemy_segment(enemies_state.active_top_rail_enemies[i]) .. " "
     end
-    display_str = display_str .. top_rail_enemies_str .. "\n\n"
+    display_str = display_str .. top_rail_enemies_str .. "\n"
+    
+    -- Fractional Enemy Segments array (7 entries)
+    local fractional_segs_str = "Fractional Segs:   "
+    for i = 1, 7 do
+        local value = enemies_state.fractional_enemy_segments_by_slot[i]
+        if value == INVALID_SEGMENT then
+            fractional_segs_str = fractional_segs_str .. " ---- "
+        else
+            fractional_segs_str = fractional_segs_str .. string.format(" %04X ", value & 0xFFFF)
+        end
+    end
+    display_str = display_str .. fractional_segs_str .. "\n\n"
 
     -- Pending Data (Show first 16 for brevity)
     local pending_vid_str = ""

@@ -693,6 +693,10 @@ function M.EnemiesState:new()
     -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper at depth 0x20)
     -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no valid enemy)
     self.active_top_rail_enemies = {} -- Relative segments of pulsars/flippers at the top rail
+    
+    -- NEW: Fractional Enemy Segments By Slot (Size 7, indexed 1-7)
+    -- Stores fractional segment position as 12-bit integer
+    self.fractional_enemy_segments_by_slot = {}
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -730,6 +734,7 @@ function M.EnemiesState:new()
         self.charging_fuseball[i] = 0
         self.active_pulsar[i] = 0
         self.active_top_rail_enemies[i] = 0
+        self.fractional_enemy_segments_by_slot[i] = 0
     end
 
     return self
@@ -870,6 +875,18 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- Read pending_vid (64 bytes starting at 0x0243)
     for i = 1, 64 do
         self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
+    end
+    
+    -- Calculate fractional enemy segments (scaled to 12 bits)
+    for i = 1, 7 do
+        if self.enemy_segments[i] == INVALID_SEGMENT then
+            self.fractional_enemy_segments_by_slot[i] = INVALID_SEGMENT -- Keep as invalid
+        else
+            -- Convert fractional segment to a 12-bit value
+            local scaled_value = math.floor(self.enemy_segments[i] * 4096) -- Scale to 12 bits
+            scaled_value = math.max(-4095, math.min(4095, scaled_value)) -- Clamp to signed 12-bit range
+            self.fractional_enemy_segments_by_slot[i] = scaled_value
+        end
     end
 
     -- === Calculate and store nearest enemy segment and engineered features ===
