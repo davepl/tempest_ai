@@ -218,10 +218,12 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 7 do insert(data, es.active_pulsar[i]) end
     -- Top Rail Enemy segments (7 entries showing relative segment to player for each top rail pulsar/flipper)
     for i = 1, 7 do insert(data, es.active_top_rail_enemies[i]) end
+    -- Fractional Enemy segments (7 entries showing fractional segment position scaled to 12-bits)
+    for i = 1, 7 do insert(data, es.fractional_enemy_segments_by_slot[i]) end
     -- Pending Vid (64)
-    for i = 1, 64 do insert(data, es.pending_vid[i]) end
+    -- for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
-    for i = 1, 64 do insert(data, es.pending_seg[i]) end
+    -- for i = 1, 64 do insert(data, es.pending_seg[i]) end
 
     -- Total main payload size should be: 5+5+23+35+16+42+7+7+7+4+4+16+64+64 = 299
 
