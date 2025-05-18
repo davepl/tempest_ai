@@ -12,7 +12,7 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local SAFE_DISTANCE = 1
+local SAFE_DISTANCE = 3
 local FREEZE_FIRE_PRIO_LOW = 4
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 4
@@ -127,7 +127,7 @@ function M.fuseball_check(player_abs_seg, enemies_state, is_open, abs_to_rel_fun
     local escape_target_seg = -1
     for i = 1, 7 do
         if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and
-           enemies_state.enemy_depths[i] <= 0x10 and
+           enemies_state.enemy_depths[i] <= 0x40 and
            enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then
             local fuseball_abs_seg = enemies_state.enemy_abs_segments[i]
             local rel_dist = abs_to_rel_func(player_abs_seg, fuseball_abs_seg, is_open)
@@ -376,8 +376,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 end
             end
             if nearest_threat_seg then
-                if nearest_threat_rel > 0 then proposed_target_seg = (nearest_threat_seg - 1 + 16) % 16
-                elseif nearest_threat_rel < 0 then proposed_target_seg = (nearest_threat_seg + 1 + 16) % 16
+                if nearest_threat_rel > 0 then proposed_target_seg = (nearest_threat_seg - SAFE_DISTANCE + 16) % 16
+                elseif nearest_threat_rel < 0 then proposed_target_seg = (nearest_threat_seg + SAFE_DISTANCE + 16) % 16
                 else proposed_target_seg = player_abs_seg end
             else -- Fallback: No Flippers/Pulsars, use midpoint
                  if is_open then local mid = math.floor((nl_seg + nr_seg) / 2); proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
@@ -486,6 +486,26 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     local detected_spinner = player_state.spinner_detected
 
     if player_state.alive == 1 then
+
+        -- Player is alive; check to see if they are on a pulsar segment
+        local player_segment = player_state.position & 0x0F
+        if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing > PULSAR_THRESHOLD then
+            reward = reward - 100 -- Deduct 100 reward if on a pulsar segment
+        end
+
+        -- If this is a fusebal charging lane, reward large spinner movement to escape
+
+        if enemies_state.fuseball_threat_nearby then
+            local fuseball_escape_target = enemies_state.fuseball_escape_target
+            if fuseball_escape_target ~= -1 then
+                local rel_dist = abs_to_rel_func(player_segment, fuseball_escape_target, level_state.level_type == 0xFF)
+                if math.abs(rel_dist) <= 2 then reward = reward + 100 end -- Reward for escaping fuseball threat
+            end
+        end
+
+        
+
+
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta <= 1000 then reward = reward + score_delta end
 
