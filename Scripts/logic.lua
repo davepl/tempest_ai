@@ -12,10 +12,10 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local SAFE_DISTANCE = 3
-local FREEZE_FIRE_PRIO_LOW = 4
+local SAFE_DISTANCE = 1
+local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
-local AVOID_FIRE_PRIORITY = 4
+local AVOID_FIRE_PRIORITY = 3
 local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance
 
 local M = {} -- Module table
