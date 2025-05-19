@@ -33,7 +33,7 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 183
-    expert_ratio_start: float = 1.0
+    expert_ratio_start: float = 0.0
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.999
     expert_ratio_decay_steps: int = 10000
@@ -52,9 +52,9 @@ class RLConfigData:
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.01
+    epsilon_end: float = 0.001
     epsilon_min: float = 0.001
-    epsilon_decay_factor: float = 0.9969 # Multiplicative factor per step (Adjusted for ~15M frames)
+    epsilon_decay_factor: float = 0.999 # Multiplicative factor per step
     epsilon_decay_steps: int = 10000   # Frames per decay step
     update_target_every: int = 500
     learning_rate: float = 0.001

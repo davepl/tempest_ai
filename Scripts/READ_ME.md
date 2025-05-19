@@ -28,7 +28,6 @@ Started grabbing inferred values, thinking it more accurately captures the curre
 
 Now at 5M frames it was hunting effectively
 
-ToDo:
+May 18-25:
+With smaller model and enemy avoidance rewards, makes it to yellow on a couple of players by 25M frames (Start 15)
 
-- Consider adding fractional lsb info to current positions/depths
-- 

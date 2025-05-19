@@ -53,12 +53,12 @@ def display_metrics_header():
     # Clear screen first
     # clear_screen()
     
-    # Print header (Remove TrainQ)
+    # Print header (Remove Open/Closed level column)
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11}" # Added Avg Level column
+        f"{'AvgInf(ms)':>11}"
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header

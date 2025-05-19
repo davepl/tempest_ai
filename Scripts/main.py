@@ -11,11 +11,12 @@ from datetime import datetime
 import traceback
 
 from aimodel import (
-    DQNAgent, KeyboardHandler, display_metrics_header, display_metrics_row
+    DQNAgent, KeyboardHandler
 )
 from config import (
     RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
 )
+from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
 
 def stats_reporter(agent, kb_handler):
@@ -69,6 +70,10 @@ def keyboard_input_handler(agent, keyboard_handler):
                     display_metrics_row(agent, keyboard_handler)
                 elif key == 'e':
                     metrics.toggle_expert_mode(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == ' ':  # Handle space key
+                    # Display the header and one row of metrics
+                    display_metrics_header()
                     display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)
