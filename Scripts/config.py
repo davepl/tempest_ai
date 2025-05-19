@@ -54,7 +54,7 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.001
     epsilon_min: float = 0.001
-    epsilon_decay_factor: float = 0.999 # Multiplicative factor per step
+    epsilon_decay_factor: float = 0.996 # Multiplicative factor per step
     epsilon_decay_steps: int = 10000   # Frames per decay step
     update_target_every: int = 500
     learning_rate: float = 0.001
