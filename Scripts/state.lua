@@ -55,9 +55,9 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
                 -- print(string.format("  -> FORBIDDEN (Pulsing Pulsar): Slot %d, Seg %d", i, abs_seg)) -- DEBUG
                 forbidden[abs_seg] = true
             end
-            -- 2. Top-level enemies (depth <= 0x20)
+            -- 2. Top-level enemies (depth <= 0x10)
             -- Includes Flippers, Pulsars, Tankers, Fuseballs, Spikers if they are close
-            if depth <= 0x20 then
+            if depth <= 0x10 then
                  -- print(string.format("  -> FORBIDDEN (Top Enemy): Slot %d, Type %d, Seg %d, Depth %02X", i, core_type, abs_seg, depth)) -- DEBUG
                  forbidden[abs_seg] = true
             end
@@ -71,7 +71,7 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
         local shot_abs_seg = enemies_state.enemy_shot_abs_segments[i]
         local shot_depth = enemies_state.shot_positions[i]
         -- Mark forbidden if shot is close AND player cannot shoot back
-        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= 0x20 and not has_ammo then
+        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= 0x30 and not has_ammo then
             -- print(string.format("  -> FORBIDDEN (Enemy Shot): Shot %d, Seg %d, Depth %02X", i, shot_abs_seg, shot_depth)) -- DEBUG
             forbidden[shot_abs_seg] = true
         end
@@ -172,10 +172,10 @@ hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_f
     -- Corrected Hunt Order (based on assembly types): Fuseball(4), Pulsar(1), Tanker(2), Flipper(0), Spiker(3)
     local hunt_order = {
         ENEMY_TYPE_FUSEBALL, -- 4
-        ENEMY_TYPE_PULSAR,   -- 1
         ENEMY_TYPE_TANKER,   -- 2
         ENEMY_TYPE_FLIPPER,  -- 0
-        ENEMY_TYPE_SPIKER    -- 3
+        ENEMY_TYPE_SPIKER,   -- 3
+        ENEMY_TYPE_PULSAR    -- 1
     }
 
     for _, enemy_type in ipairs(hunt_order) do

@@ -318,29 +318,65 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local nearest_flipper_seg = nil -- Specifically track nearest flipper
         local nearest_flipper_rel = nil
         local min_flipper_abs_rel = 100
+        local nearest_flipper_frac_pos = 0 -- Track fractional position
 
         for i = 1, 7 do
             local depth = enemies_state.enemy_depths[i]
             if depth > 0 and depth <= TOP_RAIL_DEPTH then
                 local seg = enemies_state.enemy_abs_segments[i]
                 if seg ~= INVALID_SEGMENT then
-                    local rel = abs_to_rel_func(player_abs_seg, seg, is_open)
-                    local abs_rel = math.abs(rel)
+                    -- Get fractional position (scaled to 0-1 range)
+                    local frac_pos = 0
+                    if enemies_state.fractional_enemy_segments_by_slot[i] ~= INVALID_SEGMENT then
+                        frac_pos = enemies_state.fractional_enemy_segments_by_slot[i] / 4096.0
+                    end
+                    
+                    -- Get both integer and floating point relative positions
+                    local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
+                    
+                    -- Store fractional position for detailed calculations but use integer position for main logic
+                    local rel_float = rel_int
+                    if rel_int > 0 then
+                        rel_float = rel_int + frac_pos
+                    elseif rel_int < 0 then
+                        rel_float = rel_int - (1 - frac_pos)  -- Adjust for negative direction
+                    end
+                    
+                    -- Use integer-based absolute distance for critical comparisons
+                    local abs_rel_int = math.abs(rel_int)
+                    local abs_rel_float = math.abs(rel_float)
                     local core_type = enemies_state.enemy_core_type[i]
 
-                    if abs_rel <= 1 then any_enemy_proximate = true end
-                    table.insert(top_rail_enemies, {seg = seg, rel = rel, abs_rel = abs_rel, type = core_type})
+                    if abs_rel_int <= 1 then any_enemy_proximate = true end
+                    table.insert(top_rail_enemies, {
+                        seg = seg, 
+                        rel = rel_int,  -- Store integer position for main comparisons
+                        rel_float = rel_float, -- Store float for detailed calculations
+                        abs_rel = abs_rel_int, -- Use integer-based distance
+                        type = core_type,
+                        frac_pos = frac_pos
+                    })
 
-                    -- Update nearest overall left/right
-                    if rel > 0 and abs_rel < nr_dist then nr_dist, nr_seg, enemy_right_exists = abs_rel, seg, true end
-                    if rel < 0 and abs_rel < nl_dist then nl_dist, nl_seg, enemy_left_exists = abs_rel, seg, true end
+                    -- Update nearest overall left/right (using integer positions for critical logic)
+                    if rel_int > 0 and abs_rel_int < nr_dist then 
+                        nr_dist = abs_rel_int
+                        nr_seg = seg
+                        enemy_right_exists = true 
+                    end
+                    
+                    if rel_int < 0 and abs_rel_int < nl_dist then 
+                        nl_dist = abs_rel_int
+                        nl_seg = seg
+                        enemy_left_exists = true 
+                    end
 
-                    -- Update nearest flipper specifically
+                    -- Update nearest flipper specifically - use floating point for detailed positioning
                     if core_type == ENEMY_TYPE_FLIPPER then
-                        if abs_rel < min_flipper_abs_rel then
-                             min_flipper_abs_rel = abs_rel
+                        if abs_rel_float < min_flipper_abs_rel then
+                             min_flipper_abs_rel = abs_rel_float
                              nearest_flipper_seg = seg
-                             nearest_flipper_rel = rel
+                             nearest_flipper_rel = rel_float
+                             nearest_flipper_frac_pos = frac_pos
                         end
                     end
                 end
@@ -368,29 +404,82 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
 
         if enemy_left_exists and enemy_right_exists then
-            -- Case 1: Both Sides - Find nearest threat, target inside or midpoint fallback
+            -- Case 1: Both Sides - Find nearest threat and apply alternating strategy
             local nearest_threat_seg, nearest_threat_rel, min_threat_abs_rel = nil, nil, 100
             for _, enemy in ipairs(top_rail_enemies) do
                 if enemy.type == ENEMY_TYPE_FLIPPER or enemy.type == ENEMY_TYPE_PULSAR then
-                    if enemy.abs_rel < min_threat_abs_rel then min_threat_abs_rel, nearest_threat_seg, nearest_threat_rel = enemy.abs_rel, enemy.seg, enemy.rel end
+                    if enemy.abs_rel < min_threat_abs_rel then 
+                        min_threat_abs_rel = enemy.abs_rel
+                        nearest_threat_seg = enemy.seg
+                        nearest_threat_rel = enemy.rel 
+                    end
                 end
             end
             if nearest_threat_seg then
-                if nearest_threat_rel > 0 then proposed_target_seg = (nearest_threat_seg - SAFE_DISTANCE + 16) % 16
-                elseif nearest_threat_rel < 0 then proposed_target_seg = (nearest_threat_seg + SAFE_DISTANCE + 16) % 16
-                else proposed_target_seg = player_abs_seg end
+                if is_open then
+                    -- Original open level strategy
+                    if nearest_threat_rel > 0 then proposed_target_seg = 0 else proposed_target_seg = 15 end
+                else
+                    -- Apply the successful alternating segments strategy
+                    if nearest_threat_rel > 0 then
+                        -- Enemy is to the right of player
+                        if min_threat_abs_rel < SAFE_DISTANCE then
+                            local safe_offset = math.floor(min_threat_abs_rel * 2) + 1
+                            safe_offset = math.max(1, math.min(2, safe_offset))
+                            proposed_target_seg = (nearest_threat_seg - safe_offset + 16) % 16
+                        else
+                            proposed_target_seg = player_abs_seg
+                        end
+                    elseif nearest_threat_rel < 0 then
+                        -- Enemy is to the left of player
+                        if min_threat_abs_rel < SAFE_DISTANCE then
+                            local safe_offset = math.floor(min_threat_abs_rel * 2) + 1
+                            safe_offset = math.max(1, math.min(2, safe_offset))
+                            proposed_target_seg = (nearest_threat_seg + safe_offset) % 16
+                        else
+                            proposed_target_seg = player_abs_seg
+                        end
+                    else
+                        proposed_target_seg = player_abs_seg
+                    end
+                end
             else -- Fallback: No Flippers/Pulsars, use midpoint
-                 if is_open then local mid = math.floor((nl_seg + nr_seg) / 2); proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
-                 else local dist = (nr_seg - nl_seg + 16) % 16; proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16 end
+                 if is_open then 
+                    local mid = math.floor((nl_seg + nr_seg) / 2)
+                    proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
+                 else 
+                    local dist = (nr_seg - nl_seg + 16) % 16
+                    proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16 
+                 end
             end
         elseif enemy_right_exists then
-            -- Case 2: Right Only
-            if is_open then proposed_target_seg = (nr_dist <= 1) and 0 or 1
-            else if nr_dist < SAFE_DISTANCE then proposed_target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16 else proposed_target_seg = player_abs_seg end end
+            -- Case 2: Right Only - Use adaptive distance approach
+            if is_open then 
+                proposed_target_seg = (nr_dist <= 1) and 0 or 1  -- Original working code for open level
+            else 
+                if nr_dist < SAFE_DISTANCE then
+                    -- Use alternating safe distance based on distance
+                    local safe_offset = math.floor(nr_dist * 2) + 1  -- Calculate offset based on distance
+                    safe_offset = math.max(1, math.min(2, safe_offset))  -- Keep between 1-2
+                    proposed_target_seg = (nr_seg - safe_offset + 16) % 16
+                else 
+                    proposed_target_seg = player_abs_seg 
+                end 
+            end
         elseif enemy_left_exists then
-             -- Case 3: Left Only
-            if is_open then proposed_target_seg = (nl_dist <= 1) and 14 or 13
-            else if nl_dist < SAFE_DISTANCE then proposed_target_seg = (nl_seg + SAFE_DISTANCE) % 16 else proposed_target_seg = player_abs_seg end end
+            -- Case 3: Left Only - Mirror the right-only strategy for consistency  
+            if is_open then 
+                proposed_target_seg = (nl_dist <= 1) and 14 or 13  -- Original working code for open level
+            else 
+                if nl_dist < SAFE_DISTANCE then
+                    -- Use alternating safe distance based on distance
+                    local safe_offset = math.floor(nl_dist * 2) + 1  -- Calculate offset based on distance
+                    safe_offset = math.max(1, math.min(2, safe_offset))  -- Keep between 1-2
+                    proposed_target_seg = (nl_seg + safe_offset) % 16
+                else 
+                    proposed_target_seg = player_abs_seg 
+                end 
+            end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
             if M.is_danger_lane(player_abs_seg, enemies_state) then
