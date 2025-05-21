@@ -23,7 +23,7 @@ def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
     print("Starting stats reporter thread...")
     last_report = time.time()
-    report_interval = 10.0  # Report every 10 seconds
+    report_interval = 300  # 5 minutes in seconds 
     
     # Display the header once at the beginning
     display_metrics_header()
@@ -135,14 +135,30 @@ def main():
     last_save_time = time.time()
     save_interval = 300  # 5 minutes in seconds
     
+    # Track last plateau check time
+    last_plateau_check = time.time()
+    plateau_check_interval = 600  # Check for plateaus every 10 minutes
+    
     try:
         # Keep the main thread alive
         while server.running:
             current_time = time.time()
+            
             # Save model every 5 minutes
             if current_time - last_save_time >= save_interval:
                 agent.save(LATEST_MODEL_PATH)
                 last_save_time = current_time
+                
+            # Check for plateaus periodically
+            if current_time - last_plateau_check >= plateau_check_interval:
+                is_plateaued = metrics.detect_plateau()
+                if is_plateaued:
+                    print(f"Performance plateau detected! Plateau counter: {metrics.plateau_counter}")
+                    # Force a learning rate update
+                    new_lr = metrics.update_learning_rate()
+                    print(f"Adjusting learning rate to {new_lr:.8f} to break through plateau")
+                last_plateau_check = current_time
+                
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard interrupt received, saving and shutting down...")

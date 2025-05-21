@@ -55,7 +55,7 @@ def display_metrics_header():
     
     # Print header (Remove Open/Closed level column)
     header = (
-        f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
+        f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} {'LR':>10} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
         f"{'AvgInf(ms)':>11}"
@@ -102,7 +102,8 @@ def display_metrics_row(agent, kb_handler):
     # Format the row (Remove TrainQ)
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
-        f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
+        f"{metrics.expert_ratio*100:>7.1f}% {metrics.current_learning_rate:>10.8f} " # Add learning rate
+        f"{int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
         f"{int(latest_loss):>10} {metrics.client_count:>8} "  
         f"{display_level:>10.1f} " # Added average level column, displayed as 1-based
         f"{'ON' if metrics.override_expert else 'OFF':>9} "

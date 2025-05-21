@@ -582,7 +582,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             reward = reward - 100 -- Deduct 100 reward if on a pulsar segment
         end
 
-        -- If this is a fusebal charging lane, reward large spinner movement to escape
+        if player_state.shot_count == 0 then
+            reward = reward - 100
+        elseif player_state.shot_count >= 8 then
+            reward = reward - 200
+        end
 
         if enemies_state.fuseball_threat_nearby then
             local fuseball_escape_target = enemies_state.fuseball_escape_target
@@ -591,9 +595,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 if math.abs(rel_dist) <= 2 then reward = reward + 100 end -- Reward for escaping fuseball threat
             end
         end
-
-        
-
 
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta <= 1000 then reward = reward + score_delta end
@@ -617,8 +618,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         elseif target_abs_segment < 0 then -- No Enemies Reward
             reward = reward + (detected_spinner == 0 and 150 or -20)
-            if player_state.fire_commanded == 1 then reward = reward - 100 end
-
         else -- Enemies Present Reward
             local desired_spinner, segment_distance, _ = M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
             if segment_distance == 0 then -- Aligned Reward

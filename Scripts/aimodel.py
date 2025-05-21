@@ -265,6 +265,17 @@ class DQNAgent:
         """Perform a single training step on one batch"""
         if len(self.memory) < RL_CONFIG.batch_size:
             return
+        
+        # Check for plateaus and update learning rate if needed
+        if metrics.frame_count % 10000 == 0:  # Check periodically
+            metrics.detect_plateau()
+        
+        # Update learning rate based on plateau detection and decay schedule
+        current_lr = metrics.update_learning_rate()
+        
+        # Apply new learning rate to optimizer if it has changed
+        if current_lr != self.optimizer.param_groups[0]['lr']:
+            self.update_optimizer_learning_rate(current_lr)
             
         states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
         
@@ -286,7 +297,12 @@ class DQNAgent:
     def update_target_network(self):
         """Update target network with weights from local network"""
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-        
+    
+    def update_optimizer_learning_rate(self, new_lr):
+        """Update the learning rate in the optimizer"""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+            
     def act(self, state, epsilon=0.0):
         """Select action using epsilon-greedy policy"""
         # Convert state to tensor
@@ -346,7 +362,14 @@ class DQNAgent:
                 'frame_count': metrics.frame_count,
                 'expert_ratio': ratio_to_save, # Save the determined ratio
                 'last_decay_step': metrics.last_decay_step,
-                'last_epsilon_decay_step': metrics.last_epsilon_decay_step
+                'last_epsilon_decay_step': metrics.last_epsilon_decay_step,
+                # Save learning rate parameters
+                'current_learning_rate': metrics.current_learning_rate,
+                'learning_rate_min': metrics.learning_rate_min,
+                'learning_rate_decay_factor': metrics.learning_rate_decay_factor,
+                'learning_rate_decay_steps': metrics.learning_rate_decay_steps,
+                'last_lr_decay_step': metrics.last_lr_decay_step,
+                'plateau_counter': metrics.plateau_counter
             }, filename)
             
             # Update last save time ONLY on successful save
@@ -376,18 +399,37 @@ class DQNAgent:
                     metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
                     metrics.last_decay_step = 0
                     metrics.last_epsilon_decay_step = 0 # Reset epsilon step tracker
+                    # Reset learning rate parameters
+                    metrics.current_learning_rate = RL_CONFIG.learning_rate
+                    metrics.last_lr_decay_step = 0
+                    metrics.plateau_counter = 0
                 else:
                     # Load metrics from checkpoint
                     metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
                     metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
                     metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
                     metrics.last_epsilon_decay_step = checkpoint.get('last_epsilon_decay_step', 0) # Load epsilon step tracker
-                                
+                    
+                    # Load learning rate parameters
+                    metrics.current_learning_rate = checkpoint.get('current_learning_rate', RL_CONFIG.learning_rate)
+                    metrics.learning_rate_min = checkpoint.get('learning_rate_min', metrics.learning_rate_min)
+                    metrics.learning_rate_decay_factor = checkpoint.get('learning_rate_decay_factor', metrics.learning_rate_decay_factor)
+                    metrics.learning_rate_decay_steps = checkpoint.get('learning_rate_decay_steps', metrics.learning_rate_decay_steps)
+                    metrics.last_lr_decay_step = checkpoint.get('last_lr_decay_step', 0)
+                    metrics.plateau_counter = checkpoint.get('plateau_counter', 0)
+                    
+                    # Update optimizer with loaded learning rate
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = metrics.current_learning_rate
+                
                 print(f"Loaded model from {filename}")
                 print(f"  - Resuming from frame: {metrics.frame_count}")
                 print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
                 print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
                 print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")
+                print(f"  - Resuming learning rate: {metrics.current_learning_rate:.8f}")
+                print(f"  - Plateau counter: {metrics.plateau_counter}")
+                print(f"  - Learning rate decay step: {metrics.last_lr_decay_step}")
 
                 return True
             except Exception as e:
@@ -827,3 +869,40 @@ def decay_expert_ratio(current_step):
         metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
         
     return metrics.expert_ratio
+
+def decay_learning_rate(frame_count, current_lr, plateau_counter=0):
+    """
+    Decay the learning rate based on frame count and plateau detection
+    
+    Args:
+        frame_count: Current frame count
+        current_lr: Current learning rate
+        plateau_counter: Number of consecutive plateaus detected
+    
+    Returns:
+        New learning rate value
+    """
+    # Only decay every N steps
+    decay_steps = metrics.learning_rate_decay_steps
+    
+    # If we're not at a decay step yet, return current value
+    step_interval = frame_count // decay_steps
+    if step_interval <= metrics.last_lr_decay_step:
+        return current_lr
+    
+    # Mark this as a decay step
+    metrics.last_lr_decay_step = step_interval
+    
+    # Regular decay
+    new_lr = current_lr * metrics.learning_rate_decay_factor
+    
+    # Additional decay if we're plateaued
+    if plateau_counter > 0:
+        # More aggressive decay when plateaued
+        plateau_factor = max(0.5, 0.9 ** min(10, plateau_counter))
+        new_lr *= plateau_factor
+    
+    # Ensure we don't go below minimum
+    new_lr = max(metrics.learning_rate_min, new_lr)
+    
+    return new_lr

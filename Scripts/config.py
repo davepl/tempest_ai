@@ -33,7 +33,7 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 183
-    expert_ratio_start: float = 0.0
+    expert_ratio_start: float = 1.0
     expert_ratio_min: float = 0.0
     expert_ratio_decay: float = 0.999
     expert_ratio_decay_steps: int = 10000
@@ -54,10 +54,10 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.001
     epsilon_min: float = 0.001
-    epsilon_decay_factor: float = 0.996 # Multiplicative factor per step
+    epsilon_decay_factor: float = 0.997 # Multiplicative factor per step
     epsilon_decay_steps: int = 10000   # Frames per decay step
     update_target_every: int = 500
-    learning_rate: float = 0.001
+    learning_rate: float = 0.003
     memory_size: int = 200000
     save_interval: int = 50000
     train_freq: int = 4
@@ -72,14 +72,22 @@ class MetricsData:
     frame_count: int = 0
     guided_count: int = 0
     total_controls: int = 0
-    episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
-    expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = 1.0
     expert_ratio: float = 1.0
     last_decay_step: int = 0
     last_epsilon_decay_step: int = 0 # Added tracker for epsilon decay
+    # Learning rate tracking fields
+    current_learning_rate: float = RL_CONFIG.learning_rate
+    learning_rate_min: float = 0.0000001
+    learning_rate_decay_factor: float = 0.9995
+    learning_rate_decay_steps: int = 20000
+    last_lr_decay_step: int = 0
+    plateau_counter: int = 0  # Track consecutive plateaus
+    # Other existing fields
     enemy_seg: int = -1
     open_level: bool = False
     override_expert: bool = False
@@ -197,6 +205,40 @@ class MetricsData:
         """Get current FPS"""
         with self.lock:
             return self.fps
+    
+    def update_learning_rate(self):
+        """Update learning rate based on frame count and plateau detection"""
+        with self.lock:
+            # Import here to avoid circular imports
+            from aimodel import decay_learning_rate
+            self.current_learning_rate = decay_learning_rate(
+                self.frame_count, 
+                self.current_learning_rate,
+                self.plateau_counter
+            )
+            return self.current_learning_rate
+    
+    def detect_plateau(self, window_size=100):
+        """Detect if rewards have plateaued"""
+        with self.lock:
+            if len(self.episode_rewards) < window_size * 2:
+                return False
+                
+            # Compare recent rewards with previous window
+            recent = list(self.episode_rewards)[-window_size:]
+            previous = list(self.episode_rewards)[-(window_size*2):-window_size]
+            
+            recent_avg = sum(recent) / window_size
+            previous_avg = sum(previous) / window_size
+            
+            # If recent average is not significantly better (within 1%)
+            if recent_avg <= previous_avg * 1.01:
+                self.plateau_counter += 1
+                return True
+            else:
+                # Reset plateau counter if we're improving
+                self.plateau_counter = max(0, self.plateau_counter - 1)
+                return False
     
     def toggle_override(self, kb_handler=None):
         """Toggle override mode"""
