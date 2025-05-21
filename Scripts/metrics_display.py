@@ -28,22 +28,16 @@ def clear_screen():
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
 
-def print_metrics_line(message, is_header=False):
-    """Print a metrics line with proper formatting"""
-    global row_counter
-    
+def move_to_home():
+    """Move cursor to home position without clearing screen"""
     if IS_INTERACTIVE:
-        if is_header:
-            # For header: print at current position
-            print(message)
-            print("-" * len(message))  # Add separator line
-            # Reset row counter when header is printed
-            row_counter = 0
-        else:
-            # For rows: just print at current position
-            print(message)
-            # Increment row counter
-            row_counter += 1
+        sys.stdout.write("\033[H")
+        sys.stdout.flush()
+        
+def print_metrics_line(message):
+    """Print a metrics line with proper formatting"""
+    if IS_INTERACTIVE:
+        print(message)
         sys.stdout.flush()
     else:
         print(message)

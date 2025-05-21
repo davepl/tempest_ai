@@ -7,6 +7,8 @@ local M = {} -- Module table for export
 
 -- Constants (Copied from main.lua's original display logic context)
 local INVALID_SEGMENT = -32768
+local SCREEN_WIDTH = 80
+local MAX_COLS = 3
 
 -- Helper function to format segment values for display
 local function format_segment(value)
@@ -28,198 +30,261 @@ local function format_enemy_segment(value)
     end
 end
 
--- Function to format section for display
-local function format_section(title, metrics)
-    local width = 80 -- Adjusted width for standard terminal
-    local title_padding = math.floor((width - #title - 4) / 2)
-    local separator = string.rep("-", width)
-    local result = string.format("%s--[ %s ]%s\n", string.rep("-", title_padding), title, string.rep("-", width - title_padding - #title - 4))
+-- Function to create a section header (centered title with borders)
+local function format_header(title)
+    local title_padding = math.floor((SCREEN_WIDTH - #title - 4) / 2)
+    return string.format("%s--[ %s ]%s", 
+        string.rep("-", title_padding), 
+        title, 
+        string.rep("-", SCREEN_WIDTH - title_padding - #title - 4)
+    )
+end
 
-
-    -- Find the longest key for alignment
-    local max_key_length = 0
-    for key, _ in pairs(metrics) do
-        max_key_length = math.max(max_key_length, string.len(key))
+-- Function to create a compact 3-column display
+local function format_columns(items, col_width)
+    local result = {}
+    local item_count = #items
+    local rows_needed = math.ceil(item_count / MAX_COLS)
+    
+    for row = 1, rows_needed do
+        local line = ""
+        for col = 1, MAX_COLS do
+            local idx = (row - 1) * MAX_COLS + col
+            if idx <= item_count then
+                -- Format as "key: value", right-padded to column width
+                line = line .. string.format("%-" .. col_width .. "s", items[idx])
+            end
+        end
+        table.insert(result, line)
     end
-
-    -- Format each metric
-    local metric_lines = {}
-    local sorted_keys = {}
-    for key, _ in pairs(metrics) do table.insert(sorted_keys, key) end
-    table.sort(sorted_keys) -- Sort keys alphabetically
-
-    for _, key in ipairs(sorted_keys) do
-         local value = metrics[key]
-         table.insert(metric_lines, string.format("  %-" .. max_key_length .. "s : %s", key, tostring(value)))
-    end
-
-    return result .. table.concat(metric_lines, "\n") .. "\n" .. separator .. "\n"
+    
+    return result
 end
 
 
--- Function to move the cursor to a specific row (using ANSI escape code)
-local function move_cursor_to_row(row)
-    io.write(string.format("\027[%d;1H", row)) -- Use 1H for column 1
+-- Function to clear the screen and move cursor to top-left (ANSI escape code)
+local function clear_screen()
+    io.write("\027[2J\027[1;1H") -- Clear screen and move to top-left
+    io.flush()
+end
+
+-- Format a key-value pair for display with consistent width
+local function format_item(key, value, width)
+    return string.format("%s: %-" .. (width - #key - 2) .. "s", key, tostring(value))
 end
 
 -- Main display update function (exported as M.update)
 -- Signature matches the call in the original main.lua frame_callback
-function M.update(status_message, game_state, level_state, player_state, enemies_state, num_values, last_reward) -- Note: Original didn't pass total_bytes_sent
-
-    move_cursor_to_row(1) -- Move to top-left corner
-
-    local display_str = ""
-
-    -- Game State Section
-    local game_metrics = {
-        ["Status"] = status_message,
-        ["Gamestate"] = string.format("0x%02X", game_state.gamestate),
-        ["Game Mode"] = string.format("0x%02X (%s)", game_state.game_mode, (game_state.game_mode & 0x80 == 0) and "Attract" or "Play"),
-        ["Countdown"] = string.format("0x%02X", game_state.countdown_timer),
-        ["Credits"] = game_state.credits,
-        ["P1 Lives"] = game_state.p1_lives,
-        ["P1 Level"] = game_state.p1_level,
-        ["Frame"] = game_state.frame_counter,
-        ["FPS"] = string.format("%.1f", game_state.current_fps),
-        ["Data Size"] = string.format("%d vals", num_values),
-        -- ["Bytes Sent"] = total_bytes_sent, -- total_bytes_sent is not passed in the original call
-        ["Last Reward"] = string.format("%.1f", last_reward), -- Show reward with decimals
+function M.update(status_message, game_state, level_state, player_state, enemies_state, num_values, last_reward)
+    -- Clear the screen each time to ensure a fresh display
+    clear_screen()
+    
+    local display_lines = {}
+    local col_width = math.floor(SCREEN_WIDTH / MAX_COLS)
+    
+    -- Create compact items for Game State section
+    table.insert(display_lines, format_header("Game State"))
+    
+    local game_items = {
+        format_item("Status", status_message, col_width),
+        format_item("GState", string.format("0x%02X", game_state.gamestate), col_width),
+        format_item("Mode", (game_state.game_mode & 0x80 == 0) and "Attract" or "Play", col_width),
+        format_item("Lives", game_state.p1_lives, col_width),
+        format_item("Level", game_state.p1_level, col_width),
+        format_item("Frame", game_state.frame_counter, col_width),
+        format_item("FPS", string.format("%.1f", game_state.current_fps), col_width),
+        format_item("Values", num_values, col_width),
+        format_item("Reward", string.format("%.1f", last_reward), col_width)
     }
-    display_str = display_str .. format_section("Game State", game_metrics)
+    
+    -- Add the game state items in a grid layout
+    local game_lines = format_columns(game_items, col_width)
+    for _, line in ipairs(game_lines) do
+        table.insert(display_lines, line)
+    end
+    table.insert(display_lines, "")
 
     -- Player State Section
-    local player_metrics = {
-        ["Position"] = string.format("%d (Seg %d)", player_state.position, player_state.position & 0x0F),
-        ["State"] = string.format("0x%02X", player_state.player_state),
-        ["Depth"] = string.format("0x%02X", player_state.player_depth),
-        ["Alive"] = (player_state.alive == 1) and "Yes" or "No",
-        ["Score"] = player_state.score,
-        ["Zapper Uses"] = player_state.superzapper_uses,
-        ["Zapper Active"] = (player_state.superzapper_active ~= 0) and string.format("Yes (%d)", player_state.superzapper_active) or "No", -- Show countdown
-        ["Shot Count"] = player_state.shot_count,
-        ["Debounce"] = string.format("0x%02X", player_state.debounce),
-        ["Fire Detect"] = player_state.fire_detected,
-        ["Zap Detect"] = player_state.zap_detected,
-        ["Spinner Accum"] = player_state.SpinnerAccum,
-        ["Spinner Cmd"] = player_state.spinner_commanded,
-        ["Spinner Detect"] = player_state.spinner_detected,
+    table.insert(display_lines, format_header("Player State"))
+    
+    local player_items = {
+        format_item("Pos", string.format("%d (Seg %d)", player_state.position, player_state.position & 0x0F), col_width),
+        format_item("State", string.format("0x%02X", player_state.player_state), col_width),
+        format_item("Depth", string.format("0x%02X", player_state.player_depth), col_width),
+        format_item("Alive", (player_state.alive == 1) and "Yes" or "No", col_width),
+        format_item("Score", player_state.score, col_width),
+        format_item("Z-Uses", player_state.superzapper_uses, col_width),
+        format_item("Z-Active", (player_state.superzapper_active ~= 0) and "Yes" or "No", col_width),
+        format_item("Shots", player_state.shot_count, col_width),
+        format_item("Fire", player_state.fire_detected and "Yes" or "No", col_width),
+        format_item("Zap", player_state.zap_detected and "Yes" or "No", col_width),
+        format_item("Spinner", player_state.spinner_detected, col_width),
+        format_item("SpinCmd", player_state.spinner_commanded, col_width)
     }
-    display_str = display_str .. format_section("Player State", player_metrics)
-
-    -- Player Shots
-    local shots_pos_str = ""
-    local shots_seg_str = ""
+    
+    local player_lines = format_columns(player_items, col_width)
+    for _, line in ipairs(player_lines) do
+        table.insert(display_lines, line)
+    end
+    
+    -- Player Shots (Compact single line format)
+    local shots_str = "Shots: "
     for i = 1, 8 do
-        shots_pos_str = shots_pos_str .. string.format(" %02X", player_state.shot_positions[i])
-        shots_seg_str = shots_seg_str .. " " .. format_segment(player_state.shot_segments[i])
+        if player_state.shot_segments[i] ~= INVALID_SEGMENT then
+            shots_str = shots_str .. format_segment(player_state.shot_segments[i]) .. " "
+        end
     end
-    display_str = display_str .. "Player Shots Pos:" .. shots_pos_str .. "\n"
-    display_str = display_str .. "Player Shots Seg:" .. shots_seg_str .. "\n\n"
-
+    table.insert(display_lines, shots_str)
+    table.insert(display_lines, "")
+    
     -- Level State Section
-    local level_metrics = {
-         ["Level Num"] = level_state.level_number,
-         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type == 0xFF) and "Open" or "Closed"),
-         ["Level Shape"] = level_state.level_shape,
+    table.insert(display_lines, format_header("Level State"))
+    
+    local level_items = {
+        format_item("Level", level_state.level_number, col_width),
+        format_item("Type", (level_state.level_type == 0xFF) and "Open" or "Closed", col_width),
+        format_item("Shape", level_state.level_shape, col_width)
     }
-    display_str = display_str .. format_section("Level State", level_metrics)
-    local spike_heights_str = ""
-    for i = 0, 15 do spike_heights_str = spike_heights_str .. string.format("%02X ", level_state.spike_heights[i] or 0) end
-    display_str = display_str .. "Spike Heights: " .. spike_heights_str .. "\n\n"
-
+    
+    local level_lines = format_columns(level_items, col_width)
+    for _, line in ipairs(level_lines) do
+        table.insert(display_lines, line)
+    end
+    
+    -- Spikes summary (compact format)
+    local spike_str = "Spikes: "
+    for i = 0, 15 do 
+        if i % 8 == 0 and i > 0 then spike_str = spike_str .. " | " end
+        spike_str = spike_str .. string.format("%01X", (level_state.spike_heights[i] or 0) >> 4)
+    end
+    table.insert(display_lines, spike_str)
+    table.insert(display_lines, "")
     -- Enemies State Section
-    local enemies_metrics = {
-        ["Flippers"] = string.format("%d/%d", enemies_state.active_flippers, enemies_state.spawn_slots_flippers),
-        ["Pulsars"] = string.format("%d/%d", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars),
-        ["Tankers"] = string.format("%d/%d", enemies_state.active_tankers, enemies_state.spawn_slots_tankers),
-        ["Spikers"] = string.format("%d/%d", enemies_state.active_spikers, enemies_state.spawn_slots_spikers),
-        ["Fuseballs"] = string.format("%d/%d", enemies_state.active_fuseballs, enemies_state.spawn_slots_fuseballs),
-        ["Total Active"] = enemies_state:get_total_active(),
-        ["In Tube"] = enemies_state.num_enemies_in_tube,
-        ["On Top"] = enemies_state.num_enemies_on_top,
-        ["Pending"] = enemies_state.enemies_pending,
-        ["Pulse State"] = string.format("Beat:%02X Pulse:%02X Rate:%02X", enemies_state.pulse_beat, enemies_state.pulsing, enemies_state.pulsar_fliprate),
-        ["Nearest Target"] = string.format("Seg:%s Depth:%02X Align:%.0f Err:%.0f",
-                                    format_segment(enemies_state.nearest_enemy_seg),
-                                    enemies_state.nearest_enemy_depth_raw,
-                                    enemies_state.is_aligned_with_nearest * 100, -- Show as percentage 0 or 100
-                                    enemies_state.alignment_error_magnitude * 100), -- Show as percentage
+    table.insert(display_lines, format_header("Enemy State"))
+    
+    local enemies_items = {
+        format_item("Flippers", string.format("%d/%d", enemies_state.active_flippers, enemies_state.spawn_slots_flippers), col_width),
+        format_item("Pulsars", string.format("%d/%d", enemies_state.active_pulsars, enemies_state.spawn_slots_pulsars), col_width),
+        format_item("Tankers", string.format("%d/%d", enemies_state.active_tankers, enemies_state.spawn_slots_tankers), col_width),
+        format_item("Spikers", string.format("%d/%d", enemies_state.active_spikers, enemies_state.spawn_slots_spikers), col_width),
+        format_item("Fuseballs", string.format("%d/%d", enemies_state.active_fuseballs, enemies_state.spawn_slots_fuseballs), col_width),
+        format_item("Total", enemies_state:get_total_active(), col_width),
+        format_item("In Tube", enemies_state.num_enemies_in_tube, col_width),
+        format_item("On Top", enemies_state.num_enemies_on_top, col_width),
+        format_item("Pending", enemies_state.enemies_pending, col_width),
+        format_item("Pulsing", enemies_state.pulsing > 0 and "Yes" or "No", col_width),
+        format_item("Beat", string.format("0x%02X", enemies_state.pulse_beat), col_width),
+        format_item("Rate", string.format("0x%02X", enemies_state.pulsar_fliprate), col_width)
     }
-    display_str = display_str .. format_section("Enemies State (Active/Spawnable)", enemies_metrics)
-
-    -- Enemy Slots Details
-    local enemy_details = { "Slot:", "Type:", "State:", "AbsSeg:", "RelSeg:", "Depth:" }
-    for i = 1, 7 do
-        enemy_details[1] = enemy_details[1] .. string.format(" %4d", i)
-        -- Use decode methods if they exist on the enemies_state object
-        local type_str = enemies_state.decode_enemy_type and enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i]) or string.format("%d", enemies_state.enemy_type_info[i])
-        local state_str = enemies_state.decode_enemy_state and enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i]) or string.format("0x%02X", enemies_state.active_enemy_info[i])
-        enemy_details[2] = enemy_details[2] .. " " .. string.format("%4s", type_str)
-        enemy_details[3] = enemy_details[3] .. " " .. string.format("%4s", state_str)
-        enemy_details[4] = enemy_details[4] .. string.format(" %4s", (enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT) and enemies_state.enemy_abs_segments[i] or "---")
-        enemy_details[5] = enemy_details[5] .. " " .. string.format("%4s", format_segment(enemies_state.enemy_segments[i]))
-        enemy_details[6] = enemy_details[6] .. string.format(" %02X  ", enemies_state.enemy_depths[i]) -- Use 4 chars width
+    
+    local enemies_lines = format_columns(enemies_items, col_width)
+    for _, line in ipairs(enemies_lines) do
+        table.insert(display_lines, line)
     end
-    display_str = display_str .. table.concat(enemy_details, "\n") .. "\n\n"
+    
+    -- Nearest enemy info
+    local nearest = string.format("Nearest: Seg=%s Depth=0x%02X Aligned=%s Error=%.0f%%",
+                                format_segment(enemies_state.nearest_enemy_seg),
+                                enemies_state.nearest_enemy_depth_raw,
+                                enemies_state.is_aligned_with_nearest > 0 and "Yes" or "No",
+                                enemies_state.alignment_error_magnitude * 100)
+    table.insert(display_lines, nearest)
+    table.insert(display_lines, "")
 
-    -- Enemy Shots Details
-    local e_shots_pos_str = ""
-    local e_shots_seg_str = ""
+    -- Enemy Slots Table (compact format)
+    table.insert(display_lines, format_header("Enemy Slots"))
+    
+    -- Create a compact header for the enemy slots table
+    table.insert(display_lines, "  # | Type | State | Seg  | Depth")
+    table.insert(display_lines, "----+------+-------+------+------")
+    
+    -- Display each enemy slot in a compact tabular format
+    for i = 1, 7 do
+        local type_str = enemies_state.decode_enemy_type and 
+                         enemies_state:decode_enemy_type(enemies_state.enemy_type_info[i]) or 
+                         string.format("%d", enemies_state.enemy_type_info[i])
+        
+        local state_str = enemies_state.decode_enemy_state and 
+                         enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i]) or 
+                         string.format("0x%02X", enemies_state.active_enemy_info[i])
+        
+        local abs_seg = enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and 
+                       enemies_state.enemy_abs_segments[i] or "---"
+        
+        local rel_seg = format_segment(enemies_state.enemy_segments[i])
+        local depth = string.format("%02X", enemies_state.enemy_depths[i])
+        
+        local slot_line = string.format("  %d | %-4s | %-5s | %s | %s", 
+            i, type_str, state_str, rel_seg, depth)
+        
+        table.insert(display_lines, slot_line)
+    end
+    table.insert(display_lines, "")
+    
+    -- Enemy Shots (compact format)
+    local e_shots_str = "Enemy Shots: "
     for i = 1, 4 do
-        e_shots_pos_str = e_shots_pos_str .. string.format(" %02X ", enemies_state.shot_positions[i])
-        e_shots_seg_str = e_shots_seg_str .. " " .. format_segment(enemies_state.enemy_shot_segments[i])
+        if enemies_state.enemy_shot_segments[i] ~= INVALID_SEGMENT then
+            e_shots_str = e_shots_str .. format_segment(enemies_state.enemy_shot_segments[i]) .. " "
+        end
     end
-    display_str = display_str .. "Enemy Shots Pos:" .. e_shots_pos_str .. "\n"
-    display_str = display_str .. "Enemy Shots Seg:" .. e_shots_seg_str .. "\n\n"
-
-    -- Display our three enemy tables with consistent formatting
-    -- Charging Fuseballs array (7 entries)
-    local charging_fuseball_str = "Charging Fuseball: "
-    for i = 1, 7 do
-        charging_fuseball_str = charging_fuseball_str .. format_enemy_segment(enemies_state.charging_fuseball[i]) .. " "
-    end
-    display_str = display_str .. charging_fuseball_str .. "\n"
+    table.insert(display_lines, e_shots_str)
     
-    -- Active Pulsars array (7 entries)
-    local active_pulsar_str = "Active Pulsars:    "
-    for i = 1, 7 do
-        active_pulsar_str = active_pulsar_str .. format_enemy_segment(enemies_state.active_pulsar[i]) .. " "
-    end
-    display_str = display_str .. active_pulsar_str .. "\n"
+    -- Enemy arrays summary (compact one-line format for each)
+    local fuseball_str = "Fuseballs: "
+    local pulsar_str = "Pulsars:   "
+    local top_rail_str = "Top Rail:  "
     
-    -- Top Rail Enemies array (7 entries)
-    local top_rail_enemies_str = "Top Rail Enemies:  "
     for i = 1, 7 do
-        top_rail_enemies_str = top_rail_enemies_str .. format_enemy_segment(enemies_state.active_top_rail_enemies[i]) .. " "
+        fuseball_str = fuseball_str .. format_enemy_segment(enemies_state.charging_fuseball[i]) .. " "
+        pulsar_str = pulsar_str .. format_enemy_segment(enemies_state.active_pulsar[i]) .. " "
+        top_rail_str = top_rail_str .. format_enemy_segment(enemies_state.active_top_rail_enemies[i]) .. " "
     end
-    display_str = display_str .. top_rail_enemies_str .. "\n"
     
-    -- Fractional Enemy Segments array (7 entries)
-    local fractional_segs_str = "Fractional Segs:   "
+    table.insert(display_lines, fuseball_str)
+    table.insert(display_lines, pulsar_str)
+    table.insert(display_lines, top_rail_str)
+    
+    -- Fractional positions
+    local frac_str = "Fractions: "
     for i = 1, 7 do
         local value = enemies_state.fractional_enemy_segments_by_slot[i]
         if value == INVALID_SEGMENT then
-            fractional_segs_str = fractional_segs_str .. " ---- "
+            frac_str = frac_str .. "---- "
         else
-            fractional_segs_str = fractional_segs_str .. string.format(" %04X ", value & 0xFFFF)
+            frac_str = frac_str .. string.format("%04X ", value & 0xFFFF)
         end
     end
-    display_str = display_str .. fractional_segs_str .. "\n\n"
-
-    -- Pending Data (Show first 16 for brevity)
-    local pending_vid_str = ""
-    local pending_seg_str = ""
-    for i = 1, 16 do
-        pending_vid_str = pending_vid_str .. string.format("%02X ", enemies_state.pending_vid[i])
-        pending_seg_str = pending_seg_str .. " " .. format_segment(enemies_state.pending_seg[i])
+    table.insert(display_lines, frac_str)
+    table.insert(display_lines, "")
+    
+    -- Pending data summary
+    table.insert(display_lines, format_header("Pending Data"))
+    
+    -- Show first few pending enemies in a compact format
+    local pending_count = math.min(6, #enemies_state.pending_vid)
+    if pending_count > 0 then
+        local pending_str = "Pending: "
+        for i = 1, pending_count do
+            pending_str = pending_str .. string.format("V:%02X S:%s | ", 
+                enemies_state.pending_vid[i], 
+                format_segment(enemies_state.pending_seg[i]))
+            
+            -- Break into multiple lines if needed
+            if i % 3 == 0 and i < pending_count then
+                table.insert(display_lines, pending_str)
+                pending_str = "         "
+            end
+        end
+        table.insert(display_lines, pending_str)
+    else
+        table.insert(display_lines, "No pending enemies")
     end
-    display_str = display_str .. "Pending VID:   " .. pending_vid_str .. "...\n"
-    display_str = display_str .. "Pending SEG:   " .. pending_seg_str .. "...\n"
-
-    -- Add padding to overwrite previous longer lines at the end
-    display_str = display_str .. string.rep(" ", 80 * 5) -- Add blank lines to clear potential leftover lines
-
-    -- Write the entire display string at once
+    
+    -- Join all the lines
+    local display_str = table.concat(display_lines, "\n")
+    
+    -- Write the entire display at once
     io.write(display_str)
     io.flush() -- Ensure output is written immediately
 end
