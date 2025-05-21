@@ -469,11 +469,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
-                proposed_target_seg = (nl_dist <= 1) and 14 or 13  -- Original working code for open level
+                proposed_target_seg = (nl_dist <= 2) and 14 or 13  -- Original working code for open level
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
-                    local safe_offset = math.floor(nl_dist * 2) + 1  -- Calculate offset based on distance
+                    local safe_offset = math.floor(nl_dist * 2) + 2  -- Calculate offset based on distance
                     safe_offset = math.max(1, math.min(2, safe_offset))  -- Keep between 1-2
                     proposed_target_seg = (nl_seg + safe_offset) % 16
                 else 
