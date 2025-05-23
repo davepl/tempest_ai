@@ -16,7 +16,7 @@ local SAFE_DISTANCE = 1
 local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 3
-local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance
+local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
 
 local M = {} -- Module table
 
@@ -60,8 +60,8 @@ end
 function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment, is_open_level)
     current_abs_segment = tonumber(current_abs_segment) or 0
     target_abs_segment = tonumber(target_abs_segment) or 0
-    current_abs_segment = current_abs_segment & 0x0F
-    target_abs_segment = target_abs_segment & 0x0F
+    current_abs_segment = math.floor(current_abs_segment) % 16
+    target_abs_segment = math.floor(target_abs_segment) % 16
 
     if is_open_level then
         return target_abs_segment - current_abs_segment
@@ -196,8 +196,15 @@ function M.is_danger_lane(segment, enemies_state)
             if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then return true end
         end
     end
-    for i = 1, 7 do -- Check close enemies (depth <= 0x20)
-        if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x20 then return true end
+    for i = 1, 7 do -- Check enemies with type-specific danger distances
+        if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then
+            local enemy_type = enemies_state.enemy_core_type[i]
+            local depth = enemies_state.enemy_depths[i]
+            -- Fuseballs are fatal on contact, so they're dangerous at greater distances on top rail
+            if enemy_type == ENEMY_TYPE_FUSEBALL and depth <= TOP_RAIL_DEPTH then return true end
+            -- Other enemies are dangerous when close
+            if depth <= 0x20 then return true end
+        end
     end
     for i = 1, 4 do -- Check close enemy shots (depth <= 0x30)
         if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then return true end
@@ -292,7 +299,7 @@ end
 -- Function to find the target segment and recommended action (expert policy)
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
     local is_open = (level_state.level_type == 0xFF)
-    local player_abs_seg = player_state.position & 0x0F
+    local player_abs_seg = math.floor(player_state.position) % 16
     local shot_count = player_state.shot_count or 0
 
     -- Default return values
@@ -383,12 +390,44 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             end
         end
 
-        -- === Step 1A: High Priority Flipper Avoidance ===
+        -- === Step 1A: HIGHEST Priority Fuseball Avoidance ===
+        -- Check for any fuseballs on top rail and avoid them immediately (fatal on contact)
+        local nearest_fuseball_seg = nil
+        local nearest_fuseball_rel = nil
+        local min_fuseball_distance = 100
+        
+        for _, enemy in ipairs(top_rail_enemies) do
+            if enemy.type == ENEMY_TYPE_FUSEBALL then
+                local fuseball_distance = math.abs(enemy.rel)
+                if fuseball_distance < min_fuseball_distance then
+                    min_fuseball_distance = fuseball_distance
+                    nearest_fuseball_seg = enemy.seg
+                    nearest_fuseball_rel = enemy.rel
+                end
+            end
+        end
+        
+        if nearest_fuseball_seg and min_fuseball_distance <= 2 then -- Fuseballs are dangerous within 2 segments
+            -- Move at least 3 segments away from the fuseball
+            local direction_away_from_fuseball = (nearest_fuseball_rel == 0) and 1 or (nearest_fuseball_rel > 0 and -1 or 1)
+            local target_seg = (nearest_fuseball_seg + direction_away_from_fuseball * 3 + 16) % 16
+            
+            -- Safety check the escape target
+            if M.is_danger_lane(target_seg, enemies_state) then
+                target_seg = find_nearest_safe_segment(target_seg, enemies_state, is_open)
+            end
+            
+            local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
+            local should_fire = fire_priority > shot_count
+            return target_seg, 0, should_fire, false -- Return early - fuseball avoidance is critical
+        end
+
+        -- === Step 1B: High Priority Flipper Avoidance ===
         if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
 
-            -- Calculate target D segments away from the flipper, in the direction opposite the player
-            local direction_away_from_player = (nearest_flipper_rel == 0) and 1 or (nearest_flipper_rel > 0 and -1 or 1)
-            local target_seg = (nearest_flipper_seg + direction_away_from_player * SAFE_DISTANCE + 16) % 16
+            -- Calculate target D segments away from the flipper, in the direction opposite the flipper from the player
+            local direction_away_from_flipper = (nearest_flipper_rel == 0) and 1 or (nearest_flipper_rel > 0 and -1 or 1)
+            local target_seg = (nearest_flipper_seg + direction_away_from_flipper * SAFE_DISTANCE + 16) % 16
 
             -- Safety Check for the calculated avoidance target
             if M.is_danger_lane(target_seg, enemies_state) then
@@ -404,53 +443,61 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
 
         if enemy_left_exists and enemy_right_exists then
-            -- Case 1: Both Sides - Find nearest threat and apply alternating strategy
-            local nearest_threat_seg, nearest_threat_rel, min_threat_abs_rel = nil, nil, 100
+            -- Case 1: Both Sides - Pin to nearest threat strategy
+            -- Find the nearest threat (fuseball, pulsar, or flipper - fuseballs have highest priority)
+            local nearest_threat_seg = nil
+            local nearest_threat_rel = nil
+            local min_threat_distance = 100
+            local nearest_threat_type = nil
+            
             for _, enemy in ipairs(top_rail_enemies) do
-                if enemy.type == ENEMY_TYPE_FLIPPER or enemy.type == ENEMY_TYPE_PULSAR then
-                    if enemy.abs_rel < min_threat_abs_rel then 
-                        min_threat_abs_rel = enemy.abs_rel
+                if enemy.type == ENEMY_TYPE_FUSEBALL or enemy.type == ENEMY_TYPE_FLIPPER or enemy.type == ENEMY_TYPE_PULSAR then
+                    local threat_distance = math.abs(enemy.rel)
+                    -- Fuseballs get priority due to fatal contact, then closest distance
+                    local is_higher_priority = false
+                    if enemy.type == ENEMY_TYPE_FUSEBALL and nearest_threat_type ~= ENEMY_TYPE_FUSEBALL then
+                        is_higher_priority = true
+                    elseif enemy.type == ENEMY_TYPE_FUSEBALL and nearest_threat_type == ENEMY_TYPE_FUSEBALL and threat_distance < min_threat_distance then
+                        is_higher_priority = true
+                    elseif nearest_threat_type ~= ENEMY_TYPE_FUSEBALL and threat_distance < min_threat_distance then
+                        is_higher_priority = true
+                    end
+                    
+                    if is_higher_priority then
+                        min_threat_distance = threat_distance
                         nearest_threat_seg = enemy.seg
-                        nearest_threat_rel = enemy.rel 
+                        nearest_threat_rel = enemy.rel
+                        nearest_threat_type = enemy.type
                     end
                 end
             end
+            
             if nearest_threat_seg then
-                if is_open then
-                    -- Original open level strategy
-                    if nearest_threat_rel > 0 then proposed_target_seg = 0 else proposed_target_seg = 15 end
+                -- Pin to appropriate distance from nearest threat on the near side
+                local safe_distance = (nearest_threat_type == ENEMY_TYPE_FUSEBALL) and 2 or 1 -- Fuseballs need more distance
+                
+                if nearest_threat_rel > 0 then
+                    -- Threat is to the right, pin safe_distance segments to the left of it
+                    proposed_target_seg = (nearest_threat_seg - safe_distance + 16) % 16
+                elseif nearest_threat_rel < 0 then
+                    -- Threat is to the left, pin safe_distance segments to the right of it
+                    proposed_target_seg = (nearest_threat_seg + safe_distance) % 16
                 else
-                    -- Apply the successful alternating segments strategy
-                    if nearest_threat_rel > 0 then
-                        -- Enemy is to the right of player
-                        if min_threat_abs_rel < SAFE_DISTANCE then
-                            local safe_offset = math.floor(min_threat_abs_rel * 2) + 1
-                            safe_offset = math.max(1, math.min(2, safe_offset))
-                            proposed_target_seg = (nearest_threat_seg - safe_offset + 16) % 16
-                        else
-                            proposed_target_seg = player_abs_seg
-                        end
-                    elseif nearest_threat_rel < 0 then
-                        -- Enemy is to the left of player
-                        if min_threat_abs_rel < SAFE_DISTANCE then
-                            local safe_offset = math.floor(min_threat_abs_rel * 2) + 1
-                            safe_offset = math.max(1, math.min(2, safe_offset))
-                            proposed_target_seg = (nearest_threat_seg + safe_offset) % 16
-                        else
-                            proposed_target_seg = player_abs_seg
-                        end
-                    else
-                        proposed_target_seg = player_abs_seg
-                    end
+                    -- Threat is on player position, move to safer position immediately
+                    proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
                 end
-            else -- Fallback: No Flippers/Pulsars, use midpoint
-                 if is_open then 
-                    local mid = math.floor((nl_seg + nr_seg) / 2)
-                    proposed_target_seg = any_enemy_proximate and mid or math.min(15, mid + 1)
-                 else 
-                    local dist = (nr_seg - nl_seg + 16) % 16
-                    proposed_target_seg = (nl_seg + math.floor(dist / 2) + 16) % 16 
-                 end
+                
+                -- Safety check the pinned position
+                if M.is_danger_lane(proposed_target_seg, enemies_state) then
+                    proposed_target_seg = find_nearest_safe_segment(proposed_target_seg, enemies_state, is_open)
+                end
+            else
+                -- No critical threats found, fall back to safety-based positioning
+                if M.is_danger_lane(player_abs_seg, enemies_state) then
+                    proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                else
+                    proposed_target_seg = player_abs_seg
+                end
             end
         elseif enemy_right_exists then
             -- Case 2: Right Only - Use adaptive distance approach
@@ -469,7 +516,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
-                proposed_target_seg = (nl_dist <= 1) and 14 or 13  -- Original working code for open level
+                proposed_target_seg = (nl_dist <= 1) and 13 or 14  -- Original working code for open level
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
@@ -554,8 +601,8 @@ end
 
 -- Function to calculate desired spinner direction and distance to target enemy
 function M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local player_abs_seg = player_state.position & 0x0F
-    local is_open = (level_state.level_number - 1) % 4 == 2
+    local player_abs_seg = math.floor(player_state.position) % 16
+    local is_open = (level_state.level_type == 0xFF)
     local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
 
     if target_abs_segment == -1 then return 0, 0, 255 end -- No target
@@ -577,7 +624,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     if player_state.alive == 1 then
 
         -- Player is alive; check to see if they are on a pulsar segment
-        local player_segment = player_state.position & 0x0F
+        local player_segment = math.floor(player_state.position) % 16
         if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing > PULSAR_THRESHOLD then
             reward = reward - 100 -- Deduct 100 reward if on a pulsar segment
         end
@@ -607,10 +654,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
         local target_depth = enemies_state.nearest_enemy_depth_raw
-        local player_segment = player_state.position & 0x0F
+        local player_segment = math.floor(player_state.position) % 16
 
         if game_state.gamestate == 0x20 then -- Tube Zoom Reward
-            local spike_h = level_state.spike_heights[player_segment] or 0
+            local spike_h = level_state.spike_heights[player_segment]
             if spike_h > 0 then reward = reward + math.max(0, ((255 - spike_h) / 2) - 27.5)
             else reward = reward + (detected_spinner == 0 and 250 or -50) end
             if player_state.fire_commanded == 1 then reward = reward + 200 end
