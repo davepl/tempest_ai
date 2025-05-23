@@ -20,6 +20,21 @@ local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance
 
 local M = {} -- Module table
 
+-- Helper functions for bitwise operations (copied from state.lua for now)
+local function band(a, b) -- bitwise AND
+    local result = 0
+    local bit_val = 1
+    while a > 0 and b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bit_val
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit_val = bit_val * 2
+    end
+    return result
+end
+
 -- Global variables needed by calculate_reward (scoped within this module)
 local previous_score = 0
 local previous_level = 0
@@ -60,8 +75,8 @@ end
 function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment, is_open_level)
     current_abs_segment = tonumber(current_abs_segment) or 0
     target_abs_segment = tonumber(target_abs_segment) or 0
-    current_abs_segment = current_abs_segment & 0x0F
-    target_abs_segment = target_abs_segment & 0x0F
+    current_abs_segment = band(current_abs_segment, 0x0F)
+    target_abs_segment = band(target_abs_segment, 0x0F)
 
     if is_open_level then
         return target_abs_segment - current_abs_segment
@@ -292,7 +307,7 @@ end
 -- Function to find the target segment and recommended action (expert policy)
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
     local is_open = (level_state.level_type == 0xFF)
-    local player_abs_seg = player_state.position & 0x0F
+    local player_abs_seg = band(player_state.position, 0x0F)
     local shot_count = player_state.shot_count or 0
 
     -- Default return values
@@ -325,47 +340,46 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             if depth > 0 and depth <= TOP_RAIL_DEPTH then
                 local seg = enemies_state.enemy_abs_segments[i]
                 if seg ~= INVALID_SEGMENT then
-                    -- Get fractional position (scaled to 0-1 range)
-                    local frac_pos = 0
-                    if enemies_state.fractional_enemy_segments_by_slot[i] ~= INVALID_SEGMENT then
-                        frac_pos = enemies_state.fractional_enemy_segments_by_slot[i] / 4096.0
-                    end
+                    -- Get fractional position (0.0 to 1.0)
+                    local frac_pos = enemies_state.enemy_fractional_progress[i]
+                    local is_between = enemies_state.enemy_between_segments[i]
+                    local dir_moving = enemies_state.enemy_direction_moving[i]
                     
-                    -- Get both integer and floating point relative positions
                     local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
                     
-                    -- Store fractional position for detailed calculations but use integer position for main logic
-                    local rel_float = rel_int
-                    if rel_int > 0 then
-                        rel_float = rel_int + frac_pos
-                    elseif rel_int < 0 then
-                        rel_float = rel_int - (1 - frac_pos)  -- Adjust for negative direction
+                    local rel_float = rel_int + 0.0 -- Ensure float type
+                    if is_between == 1 and frac_pos > 0.0001 and frac_pos < 0.9999 then -- Only apply if meaningfully fractional and actually between segments
+                        if dir_moving == 1 then -- Moving towards increasing segment index (further positive/less negative)
+                            rel_float = rel_int + frac_pos
+                        else -- Moving towards decreasing segment index (further negative/less positive)
+                            rel_float = rel_int - frac_pos
+                        end
                     end
                     
-                    -- Use integer-based absolute distance for critical comparisons
-                    local abs_rel_int = math.abs(rel_int)
+                    local abs_rel_int = math.abs(rel_int) -- Keep for logic that might still prefer integer distances
                     local abs_rel_float = math.abs(rel_float)
                     local core_type = enemies_state.enemy_core_type[i]
 
-                    if abs_rel_int <= 1 then any_enemy_proximate = true end
+                    if abs_rel_int <= 1 then any_enemy_proximate = true end -- Proximity check can remain integer based for simplicity
                     table.insert(top_rail_enemies, {
                         seg = seg, 
-                        rel = rel_int,  -- Store integer position for main comparisons
-                        rel_float = rel_float, -- Store float for detailed calculations
-                        abs_rel = abs_rel_int, -- Use integer-based distance
+                        rel = rel_int,
+                        rel_float = rel_float, 
+                        abs_rel = abs_rel_int, -- Retain for now, though abs_rel_float might be more accurate for some uses
+                        abs_rel_float = abs_rel_float, -- Add this for clarity
                         type = core_type,
-                        frac_pos = frac_pos
+                        frac_pos = frac_pos -- This is the 0-1 progress
                     })
 
-                    -- Update nearest overall left/right (using integer positions for critical logic)
-                    if rel_int > 0 and abs_rel_int < nr_dist then 
-                        nr_dist = abs_rel_int
+                    -- Update nearest overall left/right using floating point distances
+                    if rel_float > 0 and abs_rel_float < nr_dist then 
+                        nr_dist = abs_rel_float
                         nr_seg = seg
                         enemy_right_exists = true 
                     end
                     
-                    if rel_int < 0 and abs_rel_int < nl_dist then 
-                        nl_dist = abs_rel_int
+                    if rel_float < 0 and abs_rel_float < nl_dist then 
+                        nl_dist = abs_rel_float
                         nl_seg = seg
                         enemy_left_exists = true 
                     end
@@ -375,7 +389,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                         if abs_rel_float < min_flipper_abs_rel then
                              min_flipper_abs_rel = abs_rel_float
                              nearest_flipper_seg = seg
-                             nearest_flipper_rel = rel_float
+                             nearest_flipper_rel = rel_float -- This now uses the corrected rel_float
                              nearest_flipper_frac_pos = frac_pos
                         end
                     end
@@ -469,7 +483,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
-                proposed_target_seg = (nl_dist <= 0) and 14 or 13  -- Original working code for open level
+                proposed_target_seg = (nl_dist <= 1) and 14 or 13  -- Original working code for open level
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
@@ -554,7 +568,7 @@ end
 
 -- Function to calculate desired spinner direction and distance to target enemy
 function M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local player_abs_seg = player_state.position & 0x0F
+    local player_abs_seg = band(player_state.position, 0x0F)
     local is_open = (level_state.level_number - 1) % 4 == 2
     local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
 
@@ -577,7 +591,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     if player_state.alive == 1 then
 
         -- Player is alive; check to see if they are on a pulsar segment
-        local player_segment = player_state.position & 0x0F
+        local player_segment = band(player_state.position, 0x0F)
         if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing > PULSAR_THRESHOLD then
             reward = reward - 100 -- Deduct 100 reward if on a pulsar segment
         end
@@ -608,7 +622,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
         local target_depth = enemies_state.nearest_enemy_depth_raw
-        local player_segment = player_state.position & 0x0F
+        local player_segment = band(player_state.position, 0x0F)
 
         if game_state.gamestate == 0x20 then -- Tube Zoom Reward
             local spike_h = level_state.spike_heights[player_segment] or 0
@@ -649,4 +663,4 @@ function M.getLastReward()
     return LastRewardState
 end
 
-return M 
+return M

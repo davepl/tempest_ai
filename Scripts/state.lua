@@ -6,6 +6,21 @@
 
 local M = {} -- Module table to hold exported classes and functions
 
+-- Helper functions for bitwise operations
+local function band(a, b) -- bitwise AND
+    local result = 0
+    local bit_val = 1 -- Renamed from 'bit' to avoid conflict with 'bit' library if ever used
+    while a > 0 and b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bit_val
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit_val = bit_val * 2
+    end
+    return result
+end
+
 -- Define constants
 local INVALID_SEGMENT = -32768 -- Used as sentinel value for invalid segments
 M.INVALID_SEGMENT = INVALID_SEGMENT -- Export if needed elsewhere
@@ -215,7 +230,7 @@ end
 
 -- Function to determine target segment, depth, and firing decision
 find_target_segment = function(game_state, player_state, level_state, enemies_state, abs_to_rel_func, is_open)
-    local player_abs_seg = player_state.position & 0x0F
+    local player_abs_seg = band(player_state.position, 0x0F)
 
     local initial_target_seg_abs
     local target_depth
@@ -266,13 +281,13 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
-                local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
+                local rel_dist = abs_to_rel_func(player_abs_segment, initial_target_seg_abs, is_open)
                 should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
@@ -406,11 +421,14 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
 
                 if is_seg_safe then
                     best_safe_seg = check_seg
-                    goto found_safe_segment -- Exit outer loops once the *nearest* safe segment is found
+                    break -- Exit inner loop (segments_to_check)
                 end
             end
+            if best_safe_seg ~= -1 then
+                break -- Exit outer loop (search_dist)
+            end
         end
-        ::found_safe_segment::
+        -- ::found_safe_segment:: -- Label moved here or effectively handled by breaks
 
         if best_safe_seg ~= -1 then
             print("FUSEBALL AVOID: New target = " .. best_safe_seg)
@@ -561,7 +579,7 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     self.player_depth = mem:read_u8(0x0202) -- Player depth along the tube
 
     -- Player alive state: High bit of player_state ($201) is set when dead
-    self.alive = ((self.player_state & 0x80) == 0) and 1 or 0
+    self.alive = ((band(self.player_state, 0x80)) == 0) and 1 or 0
 
     -- Read and convert score from BCD using local helper
     local score_low = bcd_to_decimal(mem:read_u8(0x0040))
@@ -581,7 +599,7 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     -- local level_num_zero_based = (mem:read_u8(0x009F) - 1)
     -- local is_open = (level_num_zero_based % 4 == 2)
 
-    local player_abs_segment = self.position & 0x0F
+    local player_abs_segment = band(self.position, 0x0F)
     for i = 1, 8 do
         -- Read depth (position along the tube) from PlayerShotPositions ($02D3 - $02DA)
         self.shot_positions[i] = mem:read_u8(0x02D3 + i - 1)
@@ -599,7 +617,7 @@ function M.PlayerState:update(mem, abs_to_rel_func)
                 self.shot_positions[i] = 0 -- Ensure position is also zeroed if segment is invalid
             else
                 -- Valid position and valid segment read, calculate relative segment using passed function
-                abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
+                abs_segment = band(abs_segment, 0x0F)  -- Mask to get valid segment 0-15
                 self.shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
             end
         end
@@ -607,8 +625,8 @@ function M.PlayerState:update(mem, abs_to_rel_func)
 
     -- Update detected input states from debounce byte ($004D)
     self.debounce = mem:read_u8(0x004D)
-    self.fire_detected = (self.debounce & 0x10) ~= 0 and 1 or 0 -- Bit 4 for Fire
-    self.zap_detected = (self.debounce & 0x08) ~= 0 and 1 or 0  -- Bit 3 for Zap
+    self.fire_detected = (band(self.debounce, 0x10)) ~= 0 and 1 or 0 -- Bit 4 for Fire
+    self.zap_detected = (band(self.debounce, 0x08)) ~= 0 and 1 or 0  -- Bit 3 for Zap
 
     -- Update spinner state
     local currentSpinnerAccum = mem:read_u8(0x0051) -- Read current accumulator value ($0051)
@@ -673,6 +691,8 @@ function M.EnemiesState:new()
     self.enemy_can_shoot = {}      -- Bit 6 from state byte (0/1)
     self.enemy_split_behavior = {} -- Bits 0-1 from state byte
 
+    self.enemy_fractional_progress = {} -- NEW: For fractional position (0.0 to 1.0)
+
     -- Enemy Shot Info (Size 4)
     self.shot_positions = {}          -- Absolute depth/position ($02DB + i - 1)
     self.enemy_shot_segments = {}     -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
@@ -720,6 +740,7 @@ function M.EnemiesState:new()
         self.enemy_moving_away[i] = 0
         self.enemy_can_shoot[i] = 0
         self.enemy_split_behavior[i] = 0
+        self.enemy_fractional_progress[i] = 0.0 -- Initialize
     end
     for i = 1, 4 do
         self.shot_positions[i] = 0
@@ -743,7 +764,7 @@ end
 -- EnemiesState update needs game_state, player_state, level_state, and abs_to_rel_func
 function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_to_rel_func)
     -- Get player position and level type for relative calculations
-    local player_abs_segment = player_state.position & 0x0F -- Get current player absolute segment
+    local player_abs_segment = band(player_state.position, 0x0F) -- Get current player absolute segment
     -- Determine if level is open based *only* on the memory flag now
     local is_open = (level_state.level_type == 0xFF)
     -- Re-enable debug print to monitor memory flag and resulting is_open
@@ -786,10 +807,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.enemy_depths[i] = 0
         self.enemy_type_info[i] = 0
         self.active_enemy_info[i] = 0
+        self.enemy_fractional_progress[i] = 0.0 -- Reset before calculation
 
         -- Check if enemy is active (depth > 0 and segment raw byte > 0)
         if enemy_depth_raw > 0 and abs_segment_raw > 0 then
-            local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+            local abs_segment = band(abs_segment_raw, 0x0F) -- Mask to 0-15
             self.enemy_abs_segments[i] = abs_segment
             self.enemy_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
             self.enemy_depths[i] = enemy_depth_raw
@@ -801,14 +823,39 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.active_enemy_info[i] = state_byte
 
             -- Decode Type Byte (Use assembly mask)
-            self.enemy_core_type[i] = type_byte & ENEMY_TYPE_MASK -- Apply the mask to get 0-4
-            self.enemy_direction_moving[i] = (type_byte & 0x40) ~= 0 and 1 or 0 -- Bit 6: Segment increasing?
-            self.enemy_between_segments[i] = (type_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Between segments?
+            self.enemy_core_type[i] = band(type_byte, ENEMY_TYPE_MASK) -- Apply the mask to get 0-4
+            self.enemy_direction_moving[i] = (band(type_byte, 0x40)) ~= 0 and 1 or 0 -- Bit 6: Segment increasing?
+            self.enemy_between_segments[i] = (band(type_byte, 0x80)) ~= 0 and 1 or 0 -- Bit 7: Between segments?
 
             -- Decode State Byte
-            self.enemy_moving_away[i] = (state_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Moving Away?
-            self.enemy_can_shoot[i] = (state_byte & 0x40) ~= 0 and 1 or 0   -- Bit 6: Can Shoot?
-            self.enemy_split_behavior[i] = state_byte & 0x03                -- Bits 0-1: Split Behavior
+            self.enemy_moving_away[i] = band(state_byte, 0x80) ~= 0 and 1 or 0 -- Bit 7: Moving Away?
+            self.enemy_can_shoot[i] = band(state_byte, 0x40) ~= 0 and 1 or 0   -- Bit 6: Can Shoot?
+            self.enemy_split_behavior[i] = band(state_byte, 0x03)                -- Bits 0-1: Split Behavior
+
+            -- Calculate fractional progress
+            local more_info_byte = mem:read_u8(0x02CC + i - 1)
+            local core_type = self.enemy_core_type[i]
+            local is_in_transition = band(more_info_byte, 0x80) ~= 0
+
+            if is_in_transition then
+                if core_type == ENEMY_TYPE_FLIPPER or core_type == ENEMY_TYPE_PULSAR then
+                    local angle_4bit = band(more_info_byte, 0x0F)
+                    if self.enemy_direction_moving[i] == 1 then -- Increasing segment, angle decrements
+                        self.enemy_fractional_progress[i] = (15.0 - angle_4bit) / 15.0
+                    else -- Decreasing segment, angle increments
+                        self.enemy_fractional_progress[i] = angle_4bit / 15.0
+                    end
+                elseif core_type == ENEMY_TYPE_FUSEBALL then
+                    local lower_3_bits = band(more_info_byte, 0x07)
+                    if self.enemy_direction_moving[i] == 1 then -- Increasing, started with $87 (lower 3 bits = 7), counts down
+                        self.enemy_fractional_progress[i] = (7.0 - lower_3_bits) / 7.0
+                    else -- Decreasing, started with $81 (lower 3 bits = 1), counts up to 7
+                        self.enemy_fractional_progress[i] = (lower_3_bits - 1.0) / 7.0
+                    end
+                end
+                -- Clamp progress to 0.0-1.0
+                self.enemy_fractional_progress[i] = math.max(0.0, math.min(1.0, self.enemy_fractional_progress[i] or 0.0))
+            end
         end -- End if enemy active
     end -- End enemy slot loop
 
@@ -821,7 +868,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
-        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
+        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (band(self.active_enemy_info[i], 0x80)) == 0 then -- Correct type 4
             self.charging_fuseball[i] = self.enemy_segments[i]
         end
         
@@ -854,7 +901,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                 self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
                 self.shot_positions[i] = 0 -- Ensure position is zeroed
             else
-                local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+                local abs_segment = band(abs_segment_raw, 0x0F) -- Mask to 0-15
                 self.enemy_shot_abs_segments[i] = abs_segment
                 self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
             end
@@ -867,7 +914,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         if abs_segment_raw == 0 then
             self.pending_seg[i] = INVALID_SEGMENT -- Not active, use sentinel
         else
-            local segment = abs_segment_raw & 0x0F    -- Mask to ensure 0-15
+            local segment = band(abs_segment_raw, 0x0F)    -- Mask to ensure 0-15
             self.pending_seg[i] = abs_to_rel_func(player_abs_segment, segment, is_open)
         end
     end
@@ -928,9 +975,9 @@ end
 
 -- Helper functions for display (can be called on an instance)
 function M.EnemiesState:decode_enemy_type(type_byte)
-    local enemy_type = type_byte & ENEMY_TYPE_MASK -- Use the mask
-    local between_segments = (type_byte & 0x80) ~= 0
-    local segment_increasing = (type_byte & 0x40) ~= 0
+    local enemy_type = band(type_byte, ENEMY_TYPE_MASK) -- Use the mask
+    local between_segments = (band(type_byte, 0x80)) ~= 0
+    local segment_increasing = (band(type_byte, 0x40)) ~= 0
     return string.format("%d%s%s",
         enemy_type,
         between_segments and "B" or "-",
@@ -939,9 +986,9 @@ function M.EnemiesState:decode_enemy_type(type_byte)
 end
 
 function M.EnemiesState:decode_enemy_state(state_byte)
-    local split_behavior = state_byte & 0x03
-    local can_shoot = (state_byte & 0x40) ~= 0
-    local moving_away = (state_byte & 0x80) ~= 0
+    local split_behavior = band(state_byte, 0x03)
+    local can_shoot = (band(state_byte, 0x40)) ~= 0
+    local moving_away = (band(state_byte, 0x80)) ~= 0
     return string.format("%s%s%d", -- Show split behavior as number
         moving_away and "A" or "T", -- Away / Towards
         can_shoot and "S" or "-",   -- Can Shoot / Cannot Shoot

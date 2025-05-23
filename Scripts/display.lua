@@ -5,6 +5,25 @@
 
 local M = {} -- Module table for export
 
+-- Helper functions for bitwise operations
+local function band(a, b) -- bitwise AND (copied from state.lua for now)
+    local result = 0
+    local bit_val = 1
+    while a > 0 and b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bit_val
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit_val = bit_val * 2
+    end
+    return result
+end
+
+local function rshift(num, bits) -- bitwise RIGHT SHIFT
+    return math.floor(num / (2^bits))
+end
+
 -- Constants (Copied from main.lua's original display logic context)
 local INVALID_SEGMENT = -32768
 local SCREEN_WIDTH = 80
@@ -88,7 +107,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     local game_items = {
         format_item("Status", status_message, col_width),
         format_item("GState", string.format("0x%02X", game_state.gamestate), col_width),
-        format_item("Mode", (game_state.game_mode & 0x80 == 0) and "Attract" or "Play", col_width),
+        format_item("Mode", (band(game_state.game_mode, 0x80) == 0) and "Attract" or "Play", col_width),
         format_item("Lives", game_state.p1_lives, col_width),
         format_item("Level", game_state.p1_level, col_width),
         format_item("Frame", game_state.frame_counter, col_width),
@@ -108,7 +127,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     table.insert(display_lines, format_header("Player State"))
     
     local player_items = {
-        format_item("Pos", string.format("%d (Seg %d)", player_state.position, player_state.position & 0x0F), col_width),
+        format_item("Pos", string.format("%d (Seg %d)", player_state.position, band(player_state.position, 0x0F)), col_width),
         format_item("State", string.format("0x%02X", player_state.player_state), col_width),
         format_item("Depth", string.format("0x%02X", player_state.player_depth), col_width),
         format_item("Alive", (player_state.alive == 1) and "Yes" or "No", col_width),
@@ -155,7 +174,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     local spike_str = "Spikes: "
     for i = 0, 15 do 
         if i % 8 == 0 and i > 0 then spike_str = spike_str .. " | " end
-        spike_str = spike_str .. string.format("%01X", (level_state.spike_heights[i] or 0) >> 4)
+        spike_str = spike_str .. string.format("%01X", rshift(level_state.spike_heights[i] or 0, 4))
     end
     table.insert(display_lines, spike_str)
     table.insert(display_lines, "")
@@ -195,8 +214,8 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     table.insert(display_lines, format_header("Enemy Slots"))
     
     -- Create a compact header for the enemy slots table
-    table.insert(display_lines, "  # | Type | State | Seg  | Depth")
-    table.insert(display_lines, "----+------+-------+------+------")
+    table.insert(display_lines, "  # | Type | State | Seg      | Depth | FracP ") -- Adjusted header for 8-char Seg
+    table.insert(display_lines, "----+------+-------+----------+-------+-------") -- Adjusted separator for 8-char Seg
     
     -- Display each enemy slot in a compact tabular format
     for i = 1, 7 do
@@ -208,14 +227,46 @@ function M.update(status_message, game_state, level_state, player_state, enemies
                          enemies_state:decode_enemy_state(enemies_state.active_enemy_info[i]) or 
                          string.format("0x%02X", enemies_state.active_enemy_info[i])
         
-        local abs_seg = enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and 
-                       enemies_state.enemy_abs_segments[i] or "---"
+        local rel_seg_val = enemies_state.enemy_segments[i]
+        local frac_progress = enemies_state.enemy_fractional_progress[i]
+        local is_between = enemies_state.enemy_between_segments[i]
+        local dir_moving = enemies_state.enemy_direction_moving[i]
         
-        local rel_seg = format_segment(enemies_state.enemy_segments[i])
-        local depth = string.format("%02X", enemies_state.enemy_depths[i])
+        local display_seg_str -- For "Seg" column
+        if rel_seg_val == INVALID_SEGMENT then
+            display_seg_str = " --.--- " -- 8 chars for invalid
+        else
+            local effective_display_val = rel_seg_val + 0.0 -- Ensure float type
+            local tolerance = 0.0001 
+            -- Only apply fractional part if enemy is marked as 'between_segments'
+            -- and frac_progress is not essentially 0 or 1.
+            if is_between == 1 and frac_progress > tolerance and frac_progress < (1.0 - tolerance) then
+                if dir_moving == 1 then -- Moving towards more positive relative segment
+                    effective_display_val = rel_seg_val + frac_progress
+                else -- Moving towards more negative relative segment
+                    effective_display_val = rel_seg_val - frac_progress
+                end
+            end
+            display_seg_str = string.format("%+08.3f", effective_display_val) -- Format to 8 chars like +00.123 or +12.345
+        end
+
+        local depth_val = enemies_state.enemy_depths[i]
+        local depth_str -- For "Depth" column
+        if rel_seg_val == INVALID_SEGMENT then
+            depth_str = "  --   " -- 7 chars
+        else
+            depth_str = string.format("  %02X   ", depth_val) -- e.g., "  1A   " (7 chars)
+        end
+
+        local frac_column_str -- For "FracP" column
+        if rel_seg_val == INVALID_SEGMENT then
+            frac_column_str = "  ---- " 
+        else
+            frac_column_str = string.format(" %.3f ", frac_progress) 
+        end
         
-        local slot_line = string.format("  %d | %-4s | %-5s | %s | %s", 
-            i, type_str, state_str, rel_seg, depth)
+        local slot_line = string.format("  %d | %-4s | %-5s | %-8s | %-7s | %-7s", 
+            i, type_str, state_str, display_seg_str, depth_str, frac_column_str)
         
         table.insert(display_lines, slot_line)
     end
@@ -246,16 +297,16 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     table.insert(display_lines, top_rail_str)
     
     -- Fractional positions
-    local frac_str = "Fractions: "
+    local frac_display_str = "FracProg: " -- Renamed to avoid conflict with frac_str inside loop
     for i = 1, 7 do
-        local value = enemies_state.fractional_enemy_segments_by_slot[i]
-        if value == INVALID_SEGMENT then
-            frac_str = frac_str .. "---- "
+        local progress_val = enemies_state.enemy_fractional_progress[i]
+        if progress_val > 0.005 and progress_val < 0.995 then -- Only display if meaningful
+            frac_display_str = frac_display_str .. string.format("%.2f ", progress_val)
         else
-            frac_str = frac_str .. string.format("%04X ", value & 0xFFFF)
+            frac_display_str = frac_display_str .. "---- "
         end
     end
-    table.insert(display_lines, frac_str)
+    table.insert(display_lines, frac_display_str) -- Use the new variable name
     table.insert(display_lines, "")
     
     -- Pending data summary

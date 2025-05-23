@@ -22,7 +22,7 @@ local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
-local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
+local SOCKET_ADDRESS          = "socket.m2macpro:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
@@ -78,6 +78,21 @@ local function initialize_mame_interface()
     end
     print("MAME interface initialized successfully.")
     return true -- Indicate success
+end
+
+-- Helper functions for bitwise operations (copied from state.lua for now)
+local function band(a, b) -- bitwise AND
+    local result = 0
+    local bit_val = 1
+    while a > 0 and b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bit_val
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit_val = bit_val * 2
+    end
+    return result
 end
 
 -- Socket Management
@@ -218,8 +233,11 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 7 do insert(data, es.active_pulsar[i]) end
     -- Top Rail Enemy segments (7 entries showing relative segment to player for each top rail pulsar/flipper)
     for i = 1, 7 do insert(data, es.active_top_rail_enemies[i]) end
-    -- Fractional Enemy segments (7 entries showing fractional segment position scaled to 12-bits)
-    for i = 1, 7 do insert(data, es.fractional_enemy_segments_by_slot[i]) end
+    -- Fractional Enemy progress (7 entries, 0.0-1.0, scaled to 0-10000)
+    for i = 1, 7 do
+        local progress = es.enemy_fractional_progress[i] or 0.0
+        insert(data, math.floor(progress * 10000.0))
+    end
     -- Pending Vid (64)
     -- for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
@@ -239,7 +257,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     local num_values_packed = #data
 
     -- --- OOB Data Packing ---
-    local is_attract_mode = (gs.game_mode & 0x80) == 0
+    local is_attract_mode = (band(gs.game_mode, 0x80)) == 0
     local is_open_level = ls.level_type == 0xFF
     local score = ps.score or 0
     local score_high = math.floor(score / 65536)
@@ -262,7 +280,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
         0,                          -- B: Placeholder (uchar)
-        gs.game_mode,               -- B: Game Mode (uchar)
+        gs.game_mode,               -- B: Game Mode (uchar) -- No band needed, sending raw
         bDone and 1 or 0,           -- B: Done flag (uchar)
         frame,                      -- H: Frame counter (ushort)
         score_high,                 -- H: Score High (ushort)
@@ -271,9 +289,9 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         ps.fire_commanded,          -- B: Commanded Fire (uchar)
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
         ps.spinner_commanded,       -- h: Commanded Spinner (short)
-        is_attract_mode and 1 or 0, -- B: Is Attract Mode (uchar)
+        (band(gs.game_mode, 0x80) == 0) and 1 or 0, -- B: Is Attract Mode (uchar)
         expert_target_seg or -1,    -- h: Expert Target Segment (short)
-        ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
+        band(ps.position, 0x0F),         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
         expert_zap_packed,          -- B: Expert Zap (uchar)
@@ -426,7 +444,7 @@ local function determine_final_actions()
     local final_zap_cmd = 0
     local final_spinner_cmd = 0
     local final_p1_start_cmd = 0
-    local is_attract_mode = (game_state.game_mode & 0x80) == 0
+    local is_attract_mode = (band(game_state.game_mode, 0x80) == 0)
 
     -- Override based on game state
     if game_state.gamestate == 0x12 then -- High Score Entry
