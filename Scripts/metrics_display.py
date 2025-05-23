@@ -54,7 +54,7 @@ def display_metrics_header():
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
         f"{'AvgInf(ms)':>11}"
     )
-    print_metrics_line(header, is_header=True)
+    print_metrics_line(header)
     # Print an empty line after header
     print()
 
