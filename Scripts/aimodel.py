@@ -218,6 +218,7 @@ class DQNAgent:
         self.state_size = state_size
         self.action_size = action_size
         self.last_save_time = 0.0 # Initialize last save time
+        self.training_step_count = 0  # Track training steps for target network updates
         
         # Q-Networks (online and target)
         self.qnetwork_local = DQN(state_size, action_size).to(device)
@@ -268,6 +269,10 @@ class DQNAgent:
         """Perform a single training step on one batch"""
         if len(self.memory) < RL_CONFIG.batch_size:
             return
+        
+        # Increment training step counter
+        self.training_step_count += 1
+            
         # Use PER sampling
         states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(RL_CONFIG.batch_size, beta=0.4)
         states = torch.from_numpy(states).float().to(device)
@@ -293,6 +298,10 @@ class DQNAgent:
         priorities = td_errors.abs().detach().cpu().numpy() + 1e-6
         self.memory.update_priorities(indices, priorities)
         metrics.losses.append(loss.item())
+        
+        # Update target network at regular intervals
+        if self.training_step_count % RL_CONFIG.target_update == 0:
+            self.update_target_network()
 
     def update_target_network(self):
         """Update target network with weights from local network"""
@@ -357,7 +366,8 @@ class DQNAgent:
                 'frame_count': metrics.frame_count,
                 'expert_ratio': ratio_to_save, # Save the determined ratio
                 'last_decay_step': metrics.last_decay_step,
-                'last_epsilon_decay_step': metrics.last_epsilon_decay_step
+                'last_epsilon_decay_step': metrics.last_epsilon_decay_step,
+                'training_step_count': self.training_step_count  # Save training step count
             }, filename)
             
             # Update last save time ONLY on successful save
@@ -380,6 +390,7 @@ class DQNAgent:
                 
                 # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
+                self.training_step_count = checkpoint.get('training_step_count', 0)  # Load training step count
                 # Load or reset metrics based on RESET_METRICS flag from config
                 if RESET_METRICS:
                     print("RESET_METRICS flag is True. Resetting epsilon/expert_ratio.")
@@ -396,6 +407,7 @@ class DQNAgent:
                                 
                 print(f"Loaded model from {filename}")
                 print(f"  - Resuming from frame: {metrics.frame_count}")
+                print(f"  - Resuming training step: {self.training_step_count}")
                 print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
                 print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
                 print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")

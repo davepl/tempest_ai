@@ -459,11 +459,6 @@ class SocketServer:
                         print(f"Client {client_id}: Connection lost when sending action.")
                         break # Exit loop if connection is lost
 
-
-                    # Periodic target network update (only from client 0)
-                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
-                        self.agent.update_target_network()
-
                     # Periodic model saving (only from client 0)
                     if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.save_interval == 0:
                         self.agent.save(LATEST_MODEL_PATH)
