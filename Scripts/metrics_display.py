@@ -53,12 +53,12 @@ def display_metrics_header():
     # Clear screen first
     # clear_screen()
     
-    # Print header (Remove TrainQ)
+    # Print header (with Avg Level)
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
-        f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11}" # Removed TrainQ column
+        f"{'Clients':>8} {'Avg Level':>9} {'Override':>9} {'Expert Mode':>11} "
+        f"{'AvgInf(ms)':>11}"
     )
     print_metrics_line(header, is_header=True)
     # Print an empty line after header
@@ -101,14 +101,19 @@ def display_metrics_row(agent, kb_handler):
         metrics.total_inference_time = 0.0
         metrics.total_inference_requests = 0
 
-    # Format the row (Remove TrainQ)
+    # Get average level across clients
+    avg_level = metrics.get_average_level()
+    # Add 1 to display level since it's 0-indexed in the code
+    display_level = avg_level + 1.0 if avg_level > 0 else 0.0
+    
+    # Format the row (with Avg Level)
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
-        f"{int(latest_loss):>10} {metrics.client_count:>8} " # Format loss as integer
+        f"{int(latest_loss):>10} {metrics.client_count:>8} {display_level:>9.1f} " # Format loss as integer and add avg level
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
-        f"{avg_inference_time_ms:>11.2f}" # Removed TrainQ value
+        f"{avg_inference_time_ms:>11.2f}"
     )
     
     print_metrics_line(row)

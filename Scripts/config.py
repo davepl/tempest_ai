@@ -90,6 +90,7 @@ class MetricsData:
     last_fps_time: float = 0
     fps: float = 0.0
     client_count: int = 0
+    client_levels: List[int] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     total_inference_time: float = 0.0
     total_inference_requests: int = 0
@@ -179,6 +180,18 @@ class MetricsData:
         with self.lock:
             self.enemy_seg = enemy_seg
             self.open_level = open_level
+    
+    def update_client_levels(self, levels):
+        """Update client levels list"""
+        with self.lock:
+            self.client_levels = levels.copy()
+    
+    def get_average_level(self):
+        """Get current average level across all clients"""
+        with self.lock:
+            if not self.client_levels:
+                return 0.0
+            return sum(self.client_levels) / len(self.client_levels)
     
     def get_expert_ratio(self):
         """Get current expert ratio"""

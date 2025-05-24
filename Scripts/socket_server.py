@@ -91,7 +91,8 @@ class SocketServer:
                         'frames_processed': 0,
                         'fps': 0.0,  # Track per-client FPS
                         'frames_last_second': 0,  # Frames in current second
-                        'last_fps_update': time.time()  # Last FPS calculation time
+                        'last_fps_update': time.time(),  # Last FPS calculation time
+                        'current_level': 1  # Track current level for this client
                     }
                     
                     # Store client information
@@ -326,6 +327,9 @@ class SocketServer:
                             state['fps'] = state['frames_last_second'] / elapsed
                             state['frames_last_second'] = 0
                             state['last_fps_update'] = current_time
+                        
+                        # Update client level information
+                        state['current_level'] = frame.level
                     
                     # Handle save signal from game
                     if frame.save_signal:
@@ -343,6 +347,14 @@ class SocketServer:
                     self.metrics.update_epsilon()
                     self.metrics.update_expert_ratio()
                     self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
+                    
+                    # Update global level metrics by collecting levels from all clients
+                    with self.client_lock:
+                        client_levels = [
+                            client_state.get('current_level', 1) 
+                            for client_state in self.client_states.values()
+                        ]
+                        self.metrics.update_client_levels(client_levels)
                     
                     # Process previous step's results if available
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:

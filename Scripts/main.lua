@@ -22,7 +22,7 @@ local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
-local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
+local SOCKET_ADDRESS          = "socket.m2macpro:9999"
 local SOCKET_READ_TIMEOUT_S   = 0.5
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
@@ -248,6 +248,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     local score_high = math.floor(score / 65536)
     local score_low = score % 65536
     local frame = gs.frame_counter % 65536
+    local level = game_state.p1_level
 
     -- Save signal logic
     local current_time = os.time()
@@ -259,8 +260,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         else print("Periodic Save: Sending save signal.") end
     end
 
-    -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 4 UByte)
-    local oob_format = ">HdBBBHHHBBBhBhBBBB"
+    -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 5 UByte)
+    local oob_format = ">HdBBBHHHBBBhBhBBBBB"
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
@@ -279,7 +280,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
-        expert_zap_packed           -- B: Expert Zap (uchar)
+        expert_zap_packed,           -- B: Expert Zap (uchar)
+        level
     )
 
     -- Combine OOB header + main data

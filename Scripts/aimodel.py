@@ -132,6 +132,7 @@ class FrameData:
     open_level: bool
     expert_fire: bool  # Added: Expert system fire recommendation
     expert_zap: bool   # Added: Expert system zap recommendation
+    level: int
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -148,7 +149,8 @@ class FrameData:
             player_seg=data["player_seg"],
             open_level=data["open_level"],
             expert_fire=data["expert_fire"],
-            expert_zap=data["expert_zap"]
+            expert_zap=data["expert_zap"],
+            level=data["level"]
         )
 
 # Configuration constants
@@ -651,7 +653,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">HdBBBHHHBBBhBhBBBB"  # Updated format string
+        format_str = ">HdBBBHHHBBBhBhBBBBB"  # Updated format string
         header_size = struct.calcsize(format_str)
         
         if len(data) < header_size:
@@ -661,7 +663,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         values = struct.unpack(format_str, data[:header_size])
         num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open, \
-        expert_fire, expert_zap = values  # Added expert recommendations
+        expert_fire, expert_zap, level = values  # Added expert recommendations
         
         # Combine score components
         score = (score_high * 65536) + score_low
@@ -700,7 +702,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             player_seg=player_seg,
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
-            expert_zap=bool(expert_zap)
+            expert_zap=bool(expert_zap),
+            level=level
         )
         
         return frame_data
