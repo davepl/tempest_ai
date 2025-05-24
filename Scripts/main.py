@@ -71,6 +71,12 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == 'e':
                     metrics.toggle_expert_mode(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
+                elif key == 'h':
+                    print("Displaying report header...")
+                    display_metrics_header()
+                elif key == ' ':  # Space key
+                    # Display a new metrics row on demand
+                    display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)
         except Exception as e:
