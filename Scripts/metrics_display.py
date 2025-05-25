@@ -57,7 +57,7 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
-        f"{'Clients':>8} {'Override':>9} {'Expert Mode':>11} "
+        f"{'Clients':>8} {'Avg Level':>9} {'Override':>9} {'Expert Mode':>11} "
         f"{'AvgInf(ms)':>11}" # Removed TrainQ column
     )
     print_metrics_line(header, is_header=True)
@@ -101,11 +101,17 @@ def display_metrics_row(agent, kb_handler):
         metrics.total_inference_time = 0.0
         metrics.total_inference_requests = 0
 
+    # Get average level across all connected clients
+    avg_level = 0.0
+    if metrics.global_server:
+        avg_level = metrics.global_server.get_average_level()
+
     # Format the row (Remove TrainQ)
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
         f"{int(latest_loss):>10} {metrics.client_count:>8} " # Format loss as integer
+        f"{avg_level:>9.1f} " # Add average level column
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
         f"{avg_inference_time_ms:>11.2f}" # Removed TrainQ value

@@ -53,6 +53,15 @@ class SocketServer:
         self.client_lock = threading.Lock()  # Lock for client dictionaries
         self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
         
+    def get_average_level(self):
+        """Calculate the average level across all connected clients"""
+        with self.client_lock:
+            if not self.client_states:
+                return 0.0
+            
+            levels = [state.get('level', 0) for state in self.client_states.values()]
+            return sum(levels) / len(levels) if levels else 0.0
+        
     def start(self):
         """Start the socket server"""
         try:
@@ -91,7 +100,8 @@ class SocketServer:
                         'frames_processed': 0,
                         'fps': 0.0,  # Track per-client FPS
                         'frames_last_second': 0,  # Frames in current second
-                        'last_fps_update': time.time()  # Last FPS calculation time
+                        'last_fps_update': time.time(),  # Last FPS calculation time
+                        'level': 0  # Track current level for this client
                     }
                     
                     # Store client information
@@ -317,6 +327,9 @@ class SocketServer:
 
                         state = self.client_states[client_id]
                         state['frames_processed'] += 1
+                        
+                        # Update level tracking for this client
+                        state['level'] = frame.level
                         
                         # Update client-specific FPS tracking
                         current_time = time.time()

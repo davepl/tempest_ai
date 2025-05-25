@@ -248,6 +248,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     local score_high = math.floor(score / 65536)
     local score_low = score % 65536
     local frame = gs.frame_counter % 65536
+    local level = ls.level_number or 0
 
     -- Save signal logic
     local current_time = os.time()
@@ -260,7 +261,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     end
 
     -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 4 UByte)
-    local oob_format = ">HdBBBHHHBBBhBhBBBB"
+    local oob_format = ">HdBBBHHHBBBhBhBBBBB"
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
@@ -279,7 +280,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
-        expert_zap_packed           -- B: Expert Zap (uchar)
+        expert_zap_packed,          -- B: Expert Zap (uchar)
+        level                       -- B: Level Number (uchar)    
     )
 
     -- Combine OOB header + main data
