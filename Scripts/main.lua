@@ -248,7 +248,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     local score_high = math.floor(score / 65536)
     local score_low = score % 65536
     local frame = gs.frame_counter % 65536
-    local level = game_state.p1_level
+    local level = ls.level_number
 
     -- Save signal logic
     local current_time = os.time()

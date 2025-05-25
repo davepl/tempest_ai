@@ -354,14 +354,8 @@ class SocketServer:
                             client_state.get('current_level', 1) 
                             for client_state in self.client_states.values()
                         ]
-                        # Debug: Print level data when it changes significantly
-                        if client_levels:
-                            avg_level = sum(client_levels) / len(client_levels)
-                            prev_avg = self.metrics.get_average_level()
-                            if abs(avg_level - prev_avg) > 1.0:  # Significant change
-                                print(f"DEBUG: Level change - Client levels: {client_levels}, Avg: {avg_level:.1f}, Frame level: {frame.level}")
                         self.metrics.update_client_levels(client_levels)
-                    
+            
                     # Process previous step's results if available
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:
                          # Ensure agent exists before stepping
