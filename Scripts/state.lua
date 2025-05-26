@@ -172,10 +172,10 @@ hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_f
     -- Corrected Hunt Order (based on assembly types): Fuseball(4), Pulsar(1), Tanker(2), Flipper(0), Spiker(3)
     local hunt_order = {
         ENEMY_TYPE_FUSEBALL, -- 4
-        ENEMY_TYPE_PULSAR,   -- 1
         ENEMY_TYPE_TANKER,   -- 2
         ENEMY_TYPE_FLIPPER,  -- 0
-        ENEMY_TYPE_SPIKER    -- 3
+        ENEMY_TYPE_SPIKER,   -- 3
+        ENEMY_TYPE_PULSAR    -- 1
     }
 
     for _, enemy_type in ipairs(hunt_order) do
