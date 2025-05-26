@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import random
 import traceback
 from datetime import datetime
+from collections import deque
 
 # Import from config.py
 from config import (
@@ -53,14 +54,16 @@ class SocketServer:
         self.client_lock = threading.Lock()  # Lock for client dictionaries
         self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
         
+        # Deque to track last 10,000 level values for rolling average
+        self.level_history = deque(maxlen=100000)
+        self.level_lock = threading.Lock()  # Lock for level history
+        
     def get_average_level(self):
-        """Calculate the average level across all connected clients"""
-        with self.client_lock:
-            if not self.client_states:
+        """Calculate the rolling average level from the last N frames"""
+        with self.level_lock:
+            if not self.level_history:
                 return 0.0
-            
-            levels = [state.get('level', 0) for state in self.client_states.values()]
-            return sum(levels) / len(levels) if levels else 0.0
+            return sum(self.level_history) / len(self.level_history)
         
     def start(self):
         """Start the socket server"""
@@ -330,6 +333,10 @@ class SocketServer:
                         
                         # Update level tracking for this client
                         state['level'] = frame.level
+                        
+                        # Add level to the rolling history deque
+                        with self.level_lock:
+                            self.level_history.append(frame.level)
                         
                         # Update client-specific FPS tracking
                         current_time = time.time()

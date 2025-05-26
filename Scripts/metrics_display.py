@@ -104,7 +104,7 @@ def display_metrics_row(agent, kb_handler):
     # Get average level across all connected clients
     avg_level = 0.0
     if metrics.global_server:
-        avg_level = metrics.global_server.get_average_level()
+        avg_level = metrics.global_server.get_average_level() + 1.0
 
     # Format the row (Remove TrainQ)
     row = (
