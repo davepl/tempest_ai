@@ -1,0 +1,146 @@
+Here is the general movement logic we wish to implement:
+
+1) The expert will first assess the playfield for dangers, creating a map of 0-15 values, one per segment
+2) Each segment value will indicate the danger for that segment on a 0-1.0 basis, with 1.0 being certain death
+3) The map will be constructed as follows:
+
+For each active enemy, update its segment danger value to the greater of its current value (starting with 0) or:
+
+  If the enemy is a fuseball
+    if the fuseball is moving toward us
+      danger = 0.90
+    else
+      danger = 0.0
+
+  If the enemy is a pulsar
+    If the pulsing rate is currently about the PULSAR_THRESHOLD
+      danger = 1.0
+    else
+      danfer = 0.3
+
+  If the enemy is a flipper
+    If the flipper is on the top rail (depth of less than 0x20)
+       Danger = 0.5
+
+  If the enemy is a tanker
+    If the tanker has pulsars as a payload
+      Danger = 0.75 for the adjacent lanes
+      Danger = 0    for the current lane
+
+    If the tanker has fuseballs as a payload and is at a depth of less than 0x80
+      Danger = 0.75 for this lane AND the two adjacent lanes
+
+  Then the expert will pick a desired hunting target in descending priority order: fuseball, tanker, flipper, spiker, pulsar,
+  and the desired_lane will be set accordingly
+
+  If the desired_land has a danger equal or above the DANGER_THRESHOLD (0.5) value, then a safe lane will be selected instead
+
+  A safe lane is chosen as the nearest lane with 0 danger
+
+  So the logic is essentially "Build a segment map of dangers, determine where you would LIKE to hunt, and then make the priority getting to a safe lane, ideally the one selected for hunting, but safe in any case"
+  
+
+Some tips on sorting out if a tanker will   
+
+Looking at the Tempest assembly code, I can help you identify the memory locations that determine what payload a tanker will deposit. Based on the code structure and comments, here are the key memory locations to examine: Based on my analysis of the Tempest assembly code and the related Lua scripts, I can help you identify the key memory locations to check for determining what payload a tanker will deposit when it lands.
+
+Looking at the assembly code, here are the critical memory locations related to tanker payloads:
+
+## Primary Memory Locations:
+
+1. **`tanker_load` ($0149)** - This is the main variable that controls tanker behavior
+2. **`more_enemy_info` ($02CC + enemy_index)** - Contains additional enemy-specific information
+3. **`active_enemy_info` ($028A + enemy_index)** - Contains enemy state information including split behavior
+
+## Key Analysis from the Code:
+
+From the assembly code comments and the active AI system, tanker payloads are determined by the **split behavior** bits in the `active_enemy_info` byte:
+
+```assembly
+; Active Enemy State Information 
+; $80 bit set -> moving away from player, clear -> towards
+; $40 means the enemy can shoot
+; $03 bits determine what happens when enemy gets below $20:
+; $00 = no special action (as if $20 weren't special)
+; $01 = split into two flippers
+; $02 = split into two pulsars  
+; $03 = split into two fuseballs
+```
+
+## Memory Locations to Monitor:
+
+For a tanker in enemy slot `i` (1-7), check:
+
+1. **`0x028A + (i-1)`** - The `active_enemy_info` byte
+   - Bits 0-1 (`& 0x03`) determine the payload:
+     - `0x00` = No split/payload
+     - `0x01` = Will spawn 2 Flippers
+     - `0x02` = Will spawn 2 Pulsars
+     - `0x03` = Will spawn 2 Fuseballs
+
+2. **`0x02CC + (i-1)`** - The `more_enemy_info` byte (additional context)
+
+3. **`0x0149`** - The global `tanker_load` variable (may affect spawn behavior)
+
+## Implementation Suggestion:
+
+To determine a tanker's payload before it lands, you would:
+
+1. Identify active tankers by checking `enemy_type_info` for type 2 (tanker)
+2. For each tanker, read its `active_enemy_info` byte
+3. Extract bits 0-1 to determine the payload type
+4. Monitor the tanker's depth - when it reaches the rim (depth ≤ 0x20), it will deploy its payload
+
+Looking at the Tempest assembly code, I can help you identify the memory locations that determine what payload a tanker will deposit. Based on the code structure and comments, here are the key memory locations to examine: Based on my analysis of the Tempest assembly code and the related Lua scripts, I can help you identify the key memory locations to check for determining what payload a tanker will deposit when it lands.
+
+Looking at the assembly code, here are the critical memory locations related to tanker payloads:
+
+## Primary Memory Locations:
+
+1. **`tanker_load` ($0149)** - This is the main variable that controls tanker behavior
+2. **`more_enemy_info` ($02CC + enemy_index)** - Contains additional enemy-specific information
+3. **`active_enemy_info` ($028A + enemy_index)** - Contains enemy state information including split behavior
+
+## Key Analysis from the Code:
+
+From the assembly code comments and the active AI system, tanker payloads are determined by the **split behavior** bits in the `active_enemy_info` byte:
+
+```assembly
+; Active Enemy State Information 
+; $80 bit set -> moving away from player, clear -> towards
+; $40 means the enemy can shoot
+; $03 bits determine what happens when enemy gets below $20:
+; $00 = no special action (as if $20 weren't special)
+; $01 = split into two flippers
+; $02 = split into two pulsars  
+; $03 = split into two fuseballs
+```
+
+## Memory Locations to Monitor:
+
+For a tanker in enemy slot `i` (1-7), check:
+
+1. **`0x028A + (i-1)`** - The `active_enemy_info` byte
+   - Bits 0-1 (`& 0x03`) determine the payload:
+     - `0x00` = No split/payload
+     - `0x01` = Will spawn 2 Flippers
+     - `0x02` = Will spawn 2 Pulsars
+     - `0x03` = Will spawn 2 Fuseballs
+
+2. **`0x02CC + (i-1)`** - The `more_enemy_info` byte (additional context)
+
+3. **`0x0149`** - The global `tanker_load` variable (may affect spawn behavior)
+
+## Implementation Suggestion:
+
+To determine a tanker's payload before it lands, you would:
+
+1. Identify active tankers by checking `enemy_type_info` for type 2 (tanker)
+2. For each tanker, read its `active_enemy_info` byte
+3. Extract bits 0-1 to determine the payload type
+4. Monitor the tanker's depth - when it reaches the rim (depth ≤ 0x20), it will deploy its payload
+
+The AI system already tracks this in the Lua code via `enemies_state.enemy_split_behavior[i]`, which directly corresponds to the `active_enemy_info & 0x03` value from the assembly code.
+
+
+
