@@ -467,6 +467,110 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     -- Apply shot count override (happens last)
     should_fire = should_fire or player_state.shot_count < 3
 
+    -- FINAL SAFETY CHECK: Escape immediate danger from pulsars and charging fuseballs
+    -- This overrides all other logic to prioritize survival
+    local immediate_danger = false
+    local danger_reason = ""
+    
+    -- Check for high pulsar threshold danger
+    if enemies_state.pulsing > 0xE0 then
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+               enemies_state.enemy_abs_segments[i] == player_abs_seg and
+               enemies_state.enemy_depths[i] > 0 then
+                immediate_danger = true
+                danger_reason = "High pulsar threshold in current lane"
+                break
+            end
+        end
+    end
+    
+    -- Check for charging fuseball danger
+    if not immediate_danger and enemies_state.charging_fuseball_segments[player_abs_seg + 1] > 0 then
+        local fuseball_depth = enemies_state.charging_fuseball_segments[player_abs_seg + 1]
+        if fuseball_depth <= 0x40 then -- If charging fuseball is close
+            immediate_danger = true
+            danger_reason = string.format("Charging fuseball at depth %02X in current lane", fuseball_depth)
+        end
+    end
+    
+    -- If in immediate danger, find the nearest safe lane
+    if immediate_danger then
+        local emergency_target = -1
+        local min_emergency_dist = 255
+        
+        -- Search all segments for safety
+        for target_seg = 0, 15 do
+            local is_safe = true
+            local emergency_dist = math.abs(abs_to_rel_func(player_abs_seg, target_seg, is_open))
+            
+            -- Check if target segment is safe from high-threshold pulsars
+            if enemies_state.pulsing > 0xE0 then
+                for i = 1, 7 do
+                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+                       enemies_state.enemy_abs_segments[i] == target_seg and
+                       enemies_state.enemy_depths[i] > 0 then
+                        is_safe = false
+                        break
+                    end
+                end
+            end
+            
+            -- Check if target segment is safe from charging fuseballs
+            if is_safe and enemies_state.charging_fuseball_segments[target_seg + 1] > 0 then
+                local fuseball_depth = enemies_state.charging_fuseball_segments[target_seg + 1]
+                if fuseball_depth <= 0x40 then
+                    is_safe = false
+                end
+            end
+            
+            -- Check if target segment is safe from other immediate threats
+            if is_safe then
+                for i = 1, 7 do
+                    -- Avoid segments with very close enemies (depth <= 0x10)
+                    if enemies_state.enemy_abs_segments[i] == target_seg and
+                       enemies_state.enemy_depths[i] > 0 and
+                       enemies_state.enemy_depths[i] <= 0x10 then
+                        is_safe = false
+                        break
+                    end
+                end
+            end
+            
+            -- Check if target segment is safe from close enemy shots
+            if is_safe then
+                for i = 1, 4 do
+                    if enemies_state.enemy_shot_abs_segments[i] == target_seg and
+                       enemies_state.shot_positions[i] > 0 and
+                       enemies_state.shot_positions[i] <= 0x20 then
+                        is_safe = false
+                        break
+                    end
+                end
+            end
+            
+            -- If this segment is safe and closer than current best, use it
+            if is_safe and emergency_dist < min_emergency_dist then
+                min_emergency_dist = emergency_dist
+                emergency_target = target_seg
+            end
+        end
+        
+        -- If we found a safe emergency target, override all other logic
+        if emergency_target ~= -1 then
+            -- print(string.format("EMERGENCY ESCAPE: %s - Moving from %d to %d", danger_reason, player_abs_seg, emergency_target))
+            final_target_seg_abs = emergency_target
+            target_depth = 0 -- Emergency movement, depth not relevant
+            should_fire = false -- Don't fire during emergency escape
+            should_zap = false -- Don't zap during emergency escape
+        else
+            -- print(string.format("EMERGENCY WARNING: %s - No safe escape found!", danger_reason))
+            -- If no safe segment found, at least don't fire to avoid attracting more danger
+            should_fire = false
+            should_zap = false
+        end
+    end
+
     return final_target_seg_abs, target_depth, should_fire, should_zap
 end
 
