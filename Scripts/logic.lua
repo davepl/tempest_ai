@@ -13,10 +13,10 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
 local SAFE_DISTANCE = 1
-local FREEZE_FIRE_PRIO_LOW = 4
+local FREEZE_FIRE_PRIO_LOW = 6
 local FREEZE_FIRE_PRIO_HIGH = 8
-local AVOID_FIRE_PRIORITY = 4
-local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance
+local AVOID_FIRE_PRIORITY = 6
+local PULSAR_THRESHOLD = 0x80 -- Pulsing threshold for avoidance
 
 local M = {} -- Module table
 
@@ -456,7 +456,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
         -- === Step 3: Final Return ===
         final_should_fire = final_fire_priority > shot_count
-        return final_target_seg, 0, final_should_fire, false
+        return final_target_seg, 0, true, false
 
     else -- Other game states
         return player_abs_seg, 0, false, false
