@@ -181,8 +181,33 @@ hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_f
     for _, enemy_type in ipairs(hunt_order) do
         local target_seg_abs, target_depth = find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func, forbidden_segments)
         if target_seg_abs ~= -1 then
-            -- Check for Top Rail Flipper(0)/Pulsar(1) Avoidance
-            if (enemy_type == ENEMY_TYPE_FLIPPER or enemy_type == ENEMY_TYPE_PULSAR) and target_depth <= 0x10 then -- <<< CORRECTED TYPE
+            -- Special targeting logic for pulsars: aim one segment closer to player
+            if enemy_type == ENEMY_TYPE_PULSAR and target_depth > 0x010 then
+                local rel_dist = abs_to_rel_func(player_abs_segment, target_seg_abs, is_open)
+                local adjusted_target_seg = target_seg_abs
+                
+                if rel_dist > 0 then
+                    -- Pulsar is to the right, target one segment left (closer to player)
+                    if is_open then
+                        if target_seg_abs > 0 then adjusted_target_seg = target_seg_abs - 1 end
+                    else
+                        adjusted_target_seg = (target_seg_abs - 1 + 16) % 16
+                    end
+                elseif rel_dist < 0 then
+                    -- Pulsar is to the left, target one segment right (closer to player)
+                    if is_open then
+                        if target_seg_abs < 15 then adjusted_target_seg = target_seg_abs + 1 end
+                    else
+                        adjusted_target_seg = (target_seg_abs + 1) % 16
+                    end
+                end
+                -- If rel_dist == 0 (aligned), target the pulsar lane directly
+                
+                return adjusted_target_seg, target_depth, false
+            end
+            
+            -- Check for Top Rail Flipper(0) Avoidance (for flippers only now)
+            if (enemy_type == ENEMY_TYPE_FLIPPER or enemy_type == ENEMY_TYPE_PULSAR) and target_depth <= 0x10 then
                 local rel_dist = abs_to_rel_func(player_abs_segment, target_seg_abs, is_open)
                 if math.abs(rel_dist) <= 1 then -- If aligned or adjacent
                     local safe_adjacent_seg
@@ -199,11 +224,11 @@ hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_f
                          return safe_adjacent_seg, target_depth, true -- Target safe adjacent, mark as avoiding
                     end
                 else
-                    -- Top Flipper/Pulsar is not adjacent, target directly
+                    -- Top Flipper is not adjacent, target directly
                     return target_seg_abs, target_depth, false
                 end
             else
-                -- Not a top-rail Flipper/Pulsar, target directly
+                -- Not a top-rail Flipper, target directly
                 return target_seg_abs, target_depth, false
             end
         end
