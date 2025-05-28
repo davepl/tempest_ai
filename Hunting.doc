@@ -21,3 +21,17 @@ So, if there is danger in the current lane, the spinner seeks the first safe seg
 If it finds a safe lane but no target, it remembers the safe lane
 If it finds a safe target, it targets that lane
 
+--- V2 ------
+
+Let's build a map of danger on the Tempest playfield for each segment 0-15.  A value of 1.0 will represent certain death and a value of 0.0 will mean safety.
+
+WE then check threats and populate the table as follows:
+
+- For any enemy or shot, we create a scalar that goes 0-1 for depth, where depth of xF0 is 0.0 and depth of 0x10 is 1.0, and in between is mapped accordingly
+- If one of the four enemy shots is in that lane, the danger is 0.8 * depth_scalar
+- If an enemy is in the lane, the danger is 0.8 * depth_scalar
+- If a fuseball is in the lane and is moving TOWARD the top rail, the danger is 0.9
+- If a pulsar is in the lane, the danger is 0.5.  If pulsing above 0xC0 theshold value, then 1.0
+
+First, we establish where the player would LIKE to move to hunt, using the existing hunt logic.
+

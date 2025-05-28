@@ -12,7 +12,7 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local SAFE_DISTANCE = 1
+local SAFE_DISTANCE = 0
 local FREEZE_FIRE_PRIO_LOW = 6
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 6
@@ -25,6 +25,10 @@ local previous_score = 0
 local previous_level = 0
 local previous_alive_state = 1 -- Track previous alive state, initialize as alive
 local LastRewardState = 0
+
+-- Global variables for pulsed firing
+local fire_frame_counter = 0
+local FIRE_INTERVAL = 5  -- Fire every N frames
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -454,9 +458,39 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             final_fire_priority = AVOID_FIRE_PRIORITY
         end
 
-        -- === Step 3: Final Return ===
-        final_should_fire = final_fire_priority > shot_count
-        return final_target_seg, 0, true, false
+        -- === Step 3: Pulsed Firing Logic ===
+        -- Check for proximate enemies (within 1 segment and at depth 0x40 or less)
+        local has_proximate_enemy = false
+        for i = 1, 7 do
+            local enemy_seg = enemies_state.enemy_abs_segments[i]
+            local enemy_depth = enemies_state.enemy_depths[i]
+            
+            if enemy_seg ~= INVALID_SEGMENT and enemy_depth > 0 and enemy_depth <= 0x40 then
+                local rel_distance = math.abs(abs_to_rel_func(player_abs_seg, enemy_seg, is_open))
+                if rel_distance <= 1 then
+                    has_proximate_enemy = true
+                    break
+                end
+            end
+        end
+        
+        -- Determine firing decision with pulsed firing pattern
+        fire_frame_counter = fire_frame_counter + 1
+        
+        if has_proximate_enemy then
+            -- Fire continuously when enemies are proximate (within 1 segment)
+            final_should_fire = shot_count < 8
+        else
+            -- Pulsed firing: fire for one frame every FIRE_INTERVAL frames
+            if fire_frame_counter >= FIRE_INTERVAL then
+                final_should_fire = shot_count < 8
+                fire_frame_counter = 0  -- Reset counter after firing
+            else
+                final_should_fire = false
+            end
+        end
+        
+        return final_target_seg, 0, final_should_fire, false
 
     else -- Other game states
         return player_abs_seg, 0, false, false

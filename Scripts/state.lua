@@ -18,6 +18,9 @@ local ENEMY_TYPE_SPIKER   = 3
 local ENEMY_TYPE_FUSEBALL = 4
 local ENEMY_TYPE_MASK = 0x07 -- <<< ADDED THIS DEFINITION (%00000111)
 
+-- Global variables for reward calculation tracking
+previous_player_segment = 0 -- Track previous player position for distance-based rewards
+
 -- Helper function for BCD conversion (local to this module)
 local function bcd_to_decimal(bcd)
     -- Handle potential non-number inputs gracefully
@@ -1143,22 +1146,64 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
         local target_depth = enemies_state.nearest_enemy_depth_raw
         local player_segment = player_state.position & 0x0F
+        local player_distance_moved = math.abs(player_segment - previous_player_segment)
 
-        -- === Penalize being in a dangerous pulsar lane ===
+        -- === New Reward Mechanisms ===
+        
+        -- 1. Pulsar lane penalty: subtract pulsing_value / 2
         if enemies_state.pulsing > 0xE0 then
             for i = 1, 7 do
                 if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
                    enemies_state.enemy_abs_segments[i] == player_segment and
                    enemies_state.enemy_depths[i] > 0 then
-                    reward = reward - 50 -- Penalty for being in a dangerous pulsar lane
+                    reward = reward - (enemies_state.pulsing / 2)
                     break
                 end
             end
         end
 
-        -- === Penalize being in a charging fuseball segment ===
+        -- 2. Charging fuseball penalty: -100 for staying, +200 for moving 3+ segments away
         if enemies_state.charging_fuseball_segments[player_segment + 1] > 0 then
-            reward = reward - 50 -- Penalty for being in a charging fuseball segment
+            if player_distance_moved >= 3 then
+                reward = reward + 200 -- Reward for moving away from charging fuseball
+            else
+                reward = reward - 100 -- Penalty for staying in charging fuseball segment
+            end
+        end
+
+        -- 3. Approaching tanker penalty: -100 for staying, +200 for moving away
+        local found_dangerous_tanker = false
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_TANKER and
+               enemies_state.enemy_depths[i] < 0x80 and
+               enemies_state.enemy_depths[i] > 0 and
+               enemies_state.enemy_abs_segments[i] == player_segment then
+                -- Check if tanker is carrying fuseball or pulsar
+                local is_carrying_danger = false
+                -- Check for fuseball or pulsar in same segment (simplified check)
+                for j = 1, 7 do
+                    if j ~= i and 
+                       (enemies_state.enemy_core_type[j] == ENEMY_TYPE_FUSEBALL or 
+                        enemies_state.enemy_core_type[j] == ENEMY_TYPE_PULSAR) and
+                       enemies_state.enemy_abs_segments[j] == player_segment then
+                        is_carrying_danger = true
+                        break
+                    end
+                end
+                
+                if is_carrying_danger then
+                    found_dangerous_tanker = true
+                    break
+                end
+            end
+        end
+        
+        if found_dangerous_tanker then
+            if player_distance_moved >= 1 then
+                reward = reward + 200 -- Reward for moving away from dangerous tanker
+            else
+                reward = reward - 100 -- Penalty for staying near dangerous tanker
+            end
         end
 
         if game_state.gamestate == 0x20 then -- Tube Zoom Reward
@@ -1192,6 +1237,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     previous_score = player_state.score
     previous_level = level_state.level_number
     previous_alive_state = player_state.alive
+    previous_player_segment = player_state.position & 0x0F
     LastRewardState = reward
 
     return reward, bDone
