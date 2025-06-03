@@ -816,6 +816,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
         if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and 
            self.enemy_abs_segments[i] ~= INVALID_SEGMENT and 
+           self.enemy_depths[i] > 0 and
            (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
             local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
             if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
