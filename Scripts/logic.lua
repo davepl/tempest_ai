@@ -391,7 +391,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             else if nr_dist < SAFE_DISTANCE then proposed_target_seg = (nr_seg - SAFE_DISTANCE + 16) % 16 else proposed_target_seg = player_abs_seg end end
         elseif enemy_left_exists then
              -- Case 3: Left Only
-            if is_open then proposed_target_seg = 13
+            if is_open then proposed_target_seg = (nl_dist <= 1) and 14 or 13
             else if nl_dist < SAFE_DISTANCE then proposed_target_seg = (nl_seg + SAFE_DISTANCE) % 16 else proposed_target_seg = player_abs_seg end end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
