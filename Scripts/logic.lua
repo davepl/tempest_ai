@@ -491,7 +491,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta <= 2000 then reward = reward + score_delta end
 
-        reward = reward + (player_state.shot_count < 8 and player_state.fire_commanded == 1) and player_state.shot_count or -20
+        if player_state.shot_count < 8 and player_state.fire_commanded == 1 then
+            reward = reward + player_state.shot_count
+        else
+            reward = reward - 20
+        end
 
         if game_state.gamestate == 0x04 and player_state.superzapper_active ~= 0 then reward = reward - 500 end
 
