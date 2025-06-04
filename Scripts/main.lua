@@ -220,17 +220,13 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 7 do insert(data, es.top_rail_fuseball_segments[i]) end
     -- Add Top Rail Other Enemies Segments Table (7)
     for i = 1, 7 do insert(data, es.top_rail_other_segments[i]) end
-    -- Add Fuseball Lane Depths (16)
-    for i = 1, 16 do insert(data, es.fuseball_lane_depths[i]) end
     -- Add Fractional Segment Table (16)
     for i = 1, 16 do insert(data, es.fractional_enemy_segments[i]) end
-    -- Add Enemy Shot Depths by Lane (16)
-    for i = 1, 16 do insert(data, es.enemy_shot_depths_by_lane[i]) end
 
     -- Pending Vid (64)
-    for i = 1, 64 do insert(data, es.pending_vid[i]) end
+    -- for i = 1, 64 do insert(data, es.pending_vid[i]) end
     -- Pending Seg (64)
-    for i = 1, 64 do insert(data, es.pending_seg[i]) end
+    -- for i = 1, 64 do insert(data, es.pending_seg[i]) end
 
     -- Serialize main data to binary string (signed 16-bit big-endian)
     local binary_data_parts = {}
