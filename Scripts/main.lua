@@ -212,10 +212,14 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     for i = 1, 4 do insert(data, es.shot_positions[i]) end
     -- Enemy shot segments (4)
     for i = 1, 4 do insert(data, es.enemy_shot_segments[i]) end
-    -- Add Pulsar Depth Table (16)
-    for i = 1, 16 do insert(data, es.pulsar_depth_lanes[i]) end
-    -- Add Fuseball Charging Depth Table (16)
-    for i = 1, 16 do insert(data, es.charging_fuseball_segments[i]) end
+    -- Add Pulsar Lanes Table (7)
+    for i = 1, 7 do insert(data, es.pulsar_lanes[i]) end
+    -- Add Fuseball Charging Segments Table (7)
+    for i = 1, 7 do insert(data, es.charging_fuseball_segments[i]) end
+    -- Add Top Rail Fuseball Segments Table (7)
+    for i = 1, 7 do insert(data, es.top_rail_fuseball_segments[i]) end
+    -- Add Top Rail Other Enemies Segments Table (7)
+    for i = 1, 7 do insert(data, es.top_rail_other_segments[i]) end
     -- Add Fuseball Lane Depths (16)
     for i = 1, 16 do insert(data, es.fuseball_lane_depths[i]) end
     -- Add Fractional Segment Table (16)

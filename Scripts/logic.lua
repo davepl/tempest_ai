@@ -517,10 +517,21 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         end
 
         -- === NEW: Reward fleeing from active fuseball charging lanes ===
-        local player_lane_index = player_segment + 1 -- Convert 0-15 to 1-16 index
-        if enemies_state.charging_fuseball_segments[player_lane_index] > 0 then
+        local charging_fuseball_in_lane = false
+        local fuseball_depth = 0
+        
+        -- Check all enemy slots for charging fuseballs in the player's segment
+        for i = 1, 7 do
+            if enemies_state.charging_fuseball_segments[i] ~= INVALID_SEGMENT and 
+               enemies_state.charging_fuseball_segments[i] == player_segment then
+                charging_fuseball_in_lane = true
+                fuseball_depth = enemies_state.enemy_depths[i] or 0
+                break -- Found one, that's enough
+            end
+        end
+        
+        if charging_fuseball_in_lane then
             -- Player is in a lane with a charging fuseball
-            local fuseball_depth = enemies_state.charging_fuseball_segments[player_lane_index]
             
             -- Check if player is moving away from the current position
             if detected_spinner ~= 0 then

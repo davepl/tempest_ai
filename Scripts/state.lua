@@ -680,10 +680,11 @@ function M.EnemiesState:new()
     self.pending_vid = {}              -- ($0243 + i - 1)
     self.pending_seg = {}              -- Relative segment ($0203 + i - 1, or INVALID_SEGMENT)
 
-    -- Charging Fuseball Tracking (Size 16, indexed 1-16 for abs seg 0-15)
-    self.charging_fuseball_segments = {}
-    -- Pulsar Depth Lanes (Size 16, indexed 1-16 for abs seg 0-15)
-    self.pulsar_depth_lanes = {}
+    -- Enemy-based tracking tables (Size 7, indexed 1-7 for enemy slots)
+    self.charging_fuseball_segments = {} -- Relative segment of charging fuseball in each enemy slot, or INVALID_SEGMENT if none
+    self.pulsar_lanes = {} -- Relative segment of pulsar in each enemy slot, or INVALID_SEGMENT if none
+    self.top_rail_fuseball_segments = {} -- Relative segment of top rail fuseball (depth 0x10) in each enemy slot, or INVALID_SEGMENT if none
+    self.top_rail_other_segments = {} -- Relative segment of other top rail enemies (depth 0x10, not fuseballs) in each enemy slot, or INVALID_SEGMENT if none
     -- ADDED: Fuseball Lane Depths (Size 16, indexed 1-16 for abs seg 0-15)
     self.fuseball_lane_depths = {}
     -- ADDED: Enemy Shot Lane Depths (Size 16, indexed 1-16 for abs seg 0-15)
@@ -721,12 +722,11 @@ function M.EnemiesState:new()
         self.pending_vid[i] = 0
         self.pending_seg[i] = INVALID_SEGMENT
     end
-    for i = 1, 16 do
-        self.charging_fuseball_segments[i] = 0
-        self.pulsar_depth_lanes[i] = 0
-        -- ADDED: Initialize new lane depth tables
-        self.fuseball_lane_depths[i] = 0
-        self.enemy_shot_depths_by_lane[i] = 0
+    for i = 1, 7 do
+        self.charging_fuseball_segments[i] = INVALID_SEGMENT
+        self.pulsar_lanes[i] = INVALID_SEGMENT
+        self.top_rail_fuseball_segments[i] = INVALID_SEGMENT
+        self.top_rail_other_segments[i] = INVALID_SEGMENT
     end
 
     -- Fractional enemy segments (16 elements, indexed 1-16 for abs seg 0-15)
@@ -810,17 +810,35 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         end -- End if enemy active
     end -- End enemy slot loop
 
-    -- Calculate charging Fuseball segments (reset first)
-    for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
+    -- Calculate enemy-based tracking tables (reset first)
     for i = 1, 7 do
-        -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
-        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and 
-           self.enemy_abs_segments[i] ~= INVALID_SEGMENT and 
-           self.enemy_depths[i] > 0 and
-           (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
-            local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
-            if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
-                self.charging_fuseball_segments[abs_segment_idx] = self.enemy_depths[i] -- Set to the depth of the fuseball
+        self.charging_fuseball_segments[i] = INVALID_SEGMENT
+        self.pulsar_lanes[i] = INVALID_SEGMENT
+        self.top_rail_fuseball_segments[i] = INVALID_SEGMENT
+        self.top_rail_other_segments[i] = INVALID_SEGMENT
+    end
+    
+    for i = 1, 7 do
+        if self.enemy_abs_segments[i] ~= INVALID_SEGMENT and self.enemy_depths[i] > 0 then
+            -- Check if it's a charging fuseball (type 4, moving towards player)
+            if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and 
+               (self.active_enemy_info[i] & 0x80) == 0 then -- bit 7 clear = moving towards player
+                self.charging_fuseball_segments[i] = self.enemy_segments[i] -- Store relative segment
+            end
+            
+            -- Check if it's a pulsar (type 1)
+            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR then
+                self.pulsar_lanes[i] = self.enemy_segments[i] -- Store relative segment
+            end
+            
+            -- Check if it's a top rail enemy (depth 0x10)
+            if self.enemy_depths[i] == 0x10 then
+                if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL then
+                    self.top_rail_fuseball_segments[i] = self.enemy_segments[i] -- Store relative segment
+                else
+                    -- Any other enemy type at top rail
+                    self.top_rail_other_segments[i] = self.enemy_segments[i] -- Store relative segment
+                end
             end
         end
     end
@@ -917,27 +935,6 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.fuseball_lane_depths[seg_abs + 1] = min_depth_for_lane
     end
 
-    -- Calculate pulsar_depth_lanes (reset first)
-    for seg = 1, 16 do self.pulsar_depth_lanes[seg] = 0 end
-    for seg_abs = 0, 15 do
-        local min_depth = 255 -- Initialize to a high value (no pulsar found yet)
-        for i = 1, 7 do
-            if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-               self.enemy_abs_segments[i] == seg_abs and
-               self.enemy_depths[i] > 0 then -- Ignore depths of 0 (no pulsar)
-                if self.enemy_depths[i] < min_depth then
-                    min_depth = self.enemy_depths[i]
-                end
-            end
-        end
-        -- If min_depth is still 255, no pulsar was found in this segment
-        if min_depth < 255 then
-            self.pulsar_depth_lanes[seg_abs + 1] = min_depth
-        else
-            self.pulsar_depth_lanes[seg_abs + 1] = 0 -- No pulsar in this segment
-        end
-    end
-
     -- Calculate enemy_shot_depths_by_lane (reset first)
     for seg = 1, 16 do self.enemy_shot_depths_by_lane[seg] = 0 end
     for seg_abs = 0, 15 do -- Iterate through absolute segments 0-15
@@ -1029,7 +1026,18 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         end
 
         -- === Penalize being in a charging fuseball segment ===
-        if enemies_state.charging_fuseball_segments[player_segment + 1] > 0 then
+        local charging_fuseball_in_segment = false
+        
+        -- Check all enemy slots for charging fuseballs in the player's segment
+        for i = 1, 7 do
+            if enemies_state.charging_fuseball_segments[i] ~= INVALID_SEGMENT and 
+               enemies_state.charging_fuseball_segments[i] == player_segment then
+                charging_fuseball_in_segment = true
+                break -- Found one, that's enough
+            end
+        end
+        
+        if charging_fuseball_in_segment then
             reward = reward - 50 -- Penalty for being in a charging fuseball segment
         end
 

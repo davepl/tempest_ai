@@ -245,18 +245,53 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     end
     add_custom_line("Fuseball Lanes: " .. table.concat(fuseball_lane_depth_parts, " "))
 
-    -- Pulsar Depths
-    local pulsar_depth_parts = {}
-    for i = 1, 16 do -- Assuming 16 segments for pulsar depths
-        -- Use the correct table name: pulsar_depth_lanes
-        local depth = (enemies_state.pulsar_depth_lanes and enemies_state.pulsar_depth_lanes[i]) or 0
-        if depth == 0 then
-            table.insert(pulsar_depth_parts, "--")
+    -- Charging Fuseball Segments (Enemy-based)
+    local charging_fuseball_parts = {}
+    for i = 1, 7 do -- 7 enemy slots
+        local segment = (enemies_state.charging_fuseball_segments and enemies_state.charging_fuseball_segments[i]) or INVALID_SEGMENT
+        if segment == INVALID_SEGMENT then
+            table.insert(charging_fuseball_parts, "--")
         else
-            table.insert(pulsar_depth_parts, string.format("%02X", depth))
+            table.insert(charging_fuseball_parts, string.format("%02d", segment))
         end
     end
-    add_custom_line("Pulsar Depths : " .. table.concat(pulsar_depth_parts, " "))
+    add_custom_line("Charging FB Segs:" .. string.rep(" ", 1) .. table.concat(charging_fuseball_parts, " "))
+
+    -- Pulsar Segments (Enemy-based) 
+    local pulsar_segment_parts = {}
+    for i = 1, 7 do -- 7 enemy slots
+        local segment = (enemies_state.pulsar_lanes and enemies_state.pulsar_lanes[i]) or INVALID_SEGMENT
+        if segment == INVALID_SEGMENT then
+            table.insert(pulsar_segment_parts, "--")
+        else
+            table.insert(pulsar_segment_parts, string.format("%02d", segment))
+        end
+    end
+    add_custom_line("Pulsar Segments :" .. string.rep(" ", 1) .. table.concat(pulsar_segment_parts, " "))
+
+    -- Top Rail Fuseball Segments (Enemy-based)
+    local top_rail_fuseball_parts = {}
+    for i = 1, 7 do -- 7 enemy slots
+        local segment = (enemies_state.top_rail_fuseball_segments and enemies_state.top_rail_fuseball_segments[i]) or INVALID_SEGMENT
+        if segment == INVALID_SEGMENT then
+            table.insert(top_rail_fuseball_parts, "--")
+        else
+            table.insert(top_rail_fuseball_parts, string.format("%02d", segment))
+        end
+    end
+    add_custom_line("Top Rail FB Segs:" .. string.rep(" ", 1) .. table.concat(top_rail_fuseball_parts, " "))
+
+    -- Top Rail Other Enemy Segments (Enemy-based)
+    local top_rail_other_parts = {}
+    for i = 1, 7 do -- 7 enemy slots
+        local segment = (enemies_state.top_rail_other_segments and enemies_state.top_rail_other_segments[i]) or INVALID_SEGMENT
+        if segment == INVALID_SEGMENT then
+            table.insert(top_rail_other_parts, "--")
+        else
+            table.insert(top_rail_other_parts, string.format("%02d", segment))
+        end
+    end
+    add_custom_line("Top Rail Oth Segs:" .. string.rep(" ", 1) .. table.concat(top_rail_other_parts, " "))
 
     -- Enemy Shot Lane Depths
     local enemy_shot_lane_depth_parts = {}
