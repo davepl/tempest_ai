@@ -16,7 +16,6 @@ local SAFE_DISTANCE = 1
 local FREEZE_FIRE_PRIO_LOW = 4
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 4
-local PULSAR_THRESHOLD = 0x80 -- Pulsing threshold for avoidance
 local SHOT_DANGER_THRESHOLD = 0xB0 -- Enemy shot danger threshold
 local TANKER_DANGER_THRESHOLD = 0x80 -- Tanker danger threshold for proximity rewards
 
@@ -425,26 +424,25 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local pulsar_override_active = false
 
         -- ** Pulsar Check (Highest Priority) **
-        if enemies_state.pulsing > PULSAR_THRESHOLD then
-            if is_pulsar_lane(player_abs_seg, enemies_state) then -- Currently ON a pulsar lane
-                local safe_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-                final_target_seg = safe_target
-                final_fire_priority = AVOID_FIRE_PRIORITY
-                pulsar_override_active = true
-            elseif final_target_seg ~= player_abs_seg then -- Moving, check path
-                local original_proposed_target = final_target_seg -- Store original proposed target before path check
-                local relative_dist = abs_to_rel_func(player_abs_seg, original_proposed_target, is_open)
-                local dir = (relative_dist > 0) and 1 or -1
-                local steps = math.abs(relative_dist)
-                for d = 1, steps do
-                    local check_seg = (player_abs_seg + dir * d + 16) % 16
-                    if is_pulsar_lane(check_seg, enemies_state) then
-                        local safe_stop_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
-                        final_target_seg = safe_stop_seg
-                        final_fire_priority = AVOID_FIRE_PRIORITY
-                        pulsar_override_active = true
-                        break
-                    end
+        -- Always avoid pulsar lanes regardless of pulsing state for consistency with reward logic
+        if is_pulsar_lane(player_abs_seg, enemies_state) then -- Currently ON a pulsar lane
+            local safe_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+            final_target_seg = safe_target
+            final_fire_priority = AVOID_FIRE_PRIORITY
+            pulsar_override_active = true
+        elseif final_target_seg ~= player_abs_seg then -- Moving, check path
+            local original_proposed_target = final_target_seg -- Store original proposed target before path check
+            local relative_dist = abs_to_rel_func(player_abs_seg, original_proposed_target, is_open)
+            local dir = (relative_dist > 0) and 1 or -1
+            local steps = math.abs(relative_dist)
+            for d = 1, steps do
+                local check_seg = (player_abs_seg + dir * d + 16) % 16
+                if is_pulsar_lane(check_seg, enemies_state) then
+                    local safe_stop_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
+                    final_target_seg = safe_stop_seg
+                    final_fire_priority = AVOID_FIRE_PRIORITY
+                    pulsar_override_active = true
+                    break
                 end
             end
         end
@@ -503,16 +501,31 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local target_depth = enemies_state.nearest_enemy_depth_raw
         local player_segment = player_state.position & 0x0F
 
-        -- === NEW: Penalize being in a dangerous pulsar lane ===
-        if enemies_state.pulsing > PULSAR_THRESHOLD then
-            -- Check if the player is in a lane with a dangerous pulsar
-            for i = 1, 7 do
-                if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-                   enemies_state.enemy_abs_segments[i] == player_segment and
-                   enemies_state.enemy_depths[i] > 0 then
-                    reward = reward - 150 -- Penalty for being in a dangerous pulsar lane
-                    break
-                end
+        -- === NEW: Penalize being in ANY pulsar lane and reward fleeing ===
+        local pulsar_in_lane = false
+        local pulsar_depth = 0
+        
+        -- Check if the player is in a lane with ANY pulsar (regardless of pulsing state)
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+               enemies_state.enemy_abs_segments[i] == player_segment and
+               enemies_state.enemy_depths[i] > 0 then
+                pulsar_in_lane = true
+                pulsar_depth = enemies_state.enemy_depths[i]
+                break
+            end
+        end
+        
+        if pulsar_in_lane then
+            -- Player is in a lane with a pulsar
+            if detected_spinner ~= 0 then
+                -- Reward for fleeing (moving away from pulsar lane)
+                local proximity_multiplier = math.max(1, (0x80 - pulsar_depth) / 16) -- Closer = higher reward
+                reward = reward + math.floor(100 * proximity_multiplier) -- Base reward 100, up to ~400 for very close
+            else
+                -- Penalty for staying still in a pulsar lane
+                local proximity_multiplier = math.max(1, (0x80 - pulsar_depth) / 16) -- Closer = higher penalty
+                reward = reward - math.floor(150 * proximity_multiplier) -- Base penalty 150, up to ~600 for very close
             end
         end
 

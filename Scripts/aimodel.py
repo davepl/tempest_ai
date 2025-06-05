@@ -172,17 +172,28 @@ metrics.global_server = None
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
 
 class ReplayMemory:
-    """Replay buffer to store and sample experiences for training"""
+    """Optimized replay buffer using circular buffer for O(1) sampling and insertion"""
     def __init__(self, capacity):
-        self.memory = deque(maxlen=capacity)
+        self.capacity = capacity
+        self.memory = [None] * capacity  # Pre-allocate memory array
+        self.position = 0  # Current write position
+        self.size = 0  # Current number of stored experiences
         
     def push(self, state, action, reward, next_state, done):
-        """Add experience to memory"""
-        self.memory.append(Experience(state, action, reward, next_state, done))
+        """Add experience to memory - O(1) operation"""
+        self.memory[self.position] = Experience(state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity  # Circular buffer
+        self.size = min(self.size + 1, self.capacity)
         
     def sample(self, batch_size):
-        """Sample random batch of experiences"""
-        experiences = random.sample(self.memory, min(batch_size, len(self.memory)))
+        """Sample random batch of experiences - O(1) per sample"""
+        actual_batch_size = min(batch_size, self.size)
+        
+        # Generate random indices directly - O(1) access
+        # Compatible with older NumPy versions
+        indices = np.random.randint(0, self.size, size=actual_batch_size)
+        experiences = [self.memory[i] for i in indices]
+        
         states = torch.from_numpy(np.vstack([e.state for e in experiences])).float().to(device)
         actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
         rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
@@ -191,7 +202,7 @@ class ReplayMemory:
         return states, actions, rewards, next_states, dones
         
     def __len__(self):
-        return len(self.memory)
+        return self.size
 
 class DQN(nn.Module):
     """Deep Q-Network model with dueling architecture and layer normalization."""
