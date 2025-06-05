@@ -521,11 +521,52 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             if detected_spinner ~= 0 then
                 -- Reward for fleeing (moving away from pulsar lane)
                 local proximity_multiplier = math.max(1, (0x80 - pulsar_depth) / 16) -- Closer = higher reward
-                reward = reward + math.floor(100 * proximity_multiplier) -- Base reward 100, up to ~400 for very close
+                reward = reward + math.floor(150 * proximity_multiplier) -- Base reward 100, up to ~400 for very close
             else
                 -- Penalty for staying still in a pulsar lane
                 local proximity_multiplier = math.max(1, (0x80 - pulsar_depth) / 16) -- Closer = higher penalty
-                reward = reward - math.floor(150 * proximity_multiplier) -- Base penalty 150, up to ~600 for very close
+                reward = reward - math.floor(200 * proximity_multiplier) -- Base penalty 150, up to ~600 for very close
+            end
+        end
+
+        -- === NEW: Penalize moving INTO a pulsar lane ===
+        -- Check if player is about to move into a pulsar lane
+        if player_state.spinner_commanded ~= 0 then
+            local is_open = (level_state.level_type == 0xFF)
+            local next_segment = -1
+            
+            -- Calculate which segment the player will move to based on spinner command
+            if player_state.spinner_commanded > 0 then
+                -- Positive spinner decrements segment (moves left/counterclockwise)
+                if is_open then
+                    if player_segment > 0 then
+                        next_segment = player_segment - 1
+                    end
+                else -- Closed level
+                    next_segment = (player_segment - 1 + 16) % 16
+                end
+            else -- player_state.spinner_commanded < 0
+                -- Negative spinner increments segment (moves right/clockwise)
+                if is_open then
+                    if player_segment < 15 then
+                        next_segment = player_segment + 1
+                    end
+                else -- Closed level
+                    next_segment = (player_segment + 1) % 16
+                end
+            end
+            
+            -- Check if the next segment is valid and contains a pulsar
+            if next_segment ~= -1 then
+                for i = 1, 7 do
+                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
+                       enemies_state.enemy_abs_segments[i] == next_segment and
+                       enemies_state.enemy_depths[i] > 0 then
+                        -- Player is about to move into a pulsar lane - apply penalty
+                        reward = reward - 250
+                        break -- Found one pulsar, that's enough for the penalty
+                    end
+                end
             end
         end
 
@@ -554,7 +595,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             else
                 -- Penalty for staying still in a charging fuseball lane
                 local proximity_multiplier = math.max(1, (0x50 - fuseball_depth) / 10) -- Closer = higher penalty
-                reward = reward - math.floor(100 * proximity_multiplier) -- Base penalty 100, up to ~400 for very close
+                reward = reward - math.floor(200 * proximity_multiplier) -- Base penalty 100, up to ~400 for very close
             end
         end
 
