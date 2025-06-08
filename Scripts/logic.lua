@@ -16,8 +16,8 @@ local SAFE_DISTANCE = 1
 local FREEZE_FIRE_PRIO_LOW = 4
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 4
-local SHOT_DANGER_THRESHOLD = 0xB0 -- Enemy shot danger threshold
-local TANKER_DANGER_THRESHOLD = 0x80 -- Tanker danger threshold for proximity rewards
+local SHOT_DANGER_THRESHOLD = 0x40 -- Enemy shot danger threshold (shots close to rail)
+local TANKER_DANGER_THRESHOLD = 0x60 -- Tanker danger threshold for proximity rewards
 
 local M = {} -- Module table
 
@@ -489,7 +489,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local score_delta = player_state.score - previous_score
         if score_delta > 0 and score_delta <= 2000 then reward = reward + score_delta end
 
-        if player_state.shot_count < 8 and player_state.fire_commanded == 1 then
+        if player_state.shot_count < 7 and player_state.fire_commanded == 1 then
             reward = reward + player_state.shot_count
         else
             reward = reward - 20
@@ -520,12 +520,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- Player is in a lane with a pulsar
             if detected_spinner ~= 0 then
                 -- Reward for fleeing (moving away from pulsar lane)
-                local proximity_multiplier = math.max(1, (0x80 - pulsar_depth) / 16) -- Closer = higher reward
-                reward = reward + math.floor(150 * proximity_multiplier) -- Base reward 100, up to ~400 for very close
+                reward = reward + 150 -- Flat reward since pulsar depth doesn't affect lethality
             else
                 -- Penalty for staying still in a pulsar lane
-                local proximity_multiplier = math.max(1, (0x80 - pulsar_depth) / 16) -- Closer = higher penalty
-                reward = reward - math.floor(200 * proximity_multiplier) -- Base penalty 150, up to ~600 for very close
+                reward = reward - 150 -- Flat penalty since pulsar depth doesn't affect lethality
             end
         end
 
@@ -563,7 +561,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                        enemies_state.enemy_abs_segments[i] == next_segment and
                        enemies_state.enemy_depths[i] > 0 then
                         -- Player is about to move into a pulsar lane - apply penalty
-                        reward = reward - 250
+                        reward = reward - 500
                         break -- Found one pulsar, that's enough for the penalty
                     end
                 end
@@ -600,23 +598,20 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         end
 
         -- === NEW: Reward fleeing from dangerous enemy shots ===
-        -- Check for enemy shots with depth > SHOT_DANGER_THRESHOLD in player's segment
+        -- Check for enemy shots with position < SHOT_DANGER_THRESHOLD in player's segment (close to rail)
         if enemies_state.shot_segments and enemies_state.shot_positions then
             for i = 1, #enemies_state.shot_segments do
                 if enemies_state.shot_segments[i] == player_segment and 
-                   enemies_state.shot_positions[i] > SHOT_DANGER_THRESHOLD then
+                   enemies_state.shot_positions[i] < SHOT_DANGER_THRESHOLD then
                     -- Dangerous shot in player's segment
-                    local shot_depth = enemies_state.shot_positions[i]
                     
                     -- Check if player is moving away from the current position
                     if detected_spinner ~= 0 then
-                        -- Reward for fleeing (moving away), scaled by shot proximity
-                        local proximity_multiplier = math.max(1, (0xFF - shot_depth) / 20) -- Closer = higher reward
-                        reward = reward + math.floor(60 * proximity_multiplier) -- Base reward 60, up to ~240 for very close
+                        -- Reward for fleeing (moving away)
+                        reward = reward + 150 -- Flat reward for moving away from dangerous shot
                     else
                         -- Penalty for staying still with a dangerous shot approaching
-                        local proximity_multiplier = math.max(1, (0xFF - shot_depth) / 20) -- Closer = higher penalty
-                        reward = reward - math.floor(80 * proximity_multiplier) -- Base penalty 80, up to ~320 for very close
+                        reward = reward - 200 -- Flat penalty for remaining in dangerous shot lane
                     end
                     break -- Only process the first dangerous shot found to avoid over-rewarding
                 end
@@ -632,7 +627,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                enemies_state.enemy_depths[i] > TANKER_DANGER_THRESHOLD then
                 
                 local tanker_abs_seg = enemies_state.enemy_abs_segments[i]
-                local tanker_depth = enemies_state.enemy_depths[i]
                 local has_payload = enemies_state.enemy_split_behavior[i] > 0 -- Payload if split_behavior > 0
                 
                 -- Calculate distance to tanker
@@ -642,8 +636,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 
                 -- Only apply rewards if tanker is relatively close (within 3 segments)
                 if tanker_distance <= 3 then
-                    local proximity_multiplier = math.max(1, (4 - tanker_distance) / 2) -- Closer = higher multiplier
-                    
                     if has_payload then
                         -- DANGEROUS TANKER - reward fleeing, penalize staying close
                         if detected_spinner ~= 0 then
@@ -652,14 +644,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                                               (tanker_rel_dist < 0 and detected_spinner > 0)
                             if moving_away then
                                 -- Reward for fleeing from dangerous tanker
-                                reward = reward + math.floor(50 * proximity_multiplier) -- Base reward 50, up to ~100 for very close
+                                reward = reward + 150 -- Flat reward for moving away from dangerous tanker
                             else
                                 -- Penalty for moving toward dangerous tanker
-                                reward = reward - math.floor(30 * proximity_multiplier) -- Base penalty 30, up to ~60 for very close
+                                reward = reward - 100 -- Flat penalty for moving toward dangerous tanker
                             end
                         else
                             -- Penalty for staying still near dangerous tanker
-                            reward = reward - math.floor(40 * proximity_multiplier) -- Base penalty 40, up to ~80 for very close
+                            reward = reward - 200 -- Flat penalty for staying still near dangerous tanker
                         end
                     else
                         -- SAFE TANKER - reward staying close/hunting, penalize fleeing
@@ -669,14 +661,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                                                  (tanker_rel_dist < 0 and detected_spinner < 0)
                             if moving_toward then
                                 -- Reward for hunting safe tanker
-                                reward = reward + math.floor(30 * proximity_multiplier) -- Base reward 30, up to ~60 for very close
+                                reward = reward + 150 -- Flat reward for moving toward safe tanker
                             else
                                 -- Small penalty for moving away from safe tanker
-                                reward = reward - math.floor(15 * proximity_multiplier) -- Base penalty 15, up to ~30 for very close
+                                reward = reward - 50 -- Flat penalty for moving away from safe tanker
                             end
                         else
                             -- Small reward for staying near safe tanker
-                            reward = reward + math.floor(20 * proximity_multiplier) -- Base reward 20, up to ~40 for very close
+                            reward = reward + 100 -- Flat reward for staying near safe tanker
                         end
                     end
                     
