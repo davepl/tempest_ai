@@ -19,6 +19,13 @@ local AVOID_FIRE_PRIORITY = 4
 local SHOT_DANGER_THRESHOLD = 0x40 -- Enemy shot danger threshold (shots close to rail)
 local TANKER_DANGER_THRESHOLD = 0x60 -- Tanker danger threshold for proximity rewards
 
+-- New firing constants
+local FIRE_EVERY_N_FRAMES = 3 -- Fire every N frames by default
+local DANGER_DEPTH = 0x30 -- Depth threshold for immediate threats
+
+-- Global frame counter for firing rhythm
+local fire_frame_counter = 0
+
 local M = {} -- Module table
 
 -- Global variables needed by calculate_reward (scoped within this module)
@@ -27,8 +34,64 @@ local previous_level = 0
 local previous_alive_state = 1 -- Track previous alive state, initialize as alive
 local LastRewardState = 0
 
--- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
--- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
+-- NEW: Function to determine firing based on rhythm and threats
+function M.should_fire_new_logic(game_state, player_state, enemies_state)
+    local player_segment = player_state.position & 0x0F
+    
+    -- Increment frame counter
+    fire_frame_counter = fire_frame_counter + 1
+    
+    -- Check for immediate threats first
+    local threat_proximate = false
+    
+    -- Check for enemies on top rail in adjacent segments
+    for i = 1, 7 do
+        if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
+            local enemy_seg = enemies_state.enemy_abs_segments[i]
+            if enemy_seg ~= -1 then
+                -- Check if enemy is in adjacent segment (distance of 1)
+                local left_seg = (player_segment - 1 + 16) % 16
+                local right_seg = (player_segment + 1) % 16
+                if enemy_seg == left_seg or enemy_seg == right_seg then
+                    threat_proximate = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Check for shots or enemies at dangerous depth
+    if not threat_proximate then
+        -- Check enemy shots
+        for i = 1, 4 do
+            if enemies_state.shot_positions and enemies_state.shot_positions[i] and
+               enemies_state.shot_positions[i] > 0 and 
+               enemies_state.shot_positions[i] <= DANGER_DEPTH then
+                threat_proximate = true
+                break
+            end
+        end
+    end
+    
+    -- Check for enemies at dangerous depth
+    if not threat_proximate then
+        for i = 1, 7 do
+            if enemies_state.enemy_depths[i] > 0 and 
+               enemies_state.enemy_depths[i] <= DANGER_DEPTH then
+                threat_proximate = true
+                break
+            end
+        end
+    end
+    
+    -- Fire immediately if threat is proximate
+    if threat_proximate then
+        return true
+    end
+    
+    -- Otherwise, fire every N frames
+    return (fire_frame_counter % FIRE_EVERY_N_FRAMES) == 0
+end
 local function find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func)
     local nearest_seg_abs = -1
     local min_dist = 255
@@ -302,9 +365,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local final_should_fire = false
 
     if game_state.gamestate == 0x20 then -- Tube Zoom
-        proposed_target_seg, _, final_should_fire, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
-        -- In tube zoom, fire priority isn't calculated the same way, should_fire is directly returned
-        -- We will bypass the final Pulsar check for Tube Zoom state
+        proposed_target_seg, _, _, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
+        -- Always fire every frame in tube zoom
+        final_should_fire = true
         return proposed_target_seg, 0, final_should_fire, false
 
     elseif game_state.gamestate == 0x04 then -- Normal Gameplay
@@ -359,8 +422,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             if M.is_danger_lane(target_seg, enemies_state) then
                  target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nearest_flipper_seg, abs_to_rel_func)
             end
-            local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
-            local should_fire = fire_priority > shot_count
+            local should_fire = M.should_fire_new_logic(game_state, player_state, enemies_state)
             return target_seg, 0, should_fire, false -- Return early
         end
 
@@ -455,7 +517,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
 
         -- === Step 3: Final Return ===
-        final_should_fire = final_fire_priority > shot_count
+        final_should_fire = M.should_fire_new_logic(game_state, player_state, enemies_state)
         return final_target_seg, 0, final_should_fire, false
 
     else -- Other game states
@@ -490,9 +552,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         if score_delta > 0 and score_delta <= 2000 then reward = reward + score_delta end
 
         if player_state.shot_count < 7 and player_state.fire_commanded == 1 then
-            reward = reward + player_state.shot_count
-        else
-            reward = reward - 20
+            reward = reward + 50 -- Reward for firing when we have ammo
+        elseif player_state.shot_count >= 7 and player_state.fire_commanded == 1 then
+            reward = reward - 100 -- Penalty for firing when out of ammo
         end
 
         if game_state.gamestate == 0x04 and player_state.superzapper_active ~= 0 then reward = reward - 500 end
@@ -682,20 +744,21 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             local spike_h = level_state.spike_heights[player_segment] or 0
             if spike_h > 0 then reward = reward + math.max(0, ((255 - spike_h) / 2) - 27.5)
             else reward = reward + (detected_spinner == 0 and 250 or -50) end
-            if player_state.fire_commanded == 1 then reward = reward + 200 end
+            if player_state.fire_commanded == 1 then reward = reward + 100 end -- Reward firing in tube zoom
 
         elseif target_abs_segment < 0 then -- No Enemies Reward
             reward = reward + (detected_spinner == 0 and 150 or -20)
-            if player_state.fire_commanded == 1 then reward = reward - 100 end
+            -- No penalty for firing when no enemies (rhythm firing is fine)
 
         else -- Enemies Present Reward
             local desired_spinner, segment_distance, _ = M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
             if segment_distance == 0 then -- Aligned Reward
                 reward = reward + (detected_spinner == 0 and 250 or -50)
-                if player_state.fire_commanded == 1 then reward = reward + 50 end
+                if player_state.fire_commanded == 1 then reward = reward + 100 end -- Reward firing when aligned
             else -- Misaligned Reward
-                if segment_distance < 2 and target_depth <= 0x20 then reward = reward + (player_state.fire_commanded == 1 and 150 or -50)
-                else if player_state.fire_commanded == 1 then reward = reward - (segment_distance < 2 and 20 or 30) end end
+                if segment_distance < 2 and target_depth <= 0x20 then 
+                    reward = reward + (player_state.fire_commanded == 1 and 50 or -25) -- Small reward for firing at close targets
+                end
                 -- Movement reward
                 if desired_spinner * detected_spinner > 0 then reward = reward + 40
                 elseif desired_spinner * detected_spinner < 0 then reward = reward - 50

@@ -205,29 +205,35 @@ class ReplayMemory:
         return self.size
 
 class DQN(nn.Module):
-    """Deep Q-Network model with dueling architecture and layer normalization."""
+    """Deep Q-Network model with dueling architecture, layer normalization, and dropout."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         # Shared feature layers
-        self.fc1 = nn.Linear(state_size, 2048)  # Scaled for 363 inputs
-        self.ln1 = nn.LayerNorm(2048)
-        self.fc2 = nn.Linear(2048, 1024)
-        self.ln2 = nn.LayerNorm(1024)
-        self.fc3 = nn.Linear(1024, 512)
-        self.ln3 = nn.LayerNorm(512)
+        self.fc1 = nn.Linear(state_size, 1024)  # Reduced for 200 inputs
+        self.ln1 = nn.LayerNorm(1024)
+        self.dropout1 = nn.Dropout(p=0.1)
+        self.fc2 = nn.Linear(1024, 512)
+        self.ln2 = nn.LayerNorm(512)
+        self.dropout2 = nn.Dropout(p=0.1)
+        self.fc3 = nn.Linear(512, 256)
+        self.ln3 = nn.LayerNorm(256)
+        self.dropout3 = nn.Dropout(p=0.1)
         
         # Value stream
-        self.value_fc = nn.Linear(512, 256)
-        self.value = nn.Linear(256, 1)
+        self.value_fc = nn.Linear(256, 128)
+        self.value = nn.Linear(128, 1)
         
         # Advantage stream
-        self.adv_fc = nn.Linear(512, 256)
-        self.advantage = nn.Linear(256, action_size)
+        self.adv_fc = nn.Linear(256, 128)
+        self.advantage = nn.Linear(128, action_size)
 
     def forward(self, x):
         x = F.relu(self.ln1(self.fc1(x)))
+        x = self.dropout1(x)
         x = F.relu(self.ln2(self.fc2(x)))
+        x = self.dropout2(x)
         x = F.relu(self.ln3(self.fc3(x)))
+        x = self.dropout3(x)
         
         # Value stream
         val = F.relu(self.value_fc(x))
