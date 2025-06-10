@@ -20,7 +20,7 @@ local SHOT_DANGER_THRESHOLD = 0x40 -- Enemy shot danger threshold (shots close t
 local TANKER_DANGER_THRESHOLD = 0x60 -- Tanker danger threshold for proximity rewards
 
 -- New firing constants
-local FIRE_EVERY_N_FRAMES = 4lo  -- Fire every N frames by default
+local FIRE_EVERY_N_FRAMES = 5  -- Fire every N frames by default
 local DANGER_DEPTH = 0x30 -- Depth threshold for immediate threats
 
 -- Global frame counter for firing rhythm
