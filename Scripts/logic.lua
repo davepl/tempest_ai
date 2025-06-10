@@ -20,7 +20,7 @@ local SHOT_DANGER_THRESHOLD = 0x40 -- Enemy shot danger threshold (shots close t
 local TANKER_DANGER_THRESHOLD = 0x60 -- Tanker danger threshold for proximity rewards
 
 -- New firing constants
-local FIRE_EVERY_N_FRAMES = 5  -- Fire every N frames by default
+local FIRE_EVERY_N_FRAMES = 12  -- Fire every N frames by default
 local DANGER_DEPTH = 0x30 -- Depth threshold for immediate threats
 
 -- Global frame counter for firing rhythm
@@ -36,50 +36,44 @@ local LastRewardState = 0
 
 -- NEW: Function to determine firing based on rhythm and threats
 function M.should_fire_new_logic(game_state, player_state, enemies_state)
-    local player_segment = player_state.position & 0x0F
+    local player_segment = player_state.position % 16
     
     -- Increment frame counter
     fire_frame_counter = fire_frame_counter + 1
     
-    -- Check for immediate threats first
+    -- Check for immediate threats first - be VERY restrictive
     local threat_proximate = false
     
-    -- Check for enemies on top rail in adjacent segments
-    for i = 1, 7 do
-        if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
-            local enemy_seg = enemies_state.enemy_abs_segments[i]
-            if enemy_seg ~= -1 then
-                -- Check if enemy is in adjacent segment (distance of 1)
-                local left_seg = (player_segment - 1 + 16) % 16
-                local right_seg = (player_segment + 1) % 16
-                if enemy_seg == left_seg or enemy_seg == right_seg then
+    -- Only check for shots in player's segment at VERY dangerous depth (close to rail)
+    for i = 1, 4 do
+        if enemies_state.enemy_shot_abs_segments and enemies_state.enemy_shot_abs_segments[i] == player_segment and
+           enemies_state.shot_positions and enemies_state.shot_positions[i] and
+           enemies_state.shot_positions[i] > 0 and 
+           enemies_state.shot_positions[i] <= 0x20 then -- Much closer threshold
+            threat_proximate = true
+            break
+        end
+    end
+    
+    -- Check for enemies in player's segment OR adjacent segments at top rail depth
+    if not threat_proximate then
+        for i = 1, 7 do
+            if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and
+               enemies_state.enemy_depths[i] > 0 and 
+               enemies_state.enemy_depths[i] <= 0x15 then -- Top rail depth
+                
+                local enemy_segment = enemies_state.enemy_abs_segments[i]
+                -- Calculate distance to enemy segment (considering wrapping for closed levels)
+                local distance_to_enemy = math.abs(player_segment - enemy_segment)
+                if distance_to_enemy > 8 then
+                    distance_to_enemy = 16 - distance_to_enemy -- Handle wrapping for closed levels
+                end
+                
+                -- Fire if enemy is in player's segment or adjacent (distance <= 1)
+                if distance_to_enemy <= 1 then
                     threat_proximate = true
                     break
                 end
-            end
-        end
-    end
-    
-    -- Check for shots or enemies at dangerous depth
-    if not threat_proximate then
-        -- Check enemy shots
-        for i = 1, 4 do
-            if enemies_state.shot_positions and enemies_state.shot_positions[i] and
-               enemies_state.shot_positions[i] > 0 and 
-               enemies_state.shot_positions[i] <= DANGER_DEPTH then
-                threat_proximate = true
-                break
-            end
-        end
-    end
-    
-    -- Check for enemies at dangerous depth
-    if not threat_proximate then
-        for i = 1, 7 do
-            if enemies_state.enemy_depths[i] > 0 and 
-               enemies_state.enemy_depths[i] <= DANGER_DEPTH then
-                threat_proximate = true
-                break
             end
         end
     end
@@ -90,7 +84,9 @@ function M.should_fire_new_logic(game_state, player_state, enemies_state)
     end
     
     -- Otherwise, fire every N frames
-    return (fire_frame_counter % FIRE_EVERY_N_FRAMES) == 0
+    local should_fire_rhythm = (fire_frame_counter % FIRE_EVERY_N_FRAMES) == 0
+    
+    return should_fire_rhythm
 end
 local function find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func)
     local nearest_seg_abs = -1
@@ -124,8 +120,8 @@ end
 function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment, is_open_level)
     current_abs_segment = tonumber(current_abs_segment) or 0
     target_abs_segment = tonumber(target_abs_segment) or 0
-    current_abs_segment = current_abs_segment & 0x0F
-    target_abs_segment = target_abs_segment & 0x0F
+    current_abs_segment = current_abs_segment % 16
+    target_abs_segment = target_abs_segment % 16
 
     if is_open_level then
         return target_abs_segment - current_abs_segment
@@ -191,8 +187,10 @@ function M.fuseball_check(player_abs_seg, enemies_state, is_open, abs_to_rel_fun
     local escape_target_seg = -1
     for i = 1, 7 do
         if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and
+           enemies_state.enemy_depths[i] > 0 and
            enemies_state.enemy_depths[i] <= 0x10 and
-           enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+           enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and
+           enemies_state.enemy_moving_away[i] == 0 then -- Only charging fuseballs
             local fuseball_abs_seg = enemies_state.enemy_abs_segments[i]
             local rel_dist = abs_to_rel_func(player_abs_seg, fuseball_abs_seg, is_open)
             if math.abs(rel_dist) <= 2 then
@@ -356,7 +354,7 @@ end
 -- Function to find the target segment and recommended action (expert policy)
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
     local is_open = (level_state.level_type == 0xFF)
-    local player_abs_seg = player_state.position & 0x0F
+    local player_abs_seg = player_state.position % 16
     local shot_count = player_state.shot_count or 0
 
     -- Default return values
@@ -527,7 +525,7 @@ end
 
 -- Function to calculate desired spinner direction and distance to target enemy
 function M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local player_abs_seg = player_state.position & 0x0F
+    local player_abs_seg = player_state.position % 16
     local is_open = (level_state.level_number - 1) % 4 == 2
     local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
 

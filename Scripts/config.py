@@ -84,7 +84,7 @@ class MetricsData:
     open_level: bool = False
     override_expert: bool = False
     saved_expert_ratio: float = 0.75
-    expert_mode: bool = False
+    expert_mode: bool = True  # TEMPORARILY FORCE EXPERT MODE ON FOR DEBUGGING
     last_action_source: str = ""
     frames_last_second: int = 0
     last_fps_time: float = 0
