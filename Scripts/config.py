@@ -48,7 +48,7 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 1024
+    batch_size: int = 512
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
@@ -56,8 +56,19 @@ class RLConfigData:
     epsilon_min: float = 0.001
     epsilon_decay_factor: float = 0.9969 # Multiplicative factor per step (Adjusted for ~15M frames)
     epsilon_decay_steps: int = 10000   # Frames per decay step
-    update_target_every: int = 500
-    learning_rate: float = 0.001
+    update_target_every: int = 2000
+    learning_rate: float = 0.0003
+    weight_decay: float = 1e-5
+    n_step: int = 3
+    reward_clip: bool = False
+    reward_clip_value: float = 1.0
+    # Prioritized Experience Replay (PER)
+    prioritized: bool = True
+    per_alpha: float = 0.6
+    per_beta_start: float = 0.4
+    per_beta_end: float = 1.0
+    per_beta_steps: int = 1000000
+    per_eps: float = 1e-6
     memory_size: int = 5000000
     save_interval: int = 50000
     train_freq: int = 4

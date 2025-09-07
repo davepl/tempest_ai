@@ -58,6 +58,17 @@ class SocketServer:
         self.level_history = deque(maxlen=100000)
         self.level_lock = threading.Lock()  # Lock for level history
         
+        # N-step buffers per client (state, action_idx, reward)
+        self.n_step_buffers = {}
+
+        # Optional transition tracing for debugging mapping
+        self.trace_enabled = os.environ.get("TRACE_TRANSITIONS", "0") == "1"
+        try:
+            self.trace_limit = int(os.environ.get("TRACE_TRANSITIONS_MAX", "50"))
+        except ValueError:
+            self.trace_limit = 50
+        self.trace_count = 0
+        
     def get_average_level(self):
         """Calculate the rolling average level from the last N frames"""
         with self.level_lock:
@@ -113,6 +124,8 @@ class SocketServer:
                         self.clients[client_id] = client_socket
                         # Update metrics.client_count
                         metrics.client_count = len(self.clients)
+                        # Initialize n-step buffer for this client (store full transitions)
+                        self.n_step_buffers[client_id] = deque()
                     
                     # Start a thread to handle this client
                     client_thread = threading.Thread(
@@ -368,17 +381,61 @@ class SocketServer:
                     
                     # Process previous step's results if available
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:
-                         # Ensure agent exists before stepping
                         if hasattr(self, 'agent') and self.agent:
-                            self.agent.step(
+                            # Build one-step transition for previous (s,a) using current frame as (s', r, done)
+                            transition = (
                                 state['last_state'],
-                                np.array([[state['last_action_idx']]]),
+                                state['last_action_idx'],
                                 frame.reward,
                                 frame.state,
                                 frame.done
                             )
+                            if self.trace_enabled and self.trace_count < self.trace_limit:
+                                print(f"[TRACE] c{client_id} one-step: a_prev={state['last_action_idx']} r={frame.reward:.3f} done={frame.done} src={state.get('last_action_source','?')} s'len={len(frame.state)}", flush=True)
+                                self.trace_count += 1
+                            if RL_CONFIG.n_step <= 1:
+                                self.agent.step(
+                                    transition[0],
+                                    np.array([[transition[1]]]),
+                                    transition[2],
+                                    transition[3],
+                                    transition[4]
+                                )
+                            else:
+                                buf = self.n_step_buffers.get(client_id)
+                                if buf is not None:
+                                    buf.append(transition)
+                                    # If we have enough steps or the episode ended, emit an n-step transition
+                                    if len(buf) >= RL_CONFIG.n_step or any(d for *_, d in buf):
+                                        # Compute discounted return up to n steps or until done
+                                        R = 0.0
+                                        done_flag = False
+                                        next_state_for_update = buf[-1][3]
+                                        steps_to_use = min(RL_CONFIG.n_step, len(buf))
+                                        for k in range(steps_to_use):
+                                            r_k = buf[k][2]
+                                            d_k = buf[k][4]
+                                            R += (RL_CONFIG.gamma ** k) * r_k
+                                            if d_k:
+                                                done_flag = True
+                                                next_state_for_update = buf[k][3]
+                                                steps_to_use = k + 1
+                                                break
+                                        s0, a0 = buf[0][0], buf[0][1]
+                                        if self.trace_enabled and self.trace_count < self.trace_limit:
+                                            print(f"[TRACE] c{client_id} n-step: a0={a0} Rn={R:.3f} steps={steps_to_use} done={done_flag}", flush=True)
+                                            self.trace_count += 1
+                                        self.agent.step(
+                                            s0,
+                                            np.array([[a0]]),
+                                            R,
+                                            next_state_for_update,
+                                            done_flag
+                                        )
+                                        # Remove the first transition to slide the window
+                                        buf.popleft()
                         else:
-                             print(f"Client {client_id}: Agent not available for step.")
+                            print(f"Client {client_id}: Agent not available for step.")
 
 
                         # Track rewards
@@ -410,6 +467,13 @@ class SocketServer:
                              print(f"Client {client_id}: Connection lost when sending done confirmation.")
                              break # Exit loop if connection is lost
 
+
+                        # Flush any remaining n-step transitions for this client on episode end
+                        try:
+                            if RL_CONFIG.n_step > 1 and self.n_step_buffers.get(client_id):
+                                self._flush_n_step(client_id, frame)
+                        except Exception:
+                            pass
 
                         # Reset state for next episode
                         state['last_state'] = None
@@ -525,6 +589,9 @@ class SocketServer:
                 if client_id in self.clients:
                      # Replace thread with None to mark for cleanup
                      self.clients[client_id] = None
+                # Remove n-step buffer
+                if client_id in self.n_step_buffers:
+                    del self.n_step_buffers[client_id]
 
                 # Update metrics after cleanup
                 metrics.client_count = len([c for c in self.clients.values() if c is not None])
@@ -562,3 +629,33 @@ class SocketServer:
     def get_fps(self):
         with self.client_lock:
             return self.metrics.fps 
+
+    def _flush_n_step(self, client_id: int, frame):
+        """Flush remaining n-step transitions at episode end."""
+        buf = self.n_step_buffers.get(client_id)
+        if not buf:
+            return
+        # Slide through the remaining transitions
+        while buf:
+            # Base transition s0,a0 from the first element in the buffer
+            s0, a0, _, _, _ = buf[0]
+            R = 0.0
+            done_flag = False
+            next_state_for_update = frame.state
+            steps_to_use = min(RL_CONFIG.n_step, len(buf)) if RL_CONFIG.n_step > 1 else 1
+            for k in range(steps_to_use):
+                _, _, r_k, ns_k, d_k = buf[k]
+                R += (RL_CONFIG.gamma ** k) * r_k
+                if d_k:
+                    done_flag = True
+                    next_state_for_update = ns_k
+                    steps_to_use = k + 1
+                    break
+            self.agent.step(
+                s0,
+                np.array([[a0]]),
+                R,
+                next_state_for_update,
+                True
+            )
+            buf.popleft()

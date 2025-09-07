@@ -84,8 +84,8 @@ def display_metrics_row(agent, kb_handler):
         dqn_rewards_list = list(metrics.dqn_rewards)
         mean_dqn_reward = sum(dqn_rewards_list[-1000:]) / min(len(dqn_rewards_list), 1000)
     
-    # Get the latest loss value
-    latest_loss = metrics.losses[-1] if metrics.losses else 0
+    # Get the latest loss value (show with decimals to avoid truncation to 0)
+    latest_loss = float(metrics.losses[-1]) if metrics.losses else float('nan')
     
     # Get Training Queue Size (Removed - no longer needed)
     # train_q_size = 0
@@ -110,7 +110,7 @@ def display_metrics_row(agent, kb_handler):
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
-        f"{int(latest_loss):>10} {metrics.client_count:>8} " # Format loss as integer
+        f"{latest_loss:>10.2f} {metrics.client_count:>8} " # Show loss with 2 decimals
         f"{avg_level:>9.1f} " # Add average level column
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "

@@ -172,77 +172,101 @@ metrics.global_server = None
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
 
 class ReplayMemory:
-    """Optimized replay buffer using circular buffer for O(1) sampling and insertion"""
-    def __init__(self, capacity):
+    """Replay buffer with optional Prioritized Experience Replay (PER)."""
+    def __init__(self, capacity, prioritized=False, alpha=0.6, eps=1e-6):
         self.capacity = capacity
-        self.memory = [None] * capacity  # Pre-allocate memory array
-        self.position = 0  # Current write position
-        self.size = 0  # Current number of stored experiences
+        self.memory = [None] * capacity
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.position = 0
+        self.size = 0
+        self.prioritized = prioritized
+        self.alpha = alpha
+        self.eps = eps
+        self.lock = threading.Lock()
         
     def push(self, state, action, reward, next_state, done):
-        """Add experience to memory - O(1) operation"""
-        self.memory[self.position] = Experience(state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.capacity  # Circular buffer
-        self.size = min(self.size + 1, self.capacity)
+        with self.lock:
+            exp = Experience(state, action, reward, next_state, done)
+            self.memory[self.position] = exp
+            # New item gets max priority to ensure it can be sampled
+            max_prio = self.priorities.max() if self.size > 0 else 1.0
+            self.priorities[self.position] = max(max_prio, self.eps)
+            self.position = (self.position + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
         
-    def sample(self, batch_size):
-        """Sample random batch of experiences - O(1) per sample"""
-        actual_batch_size = min(batch_size, self.size)
-        
-        # Generate random indices directly - O(1) access
-        # Compatible with older NumPy versions
-        indices = np.random.randint(0, self.size, size=actual_batch_size)
-        experiences = [self.memory[i] for i in indices]
-        
+    def sample(self, batch_size, beta=0.4):
+        with self.lock:
+            local_size = self.size
+            actual_batch_size = min(batch_size, local_size)
+            if self.prioritized and local_size > 0:
+                prios = self.priorities[:local_size].copy()
+                # Compute probabilities; fall back to uniform if degenerate
+                probs = prios ** self.alpha
+                total = probs.sum()
+                if not np.isfinite(total) or total <= 0.0:
+                    probs = np.ones_like(probs) / float(local_size)
+                else:
+                    probs = probs / total
+                indices = np.random.choice(local_size, actual_batch_size, p=probs)
+                # Importance sampling weights
+                weights_np = (local_size * probs[indices]) ** (-beta)
+                weights_np = weights_np / weights_np.max()
+                weights = torch.from_numpy(weights_np).float().to(device).unsqueeze(1)
+            else:
+                indices = np.random.randint(0, max(1, local_size), size=actual_batch_size)
+                weights = torch.ones((actual_batch_size, 1), dtype=torch.float32, device=device)
+            experiences = [self.memory[i] for i in indices]
         states = torch.from_numpy(np.vstack([e.state for e in experiences])).float().to(device)
         actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
         rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
         next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences])).float().to(device)
         dones = torch.from_numpy(np.vstack([e.done for e in experiences]).astype(np.uint8)).float().to(device)
-        return states, actions, rewards, next_states, dones
-        
+        return states, actions, rewards, next_states, dones, indices, weights
+    
+    def update_priorities(self, indices, td_errors):
+        if not self.prioritized or indices is None:
+            return
+        # prio = |delta| + eps
+        new_prios = np.abs(td_errors.detach().cpu().numpy()).flatten() + self.eps
+        for idx, p in zip(indices, new_prios):
+            self.priorities[idx] = float(p)
+    
     def __len__(self):
         return self.size
 
 class DQN(nn.Module):
-    """Deep Q-Network model with dueling architecture, layer normalization, and dropout."""
+    """Deep Q-Network with dueling heads and LayerNorm (no dropout)."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         # Shared feature layers
-        self.fc1 = nn.Linear(state_size, 1024)  # Reduced for 200 inputs
-        self.ln1 = nn.LayerNorm(1024)
-        self.dropout1 = nn.Dropout(p=0.1)
-        self.fc2 = nn.Linear(1024, 512)
-        self.ln2 = nn.LayerNorm(512)
-        self.dropout2 = nn.Dropout(p=0.1)
-        self.fc3 = nn.Linear(512, 256)
-        self.ln3 = nn.LayerNorm(256)
-        self.dropout3 = nn.Dropout(p=0.1)
-        
+        self.fc1 = nn.Linear(state_size, 512)
+        self.ln1 = nn.LayerNorm(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.ln2 = nn.LayerNorm(256)
+        self.fc3 = nn.Linear(256, 128)
+        self.ln3 = nn.LayerNorm(128)
+
         # Value stream
-        self.value_fc = nn.Linear(256, 128)
+        self.value_fc = nn.Linear(128, 128)
         self.value = nn.Linear(128, 1)
-        
+
         # Advantage stream
-        self.adv_fc = nn.Linear(256, 128)
+        self.adv_fc = nn.Linear(128, 128)
         self.advantage = nn.Linear(128, action_size)
 
     def forward(self, x):
-        x = F.relu(self.ln1(self.fc1(x)))
-        x = self.dropout1(x)
-        x = F.relu(self.ln2(self.fc2(x)))
-        x = self.dropout2(x)
-        x = F.relu(self.ln3(self.fc3(x)))
-        x = self.dropout3(x)
-        
+        x = F.silu(self.ln1(self.fc1(x)))
+        x = F.silu(self.ln2(self.fc2(x)))
+        x = F.silu(self.ln3(self.fc3(x)))
+
         # Value stream
-        val = F.relu(self.value_fc(x))
+        val = F.silu(self.value_fc(x))
         val = self.value(val)
-        
+
         # Advantage stream
-        adv = F.relu(self.adv_fc(x))
+        adv = F.silu(self.adv_fc(x))
         adv = self.advantage(adv)
-        
+
         # Combine for Q-values
         q_vals = val + adv - adv.mean(dim=1, keepdim=True)
         return q_vals
@@ -259,10 +283,16 @@ class DQNAgent:
         # Q-Networks (online and target)
         self.qnetwork_local = DQN(state_size, action_size).to(device)
         self.qnetwork_target = DQN(state_size, action_size).to(device)
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate, weight_decay=RL_CONFIG.weight_decay)
         
-        # Replay memory
-        self.memory = ReplayMemory(memory_size)
+        # Replay memory (with optional PER)
+        self.per_beta = RL_CONFIG.per_beta_start
+        self.memory = ReplayMemory(
+            memory_size,
+            prioritized=RL_CONFIG.prioritized,
+            alpha=RL_CONFIG.per_alpha,
+            eps=RL_CONFIG.per_eps,
+        )
         
         # Initialize target network with same weights as local network
         self.update_target_network()
@@ -305,22 +335,39 @@ class DQNAgent:
         if len(self.memory) < RL_CONFIG.batch_size:
             return
             
-        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
+        # Sample (works for both PER and uniform cases)
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(
+            RL_CONFIG.batch_size, beta=self.per_beta)
+        if RL_CONFIG.reward_clip:
+            rewards = torch.clamp(rewards, -RL_CONFIG.reward_clip_value, RL_CONFIG.reward_clip_value)
         
         Q_expected = self.qnetwork_local(states).gather(1, actions)
-        
+
         with torch.no_grad():
             best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
             Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
             Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
-        
-        # Compute loss and perform optimization
-        criterion = SmoothL1Loss()
-        loss = criterion(Q_expected, Q_targets)
+
+        # Compute weighted loss and perform optimization
+        criterion = SmoothL1Loss(reduction='none')
+        per_sample_loss = criterion(Q_expected, Q_targets)
+        loss = (per_sample_loss * weights).mean()
         self.optimizer.zero_grad()
-        loss.backward() 
-        self.optimizer.step() 
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+        self.optimizer.step()
         metrics.losses.append(loss.item())
+
+        # Update PER priorities from TD error (|Q_expected - Q_targets|)
+        if RL_CONFIG.prioritized and indices is not None:
+            td_errors = Q_expected.detach() - Q_targets.detach()
+            self.memory.update_priorities(indices, td_errors)
+
+        # Anneal PER beta
+        if RL_CONFIG.prioritized:
+            total = max(1, RL_CONFIG.per_beta_steps)
+            step = min(metrics.frame_count, total)
+            self.per_beta = RL_CONFIG.per_beta_start + (RL_CONFIG.per_beta_end - RL_CONFIG.per_beta_start) * (step / total)
 
     def update_target_network(self):
         """Update target network with weights from local network"""
@@ -689,9 +736,15 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         for i in range(0, len(state_data), 2):  # Using 2 bytes per value
             if i + 1 < len(state_data):
                 try:
-                    value = struct.unpack(">H", state_data[i:i+2])[0]
-                    # Normalize signed 16-bit values to [-1, 1]
-                    normalized = max(-1.0, min(1.0, value / 32767.0))
+                    # Interpret as signed 16-bit big-endian short
+                    value = struct.unpack(">h", state_data[i:i+2])[0]
+                    # Normalize to [-1, 1]
+                    normalized = float(value) / 32767.0
+                    # Clamp defensively
+                    if normalized > 1.0:
+                        normalized = 1.0
+                    elif normalized < -1.0:
+                        normalized = -1.0
                     state_values.append(normalized)
                 except struct.error as e:
                     print(f"ERROR: Failed to unpack state value at position {i}: {e}", flush=True)
