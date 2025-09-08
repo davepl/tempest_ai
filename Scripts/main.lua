@@ -270,8 +270,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
-        expert_zap_packed           -- B: Expert Zap (uchar)
-        level_state.level_number    -- B: Level Number (uchar)
+        expert_zap_packed,          -- B: Expert Zap (uchar)
+        ls.level_number             -- B: Level Number (uchar)
     )
 
     -- Combine OOB header + main data
