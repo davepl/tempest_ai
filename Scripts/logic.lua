@@ -445,9 +445,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             return target_seg, 0, should_fire, false -- Return early
         end
 
-        -- === Step 1C: Top-Rail Flipper Patient Hunt (Wait & Conserve) ===
-        -- If a top-rail flipper is within ~5 segments, prefer holding position and conserving shots until adjacent
-        if nearest_flipper_seg and min_flipper_abs_rel <= FLIPPER_WAIT_DISTANCE then
+    -- === Step 1C: Top-Rail Flipper Patient Hunt (Wait & Conserve) ===
+    -- If a top-rail flipper is within ~5 segments, prefer holding position and conserving shots until adjacent
+    -- IMPORTANT: Do not use this behavior on open levels; maintain prior lane-1/14 strategy there
+    if not is_open and nearest_flipper_seg and min_flipper_abs_rel <= FLIPPER_WAIT_DISTANCE then
             -- If current lane is safe and not on a dangerous pulsar lane while pulsing, hold position
             local player_is_safe = not M.is_danger_lane(player_abs_seg, enemies_state)
             local pulsar_hot = (enemies_state.pulsing > PULSAR_THRESHOLD) and is_pulsar_lane(player_abs_seg, enemies_state)
@@ -539,8 +540,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
-                -- Use fractional distance to improve timing on open levels
-                proposed_target_seg = (nl_dist_float <= 1.05) and 13 or 14
+                -- Revert to integer distance for left-only on open fields (works better for lane-1 behavior)
+                proposed_target_seg = (nl_dist <= 1) and 13 or 14
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
