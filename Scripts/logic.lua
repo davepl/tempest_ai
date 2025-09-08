@@ -13,10 +13,11 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
 local SAFE_DISTANCE = 1
+local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 3
-local PULSAR_THRESHOLD = 0x00 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
+local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
 
 local M = {} -- Module table
 
@@ -25,6 +26,9 @@ local previous_score = 0
 local previous_level = 0
 local previous_alive_state = 1 -- Track previous alive state, initialize as alive
 local LastRewardState = 0
+-- Track superzapper usage and activation edge per level (for one-time charging)
+local previous_superzapper_active = 0
+local previous_superzapper_uses_in_level = 0
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -317,8 +321,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         -- === Step 1: Determine proposed target based on Top Rail / Hunt ===
 
         -- Scan Top Rail Enemies
-        local nl_seg, nr_seg = nil, nil
-        local nl_dist, nr_dist = 100, 100
+    local nl_seg, nr_seg = nil, nil
+    local nl_dist, nr_dist = 100, 100
+    local nl_dist_float, nr_dist_float = 100, 100
         local enemy_left_exists, enemy_right_exists = false, false
         local any_enemy_proximate = false
         local top_rail_enemies = {}
@@ -349,7 +354,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                         rel_float = rel_int - (1 - frac_pos)  -- Adjust for negative direction
                     end
                     
-                    -- Use integer-based absolute distance for critical comparisons
+                    -- Use integer-based absolute distance for coarse comparisons; keep float for precision
                     local abs_rel_int = math.abs(rel_int)
                     local abs_rel_float = math.abs(rel_float)
                     local core_type = enemies_state.enemy_core_type[i]
@@ -367,12 +372,14 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     -- Update nearest overall left/right (using integer positions for critical logic)
                     if rel_int > 0 and abs_rel_int < nr_dist then 
                         nr_dist = abs_rel_int
+                        nr_dist_float = abs_rel_float
                         nr_seg = seg
                         enemy_right_exists = true 
                     end
                     
                     if rel_int < 0 and abs_rel_int < nl_dist then 
                         nl_dist = abs_rel_int
+                        nl_dist_float = abs_rel_float
                         nl_seg = seg
                         enemy_left_exists = true 
                     end
@@ -422,7 +429,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             return target_seg, 0, should_fire, false -- Return early - fuseball avoidance is critical
         end
 
-        -- === Step 1B: High Priority Flipper Avoidance ===
+    -- === Step 1B: High Priority Flipper Avoidance ===
         if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
 
             -- Calculate target D segments away from the flipper, in the direction opposite the flipper from the player
@@ -436,6 +443,21 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
             local should_fire = fire_priority > shot_count
             return target_seg, 0, should_fire, false -- Return early
+        end
+
+        -- === Step 1C: Top-Rail Flipper Patient Hunt (Wait & Conserve) ===
+        -- If a top-rail flipper is within ~5 segments, prefer holding position and conserving shots until adjacent
+        if nearest_flipper_seg and min_flipper_abs_rel <= FLIPPER_WAIT_DISTANCE then
+            -- If current lane is safe and not on a dangerous pulsar lane while pulsing, hold position
+            local player_is_safe = not M.is_danger_lane(player_abs_seg, enemies_state)
+            local pulsar_hot = (enemies_state.pulsing > PULSAR_THRESHOLD) and is_pulsar_lane(player_abs_seg, enemies_state)
+            if player_is_safe and not pulsar_hot then
+                local abs_rel = math.abs(nearest_flipper_rel)
+                local fire_priority = (abs_rel <= 1.05) and FREEZE_FIRE_PRIO_HIGH or FREEZE_FIRE_PRIO_LOW
+                local should_fire = fire_priority > shot_count
+                return player_abs_seg, 0, should_fire, false -- Stay put; fire only when adjacent
+            end
+            -- If not safe, safety logic below will reposition minimally
         end
 
         -- === Step 1B: Determine proposed target based on Top Rail (Presence) / Hunt ===
@@ -502,7 +524,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_right_exists then
             -- Case 2: Right Only - Use adaptive distance approach
             if is_open then 
-                proposed_target_seg = (nr_dist <= 1) and 0 or 1  -- Original working code for open level
+                -- Use fractional distance to improve timing on open levels
+                proposed_target_seg = (nr_dist_float <= 1.05) and 0 or 1
             else 
                 if nr_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
@@ -516,7 +539,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         elseif enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
-                proposed_target_seg = (nl_dist <= 1) and 13 or 14  -- Original working code for open level
+                -- Use fractional distance to improve timing on open levels
+                proposed_target_seg = (nl_dist_float <= 1.05) and 13 or 14
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
@@ -623,6 +647,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
     if player_state.alive == 1 then
 
+        -- Level completion bonus and per-level resets
+        if level_state.level_number > previous_level then
+            reward = reward + 8000 -- explicit level completion reward (tuned)
+            previous_superzapper_uses_in_level = 0 -- reset zap uses for new level
+        end
+
         -- Player is alive; check to see if they are on a pulsar segment
         local player_segment = math.floor(player_state.position) % 16
         if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing > PULSAR_THRESHOLD then
@@ -634,23 +664,47 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         if enemies_state.fuseball_threat_nearby then
             local fuseball_escape_target = enemies_state.fuseball_escape_target
             if fuseball_escape_target ~= -1 then
-                local rel_dist = abs_to_rel_func(player_segment, fuseball_escape_target, level_state.level_type == 0xFF)
-                if math.abs(rel_dist) <= 2 then reward = reward + 100 end -- Reward for escaping fuseball threat
+                local is_open = (level_state.level_type == 0xFF)
+                local rel_dist = abs_to_rel_func(player_segment, fuseball_escape_target, is_open)
+                -- Directional shaping: reward moving toward escape lane, penalize moving away or idling
+                if rel_dist ~= 0 then
+                    local need_dir = (rel_dist > 0) and 1 or -1
+                    if (detected_spinner > 0 and need_dir > 0) or (detected_spinner < 0 and need_dir < 0) then
+                        reward = reward + 60 -- moving in the right direction (tuned)
+                    elseif detected_spinner == 0 then
+                        reward = reward - 30 -- idle while threatened
+                    else
+                        reward = reward - 50 -- moving the wrong way (tuned)
+                    end
+                else
+                    reward = reward + 50 -- reached/arrived at the escape lane
+                end
+                -- Small terminal bonus for being close to the escape lane
+                if math.abs(rel_dist) <= 2 then reward = reward + 100 end
             end
         end
 
         
 
 
-        local score_delta = player_state.score - previous_score
-        if score_delta > 0 and score_delta <= 1000 then reward = reward + score_delta end
+    local score_delta = player_state.score - previous_score
+    if score_delta > 0 then reward = reward + (score_delta * 0.2) end -- scale points (tuned)
 
         local sc = player_state.shot_count
         if sc == 0 or sc >= 8 then reward = reward - 50
         elseif sc == 4 then reward = reward + 5; elseif sc == 5 then reward = reward + 10
         elseif sc == 6 then reward = reward + 15; elseif sc == 7 then reward = reward + 20 end
 
-        if game_state.gamestate == 0x04 and player_state.superzapper_active ~= 0 then reward = reward - 500 end
+        -- Superzapper one-time charging per activation: -500 on first use in a level, -50 on second
+        if game_state.gamestate == 0x04 then
+            local sz_active = player_state.superzapper_active or 0
+            if previous_superzapper_active == 0 and sz_active ~= 0 then
+                local charge = (previous_superzapper_uses_in_level == 0) and 500 or 50
+                reward = reward - charge
+                previous_superzapper_uses_in_level = math.min(2, previous_superzapper_uses_in_level + 1)
+            end
+            previous_superzapper_active = sz_active
+        end
 
         local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
         local target_depth = enemies_state.nearest_enemy_depth_raw
@@ -669,19 +723,19 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         else -- Enemies Present Reward
             local desired_spinner, segment_distance, _ = M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
             if segment_distance == 0 then -- Aligned Reward
-                reward = reward + (detected_spinner == 0 and 250 or -50)
+                reward = reward + (detected_spinner == 0 and 250 or -10) -- relax penalty while aligned
                 if player_state.fire_commanded == 1 then reward = reward + 50 end
             else -- Misaligned Reward
                 if segment_distance < 2 and target_depth <= 0x20 then reward = reward + (player_state.fire_commanded == 1 and 150 or -50)
                 else if player_state.fire_commanded == 1 then reward = reward - (segment_distance < 2 and 20 or 30) end end
                 -- Movement reward
-                if desired_spinner * detected_spinner > 0 then reward = reward + 40
-                elseif desired_spinner * detected_spinner < 0 then reward = reward - 50
-                elseif detected_spinner == 0 and desired_spinner ~= 0 then reward = reward - 15 end
+        if desired_spinner * detected_spinner > 0 then reward = reward + 50
+        elseif desired_spinner * detected_spinner < 0 then reward = reward - 40
+        elseif detected_spinner == 0 and desired_spinner ~= 0 then reward = reward - 20 end
             end
         end
     else -- Player Died Penalty
-        if previous_alive_state == 1 then reward = reward - 20000; bDone = true end
+    if previous_alive_state == 1 then reward = reward - 16000; bDone = true end -- tuned
     end
 
     previous_score = player_state.score
