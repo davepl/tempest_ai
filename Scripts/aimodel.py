@@ -52,6 +52,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 import select
 import threading
 import queue
@@ -158,7 +159,7 @@ SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
 # Initialize device
-device = torch.device("cuda" if torch.cuda.is_available() else 
+device = torch.device("cpu" if torch.cuda.is_available() else 
                       "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -193,15 +194,73 @@ class ReplayMemory:
     def __len__(self):
         return len(self.memory)
 
+class NoisyLinear(nn.Module):
+    """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
+    def __init__(self, in_features: int, out_features: int, sigma_init: float = 0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Learnable parameters
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+
+        # Buffers for noise
+        self.register_buffer('weight_eps', torch.empty(out_features, in_features))
+        self.register_buffer('bias_eps', torch.empty(out_features))
+
+        self.reset_parameters(sigma_init)
+        self.reset_noise()
+
+    def reset_parameters(self, sigma_init: float):
+        mu_range = 1 / np.sqrt(self.in_features)
+        with torch.no_grad():
+            self.weight_mu.uniform_(-mu_range, mu_range)
+            self.bias_mu.uniform_(-mu_range, mu_range)
+            self.weight_sigma.fill_(sigma_init / np.sqrt(self.in_features))
+            self.bias_sigma.fill_(sigma_init / np.sqrt(self.out_features))
+
+    def _scale_noise(self, size):
+        x = torch.randn(size, device=self.weight_mu.device)
+        return x.sign() * x.abs().sqrt()
+
+    def reset_noise(self):
+        eps_in = self._scale_noise(self.in_features)
+        eps_out = self._scale_noise(self.out_features)
+        self.weight_eps.copy_(eps_out.ger(eps_in))
+        self.bias_eps.copy_(eps_out)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            # Use current sampled noise; do not mutate buffers during forward
+            weight = self.weight_mu + self.weight_sigma * self.weight_eps
+            bias = self.bias_mu + self.bias_sigma * self.bias_eps
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(input, weight, bias)
+
 class DQN(nn.Module):
     """Deep Q-Network model."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 512) 
-        self.fc2 = nn.Linear(512, 384)  
-        self.fc3 = nn.Linear(384, 192)        
+        use_noisy = RL_CONFIG.use_noisy_nets
+        noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
+        LinearOrNoisy1 = NoisyLinear if use_noisy else nn.Linear
+        LinearOrNoisy2 = NoisyLinear if use_noisy else nn.Linear
+
+        self.fc1 = nn.Linear(state_size, 512)
+        self.fc2 = LinearOrNoisy1(512, 384, noisy_std) if use_noisy else LinearOrNoisy1(512, 384)
+        self.fc3 = LinearOrNoisy2(384, 192, noisy_std) if use_noisy else LinearOrNoisy2(384, 192)
         self.fc4 = nn.Linear(192, 128)
-        self.out = nn.Linear(128, action_size) 
+        self.out = nn.Linear(128, action_size)
+
+    def reset_noise(self):
+        # Reset noise for all NoisyLinear layers
+        for m in self.modules():
+            if isinstance(m, NoisyLinear):
+                m.reset_noise()
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -223,6 +282,12 @@ class DQNAgent:
         self.qnetwork_local = DQN(state_size, action_size).to(device)
         self.qnetwork_target = DQN(state_size, action_size).to(device)
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
+        # Optional LR scheduler
+        self.scheduler = None
+        if getattr(RL_CONFIG, 'use_lr_scheduler', False):
+            step_size = getattr(RL_CONFIG, 'scheduler_step_size', 100000)
+            gamma = getattr(RL_CONFIG, 'scheduler_gamma', 0.5)
+            self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
         
         # Replay memory
         self.memory = ReplayMemory(memory_size)
@@ -267,6 +332,12 @@ class DQNAgent:
         """Perform a single training step on one batch"""
         if len(self.memory) < RL_CONFIG.batch_size:
             return
+        # If using NoisyNets, sample noise once per train step for consistency
+        if getattr(RL_CONFIG, 'use_noisy_nets', False):
+            if hasattr(self.qnetwork_local, 'reset_noise'):
+                self.qnetwork_local.reset_noise()
+            if hasattr(self.qnetwork_target, 'reset_noise'):
+                self.qnetwork_target.reset_noise()
             
         states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
         
@@ -282,12 +353,29 @@ class DQNAgent:
         loss = criterion(Q_expected, Q_targets)
         self.optimizer.zero_grad()
         loss.backward() 
-        self.optimizer.step() 
+        self.optimizer.step()
+        # Soft target update if enabled (Polyak averaging every step)
+        if getattr(RL_CONFIG, 'use_soft_target', False):
+            tau = getattr(RL_CONFIG, 'tau', 0.005)
+            self.soft_update(tau)
+        # Step LR scheduler if enabled
+        if self.scheduler is not None:
+            self.scheduler.step()
         metrics.losses.append(loss.item())
 
     def update_target_network(self):
         """Update target network with weights from local network"""
-        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        if getattr(RL_CONFIG, 'use_soft_target', False):
+            tau = getattr(RL_CONFIG, 'tau', 0.005)
+            self.soft_update(tau)
+        else:
+            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+
+    def soft_update(self, tau: float = 0.005):
+        """Soft-update target network parameters: θ_target = τ*θ_local + (1-τ)*θ_target"""
+        with torch.no_grad():
+            for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
+                target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
         
     def act(self, state, epsilon=0.0):
         """Select action using epsilon-greedy policy"""
@@ -322,14 +410,11 @@ class DQNAgent:
         """Save model weights, rate-limited unless forced."""
         is_forced_save = "exit" in filename or "shutdown" in filename
         current_time = time.time()
-        save_interval = 30.0 # Minimum seconds between saves
-        
+        save_interval = 30.0  # Minimum seconds between saves
         # Rate limit non-forced saves
         if not is_forced_save:
             if current_time - self.last_save_time < save_interval:
-                # Optional: Add a debug print if needed
-                # print(f"Skipping save to {filename}, too soon since last save.")
-                return # Skip save
+                return  # Skip save
         
         # Proceed with save if forced or interval elapsed
         try:
@@ -339,7 +424,7 @@ class DQNAgent:
             else:
                 ratio_to_save = metrics.expert_ratio
 
-            torch.save({
+            payload = {
                 'policy_state_dict': self.qnetwork_local.state_dict(),
                 'target_state_dict': self.qnetwork_target.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
@@ -349,7 +434,11 @@ class DQNAgent:
                 'expert_ratio': ratio_to_save, # Save the determined ratio
                 'last_decay_step': metrics.last_decay_step,
                 'last_epsilon_decay_step': metrics.last_epsilon_decay_step
-            }, filename)
+            }
+            # Save scheduler state if present
+            if self.scheduler is not None:
+                payload['scheduler_state_dict'] = self.scheduler.state_dict()
+            torch.save(payload, filename)
             
             # Update last save time ONLY on successful save
             self.last_save_time = current_time
@@ -364,10 +453,81 @@ class DQNAgent:
         """Load model weights"""
         if os.path.exists(filename):
             try:
+                print(f"Loading model checkpoint from {filename}")
                 checkpoint = torch.load(filename, map_location=device)
-                self.qnetwork_local.load_state_dict(checkpoint['policy_state_dict'])
-                self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                policy_sd = checkpoint['policy_state_dict']
+                target_sd = checkpoint['target_state_dict']
+
+                def _try_load(model: nn.Module, sd: dict) -> bool:
+                    try:
+                        model.load_state_dict(sd)
+                        return True
+                    except Exception:
+                        return False
+
+                ok_local = _try_load(self.qnetwork_local, policy_sd)
+                ok_target = _try_load(self.qnetwork_target, target_sd)
+
+                used_compat = False
+                if not (ok_local and ok_target):
+                    # Compatibility path: map Linear <-> NoisyLinear differences
+                    def _compat_remap(model: nn.Module, sd: dict) -> dict:
+                        model_sd = model.state_dict()
+                        new_sd = {}
+                        for k in model_sd.keys():
+                            if k in sd:
+                                new_sd[k] = sd[k]
+                                continue
+                            # Noisy expecting mu from Linear
+                            if k.endswith('weight_mu'):
+                                base = k[:-3]  # strip '_mu' -> 'weight'
+                                if base in sd:
+                                    new_sd[k] = sd[base]
+                                    continue
+                            if k.endswith('bias_mu'):
+                                base = k[:-3]  # strip '_mu' -> 'bias'
+                                if base in sd:
+                                    new_sd[k] = sd[base]
+                                    continue
+                            # Linear expecting weight/bias from Noisy mu
+                            if k.endswith('weight') and (k + '_mu') in sd:
+                                new_sd[k] = sd[k + '_mu']
+                                continue
+                            if k.endswith('bias') and (k + '_mu') in sd:
+                                new_sd[k] = sd[k + '_mu']
+                                continue
+                            # Otherwise keep initialized tensor (for sigma/eps etc.)
+                            new_sd[k] = model_sd[k]
+                        return new_sd
+
+                    remapped_policy = _compat_remap(self.qnetwork_local, policy_sd)
+                    remapped_target = _compat_remap(self.qnetwork_target, target_sd)
+                    self.qnetwork_local.load_state_dict(remapped_policy, strict=False)
+                    self.qnetwork_target.load_state_dict(remapped_target, strict=False)
+                    used_compat = True
+
+                if used_compat:
+                    print("Checkpoint loaded with compatibility remap (Linear<->Noisy).")
+                else:
+                    print("Checkpoint loaded with strict key match.")
+
+                # Optimizer/Scheduler may fail to load if param shapes changed; guard it
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("Optimizer state loaded.")
+                except Exception:
+                    print("Optimizer state not loaded (shape mismatch). Using freshly initialized optimizer.")
+                # Load scheduler state if present and configured
+                if 'scheduler_state_dict' in checkpoint and getattr(RL_CONFIG, 'use_lr_scheduler', False):
+                    if self.scheduler is None:
+                        step_size = getattr(RL_CONFIG, 'scheduler_step_size', 100000)
+                        gamma = getattr(RL_CONFIG, 'scheduler_gamma', 0.5)
+                        self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+                    try:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                        print("LR scheduler state loaded.")
+                    except Exception:
+                        print("LR scheduler state not loaded (mismatch). Using freshly initialized scheduler.")
                 
                 # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
@@ -394,7 +554,10 @@ class DQNAgent:
                 return True
             except Exception as e:
                 print(f"Error loading model: {e}")
+                print("Starting with fresh model parameters.")
                 return False
+        else:
+            print(f"No checkpoint found at {filename}. Starting new model.")
         return False
 
 class KeyboardHandler:

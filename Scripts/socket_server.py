@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import random
 import traceback
 from datetime import datetime
+from collections import deque
 
 # Import from config.py
 from config import (
@@ -93,7 +94,8 @@ class SocketServer:
                         'frames_last_second': 0,  # Frames in current second
                         'last_fps_update': time.time(),  # Last FPS calculation time
                         'last_frame_time': time.time(),  # Initialize frame time tracking
-                        'level_number': 0  # Track level number for each client
+                        'level_number': 0,  # Track level number for each client
+                        'nstep_buf': deque()  # Buffer of (state, action_idx, reward) for n-step returns
                     }
                     
                     # Store client information
@@ -350,19 +352,46 @@ class SocketServer:
                     self.metrics.update_expert_ratio()
                     self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
                     
-                    # Process previous step's results if available
+                    # Process previous step's results with n-step returns if available
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:
-                         # Ensure agent exists before stepping
-                        if hasattr(self, 'agent') and self.agent:
-                            self.agent.step(
-                                state['last_state'],
-                                np.array([[state['last_action_idx']]]),
-                                frame.reward,
-                                frame.state,
-                                frame.done
-                            )
+                        # Append the most recent (s, a, r)
+                        state['nstep_buf'].append((state['last_state'], state['last_action_idx'], frame.reward))
+                        # Emit one n-step transition if buffer has at least n entries
+                        try:
+                            n = getattr(RL_CONFIG, 'n_step', 1)
+                        except Exception:
+                            n = 1
+                        if n <= 1:
+                            # Fallback to 1-step if not configured
+                            if hasattr(self, 'agent') and self.agent:
+                                self.agent.step(
+                                    state['last_state'],
+                                    np.array([[state['last_action_idx']]]),
+                                    frame.reward,
+                                    frame.state,
+                                    frame.done
+                                )
+                            else:
+                                print(f"Client {client_id}: Agent not available for step.")
                         else:
-                             print(f"Client {client_id}: Agent not available for step.")
+                            # If we have enough rewards accumulated and not terminal yet, emit one n-step transition
+                            if len(state['nstep_buf']) >= n and hasattr(self, 'agent') and self.agent:
+                                gamma = RL_CONFIG.gamma
+                                # Compute discounted return for oldest entry over n rewards
+                                R = 0.0
+                                for i in range(n):
+                                    R += (gamma ** i) * state['nstep_buf'][i][2]
+                                s0, a0, _ = state['nstep_buf'][0]
+                                # Next state after n steps is current frame.state
+                                self.agent.step(
+                                    s0,
+                                    np.array([[a0]]),
+                                    R,
+                                    frame.state,
+                                    False if not frame.done else True
+                                )
+                                # Slide window by one
+                                state['nstep_buf'].popleft()
 
 
                         # Track rewards
@@ -387,6 +416,28 @@ class SocketServer:
                              )
 
                         state['was_done'] = True
+                        # Flush remaining n-step buffer on terminal with shorter horizons
+                        try:
+                            n = getattr(RL_CONFIG, 'n_step', 1)
+                        except Exception:
+                            n = 1
+                        if n > 1 and hasattr(self, 'agent') and self.agent and state.get('nstep_buf') is not None:
+                            gamma = RL_CONFIG.gamma
+                            # Use current terminal next_state for all pending transitions
+                            while state['nstep_buf']:
+                                R = 0.0
+                                # Horizon is remaining length
+                                for i in range(len(state['nstep_buf'])):
+                                    R += (gamma ** i) * state['nstep_buf'][i][2]
+                                s0, a0, _ = state['nstep_buf'][0]
+                                self.agent.step(
+                                    s0,
+                                    np.array([[a0]]),
+                                    R,
+                                    frame.state,
+                                    True
+                                )
+                                state['nstep_buf'].popleft()
                         # Send empty action on 'done' frame to prevent issues
                         try:
                             client_socket.sendall(struct.pack("bbb", 0, 0, 0))
@@ -398,6 +449,7 @@ class SocketServer:
                         # Reset state for next episode
                         state['last_state'] = None
                         state['last_action_idx'] = None
+                        state['nstep_buf'].clear()
                         state['total_reward'] = 0
                         state['episode_dqn_reward'] = 0
                         state['episode_expert_reward'] = 0

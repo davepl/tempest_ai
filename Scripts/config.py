@@ -62,6 +62,15 @@ class RLConfigData:
     save_interval: int = 50000
     train_freq: int = 4
     target_update: int = 10000
+    n_step: int = 5                         # N-step return horizon for training
+    # Optional improvements (all off by default to preserve current behavior)
+    use_soft_target: bool = True            # If True, do Polyak averaging instead of hard copies
+    tau: float = 0.005                      # Soft target update factor (0,1]
+    use_noisy_nets: bool = True            # If True, replace some Linear layers with NoisyLinear
+    noisy_std_init: float = 0.5             # Initial sigma for NoisyLinear layers
+    use_lr_scheduler: bool = True           # If True, enable StepLR
+    scheduler_step_size: int = 100000       # Train steps between LR decays
+    scheduler_gamma: float = 0.5            # Multiplicative LR decay factor
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
