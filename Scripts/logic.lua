@@ -526,7 +526,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             -- Case 2: Right Only - Use adaptive distance approach
             if is_open then 
                 -- Use fractional distance to improve timing on open levels
-                proposed_target_seg = (nr_dist_float <= 1.05) and 0 or 1
+                proposed_target_seg = (nr_dist <= 1) and 0 or 1
             else 
                 if nr_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
@@ -541,7 +541,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
                 -- Revert to integer distance for left-only on open fields (works better for lane-1 behavior)
-                proposed_target_seg = (nl_dist <= 1) and 13 or 14
+                proposed_target_seg = (nl_dist_float <= 1.05) and 13 or 14
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
