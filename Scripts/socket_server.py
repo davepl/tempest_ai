@@ -249,11 +249,18 @@ class SocketServer:
             if not ping_ok:
                 raise ConnectionError("Handshake failed")
 
+            # Per-client metrics batching
+            METRICS_BATCH = 8  # frames per update to reduce lock contention
+            local_frame_accum = 0
+
             # Main communication loop
             while self.running and not self.shutdown_event.is_set():
                 try:
-                    ready = select.select([client_socket], [], [], 0.01)
+                    # Non-blocking poll; minimize idle wait to increase throughput
+                    ready = select.select([client_socket], [], [], 0.0)
                     if not ready[0]:
+                        # Tiny backoff to avoid hard busy spin; adjust as needed
+                        time.sleep(0.0005)
                         continue
 
                     # Receive data length
@@ -346,23 +353,27 @@ class SocketServer:
                         except Exception as e:
                             print(f"Client {client_id}: ERROR saving model: {e}")
                     
-                    # Update global metrics
-                    current_frame = self.metrics.update_frame_count()
-                    self.metrics.update_epsilon()
-                    self.metrics.update_expert_ratio()
+                    # Batch global metrics to reduce lock contention
+                    local_frame_accum += 1
+                    if local_frame_accum >= METRICS_BATCH:
+                        current_frame = self.metrics.update_frame_count(delta=local_frame_accum)
+                        local_frame_accum = 0
+                        if client_id == 0:
+                            # Only one thread updates schedules
+                            self.metrics.update_epsilon()
+                            self.metrics.update_expert_ratio()
                     self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
                     
                     # Process previous step's results with n-step returns if available
                     if state.get('last_state') is not None and state.get('last_action_idx') is not None:
-                        # Append the most recent (s, a, r)
-                        state['nstep_buf'].append((state['last_state'], state['last_action_idx'], frame.reward))
-                        # Emit one n-step transition if buffer has at least n entries
+                        # Determine n-step horizon once
                         try:
                             n = getattr(RL_CONFIG, 'n_step', 1)
                         except Exception:
                             n = 1
+
                         if n <= 1:
-                            # Fallback to 1-step if not configured
+                            # Pure 1-step: do not use the n-step buffer at all
                             if hasattr(self, 'agent') and self.agent:
                                 self.agent.step(
                                     state['last_state'],
@@ -374,7 +385,8 @@ class SocketServer:
                             else:
                                 print(f"Client {client_id}: Agent not available for step.")
                         else:
-                            # If we have enough rewards accumulated and not terminal yet, emit one n-step transition
+                            # n-step path: append (s, a, r) and emit when we have at least n
+                            state['nstep_buf'].append((state['last_state'], state['last_action_idx'], frame.reward))
                             if len(state['nstep_buf']) >= n and hasattr(self, 'agent') and self.agent:
                                 gamma = RL_CONFIG.gamma
                                 # Compute discounted return for oldest entry over n rewards
@@ -388,10 +400,14 @@ class SocketServer:
                                     a0,
                                     R,
                                     frame.state,
-                                    False if not frame.done else True
+                                    True if frame.done else False
                                 )
-                                # Slide window by one
-                                state['nstep_buf'].popleft()
+                                # Slide window by one (guard against rare underflow)
+                                if len(state['nstep_buf']) > 0:
+                                    try:
+                                        state['nstep_buf'].popleft()
+                                    except IndexError:
+                                        pass
 
 
                         # Track rewards
@@ -423,13 +439,15 @@ class SocketServer:
                             n = 1
                         if n > 1 and hasattr(self, 'agent') and self.agent and state.get('nstep_buf') is not None:
                             gamma = RL_CONFIG.gamma
+                            buf = state['nstep_buf']
                             # Use current terminal next_state for all pending transitions
-                            while state['nstep_buf']:
+                            while len(buf) > 0:
+                                L = len(buf)
                                 R = 0.0
                                 # Horizon is remaining length
-                                for i in range(len(state['nstep_buf'])):
-                                    R += (gamma ** i) * state['nstep_buf'][i][2]
-                                s0, a0, _ = state['nstep_buf'][0]
+                                for i in range(L):
+                                    R += (gamma ** i) * buf[i][2]
+                                s0, a0, _ = buf[0]
                                 self.agent.step(
                                     s0,
                                     a0,
@@ -437,7 +455,10 @@ class SocketServer:
                                     frame.state,
                                     True
                                 )
-                                state['nstep_buf'].popleft()
+                                try:
+                                    buf.popleft()
+                                except IndexError:
+                                    break
                         # Send empty action on 'done' frame to prevent issues
                         try:
                             client_socket.sendall(struct.pack("bbb", 0, 0, 0))
@@ -519,11 +540,11 @@ class SocketServer:
 
 
                     # Periodic target network update (only from client 0)
-                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
+                    if client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
                         self.agent.update_target_network()
 
                     # Periodic model saving (only from client 0)
-                    if client_id == 0 and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.save_interval == 0:
+                    if client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.save_interval == 0:
                         self.agent.save(LATEST_MODEL_PATH)
 
 

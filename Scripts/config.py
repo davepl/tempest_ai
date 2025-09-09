@@ -33,10 +33,10 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 176
-    expert_ratio_start: float = 0.0
-    expert_ratio_min: float = 0.0
-    expert_ratio_decay: float = 0.999
-    expert_ratio_decay_steps: int = 10000
+    expert_ratio_start: float = 0.3
+    expert_ratio_min: float = 0.2
+    expert_ratio_decay: float = 0.9995
+    expert_ratio_decay_steps: int = 20000
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
 
@@ -48,16 +48,16 @@ class RLConfigData:
     """Configuration for reinforcement learning"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 1024
+    batch_size: int = 512
     gamma: float = 0.99
     epsilon: float = 1.0
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.001
-    epsilon_min: float = 0.001
-    epsilon_decay_factor: float = 0.996 # Multiplicative factor per step
-    epsilon_decay_steps: int = 10000   # Frames per decay step
+    epsilon_end: float = 0.01
+    epsilon_min: float = 0.01
+    epsilon_decay_factor: float = 0.998 # Multiplicative factor per step (slower)
+    epsilon_decay_steps: int = 20000   # Frames per decay step (slower)
     update_target_every: int = 500
-    learning_rate: float = 0.001
+    learning_rate: float = 0.0003
     memory_size: int = 200000
     save_interval: int = 50000
     train_freq: int = 4
@@ -74,9 +74,9 @@ class RLConfigData:
     # Architecture & replay upgrades
     use_dueling: bool = True               # If True, use dueling value/advantage streams
     use_per: bool = True                   # If True, use prioritized experience replay
-    per_alpha: float = 0.6                 # Priority exponent (0=uniform, 1=greedy)
+    per_alpha: float = 0.5                 # Slightly lower to reduce over-biasing
     per_beta_start: float = 0.4            # Initial importance-sampling exponent
-    per_beta_frames: int = 200000          # Frames to anneal beta to 1.0
+    per_beta_frames: int = 500000          # Slower anneal to 1.0
     per_eps: float = 1e-6                  # Small epsilon to avoid zero priority
     # Distributional (placeholder flags; not active yet)
     use_distributional: bool = True        # Enable distributional Q (QR-DQN)
@@ -118,11 +118,13 @@ class MetricsData:
     beta: float = 0.6  # Starting beta value for prioritized replay
     average_priority: float = 0.0  # Average priority value across all transitions
     
-    def update_frame_count(self):
+    def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
         with self.lock:
             # Update total frame count
-            self.frame_count += 1
+            if delta < 1:
+                delta = 1
+            self.frame_count += delta
             
             # Update FPS tracking
             current_time = time.time()
@@ -132,7 +134,7 @@ class MetricsData:
                 self.last_fps_time = current_time
                 
             # Count frames for this second
-            self.frames_last_second += 1
+            self.frames_last_second += delta
             
             # Calculate FPS every second
             elapsed = current_time - self.last_fps_time
