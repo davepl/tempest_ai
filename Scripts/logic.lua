@@ -20,6 +20,9 @@ local AVOID_FIRE_PRIORITY = 3
 local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
 -- Open-level tuning: react slightly sooner to top-rail flippers using fractional distance
 local OPEN_FLIPPER_REACT_DISTANCE = 1.10
+-- Optional: Conserve fire mode (hold fire/movement until react distance)
+local CONSERVE_FIRE_MODE = false
+local CONSERVE_REACT_DISTANCE = 1.10
 -- Configurable pulsar hunting preferences
 local PULSAR_PREF_DISTANCE = 1.0   -- desired lanes away from the pulsar (can be fractional for hold/fire logic)
 local PULSAR_PREF_TOLERANCE = 0.15 -- acceptable window around preferred distance to hold and fire
@@ -243,6 +246,18 @@ function M.get_enemy_priority(segment, enemies_state)
     return best_type, best_priority
 end
 
+-- Public API: configure conserve fire mode
+function M.set_conserve_fire_mode(enabled, react_distance)
+    CONSERVE_FIRE_MODE = not not enabled
+    if type(react_distance) == "number" and react_distance >= 0.5 then
+        CONSERVE_REACT_DISTANCE = react_distance
+    end
+end
+
+function M.get_conserve_fire_mode()
+    return CONSERVE_FIRE_MODE, CONSERVE_REACT_DISTANCE
+end
+
 -- Helper to find the nearest safe segment (not a danger lane)
 local function find_nearest_safe_segment(start_seg, enemies_state, is_open)
     if not M.is_danger_lane(start_seg, enemies_state) then return start_seg end
@@ -451,7 +466,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             end
         end
 
-        -- === Step 1A: HIGHEST Priority Fuseball Avoidance ===
+    -- === Step 1A: HIGHEST Priority Fuseball Avoidance ===
         -- Check for any fuseballs on top rail and avoid them immediately (fatal on contact)
         local nearest_fuseball_seg = nil
         local nearest_fuseball_rel = nil
@@ -483,8 +498,22 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             return target_seg, 0, should_fire, false -- Return early - fuseball avoidance is critical
         end
 
+        -- Conserve Fire Mode override: when top-rail flippers/pulsars are present, hold position and fire only when within react distance
+        local conserve_override_active = false
+        if CONSERVE_FIRE_MODE and (nearest_flipper_seg or nearest_pulsar_seg) then
+            conserve_override_active = true
+            proposed_target_seg = player_abs_seg -- hold position; safety overrides may still move us later
+            local nearest_abs = 999
+            if nearest_flipper_seg then nearest_abs = math.min(nearest_abs, min_flipper_abs_rel) end
+            if nearest_pulsar_seg then nearest_abs = math.min(nearest_abs, min_pulsar_abs_rel) end
+            local threat_near_lane = M.check_segment_threat(player_abs_seg, enemies_state)
+            local within_react = nearest_abs <= CONSERVE_REACT_DISTANCE
+            -- Stop hunting/firing unless threat in our lane or within react distance
+            proposed_fire_prio = (threat_near_lane or within_react) and FREEZE_FIRE_PRIO_HIGH or 0
+        end
+
     -- === Step 1B: High Priority Flipper/Pulsar Avoidance ===
-        if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
+        if not conserve_override_active and nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
 
             -- Calculate target D segments away from the flipper, in the direction opposite the flipper from the player
             local direction_away_from_flipper = (nearest_flipper_rel == 0) and 1 or (nearest_flipper_rel > 0 and -1 or 1)
@@ -497,7 +526,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
             local should_fire = fire_priority > shot_count
             return target_seg, 0, should_fire, false -- Return early
-        elseif nearest_pulsar_seg and min_pulsar_abs_rel < SAFE_DISTANCE then
+    elseif not conserve_override_active and nearest_pulsar_seg and min_pulsar_abs_rel < SAFE_DISTANCE then
             -- Calculate target D segments away from the pulsar, in the direction opposite the pulsar from the player
             local direction_away_from_pulsar = (nearest_pulsar_rel == 0) and 1 or (nearest_pulsar_rel > 0 and -1 or 1)
             local target_seg = (nearest_pulsar_seg + direction_away_from_pulsar * SAFE_DISTANCE + 16) % 16
@@ -520,7 +549,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     -- === Step 1C: Top-Rail Flipper/Pulsar Hunt-to-Adjacency (Closed levels) ===
     -- On closed levels, proactively move to be exactly one segment away from the nearest top-rail flipper or pulsar.
     -- For pulsars specifically, NEVER target the pulsar lane; target the adjacent lane closest to the player.
-    if not is_open then
+    if not conserve_override_active and not is_open then
             local target_threat_seg, target_threat_rel, target_threat_type, target_abs_rel = nil, nil, nil, 100
             if nearest_flipper_seg and min_flipper_abs_rel < target_abs_rel then
                 target_threat_seg = nearest_flipper_seg
@@ -575,9 +604,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
         -- === Step 1B: Determine proposed target based on Top Rail (Presence) / Hunt ===
         local base_fire_priority = any_enemy_proximate and FREEZE_FIRE_PRIO_HIGH or FREEZE_FIRE_PRIO_LOW
-        proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
+        if not conserve_override_active then
+            proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
+        end
 
-        if enemy_left_exists and enemy_right_exists then
+    if not conserve_override_active and enemy_left_exists and enemy_right_exists then
             -- Case 1: Both Sides - Pin to nearest threat strategy
             -- Find the nearest threat (fuseball, pulsar, or flipper - fuseballs have highest priority)
             local nearest_threat_seg = nil
@@ -644,7 +675,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     proposed_target_seg = player_abs_seg
                 end
             end
-    elseif enemy_right_exists then
+    elseif not conserve_override_active and enemy_right_exists then
             -- Case 2: Right Only - Use adaptive distance approach
             if is_open then 
                 -- Use fractional distance to improve timing on open levels
@@ -659,7 +690,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     proposed_target_seg = player_abs_seg 
                 end 
             end
-    elseif enemy_left_exists then
+    elseif not conserve_override_active and enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
                 -- Revert to integer distance for left-only on open fields (works better for lane-1 behavior)
@@ -676,13 +707,13 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             end
         else
             -- Case 4: No Top Rail -> Standard Hunt Logic
-            if M.is_danger_lane(player_abs_seg, enemies_state) then
+            if not conserve_override_active and M.is_danger_lane(player_abs_seg, enemies_state) then
                  proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
                  proposed_fire_prio = AVOID_FIRE_PRIORITY -- Lower priority when escaping
-            elseif M.get_enemy_priority(player_abs_seg, enemies_state) then
+            elseif not conserve_override_active and M.get_enemy_priority(player_abs_seg, enemies_state) then
                  proposed_target_seg = player_abs_seg
                  proposed_fire_prio = 6
-            else -- Search outwards
+            elseif not conserve_override_active then -- Search outwards
                 local fallback_safe, best_enemy_prio, found_target = nil, 100, false
                 local search_target = player_abs_seg
                 for sign = -1, 1, 2 do
@@ -697,6 +728,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 if not found_target and fallback_safe then proposed_target_seg = fallback_safe; proposed_fire_prio = 4
                 elseif not found_target then proposed_target_seg = player_abs_seg; proposed_fire_prio = 4
                 else proposed_target_seg = search_target end -- Use found target
+            else
+                -- Conserve mode active and no top-rail flippers/pulsars: revert to base priority
+                proposed_target_seg = player_abs_seg
+                if proposed_fire_prio == nil then proposed_fire_prio = base_fire_priority end
             end
         end
 
