@@ -53,21 +53,15 @@ def display_metrics_header():
     # Clear screen first
     # clear_screen()
     
-    # Print header (Remove Open/Closed level column)
+    # Print header with reward components as additional columns
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11} {'Training Stats':>15}"
+        f"{'AvgInf(ms)':>11} {'Training Stats':>15} "
+        f"{'Safety':>7} {'Prox':>6} {'Shots':>6} {'Threats':>7} {'Pulsar':>7}"
     )
     print_metrics_line(header, is_header=True)
-    
-    # Add reward components header
-    reward_header = (
-        f"{'':>11} {'Reward Components: Safety/Proximity/Shots/Threats/Pulsar':>65} "
-    )
-    print_metrics_line(reward_header)
-    print()  # Print an empty line after headers
 
 def display_metrics_row(agent, kb_handler):
     """Display a row of metrics data"""
@@ -115,7 +109,10 @@ def display_metrics_row(agent, kb_handler):
     # Format training stats: Memory/TrainSteps/Rate/TargetAge
     training_stats = f"{metrics.memory_buffer_size//1000}k/{metrics.total_training_steps}/{train_rate:.1f}/{frames_since_target_update//1000}k"
 
-    # Format the row (Remove TrainQ)
+    # Get reward components for the row
+    reward_averages = metrics.get_reward_component_averages()
+
+    # Format the row with reward components as additional columns
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
         f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} " # Show decimals to avoid rounding tiny rewards
@@ -124,24 +121,15 @@ def display_metrics_row(agent, kb_handler):
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
         f"{avg_inference_time_ms:>11.2f} "
-        f"{training_stats:>15}"
+        f"{training_stats:>15} "
+        f"{reward_averages['safety']:>7.3f} "
+        f"{reward_averages['proximity']:>6.3f} "
+        f"{reward_averages['shots']:>6.3f} "
+        f"{reward_averages['threats']:>7.3f} "
+        f"{reward_averages['pulsar']:>7.3f}"
     )
     
     print_metrics_line(row)
-    
-    # Display reward components on the next line
-    reward_averages = metrics.get_reward_component_averages()
-    reward_components_line = (
-        f"{'':>11} "
-        f"S:{reward_averages['safety']:>6.3f} "
-        f"P:{reward_averages['proximity']:>6.3f} "
-        f"Sh:{reward_averages['shots']:>6.3f} "
-        f"T:{reward_averages['threats']:>6.3f} "
-        f"Pu:{reward_averages['pulsar']:>6.3f} "
-        f"Sc:{reward_averages['score']:>6.3f} "
-        f"Tot:{reward_averages['total']:>6.3f}"
-    )
-    print_metrics_line(reward_components_line)
 
 def run_stats_reporter(metrics):
     """Run the stats reporter in a loop"""

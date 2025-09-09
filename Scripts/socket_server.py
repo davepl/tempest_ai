@@ -332,6 +332,14 @@ class SocketServer:
                         # Store level number from frame
                         state['level_number'] = frame.level_number
                         
+                        # Store previous frame for reward component calculations
+                        state['prev_frame'] = state.get('current_frame')
+                        state['current_frame'] = frame
+                        
+                        # Store previous frame for reward component calculations
+                        state['prev_frame'] = state.get('current_frame')
+                        state['current_frame'] = frame
+                        
                         # Calculate client's FPS
                         now = time.time()
                         elapsed = now - state['last_frame_time']
@@ -412,6 +420,10 @@ class SocketServer:
 
                         # Track rewards
                         state['total_reward'] = state.get('total_reward', 0) + frame.reward
+
+                        # Calculate and track reward components (mirror Lua logic)
+                        reward_components = self.calculate_reward_components(frame, state)
+                        self.metrics.update_reward_components(reward_components)
 
                         # Track which system's rewards based on the *previous* action source
                         prev_action_source = state.get('last_action_source')
@@ -644,7 +656,83 @@ class SocketServer:
             
             # Update epsilon and expert ratio
             self.metrics.update_epsilon()
-            self.metrics.update_expert_ratio()
+
+    def calculate_reward_components(self, frame, state):
+        """Calculate reward components mirroring Lua logic"""
+        components = {
+            'safety': 0.0,
+            'proximity': 0.0,
+            'shots': 0.0,
+            'threats': 0.0,
+            'pulsar': 0.0,
+            'score': 0.0,
+            'total': frame.reward
+        }
+        
+        # Get previous state for comparisons
+        prev_frame = state.get('prev_frame')
+        if not prev_frame:
+            components['score'] = frame.reward  # First frame, assume all reward is score
+            return components
+        
+        # Calculate score reward (difference in actual game score)
+        # Most positive reward should be from score changes
+        score_component = max(0.0, frame.reward)  # All positive reward assumed to be score
+        components['score'] = score_component
+        
+        try:
+            # Level-specific scaling factors
+            level_type_scale = 1.2 if frame.open_level else 1.0  # Open levels get 1.2x proximity
+            safety_scale = 0.8 if frame.open_level else 1.0      # Open levels get 0.8x safety
             
-            # Increment total control actions
-            self.metrics.increment_total_controls()
+            # Safety reward: avoid enemies (distance from player to nearest enemy)
+            player_seg = frame.player_seg
+            enemy_seg = frame.enemy_seg
+            if enemy_seg >= 0:  # Valid enemy position
+                seg_diff = abs(player_seg - enemy_seg)
+                if seg_diff <= 1:  # Very close - dangerous
+                    components['safety'] = -0.015 * safety_scale
+                elif seg_diff <= 2:  # Close - somewhat dangerous
+                    components['safety'] = -0.008 * safety_scale  
+                elif seg_diff >= 10:  # Far away - safe
+                    components['safety'] = 0.005 * safety_scale
+            
+            # Proximity reward: encourage moving toward center when safe
+            center_distance = abs(player_seg - 8)  # Assuming 16 segments, center is 8
+            if center_distance > 6:  # Far from center
+                components['proximity'] = -0.003 * level_type_scale
+            elif center_distance < 3:  # Close to center
+                components['proximity'] = 0.005 * level_type_scale
+            
+            # Shot reward: encourage firing when enemies present
+            fire_action = frame.action[0]  # frame.action is (fire, zap, spinner)
+            if fire_action and enemy_seg >= 0:  # Firing when enemies present
+                if abs(player_seg - enemy_seg) <= 4:  # Enemy is relatively close
+                    components['shots'] = 0.005  # Good shot
+                else:
+                    components['shots'] = 0.002  # Okay shot
+            elif not fire_action and enemy_seg >= 0 and abs(player_seg - enemy_seg) <= 3:
+                components['shots'] = -0.003  # Should be firing but not
+            
+            # Threat reward: penalty for being in immediate danger
+            if enemy_seg >= 0 and abs(player_seg - enemy_seg) <= 1:
+                components['threats'] = -0.020  # Immediate danger
+            elif enemy_seg >= 0 and abs(player_seg - enemy_seg) <= 2:
+                components['threats'] = -0.010  # Moderate danger
+                
+            # Pulsar reward: penalty during pulsar (if we can detect it)
+            # This is harder to detect from frame data alone, so leaving as 0 for now
+            components['pulsar'] = 0.0
+            
+        except Exception as e:
+            # If calculation fails, just return score component
+            components['score'] = frame.reward
+            
+        return components
+    
+    def update_expert_ratio(self):
+        """Update expert ratio"""
+        self.metrics.update_expert_ratio()
+        
+        # Increment total control actions
+        self.metrics.increment_total_controls()
