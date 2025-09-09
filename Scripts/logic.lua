@@ -147,7 +147,7 @@ end
 
 -- Function to check for pulsar threats
 function M.pulsar_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func, forbidden_segments)
-    if enemies_state.pulsing <= 0xE0 then return false, player_abs_seg, 0, false, false end
+    if enemies_state.pulsing < PULSAR_THRESHOLD then return false, player_abs_seg, 0, false, false end
 
     local is_in_pulsar_lane = false
     for i = 1, 7 do
@@ -195,7 +195,7 @@ end
 
 -- Returns true if the segment is a danger lane (more specific criteria for immediate action)
 function M.is_danger_lane(segment, enemies_state)
-    if enemies_state.pulsing > 0xE0 then -- Check dangerous pulsars first
+    if enemies_state.pulsing >= PULSAR_THRESHOLD then -- Check dangerous pulsars first
         for i = 1, 7 do
             if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then return true end
         end
@@ -270,6 +270,18 @@ local function is_pulsar_lane(segment, enemies_state)
         end
     end
     return false
+end
+
+-- Helper: Find nearest segment that is NOT a pulsar lane (ignores other dangers by design)
+local function find_nearest_non_pulsar_segment(start_seg, enemies_state, is_open)
+    if not is_pulsar_lane(start_seg, enemies_state) then return start_seg end
+    for d = 1, 8 do
+        local left_seg = is_open and (start_seg - d) or ((start_seg - d + 16) % 16)
+        local right_seg = is_open and (start_seg + d) or ((start_seg + d) % 16)
+        if left_seg >= 0 and left_seg <= 15 and not is_pulsar_lane(left_seg, enemies_state) then return left_seg end
+        if right_seg >= 0 and right_seg <= 15 and not is_pulsar_lane(right_seg, enemies_state) then return right_seg end
+    end
+    return start_seg -- fallback (should be rare)
 end
 
 -- NEW Helper: Find nearest safe segment that also respects distance from a constraint segment
@@ -584,10 +596,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local pulsar_override_active = false
 
         -- ** Pulsar Check (Highest Priority) **
-        if enemies_state.pulsing > PULSAR_THRESHOLD then
+        if enemies_state.pulsing >= PULSAR_THRESHOLD then
             if is_pulsar_lane(player_abs_seg, enemies_state) then -- Currently ON a pulsar lane
-                local safe_target = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-                final_target_seg = safe_target
+                -- Evacuate immediately to the nearest non-pulsar lane (ignore other hazards for this step)
+                local evac_target = find_nearest_non_pulsar_segment(player_abs_seg, enemies_state, is_open)
+                final_target_seg = evac_target
                 final_fire_priority = AVOID_FIRE_PRIORITY
                 pulsar_override_active = true
             elseif final_target_seg ~= player_abs_seg then -- Moving, check path
@@ -598,8 +611,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 for d = 1, steps do
                     local check_seg = (player_abs_seg + dir * d + 16) % 16
                     if is_pulsar_lane(check_seg, enemies_state) then
-                        local safe_stop_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
-                        final_target_seg = safe_stop_seg
+                        -- Stop before entering a pulsar lane
+                        final_target_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
                         final_fire_priority = AVOID_FIRE_PRIORITY
                         pulsar_override_active = true
                         break
@@ -656,7 +669,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         -- Player is alive; check to see if they are on a pulsar segment
         local player_segment = math.floor(player_state.position) % 16
-        if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing > PULSAR_THRESHOLD then
+    if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing >= PULSAR_THRESHOLD then
             reward = reward - 100 -- Deduct 100 reward if on a pulsar segment
         end
 
