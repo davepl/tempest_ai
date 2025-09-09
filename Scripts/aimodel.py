@@ -158,9 +158,13 @@ class FrameData:
 SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
-# Initialize device
-device = torch.device("cpu" if torch.cuda.is_available() else 
-                      "mps" if torch.backends.mps.is_available() else "cpu")
+# Initialize device (prefer CUDA, then MPS, else CPU)
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 print(f"Using device: {device}")
 
 # Initialize metrics
@@ -179,7 +183,16 @@ class ReplayMemory:
         
     def push(self, state, action, reward, next_state, done):
         """Add experience to memory"""
-        self.memory.append(Experience(state, action, reward, next_state, done))
+        # Normalize shapes so stacking works reliably
+        try:
+            a = int(action)
+        except Exception:
+            # Handle nested arrays/lists
+            a = int(np.array(action).reshape(-1)[0])
+        action_arr = np.array([a], dtype=np.int64)
+        reward_arr = np.array([float(reward)], dtype=np.float32)
+        done_arr = np.array([float(done)], dtype=np.float32)
+        self.memory.append(Experience(state, action_arr, reward_arr, next_state, done_arr))
         
     def sample(self, batch_size):
         """Sample random batch of experiences"""
@@ -188,7 +201,7 @@ class ReplayMemory:
         actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
         rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
         next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences]).astype(np.uint8)).float().to(device)
+        dones = torch.from_numpy(np.vstack([e.done for e in experiences])).float().to(device)
         return states, actions, rewards, next_states, dones
         
     def __len__(self):
@@ -242,19 +255,30 @@ class NoisyLinear(nn.Module):
         return F.linear(input, weight, bias)
 
 class DQN(nn.Module):
-    """Deep Q-Network model."""
+    """Deep Q-Network model (optionally dueling)."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         use_noisy = RL_CONFIG.use_noisy_nets
+        use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
-        LinearOrNoisy1 = NoisyLinear if use_noisy else nn.Linear
-        LinearOrNoisy2 = NoisyLinear if use_noisy else nn.Linear
+        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
 
+        # Shared feature extractor
         self.fc1 = nn.Linear(state_size, 512)
-        self.fc2 = LinearOrNoisy1(512, 384, noisy_std) if use_noisy else LinearOrNoisy1(512, 384)
-        self.fc3 = LinearOrNoisy2(384, 192, noisy_std) if use_noisy else LinearOrNoisy2(384, 192)
-        self.fc4 = nn.Linear(192, 128)
-        self.out = nn.Linear(128, action_size)
+        self.fc2 = LinearOrNoisy(512, 384, noisy_std) if use_noisy else LinearOrNoisy(512, 384)
+        self.fc3 = LinearOrNoisy(384, 192, noisy_std) if use_noisy else LinearOrNoisy(384, 192)
+
+        self.use_dueling = use_dueling
+        if use_dueling:
+            # Dueling streams
+            self.val_fc = nn.Linear(192, 128)
+            self.adv_fc = nn.Linear(192, 128)
+            self.val_out = nn.Linear(128, 1)
+            self.adv_out = nn.Linear(128, action_size)
+        else:
+            # Single stream
+            self.fc4 = nn.Linear(192, 128)
+            self.out = nn.Linear(128, action_size)
 
     def reset_noise(self):
         # Reset noise for all NoisyLinear layers
@@ -266,8 +290,149 @@ class DQN(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
-        return self.out(x)
+        if self.use_dueling:
+            v = F.relu(self.val_fc(x))
+            v = self.val_out(v)
+            a = F.relu(self.adv_fc(x))
+            a = self.adv_out(a)
+            # Subtract mean advantage to keep Q identifiable
+            q = v + (a - a.mean(dim=1, keepdim=True))
+            return q
+        else:
+            x = F.relu(self.fc4(x))
+            return self.out(x)
+
+class QRDQN(nn.Module):
+    """Quantile Regression DQN (distributional), optional dueling streams.
+    Outputs shape: (batch, action_size, num_quantiles)
+    """
+    def __init__(self, state_size: int, action_size: int, num_quantiles: int):
+        super().__init__()
+        use_noisy = RL_CONFIG.use_noisy_nets
+        use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
+        noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
+        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
+
+        self.num_quantiles = num_quantiles
+        self.action_size = action_size
+        self.use_dueling = use_dueling
+
+        # Shared trunk
+        self.fc1 = nn.Linear(state_size, 512)
+        self.fc2 = LinearOrNoisy(512, 384, noisy_std) if use_noisy else LinearOrNoisy(512, 384)
+        self.fc3 = LinearOrNoisy(384, 192, noisy_std) if use_noisy else LinearOrNoisy(384, 192)
+
+        if use_dueling:
+            self.val_fc = nn.Linear(192, 128)
+            self.adv_fc = nn.Linear(192, 128)
+            self.val_out = nn.Linear(128, num_quantiles)             # (B, N)
+            self.adv_out = nn.Linear(128, action_size * num_quantiles) # (B, A*N)
+        else:
+            self.fc4 = nn.Linear(192, 128)
+            self.out = nn.Linear(128, action_size * num_quantiles)
+
+    def reset_noise(self):
+        for m in self.modules():
+            if isinstance(m, NoisyLinear):
+                m.reset_noise()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        if self.use_dueling:
+            v = F.relu(self.val_fc(x))
+            v = self.val_out(v)  # (B, N)
+            a = F.relu(self.adv_fc(x))
+            a = self.adv_out(a)  # (B, A*N)
+            a = a.view(-1, self.action_size, self.num_quantiles)
+            v = v.unsqueeze(1)  # (B, 1, N)
+            # Center advantages over actions
+            q = v + (a - a.mean(dim=1, keepdim=True))
+            return q  # (B, A, N)
+        else:
+            x = F.relu(self.fc4(x))
+            out = self.out(x)  # (B, A*N)
+            return out.view(-1, self.action_size, self.num_quantiles)
+
+class PrioritizedReplayMemory:
+    """Prioritized experience replay using proportional priorities."""
+    def __init__(self, capacity: int, alpha: float = 0.6, eps: float = 1e-6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.eps = eps
+        self.pos = 0
+        self.full = False
+        self.states = np.zeros((capacity, RL_CONFIG.state_size), dtype=np.float32)
+        self.actions = np.zeros((capacity, 1), dtype=np.int64)
+        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+        self.next_states = np.zeros((capacity, RL_CONFIG.state_size), dtype=np.float32)
+        self.dones = np.zeros((capacity, 1), dtype=np.float32)
+        self.priorities = np.zeros((capacity, 1), dtype=np.float32)
+
+        # Running average for monitoring
+        self.avg_priority = 0.0
+
+    def __len__(self):
+        return self.capacity if self.full else self.pos
+
+    def push(self, state, action, reward, next_state, done):
+        idx = self.pos
+        self.states[idx] = state
+        # Coerce action to scalar index
+        try:
+            if isinstance(action, np.ndarray):
+                a_idx = int(action.reshape(-1)[0])
+            elif isinstance(action, (list, tuple)):
+                a_idx = int(action[0])
+            else:
+                a_idx = int(action)
+        except Exception:
+            a_idx = int(action)
+        self.actions[idx, 0] = a_idx
+        self.rewards[idx, 0] = reward
+        self.next_states[idx] = next_state
+        self.dones[idx, 0] = float(done)
+        # Max priority so new samples are seen at least once
+        max_prio = self.priorities.max() if self.pos > 0 or self.full else 1.0
+        if max_prio == 0:
+            max_prio = 1.0
+        self.priorities[idx, 0] = max_prio
+
+        # Update position
+        self.pos = (self.pos + 1) % self.capacity
+        if self.pos == 0:
+            self.full = True
+
+    def sample(self, batch_size: int, beta: float = 0.4):
+        size = len(self)
+        prios = self.priorities[:size, 0]
+        # Add epsilon to avoid zero-probability entries
+        probs = (prios + self.eps) ** self.alpha
+        probs_sum = probs.sum()
+        if probs_sum <= 0:
+            probs = np.ones_like(probs) / max(1, len(probs))
+        else:
+            probs = probs / probs_sum
+        k = batch_size if batch_size < size else size
+        indices = np.random.choice(size, k, p=probs, replace=False)
+        # IS weights
+        weights = (size * probs[indices]) ** (-beta)
+        weights = weights / weights.max()
+        # Tensors
+        states = torch.from_numpy(self.states[indices]).float().to(device)
+        actions = torch.from_numpy(self.actions[indices]).long().to(device)
+        rewards = torch.from_numpy(self.rewards[indices]).float().to(device)
+        next_states = torch.from_numpy(self.next_states[indices]).float().to(device)
+        dones = torch.from_numpy(self.dones[indices]).float().to(device)
+        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float().to(device)
+        return states, actions, rewards, next_states, dones, is_weights, indices
+
+    def update_priorities(self, indices, td_errors):
+        td = td_errors.detach().abs().cpu().numpy().reshape(-1) + self.eps
+        self.priorities[indices, 0] = td
+        # Track average
+        self.avg_priority = float(td.mean())
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
@@ -279,8 +444,13 @@ class DQNAgent:
         self.last_save_time = 0.0 # Initialize last save time
         
         # Q-Networks (online and target)
-        self.qnetwork_local = DQN(state_size, action_size).to(device)
-        self.qnetwork_target = DQN(state_size, action_size).to(device)
+        if getattr(RL_CONFIG, 'use_distributional', False):
+            n_quant = getattr(RL_CONFIG, 'num_atoms', 51)
+            self.qnetwork_local = QRDQN(state_size, action_size, n_quant).to(device)
+            self.qnetwork_target = QRDQN(state_size, action_size, n_quant).to(device)
+        else:
+            self.qnetwork_local = DQN(state_size, action_size).to(device)
+            self.qnetwork_target = DQN(state_size, action_size).to(device)
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         # Optional LR scheduler
         self.scheduler = None
@@ -289,8 +459,11 @@ class DQNAgent:
             gamma = getattr(RL_CONFIG, 'scheduler_gamma', 0.5)
             self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
         
-        # Replay memory
-        self.memory = ReplayMemory(memory_size)
+        # Replay memory (optionally prioritized)
+        if getattr(RL_CONFIG, 'use_per', False):
+            self.memory = PrioritizedReplayMemory(memory_size, alpha=getattr(RL_CONFIG, 'per_alpha', 0.6), eps=getattr(RL_CONFIG, 'per_eps', 1e-6))
+        else:
+            self.memory = ReplayMemory(memory_size)
         
         # Initialize target network with same weights as local network
         self.update_target_network()
@@ -339,21 +512,80 @@ class DQNAgent:
             if hasattr(self.qnetwork_target, 'reset_noise'):
                 self.qnetwork_target.reset_noise()
             
-        states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
+        use_per = getattr(RL_CONFIG, 'use_per', False)
+        if use_per:
+            # Anneal beta towards 1.0
+            frame = metrics.frame_count
+            beta_start = getattr(RL_CONFIG, 'per_beta_start', 0.4)
+            beta_frames = max(1, getattr(RL_CONFIG, 'per_beta_frames', 200000))
+            beta = min(1.0, beta_start + (1.0 - beta_start) * (frame / beta_frames))
+            states, actions, rewards, next_states, dones, is_weights, indices = self.memory.sample(RL_CONFIG.batch_size, beta=beta)
+        else:
+            states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
         
-        Q_expected = self.qnetwork_local(states).gather(1, actions)
-        
-        with torch.no_grad():
-            best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
-            Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
-            Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
-        
-        # Compute loss and perform optimization
-        criterion = SmoothL1Loss()
-        loss = criterion(Q_expected, Q_targets)
+        if getattr(RL_CONFIG, 'use_distributional', False):
+            # Distributional QR loss
+            num_quant = getattr(RL_CONFIG, 'num_atoms', 51)
+            # Current quantiles for taken actions: (B, N)
+            z_pred_all = self.qnetwork_local(states)  # (B, A, N)
+            batch_indices = torch.arange(z_pred_all.size(0), device=states.device)
+            z_pred = z_pred_all[batch_indices, actions.squeeze(1)]  # (B, N)
+
+            with torch.no_grad():
+                # Next action by mean over quantiles of local net
+                z_next_local = self.qnetwork_local(next_states)  # (B, A, N)
+                q_next_local = z_next_local.mean(dim=2)  # (B, A)
+                next_actions = q_next_local.argmax(dim=1)  # (B,)
+                # Target quantiles for those actions from target net
+                z_next_target_all = self.qnetwork_target(next_states)  # (B, A, N)
+                z_next_target = z_next_target_all[batch_indices, next_actions]  # (B, N)
+                # Bellman update for quantiles
+                z_target = rewards + (RL_CONFIG.gamma * (1 - dones)) * z_next_target  # (B, N)
+
+            # Pairwise TD errors: (B, N_pred, N_tgt) => (B, N, N)
+            z_pred_exp = z_pred.unsqueeze(2)
+            z_target_exp = z_target.unsqueeze(1)
+            td = z_target_exp - z_pred_exp  # (B, N, N)
+
+            # Huber loss
+            huber_k = 1.0
+            abs_td = td.abs()
+            huber_loss = torch.where(abs_td <= huber_k, 0.5 * td.pow(2), huber_k * (abs_td - 0.5 * huber_k))
+
+            # Quantile weights
+            with torch.no_grad():
+                taus = (torch.arange(num_quant, device=states.device, dtype=states.dtype) + 0.5) / num_quant  # (N,)
+            taus = taus.view(1, -1, 1)  # (1, N, 1)
+            quantile_weight = (taus - (td.detach() < 0).float()).abs()
+            qr_loss = (quantile_weight * huber_loss).mean(dim=2).sum(dim=1).mean()
+
+            loss = qr_loss if not use_per else (is_weights.view(-1) * (quantile_weight * huber_loss).mean(dim=2).sum(dim=1)).mean()
+
+            # For PER priority updates, define td_errors as mean absolute TD per sample
+            td_errors = td.mean(dim=(1, 2))
+        else:
+            # Standard DQN loss
+            Q_expected = self.qnetwork_local(states).gather(1, actions)
+            with torch.no_grad():
+                best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
+                Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
+                Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
+
+            if use_per:
+                td_errors = Q_expected - Q_targets
+                loss = (is_weights * (td_errors).pow(2)).mean()
+            else:
+                criterion = SmoothL1Loss()
+                loss = criterion(Q_expected, Q_targets)
         self.optimizer.zero_grad()
         loss.backward() 
         self.optimizer.step()
+        # PER: update priorities
+        if use_per:
+            with torch.no_grad():
+                self.memory.update_priorities(indices, td_errors)
+            # Track moving average priority into metrics
+            metrics.average_priority = self.memory.avg_priority
         # Soft target update if enabled (Polyak averaging every step)
         if getattr(RL_CONFIG, 'use_soft_target', False):
             tau = getattr(RL_CONFIG, 'tau', 0.005)
@@ -386,7 +618,11 @@ class DQNAgent:
         self.qnetwork_local.eval()
         
         with torch.no_grad():
-            action_values = self.qnetwork_local(state)
+            if getattr(RL_CONFIG, 'use_distributional', False):
+                q_dist = self.qnetwork_local(state)  # (1, A, N)
+                action_values = q_dist.mean(dim=2)   # (1, A)
+            else:
+                action_values = self.qnetwork_local(state)
             
         # Set training mode back
         self.qnetwork_local.train()

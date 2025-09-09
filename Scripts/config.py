@@ -71,6 +71,18 @@ class RLConfigData:
     use_lr_scheduler: bool = True           # If True, enable StepLR
     scheduler_step_size: int = 100000       # Train steps between LR decays
     scheduler_gamma: float = 0.5            # Multiplicative LR decay factor
+    # Architecture & replay upgrades
+    use_dueling: bool = True               # If True, use dueling value/advantage streams
+    use_per: bool = True                   # If True, use prioritized experience replay
+    per_alpha: float = 0.6                 # Priority exponent (0=uniform, 1=greedy)
+    per_beta_start: float = 0.4            # Initial importance-sampling exponent
+    per_beta_frames: int = 200000          # Frames to anneal beta to 1.0
+    per_eps: float = 1e-6                  # Small epsilon to avoid zero priority
+    # Distributional (placeholder flags; not active yet)
+    use_distributional: bool = True        # Enable distributional Q (QR-DQN)
+    num_atoms: int = 32                    # Quantiles; 32 for better throughput
+    v_min: float = -10.0                   # Min value support
+    v_max: float = 10.0                    # Max value support
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
