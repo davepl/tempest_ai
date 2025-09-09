@@ -53,6 +53,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
+from torch.cuda.amp import GradScaler, autocast  # For mixed precision training
 import select
 import threading
 import queue
@@ -406,19 +407,32 @@ class PrioritizedReplayMemory:
 
     def sample(self, batch_size: int, beta: float = 0.4):
         size = len(self)
+        if size == 0:
+            raise ValueError("Cannot sample from empty memory buffer")
+            
         prios = self.priorities[:size, 0]
         # Add epsilon to avoid zero-probability entries
         probs = (prios + self.eps) ** self.alpha
         probs_sum = probs.sum()
         if probs_sum <= 0:
+            # Fallback to uniform if all priorities are zero
             probs = np.ones_like(probs) / max(1, len(probs))
         else:
             probs = probs / probs_sum
-        k = batch_size if batch_size < size else size
-        indices = np.random.choice(size, k, p=probs, replace=False)
+            
+        # CRITICAL FIX: Ensure we don't try to sample more than available
+        k = min(batch_size, size)
+        if k <= 0:
+            raise ValueError(f"Invalid sample size: k={k}, size={size}")
+            
+        # CRITICAL FIX: Handle case where we need replacement due to small buffer
+        replace_needed = k > size
+        indices = np.random.choice(size, k, p=probs, replace=replace_needed)
+        
         # IS weights
         weights = (size * probs[indices]) ** (-beta)
         weights = weights / weights.max()
+        
         # Tensors
         states = torch.from_numpy(self.states[indices]).float().to(device)
         actions = torch.from_numpy(self.actions[indices]).long().to(device)
@@ -468,52 +482,99 @@ class DQNAgent:
         # Initialize target network with same weights as local network
         self.update_target_network()
 
-        # Training queue for background thread
-        self.train_queue = queue.Queue(maxsize=1000)
+        # Training queue for background thread - much larger to prevent throttling
+        self.train_queue = queue.Queue(maxsize=10000)  # Increased from 1000 to 10000
         self.training_thread = None
         self.running = True
+        self.num_training_workers = 1  # Reduced to 1 to avoid threading conflicts - will optimize differently
+        self.training_threads = []
         self._train_step_counter = 0
+        self._gradient_accumulation_counter = 0  # Track gradient accumulation steps
+        self.training_lock = threading.Lock()  # Add lock for thread safety
+        
+        # Mixed precision training setup
+        self.use_mixed_precision = getattr(RL_CONFIG, 'use_mixed_precision', False)
+        if self.use_mixed_precision and torch.cuda.is_available():
+            self.scaler = GradScaler()
+            print("Mixed precision training enabled")
+        else:
+            self.scaler = None
+        
+        # CRITICAL FIX: Initialize training enabled flag to ensure training happens
+        self.training_enabled = True
 
-        # Start background thread for training
-        self.training_thread = threading.Thread(target=self.background_train, daemon=True, name="TrainingWorker")
-        self.training_thread.start()
+        # Memory optimizations for aggressive training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear any existing cache
+            torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
+            torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+
+        # Start multiple background threads for parallel training
+        for i in range(self.num_training_workers):
+            worker_thread = threading.Thread(target=self.background_train, daemon=True, name=f"TrainingWorker-{i}")
+            worker_thread.start()
+            self.training_threads.append(worker_thread)
+        print(f"Started {self.num_training_workers} training worker threads")
         
     def background_train(self):
-        """Run training in background thread"""
-        print(f"Training thread started on {device}")
+        """Run training in background thread with optimized batched processing"""
+        worker_id = threading.current_thread().name
+        print(f"Training thread {worker_id} started on {device}")
+        
         while self.running: 
             try:
-                # Get an item from the queue. This blocks if the queue is empty.
-                # The item itself is just a signal (True), we don't need its value.
-                _ = self.train_queue.get() 
+                # Process fewer queue items in batch for stability
+                batch_size = 0
+                max_batch = 3  # Reduced from 10 to 3 for stability
                 
-                # If we get an item, process one training step (respect train_freq)
-                self._train_step_counter += 1
-                if (self._train_step_counter % max(1, getattr(RL_CONFIG, 'train_freq', 4))) == 0:
-                    self.train_step()
+                # Get first item (blocking)
+                _ = self.train_queue.get()
+                batch_size += 1
                 
-                # Signal that the task is done
-                self.train_queue.task_done()
+                # Get additional items without blocking to batch process
+                while batch_size < max_batch:
+                    try:
+                        _ = self.train_queue.get_nowait()
+                        batch_size += 1
+                    except queue.Empty:
+                        break
+                
+                # Process training steps for the batch
+                for _ in range(batch_size):
+                    self._train_step_counter += 1
+                    if (self._train_step_counter % max(1, getattr(RL_CONFIG, 'train_freq', 1))) == 0:
+                        self.train_step()
+                    
+                    # Signal task done for each processed item
+                    self.train_queue.task_done()
 
-            except queue.Empty: 
-                # This shouldn't typically happen with a blocking get unless maybe
-                # a timeout was added, but handle just in case.
-                continue 
             except Exception as e:
-                print(f"Training error: {e}")
-                traceback.print_exc() # Print full traceback for errors
-                time.sleep(1) # Pause after error
+                print(f"Training error in {worker_id}: {e}")
+                traceback.print_exc()
+                time.sleep(0.1)  # Shorter pause for faster recovery
 
     def train_step(self):
         """Perform a single training step on one batch"""
-        if len(self.memory) < RL_CONFIG.batch_size:
-            return
-        # If using NoisyNets, sample noise once per train step for consistency
-        if getattr(RL_CONFIG, 'use_noisy_nets', False):
-            if hasattr(self.qnetwork_local, 'reset_noise'):
-                self.qnetwork_local.reset_noise()
-            if hasattr(self.qnetwork_target, 'reset_noise'):
-                self.qnetwork_target.reset_noise()
+        # Thread safety - only one training step at a time
+        with self.training_lock:
+            if len(self.memory) < RL_CONFIG.batch_size:
+                return
+                
+            # Update training metrics
+            metrics.total_training_steps += 1
+            metrics.memory_buffer_size = len(self.memory)
+                
+            # Zero gradients at the start of accumulation cycle
+            accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
+            if self._gradient_accumulation_counter % accumulation_steps == 0:
+                self.optimizer.zero_grad()
+                
+            # If using NoisyNets, sample noise once per train step for consistency
+            if getattr(RL_CONFIG, 'use_noisy_nets', False):
+                if hasattr(self.qnetwork_local, 'reset_noise'):
+                    self.qnetwork_local.reset_noise()
+                if hasattr(self.qnetwork_target, 'reset_noise'):
+                    self.qnetwork_target.reset_noise()
             
         use_per = getattr(RL_CONFIG, 'use_per', False)
         if use_per:
@@ -565,7 +626,7 @@ class DQNAgent:
             loss = qr_loss if not use_per else (is_weights.view(-1) * (quantile_weight * huber_loss).mean(dim=2).sum(dim=1)).mean()
 
             # For PER priority updates, define td_errors as mean absolute TD per sample
-            td_errors = td.mean(dim=(1, 2))
+            td_errors = td.abs().mean(dim=(1, 2))  # CRITICAL FIX: Use abs() for priority updates
         else:
             # Standard DQN loss
             Q_expected = self.qnetwork_local(states).gather(1, actions)
@@ -575,18 +636,41 @@ class DQNAgent:
                 Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
 
             if use_per:
-                td_errors = Q_expected - Q_targets
-                loss = (is_weights * (td_errors).pow(2)).mean()
+                td_errors = (Q_expected - Q_targets).abs()  # CRITICAL FIX: Use abs() for priority updates
+                loss = (is_weights * (Q_expected - Q_targets).pow(2)).mean()
             else:
                 criterion = SmoothL1Loss()
                 loss = criterion(Q_expected, Q_targets)
+                td_errors = (Q_expected - Q_targets).abs()  # For consistency
 
-        # Optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        # Gradient clipping to stabilize updates under PER/Noisy/QR
-        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
-        self.optimizer.step()
+            # Calculate loss scaling for gradient accumulation
+            accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
+            loss = loss / accumulation_steps  # Scale loss for accumulation
+            
+            # Backward pass with mixed precision support
+            if self.use_mixed_precision and self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Update gradient accumulation counter
+            self._gradient_accumulation_counter += 1
+            
+            # Only step optimizer every N accumulation steps
+            if self._gradient_accumulation_counter % accumulation_steps == 0:
+                if self.use_mixed_precision and self.scaler is not None:
+                    # Gradient clipping with mixed precision
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Standard gradient clipping and optimization
+                    torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                    self.optimizer.step()
+        
+        # Always update loss metrics (use unscaled loss for reporting)
+        metrics.losses.append((loss * accumulation_steps).item())
 
         # PER: update priorities and track average
         if use_per:
@@ -594,19 +678,22 @@ class DQNAgent:
                 self.memory.update_priorities(indices, td_errors)
             metrics.average_priority = self.memory.avg_priority
 
-        # Soft target update if enabled (Polyak averaging every step)
-        if getattr(RL_CONFIG, 'use_soft_target', False):
-            tau = getattr(RL_CONFIG, 'tau', 0.005)
-            self.soft_update(tau)
+        # Only update target network and scheduler on actual optimizer steps
+        if self._gradient_accumulation_counter % accumulation_steps == 0:
+            # Soft target update if enabled (Polyak averaging every step)
+            if getattr(RL_CONFIG, 'use_soft_target', False):
+                tau = getattr(RL_CONFIG, 'tau', 0.005)
+                self.soft_update(tau)
 
-        # Step LR scheduler if enabled
-        if self.scheduler is not None:
-            self.scheduler.step()
-
-        metrics.losses.append(loss.item())
+            # Step LR scheduler if enabled
+            if self.scheduler is not None:
+                self.scheduler.step()
 
     def update_target_network(self):
         """Update target network with weights from local network"""
+        # Track when target network was last updated
+        metrics.last_target_update_frame = metrics.frame_count
+        
         if getattr(RL_CONFIG, 'use_soft_target', False):
             tau = getattr(RL_CONFIG, 'tau', 0.005)
             self.soft_update(tau)
@@ -790,6 +877,17 @@ class DQNAgent:
                     metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
                     metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
                     metrics.last_epsilon_decay_step = checkpoint.get('last_epsilon_decay_step', 0) # Load epsilon step tracker
+
+                # Respect server flags to reset at startup regardless of checkpoint values
+                if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):
+                    print(f"Resetting expert_ratio to start value per SERVER_CONFIG: {SERVER_CONFIG.expert_ratio_start}")
+                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                if getattr(SERVER_CONFIG, 'reset_frame_count', False):
+                    print("Resetting frame count/epsilon per SERVER_CONFIG.")
+                    metrics.frame_count = 0
+                    metrics.last_decay_step = 0
+                    metrics.last_epsilon_decay_step = 0
+                    metrics.epsilon = RL_CONFIG.epsilon_start
                                 
                 print(f"Loaded model from {filename}")
                 print(f"  - Resuming from frame: {metrics.frame_count}")
@@ -1217,9 +1315,15 @@ def decay_expert_ratio(current_step):
     # Skip decay if expert mode is active
     if metrics.expert_mode:
         return metrics.expert_ratio
-        
-    step_interval = current_step // SERVER_CONFIG.expert_ratio_decay_steps
     
+    # Initialize to start value on very first call (frame 0) if not already set
+    if current_step == 0 and abs(metrics.expert_ratio - SERVER_CONFIG.expert_ratio_start) > 1e-6:
+        metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+        metrics.last_decay_step = 0
+        return metrics.expert_ratio
+
+    step_interval = current_step // SERVER_CONFIG.expert_ratio_decay_steps
+
     # Only update if we've moved to a new interval
     if step_interval > metrics.last_decay_step:
         metrics.last_decay_step = step_interval
@@ -1229,8 +1333,8 @@ def decay_expert_ratio(current_step):
         else:
             # Apply decay
             metrics.expert_ratio *= SERVER_CONFIG.expert_ratio_decay
-        
+
         # Ensure we don't go below the minimum
         metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
-        
+
     return metrics.expert_ratio

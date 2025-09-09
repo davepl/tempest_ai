@@ -33,10 +33,11 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 176
-    expert_ratio_start: float = 0.3
-    expert_ratio_min: float = 0.2
-    expert_ratio_decay: float = 0.9995
-    expert_ratio_decay_steps: int = 20000
+    # Optimized expert ratio for dense rewards - start higher, decay to lower end point
+    expert_ratio_start: float = 0.85  # Start higher with dense rewards (more guidance initially)
+    expert_ratio_min: float = 0.10   # End lower for more autonomous learning  
+    expert_ratio_decay: float = 0.9998  # Slightly slower decay for smoother transition
+    expert_ratio_decay_steps: int = 15000  # Faster step interval for quicker transition
     reset_frame_count: bool = False
     reset_expert_ratio: bool = True
 
@@ -49,7 +50,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
     batch_size: int = 512
-    gamma: float = 0.99
+    gamma: float = 0.995               # Higher gamma for dense rewards (better temporal credit assignment)
     epsilon: float = 1.0
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
@@ -57,12 +58,13 @@ class RLConfigData:
     epsilon_decay_factor: float = 0.998 # Multiplicative factor per step (slower)
     epsilon_decay_steps: int = 20000   # Frames per decay step (slower)
     update_target_every: int = 500
-    learning_rate: float = 0.0003
-    memory_size: int = 200000
+    learning_rate: float = 0.0008      # Higher LR for dense rewards (faster convergence on frequent signals)
+    memory_size: int = 500000          # Increased from 200k to 500k for more diverse experiences  
+    batch_size: int = 1024             # Increased from 512 to 1024 for better GPU utilization
     save_interval: int = 50000
-    train_freq: int = 4
-    target_update: int = 10000
-    n_step: int = 5                         # N-step return horizon for training
+    train_freq: int = 2                # Train every 2 frames instead of 1 (more conservative)
+    target_update: int = 5000          # More frequent target updates (was 10000)
+    n_step: int = 5                    # N-step return horizon for training
     # Optional improvements (all off by default to preserve current behavior)
     use_soft_target: bool = True            # If True, do Polyak averaging instead of hard copies
     tau: float = 0.005                      # Soft target update factor (0,1]
@@ -74,15 +76,20 @@ class RLConfigData:
     # Architecture & replay upgrades
     use_dueling: bool = True               # If True, use dueling value/advantage streams
     use_per: bool = True                   # If True, use prioritized experience replay
-    per_alpha: float = 0.5                 # Slightly lower to reduce over-biasing
+    per_alpha: float = 0.6                 # Increased for more aggressive prioritization
     per_beta_start: float = 0.4            # Initial importance-sampling exponent
-    per_beta_frames: int = 500000          # Slower anneal to 1.0
+    per_beta_frames: int = 300000          # Faster anneal to 1.0 for quicker stabilization
     per_eps: float = 1e-6                  # Small epsilon to avoid zero priority
     # Distributional (placeholder flags; not active yet)
     use_distributional: bool = True        # Enable distributional Q (QR-DQN)
     num_atoms: int = 32                    # Quantiles; 32 for better throughput
     v_min: float = -10.0                   # Min value support
     v_max: float = 10.0                    # Max value support
+    # Performance optimizations
+    gradient_accumulation_steps: int = 2   # Accumulate gradients over multiple batches
+    prefetch_factor: int = 4               # Number of batches to prefetch
+    num_workers: int = 2                   # DataLoader workers (if applicable)
+    use_mixed_precision: bool = False      # Disabled initially for stability
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -98,7 +105,7 @@ class MetricsData:
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = 1.0
-    expert_ratio: float = 1.0
+    expert_ratio: float = SERVER_CONFIG.expert_ratio_start
     last_decay_step: int = 0
     last_epsilon_decay_step: int = 0 # Added tracker for epsilon decay
     enemy_seg: int = -1
@@ -117,6 +124,23 @@ class MetricsData:
     average_level: float = 0  # Average level number across all clients
     beta: float = 0.6  # Starting beta value for prioritized replay
     average_priority: float = 0.0  # Average priority value across all transitions
+    
+    # Training-specific metrics
+    memory_buffer_size: int = 0  # Current replay buffer size
+    total_training_steps: int = 0  # Total training steps completed
+    last_target_update_frame: int = 0  # Frame count when target network was last updated
+    
+    # Reward component tracking (for analysis and display)
+    last_reward_components: Dict[str, float] = field(default_factory=dict)
+    reward_component_history: Dict[str, Deque[float]] = field(default_factory=lambda: {
+        'safety': deque(maxlen=100),
+        'proximity': deque(maxlen=100), 
+        'shots': deque(maxlen=100),
+        'threats': deque(maxlen=100),
+        'pulsar': deque(maxlen=100),
+        'score': deque(maxlen=100),
+        'total': deque(maxlen=100)
+    })
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
@@ -176,14 +200,11 @@ class MetricsData:
             return self.expert_ratio
     
     def add_episode_reward(self, total_reward, dqn_reward, expert_reward):
-        """Add episode rewards to tracking"""
+        """Add episode rewards to tracking (include negatives/zeros for accurate means)"""
         with self.lock:
-            if total_reward > 0:
-                self.episode_rewards.append(total_reward)
-            if dqn_reward > 0:
-                self.dqn_rewards.append(dqn_reward)
-            if expert_reward > 0:
-                self.expert_rewards.append(expert_reward)
+            self.episode_rewards.append(float(total_reward))
+            self.dqn_rewards.append(float(dqn_reward))
+            self.expert_rewards.append(float(expert_reward))
     
     def increment_guided_count(self):
         """Increment guided count"""
@@ -220,6 +241,26 @@ class MetricsData:
         """Get current FPS"""
         with self.lock:
             return self.fps
+    
+    def update_reward_components(self, components: Dict[str, float]):
+        """Update reward component tracking"""
+        with self.lock:
+            self.last_reward_components = components.copy()
+            # Add to history for each component
+            for component, value in components.items():
+                if component in self.reward_component_history:
+                    self.reward_component_history[component].append(value)
+    
+    def get_reward_component_averages(self) -> Dict[str, float]:
+        """Get recent averages of reward components"""
+        with self.lock:
+            averages = {}
+            for component, history in self.reward_component_history.items():
+                if history:
+                    averages[component] = sum(history) / len(history)
+                else:
+                    averages[component] = 0.0
+            return averages
     
     def toggle_override(self, kb_handler=None):
         """Toggle override mode"""

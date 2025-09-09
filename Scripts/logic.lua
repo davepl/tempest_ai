@@ -806,10 +806,22 @@ end
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local reward, bDone = 0.0, false
+    
+    -- Component tracking for metrics
+    local reward_components = {
+        safety = 0.0,
+        proximity = 0.0,
+        shots = 0.0,
+        threats = 0.0,
+        pulsar = 0.0,
+        score = 0.0,
+        total = 0.0
+    }
 
     -- Terminal: death (edge-triggered)
     if player_state.alive == 0 and previous_alive_state == 1 then
         reward = reward - 1.0
+        reward_components.score = -1.0  -- Death penalty counts as score component
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
@@ -819,19 +831,138 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
             reward = reward + r_score
+            reward_components.score = reward_components.score + r_score
         end
 
         -- Level completion bonus (edge-triggered)
         if (level_state.level_number or 0) > (previous_level or 0) then
             reward = reward + 1.0
+            reward_components.score = reward_components.score + 1.0
         end
 
         -- Zap cost (edge-triggered on button press)
         local zap_now = player_state.zap_detected or 0
         if zap_now == 1 and previous_zap_detected == 0 then
             reward = reward - 0.05
+            reward_components.shots = reward_components.shots - 0.05
+        end
+
+        -- === OBJECTIVE DENSE REWARD COMPONENTS ===
+        -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
+        if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
+            local player_abs_seg = player_state.position & 0x0F
+            local is_open = (level_state.level_type == 0xFF)
+            
+            -- Level-specific scaling factors
+            local level_type = (level_state.level_number - 1) % 4
+            local proximity_scale = 1.0
+            local safety_scale = 1.0
+            
+            if level_type == 2 then -- Open levels (every 4th level starting from 3)
+                proximity_scale = 1.2  -- Increase proximity rewards on open levels
+                safety_scale = 0.8     -- Reduce safety emphasis (more space available)
+            elseif level_type == 0 then -- Level 1 type (every 4th level starting from 1)
+                proximity_scale = 0.9  -- Slightly reduce proximity rewards on simpler levels
+                safety_scale = 1.1     -- Increase safety emphasis on basic levels
+            end
+            
+            -- 1. DANGER AVOIDANCE REWARD (Objective Safety Assessment)
+            -- Penalty for being in objectively dangerous positions
+            if M.is_danger_lane(player_abs_seg, enemies_state) then
+                local safety_penalty = -0.015 * safety_scale
+                reward = reward + safety_penalty
+                reward_components.safety = reward_components.safety + safety_penalty
+            else
+                local safety_bonus = 0.005 * safety_scale
+                reward = reward + safety_bonus
+                reward_components.safety = reward_components.safety + safety_bonus
+            end
+            
+            -- 2. PROXIMITY OPTIMIZATION REWARD (Distance-based Positioning)
+            -- Reward optimal distance to nearest enemy (not too close, not too far)
+            local nearest_distance = enemies_state.alignment_error_magnitude or 1.0
+            if enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT then
+                -- Convert normalized distance (0-1) to segments for clearer logic
+                local max_dist = is_open and 15.0 or 8.0
+                local distance_segments = nearest_distance * max_dist
+                
+                -- Optimal range: 1-3 segments (allows reaction time but maintains offensive capability)
+                local optimal_min, optimal_max = 1.0, 3.0
+                local prox_reward = 0.0
+                if distance_segments >= optimal_min and distance_segments <= optimal_max then
+                    prox_reward = 0.010 * proximity_scale  -- Good positioning bonus
+                elseif distance_segments < optimal_min then
+                    prox_reward = -0.005 * proximity_scale  -- Too close penalty (higher risk)
+                elseif distance_segments > 5.0 then
+                    prox_reward = -0.003 * proximity_scale  -- Too far penalty (lower efficiency)
+                end
+                -- Neutral reward for 3-5 segments (acceptable range)
+                reward = reward + prox_reward
+                reward_components.proximity = reward_components.proximity + prox_reward
+            end
+            
+            -- 3. SHOT EFFICIENCY REWARD (Resource Management)
+            -- Encourage having shots available for threats while not wasting
+            local shot_count = player_state.shot_count or 0
+            local max_shots = 4  -- Game limit
+            local shot_reward = 0.0
+            
+            if shot_count >= max_shots then
+                shot_reward = -0.005  -- Penalty for shot saturation (wasteful)
+            elseif shot_count == 0 and enemies_state:get_total_active() > 0 then
+                shot_reward = 0.003  -- Small bonus for having ammunition ready
+            end
+            reward = reward + shot_reward
+            reward_components.shots = reward_components.shots + shot_reward
+            
+            -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
+            -- Bonus for appropriate responses to critical threats
+            local critical_threats = 0
+            local threat_reward = 0.0
+            for i = 1, 7 do
+                local abs_seg = enemies_state.enemy_abs_segments[i]
+                local depth = enemies_state.enemy_depths[i]
+                local enemy_type = enemies_state.enemy_core_type[i]
+                
+                if abs_seg == player_abs_seg and depth > 0 and depth <= 0x30 then
+                    critical_threats = critical_threats + 1
+                    -- Extra penalty for fuseballs (fatal on contact)
+                    if enemy_type == ENEMY_TYPE_FUSEBALL and depth <= 0x20 then
+                        threat_reward = threat_reward - 0.020
+                    end
+                end
+            end
+            
+            -- Penalty for being in lanes with multiple threats
+            if critical_threats > 1 then
+                threat_reward = threat_reward - (critical_threats * 0.008)
+            end
+            reward = reward + threat_reward
+            reward_components.threats = reward_components.threats + threat_reward
+            
+            -- 5. PULSAR SAFETY REWARD (Objective Hazard Assessment)
+            -- Extra penalty for being in pulsing pulsar lanes (objectively lethal)
+            local pulsar_reward = 0.0
+            if enemies_state.pulsing > 0 then
+                for i = 1, 7 do
+                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and 
+                       enemies_state.enemy_abs_segments[i] == player_abs_seg and
+                       enemies_state.enemy_depths[i] > 0 then
+                        pulsar_reward = -0.025  -- Strong penalty for pulsar lane during pulse
+                        break
+                    end
+                end
+            end
+            reward = reward + pulsar_reward
+            reward_components.pulsar = reward_components.pulsar + pulsar_reward
         end
     end
+
+    -- Set total reward
+    reward_components.total = reward
+    
+    -- Store components for potential external access
+    M.last_reward_components = reward_components
 
     -- State updates
     previous_score = player_state.score or 0
@@ -846,6 +977,19 @@ end
 -- Function to retrieve the last calculated reward (for display)
 function M.getLastReward()
     return LastRewardState
+end
+
+-- Function to retrieve the last reward components (for metrics)
+function M.getLastRewardComponents()
+    return M.last_reward_components or {
+        safety = 0.0,
+        proximity = 0.0,
+        shots = 0.0,
+        threats = 0.0,
+        pulsar = 0.0,
+        score = 0.0,
+        total = 0.0
+    }
 end
 
 return M 

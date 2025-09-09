@@ -58,11 +58,16 @@ def display_metrics_header():
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11}"
+        f"{'AvgInf(ms)':>11} {'Training Stats':>15}"
     )
     print_metrics_line(header, is_header=True)
-    # Print an empty line after header
-    print()
+    
+    # Add reward components header
+    reward_header = (
+        f"{'':>11} {'Reward Components: Safety/Proximity/Shots/Threats/Pulsar':>65} "
+    )
+    print_metrics_line(reward_header)
+    print()  # Print an empty line after headers
 
 def display_metrics_row(agent, kb_handler):
     """Display a row of metrics data"""
@@ -85,7 +90,7 @@ def display_metrics_row(agent, kb_handler):
         mean_dqn_reward = sum(dqn_rewards_list[-100:]) / min(len(dqn_rewards_list), 100)
     
     # Get the latest loss value
-    latest_loss = metrics.losses[-1] if metrics.losses else 0
+    latest_loss = metrics.losses[-1] if metrics.losses else 0.0
     
     # Calculate Average Inference Time (ms) and reset counters
     avg_inference_time_ms = 0.0
@@ -99,18 +104,44 @@ def display_metrics_row(agent, kb_handler):
     # Display average level as 1-based instead of 0-based
     display_level = metrics.average_level + 1.0
 
+    # Calculate training rate (training steps per 1000 frames)
+    train_rate = 0.0
+    if metrics.frame_count > 0:
+        train_rate = (metrics.total_training_steps * 1000.0) / metrics.frame_count
+    
+    # Calculate frames since last target update  
+    frames_since_target_update = metrics.frame_count - metrics.last_target_update_frame
+    
+    # Format training stats: Memory/TrainSteps/Rate/TargetAge
+    training_stats = f"{metrics.memory_buffer_size//1000}k/{metrics.total_training_steps}/{train_rate:.1f}/{frames_since_target_update//1000}k"
+
     # Format the row (Remove TrainQ)
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} " # Add comma for thousands
-        f"{metrics.expert_ratio*100:>7.1f}% {int(mean_reward):>12} {int(mean_dqn_reward):>12} " # Format rewards as integers
-        f"{int(latest_loss):>10} {metrics.client_count:>8} "  
+        f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} " # Show decimals to avoid rounding tiny rewards
+        f"{latest_loss:>10.4f} {metrics.client_count:>8} "  
         f"{display_level:>10.1f} " # Added average level column, displayed as 1-based
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
-        f"{avg_inference_time_ms:>11.2f}" 
+        f"{avg_inference_time_ms:>11.2f} "
+        f"{training_stats:>15}"
     )
     
     print_metrics_line(row)
+    
+    # Display reward components on the next line
+    reward_averages = metrics.get_reward_component_averages()
+    reward_components_line = (
+        f"{'':>11} "
+        f"S:{reward_averages['safety']:>6.3f} "
+        f"P:{reward_averages['proximity']:>6.3f} "
+        f"Sh:{reward_averages['shots']:>6.3f} "
+        f"T:{reward_averages['threats']:>6.3f} "
+        f"Pu:{reward_averages['pulsar']:>6.3f} "
+        f"Sc:{reward_averages['score']:>6.3f} "
+        f"Tot:{reward_averages['total']:>6.3f}"
+    )
+    print_metrics_line(reward_components_line)
 
 def run_stats_reporter(metrics):
     """Run the stats reporter in a loop"""
