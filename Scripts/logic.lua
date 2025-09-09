@@ -18,6 +18,8 @@ local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 3
 local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
+-- Open-level tuning: react slightly sooner to top-rail flippers using fractional distance
+local OPEN_FLIPPER_REACT_DISTANCE = 1.10
 -- Configurable pulsar hunting preferences
 local PULSAR_PREF_DISTANCE = 1.0   -- desired lanes away from the pulsar (can be fractional for hold/fire logic)
 local PULSAR_PREF_TOLERANCE = 0.15 -- acceptable window around preferred distance to hold and fire
@@ -401,7 +403,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     local abs_rel_float = math.abs(rel_float)
                     local core_type = enemies_state.enemy_core_type[i]
 
-                    if abs_rel_int <= 1 then any_enemy_proximate = true end
+                    if is_open then
+                        if abs_rel_float <= OPEN_FLIPPER_REACT_DISTANCE then any_enemy_proximate = true end
+                    else
+                        if abs_rel_int <= 1 then any_enemy_proximate = true end
+                    end
                     table.insert(top_rail_enemies, {
                         seg = seg, 
                         rel = rel_int,  -- Store integer position for main comparisons
@@ -638,11 +644,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     proposed_target_seg = player_abs_seg
                 end
             end
-        elseif enemy_right_exists then
+    elseif enemy_right_exists then
             -- Case 2: Right Only - Use adaptive distance approach
             if is_open then 
                 -- Use fractional distance to improve timing on open levels
-                proposed_target_seg = (nr_dist <= 1) and 0 or 1
+        proposed_target_seg = (nr_dist_float <= OPEN_FLIPPER_REACT_DISTANCE) and 0 or 1
             else 
                 if nr_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
@@ -653,11 +659,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     proposed_target_seg = player_abs_seg 
                 end 
             end
-        elseif enemy_left_exists then
+    elseif enemy_left_exists then
             -- Case 3: Left Only - Mirror the right-only strategy for consistency  
             if is_open then 
                 -- Revert to integer distance for left-only on open fields (works better for lane-1 behavior)
-                proposed_target_seg = (nl_dist_float <= 1.05) and 13 or 14
+        proposed_target_seg = (nl_dist_float <= OPEN_FLIPPER_REACT_DISTANCE) and 13 or 14
             else 
                 if nl_dist < SAFE_DISTANCE then
                     -- Use alternating safe distance based on distance
