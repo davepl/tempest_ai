@@ -338,11 +338,14 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local nl_dist_float, nr_dist_float = 100, 100
         local enemy_left_exists, enemy_right_exists = false, false
         local any_enemy_proximate = false
-        local top_rail_enemies = {}
-        local nearest_flipper_seg = nil -- Specifically track nearest flipper
-        local nearest_flipper_rel = nil
-        local min_flipper_abs_rel = 100
-        local nearest_flipper_frac_pos = 0 -- Track fractional position
+    local top_rail_enemies = {}
+    local nearest_flipper_seg = nil -- Specifically track nearest flipper
+    local nearest_flipper_rel = nil
+    local min_flipper_abs_rel = 100
+    local nearest_flipper_frac_pos = 0 -- Track fractional position
+    local nearest_pulsar_seg = nil -- Track nearest top-rail pulsar
+    local nearest_pulsar_rel = nil
+    local min_pulsar_abs_rel = 100
 
         for i = 1, 7 do
             local depth = enemies_state.enemy_depths[i]
@@ -404,6 +407,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                              nearest_flipper_rel = rel_float
                              nearest_flipper_frac_pos = frac_pos
                         end
+                    elseif core_type == ENEMY_TYPE_PULSAR then
+                        if abs_rel_float < min_pulsar_abs_rel then
+                            min_pulsar_abs_rel = abs_rel_float
+                            nearest_pulsar_seg = seg
+                            nearest_pulsar_rel = rel_float
+                        end
                     end
                 end
             end
@@ -441,7 +450,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             return target_seg, 0, should_fire, false -- Return early - fuseball avoidance is critical
         end
 
-    -- === Step 1B: High Priority Flipper Avoidance ===
+    -- === Step 1B: High Priority Flipper/Pulsar Avoidance ===
         if nearest_flipper_seg and min_flipper_abs_rel < SAFE_DISTANCE then
 
             -- Calculate target D segments away from the flipper, in the direction opposite the flipper from the player
@@ -455,22 +464,52 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
             local should_fire = fire_priority > shot_count
             return target_seg, 0, should_fire, false -- Return early
+        elseif nearest_pulsar_seg and min_pulsar_abs_rel < SAFE_DISTANCE then
+            -- Calculate target D segments away from the pulsar, in the direction opposite the pulsar from the player
+            local direction_away_from_pulsar = (nearest_pulsar_rel == 0) and 1 or (nearest_pulsar_rel > 0 and -1 or 1)
+            local target_seg = (nearest_pulsar_seg + direction_away_from_pulsar * SAFE_DISTANCE + 16) % 16
+
+            -- Safety check the avoidance target
+            if M.is_danger_lane(target_seg, enemies_state) then
+                target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nearest_pulsar_seg, abs_to_rel_func)
+            end
+            local fire_priority = AVOID_FIRE_PRIORITY
+            local should_fire = fire_priority > shot_count
+            return target_seg, 0, should_fire, false -- Return early
         end
 
-    -- === Step 1C: Top-Rail Flipper Patient Hunt (Wait & Conserve) ===
-    -- If a top-rail flipper is within ~5 segments, prefer holding position and conserving shots until adjacent
-    -- IMPORTANT: Do not use this behavior on open levels; maintain prior lane-1/14 strategy there
-    if not is_open and nearest_flipper_seg and min_flipper_abs_rel <= FLIPPER_WAIT_DISTANCE then
-            -- If current lane is safe and not on a dangerous pulsar lane while pulsing, hold position
-            local player_is_safe = not M.is_danger_lane(player_abs_seg, enemies_state)
-            local pulsar_hot = (enemies_state.pulsing > PULSAR_THRESHOLD) and is_pulsar_lane(player_abs_seg, enemies_state)
-            if player_is_safe and not pulsar_hot then
-                local abs_rel = math.abs(nearest_flipper_rel)
-                local fire_priority = (abs_rel <= 1.05) and FREEZE_FIRE_PRIO_HIGH or FREEZE_FIRE_PRIO_LOW
-                local should_fire = fire_priority > shot_count
-                return player_abs_seg, 0, should_fire, false -- Stay put; fire only when adjacent
+    -- === Step 1C: Top-Rail Flipper/Pulsar Hunt-to-Adjacency (Closed levels) ===
+    -- On closed levels, proactively move to be exactly one segment away from the nearest top-rail flipper or pulsar.
+    if not is_open then
+            local target_threat_seg, target_threat_rel, target_threat_type, target_abs_rel = nil, nil, nil, 100
+            if nearest_flipper_seg and min_flipper_abs_rel < target_abs_rel then
+                target_threat_seg = nearest_flipper_seg
+                target_threat_rel = nearest_flipper_rel
+                target_threat_type = ENEMY_TYPE_FLIPPER
+                target_abs_rel = min_flipper_abs_rel
             end
-            -- If not safe, safety logic below will reposition minimally
+            if nearest_pulsar_seg and min_pulsar_abs_rel < target_abs_rel then
+                target_threat_seg = nearest_pulsar_seg
+                target_threat_rel = nearest_pulsar_rel
+                target_threat_type = ENEMY_TYPE_PULSAR
+                target_abs_rel = min_pulsar_abs_rel
+            end
+
+            if target_threat_seg then
+                -- Position one segment away on the safe side relative to the player
+                local dir_toward_threat = (target_threat_rel > 0) and 1 or (target_threat_rel < 0 and -1 or 0)
+                local one_away_dir = (dir_toward_threat > 0) and -1 or (dir_toward_threat < 0 and 1 or 1)
+                local target_seg = (target_threat_seg + one_away_dir + 16) % 16
+
+                if M.is_danger_lane(target_seg, enemies_state) then
+                    -- Keep at least SAFE_DISTANCE from the threat if possible
+                    target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, target_threat_seg, abs_to_rel_func)
+                end
+
+                local fire_priority = (target_abs_rel <= 1.05) and FREEZE_FIRE_PRIO_HIGH or 6
+                local should_fire = fire_priority > shot_count
+                return target_seg, 0, should_fire, false -- Early return to enforce adjacency strategy
+            end
         end
 
         -- === Step 1B: Determine proposed target based on Top Rail (Presence) / Hunt ===
