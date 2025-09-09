@@ -18,6 +18,9 @@ local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 3
 local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
+-- Configurable pulsar hunting preferences
+local PULSAR_PREF_DISTANCE = 1.0   -- desired lanes away from the pulsar (can be fractional for hold/fire logic)
+local PULSAR_PREF_TOLERANCE = 0.15 -- acceptable window around preferred distance to hold and fire
 
 local M = {} -- Module table
 
@@ -150,33 +153,25 @@ function M.pulsar_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func,
     if enemies_state.pulsing < PULSAR_THRESHOLD then return false, player_abs_seg, 0, false, false end
 
     local is_in_pulsar_lane = false
+    local current_pulsar_seg = -1
     for i = 1, 7 do
         if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-           enemies_state.enemy_abs_segments[i] == player_abs_seg and
            enemies_state.enemy_depths[i] > 0 then
-            is_in_pulsar_lane = true; break
-        end
-    end
-    if not is_in_pulsar_lane then return false, player_abs_seg, 0, false, false end
-
-    local nearest_safe, min_dist = -1, 255
-    for target_seg = 0, 15 do
-        local is_safe = true
-        for i = 1, 7 do
-            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-               enemies_state.enemy_abs_segments[i] == target_seg and
-               enemies_state.enemy_depths[i] > 0 then
-                is_safe = false; break
+            if enemies_state.enemy_abs_segments[i] == player_abs_seg then
+                is_in_pulsar_lane = true
+                current_pulsar_seg = player_abs_seg
+                break
             end
         end
-        if is_safe then
-            local abs_dist = math.abs(abs_to_rel_func(player_abs_seg, target_seg, is_open))
-            if abs_dist < min_dist then min_dist = abs_dist; nearest_safe = target_seg end
-        end
     end
 
-    if nearest_safe ~= -1 then return true, nearest_safe, 0, false, false
-    else return true, player_abs_seg, 0, false, false end -- Stay put if no safe lane
+    if not is_in_pulsar_lane then return false, player_abs_seg, 0, false, false end
+
+    local adj = adjacent_to_pulsar_closest_to_player(current_pulsar_seg, player_abs_seg, is_open, abs_to_rel_func)
+    if adj == -1 then
+        adj = find_nearest_non_pulsar_segment(player_abs_seg, enemies_state, is_open)
+    end
+    return true, adj, 0, false, false
 end
 
 -- Function to check for immediate threats in a segment
@@ -270,6 +265,38 @@ local function is_pulsar_lane(segment, enemies_state)
         end
     end
     return false
+end
+
+-- Public API: configure pulsar hunting preferences
+function M.set_pulsar_preference(distance, tolerance)
+    if type(distance) == "number" and distance >= 1 then PULSAR_PREF_DISTANCE = distance end
+    if type(tolerance) == "number" and tolerance >= 0 then PULSAR_PREF_TOLERANCE = tolerance end
+end
+
+function M.get_pulsar_preference()
+    return PULSAR_PREF_DISTANCE, PULSAR_PREF_TOLERANCE
+end
+
+-- Helper: Get the lane adjacent to a given pulsar that's closest to the player
+local function adjacent_to_pulsar_closest_to_player(pulsar_seg, player_seg, is_open, abs_to_rel_func)
+    local left_adj = (pulsar_seg - 1 + 16) % 16
+    local right_adj = (pulsar_seg + 1) % 16
+    if is_open then
+        -- Clamp for open levels
+        left_adj = (left_adj >= 0 and left_adj <= 15) and left_adj or -1
+        right_adj = (right_adj >= 0 and right_adj <= 15) and right_adj or -1
+    end
+    local best = -1
+    local best_dist = 999
+    if left_adj ~= -1 then
+        local d = math.abs(abs_to_rel_func(player_seg, left_adj, is_open))
+        if d < best_dist then best, best_dist = left_adj, d end
+    end
+    if right_adj ~= -1 then
+        local d = math.abs(abs_to_rel_func(player_seg, right_adj, is_open))
+        if d < best_dist then best, best_dist = right_adj, d end
+    end
+    return best
 end
 
 -- Helper: Find nearest segment that is NOT a pulsar lane (ignores other dangers by design)
@@ -473,6 +500,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             if M.is_danger_lane(target_seg, enemies_state) then
                 target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, nearest_pulsar_seg, abs_to_rel_func)
             end
+            -- Never move onto a pulsar lane
+            if is_pulsar_lane(target_seg, enemies_state) then
+                local alt = (direction_away_from_pulsar == 1) and ((nearest_pulsar_seg - SAFE_DISTANCE + 16) % 16) or ((nearest_pulsar_seg + SAFE_DISTANCE) % 16)
+                if not is_pulsar_lane(alt, enemies_state) then target_seg = alt
+                else target_seg = find_nearest_non_pulsar_segment(target_seg, enemies_state, is_open) end
+            end
             local fire_priority = AVOID_FIRE_PRIORITY
             local should_fire = fire_priority > shot_count
             return target_seg, 0, should_fire, false -- Return early
@@ -480,6 +513,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- === Step 1C: Top-Rail Flipper/Pulsar Hunt-to-Adjacency (Closed levels) ===
     -- On closed levels, proactively move to be exactly one segment away from the nearest top-rail flipper or pulsar.
+    -- For pulsars specifically, NEVER target the pulsar lane; target the adjacent lane closest to the player.
     if not is_open then
             local target_threat_seg, target_threat_rel, target_threat_type, target_abs_rel = nil, nil, nil, 100
             if nearest_flipper_seg and min_flipper_abs_rel < target_abs_rel then
@@ -495,18 +529,39 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 target_abs_rel = min_pulsar_abs_rel
             end
 
-            if target_threat_seg then
-                -- Position one segment away on the safe side relative to the player
-                local dir_toward_threat = (target_threat_rel > 0) and 1 or (target_threat_rel < 0 and -1 or 0)
-                local one_away_dir = (dir_toward_threat > 0) and -1 or (dir_toward_threat < 0 and 1 or 1)
-                local target_seg = (target_threat_seg + one_away_dir + 16) % 16
+        if target_threat_seg then
+                local target_seg = -1
+                if target_threat_type == ENEMY_TYPE_PULSAR then
+            -- Hunt pulsar from preferred offset N (rounded) toward the player side; never target pulsar lane
+            local dir_to_player = abs_to_rel_func(target_threat_seg, player_abs_seg, is_open)
+            local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
+            local desired_N = math.max(1, math.min(7, math.floor(PULSAR_PREF_DISTANCE + 0.5)))
+            target_seg = (target_threat_seg + dir_sign * desired_N + 16) % 16
+                else
+                    -- Flipper: position one away opposite the threat direction
+                    local dir_toward_threat = (target_threat_rel > 0) and 1 or (target_threat_rel < 0 and -1 or 0)
+                    local one_away_dir = (dir_toward_threat > 0) and -1 or (dir_toward_threat < 0 and 1 or 1)
+                    target_seg = (target_threat_seg + one_away_dir + 16) % 16
+                end
 
                 if M.is_danger_lane(target_seg, enemies_state) then
                     -- Keep at least SAFE_DISTANCE from the threat if possible
                     target_seg = find_nearest_constrained_safe_segment(target_seg, enemies_state, is_open, target_threat_seg, abs_to_rel_func)
                 end
+                -- Never target a pulsar lane
+                if is_pulsar_lane(target_seg, enemies_state) then
+                    target_seg = find_nearest_non_pulsar_segment(target_seg, enemies_state, is_open)
+                end
 
-                local fire_priority = (target_abs_rel <= 1.05) and FREEZE_FIRE_PRIO_HIGH or 6
+                local fire_priority
+                if target_threat_type == ENEMY_TYPE_PULSAR then
+                    -- Use fractional distance to pulsar to decide hold/fire vs reposition
+                    local current_dist_float = math.abs(target_threat_rel or 0)
+                    local within = math.abs(current_dist_float - PULSAR_PREF_DISTANCE) <= PULSAR_PREF_TOLERANCE
+                    fire_priority = within and FREEZE_FIRE_PRIO_HIGH or 6
+                else
+                    fire_priority = (target_abs_rel <= 1.05) and FREEZE_FIRE_PRIO_HIGH or 6
+                end
                 local should_fire = fire_priority > shot_count
                 return target_seg, 0, should_fire, false -- Early return to enforce adjacency strategy
             end
@@ -548,22 +603,32 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             
             if nearest_threat_seg then
                 -- Pin to appropriate distance from nearest threat on the near side
-                local safe_distance = (nearest_threat_type == ENEMY_TYPE_FUSEBALL) and 2 or 1 -- Fuseballs need more distance
-                
-                if nearest_threat_rel > 0 then
-                    -- Threat is to the right, pin safe_distance segments to the left of it
-                    proposed_target_seg = (nearest_threat_seg - safe_distance + 16) % 16
-                elseif nearest_threat_rel < 0 then
-                    -- Threat is to the left, pin safe_distance segments to the right of it
-                    proposed_target_seg = (nearest_threat_seg + safe_distance) % 16
+                if nearest_threat_type == ENEMY_TYPE_PULSAR then
+                    -- Hunt pulsar from preferred offset N toward the player side
+                    local dir_to_player = abs_to_rel_func(nearest_threat_seg, player_abs_seg, is_open)
+                    local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
+                    local desired_N = math.max(1, math.min(7, math.floor(PULSAR_PREF_DISTANCE + 0.5)))
+                    proposed_target_seg = (nearest_threat_seg + dir_sign * desired_N + 16) % 16
                 else
-                    -- Threat is on player position, move to safer position immediately
-                    proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                    local safe_distance = (nearest_threat_type == ENEMY_TYPE_FUSEBALL) and 2 or 1 -- Fuseballs need more distance
+                    if nearest_threat_rel > 0 then
+                        -- Threat is to the right, pin safe_distance segments to the left of it
+                        proposed_target_seg = (nearest_threat_seg - safe_distance + 16) % 16
+                    elseif nearest_threat_rel < 0 then
+                        -- Threat is to the left, pin safe_distance segments to the right of it
+                        proposed_target_seg = (nearest_threat_seg + safe_distance) % 16
+                    else
+                        proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                    end
                 end
                 
                 -- Safety check the pinned position
                 if M.is_danger_lane(proposed_target_seg, enemies_state) then
                     proposed_target_seg = find_nearest_safe_segment(proposed_target_seg, enemies_state, is_open)
+                end
+                -- Never target pulsar lane
+                if is_pulsar_lane(proposed_target_seg, enemies_state) then
+                    proposed_target_seg = find_nearest_non_pulsar_segment(proposed_target_seg, enemies_state, is_open)
                 end
             else
                 -- No critical threats found, fall back to safety-based positioning
@@ -634,28 +699,27 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local final_fire_priority = proposed_fire_prio
         local pulsar_override_active = false
 
-        -- ** Pulsar Check (Highest Priority) **
-        if enemies_state.pulsing >= PULSAR_THRESHOLD then
-            if is_pulsar_lane(player_abs_seg, enemies_state) then -- Currently ON a pulsar lane
-                -- Evacuate immediately to the nearest non-pulsar lane (ignore other hazards for this step)
-                local evac_target = find_nearest_non_pulsar_segment(player_abs_seg, enemies_state, is_open)
-                final_target_seg = evac_target
-                final_fire_priority = AVOID_FIRE_PRIORITY
-                pulsar_override_active = true
-            elseif final_target_seg ~= player_abs_seg then -- Moving, check path
-                local original_proposed_target = final_target_seg -- Store original proposed target before path check
-                local relative_dist = abs_to_rel_func(player_abs_seg, original_proposed_target, is_open)
-                local dir = (relative_dist > 0) and 1 or -1
-                local steps = math.abs(relative_dist)
-                for d = 1, steps do
-                    local check_seg = (player_abs_seg + dir * d + 16) % 16
-                    if is_pulsar_lane(check_seg, enemies_state) then
-                        -- Stop before entering a pulsar lane
-                        final_target_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
-                        final_fire_priority = AVOID_FIRE_PRIORITY
-                        pulsar_override_active = true
-                        break
-                    end
+        -- ** Pulsar Policy (Highest Priority): never target pulsar lanes; evacuate hot pulsar lanes immediately **
+        if enemies_state.pulsing >= PULSAR_THRESHOLD and is_pulsar_lane(player_abs_seg, enemies_state) then
+            final_target_seg = find_nearest_non_pulsar_segment(player_abs_seg, enemies_state, is_open)
+            final_fire_priority = AVOID_FIRE_PRIORITY
+            pulsar_override_active = true
+        end
+        -- Never target a pulsar lane as the final target
+        if not pulsar_override_active and is_pulsar_lane(final_target_seg, enemies_state) then
+            final_target_seg = find_nearest_non_pulsar_segment(final_target_seg, enemies_state, is_open)
+        end
+        -- When moving, if path into a pulsar lane, stop right before it
+        if not pulsar_override_active and final_target_seg ~= player_abs_seg then
+            local relative_dist = abs_to_rel_func(player_abs_seg, final_target_seg, is_open)
+            local dir = (relative_dist > 0) and 1 or -1
+            local steps = math.abs(relative_dist)
+            for d = 1, steps do
+                local check_seg = (player_abs_seg + dir * d + 16) % 16
+                if is_pulsar_lane(check_seg, enemies_state) then
+                    final_target_seg = (player_abs_seg + dir * (d - 1) + 16) % 16
+                    final_fire_priority = AVOID_FIRE_PRIORITY
+                    break
                 end
             end
         end
@@ -668,6 +732,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
 
         -- === Step 3: Final Return ===
+        -- Final pulsar-lane sanitization
+        if is_pulsar_lane(final_target_seg, enemies_state) then
+            final_target_seg = find_nearest_non_pulsar_segment(final_target_seg, enemies_state, is_open)
+        end
         final_should_fire = final_fire_priority > shot_count
         return final_target_seg, 0, final_should_fire, false
 
