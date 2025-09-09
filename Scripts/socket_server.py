@@ -366,7 +366,7 @@ class SocketServer:
                             if hasattr(self, 'agent') and self.agent:
                                 self.agent.step(
                                     state['last_state'],
-                                    np.array([[state['last_action_idx']]]),
+                                    state['last_action_idx'],
                                     frame.reward,
                                     frame.state,
                                     frame.done
@@ -385,7 +385,7 @@ class SocketServer:
                                 # Next state after n steps is current frame.state
                                 self.agent.step(
                                     s0,
-                                    np.array([[a0]]),
+                                    a0,
                                     R,
                                     frame.state,
                                     False if not frame.done else True
@@ -432,7 +432,7 @@ class SocketServer:
                                 s0, a0, _ = state['nstep_buf'][0]
                                 self.agent.step(
                                     s0,
-                                    np.array([[a0]]),
+                                    a0,
                                     R,
                                     frame.state,
                                     True
