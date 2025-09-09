@@ -20,6 +20,8 @@ local AVOID_FIRE_PRIORITY = 3
 local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
 -- Open-level tuning: react slightly sooner to top-rail flippers using fractional distance
 local OPEN_FLIPPER_REACT_DISTANCE = 1.10
+-- Pulsar target offset (segments away from pulsar when hunting/avoiding)
+local PULSAR_TARGET_DISTANCE = 2
 -- Optional: Conserve fire mode (hold fire/movement until react distance)
 local CONSERVE_FIRE_MODE = false
 local CONSERVE_REACT_DISTANCE = 1.10
@@ -526,10 +528,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             local fire_priority = AVOID_FIRE_PRIORITY -- Use specific avoid priority
             local should_fire = fire_priority > shot_count
             return target_seg, 0, should_fire, false -- Return early
-    elseif not conserve_override_active and nearest_pulsar_seg and min_pulsar_abs_rel < SAFE_DISTANCE then
+        elseif not conserve_override_active and nearest_pulsar_seg and min_pulsar_abs_rel < SAFE_DISTANCE then
             -- Calculate target D segments away from the pulsar, in the direction opposite the pulsar from the player
             local direction_away_from_pulsar = (nearest_pulsar_rel == 0) and 1 or (nearest_pulsar_rel > 0 and -1 or 1)
-            local target_seg = (nearest_pulsar_seg + direction_away_from_pulsar * SAFE_DISTANCE + 16) % 16
+            local target_seg = (nearest_pulsar_seg + direction_away_from_pulsar * PULSAR_TARGET_DISTANCE + 16) % 16
 
             -- Safety check the avoidance target
             if M.is_danger_lane(target_seg, enemies_state) then
@@ -537,7 +539,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             end
             -- Never move onto a pulsar lane
             if is_pulsar_lane(target_seg, enemies_state) then
-                local alt = (direction_away_from_pulsar == 1) and ((nearest_pulsar_seg - SAFE_DISTANCE + 16) % 16) or ((nearest_pulsar_seg + SAFE_DISTANCE) % 16)
+                local alt = (direction_away_from_pulsar == 1) and ((nearest_pulsar_seg - PULSAR_TARGET_DISTANCE + 16) % 16) or ((nearest_pulsar_seg + PULSAR_TARGET_DISTANCE) % 16)
                 if not is_pulsar_lane(alt, enemies_state) then target_seg = alt
                 else target_seg = find_nearest_non_pulsar_segment(target_seg, enemies_state, is_open) end
             end
@@ -567,11 +569,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         if target_threat_seg then
                 local target_seg = -1
                 if target_threat_type == ENEMY_TYPE_PULSAR then
-            -- Hunt pulsar from preferred offset N (rounded) toward the player side; never target pulsar lane
-            local dir_to_player = abs_to_rel_func(target_threat_seg, player_abs_seg, is_open)
-            local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
-            local desired_N = math.max(1, math.min(7, math.floor(PULSAR_PREF_DISTANCE + 0.5)))
-            target_seg = (target_threat_seg + dir_sign * desired_N + 16) % 16
+                    -- Hunt pulsar from fixed offset (segments away) toward the player side; never target pulsar lane
+                    local dir_to_player = abs_to_rel_func(target_threat_seg, player_abs_seg, is_open)
+                    local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
+                    target_seg = (target_threat_seg + dir_sign * PULSAR_TARGET_DISTANCE + 16) % 16
                 else
                     -- Flipper: position one away opposite the threat direction
                     local dir_toward_threat = (target_threat_rel > 0) and 1 or (target_threat_rel < 0 and -1 or 0)
@@ -641,11 +642,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             if nearest_threat_seg then
                 -- Pin to appropriate distance from nearest threat on the near side
                 if nearest_threat_type == ENEMY_TYPE_PULSAR then
-                    -- Hunt pulsar from preferred offset N toward the player side
+                    -- Hunt pulsar from fixed offset toward the player side
                     local dir_to_player = abs_to_rel_func(nearest_threat_seg, player_abs_seg, is_open)
                     local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
-                    local desired_N = math.max(1, math.min(7, math.floor(PULSAR_PREF_DISTANCE + 0.5)))
-                    proposed_target_seg = (nearest_threat_seg + dir_sign * desired_N + 16) % 16
+                    proposed_target_seg = (nearest_threat_seg + dir_sign * PULSAR_TARGET_DISTANCE + 16) % 16
                 else
                     local safe_distance = (nearest_threat_type == ENEMY_TYPE_FUSEBALL) and 2 or 1 -- Fuseballs need more distance
                     if nearest_threat_rel > 0 then
