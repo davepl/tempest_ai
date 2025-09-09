@@ -39,6 +39,7 @@ local LastRewardState = 0
 -- Track superzapper usage and activation edge per level (for one-time charging)
 local previous_superzapper_active = 0
 local previous_superzapper_uses_in_level = 0
+local previous_zap_detected = 0
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -804,105 +805,39 @@ end
 
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local reward, bDone = 0, false
-    local detected_spinner = player_state.spinner_detected
+    local reward, bDone = 0.0, false
 
-    if player_state.alive == 1 then
-
-        -- Level completion bonus and per-level resets
-        if level_state.level_number > previous_level then
-            reward = reward + 8000 -- explicit level completion reward (tuned)
-            previous_superzapper_uses_in_level = 0 -- reset zap uses for new level
+    -- Terminal: death (edge-triggered)
+    if player_state.alive == 0 and previous_alive_state == 1 then
+        reward = reward - 1.0
+        bDone = true
+    else
+        -- Primary dense signal: scaled/clipped score delta
+        local score_delta = (player_state.score or 0) - (previous_score or 0)
+        if score_delta ~= 0 then
+            local r_score = score_delta / 1000.0
+            if r_score > 1.0 then r_score = 1.0 end
+            if r_score < -1.0 then r_score = -1.0 end
+            reward = reward + r_score
         end
 
-        -- Player is alive; check to see if they are on a pulsar segment
-        local player_segment = math.floor(player_state.position) % 16
-    if is_pulsar_lane(player_segment, enemies_state) and enemies_state.pulsing >= PULSAR_THRESHOLD then
-            reward = reward - 100 -- Deduct 100 reward if on a pulsar segment
+        -- Level completion bonus (edge-triggered)
+        if (level_state.level_number or 0) > (previous_level or 0) then
+            reward = reward + 1.0
         end
 
-        -- If this is a fusebal charging lane, reward large spinner movement to escape
-
-        if enemies_state.fuseball_threat_nearby then
-            local fuseball_escape_target = enemies_state.fuseball_escape_target
-            if fuseball_escape_target ~= -1 then
-                local is_open = (level_state.level_type == 0xFF)
-                local rel_dist = abs_to_rel_func(player_segment, fuseball_escape_target, is_open)
-                -- Directional shaping: reward moving toward escape lane, penalize moving away or idling
-                if rel_dist ~= 0 then
-                    local need_dir = (rel_dist > 0) and 1 or -1
-                    if (detected_spinner > 0 and need_dir > 0) or (detected_spinner < 0 and need_dir < 0) then
-                        reward = reward + 60 -- moving in the right direction (tuned)
-                    elseif detected_spinner == 0 then
-                        reward = reward - 30 -- idle while threatened
-                    else
-                        reward = reward - 50 -- moving the wrong way (tuned)
-                    end
-                else
-                    reward = reward + 50 -- reached/arrived at the escape lane
-                end
-                -- Small terminal bonus for being close to the escape lane
-                if math.abs(rel_dist) <= 2 then reward = reward + 100 end
-            end
+        -- Zap cost (edge-triggered on button press)
+        local zap_now = player_state.zap_detected or 0
+        if zap_now == 1 and previous_zap_detected == 0 then
+            reward = reward - 0.05
         end
-
-        
-
-
-    local score_delta = player_state.score - previous_score
-    if score_delta > 0 then reward = reward + (score_delta * 0.2) end -- scale points (tuned)
-
-        local sc = player_state.shot_count
-        if sc == 0 or sc >= 8 then reward = reward - 50
-        elseif sc == 4 then reward = reward + 5; elseif sc == 5 then reward = reward + 10
-        elseif sc == 6 then reward = reward + 15; elseif sc == 7 then reward = reward + 20 end
-
-        -- Superzapper one-time charging per activation: -500 on first use in a level, -50 on second
-        if game_state.gamestate == 0x04 then
-            local sz_active = player_state.superzapper_active or 0
-            if previous_superzapper_active == 0 and sz_active ~= 0 then
-                local charge = (previous_superzapper_uses_in_level == 0) and 500 or 50
-                reward = reward - charge
-                previous_superzapper_uses_in_level = math.min(2, previous_superzapper_uses_in_level + 1)
-            end
-            previous_superzapper_active = sz_active
-        end
-
-        local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal
-        local target_depth = enemies_state.nearest_enemy_depth_raw
-        local player_segment = math.floor(player_state.position) % 16
-
-        if game_state.gamestate == 0x20 then -- Tube Zoom Reward
-            local spike_h = level_state.spike_heights[player_segment]
-            if spike_h > 0 then reward = reward + math.max(0, ((255 - spike_h) / 2) - 27.5)
-            else reward = reward + (detected_spinner == 0 and 250 or -50) end
-            if player_state.fire_commanded == 1 then reward = reward + 200 end
-
-        elseif target_abs_segment < 0 then -- No Enemies Reward
-            reward = reward + (detected_spinner == 0 and 150 or -20)
-            if player_state.fire_commanded == 1 then reward = reward - 100 end
-
-        else -- Enemies Present Reward
-            local desired_spinner, segment_distance, _ = M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-            if segment_distance == 0 then -- Aligned Reward
-                reward = reward + (detected_spinner == 0 and 250 or -10) -- relax penalty while aligned
-                if player_state.fire_commanded == 1 then reward = reward + 50 end
-            else -- Misaligned Reward
-                if segment_distance < 2 and target_depth <= 0x20 then reward = reward + (player_state.fire_commanded == 1 and 150 or -50)
-                else if player_state.fire_commanded == 1 then reward = reward - (segment_distance < 2 and 20 or 30) end end
-                -- Movement reward
-        if desired_spinner * detected_spinner > 0 then reward = reward + 50
-        elseif desired_spinner * detected_spinner < 0 then reward = reward - 40
-        elseif detected_spinner == 0 and desired_spinner ~= 0 then reward = reward - 20 end
-            end
-        end
-    else -- Player Died Penalty
-    if previous_alive_state == 1 then reward = reward - 16000; bDone = true end -- tuned
     end
 
-    previous_score = player_state.score
-    previous_level = level_state.level_number
-    previous_alive_state = player_state.alive
+    -- State updates
+    previous_score = player_state.score or 0
+    previous_level = level_state.level_number or 0
+    previous_alive_state = player_state.alive or 0
+    previous_zap_detected = player_state.zap_detected or 0
     LastRewardState = reward
 
     return reward, bDone

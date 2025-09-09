@@ -464,16 +464,17 @@ class DQNAgent:
             self.memory = PrioritizedReplayMemory(memory_size, alpha=getattr(RL_CONFIG, 'per_alpha', 0.6), eps=getattr(RL_CONFIG, 'per_eps', 1e-6))
         else:
             self.memory = ReplayMemory(memory_size)
-        
+
         # Initialize target network with same weights as local network
         self.update_target_network()
-        
+
         # Training queue for background thread
         self.train_queue = queue.Queue(maxsize=1000)
         self.training_thread = None
         self.running = True
+        self._train_step_counter = 0
 
-        """Start background thread for training"""
+        # Start background thread for training
         self.training_thread = threading.Thread(target=self.background_train, daemon=True, name="TrainingWorker")
         self.training_thread.start()
         
@@ -486,8 +487,10 @@ class DQNAgent:
                 # The item itself is just a signal (True), we don't need its value.
                 _ = self.train_queue.get() 
                 
-                # If we get an item, process one training step
-                self.train_step()
+                # If we get an item, process one training step (respect train_freq)
+                self._train_step_counter += 1
+                if (self._train_step_counter % max(1, getattr(RL_CONFIG, 'train_freq', 4))) == 0:
+                    self.train_step()
                 
                 # Signal that the task is done
                 self.train_queue.task_done()
@@ -577,22 +580,29 @@ class DQNAgent:
             else:
                 criterion = SmoothL1Loss()
                 loss = criterion(Q_expected, Q_targets)
+
+        # Optimize
         self.optimizer.zero_grad()
-        loss.backward() 
+        loss.backward()
+        # Gradient clipping to stabilize updates under PER/Noisy/QR
+        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
         self.optimizer.step()
-        # PER: update priorities
+
+        # PER: update priorities and track average
         if use_per:
             with torch.no_grad():
                 self.memory.update_priorities(indices, td_errors)
-            # Track moving average priority into metrics
             metrics.average_priority = self.memory.avg_priority
+
         # Soft target update if enabled (Polyak averaging every step)
         if getattr(RL_CONFIG, 'use_soft_target', False):
             tau = getattr(RL_CONFIG, 'tau', 0.005)
             self.soft_update(tau)
+
         # Step LR scheduler if enabled
         if self.scheduler is not None:
             self.scheduler.step()
+
         metrics.losses.append(loss.item())
 
     def update_target_network(self):
@@ -940,10 +950,12 @@ class SafeMetrics:
         self.metrics = metrics
         self.lock = threading.Lock()
     
-    def update_frame_count(self):
+    def update_frame_count(self, delta: int = 1):
         with self.lock:
             # Update total frame count
-            self.metrics.frame_count += 1
+            if delta < 1:
+                delta = 1
+            self.metrics.frame_count += delta
             
             # Update FPS tracking
             current_time = time.time()
@@ -953,7 +965,7 @@ class SafeMetrics:
                 self.metrics.last_fps_time = current_time
                 
             # Count frames for this second
-            self.metrics.frames_last_second += 1
+            self.metrics.frames_last_second += delta
             
             # Calculate FPS every second
             elapsed = current_time - self.metrics.last_fps_time
@@ -1044,26 +1056,20 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         # Combine score components
         score = (score_high * 65536) + score_low
         
-        state_data = data[header_size:]
-        
-        # Safely process state values with error handling
-        state_values = []
-        for i in range(0, len(state_data), 2):  # Using 2 bytes per value
-            if i + 1 < len(state_data):
-                try:
-                    value = struct.unpack(">H", state_data[i:i+2])[0]
-                    normalized = (value / 255.0) * 2.0 - 1.0
-                    state_values.append(normalized)
-                except struct.error as e:
-                    print(f"ERROR: Failed to unpack state value at position {i}: {e}", flush=True)
-                    sys.exit(1)
-        
-        state = np.array(state_values, dtype=np.float32)  # Already normalized
-        
-        # Verify we got the expected number of values
-        if len(state_values) != num_values:
-            print(f"ERROR: Expected {num_values} state values but got {len(state_values)}", flush=True)
+        state_data = memoryview(data)[header_size:]
+        # Fast vectorized parse: big-endian unsigned short -> float32 normalized
+        if len(state_data) % 2 != 0:
+            print(f"ERROR: State data length not even: {len(state_data)} bytes", flush=True)
             sys.exit(1)
+        try:
+            vals = np.frombuffer(state_data, dtype=">u2", count=num_values)
+        except ValueError as e:
+            print(f"ERROR: frombuffer failed: {e}", flush=True)
+            sys.exit(1)
+        if vals.size != num_values:
+            print(f"ERROR: Expected {num_values} state values but got {vals.size}", flush=True)
+            sys.exit(1)
+        state = (vals.astype(np.float32) / 255.0) * 2.0 - 1.0
         
         frame_data = FrameData(
             state=state,
