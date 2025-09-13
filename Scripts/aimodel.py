@@ -775,10 +775,10 @@ class DQNAgent:
             total_time = time.time() - step_start
             
             # Print timing every 100 steps for debugging
-            if metrics.total_training_steps % 100 == 0:
-                print(f"Training step timing - Total: {total_time*1000:.1f}ms, "
-                      f"Sampling: {sampling_time*1000:.1f}ms, Forward: {forward_time*1000:.1f}ms, "
-                      f"Backward: {backward_time*1000:.1f}ms, Optimizer: {optimizer_time*1000:.1f}ms")
+            # if metrics.total_training_steps % 100 == 0:
+            #    print(f"Training step timing - Total: {total_time*1000:.1f}ms, "
+            #          f"Sampling: {sampling_time*1000:.1f}ms, Forward: {forward_time*1000:.1f}ms, "
+            #          f"Backward: {backward_time*1000:.1f}ms, Optimizer: {optimizer_time*1000:.1f}ms")
                     
         except Exception as e:
             print(f"Training error: {e}")
@@ -863,7 +863,7 @@ class DQNAgent:
         
         # BALANCED TRAINING: Moderate training intensity to maintain client responsiveness
         # This balances learning speed with inference performance
-        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
+        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 3)  # Use config value (3)
         for _ in range(training_multiplier):  # Reasonable training frequency
             try:
                 self.train_queue.put_nowait(True)
