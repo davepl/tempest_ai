@@ -234,7 +234,7 @@ class SocketServer:
             ping_ok = False
             try:
                 client_socket.setblocking(True)
-                client_socket.settimeout(2.0)
+                client_socket.settimeout(5.0)  # Increased from 2.0 to 5.0 (2.5x increase)
                 ping_header = client_socket.recv(2)
                 if not ping_header or len(ping_header) < 2:
                     print(f"Client {client_id} disconnected (no initial ping header)")

@@ -57,8 +57,8 @@ class RLConfigData:
     epsilon_start: float = 1.0            # Starting epsilon value
     epsilon_min: float = 0.01             # Minimum exploration rate
     epsilon_end: float = 0.01             # Final epsilon value (alias for epsilon_min)
-    epsilon_decay_steps: int = 200000     # Steps over which to decay epsilon
-    epsilon_decay_factor: float = 0.995   # Decay factor per step
+    epsilon_decay_steps: int = 25000     # Much shorter intervals for faster learning (was 200000)
+    epsilon_decay_factor: float = 0.98   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 1000000           # Replay buffer size
     hidden_size: int = 2560               # Increase network size moderately (was 2048)
     num_layers: int = 4                   # Deeper network for more GPU work
