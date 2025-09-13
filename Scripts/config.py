@@ -50,8 +50,8 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 512             # Reduced for faster sampling
-    lr: float = 7e-4                      # Adam learning rate
+    batch_size: int = 6144            # Increase batch size moderately (was 4096)
+    lr: float = 1.2e-3                    # Slightly higher LR for larger batch
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 1.0                  # Initial exploration rate
     epsilon_start: float = 1.0            # Starting epsilon value
@@ -60,13 +60,18 @@ class RLConfigData:
     epsilon_decay_steps: int = 200000     # Steps over which to decay epsilon
     epsilon_decay_factor: float = 0.995   # Decay factor per step
     memory_size: int = 1000000           # Replay buffer size
-    hidden_size: int = 1024               # Network hidden layer size  
+    hidden_size: int = 2560               # Increase network size moderately (was 2048)
+    num_layers: int = 4                   # Deeper network for more GPU work
     target_update_freq: int = 400         # Target network update frequency  
     update_target_every: int = 400        # Alias for target_update_freq
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = True           # Use noisy networks for exploration
     use_per: bool = False                 # Disabled - too slow
     use_distributional: bool = False      # Disabled - too complex
+    gradient_accumulation_steps: int = 6  # Increase accumulation moderately (was 4)
+    use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance
+    training_steps_per_sample: int = 3    # Increase training steps slightly (was 2)
+    force_gpu_utilization: bool = False   # Keep disabled to maintain client responsiveness
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
