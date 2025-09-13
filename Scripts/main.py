@@ -91,7 +91,7 @@ def main():
     agent = DQNAgent(
         state_size=RL_CONFIG.state_size,
         action_size=RL_CONFIG.action_size,
-        learning_rate=RL_CONFIG.learning_rate,
+        learning_rate=RL_CONFIG.lr,
         gamma=RL_CONFIG.gamma,
         epsilon=RL_CONFIG.epsilon,
         epsilon_min=RL_CONFIG.epsilon_min,

@@ -159,14 +159,20 @@ class FrameData:
 SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
-# Initialize device (prefer CUDA, then MPS, else CPU)
+# Initialize devices (use single device for both inference and training for stability)
 if torch.cuda.is_available():
     device = torch.device("cuda")
+    print(f"Using GPU (CUDA) for both inference and training: {device}")
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = torch.device("mps")
+    print(f"Using MPS for both inference and training: {device}")
 else:
     device = torch.device("cpu")
-print(f"Using device: {device}")
+    print(f"Using CPU for both inference and training: {device}")
+
+# For compatibility with dual-device code
+training_device = device
+inference_device = device
 
 # Initialize metrics
 metrics = config_metrics
@@ -196,14 +202,29 @@ class ReplayMemory:
         self.memory.append(Experience(state, action_arr, reward_arr, next_state, done_arr))
         
     def sample(self, batch_size):
-        """Sample random batch of experiences"""
-        experiences = random.sample(self.memory, min(batch_size, len(self.memory)))
-        states = torch.from_numpy(np.vstack([e.state for e in experiences])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
-        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences])).float().to(device)
-        return states, actions, rewards, next_states, dones
+        """Sample random batch of experiences - optimized version"""
+        memory_size = len(self.memory)
+        batch_size = min(batch_size, memory_size)
+        
+        # Get random indices
+        indices = random.sample(range(memory_size), batch_size)
+        
+        # Use list comprehension for faster batch creation
+        batch = [self.memory[i] for i in indices]
+        
+        # Stack everything at once using numpy's more efficient operations
+        states = np.stack([e.state for e in batch], axis=0).astype(np.float32)
+        actions = np.array([[e.action[0]] for e in batch], dtype=np.int64)
+        rewards = np.array([[e.reward[0]] for e in batch], dtype=np.float32)  
+        next_states = np.stack([e.next_state for e in batch], axis=0).astype(np.float32)
+        dones = np.array([[e.done[0]] for e in batch], dtype=np.float32)
+        
+        # Convert to tensors and move to GPU in one go
+        return (torch.from_numpy(states).to(training_device, non_blocking=True),
+                torch.from_numpy(actions).to(training_device, non_blocking=True),
+                torch.from_numpy(rewards).to(training_device, non_blocking=True),
+                torch.from_numpy(next_states).to(training_device, non_blocking=True),
+                torch.from_numpy(dones).to(training_device, non_blocking=True))
         
     def __len__(self):
         return len(self.memory)
@@ -450,14 +471,14 @@ class PrioritizedReplayMemory:
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
-    def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.learning_rate, gamma=RL_CONFIG.gamma, 
+    def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.lr, gamma=RL_CONFIG.gamma, 
                  epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, 
                  memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
         self.state_size = state_size
         self.action_size = action_size
         self.last_save_time = 0.0 # Initialize last save time
         
-        # Q-Networks (online and target)
+        # Q-Networks on single device for stability
         if getattr(RL_CONFIG, 'use_distributional', False):
             n_quant = getattr(RL_CONFIG, 'num_atoms', 51)
             self.qnetwork_local = QRDQN(state_size, action_size, n_quant).to(device)
@@ -465,6 +486,15 @@ class DQNAgent:
         else:
             self.qnetwork_local = DQN(state_size, action_size).to(device)
             self.qnetwork_target = DQN(state_size, action_size).to(device)
+        
+        # DISABLED torch.compile() due to CUDA graph issues
+        # Will focus on other optimizations instead
+        print("Using standard (uncompiled) neural networks for stability.")
+        
+        # Store device references (now both are the same)
+        self.inference_device = device
+        self.training_device = device
+        
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         # Optional LR scheduler
         self.scheduler = None
@@ -475,18 +505,21 @@ class DQNAgent:
         
         # Replay memory (optionally prioritized)
         if getattr(RL_CONFIG, 'use_per', False):
+            print("Using Prioritized Experience Replay (PER)")
             self.memory = PrioritizedReplayMemory(memory_size, alpha=getattr(RL_CONFIG, 'per_alpha', 0.6), eps=getattr(RL_CONFIG, 'per_eps', 1e-6))
         else:
+            print("Using standard Replay Memory")
             self.memory = ReplayMemory(memory_size)
 
         # Initialize target network with same weights as local network
         self.update_target_network()
 
         # Training queue for background thread - much larger to prevent throttling
-        self.train_queue = queue.Queue(maxsize=10000)  # Increased from 1000 to 10000
+        self.train_queue = queue.Queue(maxsize=50000)  # Increased from 20000 to 50000
         self.training_thread = None
         self.running = True
-        self.num_training_workers = 1  # Reduced to 1 to avoid threading conflicts - will optimize differently
+        # Simple approach: single training thread for maximum throughput
+        self.num_training_workers = 1  # Single thread eliminates all contention
         self.training_threads = []
         self._train_step_counter = 0
         self._gradient_accumulation_counter = 0  # Track gradient accumulation steps
@@ -508,6 +541,11 @@ class DQNAgent:
             torch.cuda.empty_cache()  # Clear any existing cache
             torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
             torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+            # Additional GPU optimizations for maximum utilization
+            torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster matmul on Ampere+
+            torch.backends.cudnn.allow_tf32 = True        # Enable TF32 for cuDNN
+            # Increase GPU memory allocation efficiency
+            torch.cuda.set_per_process_memory_fraction(0.9)  # Use up to 90% of GPU memory
 
         # Start multiple background threads for parallel training
         for i in range(self.num_training_workers):
@@ -517,49 +555,35 @@ class DQNAgent:
         print(f"Started {self.num_training_workers} training worker threads")
         
     def background_train(self):
-        """Run training in background thread with optimized batched processing"""
+        """Simple high-throughput training loop"""
         worker_id = threading.current_thread().name
         print(f"Training thread {worker_id} started on {device}")
         
         while self.running: 
             try:
-                # Process fewer queue items in batch for stability
-                batch_size = 0
-                max_batch = 3  # Reduced from 10 to 3 for stability
-                
-                # Get first item (blocking)
+                # Get training request (blocking)
                 _ = self.train_queue.get()
-                batch_size += 1
                 
-                # Get additional items without blocking to batch process
-                while batch_size < max_batch:
-                    try:
-                        _ = self.train_queue.get_nowait()
-                        batch_size += 1
-                    except queue.Empty:
-                        break
-                
-                # Process training steps for the batch
-                for _ in range(batch_size):
-                    self._train_step_counter += 1
-                    if (self._train_step_counter % max(1, getattr(RL_CONFIG, 'train_freq', 1))) == 0:
-                        self.train_step()
-                    
-                    # Signal task done for each processed item
-                    self.train_queue.task_done()
+                # Process single training step immediately
+                self._train_step_counter += 1
+                self.train_step()
+                self.train_queue.task_done()
 
             except Exception as e:
                 print(f"Training error in {worker_id}: {e}")
+                import traceback
                 traceback.print_exc()
-                time.sleep(0.1)  # Shorter pause for faster recovery
+                time.sleep(0.01)
 
     def train_step(self):
-        """Perform a single training step on one batch"""
-        # Thread safety - only one training step at a time
-        with self.training_lock:
-            if len(self.memory) < RL_CONFIG.batch_size:
-                return
-                
+        """Perform a single training step - optimized for single thread maximum throughput"""
+        if len(self.memory) < RL_CONFIG.batch_size:
+            return
+            
+        try:
+            import time
+            step_start = time.time()
+            
             # Update training metrics
             metrics.total_training_steps += 1
             metrics.memory_buffer_size = len(self.memory)
@@ -576,88 +600,95 @@ class DQNAgent:
                 if hasattr(self.qnetwork_target, 'reset_noise'):
                     self.qnetwork_target.reset_noise()
             
-        use_per = getattr(RL_CONFIG, 'use_per', False)
-        if use_per:
-            # Anneal beta towards 1.0
-            frame = metrics.frame_count
-            beta_start = getattr(RL_CONFIG, 'per_beta_start', 0.4)
-            beta_frames = max(1, getattr(RL_CONFIG, 'per_beta_frames', 200000))
-            beta = min(1.0, beta_start + (1.0 - beta_start) * (frame / beta_frames))
-            states, actions, rewards, next_states, dones, is_weights, indices = self.memory.sample(RL_CONFIG.batch_size, beta=beta)
-        else:
-            states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
-        
-        if getattr(RL_CONFIG, 'use_distributional', False):
-            # Distributional QR loss
-            num_quant = getattr(RL_CONFIG, 'num_atoms', 51)
-            # Current quantiles for taken actions: (B, N)
-            z_pred_all = self.qnetwork_local(states)  # (B, A, N)
-            batch_indices = torch.arange(z_pred_all.size(0), device=states.device)
-            z_pred = z_pred_all[batch_indices, actions.squeeze(1)]  # (B, N)
-
-            with torch.no_grad():
-                # Next action by mean over quantiles of local net
-                z_next_local = self.qnetwork_local(next_states)  # (B, A, N)
-                q_next_local = z_next_local.mean(dim=2)  # (B, A)
-                next_actions = q_next_local.argmax(dim=1)  # (B,)
-                # Target quantiles for those actions from target net
-                z_next_target_all = self.qnetwork_target(next_states)  # (B, A, N)
-                z_next_target = z_next_target_all[batch_indices, next_actions]  # (B, N)
-                # Bellman update for quantiles
-                z_target = rewards + (RL_CONFIG.gamma * (1 - dones)) * z_next_target  # (B, N)
-
-            # Pairwise TD errors: (B, N_pred, N_tgt) => (B, N, N)
-            z_pred_exp = z_pred.unsqueeze(2)
-            z_target_exp = z_target.unsqueeze(1)
-            td = z_target_exp - z_pred_exp  # (B, N, N)
-
-            # Huber loss
-            huber_k = 1.0
-            abs_td = td.abs()
-            huber_loss = torch.where(abs_td <= huber_k, 0.5 * td.pow(2), huber_k * (abs_td - 0.5 * huber_k))
-
-            # Quantile weights
-            with torch.no_grad():
-                taus = (torch.arange(num_quant, device=states.device, dtype=states.dtype) + 0.5) / num_quant  # (N,)
-            taus = taus.view(1, -1, 1)  # (1, N, 1)
-            quantile_weight = (taus - (td.detach() < 0).float()).abs()
-            qr_loss = (quantile_weight * huber_loss).mean(dim=2).sum(dim=1).mean()
-
-            loss = qr_loss if not use_per else (is_weights.view(-1) * (quantile_weight * huber_loss).mean(dim=2).sum(dim=1)).mean()
-
-            # For PER priority updates, define td_errors as mean absolute TD per sample
-            td_errors = td.abs().mean(dim=(1, 2))  # CRITICAL FIX: Use abs() for priority updates
-        else:
-            # Standard DQN loss
-            Q_expected = self.qnetwork_local(states).gather(1, actions)
-            with torch.no_grad():
-                best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
-                Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
-                Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
-
+            sampling_start = time.time()
+            use_per = getattr(RL_CONFIG, 'use_per', False)
             if use_per:
-                td_errors = (Q_expected - Q_targets).abs()  # CRITICAL FIX: Use abs() for priority updates
-                loss = (is_weights * (Q_expected - Q_targets).pow(2)).mean()
+                # Anneal beta towards 1.0
+                frame = metrics.frame_count
+                beta_start = getattr(RL_CONFIG, 'per_beta_start', 0.4)
+                beta_frames = max(1, getattr(RL_CONFIG, 'per_beta_frames', 200000))
+                beta = min(1.0, beta_start + (1.0 - beta_start) * (frame / beta_frames))
+                states, actions, rewards, next_states, dones, is_weights, indices = self.memory.sample(RL_CONFIG.batch_size, beta=beta)
             else:
-                criterion = SmoothL1Loss()
-                loss = criterion(Q_expected, Q_targets)
-                td_errors = (Q_expected - Q_targets).abs()  # For consistency
+                states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
+            sampling_time = time.time() - sampling_start
+            
+            forward_start = time.time()
+            if getattr(RL_CONFIG, 'use_distributional', False):
+                # Distributional QR loss
+                num_quant = getattr(RL_CONFIG, 'num_atoms', 51)
+                # Current quantiles for taken actions: (B, N)
+                z_pred_all = self.qnetwork_local(states)  # (B, A, N)
+                batch_indices = torch.arange(z_pred_all.size(0), device=states.device)
+                z_pred = z_pred_all[batch_indices, actions.squeeze(1)]  # (B, N)
+
+                with torch.no_grad():
+                    # Next action by mean over quantiles of local net
+                    z_next_local = self.qnetwork_local(next_states)  # (B, A, N)
+                    q_next_local = z_next_local.mean(dim=2)  # (B, A)
+                    next_actions = q_next_local.argmax(dim=1)  # (B,)
+                    # Target quantiles for those actions from target net
+                    z_next_target_all = self.qnetwork_target(next_states)  # (B, A, N)
+                    z_next_target = z_next_target_all[batch_indices, next_actions]  # (B, N)
+                    # Bellman update for quantiles
+                    z_target = rewards + (RL_CONFIG.gamma * (1 - dones)) * z_next_target  # (B, N)
+
+                # Pairwise TD errors: (B, N_pred, N_tgt) => (B, N, N)
+                z_pred_exp = z_pred.unsqueeze(2)
+                z_target_exp = z_target.unsqueeze(1)
+                td = z_target_exp - z_pred_exp  # (B, N, N)
+
+                # Huber loss
+                huber_k = 1.0
+                abs_td = td.abs()
+                huber_loss = torch.where(abs_td <= huber_k, 0.5 * td.pow(2), huber_k * (abs_td - 0.5 * huber_k))
+
+                # Quantile weights
+                with torch.no_grad():
+                    taus = (torch.arange(num_quant, device=states.device, dtype=states.dtype) + 0.5) / num_quant  # (N,)
+                taus = taus.view(1, -1, 1)  # (1, N, 1)
+                quantile_weight = (taus - (td.detach() < 0).float()).abs()
+                qr_loss = (quantile_weight * huber_loss).mean(dim=2).sum(dim=1).mean()
+
+                loss = qr_loss if not use_per else (is_weights.view(-1) * (quantile_weight * huber_loss).mean(dim=2).sum(dim=1)).mean()
+
+                # For PER priority updates, define td_errors as mean absolute TD per sample
+                td_errors = td.abs().mean(dim=(1, 2))  # CRITICAL FIX: Use abs() for priority updates
+            else:
+                # Standard DQN loss
+                Q_expected = self.qnetwork_local(states).gather(1, actions)
+                with torch.no_grad():
+                    best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
+                    Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
+                    Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
+
+                if use_per:
+                    td_errors = (Q_expected - Q_targets).abs()  # CRITICAL FIX: Use abs() for priority updates
+                    loss = (is_weights * (Q_expected - Q_targets).pow(2)).mean()
+                else:
+                    criterion = SmoothL1Loss()
+                    loss = criterion(Q_expected, Q_targets)
+                    td_errors = (Q_expected - Q_targets).abs()  # For consistency
+            forward_time = time.time() - forward_start
 
             # Calculate loss scaling for gradient accumulation
             accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
             loss = loss / accumulation_steps  # Scale loss for accumulation
             
             # Backward pass with mixed precision support
+            backward_start = time.time()
             if self.use_mixed_precision and self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
+            backward_time = time.time() - backward_start
             
             # Update gradient accumulation counter
             self._gradient_accumulation_counter += 1
             
             # Only step optimizer every N accumulation steps
             if self._gradient_accumulation_counter % accumulation_steps == 0:
+                optimizer_start = time.time()
                 if self.use_mixed_precision and self.scaler is not None:
                     # Gradient clipping with mixed precision
                     self.scaler.unscale_(self.optimizer)
@@ -668,26 +699,42 @@ class DQNAgent:
                     # Standard gradient clipping and optimization
                     torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
                     self.optimizer.step()
+                optimizer_time = time.time() - optimizer_start
+            else:
+                optimizer_time = 0
         
-        # Always update loss metrics (use unscaled loss for reporting)
-        metrics.losses.append((loss * accumulation_steps).item())
+            # Always update loss metrics (use unscaled loss for reporting)
+            metrics.losses.append((loss * accumulation_steps).item())
 
-        # PER: update priorities and track average
-        if use_per:
-            with torch.no_grad():
-                self.memory.update_priorities(indices, td_errors)
-            metrics.average_priority = self.memory.avg_priority
+            # PER: update priorities and track average
+            if use_per:
+                with torch.no_grad():
+                    self.memory.update_priorities(indices, td_errors)
+                metrics.average_priority = self.memory.avg_priority
 
-        # Only update target network and scheduler on actual optimizer steps
-        if self._gradient_accumulation_counter % accumulation_steps == 0:
-            # Soft target update if enabled (Polyak averaging every step)
-            if getattr(RL_CONFIG, 'use_soft_target', False):
-                tau = getattr(RL_CONFIG, 'tau', 0.005)
-                self.soft_update(tau)
+            # Only update target network and scheduler on actual optimizer steps
+            if self._gradient_accumulation_counter % accumulation_steps == 0:
+                # Soft target update if enabled (Polyak averaging every step)
+                if getattr(RL_CONFIG, 'use_soft_target', False):
+                    tau = getattr(RL_CONFIG, 'tau', 0.005)
+                    self.soft_update(tau)
 
-            # Step LR scheduler if enabled
-            if self.scheduler is not None:
-                self.scheduler.step()
+                # Step LR scheduler if enabled
+                if self.scheduler is not None:
+                    self.scheduler.step()
+            
+            total_time = time.time() - step_start
+            
+            # Print timing every 100 steps for debugging
+            if metrics.total_training_steps % 100 == 0:
+                print(f"Training step timing - Total: {total_time*1000:.1f}ms, "
+                      f"Sampling: {sampling_time*1000:.1f}ms, Forward: {forward_time*1000:.1f}ms, "
+                      f"Backward: {backward_time*1000:.1f}ms, Optimizer: {optimizer_time*1000:.1f}ms")
+                    
+        except Exception as e:
+            print(f"Training error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def update_target_network(self):
         """Update target network with weights from local network"""
@@ -698,18 +745,48 @@ class DQNAgent:
             tau = getattr(RL_CONFIG, 'tau', 0.005)
             self.soft_update(tau)
         else:
-            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+            # Handle cross-device state dict copying
+            local_state_dict = self.qnetwork_local.state_dict()
+            # Get device from first parameter
+            local_device = next(self.qnetwork_local.parameters()).device
+            target_device = next(self.qnetwork_target.parameters()).device
+            
+            if target_device != local_device:
+                # Move state dict to target device
+                target_state_dict = {}
+                for key, param in local_state_dict.items():
+                    target_state_dict[key] = param.to(target_device)
+                self.qnetwork_target.load_state_dict(target_state_dict)
+            else:
+                # Same device - direct load
+                self.qnetwork_target.load_state_dict(local_state_dict)
 
     def soft_update(self, tau: float = 0.005):
         """Soft-update target network parameters: θ_target = τ*θ_local + (1-τ)*θ_target"""
         with torch.no_grad():
             for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
-                target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+                # Handle cross-device parameter updates
+                if target_param.device != local_param.device:
+                    # Move local parameter to target device for computation
+                    local_data = local_param.data.to(target_param.device)
+                    target_param.data.copy_(tau * local_data + (1.0 - tau) * target_param.data)
+                else:
+                    # Same device - direct update
+                    target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+
+    def sync_inference_network(self):
+        """Synchronize inference network (CPU) with training updates"""
+        # This is called after training to ensure inference network has latest weights
+        # Since qnetwork_local is used for both inference and training, no sync needed
+        # Just ensure it's on the correct device for next inference
+        current_device = next(self.qnetwork_local.parameters()).device
+        if current_device != self.inference_device:
+            self.qnetwork_local = self.qnetwork_local.to(self.inference_device)
         
     def act(self, state, epsilon=0.0):
-        """Select action using epsilon-greedy policy"""
-        # Convert state to tensor
-        state = torch.from_numpy(state).float().unsqueeze(0).to(device)
+        """Select action using epsilon-greedy policy - optimized for parallel execution"""
+        # Convert state to tensor on inference device
+        state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         
         # Set evaluation mode
         self.qnetwork_local.eval()
@@ -735,9 +812,13 @@ class DQNAgent:
         # Save experience in replay memory
         self.memory.push(state, action, reward, next_state, done)
         
-        # Add training task to queue if not full
-        if not self.train_queue.full():
-            self.train_queue.put(True)
+        # AGGRESSIVE TRAINING: Queue multiple training requests per experience
+        # This ensures the GPU stays busy and we catch up on training backlog
+        for _ in range(3):  # Train 3x per experience for catch-up learning
+            try:
+                self.train_queue.put_nowait(True)
+            except queue.Full:
+                break  # Queue full - stop trying
             
     def save(self, filename):
         """Save model weights, rate-limited unless forced."""
@@ -882,6 +963,11 @@ class DQNAgent:
                 if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):
                     print(f"Resetting expert_ratio to start value per SERVER_CONFIG: {SERVER_CONFIG.expert_ratio_start}")
                     metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                # One-time flag to force expert ratio recalculation based on current training progress
+                if getattr(SERVER_CONFIG, 'force_expert_ratio_recalc', False):
+                    print(f"Force recalculating expert_ratio based on {metrics.frame_count:,} frames...")
+                    decay_expert_ratio(metrics.frame_count)
+                    print(f"Expert ratio recalculated to: {metrics.expert_ratio:.4f}")
                 if getattr(SERVER_CONFIG, 'reset_frame_count', False):
                     print("Resetting frame count/epsilon per SERVER_CONFIG.")
                     metrics.frame_count = 0
@@ -1316,8 +1402,9 @@ def decay_expert_ratio(current_step):
     if metrics.expert_mode:
         return metrics.expert_ratio
     
-    # Initialize to start value on very first call (frame 0) if not already set
-    if current_step == 0 and abs(metrics.expert_ratio - SERVER_CONFIG.expert_ratio_start) > 1e-6:
+    # DON'T auto-initialize to start value at frame 0 - respect loaded checkpoint values
+    # Only initialize if expert_ratio is somehow invalid (negative or > 1)
+    if current_step == 0 and (metrics.expert_ratio < 0 or metrics.expert_ratio > 1):
         metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
         metrics.last_decay_step = 0
         return metrics.expert_ratio
@@ -1326,13 +1413,12 @@ def decay_expert_ratio(current_step):
 
     # Only update if we've moved to a new interval
     if step_interval > metrics.last_decay_step:
-        metrics.last_decay_step = step_interval
-        if step_interval == 0:
-            # First interval - use starting value
-            metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
-        else:
-            # Apply decay
+        # Apply decay for each step we've advanced
+        steps_to_apply = step_interval - metrics.last_decay_step
+        for _ in range(steps_to_apply):
             metrics.expert_ratio *= SERVER_CONFIG.expert_ratio_decay
+        
+        metrics.last_decay_step = step_interval
 
         # Ensure we don't go below the minimum
         metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
