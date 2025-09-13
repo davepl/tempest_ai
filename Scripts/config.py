@@ -33,63 +33,40 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 176
-    # Optimized expert ratio for dense rewards - start higher, decay to lower end point
-    expert_ratio_start: float = 0.85  # Start higher with dense rewards (more guidance initially)
-    expert_ratio_min: float = 0.10   # End lower for more autonomous learning  
-    expert_ratio_decay: float = 0.9998  # Slightly slower decay for smoother transition
-    expert_ratio_decay_steps: int = 15000  # Faster step interval for quicker transition
+    # Expert ratio configuration - only used for brand new models
+    expert_ratio_start: float = 0.15  # Lower start value for new models (was 0.50)
+    expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
+    expert_ratio_decay: float = 0.9995 # Faster decay - 0.05% reduction per step (was 0.0001)
+    expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     reset_frame_count: bool = False
-    reset_expert_ratio: bool = True
+    reset_expert_ratio: bool = False  # Don't reset expert ratio on startup
+    force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
 # Create instance of ServerConfigData first
 SERVER_CONFIG = ServerConfigData()
 
 @dataclass
 class RLConfigData:
-    """Configuration for reinforcement learning"""
+    """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
-    action_size: int = 15  # Number of possible actions (from ACTION_MAPPING)
-    batch_size: int = 512
-    gamma: float = 0.995               # Higher gamma for dense rewards (better temporal credit assignment)
-    epsilon: float = 1.0
-    epsilon_start: float = 1.0
-    epsilon_end: float = 0.01
-    epsilon_min: float = 0.01
-    epsilon_decay_factor: float = 0.998 # Multiplicative factor per step (slower)
-    epsilon_decay_steps: int = 20000   # Frames per decay step (slower)
-    update_target_every: int = 500
-    learning_rate: float = 0.0008      # Higher LR for dense rewards (faster convergence on frequent signals)
-    memory_size: int = 500000          # Increased from 200k to 500k for more diverse experiences  
-    batch_size: int = 1024             # Increased from 512 to 1024 for better GPU utilization
-    save_interval: int = 50000
-    train_freq: int = 2                # Train every 2 frames instead of 1 (more conservative)
-    target_update: int = 5000          # More frequent target updates (was 10000)
-    n_step: int = 5                    # N-step return horizon for training
-    # Optional improvements (all off by default to preserve current behavior)
-    use_soft_target: bool = True            # If True, do Polyak averaging instead of hard copies
-    tau: float = 0.005                      # Soft target update factor (0,1]
-    use_noisy_nets: bool = True            # If True, replace some Linear layers with NoisyLinear
-    noisy_std_init: float = 0.5             # Initial sigma for NoisyLinear layers
-    use_lr_scheduler: bool = True           # If True, enable StepLR
-    scheduler_step_size: int = 100000       # Train steps between LR decays
-    scheduler_gamma: float = 0.5            # Multiplicative LR decay factor
-    # Architecture & replay upgrades
-    use_dueling: bool = True               # If True, use dueling value/advantage streams
-    use_per: bool = True                   # If True, use prioritized experience replay
-    per_alpha: float = 0.6                 # Increased for more aggressive prioritization
-    per_beta_start: float = 0.4            # Initial importance-sampling exponent
-    per_beta_frames: int = 300000          # Faster anneal to 1.0 for quicker stabilization
-    per_eps: float = 1e-6                  # Small epsilon to avoid zero priority
-    # Distributional (placeholder flags; not active yet)
-    use_distributional: bool = True        # Enable distributional Q (QR-DQN)
-    num_atoms: int = 32                    # Quantiles; 32 for better throughput
-    v_min: float = -10.0                   # Min value support
-    v_max: float = 10.0                    # Max value support
-    # Performance optimizations
-    gradient_accumulation_steps: int = 2   # Accumulate gradients over multiple batches
-    prefetch_factor: int = 4               # Number of batches to prefetch
-    num_workers: int = 2                   # DataLoader workers (if applicable)
-    use_mixed_precision: bool = False      # Disabled initially for stability
+    action_size: int = 18                 
+    batch_size: int = 512             # Reduced for faster sampling
+    lr: float = 7e-4                      # Adam learning rate
+    gamma: float = 0.99                   # Discount factor
+    epsilon: float = 1.0                  # Initial exploration rate
+    epsilon_start: float = 1.0            # Starting epsilon value
+    epsilon_min: float = 0.01             # Minimum exploration rate
+    epsilon_end: float = 0.01             # Final epsilon value (alias for epsilon_min)
+    epsilon_decay_steps: int = 200000     # Steps over which to decay epsilon
+    epsilon_decay_factor: float = 0.995   # Decay factor per step
+    memory_size: int = 1000000           # Replay buffer size
+    hidden_size: int = 1024               # Network hidden layer size  
+    target_update_freq: int = 400         # Target network update frequency  
+    update_target_every: int = 400        # Alias for target_update_freq
+    save_interval: int = 10000            # Model save frequency
+    use_noisy_nets: bool = True           # Use noisy networks for exploration
+    use_per: bool = False                 # Disabled - too slow
+    use_distributional: bool = False      # Disabled - too complex
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -308,7 +285,10 @@ ACTION_MAPPING = {
     11: (1, 0, 0.1),   # Soft right, fire, no zap
     12: (1, 0, 0.2),   # Medium right, fire, no zap
     13: (1, 0, 0.3),   # Hard right, fire, no zap
-    14: (1, 1, 0.0),   # Zap+Fire+Sit
+    14: (1, 1, 0.0),   # Zap+Fire+Center
+    15: (0, 1, -0.1),  # Zap+No fire+Soft left
+    16: (0, 1, 0.0),   # Zap+No fire+Center  
+    17: (0, 1, 0.1),   # Zap+No fire+Soft right
 }
 
 # Create instances of config classes
