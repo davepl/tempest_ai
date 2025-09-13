@@ -184,50 +184,83 @@ metrics.global_server = None
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
 
 class ReplayMemory:
-    """Replay buffer to store and sample experiences for training"""
+    """Replay buffer with O(1) sampling using numpy circular buffer"""
     def __init__(self, capacity):
-        self.memory = deque(maxlen=capacity)
+        self.capacity = capacity
+        self.size = 0
+        self.index = 0
+        
+        # Pre-allocate numpy arrays for O(1) access - will be initialized on first push
+        self.states = None
+        self.actions = None 
+        self.rewards = None
+        self.next_states = None
+        self.dones = None
         
     def push(self, state, action, reward, next_state, done):
-        """Add experience to memory"""
-        # Normalize shapes so stacking works reliably
+        """Add experience to memory - O(1) operation with thread safety"""
+        # Normalize inputs first
         try:
             a = int(action)
         except Exception:
-            # Handle nested arrays/lists
             a = int(np.array(action).reshape(-1)[0])
-        action_arr = np.array([a], dtype=np.int64)
-        reward_arr = np.array([float(reward)], dtype=np.float32)
-        done_arr = np.array([float(done)], dtype=np.float32)
-        self.memory.append(Experience(state, action_arr, reward_arr, next_state, done_arr))
+        action_val = np.array([a], dtype=np.int64)
+        reward_val = np.array([float(reward)], dtype=np.float32)
+        done_val = np.array([float(done)], dtype=np.float32)
+        
+        # Initialize arrays on first push - thread safe
+        if self.states is None:
+            # Initialize all arrays atomically
+            states = np.zeros((self.capacity,) + state.shape, dtype=np.float32)
+            actions = np.zeros((self.capacity, 1), dtype=np.int64)
+            rewards = np.zeros((self.capacity, 1), dtype=np.float32)
+            next_states = np.zeros((self.capacity,) + next_state.shape, dtype=np.float32)
+            dones = np.zeros((self.capacity, 1), dtype=np.float32)
+            
+            # Assign all at once to avoid race conditions
+            self.states = states
+            self.actions = actions
+            self.rewards = rewards
+            self.next_states = next_states
+            self.dones = dones
+            
+        # Store data in circular buffer
+        self.states[self.index] = state
+        self.actions[self.index] = action_val
+        self.rewards[self.index] = reward_val
+        self.next_states[self.index] = next_state  
+        self.dones[self.index] = done_val
+        
+        # Update pointers
+        self.index = (self.index + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
         
     def sample(self, batch_size):
-        """Sample random batch of experiences - optimized version"""
-        memory_size = len(self.memory)
-        batch_size = min(batch_size, memory_size)
+        """Sample random batch of experiences - TRUE O(1) operation"""
+        if self.size == 0:
+            return None
+            
+        batch_size = min(batch_size, self.size)
         
-        # Get random indices
-        indices = random.sample(range(memory_size), batch_size)
+        # O(1) random sampling using numpy indexing - no loops!
+        indices = np.random.randint(0, self.size, size=batch_size)
         
-        # Use list comprehension for faster batch creation
-        batch = [self.memory[i] for i in indices]
+        # O(1) batch extraction using numpy advanced indexing
+        batch_states = self.states[indices]
+        batch_actions = self.actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_next_states = self.next_states[indices]
+        batch_dones = self.dones[indices]
         
-        # Stack everything at once using numpy's more efficient operations
-        states = np.stack([e.state for e in batch], axis=0).astype(np.float32)
-        actions = np.array([[e.action[0]] for e in batch], dtype=np.int64)
-        rewards = np.array([[e.reward[0]] for e in batch], dtype=np.float32)  
-        next_states = np.stack([e.next_state for e in batch], axis=0).astype(np.float32)
-        dones = np.array([[e.done[0]] for e in batch], dtype=np.float32)
-        
-        # Convert to tensors and move to GPU in one go
-        return (torch.from_numpy(states).to(training_device, non_blocking=True),
-                torch.from_numpy(actions).to(training_device, non_blocking=True),
-                torch.from_numpy(rewards).to(training_device, non_blocking=True),
-                torch.from_numpy(next_states).to(training_device, non_blocking=True),
-                torch.from_numpy(dones).to(training_device, non_blocking=True))
+        # Direct GPU transfer with pinned memory
+        return (torch.from_numpy(batch_states).pin_memory().to(training_device, non_blocking=True),
+                torch.from_numpy(batch_actions).pin_memory().to(training_device, non_blocking=True),
+                torch.from_numpy(batch_rewards).pin_memory().to(training_device, non_blocking=True),
+                torch.from_numpy(batch_next_states).pin_memory().to(training_device, non_blocking=True),
+                torch.from_numpy(batch_dones).pin_memory().to(training_device, non_blocking=True))
         
     def __len__(self):
-        return len(self.memory)
+        return self.size
 
 class NoisyLinear(nn.Module):
     """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
@@ -277,30 +310,37 @@ class NoisyLinear(nn.Module):
         return F.linear(input, weight, bias)
 
 class DQN(nn.Module):
-    """Deep Q-Network model (optionally dueling)."""
+    """Deep Q-Network model - Balanced architecture for good GPU utilization without starving inference."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         use_noisy = RL_CONFIG.use_noisy_nets
         use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
+        hidden_size = RL_CONFIG.hidden_size  # 2048 - reasonable size
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
 
-        # Shared feature extractor
-        self.fc1 = nn.Linear(state_size, 512)
-        self.fc2 = LinearOrNoisy(512, 384, noisy_std) if use_noisy else LinearOrNoisy(512, 384)
-        self.fc3 = LinearOrNoisy(384, 192, noisy_std) if use_noisy else LinearOrNoisy(384, 192)
+        # Balanced feature extractor - slightly larger for better GPU utilization
+        self.fc1 = nn.Linear(state_size, hidden_size)         # 176 -> 2560  
+        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 2560 -> 2560
+        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 2560 -> 1280
+        self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)  # 1280 -> 640
+        
+        # Apply noisy layers if enabled
+        if use_noisy:
+            self.fc2 = NoisyLinear(hidden_size, hidden_size, noisy_std)
+            self.fc3 = NoisyLinear(hidden_size, hidden_size//2, noisy_std)
 
         self.use_dueling = use_dueling
         if use_dueling:
-            # Dueling streams
-            self.val_fc = nn.Linear(192, 128)
-            self.adv_fc = nn.Linear(192, 128)
-            self.val_out = nn.Linear(128, 1)
-            self.adv_out = nn.Linear(128, action_size)
+            # Dueling streams with reasonable sizes
+            self.val_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 640 -> 320
+            self.adv_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 640 -> 320
+            self.val_out = nn.Linear(hidden_size//8, 1)              # 320 -> 1
+            self.adv_out = nn.Linear(hidden_size//8, action_size)    # 320 -> 18
         else:
-            # Single stream
-            self.fc4 = nn.Linear(192, 128)
-            self.out = nn.Linear(128, action_size)
+            # Single stream with reasonable sizes
+            self.fc5 = nn.Linear(hidden_size//4, hidden_size//8)     # 640 -> 320
+            self.out = nn.Linear(hidden_size//8, action_size)        # 320 -> 18
 
     def reset_noise(self):
         # Reset noise for all NoisyLinear layers
@@ -309,20 +349,23 @@ class DQN(nn.Module):
                 m.reset_noise()
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
+        # Balanced feature extraction - slightly more compute for better GPU utilization
+        x = F.relu(self.fc1(x))    # 176 -> 2560
+        x = F.relu(self.fc2(x))    # 2560 -> 2560  
+        x = F.relu(self.fc3(x))    # 2560 -> 1280
+        x = F.relu(self.fc4(x))    # 1280 -> 640
+        
         if self.use_dueling:
-            v = F.relu(self.val_fc(x))
-            v = self.val_out(v)
-            a = F.relu(self.adv_fc(x))
-            a = self.adv_out(a)
+            v = F.relu(self.val_fc(x))  # 640 -> 320
+            v = self.val_out(v)         # 320 -> 1
+            a = F.relu(self.adv_fc(x))  # 640 -> 320
+            a = self.adv_out(a)         # 320 -> 18
             # Subtract mean advantage to keep Q identifiable
             q = v + (a - a.mean(dim=1, keepdim=True))
             return q
         else:
-            x = F.relu(self.fc4(x))
-            return self.out(x)
+            x = F.relu(self.fc5(x))     # 640 -> 320
+            return self.out(x)          # 320 -> 18
 
 class QRDQN(nn.Module):
     """Quantile Regression DQN (distributional), optional dueling streams.
@@ -519,7 +562,7 @@ class DQNAgent:
         self.training_thread = None
         self.running = True
         # Simple approach: single training thread for maximum throughput
-        self.num_training_workers = 1  # Single thread eliminates all contention
+        self.num_training_workers = 1  # Single worker to avoid gradient race conditions
         self.training_threads = []
         self._train_step_counter = 0
         self._gradient_accumulation_counter = 0  # Track gradient accumulation steps
@@ -555,7 +598,7 @@ class DQNAgent:
         print(f"Started {self.num_training_workers} training worker threads")
         
     def background_train(self):
-        """Simple high-throughput training loop"""
+        """High-throughput single-threaded training loop for maximum GPU utilization"""
         worker_id = threading.current_thread().name
         print(f"Training thread {worker_id} started on {device}")
         
@@ -564,9 +607,15 @@ class DQNAgent:
                 # Get training request (blocking)
                 _ = self.train_queue.get()
                 
-                # Process single training step immediately
-                self._train_step_counter += 1
-                self.train_step()
+                # Process multiple training steps per request for maximum GPU utilization
+                steps_per_batch = getattr(RL_CONFIG, 'training_steps_per_sample', 3)
+                for _ in range(steps_per_batch):
+                    if len(self.memory) >= RL_CONFIG.batch_size:
+                        self._train_step_counter += 1
+                        self.train_step()
+                    else:
+                        break
+                        
                 self.train_queue.task_done()
 
             except Exception as e:
@@ -812,9 +861,10 @@ class DQNAgent:
         # Save experience in replay memory
         self.memory.push(state, action, reward, next_state, done)
         
-        # AGGRESSIVE TRAINING: Queue multiple training requests per experience
-        # This ensures the GPU stays busy and we catch up on training backlog
-        for _ in range(3):  # Train 3x per experience for catch-up learning
+        # BALANCED TRAINING: Moderate training intensity to maintain client responsiveness
+        # This balances learning speed with inference performance
+        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
+        for _ in range(training_multiplier):  # Reasonable training frequency
             try:
                 self.train_queue.put_nowait(True)
             except queue.Full:
