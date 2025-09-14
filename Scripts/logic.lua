@@ -25,7 +25,7 @@ local OPEN_FLIPPER_REACT_DISTANCE = 1.10
 -- Retreat positions for open level flipper handling
 local RIGHT_RETREAT_SEGMENT = 1  -- retreat to segment 1 when flippers to the right
 local RIGHT_FIRE_SEGMENT = 0     -- move to segment 0 to fire when enemy is close
-local LEFT_RETREAT_SEGMENT = 15  -- retreat to segment 15 when flippers to the left  
+local LEFT_RETREAT_SEGMENT = 14  -- retreat to segment 15 when flippers to the left  
 local LEFT_FIRE_SEGMENT = 14     -- move to segment 14 to fire when enemy is close
 -- Pulsar target offset (segments away from pulsar when hunting/avoiding)
 local PULSAR_TARGET_DISTANCE = 2
