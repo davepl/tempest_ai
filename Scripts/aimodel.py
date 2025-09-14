@@ -1306,7 +1306,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         score = (score_high * 65536) + score_low
         
         state_data = memoryview(data)[header_size:]
-        # Parse as uint8 payload (299 bytes expected) then center/scale to [-1,1]
+        # Parse as uint8 payload then normalize based on encoding type
         try:
             vals_u8 = np.frombuffer(state_data, dtype=np.uint8, count=num_values)
         except ValueError as e:
@@ -1315,8 +1315,99 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         if vals_u8.size != num_values:
             print(f"ERROR: Expected {num_values} state values but got {vals_u8.size}", flush=True)
             sys.exit(1)
-        # Center to [-128,127] then scale to [-1,1]; 0..255 -> (-1..~1)
-        state = ((vals_u8.astype(np.float32) - 128.0) / 127.0).clip(-1.0, 1.0)
+        
+        # Mixed normalization based on Lua packing:
+        # - Natural 8-bit values (0-255): normalize to [0,1] via /255
+        # - Relative segments: INVALID=0→-1, valid [1,255]→[-1,+1] via (v-128)/127  
+        # - Booleans: 0→0, 255→1 via /255
+        # - Unit floats: [0,255]→[0,1] via /255
+        
+        # Define ranges for different encoding types (matching Lua packing order):
+        # Game state (5): natural u8
+        # Targeting (5): nearest_seg(rel), nearest_seg_dup(rel), depth(u8), aligned(bool), error_mag(unit)
+        # Player state (23): pos(u8), alive(u8), state(u8), depth(u8), zap_uses(u8), zap_active(u8), shot_count(u8), 
+        #                   shot_pos[8](u8), shot_seg[8](rel)  
+        # Level state (35): level_num(u8), level_type(u8), level_shape(u8), spike_heights[16](u8), level_angles[16](u8)
+        # Enemies state (16): all counts are natural u8
+        # Enemy info (42): all natural u8 flags/types
+        # Enemy segments (7): rel segments  
+        # Enemy depths (7): natural u8
+        # Top enemy segs (7): rel segments
+        # Enemy shot pos (4): natural u8
+        # Enemy shot segs (4): rel segments
+        # Charging fuseball segs (7): rel segments
+        # Active pulsar segs (7): rel segments  
+        # Top rail enemy segs (7): rel segments
+        
+        # Build mask for relative vs natural encoding
+        rel_indices = set()
+        idx = 0
+        
+        # Game state (5) - all natural
+        idx += 5
+        
+        # Targeting (5) - nearest_seg(rel), nearest_seg_dup(rel), depth(nat), aligned(bool→nat), error_mag(unit→nat)
+        rel_indices.update([idx, idx+1])  # nearest_seg, nearest_seg_dup
+        idx += 5
+        
+        # Player state (23) - shot_seg[8] are relative at indices [15:23]
+        shot_seg_start = idx + 15  # pos(1) + alive(1) + state(1) + depth(1) + zap_uses(1) + zap_active(1) + shot_count(1) + shot_pos[8](8) = 15
+        rel_indices.update(range(shot_seg_start, shot_seg_start + 8))
+        idx += 23
+        
+        # Level state (35) - all natural
+        idx += 35
+        
+        # Enemies state (16) - all natural  
+        idx += 16
+        
+        # Enemy info (42) - all natural
+        idx += 42
+        
+        # Enemy segments (7) - all relative
+        rel_indices.update(range(idx, idx + 7))
+        idx += 7
+        
+        # Enemy depths (7) - all natural
+        idx += 7
+        
+        # Top enemy segs (7) - all relative
+        rel_indices.update(range(idx, idx + 7))
+        idx += 7
+        
+        # Enemy shot pos (4) - all natural
+        idx += 4
+        
+        # Enemy shot segs (4) - all relative  
+        rel_indices.update(range(idx, idx + 4))
+        idx += 4
+        
+        # Charging fuseball segs (7) - all relative
+        rel_indices.update(range(idx, idx + 7))
+        idx += 7
+        
+        # Active pulsar segs (7) - all relative
+        rel_indices.update(range(idx, idx + 7))
+        idx += 7
+        
+        # Top rail enemy segs (7) - all relative
+        rel_indices.update(range(idx, idx + 7))
+        idx += 7
+        
+        # Apply mixed normalization
+        state = np.zeros(vals_u8.shape, dtype=np.float32)
+        for i in range(len(vals_u8)):
+            if i in rel_indices:
+                # Relative encoding: 0=INVALID→-1, [1,255]→[-1,+1] via (v-128)/127
+                if vals_u8[i] == 0:
+                    state[i] = -1.0  # INVALID
+                else:
+                    state[i] = (vals_u8[i] - 128.0) / 127.0
+            else:
+                # Natural encoding: [0,255]→[0,1] via /255
+                state[i] = vals_u8[i] / 255.0
+        
+        state = np.clip(state, -1.0, 1.0)
         
         frame_data = FrameData(
             state=state,
@@ -1391,35 +1482,44 @@ def display_metrics_row(agent, kb=None):
     print_with_terminal_restore(kb, row)
 
 def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
-    """Calculate expert-guided action based on game state and Lua recommendations"""
+    """Expert policy to move toward nearest enemy with neutral tie-breaker.
+    Returns (fire, zap, spinner)
+    """
     # Check for INVALID_SEGMENT (-32768) which indicates no valid target (like during tube transitions)
     if enemy_seg == -32768:  # INVALID_SEGMENT
         return expert_fire, expert_zap, 0  # Use Lua's recommendations with no movement
-        
-    # Convert absolute segments to relative distance
+
+    # Normalize to ring indices
+    enemy_seg = int(enemy_seg) % 16
+    player_seg = int(player_seg) % 16
+
+    # Compute signed shortest distance with neutral tie-break at exactly 8
     if is_open_level:
-        # Open level: direct distance calculation (-15 to +15)
+        # Open level: direct arithmetic distance; treat exact 8 as neutral tie
         relative_dist = enemy_seg - player_seg
+        if abs(relative_dist) == 8:
+            relative_dist = 8 if random.random() < 0.5 else -8
     else:
-        # Closed level: find shortest path around the circle (-7 to +8)
         clockwise = (enemy_seg - player_seg) % 16
         counter = (player_seg - enemy_seg) % 16
-        if clockwise <= 8:
-            relative_dist = clockwise  # Move clockwise
+        if clockwise < 8:
+            relative_dist = clockwise
+        elif counter < 8:
+            relative_dist = -counter
         else:
-            relative_dist = -counter  # Move counter-clockwise
+            # Tie (8 vs 8)
+            relative_dist = 8 if random.random() < 0.5 else -8
 
     if relative_dist == 0:
-        return expert_fire, expert_zap, 0  # Use Lua's recommendations when aligned
-        
+        return expert_fire, expert_zap, 0  # No movement needed
+
     # Calculate intensity based on distance
     distance = abs(relative_dist)
     intensity = min(0.9, 0.3 + (distance * 0.05))  # Match Lua intensity calculation
-    
+
     # For positive relative_dist (need to move clockwise), use negative spinner
     spinner = -intensity if relative_dist > 0 else intensity
-    
-    # Always use Lua's recommendations for fire/zap
+
     return expert_fire, expert_zap, spinner
 
 def expert_action_to_index(fire, zap, spinner):
