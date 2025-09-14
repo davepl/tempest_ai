@@ -23,10 +23,9 @@ local START_ADVANCED          = true
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
-local SOCKET_READ_TIMEOUT_S   = 1.5  -- Increased from 0.5 to 1.5 (3x increase)
+local SOCKET_READ_TIMEOUT_S   = 3.5  -- Increased from 0.5 to 3.5 (7x increase)
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
--- local CHEAT_START_LEVEL       = 17 -- Optional: uncomment to force start level
 
 -- MAME Interface Globals (initialized later)
 local mainCpu                 = nil
@@ -179,146 +178,169 @@ local controls = nil -- Initialized after MAME interface confirmed
 local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
     local insert = table.insert -- Local alias for performance
 
-    -- Helpers for 8-bit payload packing
+    -- Helpers for normalized float32 packing - much cleaner approach!
     local function clamp(v, lo, hi)
         if v < lo then return lo elseif v > hi then return hi else return v end
     end
-    local function push_u8(parts, v)
-        local n = clamp(tonumber(v) or 0, 0, 255)
-        insert(parts, string.pack(">B", n))
+    
+    local function push_float32(parts, v)
+        local val = tonumber(v) or 0.0
+        insert(parts, string.pack(">f", val))  -- Big-endian float32
         return 1
     end
-    -- Map relative/signed values to centered uint8. Reserve 0 as INVALID.
+    
+    -- Normalize natural 8-bit values [0,255] to [0,1]
+    local function push_natural_norm(parts, v)
+        local val = clamp(tonumber(v) or 0, 0, 255) / 255.0
+        return push_float32(parts, val)
+    end
+    
+    -- Normalize relative segments with proper Tempest range handling
     local INVALID_SEGMENT = state_defs.INVALID_SEGMENT or -32768
-    local function push_rel_u8(parts, v)
+    local function push_relative_norm(parts, v)
         local num = tonumber(v) or 0
         if num == INVALID_SEGMENT then
-            insert(parts, string.pack(">B", 0))
-            return 1
+            return push_float32(parts, -1.0)  -- INVALID sentinel
         end
-        -- Center around 128, clamp safe range [-127,127] -> [1,255]
-        local centered = clamp(num, -127, 127) + 128
-        insert(parts, string.pack(">B", centered))
-        return 1
+        -- Clamp to actual Tempest range and normalize to [-1,+1]
+        local clamped = clamp(num, -15, 15)
+        local normalized = clamped / 15.0  -- [-15,+15] → [-1,+1]
+        return push_float32(parts, normalized)
     end
-    local function push_bool255(parts, cond)
-        return push_u8(parts, cond and 255 or 0)
+    
+    -- Normalize boolean to [0,1]
+    local function push_bool_norm(parts, v)
+        local val = v and 1.0 or 0.0
+        return push_float32(parts, val)
     end
-    local function push_unit_float(parts, f)
-        local val = tonumber(f) or 0.0
-        if val < 0 then val = 0 elseif val > 1 then val = 1 end
-        return push_u8(parts, math.floor(val * 255.0 + 0.5))
+    
+    -- Normalize unit float [0,1] (already normalized)
+    local function push_unit_norm(parts, v)
+        local val = clamp(tonumber(v) or 0, 0.0, 1.0)
+        return push_float32(parts, val)
     end
 
     local binary_data_parts = {}
     local num_values_packed = 0
 
-    -- Game state (5)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, gs.gamestate)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, gs.game_mode)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, gs.countdown_timer)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, gs.p1_lives)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, gs.p1_level)
+    -- Game state (5) - all natural values
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.gamestate)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.game_mode)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.countdown_timer)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_lives)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_level)
 
     -- Targeting / Engineered Features (5)
-    num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.nearest_enemy_seg)
-    num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.nearest_enemy_seg)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.nearest_enemy_depth_raw)
-    num_values_packed = num_values_packed + push_bool255(binary_data_parts, es.is_aligned_with_nearest > 0)
-    num_values_packed = num_values_packed + push_unit_float(binary_data_parts, es.alignment_error_magnitude)
+    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
+    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.nearest_enemy_depth_raw)
+    num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, es.is_aligned_with_nearest > 0)
+    num_values_packed = num_values_packed + push_unit_norm(binary_data_parts, es.alignment_error_magnitude)
 
     -- Player state (7 + 8 + 8 = 23)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.position)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.alive)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.player_state)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.player_depth)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.superzapper_uses)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.superzapper_active)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.shot_count)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.position)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.alive)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_state)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_depth)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_uses)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.shot_count)
     for i = 1, 8 do
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, ps.shot_positions[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.shot_positions[i])
     end
     for i = 1, 8 do
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, ps.shot_segments[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i])
     end
 
-    -- Level state (3 + 16 + 16 = 35)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ls.level_number)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ls.level_type)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, ls.level_shape)
+    -- Level state (3 + 16 + 16 = 35) - all natural values
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_number)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_type)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_shape)
     for i = 0, 15 do
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, ls.spike_heights[i] or 0)
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.spike_heights[i] or 0)
     end
     for i = 0, 15 do
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, ls.level_angles[i] or 0)
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_angles[i] or 0)
     end
 
-    -- Enemies state (counts: 10 + other: 6 = 16)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.active_flippers)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.active_pulsars)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.active_tankers)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.active_spikers)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.active_fuseballs)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.spawn_slots_flippers)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.spawn_slots_pulsars)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.spawn_slots_tankers)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.spawn_slots_spikers)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.spawn_slots_fuseballs)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.num_enemies_in_tube)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.num_enemies_on_top)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemies_pending)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.pulsar_fliprate)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.pulse_beat)
-    num_values_packed = num_values_packed + push_u8(binary_data_parts, es.pulsing)
+    -- Enemies state (counts: 10 + other: 6 = 16) - all natural values
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_flippers)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_pulsars)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_tankers)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_spikers)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_fuseballs)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_flippers)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_pulsars)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_tankers)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_spikers)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_fuseballs)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.num_enemies_in_tube)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.num_enemies_on_top)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemies_pending)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsar_fliprate)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulse_beat)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsing)
 
-    -- Decoded Enemy Info (7 * 6 = 42)
+    -- Decoded Enemy Info (7 * 6 = 42) - all natural values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_core_type[i])
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_direction_moving[i])
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_between_segments[i])
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_moving_away[i])
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_can_shoot[i])
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_split_behavior[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_core_type[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_direction_moving[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_between_segments[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_moving_away[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_can_shoot[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_split_behavior[i])
     end
 
-    -- Enemy segments (7)
+    -- Enemy segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.enemy_segments[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i])
     end
-    -- Enemy depths (7)
+    -- Enemy depths (7) - natural values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.enemy_depths[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_depths[i])
     end
-    -- Top Enemy Segments (7)
+    -- Top Enemy Segments (7) - relative values
     for i = 1, 7 do
         local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, seg)
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
     end
-    -- Enemy shot positions (4)
+    -- Enemy shot positions (4) - natural values
     for i = 1, 4 do
-        num_values_packed = num_values_packed + push_u8(binary_data_parts, es.shot_positions[i])
+        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.shot_positions[i])
     end
-    -- Enemy shot segments (4)
+    -- Enemy shot segments (4) - relative values
     for i = 1, 4 do
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.enemy_shot_segments[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_shot_segments[i])
     end
-    -- Charging Fuseball segments (7 entries showing relative segment to player for each charging fuseball)
+    -- Charging Fuseball segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.charging_fuseball[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.charging_fuseball[i])
     end
-    -- Active Pulsar segments (7 entries showing relative segment to player for each pulsar)
+    -- Active Pulsar segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.active_pulsar[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_pulsar[i])
     end
-    -- Top Rail Enemy segments (7 entries showing relative segment to player for each top rail pulsar/flipper)
+    -- Top Rail Enemy segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.active_top_rail_enemies[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
     end
 
-    -- Total main payload size: 5+5+23+35+16+42+7+7+7+4+4+7+7+7 = 176
+    -- Total main payload size: 176 float32 values = 176 * 4 = 704 bytes
 
-    -- Serialize main data to binary string (unsigned 8-bit values)
+    -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
+
+    -- VALIDATION: Debug print to verify key segment encodings (first few frames only)
+    if gs.frame_counter < 5 then
+        print(string.format("[DEBUG] Frame %d: Nearest enemy seg=%.3f, Player shot segs=[%.3f,%.3f,%.3f,%.3f]",
+            gs.frame_counter,
+            (es.nearest_enemy_seg == INVALID_SEGMENT) and -1.0 or (es.nearest_enemy_seg / 15.0),
+            (ps.shot_segments[1] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[1] / 15.0),
+            (ps.shot_segments[2] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[2] / 15.0),
+            (ps.shot_segments[3] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[3] / 15.0),
+            (ps.shot_segments[4] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[4] / 15.0)
+        ))
+    end
 
     -- --- OOB Data Packing ---
     local is_attract_mode = (gs.game_mode & 0x80) == 0
@@ -379,7 +401,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Combine OOB header + main data
     local final_data = oob_data .. binary_data
 
-    -- DEBUG: Length sanity (approx): OOB ~56 bytes, Main=176 bytes -> Total ~232 bytes
+    -- DEBUG: Updated length info for float32 payload: OOB ~56 bytes, Main=704 bytes -> Total ~760 bytes  
     -- print(string.format("Packed lengths: OOB~%d, Main=%d, Total=%d, Num values: %d", 56, #binary_data, #final_data, num_values_packed))
 
     return final_data, num_values_packed

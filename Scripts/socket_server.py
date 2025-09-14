@@ -53,30 +53,7 @@ class SocketServer:
         self.client_states = {}  # Dictionary to store per-client state
         self.client_lock = threading.Lock()  # Lock for client dictionaries
         self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
-        # Precompute mask of indices where 0-byte means INVALID sentinel (relative segment fields)
-        try:
-            n = RL_CONFIG.state_size
-            mask = np.zeros((n,), dtype=bool)
-            # Build ranges per Lua packing order (0-based indices)
-            # Targeting rel: [5,6]
-            mask[5:7] = True
-            # Player shot_segments: [25..32]
-            mask[25:33] = True
-            # Enemy segments: [126..132]
-            mask[126:133] = True
-            # Top enemy segments: [140..146]
-            mask[140:147] = True
-            # Enemy shot segments: [151..154]
-            mask[151:155] = True
-            # Charging fuseball segments: [155..161]
-            mask[155:162] = True
-            # Active pulsar segments: [162..168]
-            mask[162:169] = True
-            # Top rail enemies: [169..175]
-            mask[169:176] = True
-            self._rel_invalid_mask = mask
-        except Exception:
-            self._rel_invalid_mask = None
+        # SIMPLIFIED: No longer need complex segment masking with float32 normalization
         
     def start(self):
         """Start the socket server"""
@@ -353,11 +330,8 @@ class SocketServer:
                             s_std = float(np.std(s))
                             s_min = float(np.min(s))
                             s_max = float(np.max(s))
-                            if self._rel_invalid_mask is not None:
-                                rel_vals = s[self._rel_invalid_mask]
-                                invalid_frac = float(np.mean((rel_vals <= -0.999).astype(np.float32)))
-                            else:
-                                invalid_frac = float(np.mean((s <= -0.999).astype(np.float32)))
+                            # SIMPLIFIED: With float32 normalization, invalid values are handled in Lua
+                            invalid_frac = float(np.mean((s <= -0.999).astype(np.float32)))
                             with self.metrics.lock:
                                 self.metrics.state_mean = s_mean
                                 self.metrics.state_std = s_std
