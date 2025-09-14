@@ -34,12 +34,13 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 176
     # Expert ratio configuration - only used for brand new models
-    expert_ratio_start: float = 0.15  # Lower start value for new models (was 0.50)
+    expert_ratio_start: float = 0.10  # Lower start value for new models (was 0.50)
     expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
-    expert_ratio_decay: float = 0.9995 # Faster decay - 0.05% reduction per step (was 0.0001)
+    expert_ratio_decay: float = 0.99995 # Faster decay - 0.05% reduction per step (was 0.0001)
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     reset_frame_count: bool = False
     reset_expert_ratio: bool = False  # Don't reset expert ratio on startup
+    reset_epsilon: bool = False     # One-time flag to reset epsilon on startup (set back to False after first run)
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
 # Create instance of ServerConfigData first
@@ -53,10 +54,10 @@ class RLConfigData:
     batch_size: int = 8192            # Modestly higher batch size to increase GPU utilization (was 6144)
     lr: float = 8.0e-4                    # Reduced for more stable learning (was 1.2e-3)
     gamma: float = 0.99                   # Discount factor
-    epsilon: float = 1.0                  # Initial exploration rate
-    epsilon_start: float = 1.0            # Starting epsilon value
-    epsilon_min: float = 0.01             # Minimum exploration rate
-    epsilon_end: float = 0.01             # Final epsilon value (alias for epsilon_min)
+    epsilon: float = 0.25                 # Initial exploration rate
+    epsilon_start: float = 0.25           # Starting epsilon value
+    epsilon_min: float = 0.05             # Minimum exploration rate
+    epsilon_end: float = 0.05             # Final epsilon value (alias for epsilon_min)
     epsilon_decay_steps: int = 25000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.98   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 1000000           # Replay buffer size

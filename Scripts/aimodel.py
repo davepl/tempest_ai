@@ -126,6 +126,7 @@ class FrameData:
     reward: float
     action: Tuple[bool, bool, float]  # fire, zap, spinner
     mode: int
+    gamestate: int    # Added: Game state value from Lua
     done: bool
     attract: bool
     save_signal: bool
@@ -151,6 +152,7 @@ class FrameData:
             reward=data["reward"],
             action=data["action"],
             mode=data["mode"],
+            gamestate=data.get("gamestate", 0),  # Default to 0 if not provided
             done=data["done"],
             attract=data["attract"],
             save_signal=data["save_signal"],
@@ -1020,6 +1022,10 @@ class DQNAgent:
                 if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):
                     print(f"Resetting expert_ratio to start value per SERVER_CONFIG: {SERVER_CONFIG.expert_ratio_start}")
                     metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                if getattr(SERVER_CONFIG, 'reset_epsilon', False):
+                    print(f"Resetting epsilon to start value per SERVER_CONFIG: {RL_CONFIG.epsilon_start}")
+                    metrics.epsilon = RL_CONFIG.epsilon_start
+                    metrics.last_epsilon_decay_step = 0
                 # One-time flag to force expert ratio recalculation based on current training progress
                 if getattr(SERVER_CONFIG, 'force_expert_ratio_recalc', False):
                     print(f"Force recalculating expert_ratio based on {metrics.frame_count:,} frames...")
@@ -1296,7 +1302,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
 
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
-        (num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low,
+        (num_values, reward, gamestate, game_mode, done, frame_counter, score_high, score_low,
          save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
          expert_fire, expert_zap, level_number,
          rc_safety, rc_proximity, rc_shots, rc_threats, rc_pulsar, rc_score) = values
@@ -1414,6 +1420,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             reward=reward,
             action=(bool(fire), bool(zap), spinner),
             mode=game_mode,
+            gamestate=gamestate,        # Added: Include gamestate from OOB header
             done=bool(done),
             attract=bool(is_attract),
             save_signal=bool(save_signal),

@@ -344,14 +344,14 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Pack OOB data (extended with 6 floats for reward components at the end)
     -- Format legend:
     --   >HdBBBHHHBBBhBhBBBBBffffff
-    --   H: num_values, d: reward, BBB: (placeholder, game_mode, done), HHH: (frame, score_hi, score_lo),
+    --   H: num_values, d: reward, BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
     --   BBB: (save, fire, zap), h: spinner, B: attract, h: expert_target_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number, ffffff: (rc_safety, rc_proximity, rc_shots, rc_threats, rc_pulsar, rc_score)
     local oob_format = ">HdBBBHHHBBBhBhBBBBBffffff"
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
-        0,                          -- B: Placeholder (uchar)
+        gs.gamestate,               -- B: Gamestate (uchar) - was placeholder
         gs.game_mode,               -- B: Game Mode (uchar)
         bDone and 1 or 0,           -- B: Done flag (uchar)
         frame,                      -- H: Frame counter (ushort)
