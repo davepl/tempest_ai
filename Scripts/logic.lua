@@ -82,9 +82,17 @@ function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment,
         return target_abs_segment - current_abs_segment
     else
         local diff = target_abs_segment - current_abs_segment
-        if diff > 8 then return diff - 16
-        elseif diff <= -8 then return diff + 16
-        else return diff end
+        -- Wrap into [-8, +8] range, but treat exact ties (±8) neutrally
+        if diff > 8 then
+            diff = diff - 16
+        elseif diff < -8 then
+            diff = diff + 16
+        end
+        -- Neutral tie-breaker: if exactly opposite (distance 8), randomly pick direction
+        if diff == 8 or diff == -8 then
+            diff = (math.random() < 0.5) and 8 or -8
+        end
+        return diff
     end
 end
 
@@ -955,6 +963,32 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
             reward = reward + pulsar_reward
             reward_components.pulsar = reward_components.pulsar + pulsar_reward
+
+            -- 6. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
+            -- Apply a small penalty when spinning while already aligned (or no target)
+            -- and not in immediate danger. Keeps behavior calm instead of fidgety.
+            do
+                local spin_delta = math.abs(tonumber(player_state.spinner_detected or 0))
+                if spin_delta > 0 then
+                    local player_abs_seg2 = player_state.position & 0x0F
+                    local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
+                    local is_open2 = (level_state.level_type == 0xFF)
+                    local need_move = false
+                    if nearest_abs ~= -1 then
+                        local rel = abs_to_rel_func(player_abs_seg2, nearest_abs, is_open2)
+                        need_move = math.abs(rel) > 1 -- require movement if more than one segment off
+                    end
+                    local in_danger = M.is_danger_lane(player_abs_seg2, enemies_state)
+                    if not need_move and not in_danger then
+                        -- Scale a gentle penalty with movement magnitude, capped
+                        local units = math.min(4, spin_delta)
+                        local move_penalty = -0.0008 * units
+                        reward = reward + move_penalty
+                        -- Attribute to proximity shaping bucket for metrics
+                        reward_components.proximity = reward_components.proximity + move_penalty
+                    end
+                end
+            end
         end
     end
 
