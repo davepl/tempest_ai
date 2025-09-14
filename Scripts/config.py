@@ -51,7 +51,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     batch_size: int = 6144            # Increase batch size moderately (was 4096)
-    lr: float = 1.2e-3                    # Slightly higher LR for larger batch
+    lr: float = 8.0e-4                    # Reduced for more stable learning (was 1.2e-3)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 1.0                  # Initial exploration rate
     epsilon_start: float = 1.0            # Starting epsilon value
@@ -232,6 +232,7 @@ class MetricsData:
             for component, value in components.items():
                 if component in self.reward_component_history:
                     self.reward_component_history[component].append(value)
+            # Note: components may come from Lua OOB header (preferred) or Python fallback
     
     def get_reward_component_averages(self) -> Dict[str, float]:
         """Get recent averages of reward components"""
