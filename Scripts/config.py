@@ -32,7 +32,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 299
+    params_count: int = 176
     # Expert ratio configuration - only used for brand new models
     expert_ratio_start: float = 0.15  # Lower start value for new models (was 0.50)
     expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
@@ -123,6 +123,12 @@ class MetricsData:
         'score': deque(maxlen=100),
         'total': deque(maxlen=100)
     })
+    # State summary stats (rolling)
+    state_mean: float = 0.0
+    state_std: float = 0.0
+    state_min: float = 0.0
+    state_max: float = 0.0
+    state_invalid_frac: float = 0.0  # Fraction of entries equal to -1.0 (our invalid sentinel)
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""

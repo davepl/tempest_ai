@@ -20,7 +20,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 -- Constants
 local SHOW_DISPLAY            = true
 local START_ADVANCED          = true
-local START_LEVEL_MIN         = 17
+local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
 local SOCKET_READ_TIMEOUT_S   = 1.5  -- Increased from 0.5 to 1.5 (3x increase)
@@ -315,7 +315,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         num_values_packed = num_values_packed + push_rel_u8(binary_data_parts, es.active_top_rail_enemies[i])
     end
 
-    -- Total main payload size should be: 5+5+23+35+16+42+7+7+7+4+4+7+7+7 = 299
+    -- Total main payload size: 5+5+23+35+16+42+7+7+7+4+4+7+7+7 = 176
 
     -- Serialize main data to binary string (unsigned 8-bit values)
     local binary_data = table.concat(binary_data_parts)
@@ -379,10 +379,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Combine OOB header + main data
     local final_data = oob_data .. binary_data
 
-    -- DEBUG: Verify length (OOB=30 bytes, Main=299*2=598 bytes -> Total=628)
-    -- if #final_data ~= 628 then
-    --     print(string.format("WARNING: Packed data length mismatch! Expected 628, got %d. Num values: %d", #final_data, num_values_packed))
-    -- end
+    -- DEBUG: Length sanity (approx): OOB ~56 bytes, Main=176 bytes -> Total ~232 bytes
+    -- print(string.format("Packed lengths: OOB~%d, Main=%d, Total=%d, Num values: %d", 56, #binary_data, #final_data, num_values_packed))
 
     return final_data, num_values_packed
 end
