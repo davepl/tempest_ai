@@ -73,7 +73,7 @@ def display_metrics_header():
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11} {'Training Stats':>15}"
+        f"{'AvgInf(ms)':>11} {'Training Stats':>15} {'Data Health':>12}"
     )
 
     # Conditionally append reward component headers (without Pulsar)
@@ -138,6 +138,12 @@ def display_metrics_row(agent, kb_handler):
     # Format training stats: Memory/TrainSteps/Rate/TargetAge
     training_stats = f"{metrics.memory_buffer_size//1000}k/{metrics.total_training_steps}/{train_rate:.1f}/{frames_since_target_update//1000}k"
 
+    # Data health metrics for float32 validation
+    data_health = "N/A"
+    if hasattr(metrics, 'state_min') and hasattr(metrics, 'state_max') and hasattr(metrics, 'state_invalid_frac'):
+        # Format: "min/max/invalid%" - compact but informative
+        data_health = f"{metrics.state_min:.2f}/{metrics.state_max:.2f}/{metrics.state_invalid_frac*100:.0f}%"
+
     # Base row text
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} "
@@ -147,7 +153,7 @@ def display_metrics_row(agent, kb_handler):
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
         f"{avg_inference_time_ms:>11.2f} "
-        f"{training_stats:>15}"
+        f"{training_stats:>15} {data_health:>12}"
     )
 
     # Conditionally append reward component values (without Pulsar)

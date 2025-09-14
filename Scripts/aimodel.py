@@ -1332,12 +1332,12 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print(f"ERROR: Expected {num_values} state values but got {state.size}", flush=True)
             sys.exit(1)
 
-        # VALIDATION: Debug print to verify decoding matches Lua (first few frames only)  
-        if frame_counter < 5:
-            print(f"[DEBUG] Frame {frame_counter}: Python received - "
-                  f"Nearest enemy seg[5]={state[5]:.3f}, "
-                  f"Player shot segs[25-28]=[{state[25]:.3f},{state[26]:.3f},{state[27]:.3f},{state[28]:.3f}]", 
-                  flush=True)
+        # CRITICAL: Check for NaN/Inf values that would cause training instability
+        nan_count = np.sum(np.isnan(state))
+        inf_count = np.sum(np.isinf(state))
+        if nan_count > 0 or inf_count > 0:
+            print(f"[CRITICAL] Frame {frame_counter}: {nan_count} NaN values, {inf_count} Inf values detected! "
+                  f"This will cause training instability!", flush=True)
 
         # Ensure all values are in expected range [-1, 1] with warnings for issues
         out_of_range_count = np.sum((state < -1.001) | (state > 1.001))
