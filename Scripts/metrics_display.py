@@ -63,7 +63,9 @@ def _should_show_reward_columns() -> Dict[str, bool]:
 
 def display_metrics_header():
     """Display the header for metrics output"""
-    # Clear screen first
+    row_counter = 0
+    # Track last header configuration to reprint header when columns change
+    _last_show_reward_cols: bool | None = None
     # clear_screen()
     
     # Base header
@@ -92,6 +94,7 @@ def display_metrics_header():
 def display_metrics_row(agent, kb_handler):
     """Display a row of metrics data"""
     global row_counter
+    global _last_show_reward_cols
     
     # Check if we need to print the header (every 30th row)
     if row_counter > 0 and row_counter % 30 == 0:
