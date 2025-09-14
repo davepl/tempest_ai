@@ -23,8 +23,8 @@ local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerou
 -- Open-level tuning: react slightly sooner to top-rail flippers using fractional distance
 local OPEN_FLIPPER_REACT_DISTANCE = 1.10
 -- Retreat positions for open level flipper handling
-local RIGHT_RETREAT_SEGMENT = 0  -- retreat to segment 1 when flippers to the right
-local LEFT_RETREAT_SEGMENT = 14  -- retreat to segment 14 when flippers to the left  
+local RIGHT_RETREAT_SEGMENT = 1  -- retreat to segment 1 when flippers to the right
+local LEFT_RETREAT_SEGMENT = 13  -- retreat to segment 14 when flippers to the left  
 -- Pulsar target offset (segments away from pulsar when hunting/avoiding)
 local PULSAR_TARGET_DISTANCE = 2
 -- Optional: Conserve fire mode (hold fire/movement until react distance)
