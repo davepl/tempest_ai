@@ -14,7 +14,8 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 local TOP_RAIL_DEPTH = 0x15
 local SAFE_DISTANCE = 1
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
-local FLIPPER_REACT_DISTANCE = 1 -- distance at which we move one segment and fire
+local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
+local FLIPPER_REACT_DISTANCE_L = 2.0 -- distance at which we move one segment and fire (left-side, float)
 local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 3
@@ -23,7 +24,7 @@ local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerou
 local OPEN_FLIPPER_REACT_DISTANCE = 1.10
 -- Retreat positions for open level flipper handling
 local RIGHT_RETREAT_SEGMENT = 1  -- retreat to segment 1 when flippers to the right
-local RIGHT_FIRE_SEGMENT = 2     -- move to segment 2 to fire when enemy is close
+local RIGHT_FIRE_SEGMENT = 0     -- move to segment 0 to fire when enemy is close
 local LEFT_RETREAT_SEGMENT = 15  -- retreat to segment 15 when flippers to the left  
 local LEFT_FIRE_SEGMENT = 14     -- move to segment 14 to fire when enemy is close
 -- Pulsar target offset (segments away from pulsar when hunting/avoiding)
@@ -691,20 +692,24 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 end
             end
     elseif not conserve_override_active and enemy_right_exists then
-            -- Case 2: Right Only - Retreat to segment 1, wait for enemy within distance, then move one segment and fire
+            -- Case 2: Right Only - Retreat to segment 1, wait for enemy within distance, then move to segment 0 and fire
             if is_open then 
-                -- Proper retreat-wait-move-fire strategy for open levels with integer distance
-                local nr_dist_int = math.floor(nr_dist_float + 0.5) -- Round to nearest integer
-                if nr_dist_int <= FLIPPER_REACT_DISTANCE then
-                    -- Enemy is close (within react distance), move to fire segment and fire
+                -- Proper retreat-wait-move-fire strategy for open levels with floating-point distance
+                if nr_dist_float <= FLIPPER_REACT_DISTANCE_R then
+                    -- Enemy is close (within react distance), move to segment 0 and fire aggressively
                     proposed_target_seg = RIGHT_FIRE_SEGMENT
-                    proposed_fire_prio = FREEZE_FIRE_PRIO_HIGH -- High priority fire
-                elseif nr_dist_int <= FLIPPER_WAIT_DISTANCE then
-                    -- Enemy is within waiting distance, retreat and wait
+                    -- Only fire with high priority if we're already at the firing position
+                    if player_abs_seg == RIGHT_FIRE_SEGMENT then
+                        proposed_fire_prio = 15 -- Very high priority to override safety checks
+                    else
+                        proposed_fire_prio = 1 -- Move to position first, don't fire while moving
+                    end
+                elseif nr_dist_float <= FLIPPER_WAIT_DISTANCE then
+                    -- Enemy is within waiting distance, retreat to segment 1 and wait
                     proposed_target_seg = RIGHT_RETREAT_SEGMENT
-                    proposed_fire_prio = FREEZE_FIRE_PRIO_LOW -- Low priority, conserve shots
+                    proposed_fire_prio = 1 -- Very low priority, conserve shots while waiting
                 else
-                    -- Enemy is far, retreat and wait
+                    -- Enemy is far, retreat to segment 1 and wait
                     proposed_target_seg = RIGHT_RETREAT_SEGMENT
                     proposed_fire_prio = 1 -- Very low priority
                 end
@@ -722,10 +727,15 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             -- Case 3: Left Only - Similar strategy but with fractional distance consideration  
             if is_open then 
                 -- Use fractional distance for better precision on left-side threats
-                if nl_dist_float <= FLIPPER_REACT_DISTANCE then
+                if nl_dist_float <= FLIPPER_REACT_DISTANCE_L then
                     -- Enemy is close (within react distance fractional), move to fire segment and fire
                     proposed_target_seg = LEFT_FIRE_SEGMENT
-                    proposed_fire_prio = FREEZE_FIRE_PRIO_HIGH -- High priority fire
+                    -- Only fire with high priority if we're already at the firing position
+                    if player_abs_seg == LEFT_FIRE_SEGMENT then
+                        proposed_fire_prio = 15 -- Very high priority to override safety checks
+                    else
+                        proposed_fire_prio = 1 -- Move to position first, don't fire while moving
+                    end
                 elseif nl_dist_float <= FLIPPER_WAIT_DISTANCE then
                     -- Enemy is within waiting distance, retreat and wait
                     proposed_target_seg = LEFT_RETREAT_SEGMENT
