@@ -32,7 +32,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 176
+    params_count: int = 299
     # Expert ratio configuration - only used for brand new models
     expert_ratio_start: float = 0.15  # Lower start value for new models (was 0.50)
     expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
@@ -50,7 +50,7 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 6144            # Increase batch size moderately (was 4096)
+    batch_size: int = 8192            # Modestly higher batch size to increase GPU utilization (was 6144)
     lr: float = 8.0e-4                    # Reduced for more stable learning (was 1.2e-3)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 1.0                  # Initial exploration rate
@@ -68,9 +68,9 @@ class RLConfigData:
     use_noisy_nets: bool = True           # Use noisy networks for exploration
     use_per: bool = False                 # Disabled - too slow
     use_distributional: bool = False      # Disabled - too complex
-    gradient_accumulation_steps: int = 6  # Increase accumulation moderately (was 4)
+    gradient_accumulation_steps: int = 8  # Slightly more accumulation for bigger effective batch (was 6)
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance
-    training_steps_per_sample: int = 3    # Increase training steps slightly (was 2)
+    training_steps_per_sample: int = 5    # One extra train step per env sample to use more GPU (was 3)
     force_gpu_utilization: bool = False   # Keep disabled to maintain client responsiveness
 
 # Create instance of RLConfigData after its definition
