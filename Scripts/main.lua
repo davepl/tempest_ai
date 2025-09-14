@@ -256,8 +256,16 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         else print("Periodic Save: Sending save signal.") end
     end
 
-    -- Pack OOB data (Format: >HdBBBHHHBBBhBhBBBBB = 1 UnsignedShort, 1 Double, 3 UByte, 3 UShort, 3 UByte, 1 Short, 1 UByte, 1 Short, 5 UByte)
-    local oob_format = ">HdBBBHHHBBBhBhBBBBB"
+    -- Fetch last reward components to transmit out-of-band (avoid recomputation in Python)
+    local rc = logic.getLastRewardComponents()
+
+    -- Pack OOB data (extended with 6 floats for reward components at the end)
+    -- Format legend:
+    --   >HdBBBHHHBBBhBhBBBBBffffff
+    --   H: num_values, d: reward, BBB: (placeholder, game_mode, done), HHH: (frame, score_hi, score_lo),
+    --   BBB: (save, fire, zap), h: spinner, B: attract, h: expert_target_seg, B: player_seg, B: is_open,
+    --   BB: (expert_fire, expert_zap), B: level_number, ffffff: (rc_safety, rc_proximity, rc_shots, rc_threats, rc_pulsar, rc_score)
+    local oob_format = ">HdBBBHHHBBBhBhBBBBBffffff"
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
@@ -277,7 +285,13 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
         expert_zap_packed,          -- B: Expert Zap (uchar)
-        ls.level_number            -- B: Current Level Number (uchar)
+        ls.level_number,            -- B: Current Level Number (uchar)
+        tonumber(rc.safety or 0.0),     -- f: Reward Component - Safety
+        tonumber(rc.proximity or 0.0),  -- f: Reward Component - Proximity
+        tonumber(rc.shots or 0.0),      -- f: Reward Component - Shots
+        tonumber(rc.threats or 0.0),    -- f: Reward Component - Threats
+        tonumber(rc.pulsar or 0.0),     -- f: Reward Component - Pulsar
+        tonumber(rc.score or 0.0)       -- f: Reward Component - Score
     )
 
     -- Combine OOB header + main data
