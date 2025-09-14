@@ -230,8 +230,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_lives)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_level)
 
-    -- Targeting / Engineered Features (5)
-    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
+    -- Targeting / Engineered Features (4) - FIXED: Removed duplicate nearest_enemy_seg
     num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.nearest_enemy_depth_raw)
     num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, es.is_aligned_with_nearest > 0)

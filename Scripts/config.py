@@ -52,7 +52,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     batch_size: int = 8192            # Modestly higher batch size to increase GPU utilization (was 6144)
-    lr: float = 8.0e-4                    # Reduced for more stable learning (was 1.2e-3)
+    lr: float = 5.0e-5                    # Aggressive reduction for float32 stability (was 2.0e-4, originally 8.0e-4 for uint8)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.5           # Starting epsilon value
