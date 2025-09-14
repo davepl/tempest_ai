@@ -1282,7 +1282,7 @@ class SafeMetrics:
             return self.metrics.fps
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
-    """Parse binary frame data from Lua into game state"""
+    """Parse binary frame data from Lua into game state - SIMPLIFIED with float32 payload"""
     try:
         if not data or len(data) < 10:  # Minimal size check
             print("ERROR: Received empty or too small data packet", flush=True)
@@ -1312,115 +1312,45 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         score = (score_high * 65536) + score_low
         
         state_data = memoryview(data)[header_size:]
-        # Parse as uint8 payload then normalize based on encoding type
+        
+        # SIMPLIFIED: Parse as float32 array directly (no complex normalization needed!)
         try:
-            vals_u8 = np.frombuffer(state_data, dtype=np.uint8, count=num_values)
+            # Each float32 is 4 bytes, big-endian format
+            expected_bytes = num_values * 4
+            if len(state_data) < expected_bytes:
+                print(f"ERROR: Expected {expected_bytes} bytes for {num_values} floats, got {len(state_data)}", flush=True)
+                sys.exit(1)
+                
+            state = np.frombuffer(state_data, dtype='>f4', count=num_values)  # big-endian float32
+            state = state.astype(np.float32)  # Ensure correct dtype
+            
         except ValueError as e:
             print(f"ERROR: frombuffer failed: {e}", flush=True)
             sys.exit(1)
-        if vals_u8.size != num_values:
-            print(f"ERROR: Expected {num_values} state values but got {vals_u8.size}", flush=True)
+            
+        if state.size != num_values:
+            print(f"ERROR: Expected {num_values} state values but got {state.size}", flush=True)
             sys.exit(1)
-        
-        # Mixed normalization based on Lua packing:
-        # - Natural 8-bit values (0-255): normalize to [0,1] via /255
-        # - Relative segments: INVALID=0→-1, valid [1,255]→[-1,+1] via (v-128)/127  
-        # - Booleans: 0→0, 255→1 via /255
-        # - Unit floats: [0,255]→[0,1] via /255
-        
-        # Define ranges for different encoding types (matching Lua packing order):
-        # Game state (5): natural u8
-        # Targeting (5): nearest_seg(rel), nearest_seg_dup(rel), depth(u8), aligned(bool), error_mag(unit)
-        # Player state (23): pos(u8), alive(u8), state(u8), depth(u8), zap_uses(u8), zap_active(u8), shot_count(u8), 
-        #                   shot_pos[8](u8), shot_seg[8](rel)  
-        # Level state (35): level_num(u8), level_type(u8), level_shape(u8), spike_heights[16](u8), level_angles[16](u8)
-        # Enemies state (16): all counts are natural u8
-        # Enemy info (42): all natural u8 flags/types
-        # Enemy segments (7): rel segments  
-        # Enemy depths (7): natural u8
-        # Top enemy segs (7): rel segments
-        # Enemy shot pos (4): natural u8
-        # Enemy shot segs (4): rel segments
-        # Charging fuseball segs (7): rel segments
-        # Active pulsar segs (7): rel segments  
-        # Top rail enemy segs (7): rel segments
-        
-        # Build mask for relative vs natural encoding
-        rel_indices = set()
-        idx = 0
-        
-        # Game state (5) - all natural
-        idx += 5
-        
-        # Targeting (5) - nearest_seg(rel), nearest_seg_dup(rel), depth(nat), aligned(bool→nat), error_mag(unit→nat)
-        rel_indices.update([idx, idx+1])  # nearest_seg, nearest_seg_dup
-        idx += 5
-        
-        # Player state (23) - shot_seg[8] are relative at indices [15:23]
-        shot_seg_start = idx + 15  # pos(1) + alive(1) + state(1) + depth(1) + zap_uses(1) + zap_active(1) + shot_count(1) + shot_pos[8](8) = 15
-        rel_indices.update(range(shot_seg_start, shot_seg_start + 8))
-        idx += 23
-        
-        # Level state (35) - all natural
-        idx += 35
-        
-        # Enemies state (16) - all natural  
-        idx += 16
-        
-        # Enemy info (42) - all natural
-        idx += 42
-        
-        # Enemy segments (7) - all relative
-        rel_indices.update(range(idx, idx + 7))
-        idx += 7
-        
-        # Enemy depths (7) - all natural
-        idx += 7
-        
-        # Top enemy segs (7) - all relative
-        rel_indices.update(range(idx, idx + 7))
-        idx += 7
-        
-        # Enemy shot pos (4) - all natural
-        idx += 4
-        
-        # Enemy shot segs (4) - all relative  
-        rel_indices.update(range(idx, idx + 4))
-        idx += 4
-        
-        # Charging fuseball segs (7) - all relative
-        rel_indices.update(range(idx, idx + 7))
-        idx += 7
-        
-        # Active pulsar segs (7) - all relative
-        rel_indices.update(range(idx, idx + 7))
-        idx += 7
-        
-        # Top rail enemy segs (7) - all relative
-        rel_indices.update(range(idx, idx + 7))
-        idx += 7
-        
-        # Apply mixed normalization
-        state = np.zeros(vals_u8.shape, dtype=np.float32)
-        for i in range(len(vals_u8)):
-            if i in rel_indices:
-                # Relative encoding: 0=INVALID→-1, [1,255]→[-1,+1] via (v-128)/127
-                if vals_u8[i] == 0:
-                    state[i] = -1.0  # INVALID
-                else:
-                    state[i] = (vals_u8[i] - 128.0) / 127.0
-            else:
-                # Natural encoding: [0,255]→[0,1] via /255
-                state[i] = vals_u8[i] / 255.0
-        
-        state = np.clip(state, -1.0, 1.0)
+
+        # VALIDATION: Debug print to verify decoding matches Lua (first few frames only)  
+        if frame_counter < 5:
+            print(f"[DEBUG] Frame {frame_counter}: Python received - "
+                  f"Nearest enemy seg[5]={state[5]:.3f}, "
+                  f"Player shot segs[25-28]=[{state[25]:.3f},{state[26]:.3f},{state[27]:.3f},{state[28]:.3f}]", 
+                  flush=True)
+
+        # Ensure all values are in expected range [-1, 1] with warnings for issues
+        out_of_range_count = np.sum((state < -1.001) | (state > 1.001))
+        if out_of_range_count > 0:
+            print(f"[WARNING] Frame {frame_counter}: {out_of_range_count} values outside [-1,1] range", flush=True)
+            state = np.clip(state, -1.0, 1.0)
         
         frame_data = FrameData(
             state=state,
             reward=reward,
             action=(bool(fire), bool(zap), spinner),
             mode=game_mode,
-            gamestate=gamestate,        # Added: Include gamestate from OOB header
+            gamestate=gamestate,
             done=bool(done),
             attract=bool(is_attract),
             save_signal=bool(save_signal),
@@ -1429,7 +1359,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
             expert_zap=bool(expert_zap),
-            level_number=level_number,  # Use the received level_number from OOB data
+            level_number=level_number,
             rc_safety=float(rc_safety),
             rc_proximity=float(rc_proximity),
             rc_shots=float(rc_shots),
@@ -1448,7 +1378,7 @@ def display_metrics_header(kb=None):
     if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10} | {'Data Health':>12}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -1481,10 +1411,17 @@ def display_metrics_row(agent, kb=None):
     # Display average level as 1-based instead of 0-based
     display_level = metrics.average_level + 1.0
     
+    # Data health metrics for float32 validation
+    data_health = "N/A"
+    if hasattr(metrics, 'state_min') and hasattr(metrics, 'state_max') and hasattr(metrics, 'state_invalid_frac'):
+        # Format: "min/max/invalid%" - compact but informative
+        # Show range bounds and percentage of invalid (-1.0) values
+        data_health = f"{metrics.state_min:.2f}/{metrics.state_max:.2f}/{metrics.state_invalid_frac*100:.0f}%"
+    
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10}"
+        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | {data_health:>12}"
     )
     print_with_terminal_restore(kb, row)
 
@@ -1555,7 +1492,7 @@ def encode_action_to_game(fire, zap, spinner):
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate using step-based decay."""
     step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
-
+    
     # Only decay if a new step interval is reached
     if step_interval > metrics.last_epsilon_decay_step:
         # Apply decay multiplicatively for the number of steps missed

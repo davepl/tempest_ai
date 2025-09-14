@@ -34,9 +34,9 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 176
     # Expert ratio configuration - only used for brand new models
-    expert_ratio_start: float = 0.10  # Lower start value for new models (was 0.50)
+    expert_ratio_start: float = 0.95  # Lower start value for new models (was 0.50)
     expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
-    expert_ratio_decay: float = 0.99995 # Faster decay - 0.05% reduction per step (was 0.0001)
+    expert_ratio_decay: float = 0.9975 # Faster decay to reach ~0.001 by 50M frames (was 0.9995)
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     reset_frame_count: bool = False
     reset_expert_ratio: bool = False  # Don't reset expert ratio on startup
@@ -55,11 +55,11 @@ class RLConfigData:
     lr: float = 8.0e-4                    # Reduced for more stable learning (was 1.2e-3)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
-    epsilon_start: float = 0.25           # Starting epsilon value
-    epsilon_min: float = 0.05             # Minimum exploration rate
-    epsilon_end: float = 0.05             # Final epsilon value (alias for epsilon_min)
-    epsilon_decay_steps: int = 25000     # Much shorter intervals for faster learning (was 200000)
-    epsilon_decay_factor: float = 0.98   # More aggressive decay for practical training (was 0.995)
+    epsilon_start: float = 0.5           # Starting epsilon value
+    epsilon_min: float = 0.01             # Minimum exploration rate
+    epsilon_end: float = 0.01             # Final epsilon value (alias for epsilon_min)
+    epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
+    epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 1000000           # Replay buffer size
     hidden_size: int = 2560               # Increase network size moderately (was 2048)
     num_layers: int = 4                   # Deeper network for more GPU work
@@ -87,7 +87,7 @@ class MetricsData:
     dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
-    epsilon: float = 1.0
+    epsilon: float = field(default_factory=lambda: RL_CONFIG.epsilon_start)
     expert_ratio: float = SERVER_CONFIG.expert_ratio_start
     last_decay_step: int = 0
     last_epsilon_decay_step: int = 0 # Added tracker for epsilon decay
