@@ -1492,8 +1492,8 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
     """Expert policy to move toward nearest enemy with neutral tie-breaker.
     Returns (fire, zap, spinner)
     """
-    # Check for INVALID_SEGMENT (-32768) which indicates no valid target (like during tube transitions)
-    if enemy_seg == -32768:  # INVALID_SEGMENT
+    # Check for INVALID_SEGMENT (-32768) or no target (-1) which indicates no valid target (like during tube transitions)
+    if enemy_seg == -32768 or enemy_seg == -1:  # INVALID_SEGMENT or no target
         return expert_fire, expert_zap, 0  # Use Lua's recommendations with no movement
 
     # Normalize to ring indices
