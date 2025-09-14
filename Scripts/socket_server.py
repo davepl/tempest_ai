@@ -334,11 +334,7 @@ class SocketServer:
                         # Store level number from frame
                         state['level_number'] = frame.level_number
                         
-                        # Store previous frame for reward component calculations
-                        state['prev_frame'] = state.get('current_frame')
-                        state['current_frame'] = frame
-                        
-                        # Store previous frame for reward component calculations
+                        # Store previous and current frame for reward component calculations
                         state['prev_frame'] = state.get('current_frame')
                         state['current_frame'] = frame
                         
@@ -436,6 +432,7 @@ class SocketServer:
                                 'total': float(frame.reward)
                             }
                         except Exception:
+                            print(f"Client {client_id}: Missing reward components from frame, using fallback calculation.")
                             components = self.calculate_reward_components(frame, state)
                         self.metrics.update_reward_components(components)
 

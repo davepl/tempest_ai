@@ -135,6 +135,13 @@ class FrameData:
     expert_fire: bool  # Added: Expert system fire recommendation
     expert_zap: bool   # Added: Expert system zap recommendation
     level_number: int  # Added: Current level number from Lua
+    # Lua-provided reward component breakdown (OOB header). Defaults keep parsing robust.
+    rc_safety: float = 0.0
+    rc_proximity: float = 0.0
+    rc_shots: float = 0.0
+    rc_threats: float = 0.0
+    rc_pulsar: float = 0.0
+    rc_score: float = 0.0
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -1275,35 +1282,41 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
         
-        format_str = ">HdBBBHHHBBBhBhBBBBB"  # Updated format string with level_number field at the end
-        header_size = struct.calcsize(format_str)
-        
-        if len(data) < header_size:
-            print(f"ERROR: Received data too small: {len(data)} bytes, need {header_size}", flush=True)
+        # Fixed OOB header format (must match Lua exactly). Precompute once.
+        # Format: ">HdBBBHHHBBBhBhBBBBBffffff"
+        global _FMT_OOB, _HDR_OOB
+        try:
+            _FMT_OOB
+        except NameError:
+            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBBffffff"
+            _HDR_OOB = struct.calcsize(_FMT_OOB)
+
+        if len(data) < _HDR_OOB:
+            print(f"ERROR: Received data too small: {len(data)} bytes, need {_HDR_OOB}", flush=True)
             sys.exit(1)
-            
-        values = struct.unpack(format_str, data[:header_size])
-        num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low, \
-        save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open, \
-        expert_fire, expert_zap, level_number = values  # Added level_number
+
+        values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
+        (num_values, reward, game_action, game_mode, done, frame_counter, score_high, score_low,
+         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
+         expert_fire, expert_zap, level_number,
+         rc_safety, rc_proximity, rc_shots, rc_threats, rc_pulsar, rc_score) = values
+        header_size = _HDR_OOB
         
         # Combine score components
         score = (score_high * 65536) + score_low
         
         state_data = memoryview(data)[header_size:]
-        # Fast vectorized parse: big-endian unsigned short -> float32 normalized
-        if len(state_data) % 2 != 0:
-            print(f"ERROR: State data length not even: {len(state_data)} bytes", flush=True)
-            sys.exit(1)
+        # Parse as uint8 payload (299 bytes expected) then center/scale to [-1,1]
         try:
-            vals = np.frombuffer(state_data, dtype=">u2", count=num_values)
+            vals_u8 = np.frombuffer(state_data, dtype=np.uint8, count=num_values)
         except ValueError as e:
             print(f"ERROR: frombuffer failed: {e}", flush=True)
             sys.exit(1)
-        if vals.size != num_values:
-            print(f"ERROR: Expected {num_values} state values but got {vals.size}", flush=True)
+        if vals_u8.size != num_values:
+            print(f"ERROR: Expected {num_values} state values but got {vals_u8.size}", flush=True)
             sys.exit(1)
-        state = (vals.astype(np.float32) / 255.0) * 2.0 - 1.0
+        # Center to [-128,127] then scale to [-1,1]; 0..255 -> (-1..~1)
+        state = ((vals_u8.astype(np.float32) - 128.0) / 127.0).clip(-1.0, 1.0)
         
         frame_data = FrameData(
             state=state,
@@ -1318,7 +1331,13 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
             expert_zap=bool(expert_zap),
-            level_number=level_number  # Use the received level_number from OOB data
+            level_number=level_number,  # Use the received level_number from OOB data
+            rc_safety=float(rc_safety),
+            rc_proximity=float(rc_proximity),
+            rc_shots=float(rc_shots),
+            rc_threats=float(rc_threats),
+            rc_pulsar=float(rc_pulsar),
+            rc_score=float(rc_score)
         )
         
         return frame_data
