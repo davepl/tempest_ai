@@ -568,7 +568,12 @@ class SocketServer:
 
                     # Ensure agent exists before deciding action
                     if hasattr(self, 'agent') and self.agent:
-                        if random.random() < self.metrics.get_expert_ratio() and not self.metrics.is_override_active():
+                        # HACK: Use 95% expert ratio when gamestate is GS_ZoomingDown (0x20)
+                        current_expert_ratio = self.metrics.get_expert_ratio()
+                        if frame.gamestate == 0x20:  # GS_ZoomingDown
+                            current_expert_ratio = 0.95
+                            
+                        if random.random() < current_expert_ratio and not self.metrics.is_override_active():
                             # Use expert system
                             fire, zap, spinner = get_expert_action(
                                 frame.enemy_seg,
