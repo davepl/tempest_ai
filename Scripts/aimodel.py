@@ -467,10 +467,20 @@ class PrioritizedReplayMemory:
         self.rewards[idx, 0] = reward
         self.next_states[idx] = next_state
         self.dones[idx, 0] = float(done)
-        # Max priority so new samples are seen at least once
-        max_prio = self.priorities.max() if self.pos > 0 or self.full else 1.0
-        if max_prio == 0:
+        
+        # CRITICAL FIX #5: Safe max priority calculation with corruption protection
+        current_priorities = self.priorities[:self.pos, 0] if not self.full else self.priorities[:, 0]
+        if len(current_priorities) > 0:
+            # Clean existing priorities before taking max
+            clean_priorities = np.nan_to_num(current_priorities, nan=self.eps, posinf=1.0, neginf=self.eps)
+            max_prio = np.clip(clean_priorities.max(), self.eps, 1e6)
+        else:
             max_prio = 1.0
+            
+        # Ensure max_prio is valid
+        if not np.isfinite(max_prio) or max_prio <= 0:
+            max_prio = 1.0
+            
         self.priorities[idx, 0] = max_prio
 
         # Update position
@@ -484,27 +494,60 @@ class PrioritizedReplayMemory:
             raise ValueError("Cannot sample from empty memory buffer")
             
         prios = self.priorities[:size, 0]
+        
+        # CRITICAL FIX #1: Robust priority handling with NaN/Inf protection
+        prios = np.nan_to_num(prios, nan=self.eps, posinf=1.0, neginf=self.eps)
+        prios = np.clip(prios, self.eps, 1e6)  # Prevent extreme values
+        
         # Add epsilon to avoid zero-probability entries
         probs = (prios + self.eps) ** self.alpha
         probs_sum = probs.sum()
-        if probs_sum <= 0:
-            # Fallback to uniform if all priorities are zero
-            probs = np.ones_like(probs) / max(1, len(probs))
+        
+        # CRITICAL FIX #6: Cold start detection - when all priorities are nearly equal
+        prio_variance = np.var(prios)
+        is_cold_start = prio_variance < self.eps or np.allclose(prios, prios[0], rtol=1e-3)
+        
+        # CRITICAL FIX #2: More robust probability normalization
+        if not np.isfinite(probs_sum) or probs_sum <= self.eps or is_cold_start:
+            # Complete fallback to uniform distribution for cold start or invalid probabilities
+            probs = np.ones(size, dtype=np.float32) / size
+            # In cold start, use uniform weights (no prioritization benefit yet)
+            is_uniform_sampling = True
         else:
             probs = probs / probs_sum
+            # Ensure probabilities are valid
+            probs = np.nan_to_num(probs, nan=1.0/size, posinf=1.0/size, neginf=1.0/size)
+            probs = probs / probs.sum()  # Renormalize after cleanup
+            is_uniform_sampling = False
             
-        # CRITICAL FIX: Ensure we don't try to sample more than available
+        # Ensure we don't try to sample more than available
         k = min(batch_size, size)
         if k <= 0:
             raise ValueError(f"Invalid sample size: k={k}, size={size}")
             
-        # CRITICAL FIX: Handle case where we need replacement due to small buffer
+        # Handle case where we need replacement due to small buffer
         replace_needed = k > size
         indices = np.random.choice(size, k, p=probs, replace=replace_needed)
         
-        # IS weights
-        weights = (size * probs[indices]) ** (-beta)
-        weights = weights / weights.max()
+        # CRITICAL FIX #3: Safe importance sampling weights with explosion protection
+        selected_probs = probs[indices]
+        
+        if is_uniform_sampling:
+            # Cold start mode: use uniform weights (all samples equally important)
+            weights = np.ones(len(indices), dtype=np.float32)
+        else:
+            # Normal PER mode: compute importance sampling weights
+            # Prevent weight explosion by clamping minimum probability
+            min_prob = max(1e-8, 1.0 / (size * 1000))  # Allow max 1000x weight amplification
+            selected_probs = np.clip(selected_probs, min_prob, 1.0)
+            
+            weights = (size * selected_probs) ** (-beta)
+            # Additional safety: clip extreme weights
+            weights = np.clip(weights, 1e-6, 1e6)
+            weights = weights / weights.max()
+            
+            # Final NaN/Inf check on weights
+            weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
         
         # Tensors
         states = torch.from_numpy(self.states[indices]).float().to(device)
@@ -516,10 +559,36 @@ class PrioritizedReplayMemory:
         return states, actions, rewards, next_states, dones, is_weights, indices
 
     def update_priorities(self, indices, td_errors):
-        td = td_errors.detach().abs().cpu().numpy().reshape(-1) + self.eps
-        self.priorities[indices, 0] = td
-        # Track average
-        self.avg_priority = float(td.mean())
+        # CRITICAL FIX #4: Safe TD error processing with NaN/Inf protection
+        if td_errors is None or len(td_errors) == 0:
+            return
+            
+        # Convert to numpy and ensure finite values
+        td = td_errors.detach().abs().cpu().numpy().reshape(-1)
+        
+        # Protect against NaN/Inf corruption
+        td = np.nan_to_num(td, nan=self.eps, posinf=1.0, neginf=self.eps)
+        td = np.clip(td, self.eps, 1e6)  # Prevent extreme priorities
+        
+        # Add epsilon for stability
+        td = td + self.eps
+        
+        # Validate indices
+        indices = np.asarray(indices)
+        valid_mask = (indices >= 0) & (indices < len(self))
+        if not np.any(valid_mask):
+            return
+            
+        # Only update valid indices
+        valid_indices = indices[valid_mask]
+        valid_td = td[valid_mask] if len(td) == len(indices) else td[:len(valid_indices)]
+        
+        # Update priorities safely
+        self.priorities[valid_indices, 0] = valid_td
+        
+        # Track average with finite check
+        avg_td = valid_td.mean() if len(valid_td) > 0 else self.eps
+        self.avg_priority = float(np.nan_to_num(avg_td, nan=self.eps))
 
 class DQNAgent:
     """DQN Agent with experience replay and target network"""
@@ -635,7 +704,15 @@ class DQNAgent:
 
     def train_step(self):
         """Perform a single training step - optimized for single thread maximum throughput"""
-        if len(self.memory) < RL_CONFIG.batch_size:
+        buffer_size = len(self.memory)
+        
+        # CRITICAL FIX #6: Enhanced cold start protection for PER
+        min_buffer_size = RL_CONFIG.batch_size
+        if hasattr(RL_CONFIG, 'use_per') and RL_CONFIG.use_per:
+            # PER needs extra buffer to handle priority sampling effectively
+            min_buffer_size = max(RL_CONFIG.batch_size * 2, 16384)
+            
+        if buffer_size < min_buffer_size:
             return
             
         try:
@@ -644,7 +721,7 @@ class DQNAgent:
             
             # Update training metrics
             metrics.total_training_steps += 1
-            metrics.memory_buffer_size = len(self.memory)
+            metrics.memory_buffer_size = buffer_size
                 
             # Zero gradients at the start of accumulation cycle
             accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
@@ -988,6 +1065,13 @@ class DQNAgent:
                 try:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     print("Optimizer state loaded.")
+                    
+                    # CRITICAL FIX: Override loaded learning rate with current config value
+                    # This ensures config changes actually take effect!
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = RL_CONFIG.lr
+                    print(f"Learning rate overridden to config value: {RL_CONFIG.lr}")
+                    
                 except Exception:
                     print("Optimizer state not loaded (shape mismatch). Using freshly initialized optimizer.")
                 # Load scheduler state if present and configured
