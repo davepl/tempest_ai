@@ -692,7 +692,6 @@ class DQNAgent:
                 raise
             except Exception as e:
                 print(f"Training error in {worker_id}: {e}")
-                import traceback
                 traceback.print_exc()
                 time.sleep(0.01)
 
@@ -913,7 +912,6 @@ class DQNAgent:
             raise
         except Exception as e:
             print(f"Training error: {e}")
-            import traceback
             traceback.print_exc()
 
     def update_target_network(self):
