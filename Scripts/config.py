@@ -54,8 +54,8 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 4096            # Moderate batch size for dual GPU balance (was 16384)
-    lr: float = 4.0e-5                    # Increased from 5.0e-5 for better learning (loss too low)
+    batch_size: int = 8192            # Moderate batch size for dual GPU balance (was 16384)
+    lr: float = 1.0e-4                    # Increased from 5.0e-5 for better learning (loss too low)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.5           # Starting epsilon value
@@ -63,7 +63,7 @@ class RLConfigData:
     epsilon_end: float = 0.15             # Final epsilon value (alias for epsilon_min)
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
-    memory_size: int = 1000000           # Balanced buffer size (was 4000000)
+    memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 4096               # More reasonable network size for dual GPU setup (was 8192)
     num_layers: int = 4                   # Deeper network for more GPU work
     target_update_freq: int = 200         # Reduced for more dynamic Q-targets (was 800)  
