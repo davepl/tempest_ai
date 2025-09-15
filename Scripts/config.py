@@ -32,7 +32,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 176
+    params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
     # Expert ratio configuration - only used for brand new models
     expert_ratio_start: float = 0.95  # Lower start value for new models (was 0.50)
     expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
