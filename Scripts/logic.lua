@@ -387,7 +387,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         proposed_target_seg, _, final_should_fire, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
         -- In tube zoom, fire priority isn't calculated the same way, should_fire is directly returned
         -- We will bypass the final Pulsar check for Tube Zoom state
-        return proposed_target_seg, 0, final_should_fire, false
+        return proposed_target_seg, 0, final_should_fire, false  -- No superzap in tube zoom
 
     elseif game_state.gamestate == 0x04 then -- Normal Gameplay
         -- === Step 1: Determine proposed target based on Top Rail / Hunt ===
@@ -800,16 +800,34 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             final_fire_priority = AVOID_FIRE_PRIORITY
         end
 
-        -- === Step 3: Final Return ===
+        -- === Step 3: Superzap Check for Crowded Top Rail ===
+        -- Count top rail enemies for superzap decision
+        local top_rail_count = 0
+        for i = 1, 7 do
+            local depth = enemies_state.enemy_depths[i]
+            local seg = enemies_state.enemy_abs_segments[i]
+            if depth > 0 and depth <= TOP_RAIL_DEPTH and seg ~= INVALID_SEGMENT then
+                top_rail_count = top_rail_count + 1
+            end
+        end
+        
+        -- Recommend superzap if 3+ top rail enemies and superzapper is available
+        local should_superzap = false
+        local superzapper_available = (player_state.superzapper_active or 0) > 0
+        if top_rail_count >= 3 and superzapper_available then
+            should_superzap = true
+        end
+
+        -- === Step 4: Final Return ===
         -- Final pulsar-lane sanitization
         if is_pulsar_lane(final_target_seg, enemies_state) then
             final_target_seg = find_nearest_non_pulsar_segment(final_target_seg, enemies_state, is_open)
         end
         final_should_fire = final_fire_priority > shot_count
-        return final_target_seg, 0, final_should_fire, false
+        return final_target_seg, 0, final_should_fire, should_superzap
 
     else -- Other game states
-        return player_abs_seg, 0, false, false
+        return player_abs_seg, 0, false, false  -- No superzap in other states
     end
 end
 
@@ -847,8 +865,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
     -- Terminal: death (edge-triggered) - INCREASED penalty for better learning
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = reward - 10.0                                                  -- Increased from -1.0 to make death much more significant
-        reward_components.score = -10.0                                         -- Death penalty counts as score component
+        reward = reward - 5.0                                                   -- Scaled down from -10.0 to prevent TD explosion
+        reward_components.score = -5.0                                          -- Death penalty counts as score component
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
@@ -863,7 +881,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         -- Level completion bonus (edge-triggered) - BOOSTED for breakthrough
         if (level_state.level_number or 0) > (previous_level or 0) then
-            local level_bonus = 5.0                                             -- Reduced from 10.0 to prevent Q-value explosion
+            local level_bonus = 2.5                                             -- Scaled down from 5.0 to prevent TD explosion
             reward = reward + level_bonus
             reward_components.score = reward_components.score + level_bonus
         end
@@ -929,17 +947,26 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 reward_components.proximity = reward_components.proximity + prox_reward
             end
             
-            -- 3. SHOT EFFICIENCY REWARD (Resource Management)
-            -- Encourage having shots available for threats while not wasting
+            -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)
+            -- Encourage defensive shots in current segment while preserving ammo for critical threats
             local shot_count = player_state.shot_count or 0
-            local max_shots = 4  -- Game limit
+            local max_shots = 8  -- Actual Tempest game limit
             local shot_reward = 0.0
             
-            if shot_count >= max_shots then
-                shot_reward = -0.005  -- Penalty for shot saturation (wasteful)
-            elseif shot_count == 0 and enemies_state:get_total_active() > 0 then
-                shot_reward = 0.003  -- Small bonus for having ammunition ready
+            -- Optimal shot count: 1-6 active (keeping 2-7 in reserve)
+            if shot_count == 0 then
+                -- No shots active - vulnerable to enemies in current segment
+                shot_reward = -0.010  -- Small penalty for being defenseless
+            elseif shot_count >= 1 and shot_count <= 6 then
+                -- Good range: defensive coverage with adequate reserves
+                local segment_safety_bonus = 0.002  -- Small reward for segment protection
+                local reserve_bonus = (max_shots - shot_count) * 0.001  -- Bonus for keeping reserves
+                shot_reward = segment_safety_bonus + reserve_bonus
+            elseif shot_count >= 7 then
+                -- Too many shots active - insufficient reserves for emergencies
+                shot_reward = -0.005  -- Penalty for poor resource management
             end
+            
             reward = reward + shot_reward
             reward_components.shots = reward_components.shots + shot_reward
             
