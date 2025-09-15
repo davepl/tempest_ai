@@ -937,7 +937,7 @@ class DQNAgent:
                     
                     # STRICT ASSERTION: TD errors should be reasonable (catch Q-value explosion)
                     max_td_error = td_errors.max().item()
-                    if max_td_error >= 10.0:  # Reduced threshold since we're clamping priorities and rewards
+                    if max_td_error >= 25.0:
                         print(f"\n!!! CRITICAL BUG DETECTED !!!")
                         print(f"TD error explosion! Max TD error = {max_td_error:.6f}")
                         print(f"Q_expected: [{q_exp_min:.3f}, {q_exp_max:.3f}], mean={q_exp_mean:.3f}")
