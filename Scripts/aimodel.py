@@ -1031,6 +1031,11 @@ class DQNAgent:
                 if getattr(RL_CONFIG, 'use_soft_target', False):
                     tau = getattr(RL_CONFIG, 'tau', 0.005)
                     self.soft_update(tau)
+                else:
+                    # Hard target network update every target_update_freq steps
+                    target_freq = getattr(RL_CONFIG, 'target_update_freq', 200)
+                    if metrics.total_training_steps % target_freq == 0:
+                        self.update_target_network()
 
                 # Step LR scheduler if enabled
                 if self.scheduler is not None:
