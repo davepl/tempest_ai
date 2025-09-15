@@ -48,47 +48,19 @@ def print_metrics_line(message, is_header=False):
     else:
         print(message)
 
-def _should_show_reward_columns() -> Dict[str, bool]:
-    """Determine which reward component columns to show based on recent non-zero averages."""
-    avgs = metrics.get_reward_component_averages()
-    # Threshold to treat as effectively zero
-    tol = 1e-6
-    return {
-        'safety': abs(avgs.get('safety', 0.0)) > tol,
-        'proximity': abs(avgs.get('proximity', 0.0)) > tol,
-        'shots': abs(avgs.get('shots', 0.0)) > tol,
-        'threats': abs(avgs.get('threats', 0.0)) > tol,
-        # Pulsar intentionally excluded from display
-    }
-
 def display_metrics_header():
     """Display the header for metrics output"""
     row_counter = 0
-    # Track last header configuration to reprint header when columns change
-    _last_show_reward_cols: bool | None = None
     # clear_screen()
     
-    # Base header
-    base = (
+    # Header with Q-Value Range moved before Training Stats, reward components removed
+    header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11} {'Training Stats':>15} {'Data Health':>12}"
+        f"{'AvgInf(ms)':>11} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
-
-    # Conditionally append reward component headers (without Pulsar)
-    show = _should_show_reward_columns()
-    reward_parts = []
-    if show['safety']:
-        reward_parts.append(f"{'Safety':>7}")
-    if show['proximity']:
-        reward_parts.append(f"{'Prox':>6}")
-    if show['shots']:
-        reward_parts.append(f"{'Shots':>6}")
-    if show['threats']:
-        reward_parts.append(f"{'Threats':>7}")
-
-    header = base if not reward_parts else base + ' ' + ' '.join(reward_parts)
+    
     print_metrics_line(header, is_header=True)
 
 def display_metrics_row(agent, kb_handler):
@@ -138,13 +110,17 @@ def display_metrics_row(agent, kb_handler):
     # Format training stats: Memory/TrainSteps/Rate/TargetAge
     training_stats = f"{metrics.memory_buffer_size//1000}k/{metrics.total_training_steps}/{train_rate:.1f}/{frames_since_target_update//1000}k"
 
-    # Data health metrics for float32 validation
-    data_health = "N/A"
-    if hasattr(metrics, 'state_min') and hasattr(metrics, 'state_max') and hasattr(metrics, 'state_invalid_frac'):
-        # Format: "min/max/invalid%" - compact but informative
-        data_health = f"{metrics.state_min:.2f}/{metrics.state_max:.2f}/{metrics.state_invalid_frac*100:.0f}%"
+    # Get Q-value range from the agent
+    q_range = "N/A"
+    if agent:
+        try:
+            min_q, max_q = agent.get_q_value_range()
+            if not (np.isnan(min_q) or np.isnan(max_q)):
+                q_range = f"[{min_q:.2f}, {max_q:.2f}]"
+        except Exception:
+            q_range = "Error"
 
-    # Base row text
+    # Base row text with Q-Value Range moved before Training Stats, reward components removed
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} "
         f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} "
@@ -153,23 +129,8 @@ def display_metrics_row(agent, kb_handler):
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
         f"{avg_inference_time_ms:>11.2f} "
-        f"{training_stats:>15} {data_health:>12}"
+        f"{q_range:>14} {training_stats:>15}"
     )
-
-    # Conditionally append reward component values (without Pulsar)
-    show = _should_show_reward_columns()
-    if any(show.values()):
-        avgs = metrics.get_reward_component_averages()
-        parts = []
-        if show['safety']:
-            parts.append(f"{avgs['safety']:>7.3f}")
-        if show['proximity']:
-            parts.append(f"{avgs['proximity']:>6.3f}")
-        if show['shots']:
-            parts.append(f"{avgs['shots']:>6.3f}")
-        if show['threats']:
-            parts.append(f"{avgs['threats']:>7.3f}")
-        row = row + ' ' + ' '.join(parts)
     
     print_metrics_line(row)
 
