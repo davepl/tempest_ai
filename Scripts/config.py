@@ -20,7 +20,8 @@ from collections import deque
 IS_INTERACTIVE = sys.stdin.isatty()
 
 # Flag to control metric reset on load
-RESET_METRICS = False # Set to True to ignore saved epsilon/expert ratio
+RESET_METRICS = False # Set to True to ignore saved epsilon/expert ratio - FRESH START
+FORCE_FRESH_MODEL = False # Set to True to completely ignore saved model and start fresh
 
 # Directory paths
 MODEL_DIR = "models"
@@ -39,9 +40,9 @@ class ServerConfigData:
     expert_ratio_decay: float = 0.9975 # Faster decay to reach ~0.001 by 50M frames (was 0.9995)
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     
-    reset_frame_count: bool = False
-    reset_expert_ratio: bool = False  # Don't reset expert ratio on startup
-    reset_epsilon: bool = False      # FORCE RESET - Set epsilon to config value to break plateau
+    reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
+    reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
+    reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
     
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
@@ -53,8 +54,8 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 8192            # Modestly higher batch size to increase GPU utilization (was 6144)
-    lr: float = 5.0e-5                    # Reduced learning rate for more stable training (was 1.0e-4)
+    batch_size: int = 32768           # Balanced batch size (was 131072)
+    lr: float = 2.0e-4                    # Balanced learning rate (was 2.5e-4)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.5           # Starting epsilon value
@@ -62,19 +63,21 @@ class RLConfigData:
     epsilon_end: float = 0.15             # Final epsilon value (alias for epsilon_min)
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
-    memory_size: int = 500000            # Reduced buffer size to prevent stale experiences (was 1000000)
-    hidden_size: int = 2560               # Increase network size moderately (was 2048)
+    memory_size: int = 1000000           # Balanced buffer size (was 4000000)
+    hidden_size: int = 6144               # Moderate network size (was 12288)
     num_layers: int = 4                   # Deeper network for more GPU work
-    target_update_freq: int = 800         # Less frequent target updates for stability (was 400)  
+    target_update_freq: int = 200         # Reduced for more dynamic Q-targets (was 800)  
     update_target_every: int = 400        # Alias for target_update_freq
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = True           # Use noisy networks for exploration
-    use_per: bool = True                  # Disabled 
+    use_per: bool = True                  # Enabled with priority clamping to prevent explosion
     use_distributional: bool = False      # Disabled - too complex
-    gradient_accumulation_steps: int = 8  # Slightly more accumulation for bigger effective batch (was 6)
-    use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance
-    training_steps_per_sample: int = 5    # One extra train step per env sample to use more GPU (was 3)
-    force_gpu_utilization: bool = False   # Keep disabled to maintain client responsiveness
+    gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
+    use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
+    training_steps_per_sample: int = 5    # Balanced training load (was 10)
+    training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
+    use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
+    # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()

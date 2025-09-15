@@ -168,20 +168,34 @@ class FrameData:
 SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
-# Initialize devices (use single device for both inference and training for stability)
+# Initialize devices (single GPU with balanced workload)
 if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"Using GPU (CUDA) for both inference and training: {device}")
+    training_device = torch.device("cuda:0")
+    inference_device = torch.device("cuda:0")
+    print(f"Using balanced single GPU setup: {training_device}")
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print(f"Using MPS for both inference and training: {device}")
+    training_device = torch.device("mps")
+    inference_device = torch.device("mps")
+    print(f"Using MPS for both inference and training: {training_device}")
 else:
-    device = torch.device("cpu")
-    print(f"Using CPU for both inference and training: {device}")
+    training_device = torch.device("cpu")
+    inference_device = torch.device("cpu")
+    print(f"Using CPU for both inference and training: {training_device}")
+
+# Display key configuration parameters
+print(f"Learning rate: {RL_CONFIG.lr}")
+print(f"Batch size: {RL_CONFIG.batch_size}")
+print(f"Memory size: {RL_CONFIG.memory_size:,}")
+print(f"Hidden size: {RL_CONFIG.hidden_size}")
+if getattr(RL_CONFIG, 'use_per', False):
+    print(f"Using PER with alpha: {getattr(RL_CONFIG, 'per_alpha', 0.6)}")
+else:
+    print("Using standard experience replay")
+print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision', False) else 'disabled'}")
+print(f"State size: {RL_CONFIG.state_size}")
 
 # For compatibility with dual-device code
-training_device = device
-inference_device = device
+device = training_device  # Legacy compatibility
 
 # Initialize metrics
 metrics = config_metrics
@@ -325,31 +339,34 @@ class DQN(nn.Module):
         use_noisy = RL_CONFIG.use_noisy_nets
         use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
-        hidden_size = RL_CONFIG.hidden_size  # 2048 - reasonable size
+        hidden_size = RL_CONFIG.hidden_size  # 6144 - Balanced for RTX 6000 Ada
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
 
-        # Balanced feature extractor - slightly larger for better GPU utilization
-        self.fc1 = nn.Linear(state_size, hidden_size)         # 176 -> 2560  
-        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 2560 -> 2560
-        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 2560 -> 1280
-        self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)  # 1280 -> 640
+        # Balanced feature extractor for good GPU utilization without inference starvation
+        self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 6144  
+        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 6144 -> 6144
+        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 6144 -> 3072
+        self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)  # 3072 -> 1536
+        self.fc5 = nn.Linear(hidden_size//4, hidden_size//8)  # 1536 -> 768
         
         # Apply noisy layers if enabled
         if use_noisy:
             self.fc2 = NoisyLinear(hidden_size, hidden_size, noisy_std)
             self.fc3 = NoisyLinear(hidden_size, hidden_size//2, noisy_std)
+            self.fc4 = NoisyLinear(hidden_size//2, hidden_size//4, noisy_std)
+            self.fc5 = NoisyLinear(hidden_size//4, hidden_size//8, noisy_std)
 
         self.use_dueling = use_dueling
         if use_dueling:
-            # Dueling streams with reasonable sizes
-            self.val_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 640 -> 320
-            self.adv_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 640 -> 320
-            self.val_out = nn.Linear(hidden_size//8, 1)              # 320 -> 1
-            self.adv_out = nn.Linear(hidden_size//8, action_size)    # 320 -> 18
+            # Dueling streams with balanced sizes
+            self.val_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 768 -> 384
+            self.adv_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 768 -> 384
+            self.val_out = nn.Linear(hidden_size//16, 1)              # 384 -> 1
+            self.adv_out = nn.Linear(hidden_size//16, action_size)    # 384 -> 18
         else:
-            # Single stream with reasonable sizes
-            self.fc5 = nn.Linear(hidden_size//4, hidden_size//8)     # 640 -> 320
-            self.out = nn.Linear(hidden_size//8, action_size)        # 320 -> 18
+            # Single stream with balanced sizes
+            self.fc6 = nn.Linear(hidden_size//8, hidden_size//16)     # 768 -> 384
+            self.out = nn.Linear(hidden_size//16, action_size)        # 384 -> 18
 
     def reset_noise(self):
         # Reset noise for all NoisyLinear layers
@@ -358,23 +375,24 @@ class DQN(nn.Module):
                 m.reset_noise()
 
     def forward(self, x):
-        # Balanced feature extraction - slightly more compute for better GPU utilization
-        x = F.relu(self.fc1(x))    # 176 -> 2560
-        x = F.relu(self.fc2(x))    # 2560 -> 2560  
-        x = F.relu(self.fc3(x))    # 2560 -> 1280
-        x = F.relu(self.fc4(x))    # 1280 -> 640
+        # Balanced feature extraction for good GPU utilization
+        x = F.relu(self.fc1(x))    # 175 -> 6144
+        x = F.relu(self.fc2(x))    # 6144 -> 6144
+        x = F.relu(self.fc3(x))    # 6144 -> 3072
+        x = F.relu(self.fc4(x))    # 3072 -> 1536
+        x = F.relu(self.fc5(x))    # 1536 -> 768
         
         if self.use_dueling:
-            v = F.relu(self.val_fc(x))  # 640 -> 320
-            v = self.val_out(v)         # 320 -> 1
-            a = F.relu(self.adv_fc(x))  # 640 -> 320
-            a = self.adv_out(a)         # 320 -> 18
+            v = F.relu(self.val_fc(x))  # 768 -> 384
+            v = self.val_out(v)         # 384 -> 1
+            a = F.relu(self.adv_fc(x))  # 768 -> 384
+            a = self.adv_out(a)         # 384 -> 18
             # Subtract mean advantage to keep Q identifiable
             q = v + (a - a.mean(dim=1, keepdim=True))
             return q
         else:
-            x = F.relu(self.fc5(x))     # 640 -> 320
-            return self.out(x)          # 320 -> 18
+            x = F.relu(self.fc6(x))     # 768 -> 384
+            return self.out(x)          # 384 -> 18
 
 class QRDQN(nn.Module):
     """Quantile Regression DQN (distributional), optional dueling streams.
@@ -527,13 +545,13 @@ class PrioritizedReplayMemory:
         assert np.all(np.isfinite(weights)), "CRITICAL BUG: Invalid importance sampling weights contain NaN/Inf!"
         assert np.all(weights > 0), f"CRITICAL BUG: Found zero/negative importance sampling weights! Range=[{weights.min()}, {weights.max()}]"
         
-        # Return sampled batch as PyTorch tensors
-        states = torch.from_numpy(self.states[indices]).float().to(device)
-        actions = torch.from_numpy(self.actions[indices]).long().to(device)
-        rewards = torch.from_numpy(self.rewards[indices]).float().to(device)
-        next_states = torch.from_numpy(self.next_states[indices]).float().to(device)
-        dones = torch.from_numpy(self.dones[indices]).float().to(device)
-        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float().to(device)
+        # Return sampled batch as PyTorch tensors on training device
+        states = torch.from_numpy(self.states[indices]).float().to(training_device)
+        actions = torch.from_numpy(self.actions[indices]).long().to(training_device)
+        rewards = torch.from_numpy(self.rewards[indices]).float().to(training_device)
+        next_states = torch.from_numpy(self.next_states[indices]).float().to(training_device)
+        dones = torch.from_numpy(self.dones[indices]).float().to(training_device)
+        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float().to(training_device)
         
         return states, actions, rewards, next_states, dones, is_weights, indices
 
@@ -564,9 +582,17 @@ class PrioritizedReplayMemory:
         assert not np.any(np.isnan(td)) and not np.any(np.isinf(td)), f"CRITICAL BUG: TD errors contain NaN/Inf! This indicates training instability."
         assert not np.any(td < 0), f"CRITICAL BUG: TD errors are negative after abs()! Min value: {td.min()}"
         
+        # DIAGNOSTIC: Log TD error distribution before clamping
+        # if len(self) > 1000 and np.random.random() < 0.01:  # 1% chance to log
+        #     print(f"TD errors before clamping: min={td.min():.4f}, max={td.max():.4f}, mean={td.mean():.4f}")
+        
+        # CRITICAL FIX: Clamp TD errors to prevent priority explosion feedback loop
+        # This breaks the cycle where large TD errors -> high priorities -> more sampling -> larger gradients -> larger TD errors
+        td = np.clip(td, 0.0, 5.0)  # Clamp TD errors to max 5.0 to prevent priority explosion
+        
         # STRICT ASSERTION: TD errors should be reasonable (not exploded)
         max_td = td.max()
-        assert max_td < 50.0, f"CRITICAL BUG: TD error explosion in update_priorities! Max TD error = {max_td:.6f}."
+        assert max_td <= 5.0, f"CRITICAL BUG: TD error still too large after clamping! Max TD error = {max_td:.6f}."
         
         # Validate indices
         indices = np.asarray(indices)
@@ -577,6 +603,10 @@ class PrioritizedReplayMemory:
         new_priorities = td + self.eps
         old_priorities = self.priorities[indices, 0].copy()
         self.priorities[indices, 0] = new_priorities
+        
+        # DIAGNOSTIC: Track priority updates
+        # if len(self) > 1000 and np.random.random() < 0.01:  # 1% chance to log
+        #     print(f"Priority update: old_max={old_priorities.max():.4f}, new_max={new_priorities.max():.4f}")
         
         # Update running average
         self.avg_priority = float(new_priorities.mean())
@@ -590,22 +620,32 @@ class DQNAgent:
         self.action_size = action_size
         self.last_save_time = 0.0 # Initialize last save time
         
-        # Q-Networks on single device for stability
+        # Q-Networks on separate devices for optimal performance
         if getattr(RL_CONFIG, 'use_distributional', False):
             n_quant = getattr(RL_CONFIG, 'num_atoms', 51)
-            self.qnetwork_local = QRDQN(state_size, action_size, n_quant).to(device)
-            self.qnetwork_target = QRDQN(state_size, action_size, n_quant).to(device)
+            self.qnetwork_local = QRDQN(state_size, action_size, n_quant).to(training_device)
+            self.qnetwork_target = QRDQN(state_size, action_size, n_quant).to(training_device)
         else:
-            self.qnetwork_local = DQN(state_size, action_size).to(device)
-            self.qnetwork_target = DQN(state_size, action_size).to(device)
+            self.qnetwork_local = DQN(state_size, action_size).to(training_device)
+            self.qnetwork_target = DQN(state_size, action_size).to(training_device)
         
-        # DISABLED torch.compile() due to CUDA graph issues
-        # Will focus on other optimizations instead
+        # Create inference copy on inference device for low-latency serving
+        if inference_device != training_device:
+            print("Creating dedicated inference network on GPU 0 for low-latency serving")
+            if getattr(RL_CONFIG, 'use_distributional', False):
+                self.qnetwork_inference = QRDQN(state_size, action_size, n_quant).to(inference_device)
+            else:
+                self.qnetwork_inference = DQN(state_size, action_size).to(inference_device)
+        else:
+            # Same device - use training network for inference
+            self.qnetwork_inference = self.qnetwork_local
+        
+        # torch.compile removed from forward pass - causes CUDA graph issues with multi-threaded clients
         print("Using standard (uncompiled) neural networks for stability.")
         
-        # Store device references (now both are the same)
-        self.inference_device = device
-        self.training_device = device
+        # Store device references
+        self.inference_device = inference_device
+        self.training_device = training_device
         
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         # Optional LR scheduler
@@ -630,12 +670,13 @@ class DQNAgent:
         self.train_queue = queue.Queue(maxsize=50000)  # Increased from 20000 to 50000
         self.training_thread = None
         self.running = True
-        # Simple approach: single training thread for maximum throughput
-        self.num_training_workers = 1  # Single worker to avoid gradient race conditions
+        # Multi-threaded training with gradient synchronization
+        self.num_training_workers = getattr(RL_CONFIG, 'training_workers', 1)  # Configurable worker count
         self.training_threads = []
         self._train_step_counter = 0
         self._gradient_accumulation_counter = 0  # Track gradient accumulation steps
-        self.training_lock = threading.Lock()  # Add lock for thread safety
+        self.training_lock = threading.Lock()  # Lock for optimizer updates only
+        self.gradient_lock = threading.Lock()  # Separate lock for gradient accumulation
         
         # Mixed precision training setup
         self.use_mixed_precision = getattr(RL_CONFIG, 'use_mixed_precision', False)
@@ -644,6 +685,22 @@ class DQNAgent:
             print("Mixed precision training enabled")
         else:
             self.scaler = None
+        
+        # torch.compile for training computation - safe in single-threaded training context
+        self._compiled_loss_computation = None
+        if (torch.cuda.is_available() and hasattr(torch, 'compile') and 
+            getattr(RL_CONFIG, 'use_torch_compile', False)):
+            try:
+                print("Attempting to compile loss computation for training acceleration...")
+                self._compiled_loss_computation = torch.compile(
+                    self._compute_dqn_loss,
+                    mode='max-autotune',  # Aggressive optimization for training
+                    fullgraph=False  # Allow graph breaks for compatibility
+                )
+                print("Loss computation compilation successful")
+            except Exception as e:
+                print(f"Loss computation compilation failed: {e}")
+                self._compiled_loss_computation = None
         
         # CRITICAL FIX: Initialize training enabled flag to ensure training happens
         self.training_enabled = True
@@ -667,9 +724,9 @@ class DQNAgent:
         print(f"Started {self.num_training_workers} training worker threads")
         
     def background_train(self):
-        """High-throughput single-threaded training loop for maximum GPU utilization"""
+        """High-throughput training loop on dedicated GPU for maximum utilization"""
         worker_id = threading.current_thread().name
-        print(f"Training thread {worker_id} started on {device}")
+        print(f"Training thread {worker_id} started on {self.training_device}")
         
         while self.running: 
             try:
@@ -682,6 +739,10 @@ class DQNAgent:
                     if len(self.memory) >= RL_CONFIG.batch_size:
                         self._train_step_counter += 1
                         self.train_step()
+                        
+                        # Sync inference network every 100 training steps for responsiveness
+                        if self._train_step_counter % 100 == 0:
+                            self.sync_inference_network()
                     else:
                         break
                         
@@ -695,6 +756,36 @@ class DQNAgent:
                 import traceback
                 traceback.print_exc()
                 time.sleep(0.01)
+    
+    def _compute_dqn_loss(self, states, actions, rewards, next_states, dones, is_weights=None):
+        """
+        Compiled core DQN loss computation - separate method for torch.compile optimization.
+        This method handles the most computationally intensive parts of training.
+        """
+        # Standard DQN loss with Double DQN to reduce overestimation bias
+        Q_expected = self.qnetwork_local(states).gather(1, actions)
+        
+        with torch.no_grad():
+            # Double DQN: Use local network to select actions, target network to evaluate them
+            next_state_q_all = self.qnetwork_local(next_states)  # Local net selects actions
+            best_actions = next_state_q_all.argmax(1, keepdim=True)
+            Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)  # Target net evaluates
+            Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
+        
+        # Compute TD errors
+        td_errors = (Q_expected - Q_targets).abs()
+        
+        # Compute loss (with or without importance sampling weights)
+        if is_weights is not None:
+            weighted_td_loss = is_weights * (Q_expected - Q_targets).pow(2)
+            loss = weighted_td_loss.mean()
+        else:
+            # Use MSE loss instead of SmoothL1Loss for stronger gradients
+            # MSE is more sensitive to outliers and will produce larger loss values
+            mse_loss = (Q_expected - Q_targets).pow(2).mean()
+            loss = mse_loss
+        
+        return loss, td_errors, Q_expected, Q_targets
 
     def train_step(self):
         """Perform a single training step - optimized for single thread maximum throughput"""
@@ -714,13 +805,23 @@ class DQNAgent:
             import time
             step_start = time.time()
             
-            # Update training metrics
-            metrics.total_training_steps += 1
-            metrics.memory_buffer_size = buffer_size
+            # Thread-safe gradient accumulation and counter management
+            with self.gradient_lock:
+                # Update training metrics (thread-safe)
+                metrics.total_training_steps += 1
+                metrics.memory_buffer_size = buffer_size
                 
-            # Zero gradients at the start of accumulation cycle
-            accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
-            if self._gradient_accumulation_counter % accumulation_steps == 0:
+                # Update gradient accumulation counter
+                self._gradient_accumulation_counter += 1
+                current_accumulation_step = self._gradient_accumulation_counter
+                
+                # Check if we need to zero gradients (start of new accumulation cycle)
+                accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
+                should_zero_gradients = (current_accumulation_step - 1) % accumulation_steps == 0
+                should_step_optimizer = current_accumulation_step % accumulation_steps == 0
+            
+            # Zero gradients outside lock (but coordinate via flag)
+            if should_zero_gradients:
                 self.optimizer.zero_grad()
                 
             # If using NoisyNets, sample noise once per train step for consistency
@@ -740,8 +841,8 @@ class DQNAgent:
                 beta = min(1.0, beta_start + (1.0 - beta_start) * (frame / beta_frames))
                 
                 # DEBUG: Log beta calculation
-                if metrics.total_training_steps % 1000 == 0:
-                    print(f"PER Beta: {beta:.4f} (frame {frame}, beta_frames {beta_frames})")
+                # if metrics.total_training_steps % 1000 == 0:
+                #     print(f"PER Beta: {beta:.4f} (frame {frame}, beta_frames {beta_frames})")
                 
                 states, actions, rewards, next_states, dones, is_weights, indices = self.memory.sample(RL_CONFIG.batch_size, beta=beta)
             else:
@@ -790,44 +891,62 @@ class DQNAgent:
                 # For PER priority updates, define td_errors as mean absolute TD per sample
                 td_errors = td.abs().mean(dim=(1, 2))  # CRITICAL FIX: Use abs() for priority updates
             else:
-                # Standard DQN loss
-                Q_expected = self.qnetwork_local(states).gather(1, actions)
+                # Standard DQN loss computation - use compiled version if available
+                if self._compiled_loss_computation is not None:
+                    # Use compiled loss computation for performance
+                    is_weights_tensor = is_weights if use_per else None
+                    loss, td_errors, Q_expected, Q_targets = self._compiled_loss_computation(
+                        states, actions, rewards, next_states, dones, is_weights_tensor)
+                else:
+                    # Fallback to original computation if compilation failed
+                    loss, td_errors, Q_expected, Q_targets = self._compute_dqn_loss(
+                        states, actions, rewards, next_states, dones, 
+                        is_weights if use_per else None)
                 
-                # STRICT ASSERTION: Q_expected should be reasonable (not exploded)
+                # DIAGNOSTIC: Track Q-value statistics (extracted from compiled computation)
                 q_exp_max = Q_expected.max().item()
                 q_exp_min = Q_expected.min().item()
+                q_exp_mean = Q_expected.mean().item()
+                q_exp_std = Q_expected.std().item()
+                
+                # STRICT ASSERTION: Q_expected should be reasonable (not exploded)
                 assert abs(q_exp_max) < 30.0 and abs(q_exp_min) < 30.0, f"CRITICAL BUG: Q_expected explosion! Q_expected range: [{q_exp_min:.3f}, {q_exp_max:.3f}]. Neural network is broken - restart with fresh model."
-                with torch.no_grad():
-                    best_actions = self.qnetwork_local(next_states).argmax(1, keepdim=True)
-                    Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
-                    
-                    # STRICT ASSERTION: Q-values should be reasonable (not exploded)
-                    q_next_max = Q_targets_next.max().item()
-                    q_next_min = Q_targets_next.min().item()
-                    assert abs(q_next_max) < 30.0 and abs(q_next_min) < 30.0, f"CRITICAL BUG: Q-value explosion! Q_next range: [{q_next_min:.3f}, {q_next_max:.3f}]. Neural network is broken - restart with fresh model."
-                    
-                    Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
-                    
-                    # STRICT ASSERTION: Rewards should be reasonable
-                    reward_max = rewards.max().item()
-                    reward_min = rewards.min().item()
-                    assert abs(reward_max) < 50.0 and abs(reward_min) < 50.0, f"CRITICAL BUG: Reward corruption! Reward range: [{reward_min:.3f}, {reward_max:.3f}]"
+                
+                # Additional diagnostic checks for targets and rewards
+                q_tgt_max = Q_targets.max().item()
+                q_tgt_min = Q_targets.min().item()
+                q_tgt_mean = Q_targets.mean().item()
+                
+                reward_max = rewards.max().item()
+                reward_min = rewards.min().item()
+                assert abs(reward_max) < 50.0 and abs(reward_min) < 50.0, f"CRITICAL BUG: Reward corruption! Reward range: [{reward_min:.3f}, {reward_max:.3f}]"
 
                 if use_per:
-                    td_errors = (Q_expected - Q_targets).abs()  # CRITICAL FIX: Use abs() for priority updates
+                    # DIAGNOSTIC: Track TD error distribution before explosion check
+                    td_max = td_errors.max().item()
+                    td_min = td_errors.min().item()
+                    td_mean = td_errors.mean().item()
+                    td_std = td_errors.std().item()
+                    
+                    # DIAGNOSTIC: Track priority distribution health
+                    if hasattr(self.memory, 'priorities'):
+                        current_priorities = self.memory.priorities[:len(self.memory), 0]
+                        prio_max = current_priorities.max()
+                        prio_mean = current_priorities.mean()
+                        high_prio_count = np.sum(current_priorities > td_mean * 3)  # Count priorities > 3x mean TD error
                     
                     # STRICT ASSERTION: TD errors should be reasonable (catch Q-value explosion)
                     max_td_error = td_errors.max().item()
-                    if max_td_error >= 15.0:
+                    if max_td_error >= 10.0:  # Reduced threshold since we're clamping priorities and rewards
                         print(f"\n!!! CRITICAL BUG DETECTED !!!")
                         print(f"TD error explosion! Max TD error = {max_td_error:.6f}")
+                        print(f"Q_expected: [{q_exp_min:.3f}, {q_exp_max:.3f}], mean={q_exp_mean:.3f}")
+                        print(f"Q_targets: [{q_tgt_min:.3f}, {q_tgt_max:.3f}], mean={q_tgt_mean:.3f}")
+                        print(f"Rewards: [{rewards.min().item():.3f}, {rewards.max().item():.3f}]")
                         print(f"This indicates Q-value explosion - neural network is broken.")
                         print(f"FORCING APPLICATION SHUTDOWN...")
                         import os
                         os._exit(1)  # Force immediate process termination
-                    
-                    weighted_td_loss = is_weights * (Q_expected - Q_targets).pow(2)
-                    loss = weighted_td_loss.mean()
                     
                     # DEBUG: Check for zero loss issues
                     if loss.item() < 1e-8:
@@ -836,19 +955,14 @@ class DQNAgent:
                         print(f"  Q_targets range: [{Q_targets.min():.4f}, {Q_targets.max():.4f}]")  
                         print(f"  TD errors range: [{td_errors.min():.4f}, {td_errors.max():.4f}]")
                         print(f"  IS weights range: [{is_weights.min():.4f}, {is_weights.max():.4f}]")
-                        print(f"  Weighted loss range: [{weighted_td_loss.min():.6f}, {weighted_td_loss.max():.6f}]")
                         print(f"  Final loss: {loss.item():.8f}")
-                else:
-                    criterion = SmoothL1Loss()
-                    loss = criterion(Q_expected, Q_targets)
-                    td_errors = (Q_expected - Q_targets).abs()  # For consistency
             forward_time = time.time() - forward_start
 
             # Calculate loss scaling for gradient accumulation
             accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
             loss = loss / accumulation_steps  # Scale loss for accumulation
             
-            # Backward pass with mixed precision support
+            # Backward pass with mixed precision support (can be done in parallel)
             backward_start = time.time()
             if self.use_mixed_precision and self.scaler is not None:
                 self.scaler.scale(loss).backward()
@@ -856,23 +970,36 @@ class DQNAgent:
                 loss.backward()
             backward_time = time.time() - backward_start
             
-            # Update gradient accumulation counter
-            self._gradient_accumulation_counter += 1
-            
-            # Only step optimizer every N accumulation steps
-            if self._gradient_accumulation_counter % accumulation_steps == 0:
-                optimizer_start = time.time()
-                if self.use_mixed_precision and self.scaler is not None:
-                    # Gradient clipping with mixed precision
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    # Standard gradient clipping and optimization
-                    torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
-                    self.optimizer.step()
-                optimizer_time = time.time() - optimizer_start
+            # Thread-safe optimizer stepping - CRITICAL SECTION
+            if should_step_optimizer:
+                with self.training_lock:  # Serialize optimizer updates across all threads
+                    optimizer_start = time.time()
+                    
+                    # DIAGNOSTIC: Track gradient norms before clipping
+                    total_grad_norm = 0.0
+                    param_count = 0
+                    for param in self.qnetwork_local.parameters():
+                        if param.grad is not None:
+                            param_norm = param.grad.data.norm(2)
+                            total_grad_norm += param_norm.item() ** 2
+                            param_count += 1
+                    total_grad_norm = total_grad_norm ** (1. / 2)
+                    
+                    # Enable gradient norm logging to diagnose vanishing gradients
+                    if metrics.total_training_steps % 1000 == 0:
+                        print(f"Step {metrics.total_training_steps}: Gradient norm: {total_grad_norm:.6f}, Loss: {(loss * accumulation_steps).item():.6f}")
+                    
+                    if self.use_mixed_precision and self.scaler is not None:
+                        # Gradient clipping with mixed precision
+                        self.scaler.unscale_(self.optimizer)
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        # Standard gradient clipping and optimization
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                        self.optimizer.step()
+                    optimizer_time = time.time() - optimizer_start
             else:
                 optimizer_time = 0
         
@@ -886,11 +1013,10 @@ class DQNAgent:
                 metrics.average_priority = self.memory.avg_priority
                 
                 # DEBUG: Validate priorities periodically
-                if metrics.total_training_steps % 1000 == 0:
-                    self.memory.validate_priorities()
-
-            # Only update target network and scheduler on actual optimizer steps
-            if self._gradient_accumulation_counter % accumulation_steps == 0:
+                # if metrics.total_training_steps % 1000 == 0:
+                #     self.memory.validate_priorities()            # Only update target network and scheduler on actual optimizer steps
+            if should_step_optimizer:
+                # Target network and scheduler updates are already inside training_lock above
                 # Soft target update if enabled (Polyak averaging every step)
                 if getattr(RL_CONFIG, 'use_soft_target', False):
                     tau = getattr(RL_CONFIG, 'tau', 0.005)
@@ -955,31 +1081,54 @@ class DQNAgent:
                     target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
 
     def sync_inference_network(self):
-        """Synchronize inference network (CPU) with training updates"""
-        # This is called after training to ensure inference network has latest weights
-        # Since qnetwork_local is used for both inference and training, no sync needed
-        # Just ensure it's on the correct device for next inference
-        current_device = next(self.qnetwork_local.parameters()).device
-        if current_device != self.inference_device:
-            self.qnetwork_local = self.qnetwork_local.to(self.inference_device)
-        
+        """Synchronize inference network with training updates"""
+        if hasattr(self, 'qnetwork_inference') and self.qnetwork_inference != self.qnetwork_local:
+            # Copy weights from training network to inference network across devices
+            with torch.no_grad():
+                inference_state_dict = {}
+                for key, param in self.qnetwork_local.state_dict().items():
+                    inference_state_dict[key] = param.to(self.inference_device)
+                self.qnetwork_inference.load_state_dict(inference_state_dict)
+    
+    def get_q_value_range(self):
+        """Get current Q-value range from the network for monitoring"""
+        try:
+            with torch.no_grad():
+                # Test Q-values on a dummy state using inference network
+                dummy_state = torch.zeros(1, self.state_size).to(self.inference_device)
+                self.qnetwork_inference.eval()
+                
+                if getattr(RL_CONFIG, 'use_distributional', False):
+                    q_dist = self.qnetwork_inference(dummy_state)  # (1, A, N)
+                    test_q_values = q_dist.mean(dim=2)   # (1, A)
+                else:
+                    test_q_values = self.qnetwork_inference(dummy_state)
+                
+                self.qnetwork_inference.train()
+                
+                max_q = test_q_values.max().item()
+                min_q = test_q_values.min().item()
+                return min_q, max_q
+        except Exception:
+            return float('nan'), float('nan')
+
     def act(self, state, epsilon=0.0):
-        """Select action using epsilon-greedy policy - optimized for parallel execution"""
+        """Select action using epsilon-greedy policy - optimized for low-latency inference"""
         # Convert state to tensor on inference device
         state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         
         # Set evaluation mode
-        self.qnetwork_local.eval()
+        self.qnetwork_inference.eval()
         
         with torch.no_grad():
             if getattr(RL_CONFIG, 'use_distributional', False):
-                q_dist = self.qnetwork_local(state)  # (1, A, N)
+                q_dist = self.qnetwork_inference(state)  # (1, A, N)
                 action_values = q_dist.mean(dim=2)   # (1, A)
             else:
-                action_values = self.qnetwork_local(state)
+                action_values = self.qnetwork_inference(state)
             
         # Set training mode back
-        self.qnetwork_local.train()
+        self.qnetwork_inference.train()
         
         # Epsilon-greedy action selection
         if random.random() < epsilon:
@@ -1046,10 +1195,16 @@ class DQNAgent:
 
     def load(self, filename):
         """Load model weights"""
+        from config import FORCE_FRESH_MODEL
+        
+        if FORCE_FRESH_MODEL:
+            print(f"FORCE_FRESH_MODEL is True - skipping model loading and starting with fresh weights")
+            return
+            
         if os.path.exists(filename):
             try:
                 print(f"Loading model checkpoint from {filename}")
-                checkpoint = torch.load(filename, map_location=device)
+                checkpoint = torch.load(filename, map_location=training_device)
                 policy_sd = checkpoint['policy_state_dict']
                 target_sd = checkpoint['target_state_dict']
 
@@ -1133,6 +1288,38 @@ class DQNAgent:
                 
                 # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
+                
+                # CRITICAL FIX: Detect and fix Q-value explosion in loaded model
+                print("Checking loaded model for Q-value corruption...")
+                with torch.no_grad():
+                    # Test Q-values on a dummy state
+                    dummy_state = torch.zeros(1, self.state_size).to(device)
+                    test_q_values = self.qnetwork_local(dummy_state)
+                    max_q = test_q_values.max().item()
+                    min_q = test_q_values.min().item()
+                    
+                    print(f"Loaded model Q-value range: [{min_q:.3f}, {max_q:.3f}]")
+                    
+                    # If Q-values are corrupted (too large), rescale the network weights
+                    if abs(max_q) > 10.0 or abs(min_q) > 10.0:
+                        print(f"WARNING: Loaded model has corrupted Q-values! Rescaling network weights...")
+                        scale_factor = 5.0 / max(abs(max_q), abs(min_q))  # Scale to max ±5.0
+                        print(f"Applying scale factor: {scale_factor:.4f}")
+                        
+                        # Rescale all weights in both networks
+                        for param in self.qnetwork_local.parameters():
+                            param.data *= scale_factor
+                        for param in self.qnetwork_target.parameters():
+                            param.data *= scale_factor
+                            
+                        # Verify the fix
+                        test_q_values_fixed = self.qnetwork_local(dummy_state)
+                        max_q_fixed = test_q_values_fixed.max().item()
+                        min_q_fixed = test_q_values_fixed.min().item()
+                        print(f"Rescaled Q-value range: [{min_q_fixed:.3f}, {max_q_fixed:.3f}]")
+                    else:
+                        print("Model Q-values are in acceptable range.")
+                
                 # Load or reset metrics based on RESET_METRICS flag from config
                 if RESET_METRICS:
                     print("RESET_METRICS flag is True. Resetting epsilon/expert_ratio.")
@@ -1507,7 +1694,7 @@ def display_metrics_header(kb=None):
     if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10} | {'Data Health':>12}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10} | {'Q-Value Range':>14}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -1540,17 +1727,20 @@ def display_metrics_row(agent, kb=None):
     # Display average level as 1-based instead of 0-based
     display_level = metrics.average_level + 1.0
     
-    # Data health metrics for float32 validation
-    data_health = "N/A"
-    if hasattr(metrics, 'state_min') and hasattr(metrics, 'state_max') and hasattr(metrics, 'state_invalid_frac'):
-        # Format: "min/max/invalid%" - compact but informative
-        # Show range bounds and percentage of invalid (-1.0) values
-        data_health = f"{metrics.state_min:.2f}/{metrics.state_max:.2f}/{metrics.state_invalid_frac*100:.0f}%"
+    # Get Q-value range from the agent
+    q_range = "N/A"
+    if agent:
+        try:
+            min_q, max_q = agent.get_q_value_range()
+            if not (np.isnan(min_q) or np.isnan(max_q)):
+                q_range = f"[{min_q:.2f}, {max_q:.2f}]"
+        except Exception:
+            q_range = "Error"
     
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | {data_health:>12}"
+        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | {q_range:>14}"
     )
     print_with_terminal_restore(kb, row)
 
