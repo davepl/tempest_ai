@@ -168,11 +168,21 @@ class FrameData:
 SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
-# Initialize devices (single GPU with balanced workload)
+# Initialize devices (dual GPU setup: inference on GPU1, training on GPU0)
 if torch.cuda.is_available():
-    training_device = torch.device("cuda:0")
-    inference_device = torch.device("cuda:0")
-    print(f"Using balanced single GPU setup: {training_device}")
+    # Check if both GPUs are available for dual GPU setup
+    if torch.cuda.device_count() >= 2:
+        training_device = torch.device("cuda:0")
+        inference_device = torch.device("cuda:1")
+        print(f"Using dual GPU setup: Training on {training_device}, Inference on {inference_device}")
+        print(f"Available GPUs: {torch.cuda.device_count()}")
+        print(f"GPU 0: {torch.cuda.get_device_name(0)}")
+        print(f"GPU 1: {torch.cuda.get_device_name(1)}")
+    else:
+        # Fall back to single GPU if only one is available
+        training_device = torch.device("cuda:0")
+        inference_device = torch.device("cuda:0")
+        print(f"Only {torch.cuda.device_count()} GPU(s) available, using single GPU setup: {training_device}")
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     training_device = torch.device("mps")
     inference_device = torch.device("mps")
@@ -333,21 +343,21 @@ class NoisyLinear(nn.Module):
         return F.linear(input, weight, bias)
 
 class DQN(nn.Module):
-    """Deep Q-Network model - Balanced architecture for good GPU utilization without starving inference."""
+    """Deep Q-Network model - Balanced architecture for dual GPU setup with reasonable training load."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         use_noisy = RL_CONFIG.use_noisy_nets
         use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
-        hidden_size = RL_CONFIG.hidden_size  # 6144 - Balanced for RTX 6000 Ada
+        hidden_size = RL_CONFIG.hidden_size  # 4096 - Balanced for dual GPU setup
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
 
-        # Balanced feature extractor for good GPU utilization without inference starvation
-        self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 6144  
-        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 6144 -> 6144
-        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 6144 -> 3072
-        self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)  # 3072 -> 1536
-        self.fc5 = nn.Linear(hidden_size//4, hidden_size//8)  # 1536 -> 768
+        # Balanced feature extractor for dual GPU setup
+        self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 4096  
+        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 4096 -> 4096
+        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 4096 -> 2048
+        self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)  # 2048 -> 1024
+        self.fc5 = nn.Linear(hidden_size//4, hidden_size//8)  # 1024 -> 512
         
         # Apply noisy layers if enabled
         if use_noisy:
@@ -359,14 +369,14 @@ class DQN(nn.Module):
         self.use_dueling = use_dueling
         if use_dueling:
             # Dueling streams with balanced sizes
-            self.val_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 768 -> 384
-            self.adv_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 768 -> 384
-            self.val_out = nn.Linear(hidden_size//16, 1)              # 384 -> 1
-            self.adv_out = nn.Linear(hidden_size//16, action_size)    # 384 -> 18
+            self.val_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 512 -> 256
+            self.adv_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 512 -> 256
+            self.val_out = nn.Linear(hidden_size//16, 1)              # 256 -> 1
+            self.adv_out = nn.Linear(hidden_size//16, action_size)    # 256 -> 18
         else:
             # Single stream with balanced sizes
-            self.fc6 = nn.Linear(hidden_size//8, hidden_size//16)     # 768 -> 384
-            self.out = nn.Linear(hidden_size//16, action_size)        # 384 -> 18
+            self.fc6 = nn.Linear(hidden_size//8, hidden_size//16)     # 512 -> 256
+            self.out = nn.Linear(hidden_size//16, action_size)        # 256 -> 18
 
     def reset_noise(self):
         # Reset noise for all NoisyLinear layers
@@ -375,24 +385,24 @@ class DQN(nn.Module):
                 m.reset_noise()
 
     def forward(self, x):
-        # Balanced feature extraction for good GPU utilization
-        x = F.relu(self.fc1(x))    # 175 -> 6144
-        x = F.relu(self.fc2(x))    # 6144 -> 6144
-        x = F.relu(self.fc3(x))    # 6144 -> 3072
-        x = F.relu(self.fc4(x))    # 3072 -> 1536
-        x = F.relu(self.fc5(x))    # 1536 -> 768
+        # Balanced feature extraction for dual GPU setup
+        x = F.relu(self.fc1(x))    # 175 -> 4096
+        x = F.relu(self.fc2(x))    # 4096 -> 4096
+        x = F.relu(self.fc3(x))    # 4096 -> 2048
+        x = F.relu(self.fc4(x))    # 2048 -> 1024
+        x = F.relu(self.fc5(x))    # 1024 -> 512
         
         if self.use_dueling:
-            v = F.relu(self.val_fc(x))  # 768 -> 384
-            v = self.val_out(v)         # 384 -> 1
-            a = F.relu(self.adv_fc(x))  # 768 -> 384
-            a = self.adv_out(a)         # 384 -> 18
+            v = F.relu(self.val_fc(x))  # 512 -> 256
+            v = self.val_out(v)         # 256 -> 1
+            a = F.relu(self.adv_fc(x))  # 512 -> 256
+            a = self.adv_out(a)         # 256 -> 18
             # Subtract mean advantage to keep Q identifiable
             q = v + (a - a.mean(dim=1, keepdim=True))
             return q
         else:
-            x = F.relu(self.fc6(x))     # 768 -> 384
-            return self.out(x)          # 384 -> 18
+            x = F.relu(self.fc6(x))     # 512 -> 256
+            return self.out(x)          # 256 -> 18
 
 class QRDQN(nn.Module):
     """Quantile Regression DQN (distributional), optional dueling streams.
@@ -631,7 +641,7 @@ class DQNAgent:
         
         # Create inference copy on inference device for low-latency serving
         if inference_device != training_device:
-            print("Creating dedicated inference network on GPU 0 for low-latency serving")
+            print(f"Creating dedicated inference network on {inference_device} for low-latency serving")
             if getattr(RL_CONFIG, 'use_distributional', False):
                 self.qnetwork_inference = QRDQN(state_size, action_size, n_quant).to(inference_device)
             else:
@@ -705,16 +715,16 @@ class DQNAgent:
         # CRITICAL FIX: Initialize training enabled flag to ensure training happens
         self.training_enabled = True
 
-        # Memory optimizations for aggressive training
+        # Memory optimizations for dual GPU training
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # Clear any existing cache
             torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
             torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
-            # Additional GPU optimizations for maximum utilization
+            # Additional GPU optimizations for dual GPU setup
             torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster matmul on Ampere+
             torch.backends.cudnn.allow_tf32 = True        # Enable TF32 for cuDNN
-            # Increase GPU memory allocation efficiency
-            torch.cuda.set_per_process_memory_fraction(0.9)  # Use up to 90% of GPU memory
+            # Moderate GPU memory allocation for dual GPU stability
+            torch.cuda.set_per_process_memory_fraction(0.7)  # Use up to 70% of GPU memory per GPU
 
         # Start multiple background threads for parallel training
         for i in range(self.num_training_workers):
@@ -795,8 +805,8 @@ class DQNAgent:
         min_buffer_size = RL_CONFIG.batch_size
         if hasattr(RL_CONFIG, 'use_per') and RL_CONFIG.use_per:
             # PER needs extra buffer to handle priority sampling effectively
-            # Require significantly more data before enabling PER
-            min_buffer_size = max(RL_CONFIG.batch_size * 4, 32768)  # Increased from 2x to 4x
+            # Reasonable requirement for dual GPU setup
+            min_buffer_size = max(RL_CONFIG.batch_size * 2, 12288)  # Reduced requirements for faster training start
             
         if buffer_size < min_buffer_size:
             return
