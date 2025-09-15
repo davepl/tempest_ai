@@ -40,7 +40,7 @@ class ServerConfigData:
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     reset_frame_count: bool = False
     reset_expert_ratio: bool = False  # Don't reset expert ratio on startup
-    reset_epsilon: bool = False     # One-time flag to reset epsilon on startup (set back to False after first run)
+    reset_epsilon: bool = True      # FORCE RESET - Set epsilon to config value to break plateau
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
 # Create instance of ServerConfigData first
@@ -52,12 +52,12 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     batch_size: int = 8192            # Modestly higher batch size to increase GPU utilization (was 6144)
-    lr: float = 5.0e-5                    # Aggressive reduction for float32 stability (was 2.0e-4, originally 8.0e-4 for uint8)
+    lr: float = 1.0e-4                    # Increased for faster learning - loss is stable at 5.0e-5
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.5           # Starting epsilon value
-    epsilon_min: float = 0.01             # Minimum exploration rate
-    epsilon_end: float = 0.01             # Final epsilon value (alias for epsilon_min)
+    epsilon_min: float = 0.15             # INCREASED - force more exploration to break plateau
+    epsilon_end: float = 0.15             # Final epsilon value (alias for epsilon_min)
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 1000000           # Replay buffer size

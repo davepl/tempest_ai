@@ -861,10 +861,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             reward_components.score = reward_components.score + r_score
         end
 
-        -- Level completion bonus (edge-triggered)
+        -- Level completion bonus (edge-triggered) - BOOSTED for breakthrough
         if (level_state.level_number or 0) > (previous_level or 0) then
-            reward = reward + 1.0
-            reward_components.score = reward_components.score + 1.0
+            local level_bonus = min(10.0, level_state.level_number)  -- Increased from 1.0 to make level progression highly attractive
+            reward = reward + level_bonus
+            reward_components.score = reward_components.score + level_bonus
         end
 
         -- Zap cost (edge-triggered on button press)
