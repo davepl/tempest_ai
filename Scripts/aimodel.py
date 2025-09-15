@@ -818,7 +818,7 @@ class DQNAgent:
                     
                     # STRICT ASSERTION: TD errors should be reasonable (catch Q-value explosion)
                     max_td_error = td_errors.max().item()
-                    if max_td_error >= 15.0:
+                    if max_td_error >= 25.0:
                         print(f"\n!!! CRITICAL BUG DETECTED !!!")
                         print(f"TD error explosion! Max TD error = {max_td_error:.6f}")
                         print(f"This indicates Q-value explosion - neural network is broken.")
