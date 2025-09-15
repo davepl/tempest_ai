@@ -545,7 +545,7 @@ class SocketServer:
                         # HACK: Use 95% expert ratio when gamestate is GS_ZoomingDown (0x20)
                         current_expert_ratio = self.metrics.get_expert_ratio()
                         if frame.gamestate == 0x20:  # GS_ZoomingDown
-                            current_expert_ratio = 0.95
+                            current_expert_ratio = 1.0
                             
                         if random.random() < current_expert_ratio and not self.metrics.is_override_active():
                             # Use expert system
