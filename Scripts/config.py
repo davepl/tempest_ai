@@ -54,7 +54,7 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 8192            # Modestly higher batch size to increase GPU utilization (was 6144)
+    batch_size: int = 4096            # Moderate batch size for dual GPU balance (was 16384)
     lr: float = 4.0e-5                    # Increased from 5.0e-5 for better learning (loss too low)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
@@ -64,7 +64,7 @@ class RLConfigData:
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 1000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 6144               # Moderate network size (was 12288)
+    hidden_size: int = 4096               # More reasonable network size for dual GPU setup (was 8192)
     num_layers: int = 4                   # Deeper network for more GPU work
     target_update_freq: int = 200         # Reduced for more dynamic Q-targets (was 800)  
     update_target_every: int = 400        # Alias for target_update_freq
@@ -74,7 +74,7 @@ class RLConfigData:
     use_distributional: bool = False      # Disabled - too complex
     gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
-    training_steps_per_sample: int = 5    # Balanced training load (was 10)
+    training_steps_per_sample: int = 2    # Reduced training load for better balance (was 8)
     training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
     use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
     # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
