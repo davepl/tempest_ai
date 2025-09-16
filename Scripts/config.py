@@ -77,6 +77,10 @@ class RLConfigData:
     training_steps_per_sample: int = 2    # Reduced training load for better balance (was 8)
     training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
     use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
+    use_soft_target: bool = True          # Enable soft target updates for stability
+    tau: float = 0.005                    # Soft update coefficient (Polyak averaging)
+    # Scale factor applied to epsilon-random zap probability (1.0 = uniform baseline, 0.0 = never choose zap during epsilon)
+    zap_random_scale: float = 0.0
     # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
 
 # Create instance of RLConfigData after its definition
@@ -117,6 +121,9 @@ class MetricsData:
     memory_buffer_size: int = 0  # Current replay buffer size
     total_training_steps: int = 0  # Total training steps completed
     last_target_update_frame: int = 0  # Frame count when target network was last updated
+    last_inference_sync_frame: int = 0 # Frame count when inference net was last synced
+    last_target_update_time: float = 0.0   # Wall time of last target update
+    last_inference_sync_time: float = 0.0  # Wall time of last inference sync
     
     # Reward component tracking (for analysis and display)
     last_reward_components: Dict[str, float] = field(default_factory=dict)
@@ -308,6 +315,9 @@ ACTION_MAPPING = {
     16: (0, 1, 0.0),   # Zap+No fire+Center  
     17: (0, 1, 0.1),   # Zap+No fire+Soft right
 }
+
+# Indices corresponding to zap actions in ACTION_MAPPING
+ZAP_ACTIONS = [idx for idx, triplet in ACTION_MAPPING.items() if len(triplet) >= 2 and triplet[1] == 1]
 
 # Create instances of config classes
 metrics = MetricsData()
