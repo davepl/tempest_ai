@@ -58,7 +58,7 @@ def display_metrics_header():
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
-        f"{'AvgInf(ms)':>11} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'AvgInf(ms)':>11} {'Q-Value Range':>14} {'Sync':>9} {'Update':>9} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -110,6 +110,19 @@ def display_metrics_row(agent, kb_handler):
     # Format training stats: Memory/TrainSteps/Rate/TargetAge
     training_stats = f"{metrics.memory_buffer_size//1000}k/{metrics.total_training_steps}/{train_rate:.1f}/{frames_since_target_update//1000}k"
 
+    # Compute sync and update ages (frames and seconds)
+    frames_since_infer_sync = metrics.frame_count - getattr(metrics, 'last_inference_sync_frame', 0)
+    secs_since_infer_sync = 0.0
+    if getattr(metrics, 'last_inference_sync_time', 0.0) > 0.0:
+        secs_since_infer_sync = max(0.0, time.time() - metrics.last_inference_sync_time)
+    frames_since_tgt_update = frames_since_target_update
+    secs_since_tgt_update = 0.0
+    if getattr(metrics, 'last_target_update_time', 0.0) > 0.0:
+        secs_since_tgt_update = max(0.0, time.time() - metrics.last_target_update_time)
+
+    sync_col = f"{frames_since_infer_sync//1000}k/{secs_since_infer_sync:0.1f}s"
+    update_col = f"{frames_since_tgt_update//1000}k/{secs_since_tgt_update:0.1f}s"
+
     # Get Q-value range from the agent
     q_range = "N/A"
     if agent:
@@ -129,7 +142,7 @@ def display_metrics_row(agent, kb_handler):
         f"{'ON' if metrics.override_expert else 'OFF':>9} "
         f"{'ON' if metrics.expert_mode else 'OFF':>11} "
         f"{avg_inference_time_ms:>11.2f} "
-        f"{q_range:>14} {training_stats:>15}"
+        f"{q_range:>14} {sync_col:>9} {update_col:>9} {training_stats:>15}"
     )
     
     print_metrics_line(row)

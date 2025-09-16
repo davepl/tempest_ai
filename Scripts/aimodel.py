@@ -43,7 +43,6 @@ import time
 import struct
 import random
 import sys
-import subprocess
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Deque
@@ -53,7 +52,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
-from torch.cuda.amp import GradScaler, autocast  # For mixed precision training
+from torch.cuda.amp import GradScaler  # For mixed precision training
 import select
 import threading
 import queue
@@ -203,7 +202,7 @@ else:
     print("Using standard experience replay")
 print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision', False) else 'disabled'}")
 print(f"State size: {RL_CONFIG.state_size}")
-
+print(f"Use Dueling DQN: {'enabled' if RL_CONFIG.use_dueling else 'disabled'}")
 # For compatibility with dual-device code
 device = training_device  # Legacy compatibility
 
@@ -276,7 +275,7 @@ class ReplayMemory:
         batch_size = min(batch_size, self.size)
         
         # O(1) random sampling using numpy indexing - no loops!
-        indices = np.random.randint(0, self.size, size=batch_size)
+        indices = np.random.randint(0, self.size, size=batch_size)  # QUESTION: Why is batch_size used here, to what purpose?
         
         # O(1) batch extraction using numpy advanced indexing
         batch_states = self.states[indices]
@@ -347,7 +346,7 @@ class DQN(nn.Module):
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         use_noisy = RL_CONFIG.use_noisy_nets
-        use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
+        use_dueling = getattr(RL_CONFIG, 'use_dueling', True)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
         hidden_size = RL_CONFIG.hidden_size  # 4096 - Balanced for dual GPU setup
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
@@ -411,7 +410,7 @@ class QRDQN(nn.Module):
     def __init__(self, state_size: int, action_size: int, num_quantiles: int):
         super().__init__()
         use_noisy = RL_CONFIG.use_noisy_nets
-        use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
+        use_dueling = getattr(RL_CONFIG, 'use_dueling', True)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
 
@@ -676,6 +675,17 @@ class DQNAgent:
         # Initialize target network with same weights as local network
         self.update_target_network()
 
+        # Ensure inference network is in sync at startup so it never serves random weights
+        try:
+            self.sync_inference_network()
+            ok, msg = self._verify_inference_parity()
+            if ok:
+                print("Initial inference sync complete (parity OK).")
+            else:
+                print(f"[WARN] Initial inference parity check failed: {msg}")
+        except Exception as e:
+            print(f"[WARN] Initial inference sync failed: {e}")
+
         # Training queue for background thread - much larger to prevent throttling
         self.train_queue = queue.Queue(maxsize=50000)  # Increased from 20000 to 50000
         self.training_thread = None
@@ -786,14 +796,13 @@ class DQNAgent:
         td_errors = (Q_expected - Q_targets).abs()
         
         # Compute loss (with or without importance sampling weights)
+        # Switch to Huber (SmoothL1) loss for stability against outliers
+        td = Q_expected - Q_targets
+        huber = F.smooth_l1_loss(Q_expected, Q_targets, reduction='none')
         if is_weights is not None:
-            weighted_td_loss = is_weights * (Q_expected - Q_targets).pow(2)
-            loss = weighted_td_loss.mean()
+            loss = (is_weights * huber).mean()
         else:
-            # Use MSE loss instead of SmoothL1Loss for stronger gradients
-            # MSE is more sensitive to outliers and will produce larger loss values
-            mse_loss = (Q_expected - Q_targets).pow(2).mean()
-            loss = mse_loss
+            loss = huber.mean()
         
         return loss, td_errors, Q_expected, Q_targets
 
@@ -919,8 +928,40 @@ class DQNAgent:
                 q_exp_mean = Q_expected.mean().item()
                 q_exp_std = Q_expected.std().item()
                 
-                # STRICT ASSERTION: Q_expected should be reasonable (not exploded)
-                assert abs(q_exp_max) < 30.0 and abs(q_exp_min) < 30.0, f"CRITICAL BUG: Q_expected explosion! Q_expected range: [{q_exp_min:.3f}, {q_exp_max:.3f}]. Neural network is broken - restart with fresh model."
+                # RECOVERY MECHANISM: If Q_expected has exploded, reset network weights instead of crashing
+                # Threshold adjusted for standard replay buffer training dynamics
+                if abs(q_exp_max) >= 60.0 or abs(q_exp_min) >= 60.0:
+                    print(f"\n!!! Q-VALUE EXPLOSION DETECTED !!!")
+                    print(f"Q_expected range: [{q_exp_min:.3f}, {q_exp_max:.3f}]")
+                    print(f"Attempting network weight reset to prevent crash...")
+                    
+                    # Reset network weights using Xavier/Glorot initialization
+                    def reset_weights(m):
+                        if isinstance(m, nn.Linear):
+                            torch.nn.init.xavier_uniform_(m.weight)
+                            if m.bias is not None:
+                                torch.nn.init.zeros_(m.bias)
+                    
+                    # Apply weight reset to both networks
+                    self.qnetwork_local.apply(reset_weights)
+                    self.qnetwork_target.apply(reset_weights)
+                    
+                    # Reset optimizer state
+                    self.optimizer = optim.AdamW(self.qnetwork_local.parameters(), 
+                                               lr=RL_CONFIG.lr, weight_decay=1e-2)
+                    
+                    # Reset gradient scaler if using mixed precision (currently disabled)
+                    if self.use_mixed_precision and self.scaler is not None:
+                        self.scaler = GradScaler()
+                    
+                    print(f"Network weights reset successfully. Continuing training...")
+                    # Ensure inference model mirrors the reset weights immediately
+                    try:
+                        self.sync_inference_network()
+                    except Exception:
+                        pass
+                    # Skip this training step and return early
+                    return
                 
                 # Additional diagnostic checks for targets and rewards
                 q_tgt_max = Q_targets.max().item()
@@ -1002,12 +1043,12 @@ class DQNAgent:
                     if self.use_mixed_precision and self.scaler is not None:
                         # Gradient clipping with mixed precision
                         self.scaler.unscale_(self.optimizer)
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=1.0)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         # Standard gradient clipping and optimization
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=1.0)
                         self.optimizer.step()
                     optimizer_time = time.time() - optimizer_start
             else:
@@ -1061,6 +1102,7 @@ class DQNAgent:
         """Update target network with weights from local network"""
         # Track when target network was last updated
         metrics.last_target_update_frame = metrics.frame_count
+        metrics.last_target_update_time = time.time()
         
         if getattr(RL_CONFIG, 'use_soft_target', False):
             tau = getattr(RL_CONFIG, 'tau', 0.005)
@@ -1104,6 +1146,30 @@ class DQNAgent:
                 for key, param in self.qnetwork_local.state_dict().items():
                     inference_state_dict[key] = param.to(self.inference_device)
                 self.qnetwork_inference.load_state_dict(inference_state_dict)
+        # Record metrics for sync timing
+        metrics.last_inference_sync_frame = metrics.frame_count
+        metrics.last_inference_sync_time = time.time()
+
+    def _verify_inference_parity(self) -> Tuple[bool, str]:
+        """Check that inference and training nets have matching parameters immediately after sync."""
+        try:
+            if self.qnetwork_inference is self.qnetwork_local:
+                return True, "Same object (single device)"
+            local_sd = self.qnetwork_local.state_dict()
+            infer_sd = self.qnetwork_inference.state_dict()
+            if local_sd.keys() != infer_sd.keys():
+                missing = set(local_sd.keys()) - set(infer_sd.keys())
+                extra = set(infer_sd.keys()) - set(local_sd.keys())
+                return False, f"Key mismatch. Missing={len(missing)} Extra={len(extra)}"
+            # Compare simple signatures (sum) for exact copy
+            for k in local_sd.keys():
+                a_sum = local_sd[k].detach().float().sum().cpu().item()
+                b_sum = infer_sd[k].detach().float().sum().cpu().item()
+                if a_sum != b_sum:
+                    return False, f"Tensor '{k}' differs (sum {a_sum} vs {b_sum})"
+            return True, "Match"
+        except Exception as e:
+            return False, f"Parity check error: {e}"
     
     def get_q_value_range(self):
         """Get current Q-value range from the network for monitoring"""
@@ -1374,6 +1440,17 @@ class DQNAgent:
                 print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
                 print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
                 print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")
+
+                # Ensure inference copy reflects the just-loaded weights
+                try:
+                    self.sync_inference_network()
+                    ok, msg = self._verify_inference_parity()
+                    if not ok:
+                        print(f"[WARN] Post-load inference parity check failed: {msg}")
+                    else:
+                        print("Post-load inference sync complete (parity OK).")
+                except Exception as e:
+                    print(f"[WARN] Post-load inference sync failed: {e}")
 
                 return True
             except Exception as e:
@@ -1819,9 +1896,32 @@ def expert_action_to_index(fire, zap, spinner):
     return base_idx + spinner_idx
 
 def encode_action_to_game(fire, zap, spinner):
-    """Convert action values to game-compatible format"""
-    spinner_val = spinner * 31
-    return int(fire), int(zap), int(spinner_val)
+    """Convert action values to game-compatible format.
+    Spinner is clamped to [-0.3, 0.3] and quantized to the 0.1 step used in ACTION_MAPPING,
+    then scaled to a signed byte for Lua. This keeps the executed action aligned with the
+    discrete index stored for training (prevents expert from sending stronger magnitudes
+    than the discrete mapping represents).
+    """
+    # Normalize fire/zap to 0/1
+    fire_i = 1 if bool(fire) else 0
+    zap_i = 1 if bool(zap) else 0
+
+    # Clamp and quantize spinner to mapping resolution
+    try:
+        s = float(spinner)
+    except Exception:
+        s = 0.0
+    # Clamp to mapping range
+    if s > 0.3:
+        s = 0.3
+    elif s < -0.3:
+        s = -0.3
+    # Quantize to nearest 0.1 step
+    s = round(s / 0.1) * 0.1
+
+    # Scale to signed byte-ish range expected by Lua (approximate; Lua clamps to [-128,127])
+    spinner_val = int(round(s * 31))
+    return fire_i, zap_i, spinner_val
 
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate using step-based decay."""

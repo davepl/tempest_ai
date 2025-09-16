@@ -99,6 +99,18 @@ def main():
         batch_size=RL_CONFIG.batch_size
     )
     
+    # Print configuration information
+    print(f"=== Training Configuration ===")
+    print(f"Learning Rate: {RL_CONFIG.lr}")
+    print(f"Buffer Size: {RL_CONFIG.memory_size:,}")
+    print(f"Batch Size: {RL_CONFIG.batch_size:,}")
+    print(f"Target Update Frequency: {RL_CONFIG.target_update_freq}")
+    print(f"Gamma (Discount): {RL_CONFIG.gamma}")
+    print(f"Epsilon: {RL_CONFIG.epsilon} -> {RL_CONFIG.epsilon_min}")
+    print(f"Use PER: {RL_CONFIG.use_per}")
+    print(f"Hidden Size: {RL_CONFIG.hidden_size}")
+    print(f"==============================")
+    
     # Load the model if it exists
     if os.path.exists(LATEST_MODEL_PATH):
         agent.load(LATEST_MODEL_PATH)

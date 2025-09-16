@@ -8,12 +8,11 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os
 import sys
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List
 from collections import deque
 
 # Global flags
@@ -35,16 +34,16 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
     # Expert ratio configuration - only used for brand new models
-    expert_ratio_start: float = 0.95  # Lower start value for new models (was 0.50)
-    expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
-    expert_ratio_decay: float = 0.9975 # Faster decay to reach ~0.001 by 50M frames (was 0.9995)
-    expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
+    expert_ratio_start: float = 0.80  # Lower start value for new models (was 0.50)
+    expert_ratio_min: float = 0.30    # INCREASED - maintain significant expert guidance (was 0.00)
+    expert_ratio_decay: float = 0.9999
+    expert_ratio_decay_steps: int = 20000  # Less frequent updates - current decay too aggressive (was 5000)
     
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
-    reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
+    reset_expert_ratio: bool = False   # RESET expert ratio - current 24% is too low, performance declining  
     reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
     
-    force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
+    force_expert_ratio_recalc: bool = False  # DISABLED - stop forcing recalc, keep current ratio
 
 # Create instance of ServerConfigData first
 SERVER_CONFIG = ServerConfigData()
@@ -53,27 +52,28 @@ SERVER_CONFIG = ServerConfigData()
 class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
-    action_size: int = 18                 
-    batch_size: int = 8192            # Moderate batch size for dual GPU balance (was 16384)
-    lr: float = 1.0e-4                    # Increased from 5.0e-5 for better learning (loss too low)
+    action_size: int = 15                 
+    batch_size: int = 16384            # Moderate batch size for dual GPU balance (was 16384)
+    lr: float = 0.00025
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
-    epsilon_start: float = 0.5           # Starting epsilon value
+    epsilon_start: float = 0.75           # Starting epsilon value
     epsilon_min: float = 0.15             # INCREASED - force more exploration to break plateau
     epsilon_end: float = 0.15             # Final epsilon value (alias for epsilon_min)
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 4096               # More reasonable network size for dual GPU setup (was 8192)
-    num_layers: int = 4                   # Deeper network for more GPU work
-    target_update_freq: int = 200         # Reduced for more dynamic Q-targets (was 800)  
-    update_target_every: int = 400        # Alias for target_update_freq
+    target_update_freq: int = 50          # INCREASED frequency to prevent Q-value divergence (was 100)  
+    use_soft_target: bool = True          # Enable soft target updates for stability
+    tau: float = 0.005                    # Soft update coefficient (Polyak averaging)
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = True           # Use noisy networks for exploration
-    use_per: bool = True                  # Enabled with priority clamping to prevent explosion
+    use_dueling: bool = True              # Enable dueling value/advantage heads by default
+    use_per: bool = False                  # Enabled with priority clamping to prevent explosion
     use_distributional: bool = False      # Disabled - too complex
     gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
-    use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
+    use_mixed_precision: bool = False     # DISABLED to prevent numerical instability during Q-explosion recovery
     training_steps_per_sample: int = 2    # Reduced training load for better balance (was 8)
     training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
     use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
@@ -117,24 +117,12 @@ class MetricsData:
     memory_buffer_size: int = 0  # Current replay buffer size
     total_training_steps: int = 0  # Total training steps completed
     last_target_update_frame: int = 0  # Frame count when target network was last updated
+    last_inference_sync_frame: int = 0 # Frame count when inference net was last synced
+    last_target_update_time: float = 0.0   # Wall time of last target update
+    last_inference_sync_time: float = 0.0  # Wall time of last inference sync
     
     # Reward component tracking (for analysis and display)
     last_reward_components: Dict[str, float] = field(default_factory=dict)
-    reward_component_history: Dict[str, Deque[float]] = field(default_factory=lambda: {
-        'safety': deque(maxlen=100),
-        'proximity': deque(maxlen=100), 
-        'shots': deque(maxlen=100),
-        'threats': deque(maxlen=100),
-        'pulsar': deque(maxlen=100),
-        'score': deque(maxlen=100),
-        'total': deque(maxlen=100)
-    })
-    # State summary stats (rolling)
-    state_mean: float = 0.0
-    state_std: float = 0.0
-    state_min: float = 0.0
-    state_max: float = 0.0
-    state_invalid_frac: float = 0.0  # Fraction of entries equal to -1.0 (our invalid sentinel)
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
@@ -240,22 +228,7 @@ class MetricsData:
         """Update reward component tracking"""
         with self.lock:
             self.last_reward_components = components.copy()
-            # Add to history for each component
-            for component, value in components.items():
-                if component in self.reward_component_history:
-                    self.reward_component_history[component].append(value)
             # Note: components may come from Lua OOB header (preferred) or Python fallback
-    
-    def get_reward_component_averages(self) -> Dict[str, float]:
-        """Get recent averages of reward components"""
-        with self.lock:
-            averages = {}
-            for component, history in self.reward_component_history.items():
-                if history:
-                    averages[component] = sum(history) / len(history)
-                else:
-                    averages[component] = 0.0
-            return averages
     
     def toggle_override(self, kb_handler=None):
         """Toggle override mode"""
@@ -303,10 +276,7 @@ ACTION_MAPPING = {
     11: (1, 0, 0.1),   # Soft right, fire, no zap
     12: (1, 0, 0.2),   # Medium right, fire, no zap
     13: (1, 0, 0.3),   # Hard right, fire, no zap
-    14: (1, 1, 0.0),   # Zap+Fire+Center
-    15: (0, 1, -0.1),  # Zap+No fire+Soft left
-    16: (0, 1, 0.0),   # Zap+No fire+Center  
-    17: (0, 1, 0.1),   # Zap+No fire+Soft right
+    14: (1, 1, 0.0),   # Zap+Fire+Center (sole zap action)
 }
 
 # Create instances of config classes

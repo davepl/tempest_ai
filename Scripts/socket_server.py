@@ -321,32 +321,7 @@ class SocketServer:
                         # Send empty response on parsing failure
                         client_socket.sendall(struct.pack("bbb", 0, 0, 0))
                         continue
-                    # Update state summary stats periodically
-                    try:
-                        if state.get('frames_processed_since_stats', 0) >= 500:
-                            s = frame.state
-                            # Flatten already 1D; compute quick stats
-                            s_mean = float(np.mean(s))
-                            s_std = float(np.std(s))
-                            s_min = float(np.min(s))
-                            s_max = float(np.max(s))
-                            # SIMPLIFIED: With float32 normalization, invalid values are handled in Lua
-                            invalid_frac = float(np.mean((s <= -0.999).astype(np.float32)))
-                            with self.metrics.lock:
-                                self.metrics.state_mean = s_mean
-                                self.metrics.state_std = s_std
-                                self.metrics.state_min = s_min
-                                self.metrics.state_max = s_max
-                                self.metrics.state_invalid_frac = invalid_frac
-                            state['frames_processed_since_stats'] = 0
-                            # Light, occasional print for sanity
-                            #if self.metrics.frame_count % 5000 < 500:
-                            #    print(f"State stats: mean={s_mean:+.3f} std={s_std:.3f} min={s_min:+.3f} max={s_max:+.3f} relInvalid={invalid_frac*100:.1f}%")
-                        else:
-                            state['frames_processed_since_stats'] = state.get('frames_processed_since_stats', 0) + 1
-                    except Exception:
-                        pass
-                    
+
                     # Get client state
                     with self.client_lock:
                         # Check if client_id still exists before accessing state
@@ -559,6 +534,9 @@ class SocketServer:
                             self.metrics.increment_guided_count()
                             action_source = "expert"
                             action_idx = expert_action_to_index(fire, zap, spinner)
+                            # IMPORTANT: Align executed action with the discrete mapping used for training
+                            # This ensures the control we send matches the index we store
+                            fire, zap, spinner = ACTION_MAPPING[action_idx]
                         else:
                             # Use DQN with current epsilon
                             start_time = time.perf_counter()
@@ -594,7 +572,7 @@ class SocketServer:
 
 
                     # Periodic target network update (only from client 0)
-                    if client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
+                    if client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.target_update_freq == 0:
                         self.agent.update_target_network()
 
                     # Periodic model saving (only from client 0)
