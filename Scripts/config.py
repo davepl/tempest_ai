@@ -55,7 +55,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     batch_size: int = 8192            # Moderate batch size for dual GPU balance (was 16384)
-    lr: float = 1.0e-4                    # Increased from 5.0e-5 for better learning (loss too low)
+    lr: float = .00025                    # Increased from 5.0e-5 for better learning (loss too low)
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.5           # Starting epsilon value

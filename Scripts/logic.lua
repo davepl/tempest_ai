@@ -565,7 +565,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     -- === Step 1C: Top-Rail Flipper/Pulsar Hunt-to-Adjacency (Closed levels) ===
     -- On closed levels, proactively move to be exactly one segment away from the nearest top-rail flipper or pulsar.
     -- For pulsars specifically, NEVER target the pulsar lane; target the adjacent lane closest to the player.
-    if not conserve_override_active and not is_open then
+    if not conserve_override_active and not is_open and not (enemy_left_exists and enemy_right_exists) then
             local target_threat_seg, target_threat_rel, target_threat_type, target_abs_rel = nil, nil, nil, 100
             if nearest_flipper_seg and min_flipper_abs_rel < target_abs_rel then
                 target_threat_seg = nearest_flipper_seg
@@ -624,69 +624,62 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
 
     if not conserve_override_active and enemy_left_exists and enemy_right_exists then
-            -- Case 1: Both Sides - Pin to nearest threat strategy
-            -- Find the nearest threat (fuseball, pulsar, or flipper - fuseballs have highest priority)
-            local nearest_threat_seg = nil
-            local nearest_threat_rel = nil
-            local min_threat_distance = 100
-            local nearest_threat_type = nil
-            
-            for _, enemy in ipairs(top_rail_enemies) do
-                if enemy.type == ENEMY_TYPE_FUSEBALL or enemy.type == ENEMY_TYPE_FLIPPER or enemy.type == ENEMY_TYPE_PULSAR then
-                    local threat_distance = math.abs(enemy.rel)
-                    -- Fuseballs get priority due to fatal contact, then closest distance
-                    local is_higher_priority = false
-                    if enemy.type == ENEMY_TYPE_FUSEBALL and nearest_threat_type ~= ENEMY_TYPE_FUSEBALL then
-                        is_higher_priority = true
-                    elseif enemy.type == ENEMY_TYPE_FUSEBALL and nearest_threat_type == ENEMY_TYPE_FUSEBALL and threat_distance < min_threat_distance then
-                        is_higher_priority = true
-                    elseif nearest_threat_type ~= ENEMY_TYPE_FUSEBALL and threat_distance < min_threat_distance then
-                        is_higher_priority = true
-                    end
-                    
-                    if is_higher_priority then
-                        min_threat_distance = threat_distance
-                        nearest_threat_seg = enemy.seg
-                        nearest_threat_rel = enemy.rel
-                        nearest_threat_type = enemy.type
-                    end
-                end
-            end
-            
-            if nearest_threat_seg then
-                -- Pin to appropriate distance from nearest threat on the near side
-                if nearest_threat_type == ENEMY_TYPE_PULSAR then
-                    -- Hunt pulsar from fixed offset toward the player side
-                    local dir_to_player = abs_to_rel_func(nearest_threat_seg, player_abs_seg, is_open)
-                    local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
-                    proposed_target_seg = (nearest_threat_seg + dir_sign * PULSAR_TARGET_DISTANCE + 16) % 16
+            -- Case 1: Both Sides (Closed levels) - Stay stationary and conserve fire until thresholds, then fire
+            if not is_open then
+                proposed_target_seg = player_abs_seg
+                -- Determine if either side is within reaction thresholds
+                local within_right = (nr_dist_float <= FLIPPER_REACT_DISTANCE_R)
+                local within_left  = (nl_dist_float <= FLIPPER_REACT_DISTANCE_L)
+                if within_right or within_left then
+                    proposed_fire_prio = FREEZE_FIRE_PRIO_HIGH  -- high priority to allow firing now
                 else
-                    local safe_distance = (nearest_threat_type == ENEMY_TYPE_FUSEBALL) and 2 or 1 -- Fuseballs need more distance
-                    if nearest_threat_rel > 0 then
-                        -- Threat is to the right, pin safe_distance segments to the left of it
-                        proposed_target_seg = (nearest_threat_seg - safe_distance + 16) % 16
-                    elseif nearest_threat_rel < 0 then
-                        -- Threat is to the left, pin safe_distance segments to the right of it
-                        proposed_target_seg = (nearest_threat_seg + safe_distance) % 16
-                    else
-                        proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
-                    end
-                end
-                
-                -- Safety check the pinned position
-                if M.is_danger_lane(proposed_target_seg, enemies_state) then
-                    proposed_target_seg = find_nearest_safe_segment(proposed_target_seg, enemies_state, is_open)
-                end
-                -- Never target pulsar lane
-                if is_pulsar_lane(proposed_target_seg, enemies_state) then
-                    proposed_target_seg = find_nearest_non_pulsar_segment(proposed_target_seg, enemies_state, is_open)
+                    proposed_fire_prio = 0  -- conserve shots while waiting
                 end
             else
-                -- No critical threats found, fall back to safety-based positioning
-                if M.is_danger_lane(player_abs_seg, enemies_state) then
-                    proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                -- Open levels: retain previous behavior (pin/positioning)
+                -- Find nearest significant threat and position relative to it
+                local nearest_threat_seg = nil
+                local nearest_threat_rel = nil
+                local min_threat_distance = 100
+                local nearest_threat_type = nil
+                for _, enemy in ipairs(top_rail_enemies) do
+                    if enemy.type == ENEMY_TYPE_FUSEBALL or enemy.type == ENEMY_TYPE_FLIPPER or enemy.type == ENEMY_TYPE_PULSAR then
+                        local threat_distance = math.abs(enemy.rel)
+                        if threat_distance < min_threat_distance then
+                            min_threat_distance = threat_distance
+                            nearest_threat_seg = enemy.seg
+                            nearest_threat_rel = enemy.rel
+                            nearest_threat_type = enemy.type
+                        end
+                    end
+                end
+                if nearest_threat_seg then
+                    if nearest_threat_type == ENEMY_TYPE_PULSAR then
+                        local dir_to_player = abs_to_rel_func(nearest_threat_seg, player_abs_seg, is_open)
+                        local dir_sign = (dir_to_player > 0) and 1 or (dir_to_player < 0 and -1 or 1)
+                        proposed_target_seg = (nearest_threat_seg + dir_sign * PULSAR_TARGET_DISTANCE + 16) % 16
+                    else
+                        local safe_distance = (nearest_threat_type == ENEMY_TYPE_FUSEBALL) and 2 or 1
+                        if nearest_threat_rel > 0 then
+                            proposed_target_seg = (nearest_threat_seg - safe_distance + 16) % 16
+                        elseif nearest_threat_rel < 0 then
+                            proposed_target_seg = (nearest_threat_seg + safe_distance) % 16
+                        else
+                            proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                        end
+                    end
+                    if M.is_danger_lane(proposed_target_seg, enemies_state) then
+                        proposed_target_seg = find_nearest_safe_segment(proposed_target_seg, enemies_state, is_open)
+                    end
+                    if is_pulsar_lane(proposed_target_seg, enemies_state) then
+                        proposed_target_seg = find_nearest_non_pulsar_segment(proposed_target_seg, enemies_state, is_open)
+                    end
                 else
-                    proposed_target_seg = player_abs_seg
+                    if M.is_danger_lane(player_abs_seg, enemies_state) then
+                        proposed_target_seg = find_nearest_safe_segment(player_abs_seg, enemies_state, is_open)
+                    else
+                        proposed_target_seg = player_abs_seg
+                    end
                 end
             end
     elseif not conserve_override_active and enemy_right_exists then
