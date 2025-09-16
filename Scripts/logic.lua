@@ -813,7 +813,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         
         -- Recommend superzap if 3+ top rail enemies and superzapper is available
         local should_superzap = false
-        local superzapper_available = (player_state.superzapper_active or 0) > 0
+        local superzapper_available = (player_state.superzapper_uses or 0) < 2
         if top_rail_count >= 3 and superzapper_available then
             should_superzap = true
         end

@@ -97,6 +97,7 @@ from config import (
     MODEL_DIR,
     LATEST_MODEL_PATH,
     ACTION_MAPPING,
+    ZAP_ACTIONS,
     metrics as config_metrics,
     ServerConfigData,
     RLConfigData,
@@ -1145,9 +1146,28 @@ class DQNAgent:
         # Set training mode back
         self.qnetwork_inference.train()
         
-        # Epsilon-greedy action selection
+        # Epsilon-greedy action selection with zap-downscaling
         if random.random() < epsilon:
-            return random.randrange(self.action_size)
+            # Build a weighted choice where zap actions are downscaled
+            zap_scale = max(0.0, min(1.0, getattr(RL_CONFIG, 'zap_random_scale', 1.0)))
+            # Uniform base weights for all actions
+            weights = [1.0] * self.action_size
+            # Apply zap scaling
+            for idx in ZAP_ACTIONS:
+                if 0 <= idx < self.action_size:
+                    weights[idx] *= zap_scale
+            # If all weights zero (zap_scale=0 and all zap), fall back safely to center no-zap
+            total_w = sum(weights)
+            if total_w <= 0:
+                return 3  # center, no fire, no zap
+            # Sample according to weights
+            r = random.random() * total_w
+            cum = 0.0
+            for i, w in enumerate(weights):
+                cum += w
+                if r <= cum:
+                    return i
+            return self.action_size - 1
         else:
             return action_values.cpu().data.numpy().argmax()
             
@@ -1709,7 +1729,8 @@ def display_metrics_header(kb=None):
     if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10} | {'Q-Value Range':>14}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10} | "
+        f"{'InferSync ΔF/Δt':>16} | {'TargetUpd ΔF/Δt':>17} | {'Q-Value Range':>14}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -1751,11 +1772,21 @@ def display_metrics_row(agent, kb=None):
                 q_range = f"[{min_q:.2f}, {max_q:.2f}]"
         except Exception:
             q_range = "Error"
+
+    # Compute frames/time since last inference sync and last target update
+    now = time.time()
+    sync_df = metrics.frame_count - getattr(metrics, 'last_inference_sync_frame', 0)
+    sync_dt = max(0.0, now - getattr(metrics, 'last_inference_sync_time', 0.0))
+    targ_df = metrics.frame_count - getattr(metrics, 'last_target_update_frame', 0)
+    targ_dt = max(0.0, now - getattr(metrics, 'last_target_update_time', 0.0))
+    sync_col = f"{sync_df:6d}/{sync_dt:6.1f}s"
+    targ_col = f"{targ_df:6d}/{targ_dt:6.1f}s"
     
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | {q_range:>14}"
+        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | "
+        f"{sync_col:>16} | {targ_col:>17} | {q_range:>14}"
     )
     print_with_terminal_restore(kb, row)
 
