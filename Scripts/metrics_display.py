@@ -57,7 +57,8 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
         f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
-        f"{'Clients':>8} {'Avg Level':>10} {'Override':>9} {'Expert Mode':>11} "
+        f"{'Clients':>8} {'Avg Level':>10} {'OVR':>3} {'Expert':>6} "
+    f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
         f"{'AvgInf(ms)':>11} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
@@ -120,14 +121,29 @@ def display_metrics_row(agent, kb_handler):
         except Exception:
             q_range = "Error"
 
+    # Compute frames/time since last inference sync and last target update
+    now = time.time()
+    # Frames since
+    sync_df = metrics.frame_count - getattr(metrics, 'last_inference_sync_frame', 0)
+    targ_df = metrics.frame_count - getattr(metrics, 'last_hard_target_update_frame', 0)
+
+    # Seconds since (guard against unset timestamps which default to 0.0)
+    last_sync_time = getattr(metrics, 'last_inference_sync_time', 0.0)
+    last_targ_time = getattr(metrics, 'last_hard_target_update_time', 0.0)
+    sync_dt = (now - last_sync_time) if last_sync_time > 0.0 else None
+    targ_dt = (now - last_targ_time) if last_targ_time > 0.0 else None
+    sync_col = f"{sync_df//1000}k/{(f'{sync_dt:>4.1f}s' if sync_dt is not None else 'n/a'):>6}"
+    targ_col = f"{targ_df//1000}k/{(f'{targ_dt:>4.1f}s' if targ_dt is not None else 'n/a'):>6}"
+
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.4f} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.5f} "
         f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} "
         f"{latest_loss:>10.4f} {metrics.client_count:>8} "
         f"{display_level:>10.1f} "
-        f"{'ON' if metrics.override_expert else 'OFF':>9} "
-        f"{'ON' if metrics.expert_mode else 'OFF':>11} "
+    f"{'ON' if metrics.override_expert else 'OFF':>3} "
+    f"{'ON' if metrics.expert_mode else 'OFF':>6} "
+        f"{sync_col:>12} {targ_col:>13} "
         f"{avg_inference_time_ms:>11.2f} "
         f"{q_range:>14} {training_stats:>15}"
     )
