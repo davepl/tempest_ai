@@ -657,8 +657,10 @@ class DQNAgent:
         # Store device references
         self.inference_device = inference_device
         self.training_device = training_device
-        
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
+
+        # Optional small weight decay for regularization
+        wd = float(getattr(RL_CONFIG, 'adam_weight_decay', 0.0))
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate, weight_decay=wd)
         # Optional LR scheduler
         self.scheduler = None
         if getattr(RL_CONFIG, 'use_lr_scheduler', False):
@@ -674,8 +676,8 @@ class DQNAgent:
             print("Using standard Replay Memory")
             self.memory = ReplayMemory(memory_size)
 
-        # Initialize target network with same weights as local network
-        self.update_target_network()
+        # Initialize target network with same weights as local network (force hard copy)
+        self.force_hard_target_update()
 
         # Training queue for background thread - much larger to prevent throttling
         self.train_queue = queue.Queue(maxsize=50000)  # Increased from 20000 to 50000
@@ -733,6 +735,11 @@ class DQNAgent:
             worker_thread.start()
             self.training_threads.append(worker_thread)
         print(f"Started {self.num_training_workers} training worker threads")
+
+        # Start inference sync heartbeat to ensure regular syncing at least every N seconds
+        self._sync_interval_seconds = float(getattr(RL_CONFIG, 'inference_sync_interval_sec', 10.0))
+        self._sync_thread = threading.Thread(target=self._inference_sync_heartbeat, daemon=True, name="InferenceSyncHeartbeat")
+        self._sync_thread.start()
         
     def background_train(self):
         """High-throughput training loop on dedicated GPU for maximum utilization"""
@@ -745,7 +752,7 @@ class DQNAgent:
                 _ = self.train_queue.get()
                 
                 # Process multiple training steps per request for maximum GPU utilization
-                steps_per_batch = getattr(RL_CONFIG, 'training_steps_per_sample', 3)
+                steps_per_batch = getattr(RL_CONFIG, 'training_steps_per_sample', 10)
                 for _ in range(steps_per_batch):
                     if len(self.memory) >= RL_CONFIG.batch_size:
                         self._train_step_counter += 1
@@ -786,15 +793,17 @@ class DQNAgent:
         # Compute TD errors
         td_errors = (Q_expected - Q_targets).abs()
         
+        # Optionally clamp targets to prevent runaway bootstrap
+        if bool(getattr(RL_CONFIG, 'clamp_targets', True)):
+            Q_targets = Q_targets.clamp(min=-10.0, max=10.0)
+
         # Compute loss (with or without importance sampling weights)
+        # Use SmoothL1 (Huber) loss for stability against outliers
         if is_weights is not None:
-            weighted_td_loss = is_weights * (Q_expected - Q_targets).pow(2)
-            loss = weighted_td_loss.mean()
+            huber = F.smooth_l1_loss(Q_expected, Q_targets, reduction='none')
+            loss = (is_weights * huber).mean()
         else:
-            # Use MSE loss instead of SmoothL1Loss for stronger gradients
-            # MSE is more sensitive to outliers and will produce larger loss values
-            mse_loss = (Q_expected - Q_targets).pow(2).mean()
-            loss = mse_loss
+            loss = F.smooth_l1_loss(Q_expected, Q_targets, reduction='mean')
         
         return loss, td_errors, Q_expected, Q_targets
 
@@ -986,30 +995,58 @@ class DQNAgent:
                 with self.training_lock:  # Serialize optimizer updates across all threads
                     optimizer_start = time.time()
                     
-                    # DIAGNOSTIC: Track gradient norms before clipping
-                    total_grad_norm = 0.0
-                    param_count = 0
-                    for param in self.qnetwork_local.parameters():
-                        if param.grad is not None:
-                            param_norm = param.grad.data.norm(2)
-                            total_grad_norm += param_norm.item() ** 2
-                            param_count += 1
-                    total_grad_norm = total_grad_norm ** (1. / 2)
-                    
-                    # Enable gradient norm logging to diagnose vanishing gradients
-                    if metrics.total_training_steps % 1000 == 0:
-                        print(f"Step {metrics.total_training_steps}: Gradient norm: {total_grad_norm:.6f}, Loss: {(loss * accumulation_steps).item():.6f}")
-                    
+                    # Unscale (if AMP) so logged norms are meaningful, then measure/clip
+                    preclip_grad_norm = None
+                    postclip_grad_norm = None
+
                     if self.use_mixed_precision and self.scaler is not None:
-                        # Gradient clipping with mixed precision
+                        # Unscale the gradients to real values before measuring/clipping
                         self.scaler.unscale_(self.optimizer)
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+
+                        # Measure pre-clip L2 grad norm
+                        sq_sum = 0.0
+                        for p in self.qnetwork_local.parameters():
+                            if p.grad is not None:
+                                sq_sum += p.grad.data.norm(2).item() ** 2
+                        preclip_grad_norm = sq_sum ** 0.5
+
+                        # Clip and then measure post-clip norm
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=5.0)
+                        # clipped_grad_norm is already the total norm after clipping, but compute explicitly for clarity
+                        sq_sum = 0.0
+                        for p in self.qnetwork_local.parameters():
+                            if p.grad is not None:
+                                sq_sum += p.grad.data.norm(2).item() ** 2
+                        postclip_grad_norm = sq_sum ** 0.5
+
+                        # Optimizer step/update
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
-                        # Standard gradient clipping and optimization
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=10.0)
+                        # Measure pre-clip L2 grad norm (fp32 path)
+                        sq_sum = 0.0
+                        for p in self.qnetwork_local.parameters():
+                            if p.grad is not None:
+                                sq_sum += p.grad.data.norm(2).item() ** 2
+                        preclip_grad_norm = sq_sum ** 0.5
+
+                        # Clip and step
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=5.0)
+                        # Measure post-clip
+                        sq_sum = 0.0
+                        for p in self.qnetwork_local.parameters():
+                            if p.grad is not None:
+                                sq_sum += p.grad.data.norm(2).item() ** 2
+                        postclip_grad_norm = sq_sum ** 0.5
+
                         self.optimizer.step()
+
+                    # Log meaningful (unscaled) gradient norms every 1000 training steps
+                    if metrics.total_training_steps % 1000 == 0:
+                        print(
+                            f"Step {metrics.total_training_steps}: Grad L2 pre-clip={preclip_grad_norm:.6e}, "
+                            f"post-clip={postclip_grad_norm:.6e}, Loss={(loss * accumulation_steps).item():.6f}"
+                        )
                     optimizer_time = time.time() - optimizer_start
             else:
                 optimizer_time = 0
@@ -1027,16 +1064,8 @@ class DQNAgent:
                 # if metrics.total_training_steps % 1000 == 0:
                 #     self.memory.validate_priorities()            # Only update target network and scheduler on actual optimizer steps
             if should_step_optimizer:
-                # Target network and scheduler updates are already inside training_lock above
-                # Soft target update if enabled (Polyak averaging every step)
-                if getattr(RL_CONFIG, 'use_soft_target', False):
-                    tau = getattr(RL_CONFIG, 'tau', 0.005)
-                    self.soft_update(tau)
-                else:
-                    # Hard target network update every target_update_freq steps
-                    target_freq = getattr(RL_CONFIG, 'target_update_freq', 200)
-                    if metrics.total_training_steps % target_freq == 0:
-                        self.update_target_network()
+                # Unified target update management (soft + hard)
+                self._manage_target_updates()
 
                 # Step LR scheduler if enabled
                 if self.scheduler is not None:
@@ -1060,28 +1089,82 @@ class DQNAgent:
 
     def update_target_network(self):
         """Update target network with weights from local network"""
-        # Track when target network was last updated
+        # Track when target network was last updated (any kind of update)
         metrics.last_target_update_frame = metrics.frame_count
-        
+        metrics.last_target_update_time = time.time()
+
         if getattr(RL_CONFIG, 'use_soft_target', False):
+            # Soft update only (do not mark as hard)
             tau = getattr(RL_CONFIG, 'tau', 0.005)
             self.soft_update(tau)
         else:
-            # Handle cross-device state dict copying
-            local_state_dict = self.qnetwork_local.state_dict()
-            # Get device from first parameter
-            local_device = next(self.qnetwork_local.parameters()).device
-            target_device = next(self.qnetwork_target.parameters()).device
-            
-            if target_device != local_device:
-                # Move state dict to target device
-                target_state_dict = {}
-                for key, param in local_state_dict.items():
-                    target_state_dict[key] = param.to(target_device)
-                self.qnetwork_target.load_state_dict(target_state_dict)
-            else:
-                # Same device - direct load
-                self.qnetwork_target.load_state_dict(local_state_dict)
+            # Hard copy path
+            self._hard_copy_target_from_local()
+            # Mark this as a FULL (hard) update for telemetry
+            metrics.last_hard_target_update_frame = metrics.frame_count
+            metrics.last_hard_target_update_time = time.time()
+
+    def _manage_target_updates(self):
+        """Centralized policy for soft updates and scheduled hard refreshes."""
+        # Soft update each optimizer step if enabled
+        if getattr(RL_CONFIG, 'use_soft_target', False):
+            tau = getattr(RL_CONFIG, 'tau', 0.005)
+            self.soft_update(tau)
+            # Record that a target update happened (soft)
+            metrics.last_target_update_frame = metrics.frame_count
+            metrics.last_target_update_time = time.time()
+
+            # Warmup hard refresh cadence (to anchor target early on)
+            steps = metrics.total_training_steps
+            warm_until = int(getattr(RL_CONFIG, 'warmup_hard_refresh_until_steps', 0))
+            warm_every = max(1, int(getattr(RL_CONFIG, 'warmup_hard_refresh_every_steps', 0)))
+            if warm_until > 0 and steps < warm_until and steps % warm_every == 0:
+                self.force_hard_target_update()
+
+            # Periodic hard refresh (longer cadence) after warmup
+            refresh_steps = int(getattr(RL_CONFIG, 'hard_target_refresh_every_steps', 0))
+            if refresh_steps > 0 and steps % refresh_steps == 0:
+                self.force_hard_target_update()
+
+            # Watchdog: if too long since last hard update, force one (time-based)
+            watchdog_sec = float(getattr(RL_CONFIG, 'hard_update_watchdog_seconds', 0.0))
+            if watchdog_sec > 0.0:
+                last_t = getattr(metrics, 'last_hard_target_update_time', 0.0)
+                now = time.time()
+                if last_t <= 0.0 or (now - last_t) >= watchdog_sec:
+                    self.force_hard_target_update()
+        else:
+            # No soft targets: do standard periodic hard updates by steps
+            target_freq = getattr(RL_CONFIG, 'target_update_freq', 200)
+            if target_freq > 0 and metrics.total_training_steps % target_freq == 0:
+                self.update_target_network()
+
+    def force_hard_target_update(self):
+        """Force a full hard copy of local -> target, regardless of soft-target setting."""
+        # Track any target update
+        metrics.last_target_update_frame = metrics.frame_count
+        metrics.last_target_update_time = time.time()
+        # Perform actual hard copy
+        self._hard_copy_target_from_local()
+        # Telemetry for hard update
+        metrics.last_hard_target_update_frame = metrics.frame_count
+        metrics.last_hard_target_update_time = time.time()
+
+    def _hard_copy_target_from_local(self):
+        """Helper to copy local network weights to target network across devices."""
+        # Handle cross-device state dict copying
+        local_state_dict = self.qnetwork_local.state_dict()
+        local_device = next(self.qnetwork_local.parameters()).device
+        target_device = next(self.qnetwork_target.parameters()).device
+        if target_device != local_device:
+            # Move state dict to target device
+            target_state_dict = {}
+            for key, param in local_state_dict.items():
+                target_state_dict[key] = param.to(target_device)
+            self.qnetwork_target.load_state_dict(target_state_dict)
+        else:
+            # Same device - direct load
+            self.qnetwork_target.load_state_dict(local_state_dict)
 
     def soft_update(self, tau: float = 0.005):
         """Soft-update target network parameters: θ_target = τ*θ_local + (1-τ)*θ_target"""
@@ -1098,13 +1181,33 @@ class DQNAgent:
 
     def sync_inference_network(self):
         """Synchronize inference network with training updates"""
-        if hasattr(self, 'qnetwork_inference') and self.qnetwork_inference != self.qnetwork_local:
-            # Copy weights from training network to inference network across devices
-            with torch.no_grad():
-                inference_state_dict = {}
-                for key, param in self.qnetwork_local.state_dict().items():
-                    inference_state_dict[key] = param.to(self.inference_device)
-                self.qnetwork_inference.load_state_dict(inference_state_dict)
+        did_copy = False
+        if hasattr(self, 'qnetwork_inference'):
+            if self.qnetwork_inference != self.qnetwork_local:
+                # Copy weights from training network to inference network across devices
+                with torch.no_grad():
+                    inference_state_dict = {}
+                    for key, param in self.qnetwork_local.state_dict().items():
+                        inference_state_dict[key] = param.to(self.inference_device)
+                    self.qnetwork_inference.load_state_dict(inference_state_dict)
+                did_copy = True
+        # Track sync timing for metrics even if copy is a no-op (single-GPU case)
+        metrics.last_inference_sync_frame = metrics.frame_count
+        metrics.last_inference_sync_time = time.time()
+        return did_copy
+
+    def _inference_sync_heartbeat(self):
+        """Background thread to ensure inference network syncing at least every N seconds."""
+        while self.running:
+            try:
+                now = time.time()
+                last = getattr(metrics, 'last_inference_sync_time', 0.0)
+                if last <= 0.0 or (now - last) >= self._sync_interval_seconds:
+                    self.sync_inference_network()
+                time.sleep(1.0)
+            except Exception:
+                # Be resilient to transient errors
+                time.sleep(1.0)
     
     def get_q_value_range(self):
         """Get current Q-value range from the network for monitoring"""
@@ -1729,8 +1832,8 @@ def display_metrics_header(kb=None):
     if not IS_INTERACTIVE: return
     header = (
         f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'Override':>10} | "
-        f"{'InferSync ΔF/Δt':>16} | {'TargetUpd ΔF/Δt':>17} | {'Q-Value Range':>14}"
+        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'OVR':>3} | {'Expert':>6} | "
+        f"{'InferSync ΔF/Δt':>16} | {'HardUpd ΔF/Δt':>17} | {'Q-Value Range':>14}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -1754,11 +1857,8 @@ def display_metrics_row(agent, kb=None):
             metrics.client_count = client_count
     
     # Determine override status
-    override_status = "OFF"
-    if metrics.override_expert:
-        override_status = "SELF"
-    elif metrics.expert_mode:
-        override_status = "BOT"
+    # Display simple ON/OFF for override in its own column; Expert has its own ON/OFF column
+    override_status = "ON" if metrics.override_expert else "OFF"
     
     # Display average level as 1-based instead of 0-based
     display_level = metrics.average_level + 1.0
@@ -1773,19 +1873,21 @@ def display_metrics_row(agent, kb=None):
         except Exception:
             q_range = "Error"
 
-    # Compute frames/time since last inference sync and last target update
+    # Compute frames/time since last inference sync and last HARD target update
     now = time.time()
     sync_df = metrics.frame_count - getattr(metrics, 'last_inference_sync_frame', 0)
-    sync_dt = max(0.0, now - getattr(metrics, 'last_inference_sync_time', 0.0))
-    targ_df = metrics.frame_count - getattr(metrics, 'last_target_update_frame', 0)
-    targ_dt = max(0.0, now - getattr(metrics, 'last_target_update_time', 0.0))
-    sync_col = f"{sync_df:6d}/{sync_dt:6.1f}s"
-    targ_col = f"{targ_df:6d}/{targ_dt:6.1f}s"
+    targ_df = metrics.frame_count - getattr(metrics, 'last_hard_target_update_frame', 0)
+    last_sync_time = getattr(metrics, 'last_inference_sync_time', 0.0)
+    last_targ_time = getattr(metrics, 'last_hard_target_update_time', 0.0)
+    sync_dt = (now - last_sync_time) if last_sync_time > 0.0 else None
+    targ_dt = (now - last_targ_time) if last_targ_time > 0.0 else None
+    sync_col = f"{sync_df:6d}/{(f'{sync_dt:6.1f}s' if sync_dt is not None else '   n/a')}"
+    targ_col = f"{targ_df:6d}/{(f'{targ_dt:6.1f}s' if targ_dt is not None else '   n/a')}"
     
     row = (
         f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-        f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:10} | "
+    f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:>3} | {'ON' if metrics.expert_mode else 'OFF':>6} | "
         f"{sync_col:>16} | {targ_col:>17} | {q_range:>14}"
     )
     print_with_terminal_restore(kb, row)

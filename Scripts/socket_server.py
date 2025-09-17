@@ -390,10 +390,10 @@ class SocketServer:
                     if local_frame_accum >= METRICS_BATCH:
                         current_frame = self.metrics.update_frame_count(delta=local_frame_accum)
                         local_frame_accum = 0
-                        if client_id == 0:
-                            # Only one thread updates schedules
-                            self.metrics.update_epsilon()
-                            self.metrics.update_expert_ratio()
+                        # Decouple decay schedules from client 0: any client can advance
+                        # These methods are lock-protected and interval-guarded, so safe to call
+                        self.metrics.update_epsilon()
+                        self.metrics.update_expert_ratio()
                     self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
                     
                     # Process previous step's results with n-step returns if available
@@ -594,13 +594,21 @@ class SocketServer:
 
 
                     # Periodic target network update (only from client 0)
-                    if client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.update_target_every == 0:
-                        self.agent.update_target_network()
+                    # IMPORTANT: When soft targets are enabled, training loop handles soft updates
+                    # and periodic hard refresh on a step cadence. Avoid frequent frame-based hard
+                    # updates here, which can destabilize learning by removing target lag.
+                    if (client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent
+                        and current_frame % RL_CONFIG.update_target_every == 0):
+                        if not getattr(RL_CONFIG, 'use_soft_target', True):
+                            # Hard update only if soft targets are disabled
+                            if hasattr(self.agent, 'force_hard_target_update'):
+                                self.agent.force_hard_target_update()
+                            else:
+                                self.agent.update_target_network()
 
                     # Periodic model saving (only from client 0)
                     if client_id == 0 and 'current_frame' in locals() and hasattr(self, 'agent') and self.agent and current_frame % RL_CONFIG.save_interval == 0:
                         self.agent.save(LATEST_MODEL_PATH)
-
 
                 except (BlockingIOError, InterruptedError):
                     # Expected with non-blocking socket, short sleep prevents busy-waiting

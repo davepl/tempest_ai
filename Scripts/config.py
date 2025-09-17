@@ -35,13 +35,13 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
     # Expert ratio configuration - only used for brand new models
-    expert_ratio_start: float = 0.95  # Lower start value for new models (was 0.50)
+    expert_ratio_start: float = 0.75  # Lower start value for new models (was 0.50)
     expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
-    expert_ratio_decay: float = 0.9975 # Faster decay to reach ~0.001 by 50M frames (was 0.9995)
+    expert_ratio_decay: float = 0.9995 # Faster decay to reach ~0.001 by 50M frames (was 0.9995)
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
-    reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
+    reset_expert_ratio: bool = True  # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
     
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
@@ -54,13 +54,13 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 8192            # Moderate batch size for dual GPU balance (was 16384)
-    lr: float = .00025                    # Increased from 5.0e-5 for better learning (loss too low)
+    batch_size: int = 16384            # Moderate batch size for dual GPU balance (was 16384)
+    lr: float = .0001                     # Slightly lower LR for stability under high throughput
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
-    epsilon_start: float = 0.5           # Starting epsilon value
-    epsilon_min: float = 0.15             # INCREASED - force more exploration to break plateau
-    epsilon_end: float = 0.15             # Final epsilon value (alias for epsilon_min)
+    epsilon_start: float = 0.15           # Starting epsilon value
+    epsilon_min: float = 0.025             # INCREASED - force more exploration to break plateau
+    epsilon_end: float = 0.025             # Final epsilon value (alias for epsilon_min)
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
@@ -70,7 +70,7 @@ class RLConfigData:
     update_target_every: int = 400        # Alias for target_update_freq
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = True           # Use noisy networks for exploration
-    use_per: bool = True                  # Enabled with priority clamping to prevent explosion
+    use_per: bool = False                  # Enabled with priority clamping to prevent explosion
     use_distributional: bool = False      # Disabled - too complex
     gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
@@ -78,7 +78,16 @@ class RLConfigData:
     training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
     use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
     use_soft_target: bool = True          # Enable soft target updates for stability
-    tau: float = 0.005                    # Soft update coefficient (Polyak averaging)
+    tau: float = 0.0025                   # Slightly slower Polyak to reduce drift/instability
+    # Optional hard refresh of target net even when using soft updates
+    hard_target_refresh_every_steps: int = 10000  # More conservative hard refresh interval
+    # Inference sync heartbeat interval (seconds)
+    inference_sync_interval_sec: float = 30.0
+    # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
+    warmup_hard_refresh_until_steps: int = 2000
+    warmup_hard_refresh_every_steps: int = 200
+    # Watchdog: ensure a hard refresh happens at least every N seconds once training is active
+    hard_update_watchdog_seconds: float = 60.0
     # Scale factor applied to epsilon-random zap probability (1.0 = uniform baseline, 0.0 = never choose zap during epsilon)
     zap_random_scale: float = 0.0
     # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
@@ -124,6 +133,9 @@ class MetricsData:
     last_inference_sync_frame: int = 0 # Frame count when inference net was last synced
     last_target_update_time: float = 0.0   # Wall time of last target update
     last_inference_sync_time: float = 0.0  # Wall time of last inference sync
+    # Hard target update telemetry (full copy)
+    last_hard_target_update_frame: int = 0
+    last_hard_target_update_time: float = 0.0
     
     # Reward component tracking (for analysis and display)
     last_reward_components: Dict[str, float] = field(default_factory=dict)
