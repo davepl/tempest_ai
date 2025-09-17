@@ -351,7 +351,7 @@ class SocketServer:
                     with self.client_lock:
                         # Check if client_id still exists before accessing state
                         if client_id not in self.client_states:
-                            print(f"Client {client_id}: State not found, likely disconnected during processing. Aborting frame.")
+                            # print(f"Client {client_id}: State not found, likely disconnected during processing. Aborting frame.")
                             break # Exit loop if state is gone
 
                         state = self.client_states[client_id]
@@ -545,7 +545,7 @@ class SocketServer:
                         # HACK: Use 95% expert ratio when gamestate is GS_ZoomingDown (0x20)
                         current_expert_ratio = self.metrics.get_expert_ratio()
                         if frame.gamestate == 0x20:  # GS_ZoomingDown
-                            current_expert_ratio = 1.0
+                            current_expert_ratio = current_expert_ratio * 2
                             
                         if random.random() < current_expert_ratio and not self.metrics.is_override_active():
                             # Use expert system
@@ -615,7 +615,7 @@ class SocketServer:
                     time.sleep(0.001)
                     continue
                 except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
-                    print(f"Client {client_id} connection error: {e}")
+                    # print(f"Client {client_id} connection error: {e}")
                     break # Exit the loop on connection errors
                 except Exception as e:
                     print(f"Error handling client {client_id}: {e}")
@@ -647,8 +647,8 @@ class SocketServer:
 
                 # Update metrics after cleanup
                 metrics.client_count = len([c for c in self.clients.values() if c is not None])
-                if client_exists:
-                    print(f"Client {client_id} cleanup complete. Active clients: {metrics.client_count}")
+                # if client_exists:
+                #   print(f"Client {client_id} cleanup complete. Active clients: {metrics.client_count}")
 
             # Schedule cleanup of disconnected clients (thread safe)
             threading.Timer(1.0, self.cleanup_disconnected_clients).start()
@@ -672,7 +672,7 @@ class SocketServer:
             # Update metrics if needed
             if cleaned_count > 0:
                 metrics.client_count = len(self.clients)
-                print(f"Background cleanup removed {cleaned_count} disconnected clients. Active: {metrics.client_count}")
+                # print(f"Background cleanup removed {cleaned_count} disconnected clients. Active: {metrics.client_count}")
 
     def is_override_active(self):
         with self.client_lock:
@@ -693,6 +693,12 @@ class SocketServer:
                 avg_level = sum(valid_levels) / len(valid_levels)
                 # Update metrics with average level
                 self.metrics.average_level = avg_level
+                # Track interval average (0-based)
+                try:
+                    self.metrics.level_sum_interval += float(avg_level)
+                    self.metrics.level_count_interval += 1
+                except Exception:
+                    pass
                 return avg_level
             else:
                 self.metrics.average_level = 0
