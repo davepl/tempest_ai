@@ -23,7 +23,7 @@ def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
     print("Starting stats reporter thread...")
     last_report = time.time()
-    report_interval = 10.0  # Report every 10 seconds
+    report_interval = 60.0  # Reduced frequency: print 1/5 as often
     
     # Display the header once at the beginning
     display_metrics_header()

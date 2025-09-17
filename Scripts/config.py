@@ -36,12 +36,13 @@ class ServerConfigData:
     params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
     # Expert ratio configuration - only used for brand new models
     expert_ratio_start: float = 0.75  # Lower start value for new models (was 0.50)
-    expert_ratio_min: float = 0.00    # Allow complete AI autonomy for advanced levels
-    expert_ratio_decay: float = 0.9995 # Faster decay to reach ~0.001 by 50M frames (was 0.9995)
+    # Quick Win: keep more expert in the loop to avoid premature handoff
+    expert_ratio_min: float = 0.30    # Raised floor from 0.05 -> 0.30 (can taper later)
+    expert_ratio_decay: float = 0.9995 # Decay stays the same for now; adaptive options possible
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
-    reset_expert_ratio: bool = True  # Resume from checkpoint - don't reset expert ratio  
+    reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
     
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
@@ -54,13 +55,15 @@ class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
-    batch_size: int = 16384            # Moderate batch size for dual GPU balance (was 16384)
-    lr: float = .0001                     # Slightly lower LR for stability under high throughput
+    # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
+    batch_size: int = 4096             # Was 16384
+    lr: float = 0.00025                    # Slightly lower LR for stability under high throughput
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.15           # Starting epsilon value
-    epsilon_min: float = 0.025             # INCREASED - force more exploration to break plateau
-    epsilon_end: float = 0.025             # Final epsilon value (alias for epsilon_min)
+    # Quick Win: keep a bit more random exploration while DQN catches up
+    epsilon_min: float = 0.050
+    epsilon_end: float = 0.050
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
@@ -70,7 +73,15 @@ class RLConfigData:
     update_target_every: int = 400        # Alias for target_update_freq
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = True           # Use noisy networks for exploration
-    use_per: bool = False                  # Enabled with priority clamping to prevent explosion
+    # Quick Win: Turn on PER with conservative, clamped settings
+    use_per: bool = True
+    per_alpha: float = 0.6
+    per_eps: float = 1e-6
+    per_beta_start: float = 0.4
+    per_beta_frames: int = 200000
+    # PER performance tuning
+    per_active_size: int = 250_000      # Limit sampling window to the most recent items to avoid O(N) over full buffer
+    per_strict_checks_every: int = 1000 # Run full priority validation every N samples (0 to disable)
     use_distributional: bool = False      # Disabled - too complex
     gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
@@ -78,18 +89,19 @@ class RLConfigData:
     training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
     use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
     use_soft_target: bool = True          # Enable soft target updates for stability
-    tau: float = 0.0025                   # Slightly slower Polyak to reduce drift/instability
+    tau: float = 0.01 
     # Optional hard refresh of target net even when using soft updates
-    hard_target_refresh_every_steps: int = 10000  # More conservative hard refresh interval
+    hard_target_refresh_every_steps: int = 50000  # Much slower hard refresh cadence when soft targets are on
     # Inference sync heartbeat interval (seconds)
     inference_sync_interval_sec: float = 30.0
     # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
     warmup_hard_refresh_until_steps: int = 2000
     warmup_hard_refresh_every_steps: int = 200
     # Watchdog: ensure a hard refresh happens at least every N seconds once training is active
-    hard_update_watchdog_seconds: float = 60.0
+    hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Scale factor applied to epsilon-random zap probability (1.0 = uniform baseline, 0.0 = never choose zap during epsilon)
-    zap_random_scale: float = 0.0
+    # Quick Win: allow a little zap exploration during epsilon (down-weighted)
+    zap_random_scale: float = 0.20
     # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
 
 # Create instance of RLConfigData after its definition
@@ -125,6 +137,11 @@ class MetricsData:
     average_level: float = 0  # Average level number across all clients
     beta: float = 0.6  # Starting beta value for prioritized replay
     average_priority: float = 0.0  # Average priority value across all transitions
+    # Gradient clipping diagnostics
+    grad_clip_delta: float = 1.0   # post-clip L2 norm divided by pre-clip L2 norm (should be ~1.0 if not clipping)
+    # Loss averaging since last metrics print
+    loss_sum_interval: float = 0.0
+    loss_count_interval: int = 0
     
     # Training-specific metrics
     memory_buffer_size: int = 0  # Current replay buffer size
@@ -154,6 +171,9 @@ class MetricsData:
     state_min: float = 0.0
     state_max: float = 0.0
     state_invalid_frac: float = 0.0  # Fraction of entries equal to -1.0 (our invalid sentinel)
+    # Level averaging since last metrics print (0-based levels)
+    level_sum_interval: float = 0.0
+    level_count_interval: int = 0
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""

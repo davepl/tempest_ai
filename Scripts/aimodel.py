@@ -466,6 +466,8 @@ class PrioritizedReplayMemory:
         self.eps = eps
         self.pos = 0
         self.full = False
+        # Thread-safety: protect concurrent push/sample/update from different threads
+        self._lock = threading.Lock()
         self.states = np.zeros((capacity, RL_CONFIG.state_size), dtype=np.float32)
         self.actions = np.zeros((capacity, 1), dtype=np.int64)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
@@ -473,107 +475,112 @@ class PrioritizedReplayMemory:
         self.dones = np.zeros((capacity, 1), dtype=np.float32)
         self.priorities = np.full((capacity, 1), self.eps, dtype=np.float32)  # CRITICAL FIX: Initialize with eps, not zero!
 
-        # Running average for monitoring
+        # Running average and max for monitoring and fast push priority init
         self.avg_priority = 0.0
+        self._max_priority = 1.0
+        self._sample_calls = 0
 
     def __len__(self):
-        return self.capacity if self.full else self.pos
+        # Atomic read of size-related fields
+        with self._lock:
+            return self.capacity if self.full else self.pos
 
     def push(self, state, action, reward, next_state, done):
-        idx = self.pos
-        self.states[idx] = state
-        # Coerce action to scalar index
-        try:
-            if isinstance(action, np.ndarray):
-                a_idx = int(action.reshape(-1)[0])
-            elif isinstance(action, (list, tuple)):
-                a_idx = int(action[0])
-            else:
+        with self._lock:
+            idx = self.pos
+            self.states[idx] = state
+            # Coerce action to scalar index
+            try:
+                if isinstance(action, np.ndarray):
+                    a_idx = int(action.reshape(-1)[0])
+                elif isinstance(action, (list, tuple)):
+                    a_idx = int(action[0])
+                else:
+                    a_idx = int(action)
+            except Exception:
                 a_idx = int(action)
-        except Exception:
-            a_idx = int(action)
-      
-        self.actions[idx, 0] = a_idx
-        self.rewards[idx, 0] = reward
-        self.next_states[idx] = next_state
-        self.dones[idx, 0] = float(done)
-        
-        # Set priority for new experience
-        current_priorities = self.priorities[:self.pos, 0] if not self.full else self.priorities[:, 0]
-        if len(current_priorities) > 0:
-            # STRICT ASSERTION: All existing priorities should be valid
-            assert not np.any(current_priorities <= 0), f"CRITICAL BUG: Found {np.sum(current_priorities <= 0)} zero/negative priorities in buffer during push!"
-            assert np.all(np.isfinite(current_priorities)), f"CRITICAL BUG: Found NaN/Inf priorities in buffer during push!"
-            max_prio = current_priorities.max()
-        else:
-            max_prio = 1.0
-            
-        self.priorities[idx, 0] = max_prio
-        
-        # STRICT ASSERTION: Verify the priority we just set is valid
-        assert max_prio > 0 and np.isfinite(max_prio), f"CRITICAL BUG: Setting invalid priority {max_prio}"
 
-        # Update position
-        self.pos = (self.pos + 1) % self.capacity
-        if self.pos == 0:
-            self.full = True
+            self.actions[idx, 0] = a_idx
+            self.rewards[idx, 0] = reward
+            self.next_states[idx] = next_state
+            self.dones[idx, 0] = float(done)
+
+            # Initialize priority for new experience to current max priority
+            max_prio = float(self._max_priority) if np.isfinite(self._max_priority) and self._max_priority > 0 else 1.0
+            self.priorities[idx, 0] = max_prio
+
+            # Update position
+            self.pos = (self.pos + 1) % self.capacity
+            if self.pos == 0:
+                self.full = True
 
     def sample(self, batch_size: int, beta: float = 0.4):
         """Sample batch with importance sampling weights - STRICT MODE with early assertions"""
-        size = len(self)
-        assert size > 0, "Cannot sample from empty buffer"
-        assert batch_size <= size, f"Cannot sample {batch_size} items from buffer of size {size}"
-            
-        # Get all current priorities
-        prios = self.priorities[:size, 0]
-        
-        # STRICT ASSERTION: No zero/negative priorities should ever exist
-        zero_count = np.sum(prios <= 0)
-        assert zero_count == 0, f"CRITICAL BUG: Found {zero_count} zero/negative priorities in buffer! This indicates persisted bad state."
-        
-        # STRICT ASSERTION: No NaN/Inf priorities should ever exist  
-        nan_count = np.sum(~np.isfinite(prios))
-        assert nan_count == 0, f"CRITICAL BUG: Found {nan_count} NaN/Inf priorities in buffer! This indicates memory corruption."
-        
-        # Calculate probabilities with alpha weighting
-        prob_alpha = prios ** self.alpha
-        probs = prob_alpha / prob_alpha.sum()
-        
-        # STRICT ASSERTION: Probabilities must be valid
-        assert np.all(np.isfinite(probs)), "CRITICAL BUG: Invalid probability distribution contains NaN/Inf!"
-        assert np.allclose(probs.sum(), 1.0, atol=1e-6), f"CRITICAL BUG: Probabilities don't sum to 1.0! Sum={probs.sum()}"
-        
-        # Sample indices
-        indices = np.random.choice(size, batch_size, p=probs, replace=False)
-        
-        # Calculate importance sampling weights
-        # weight = (N * P(i))^(-β) 
-        sampled_probs = probs[indices]
-        weights = (size * sampled_probs) ** (-beta)
-        weights = weights / weights.max()  # Normalize by max weight
-        
-        # STRICT ASSERTION: Weights must be valid
-        assert np.all(np.isfinite(weights)), "CRITICAL BUG: Invalid importance sampling weights contain NaN/Inf!"
-        assert np.all(weights > 0), f"CRITICAL BUG: Found zero/negative importance sampling weights! Range=[{weights.min()}, {weights.max()}]"
-        
-        # Return sampled batch as PyTorch tensors on training device
+        with self._lock:
+            size = self.capacity if self.full else self.pos
+            assert size > 0, "Cannot sample from empty buffer"
+            assert batch_size <= size, f"Cannot sample {batch_size} items from buffer of size {size}"
+
+            # Use only the most recent active window to reduce O(N) cost
+            active_size_cfg = int(getattr(RL_CONFIG, 'per_active_size', 0) or 0)
+            active_size = min(size, active_size_cfg) if active_size_cfg > 0 else size
+
+            if active_size == size:
+                window_indices = np.arange(size, dtype=np.int64)
+            else:
+                if self.full:
+                    start = (self.pos - active_size) % self.capacity
+                    if start + active_size <= self.capacity:
+                        window_indices = np.arange(start, start + active_size, dtype=np.int64)
+                    else:
+                        first = np.arange(start, self.capacity, dtype=np.int64)
+                        second = np.arange(0, (start + active_size) % self.capacity, dtype=np.int64)
+                        window_indices = np.concatenate([first, second])
+                else:
+                    window_indices = np.arange(size - active_size, size, dtype=np.int64)
+
+            prios = self.priorities[window_indices, 0]
+
+            # Throttle deep validation checks
+            self._sample_calls += 1
+            strict_every = int(getattr(RL_CONFIG, 'per_strict_checks_every', 0) or 0)
+            if strict_every > 0 and (self._sample_calls % strict_every == 0):
+                zero_count = np.sum(prios <= 0)
+                assert zero_count == 0, f"CRITICAL BUG: Found {zero_count} zero/negative priorities in buffer window!"
+                nan_count = np.sum(~np.isfinite(prios))
+                assert nan_count == 0, f"CRITICAL BUG: Found {nan_count} NaN/Inf priorities in buffer window!"
+
+            # Calculate probabilities with alpha weighting over the active window
+            prob_alpha = prios ** self.alpha
+            probs = prob_alpha / prob_alpha.sum()
+
+            # Sample within window, then map to buffer indices
+            chosen = np.random.choice(active_size if active_size > 0 else size, batch_size, p=probs, replace=False)
+            indices = window_indices[chosen]
+
+            # Importance weights: use total buffer size for N term (approximation when windowed)
+            sampled_probs = probs[chosen]
+            weights = (size * sampled_probs) ** (-beta)
+            weights = weights / max(weights.max(), 1e-12)  # Normalize by max weight
+
+        # Return sampled batch as PyTorch tensors on training device (outside lock for speed)
         states = torch.from_numpy(self.states[indices]).float().to(training_device)
         actions = torch.from_numpy(self.actions[indices]).long().to(training_device)
         rewards = torch.from_numpy(self.rewards[indices]).float().to(training_device)
         next_states = torch.from_numpy(self.next_states[indices]).float().to(training_device)
         dones = torch.from_numpy(self.dones[indices]).float().to(training_device)
         is_weights = torch.from_numpy(weights.reshape(-1, 1)).float().to(training_device)
-        
+
         return states, actions, rewards, next_states, dones, is_weights, indices
 
 
     def validate_priorities(self):
         """Debug function to validate priority buffer integrity"""
-        size = len(self)
-        if size == 0:
-            return
-            
-        prios = self.priorities[:size, 0]
+        with self._lock:
+            size = self.capacity if self.full else self.pos
+            if size == 0:
+                return
+            prios = self.priorities[:size, 0]
         print(f"Priority Validation (size {size}):")
         print(f"  Min: {prios.min():.6f}, Max: {prios.max():.6f}")
         print(f"  Mean: {prios.mean():.6f}, Std: {prios.std():.6f}")
@@ -585,7 +592,7 @@ class PrioritizedReplayMemory:
     def update_priorities(self, indices, td_errors):
         """Update priorities with strict assertions - fails fast on any issues"""
         assert td_errors is not None and len(td_errors) > 0, "update_priorities called with empty/None td_errors"
-            
+        
         # Convert to numpy and validate
         td = td_errors.detach().abs().cpu().numpy().reshape(-1)
         
@@ -605,16 +612,21 @@ class PrioritizedReplayMemory:
         max_td = td.max()
         assert max_td <= 5.0, f"CRITICAL BUG: TD error still too large after clamping! Max TD error = {max_td:.6f}."
         
-        # Validate indices
-        indices = np.asarray(indices)
-        assert len(indices) == len(td), f"Mismatched lengths: {len(indices)} indices vs {len(td)} TD errors"
-        assert not np.any(indices < 0) and not np.any(indices >= len(self)), f"Invalid indices: range [{indices.min()}, {indices.max()}] for buffer size {len(self)}"
-        
-        # Update priorities (add epsilon for stability)
-        new_priorities = td + self.eps
-        old_priorities = self.priorities[indices, 0].copy()
-        self.priorities[indices, 0] = new_priorities
-        
+        # Validate indices and update under lock against concurrent push/sample
+        with self._lock:
+            size = self.capacity if self.full else self.pos
+            indices = np.asarray(indices)
+            assert len(indices) == len(td), f"Mismatched lengths: {len(indices)} indices vs {len(td)} TD errors"
+            assert not np.any(indices < 0) and not np.any(indices >= size), f"Invalid indices: range [{indices.min()}, {indices.max()}] for buffer size {size}"
+            # Update priorities (add epsilon for stability)
+            new_priorities = td + self.eps
+            self.priorities[indices, 0] = new_priorities
+            # Update running max priority
+            try:
+                self._max_priority = float(max(self._max_priority, float(new_priorities.max())))
+            except Exception:
+                pass
+
         # DIAGNOSTIC: Track priority updates
         # if len(self) > 1000 and np.random.random() < 0.01:  # 1% chance to log
         #     print(f"Priority update: old_max={old_priorities.max():.4f}, new_max={new_priorities.max():.4f}")
@@ -752,7 +764,7 @@ class DQNAgent:
                 _ = self.train_queue.get()
                 
                 # Process multiple training steps per request for maximum GPU utilization
-                steps_per_batch = getattr(RL_CONFIG, 'training_steps_per_sample', 10)
+                steps_per_batch = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
                 for _ in range(steps_per_batch):
                     if len(self.memory) >= RL_CONFIG.batch_size:
                         self._train_step_counter += 1
@@ -790,12 +802,12 @@ class DQNAgent:
             Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)  # Target net evaluates
             Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
         
-        # Compute TD errors
-        td_errors = (Q_expected - Q_targets).abs()
-        
         # Optionally clamp targets to prevent runaway bootstrap
         if bool(getattr(RL_CONFIG, 'clamp_targets', True)):
             Q_targets = Q_targets.clamp(min=-10.0, max=10.0)
+
+        # Compute TD errors AFTER any clamping so PER priorities reflect effective loss
+        td_errors = (Q_expected - Q_targets).abs()
 
         # Compute loss (with or without importance sampling weights)
         # Use SmoothL1 (Huber) loss for stability against outliers
@@ -1041,18 +1053,27 @@ class DQNAgent:
 
                         self.optimizer.step()
 
-                    # Log meaningful (unscaled) gradient norms every 1000 training steps
-                    if metrics.total_training_steps % 1000 == 0:
-                        print(
-                            f"Step {metrics.total_training_steps}: Grad L2 pre-clip={preclip_grad_norm:.6e}, "
-                            f"post-clip={postclip_grad_norm:.6e}, Loss={(loss * accumulation_steps).item():.6f}"
-                        )
+                    # Update gradient clipping delta metric (post / pre); avoid divide-by-zero
+                    try:
+                        if preclip_grad_norm is not None and preclip_grad_norm > 0:
+                            metrics.grad_clip_delta = float(postclip_grad_norm / max(preclip_grad_norm, 1e-12))
+                        else:
+                            metrics.grad_clip_delta = 1.0
+                    except Exception:
+                        pass
                     optimizer_time = time.time() - optimizer_start
             else:
                 optimizer_time = 0
         
             # Always update loss metrics (use unscaled loss for reporting)
-            metrics.losses.append((loss * accumulation_steps).item())
+            _loss_item = (loss * accumulation_steps).item()
+            metrics.losses.append(_loss_item)
+            # Track loss since last display row
+            try:
+                metrics.loss_sum_interval += float(_loss_item)
+                metrics.loss_count_interval += 1
+            except Exception:
+                pass
 
             # PER: update priorities and track average
             if use_per:
@@ -1281,7 +1302,7 @@ class DQNAgent:
         
         # BALANCED TRAINING: Moderate training intensity to maintain client responsiveness
         # This balances learning speed with inference performance
-        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 3)  # Use config value (3)
+        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)  # Align with config default
         for _ in range(training_multiplier):  # Reasonable training frequency
             try:
                 self.train_queue.put_nowait(True)

@@ -56,10 +56,10 @@ def display_metrics_header():
     # Header with Q-Value Range moved before Training Stats, reward components removed
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
-        f"{'Mean Reward':>12} {'DQN Reward':>12} {'Loss':>10} "
+        f"{'Mean Reward':>12} {'DQN Rwd':>8} {'Loss':>10} "
         f"{'Clients':>8} {'Avg Level':>10} {'OVR':>3} {'Expert':>6} "
-    f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
-        f"{'AvgInf(ms)':>11} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
+        f"{'AvgInf':>7} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -85,20 +85,33 @@ def display_metrics_row(agent, kb_handler):
         dqn_rewards_list = list(metrics.dqn_rewards)
         mean_dqn_reward = sum(dqn_rewards_list[-100:]) / min(len(dqn_rewards_list), 100)
     
-    # Get the latest loss value
+    # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time
     latest_loss = metrics.losses[-1] if metrics.losses else 0.0
-    
-    # Calculate Average Inference Time (ms) and reset counters
+    loss_avg = latest_loss
     avg_inference_time_ms = 0.0
     with metrics.lock:
+        # Average inference time and reset
         if metrics.total_inference_requests > 0:
             avg_inference_time_ms = (metrics.total_inference_time / metrics.total_inference_requests) * 1000
-        # Reset counters for the next interval
         metrics.total_inference_time = 0.0
         metrics.total_inference_requests = 0
+
+        # Average loss since last row and reset
+        if getattr(metrics, 'loss_count_interval', 0) > 0:
+            loss_avg = metrics.loss_sum_interval / max(metrics.loss_count_interval, 1)
+        # Reset interval accumulators
+        metrics.loss_sum_interval = 0.0
+        metrics.loss_count_interval = 0
     
-    # Display average level as 1-based instead of 0-based
+    # Average level since last print, default to current snapshot; display as 1-based
     display_level = metrics.average_level + 1.0
+    with metrics.lock:
+        if getattr(metrics, 'level_count_interval', 0) > 0:
+            avg_level_interval = metrics.level_sum_interval / max(metrics.level_count_interval, 1)
+            display_level = avg_level_interval + 1.0
+        # Reset interval accumulators
+        metrics.level_sum_interval = 0.0
+        metrics.level_count_interval = 0
 
     # Calculate training rate (training steps per 1000 frames)
     train_rate = 0.0
@@ -138,13 +151,14 @@ def display_metrics_row(agent, kb_handler):
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.5f} "
-        f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>12.2f} "
-        f"{latest_loss:>10.4f} {metrics.client_count:>8} "
+    f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>8.2f} "
+    f"{loss_avg:>10.6f} {metrics.client_count:>8} "
         f"{display_level:>10.1f} "
     f"{'ON' if metrics.override_expert else 'OFF':>3} "
     f"{'ON' if metrics.expert_mode else 'OFF':>6} "
         f"{sync_col:>12} {targ_col:>13} "
-        f"{avg_inference_time_ms:>11.2f} "
+        f"{avg_inference_time_ms:>7.2f} "
+        f"{metrics.grad_clip_delta:>6.3f} "
         f"{q_range:>14} {training_stats:>15}"
     )
     
