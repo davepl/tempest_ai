@@ -355,25 +355,25 @@ class DQN(nn.Module):
 
         # Simplified 3-layer architecture for better learning
         self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 512
-        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 512 -> 512
-        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 512 -> 256
+        self.fc2 = nn.Linear(hidden_size, hidden_size//2)     # 512 -> 256
+        self.fc3 = nn.Linear(hidden_size//2, hidden_size//4)  # 256 -> 128
         
         # Apply noisy layers if enabled
         if use_noisy:
-            self.fc2 = NoisyLinear(hidden_size, hidden_size, noisy_std)
-            self.fc3 = NoisyLinear(hidden_size, hidden_size//2, noisy_std)
+            self.fc2 = NoisyLinear(hidden_size, hidden_size//2, noisy_std)
+            self.fc3 = NoisyLinear(hidden_size//2, hidden_size//4, noisy_std)
 
         self.use_dueling = use_dueling
         if use_dueling:
             # Dueling streams with balanced sizes
-            self.val_fc = nn.Linear(hidden_size//2, hidden_size//4)  # 256 -> 128
-            self.adv_fc = nn.Linear(hidden_size//2, hidden_size//4)  # 256 -> 128
-            self.val_out = nn.Linear(hidden_size//4, 1)              # 128 -> 1
-            self.adv_out = nn.Linear(hidden_size//4, action_size)    # 128 -> 18
+            self.val_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 128 -> 64
+            self.adv_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 128 -> 64
+            self.val_out = nn.Linear(hidden_size//8, 1)              # 64 -> 1
+            self.adv_out = nn.Linear(hidden_size//8, action_size)    # 64 -> 18
         else:
             # Single stream
-            self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)     # 256 -> 128
-            self.out = nn.Linear(hidden_size//4, action_size)        # 128 -> 18
+            self.fc4 = nn.Linear(hidden_size//4, hidden_size//8)     # 128 -> 64
+            self.out = nn.Linear(hidden_size//8, action_size)        # 64 -> 18
 
     def reset_noise(self):
         # Reset noise for all NoisyLinear layers
@@ -384,20 +384,20 @@ class DQN(nn.Module):
     def forward(self, x):
         # Simplified forward pass for better learning
         x = F.relu(self.fc1(x))    # 175 -> 512
-        x = F.relu(self.fc2(x))    # 512 -> 512
-        x = F.relu(self.fc3(x))    # 512 -> 256
+        x = F.relu(self.fc2(x))    # 512 -> 256
+        x = F.relu(self.fc3(x))    # 256 -> 128
         
         if self.use_dueling:
-            v = F.relu(self.val_fc(x))  # 256 -> 128
-            v = self.val_out(v)         # 128 -> 1
-            a = F.relu(self.adv_fc(x))  # 256 -> 128
-            a = self.adv_out(a)         # 128 -> 18
+            v = F.relu(self.val_fc(x))  # 128 -> 64
+            v = self.val_out(v)         # 64 -> 1
+            a = F.relu(self.adv_fc(x))  # 128 -> 64
+            a = self.adv_out(a)         # 64 -> 18
             # Subtract mean advantage to keep Q identifiable
             q = v + (a - a.mean(dim=1, keepdim=True))
             return q
         else:
-            x = F.relu(self.fc4(x))     # 256 -> 128
-            return self.out(x)          # 128 -> 18
+            x = F.relu(self.fc4(x))     # 128 -> 64
+            return self.out(x)          # 64 -> 18
 
 class QRDQN(nn.Module):
     """Quantile Regression DQN (distributional), optional dueling streams.

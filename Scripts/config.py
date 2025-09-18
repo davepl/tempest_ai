@@ -56,8 +56,9 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
-    batch_size: int = 1024             # Increased from 512 to 1024 for better GPU utilization
-    lr: float = 0.00025                    # Slightly lower LR for stability
+    batch_size: int = 1024                # Reduced from 4096 - too large for learning signal with large network
+    lr: float = 0.0005                    # Increased slightly for larger network (12M params)
+    gradient_accumulation_steps: int = 2  # Reduced - GPU utilization is now good
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.15           # Starting epsilon value
@@ -67,7 +68,7 @@ class RLConfigData:
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 512               # Reduced from 4096 to 512 for better learning
+    hidden_size: int = 4096               # Reduced from 4096 to 512 for better learning
     num_layers: int = 3                  # Simplified to 3 layers
     target_update_freq: int = 2000        # Increased from 200 to 2000 for stability
     update_target_every: int = 2000       # Alias for target_update_freq
