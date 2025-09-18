@@ -858,14 +858,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
     -- Terminal: death (edge-triggered) - INCREASED penalty for better learning
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = reward - 5.0                                                   -- Increased from -1.0 for stronger learning signal
+        reward = reward - 5.0                                                   -- REDUCED from -5.0 to -1.0 for proper scaling
         reward_components.score = -5.0                                          -- Death penalty counts as score component
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
         if score_delta ~= 0 and score_delta < 1000 then                         -- Filter our large completion bonuses
-            local r_score = score_delta / 5000.0
+            local r_score = score_delta / 500.0                               -- REDUCED from 5000.0 for stronger learning signal
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
             reward = reward + r_score
@@ -874,7 +874,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         -- Level completion bonus (edge-triggered) - BOOSTED for breakthrough
         if (level_state.level_number or 0) > (previous_level or 0) then
-            local level_bonus = 5.0                                             -- Increased from 1.0 for stronger learning signal
+            local level_bonus = 5.0                                             -- REDUCED from 5.0 to 1.0 for proper scaling
             reward = reward + level_bonus
             reward_components.score = reward_components.score + level_bonus
             bDone = true

@@ -489,14 +489,8 @@ end
 local function handle_ai_interaction()
     -- Calculate reward based on current state and detected actions
     local reward, episode_done = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
-
-    if reward < -1 then
-        reward = -1
-    elseif reward > 1 then
-        reward = 1
-    end
     
-    -- Calculate expert advice (target segment, fire, zap)
+    -- NOTE: Removed reward clamping [-1,1] since rewards are now properly scaled in logic.calculate_reward()    -- Calculate expert advice (target segment, fire, zap)
     local is_open_level = (level_state.level_number - 1) % 4 == 2
     local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = logic.find_target_segment(
         game_state, player_state, level_state, enemies_state, logic.absolute_to_relative_segment, is_open_level
