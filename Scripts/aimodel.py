@@ -841,6 +841,11 @@ class DQNAgent:
             with self.gradient_lock:
                 # Update training metrics (thread-safe)
                 metrics.total_training_steps += 1
+                # Count steps for Steps/s interval metric
+                try:
+                    metrics.training_steps_interval += 1
+                except Exception:
+                    pass
                 metrics.memory_buffer_size = buffer_size
                 
                 # Update gradient accumulation counter
@@ -1678,6 +1683,11 @@ class SafeMetrics:
             if delta < 1:
                 delta = 1
             self.metrics.frame_count += delta
+            # Track interval frames for display rate
+            try:
+                self.metrics.frames_count_interval += delta
+            except Exception:
+                pass
             
             # Update FPS tracking
             current_time = time.time()
@@ -1715,6 +1725,9 @@ class SafeMetrics:
             
     def update_expert_ratio(self):
         with self.lock:
+            # Respect override_expert: freeze expert_ratio at 0 while override is ON
+            if self.metrics.override_expert:
+                return self.metrics.expert_ratio
             decay_expert_ratio(self.metrics.frame_count)
             return self.metrics.expert_ratio
     
@@ -1999,8 +2012,8 @@ def decay_epsilon(frame_count):
 
 def decay_expert_ratio(current_step):
     """Update expert ratio based on 10,000 frame intervals"""
-    # Skip decay if expert mode is active
-    if metrics.expert_mode:
+    # Skip decay if expert mode or override is active
+    if metrics.expert_mode or metrics.override_expert:
         return metrics.expert_ratio
     
     # DON'T auto-initialize to start value at frame 0 - respect loaded checkpoint values
@@ -2021,7 +2034,8 @@ def decay_expert_ratio(current_step):
         
         metrics.last_decay_step = step_interval
 
-        # Ensure we don't go below the minimum
-        metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
+        # Ensure we don't go below the minimum (unless override is active forcing 0.0)
+        if not metrics.override_expert:
+            metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
 
     return metrics.expert_ratio

@@ -56,8 +56,8 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
-    batch_size: int = 4096             # Was 16384
-    lr: float = 0.00025                    # Slightly lower LR for stability under high throughput
+    batch_size: int = 12000             # Was 16384
+    lr: float = 0.00030                    # Slightly lower LR for stability under high throughput
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.15           # Starting epsilon value
@@ -80,7 +80,7 @@ class RLConfigData:
     per_beta_start: float = 0.4
     per_beta_frames: int = 200000
     # PER performance tuning
-    per_active_size: int = 250_000      # Limit sampling window to the most recent items to avoid O(N) over full buffer
+    per_active_size: int = 500_000      # Slightly widen active PER window to improve sample diversity
     per_strict_checks_every: int = 1000 # Run full priority validation every N samples (0 to disable)
     use_distributional: bool = False      # Disabled - too complex
     gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
@@ -89,9 +89,9 @@ class RLConfigData:
     training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
     use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
     use_soft_target: bool = True          # Enable soft target updates for stability
-    tau: float = 0.01 
+    tau: float = 0.03 
     # Optional hard refresh of target net even when using soft updates
-    hard_target_refresh_every_steps: int = 50000  # Much slower hard refresh cadence when soft targets are on
+    hard_target_refresh_every_steps: int = 25000  # Slightly faster hard refresh cadence to re-anchor periodically
     # Inference sync heartbeat interval (seconds)
     inference_sync_interval_sec: float = 30.0
     # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
@@ -102,6 +102,8 @@ class RLConfigData:
     # Scale factor applied to epsilon-random zap probability (1.0 = uniform baseline, 0.0 = never choose zap during epsilon)
     # Quick Win: allow a little zap exploration during epsilon (down-weighted)
     zap_random_scale: float = 0.20
+    # Modest n-step to aid credit assignment without destabilizing
+    n_step: int = 3
     # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
 
 # Create instance of RLConfigData after its definition
@@ -142,6 +144,11 @@ class MetricsData:
     # Loss averaging since last metrics print
     loss_sum_interval: float = 0.0
     loss_count_interval: int = 0
+    # Training steps since last metrics print and when last row printed
+    training_steps_interval: int = 0
+    last_metrics_row_time: float = 0.0
+    # Frames since last metrics print
+    frames_count_interval: int = 0
     
     # Training-specific metrics
     memory_buffer_size: int = 0  # Current replay buffer size
@@ -174,6 +181,11 @@ class MetricsData:
     # Level averaging since last metrics print (0-based levels)
     level_sum_interval: float = 0.0
     level_count_interval: int = 0
+    # Reward averaging since last metrics print
+    reward_sum_interval_total: float = 0.0
+    reward_count_interval_total: int = 0
+    reward_sum_interval_dqn: float = 0.0
+    reward_count_interval_dqn: int = 0
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
@@ -182,6 +194,11 @@ class MetricsData:
             if delta < 1:
                 delta = 1
             self.frame_count += delta
+            # Track interval frames for rate calculations
+            try:
+                self.frames_count_interval += delta
+            except Exception:
+                pass
             
             # Update FPS tracking
             current_time = time.time()
@@ -226,8 +243,8 @@ class MetricsData:
         with self.lock:
             # Import here to avoid circular imports
             from aimodel import decay_expert_ratio
-            # Skip decay if expert mode is active
-            if self.expert_mode:
+            # Skip decay if expert mode or override mode is active
+            if self.expert_mode or self.override_expert:
                 return self.expert_ratio
             decay_expert_ratio(self.frame_count)
             return self.expert_ratio
@@ -238,6 +255,14 @@ class MetricsData:
             self.episode_rewards.append(float(total_reward))
             self.dqn_rewards.append(float(dqn_reward))
             self.expert_rewards.append(float(expert_reward))
+            # Track interval reward averages
+            try:
+                self.reward_sum_interval_total += float(total_reward)
+                self.reward_count_interval_total += 1
+                self.reward_sum_interval_dqn += float(dqn_reward)
+                self.reward_count_interval_dqn += 1
+            except Exception:
+                pass
     
     def increment_guided_count(self):
         """Increment guided count"""
