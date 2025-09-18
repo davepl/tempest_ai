@@ -14,12 +14,84 @@ import time
 import threading
 import numpy as np
 from typing import Optional, List, Dict, Any
+from collections import deque
 
 # Import from config.py
 from config import metrics, IS_INTERACTIVE
 
 # Add a counter to track the number of rows printed
 row_counter = 0
+
+# Rolling window for DQN reward over last 5M frames
+DQN_WINDOW_FRAMES = 5_000_000
+_dqn_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: float, frame_end: int)
+_dqn_window_frames = 0
+_last_frame_count_seen = None
+
+def _update_dqn_window(mean_dqn_reward: float):
+    """Update the 5M-frames rolling window with the latest interval.
+
+    Uses the number of frames progressed since the last row as the weight.
+    """
+    global _dqn_window_frames, _last_frame_count_seen
+    current_frame = metrics.frame_count
+    # Determine frames elapsed since last sample
+    if _last_frame_count_seen is None:
+        delta_frames = 0
+    else:
+        delta_frames = max(0, current_frame - _last_frame_count_seen)
+    _last_frame_count_seen = current_frame
+
+    # If no frame progress (e.g., first row), just return without adding
+    if delta_frames <= 0:
+        return
+
+    # Append new interval
+    _dqn_window.append((delta_frames, float(mean_dqn_reward), int(current_frame)))
+    _dqn_window_frames += delta_frames
+
+    # Trim window to last 5M frames (may need partial trim of the oldest bucket)
+    while _dqn_window and _dqn_window_frames > DQN_WINDOW_FRAMES:
+        overflow = _dqn_window_frames - DQN_WINDOW_FRAMES
+        oldest_frames, oldest_val, oldest_end = _dqn_window[0]
+        if oldest_frames <= overflow:
+            _dqn_window.popleft()
+            _dqn_window_frames -= oldest_frames
+        else:
+            # Partially trim the oldest bucket
+            kept_frames = oldest_frames - overflow
+            _dqn_window[0] = (kept_frames, oldest_val, oldest_end)
+            _dqn_window_frames = DQN_WINDOW_FRAMES
+            break
+
+def _compute_dqn_window_stats():
+    """Compute weighted average and weighted regression slope (per million frames) for the 5M-frame window.
+
+    Returns (avg, slope_per_million).
+    """
+    if not _dqn_window or _dqn_window_frames <= 0:
+        return 0.0, 0.0
+
+    # Weighted average
+    w_sum = float(_dqn_window_frames)
+    wy_sum = sum(fr * val for fr, val, _ in _dqn_window)
+    avg = wy_sum / w_sum if w_sum > 0 else 0.0
+
+    # Weighted linear regression slope of y vs x, with weights = frames
+    # Use frame_end as x for each bucket
+    wx_sum = sum(fr * x for fr, _, x in _dqn_window)
+    wxx_sum = sum(fr * (x * x) for fr, _, x in _dqn_window)
+    wy_sum = sum(fr * y for fr, y, _ in _dqn_window)
+    wxy_sum = sum(fr * x * y for fr, y, x in _dqn_window)
+
+    denom = (wxx_sum - (wx_sum * wx_sum) / w_sum) if w_sum > 0 else 0.0
+    if denom <= 0:
+        slope = 0.0
+    else:
+        slope = (wxy_sum - (wx_sum * wy_sum) / w_sum) / denom
+
+    slope_per_million = slope * 1_000_000.0
+    return avg, slope_per_million
 
 def clear_screen():
     """Clear the screen and move cursor to home position"""
@@ -55,11 +127,11 @@ def display_metrics_header():
     
     # Header with Q-Value Range moved before Training Stats, reward components removed
     header = (
-        f"{'Frame':>11} {'FPS':>6} {'Epsilon':>8} {'Expert%':>8} "
-        f"{'Mean Reward':>12} {'DQN Rwd':>8} {'Loss':>10} "
-        f"{'Clients':>8} {'Avg Level':>10} {'OVR':>3} {'Expert':>6} "
+        f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
+        f"{'Rwrd':>6} {'DQN':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
+        f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} "
         f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
-        f"{'AvgInf':>7} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'AvgInf':>7} {'Steps/s':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -73,22 +145,33 @@ def display_metrics_row(agent, kb_handler):
     if row_counter > 0 and row_counter % 30 == 0:
         display_metrics_header()
     
-    # Calculate mean reward from the last 100 episodes
-    mean_reward = 0
-    if metrics.episode_rewards:
+    # Compute reward averages since last print; fallback to recent deque averages
+    mean_reward = 0.0
+    mean_dqn_reward = 0.0
+    with metrics.lock:
+        if getattr(metrics, 'reward_count_interval_total', 0) > 0:
+            mean_reward = metrics.reward_sum_interval_total / max(metrics.reward_count_interval_total, 1)
+        if getattr(metrics, 'reward_count_interval_dqn', 0) > 0:
+            mean_dqn_reward = metrics.reward_sum_interval_dqn / max(metrics.reward_count_interval_dqn, 1)
+        # Reset interval counters so next print is fresh
+        metrics.reward_sum_interval_total = 0.0
+        metrics.reward_count_interval_total = 0
+        metrics.reward_sum_interval_dqn = 0.0
+        metrics.reward_count_interval_dqn = 0
+    # Fallback if no interval episodes finished
+    if mean_reward == 0.0 and metrics.episode_rewards:
         rewards_list = list(metrics.episode_rewards)
-        mean_reward = sum(rewards_list[-100:]) / min(len(rewards_list), 100)
-    
-    # Calculate mean DQN reward
-    mean_dqn_reward = 0
-    if metrics.dqn_rewards:
+        mean_reward = sum(rewards_list[-20:]) / min(len(rewards_list), 20)
+    if mean_dqn_reward == 0.0 and metrics.dqn_rewards:
         dqn_rewards_list = list(metrics.dqn_rewards)
-        mean_dqn_reward = sum(dqn_rewards_list[-100:]) / min(len(dqn_rewards_list), 100)
+        mean_dqn_reward = sum(dqn_rewards_list[-20:]) / min(len(dqn_rewards_list), 20)
     
-    # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time
+    # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time and Steps/s
     latest_loss = metrics.losses[-1] if metrics.losses else 0.0
     loss_avg = latest_loss
     avg_inference_time_ms = 0.0
+    steps_per_sec = 0.0
+    steps_per_1k_frames = 0.0
     with metrics.lock:
         # Average inference time and reset
         if metrics.total_inference_requests > 0:
@@ -102,6 +185,24 @@ def display_metrics_row(agent, kb_handler):
         # Reset interval accumulators
         metrics.loss_sum_interval = 0.0
         metrics.loss_count_interval = 0
+
+        # Steps/s: compute using time elapsed since last row
+        now = time.time()
+        last_t = getattr(metrics, 'last_metrics_row_time', 0.0)
+        elapsed = now - last_t if last_t > 0.0 else None
+        steps_int = int(getattr(metrics, 'training_steps_interval', 0))
+        frames_int = int(getattr(metrics, 'frames_count_interval', 0))
+        if elapsed and elapsed > 0:
+            steps_per_sec = steps_int / elapsed
+        else:
+            steps_per_sec = float(steps_int)
+        # Interval Steps/1kF using the same interval counts
+        denom_frames = max(1, frames_int)
+        steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
+        # Reset intervals and update last row time
+        metrics.training_steps_interval = 0
+        metrics.frames_count_interval = 0
+        metrics.last_metrics_row_time = now
     
     # Average level since last print, default to current snapshot; display as 1-based
     display_level = metrics.average_level + 1.0
@@ -113,16 +214,21 @@ def display_metrics_row(agent, kb_handler):
         metrics.level_sum_interval = 0.0
         metrics.level_count_interval = 0
 
-    # Calculate training rate (training steps per 1000 frames)
-    train_rate = 0.0
-    if metrics.frame_count > 0:
-        train_rate = (metrics.total_training_steps * 1000.0) / metrics.frame_count
+    # Update 5M-frame DQN window stats now that we have this row's mean_dqn_reward
+    try:
+        _update_dqn_window(mean_dqn_reward)
+        dqn5m_avg, dqn5m_slopeM = _compute_dqn_window_stats()
+    except Exception:
+        dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
+
+    # steps_per_1k_frames already computed above using the same interval counts
     
     # Calculate frames since last target update  
     frames_since_target_update = metrics.frame_count - metrics.last_target_update_frame
     
-    # Format training stats: Memory/TrainSteps/Rate/TargetAge
-    training_stats = f"{metrics.memory_buffer_size//1000}k/{metrics.total_training_steps}/{train_rate:.1f}/{frames_since_target_update//1000}k"
+    # Format training stats: MemK/Steps/StepsPer1kF/TargetAge
+    mem_k = getattr(metrics, 'memory_buffer_size', 0) // 1000
+    training_stats = f"{mem_k}k/{metrics.total_training_steps}/{steps_per_1k_frames:.1f}/{frames_since_target_update//1000}k"
 
     # Get Q-value range from the agent
     q_range = "N/A"
@@ -150,14 +256,15 @@ def display_metrics_row(agent, kb_handler):
 
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>8.5f} "
-    f"{metrics.expert_ratio*100:>7.1f}% {mean_reward:>12.2f} {mean_dqn_reward:>8.2f} "
-    f"{loss_avg:>10.6f} {metrics.client_count:>8} "
-        f"{display_level:>10.1f} "
-    f"{'ON' if metrics.override_expert else 'OFF':>3} "
-    f"{'ON' if metrics.expert_mode else 'OFF':>6} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>6.2f} "
+    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_dqn_reward:>6.2f} "
+        f"{dqn5m_avg:>6.2f} {dqn5m_slopeM:>6.2f} {loss_avg:>10.6f} "
+    f"{metrics.client_count:04d} {display_level:>5.1f} "
+        f"{'ON' if metrics.override_expert else 'OFF':>3} "
+        f"{'ON' if metrics.expert_mode else 'OFF':>6} "
         f"{sync_col:>12} {targ_col:>13} "
         f"{avg_inference_time_ms:>7.2f} "
+        f"{steps_per_sec:>8.1f} "
         f"{metrics.grad_clip_delta:>6.3f} "
         f"{q_range:>14} {training_stats:>15}"
     )
