@@ -344,40 +344,36 @@ class NoisyLinear(nn.Module):
         return F.linear(input, weight, bias)
 
 class DQN(nn.Module):
-    """Deep Q-Network model - Balanced architecture for dual GPU setup with reasonable training load."""
+    """Simplified DQN model for better learning on high-dimensional state space."""
     def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
         use_noisy = RL_CONFIG.use_noisy_nets
         use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
         noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
-        hidden_size = RL_CONFIG.hidden_size  # 4096 - Balanced for dual GPU setup
+        hidden_size = RL_CONFIG.hidden_size  # Reduced to 512 for better learning
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
 
-        # Balanced feature extractor for dual GPU setup
-        self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 4096  
-        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 4096 -> 4096
-        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 4096 -> 2048
-        self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)  # 2048 -> 1024
-        self.fc5 = nn.Linear(hidden_size//4, hidden_size//8)  # 1024 -> 512
+        # Simplified 3-layer architecture for better learning
+        self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 512
+        self.fc2 = nn.Linear(hidden_size, hidden_size)        # 512 -> 512
+        self.fc3 = nn.Linear(hidden_size, hidden_size//2)     # 512 -> 256
         
         # Apply noisy layers if enabled
         if use_noisy:
             self.fc2 = NoisyLinear(hidden_size, hidden_size, noisy_std)
             self.fc3 = NoisyLinear(hidden_size, hidden_size//2, noisy_std)
-            self.fc4 = NoisyLinear(hidden_size//2, hidden_size//4, noisy_std)
-            self.fc5 = NoisyLinear(hidden_size//4, hidden_size//8, noisy_std)
 
         self.use_dueling = use_dueling
         if use_dueling:
             # Dueling streams with balanced sizes
-            self.val_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 512 -> 256
-            self.adv_fc = nn.Linear(hidden_size//8, hidden_size//16)  # 512 -> 256
-            self.val_out = nn.Linear(hidden_size//16, 1)              # 256 -> 1
-            self.adv_out = nn.Linear(hidden_size//16, action_size)    # 256 -> 18
+            self.val_fc = nn.Linear(hidden_size//2, hidden_size//4)  # 256 -> 128
+            self.adv_fc = nn.Linear(hidden_size//2, hidden_size//4)  # 256 -> 128
+            self.val_out = nn.Linear(hidden_size//4, 1)              # 128 -> 1
+            self.adv_out = nn.Linear(hidden_size//4, action_size)    # 128 -> 18
         else:
-            # Single stream with balanced sizes
-            self.fc6 = nn.Linear(hidden_size//8, hidden_size//16)     # 512 -> 256
-            self.out = nn.Linear(hidden_size//16, action_size)        # 256 -> 18
+            # Single stream
+            self.fc4 = nn.Linear(hidden_size//2, hidden_size//4)     # 256 -> 128
+            self.out = nn.Linear(hidden_size//4, action_size)        # 128 -> 18
 
     def reset_noise(self):
         # Reset noise for all NoisyLinear layers
@@ -386,24 +382,22 @@ class DQN(nn.Module):
                 m.reset_noise()
 
     def forward(self, x):
-        # Balanced feature extraction for dual GPU setup
-        x = F.relu(self.fc1(x))    # 175 -> 4096
-        x = F.relu(self.fc2(x))    # 4096 -> 4096
-        x = F.relu(self.fc3(x))    # 4096 -> 2048
-        x = F.relu(self.fc4(x))    # 2048 -> 1024
-        x = F.relu(self.fc5(x))    # 1024 -> 512
+        # Simplified forward pass for better learning
+        x = F.relu(self.fc1(x))    # 175 -> 512
+        x = F.relu(self.fc2(x))    # 512 -> 512
+        x = F.relu(self.fc3(x))    # 512 -> 256
         
         if self.use_dueling:
-            v = F.relu(self.val_fc(x))  # 512 -> 256
-            v = self.val_out(v)         # 256 -> 1
-            a = F.relu(self.adv_fc(x))  # 512 -> 256
-            a = self.adv_out(a)         # 256 -> 18
+            v = F.relu(self.val_fc(x))  # 256 -> 128
+            v = self.val_out(v)         # 128 -> 1
+            a = F.relu(self.adv_fc(x))  # 256 -> 128
+            a = self.adv_out(a)         # 128 -> 18
             # Subtract mean advantage to keep Q identifiable
             q = v + (a - a.mean(dim=1, keepdim=True))
             return q
         else:
-            x = F.relu(self.fc6(x))     # 512 -> 256
-            return self.out(x)          # 256 -> 18
+            x = F.relu(self.fc4(x))     # 256 -> 128
+            return self.out(x)          # 128 -> 18
 
 class QRDQN(nn.Module):
     """Quantile Regression DQN (distributional), optional dueling streams.
@@ -719,7 +713,7 @@ class DQNAgent:
                 print("Attempting to compile loss computation for training acceleration...")
                 self._compiled_loss_computation = torch.compile(
                     self._compute_dqn_loss,
-                    mode='max-autotune',  # Aggressive optimization for training
+                    mode='default',  # Conservative compilation mode to avoid memory issues
                     fullgraph=False  # Allow graph breaks for compatibility
                 )
                 print("Loss computation compilation successful")
@@ -1341,7 +1335,11 @@ class DQNAgent:
                 'frame_count': metrics.frame_count,
                 'expert_ratio': ratio_to_save, # Save the determined ratio
                 'last_decay_step': metrics.last_decay_step,
-                'last_epsilon_decay_step': metrics.last_epsilon_decay_step
+                'last_epsilon_decay_step': metrics.last_epsilon_decay_step,
+                # Persist recent reward histories (last N values)
+                'episode_rewards': list(metrics.episode_rewards) if hasattr(metrics, 'episode_rewards') else [],
+                'dqn_rewards': list(metrics.dqn_rewards) if hasattr(metrics, 'dqn_rewards') else [],
+                'expert_rewards': list(metrics.expert_rewards) if hasattr(metrics, 'expert_rewards') else []
             }
             # Save scheduler state if present
             if self.scheduler is not None:
@@ -1491,12 +1489,35 @@ class DQNAgent:
                     metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
                     metrics.last_decay_step = 0
                     metrics.last_epsilon_decay_step = 0 # Reset epsilon step tracker
+                    # Clear recent reward histories on explicit reset
+                    try:
+                        if hasattr(metrics, 'episode_rewards'): metrics.episode_rewards.clear()
+                        if hasattr(metrics, 'dqn_rewards'): metrics.dqn_rewards.clear()
+                        if hasattr(metrics, 'expert_rewards'): metrics.expert_rewards.clear()
+                    except Exception:
+                        pass
                 else:
                     # Load metrics from checkpoint
                     metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
                     metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
                     metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
                     metrics.last_epsilon_decay_step = checkpoint.get('last_epsilon_decay_step', 0) # Load epsilon step tracker
+                    # Restore recent reward histories if present (bounded by deque maxlen)
+                    try:
+                        if hasattr(metrics, 'episode_rewards'):
+                            metrics.episode_rewards.clear()
+                            for v in checkpoint.get('episode_rewards', [])[-metrics.episode_rewards.maxlen:]:
+                                metrics.episode_rewards.append(float(v))
+                        if hasattr(metrics, 'dqn_rewards'):
+                            metrics.dqn_rewards.clear()
+                            for v in checkpoint.get('dqn_rewards', [])[-metrics.dqn_rewards.maxlen:]:
+                                metrics.dqn_rewards.append(float(v))
+                        if hasattr(metrics, 'expert_rewards'):
+                            metrics.expert_rewards.clear()
+                            for v in checkpoint.get('expert_rewards', [])[-metrics.expert_rewards.maxlen:]:
+                                metrics.expert_rewards.append(float(v))
+                    except Exception:
+                        pass
 
                 # Respect server flags to reset at startup regardless of checkpoint values
                 if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):

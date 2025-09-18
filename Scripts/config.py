@@ -37,7 +37,7 @@ class ServerConfigData:
     # Expert ratio configuration - only used for brand new models
     expert_ratio_start: float = 0.75  # Lower start value for new models (was 0.50)
     # Quick Win: keep more expert in the loop to avoid premature handoff
-    expert_ratio_min: float = 0.30    # Raised floor from 0.05 -> 0.30 (can taper later)
+    expert_ratio_min: float = 0.20    # Lowered from 0.30 to 0.20 to give DQN more control sooner
     expert_ratio_decay: float = 0.9995 # Decay stays the same for now; adaptive options possible
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     
@@ -56,8 +56,8 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
-    batch_size: int = 12000             # Was 16384
-    lr: float = 0.00030                    # Slightly lower LR for stability under high throughput
+    batch_size: int = 1024             # Increased from 512 to 1024 for better GPU utilization
+    lr: float = 0.00025                    # Slightly lower LR for stability
     gamma: float = 0.99                   # Discount factor
     epsilon: float = 0.25                 # Initial exploration rate
     epsilon_start: float = 0.15           # Starting epsilon value
@@ -67,33 +67,31 @@ class RLConfigData:
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 4096               # More reasonable network size for dual GPU setup (was 8192)
-    num_layers: int = 4                   # Deeper network for more GPU work
-    target_update_freq: int = 200         # Reduced for more dynamic Q-targets (was 800)  
-    update_target_every: int = 400        # Alias for target_update_freq
+    hidden_size: int = 512               # Reduced from 4096 to 512 for better learning
+    num_layers: int = 3                  # Simplified to 3 layers
+    target_update_freq: int = 2000        # Increased from 200 to 2000 for stability
+    update_target_every: int = 2000       # Alias for target_update_freq
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = True           # Use noisy networks for exploration
     # Quick Win: Turn on PER with conservative, clamped settings
     use_per: bool = True
     per_alpha: float = 0.6
     per_eps: float = 1e-6
-    per_beta_start: float = 0.4
+    per_beta_start: float = 0.6           # Increased from 0.4 for better importance sampling
     per_beta_frames: int = 200000
     # PER performance tuning
-    per_active_size: int = 500_000      # Slightly widen active PER window to improve sample diversity
+    per_active_size: int = 100000         # Increased from 50k to 100k for better GPU utilization per sampling operation
     per_strict_checks_every: int = 1000 # Run full priority validation every N samples (0 to disable)
     use_distributional: bool = False      # Disabled - too complex
-    gradient_accumulation_steps: int = 4  # Balanced accumulation (was 2)
+    gradient_accumulation_steps: int = 8  # Increased from 4 to 8 for massive effective batch size (1024*8=8192)
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
-    training_steps_per_sample: int = 2    # Reduced training load for better balance (was 8)
-    training_workers: int = 1             # Number of parallel training threads (1 for single-threaded, safe mode)
-    use_torch_compile: bool = False       # DISABLED - CUDA graph conflicts between shared model in training/inference threads
+    training_steps_per_sample: int = 24    # Increased from 4 to 6 - more training per sample to combat flattening
+    training_workers: int = 1             # Reverted to 1 - multi-threaded training causes autograd conflicts
+    use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
-    tau: float = 0.03 
+    tau: float = 0.005                    # Reduced from 0.03 to 0.005 for more stable updates
     # Optional hard refresh of target net even when using soft updates
     hard_target_refresh_every_steps: int = 25000  # Slightly faster hard refresh cadence to re-anchor periodically
-    # Inference sync heartbeat interval (seconds)
-    inference_sync_interval_sec: float = 30.0
     # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
     warmup_hard_refresh_until_steps: int = 2000
     warmup_hard_refresh_every_steps: int = 200
@@ -104,7 +102,8 @@ class RLConfigData:
     zap_random_scale: float = 0.20
     # Modest n-step to aid credit assignment without destabilizing
     n_step: int = 3
-    # reward_clipping: float = 2.0         # DISABLED - Let's see true reward distribution to identify root causes
+    # Enable dueling architecture for better value/advantage separation
+    use_dueling: bool = True
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()

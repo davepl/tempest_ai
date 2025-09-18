@@ -858,8 +858,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
     -- Terminal: death (edge-triggered) - INCREASED penalty for better learning
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = reward - 1.0                                                   -- Scaled down from -10.0 to prevent TD explosion
-        reward_components.score = -1.0                                          -- Death penalty counts as score component
+        reward = reward - 5.0                                                   -- Increased from -1.0 for stronger learning signal
+        reward_components.score = -5.0                                          -- Death penalty counts as score component
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
@@ -874,9 +874,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
         -- Level completion bonus (edge-triggered) - BOOSTED for breakthrough
         if (level_state.level_number or 0) > (previous_level or 0) then
-            local level_bonus = 1.0                                             -- Scaled down from 5.0 to prevent TD explosion
+            local level_bonus = 5.0                                             -- Increased from 1.0 for stronger learning signal
             reward = reward + level_bonus
             reward_components.score = reward_components.score + level_bonus
+            bDone = true
         end
 
         -- Zap cost (edge-triggered on button press)
@@ -997,7 +998,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and 
                        enemies_state.enemy_abs_segments[i] == player_abs_seg and
                        enemies_state.enemy_depths[i] > 0 then
-                        pulsar_reward = -0.1  -- Strong penalty for pulsar lane during pulse
+                        pulsar_reward = -0.1  -- Strong penalty for pulsar lane 
                         break
                     end
                 end
@@ -1024,9 +1025,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         -- Scale a gentle penalty with movement magnitude, capped
                         local units = math.min(4, spin_delta)
                         local move_penalty = -0.0002 * units
-                        reward = reward + move_penalty
+                        -- reward = reward + move_penalty
                         -- Attribute to proximity shaping bucket for metrics
-                        reward_components.proximity = reward_components.proximity + move_penalty
+                        -- reward_components.proximity = reward_components.proximity + move_penalty
                     end
                 end
             end
