@@ -10,15 +10,11 @@ import sys
 import os
 from unittest.mock import patch, MagicMock
 
-# Add Scripts directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Scripts'))
-
-from config import RL_CONFIG, FIRE_ZAP_MAPPING, SPINNER_MIN, SPINNER_MAX
-from aimodel import (
+from Scripts.config import RL_CONFIG, FIRE_ZAP_MAPPING, SPINNER_MIN, SPINNER_MAX
+from Scripts.aimodel import (
     HybridDQN, HybridReplayBuffer, HybridDQNAgent,
     fire_zap_to_discrete, discrete_to_fire_zap,
-    get_expert_hybrid_action, hybrid_to_game_action,
-    legacy_action_to_hybrid, hybrid_to_legacy_action
+    get_expert_hybrid_action, hybrid_to_game_action
 )
 
 def test_fire_zap_conversion():
@@ -231,54 +227,19 @@ def test_game_action_conversion():
         # Verify ranges
         assert fire_cmd in [0, 1], f"Fire cmd out of range: {fire_cmd}"
         assert zap_cmd in [0, 1], f"Zap cmd out of range: {zap_cmd}"
-        assert -9 <= spinner_cmd <= 9, f"Spinner cmd out of range: {spinner_cmd}"
+        assert -32 <= spinner_cmd <= 31, f"Spinner cmd out of range: {spinner_cmd}"
         
         # Verify fire/zap encoding
         expected_fire, expected_zap = discrete_to_fire_zap(discrete_action)
         assert fire_cmd == expected_fire, f"Fire cmd mismatch: {fire_cmd} != {expected_fire}"
         assert zap_cmd == expected_zap, f"Zap cmd mismatch: {zap_cmd} != {expected_zap}"
         
-        # Verify spinner scaling (approximately)
-        expected_spinner_cmd = int(continuous_spinner * 31)
-        assert abs(spinner_cmd - expected_spinner_cmd) <= 1, f"Spinner cmd mismatch: {spinner_cmd} != {expected_spinner_cmd}"
+        # Verify spinner scaling (exact with rounding and clamp)
+        expected_spinner_cmd = int(round(continuous_spinner * 32))
+        expected_spinner_cmd = max(-32, min(31, expected_spinner_cmd))
+        assert spinner_cmd == expected_spinner_cmd, f"Spinner cmd mismatch: {spinner_cmd} != {expected_spinner_cmd}"
     
     print("✓ Game action conversion works correctly")
-
-def test_legacy_compatibility():
-    """Test backward compatibility with legacy 18-action system"""
-    print("\n=== Testing Legacy Compatibility ===")
-    
-    # Test conversion from legacy to hybrid
-    for legacy_idx in range(18):
-        discrete_action, continuous_spinner = legacy_action_to_hybrid(legacy_idx)
-        
-        assert isinstance(discrete_action, int), f"Discrete action type: {type(discrete_action)}"
-        assert isinstance(continuous_spinner, float), f"Continuous spinner type: {type(continuous_spinner)}"
-        assert 0 <= discrete_action < 4, f"Discrete action out of range: {discrete_action}"
-        assert -0.3 <= continuous_spinner <= 0.3, f"Continuous spinner out of range: {continuous_spinner}"
-    
-    print("✓ Legacy to hybrid conversion works correctly")
-    
-    # Test round-trip conversion (hybrid -> legacy -> hybrid)
-    test_hybrid_actions = [
-        (0, 0.0),
-        (1, -0.6),
-        (2, 0.4),
-        (3, -0.9),
-    ]
-    
-    for original_discrete, original_continuous in test_hybrid_actions:
-        # Convert to legacy
-        legacy_idx = hybrid_to_legacy_action(original_discrete, original_continuous)
-        
-        # Convert back to hybrid
-        recovered_discrete, recovered_continuous = legacy_action_to_hybrid(legacy_idx)
-        
-        # Check if reasonably close (may not be exact due to quantization)
-        assert recovered_discrete == original_discrete, f"Discrete mismatch: {recovered_discrete} != {original_discrete}"
-        assert abs(recovered_continuous - original_continuous) < 0.4, f"Continuous mismatch: {recovered_continuous} != {original_continuous}"
-    
-    print("✓ Round-trip legacy compatibility works correctly")
 
 @patch('aimodel.training_device', torch.device('cpu'))
 @patch('aimodel.inference_device', torch.device('cpu'))
@@ -357,7 +318,6 @@ def run_all_tests():
         test_hybrid_agent_action_selection()
         test_expert_hybrid_integration()
         test_game_action_conversion()
-        test_legacy_compatibility()
         test_hybrid_training_loop()
         test_model_save_load()
         

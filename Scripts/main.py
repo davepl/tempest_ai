@@ -11,7 +11,7 @@ from datetime import datetime
 import traceback
 
 from aimodel import (
-    DQNAgent, KeyboardHandler
+    DQNAgent, HybridDQNAgent, KeyboardHandler
 )
 from config import (
     RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
@@ -87,10 +87,12 @@ def main():
     if not os.path.exists(MODEL_DIR):
         os.makedirs(MODEL_DIR)
     
-    # Initialize the DQN agent
-    agent = DQNAgent(
+    # Initialize the Agent
+    # Use HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner)
+    # Fall back to legacy DQNAgent if needed by flipping this block.
+    agent = HybridDQNAgent(
         state_size=RL_CONFIG.state_size,
-        action_size=RL_CONFIG.action_size,
+        discrete_actions=4,
         learning_rate=RL_CONFIG.lr,
         gamma=RL_CONFIG.gamma,
         epsilon=RL_CONFIG.epsilon,
