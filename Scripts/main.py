@@ -71,9 +71,22 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == 'e':
                     metrics.toggle_expert_mode(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
-                elif key == ' ':  # Handle space key
-                    # Display the header and one row of metrics
+                elif key.lower() == 'p':
+                    metrics.toggle_epsilon_override(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key.lower() == 't':
+                    metrics.toggle_training_mode(keyboard_handler)
+                    # Propagate to agent
+                    try:
+                        agent.set_training_enabled(metrics.training_enabled)
+                    except Exception:
+                        pass
+                    display_metrics_row(agent, keyboard_handler)
+                elif key.lower() == 'h':
+                    # Print the header
                     display_metrics_header()
+                elif key == ' ':  # Handle space key
+                    # Print only one row (no header)
                     display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)

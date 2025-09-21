@@ -202,6 +202,10 @@ class MetricsData:
     reward_count_interval_total: int = 0
     reward_sum_interval_dqn: float = 0.0
     reward_count_interval_dqn: int = 0
+    # Training enable/disable (UI toggle). When False, background workers do no training.
+    training_enabled: bool = True
+    # Epsilon override: when True, force epsilon=0.0 (pure greedy) regardless of other overrides
+    override_epsilon: bool = False
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
@@ -245,6 +249,15 @@ class MetricsData:
         """Get current epsilon value"""
         with self.lock:
             return self.epsilon
+
+    def get_effective_epsilon(self) -> float:
+        """Return the epsilon value that will actually be used for action selection.
+
+        When override_epsilon is ON, this returns 0.0 (pure greedy) regardless of other modes.
+        Otherwise, returns the current decayed epsilon.
+        """
+        with self.lock:
+            return 0.0 if self.override_epsilon else float(self.epsilon)
     
     def update_epsilon(self):
         """Update epsilon based on frame count"""
@@ -366,6 +379,24 @@ class MetricsData:
                 # Import here to avoid circular import at top level
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}\r")
+
+    def toggle_training_mode(self, kb_handler=None):
+        """Toggle training enable/disable (does not affect data collection)."""
+        with self.lock:
+            self.training_enabled = not self.training_enabled
+            status = 'ON' if self.training_enabled else 'OFF'
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nTrain: {status}\r")
+
+    def toggle_epsilon_override(self, kb_handler=None):
+        """Toggle epsilon override. When ON, epsilon is treated as 0.0 everywhere (pure greedy)."""
+        with self.lock:
+            self.override_epsilon = not self.override_epsilon
+            status = 'ON' if self.override_epsilon else 'OFF'
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nEpsilon override: {status}\r")
 
 # Define hybrid action space
 # Discrete fire/zap combinations (4 total)

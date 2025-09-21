@@ -324,7 +324,19 @@ class SocketServer:
                         continuous_spinner = float(spin)
                         action_source = 'expert'
                     else:
-                        epsilon = 0.0 if self.metrics.is_override_active() else self.metrics.get_epsilon()
+                        # Epsilon policy: when override_epsilon is ON, force 0.0 (pure greedy).
+                        # Otherwise, always use the current decayed epsilon even during expert/inference overrides.
+                        try:
+                            # SafeMetrics may or may not expose get_effective_epsilon; fall back to metrics method
+                            if hasattr(self.metrics, 'get_effective_epsilon'):
+                                epsilon = float(self.metrics.get_effective_epsilon())
+                            elif hasattr(self.metrics, 'metrics') and hasattr(self.metrics.metrics, 'get_effective_epsilon'):
+                                with self.metrics.lock:
+                                    epsilon = float(self.metrics.metrics.get_effective_epsilon())
+                            else:
+                                epsilon = float(self.metrics.get_epsilon())
+                        except Exception:
+                            epsilon = float(self.metrics.get_epsilon())
                         start_t = time.perf_counter()
                         da, ca = self.agent.act(frame.state, epsilon)
                         infer_t = time.perf_counter() - start_t

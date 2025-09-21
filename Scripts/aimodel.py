@@ -1914,6 +1914,8 @@ class HybridDQNAgent:
         self.training_steps = 0
         self.last_target_update = 0
         self.last_inference_sync = 0
+        # Honor global training enable toggle
+        self.training_enabled = True
 
         # Background training worker(s)
         self.running = True
@@ -1966,6 +1968,8 @@ class HybridDQNAgent:
         self.memory.push(state, discrete_action, continuous_action, reward, next_state, done)
         
         # Queue multiple training steps per experience
+        if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
+            return
         training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
         for _ in range(training_multiplier):
             try:
@@ -1980,6 +1984,10 @@ class HybridDQNAgent:
         while self.running:
             try:
                 _ = self.train_queue.get()  # block until work arrives
+                # Skip training work if disabled; still mark task done
+                if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
+                    self.train_queue.task_done()
+                    continue
                 steps_per_req = int(getattr(RL_CONFIG, 'training_steps_per_sample', 2) or 1)
                 for _ in range(steps_per_req):
                     loss_val = self.train_step()
@@ -1995,6 +2003,9 @@ class HybridDQNAgent:
     
     def train_step(self):
         """Perform a single training step with hybrid loss function"""
+        # Global gate
+        if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
+            return 0.0
         # Post-load burn-in: require some fresh frames after loading before training
         try:
             loaded_fc = int(getattr(metrics, 'loaded_frame_count', 0) or 0)
@@ -2133,6 +2144,23 @@ class HybridDQNAgent:
                 pass
         
         return total_loss.item()
+
+    def set_training_enabled(self, enabled: bool):
+        """Enable/disable training at runtime. When disabling, drain pending work."""
+        self.training_enabled = bool(enabled)
+        # Reflect into global metrics for consistency
+        try:
+            metrics.training_enabled = bool(enabled)
+        except Exception:
+            pass
+        # If disabling, drain queue quickly to avoid stale tasks
+        if not self.training_enabled:
+            try:
+                while not self.train_queue.empty():
+                    self.train_queue.get_nowait()
+                    self.train_queue.task_done()
+            except Exception:
+                pass
 
     def sync_inference_network(self):
         """Synchronize inference network weights and record telemetry."""
@@ -2451,6 +2479,14 @@ class SafeMetrics:
     def get_epsilon(self):
         with self.lock:
             return self.metrics.epsilon
+
+    def get_effective_epsilon(self):
+        """Thread-safe access to effective epsilon (0.0 when override_epsilon is ON)."""
+        with self.lock:
+            try:
+                return 0.0 if getattr(self.metrics, 'override_epsilon', False) else float(self.metrics.epsilon)
+            except Exception:
+                return float(self.metrics.epsilon)
             
     def update_epsilon(self):
         with self.lock:

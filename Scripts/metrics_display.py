@@ -129,7 +129,7 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
         f"{'Rwrd':>6} {'DQN':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
-        f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} "
+        f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
         f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
         f"{'AvgInf':>7} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
@@ -263,13 +263,20 @@ def display_metrics_row(agent, kb_handler):
     targ_col = f"{targ_df//1000}k/{(f'{targ_dt:>4.1f}s' if targ_dt is not None else 'n/a'):>6}"
 
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
+    # Show effective epsilon (0.00 when epsilon override is ON)
+    try:
+        effective_eps = metrics.get_effective_epsilon()
+    except Exception:
+        effective_eps = metrics.epsilon
+
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {metrics.epsilon:>6.2f} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
     f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_dqn_reward:>6.2f} "
         f"{dqn5m_avg:>6.2f} {dqn5m_slopeM:>6.2f} {loss_avg:>10.6f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{'ON' if metrics.override_expert else 'OFF':>3} "
         f"{'ON' if metrics.expert_mode else 'OFF':>6} "
+        f"{'ON' if metrics.training_enabled else 'OFF':>5} "
         f"{sync_col:>12} {targ_col:>13} "
         f"{avg_inference_time_ms:>7.2f} "
         f"{steps_per_sec:>8.1f} "
