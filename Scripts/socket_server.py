@@ -62,7 +62,9 @@ class SocketServer:
         # SIMPLIFIED: No longer need complex segment masking with float32 normalization
         
     def report_action_distribution(self):
-        """Print action distribution statistics for debugging"""
+        """Print action distribution statistics for debugging - DISABLED"""
+        return  # Early return to disable action distribution reporting
+        
         from config import ACTION_MAPPING
         
         print("\n=== ACTION DISTRIBUTION REPORT ===")
@@ -482,21 +484,10 @@ class SocketServer:
                         # Track rewards
                         state['total_reward'] = state.get('total_reward', 0) + frame.reward
 
-                        # Calculate and track reward components
-                        # Prefer Lua-provided components to avoid duplication; fallback to Python calc if unavailable
-                        try:
-                            components = {
-                                'safety': float(getattr(frame, 'rc_safety')),
-                                'proximity': float(getattr(frame, 'rc_proximity')),
-                                'shots': float(getattr(frame, 'rc_shots')),
-                                'threats': float(getattr(frame, 'rc_threats')),
-                                'pulsar': float(getattr(frame, 'rc_pulsar')),
-                                'score': float(getattr(frame, 'rc_score')),
-                                'total': float(frame.reward)
-                            }
-                        except Exception:
-                            print(f"Client {client_id}: Missing reward components from frame, using fallback calculation.")
-                            components = self.calculate_reward_components(frame, state)
+                        # Track total reward only (individual components removed for simplicity)
+                        components = {
+                            'total': float(frame.reward)
+                        }
                         self.metrics.update_reward_components(components)
 
                         # Track which system's rewards based on the *previous* action source
@@ -631,10 +622,10 @@ class SocketServer:
                     # Send action to game
                     game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
                     
-                    # Periodic action distribution report (every 5000 frames)
-                    if self.metrics.frame_count - self.last_action_report >= 5000:
-                        self.report_action_distribution()
-                        self.last_action_report = self.metrics.frame_count
+                    # Periodic action distribution report (every 5000 frames) - DISABLED
+                    # if self.metrics.frame_count - self.last_action_report >= 5000:
+                    #     self.report_action_distribution()
+                    #     self.last_action_report = self.metrics.frame_count
                     
                     try:
                         client_socket.sendall(struct.pack("bbb", game_fire, game_zap, game_spinner))
@@ -763,20 +754,6 @@ class SocketServer:
             # Update epsilon and expert ratio
             self.metrics.update_epsilon()
 
-    def calculate_reward_components(self, frame, state):
-        """Minimal Python-side fallback for reward components.
-        Prefer Lua-provided components via OOB header; this returns a safe default.
-        """
-        return {
-            'safety': 0.0,
-            'proximity': 0.0,
-            'shots': 0.0,
-            'threats': 0.0,
-            'pulsar': 0.0,
-            'score': max(0.0, float(getattr(frame, 'reward', 0.0))),
-            'total': float(getattr(frame, 'reward', 0.0)),
-        }
-    
     def update_expert_ratio(self):
         """Update expert ratio"""
         self.metrics.update_expert_ratio()

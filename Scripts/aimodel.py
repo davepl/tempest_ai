@@ -146,13 +146,6 @@ class FrameData:
     expert_fire: bool  # Added: Expert system fire recommendation
     expert_zap: bool   # Added: Expert system zap recommendation
     level_number: int  # Added: Current level number from Lua
-    # Lua-provided reward component breakdown (OOB header). Defaults keep parsing robust.
-    rc_safety: float = 0.0
-    rc_proximity: float = 0.0
-    rc_shots: float = 0.0
-    rc_threats: float = 0.0
-    rc_pulsar: float = 0.0
-    rc_score: float = 0.0
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -382,6 +375,185 @@ class QRDQN(nn.Module):
             x = F.relu(self.fc4(x))
             out = self.out(x)  # (B, A*N)
             return out.view(-1, self.action_size, self.num_quantiles)
+
+class HybridDQN(nn.Module):
+    """Hybrid DQN with discrete fire/zap actions + continuous spinner.
+    
+    Architecture:
+    - Shared trunk: processes state features
+    - Discrete head: outputs Q-values for 4 fire/zap combinations
+    - Continuous head: outputs single continuous spinner value in [-0.9, +0.9]
+    
+    Forward pass returns: (discrete_q_values, continuous_spinner)
+    - discrete_q_values: (batch_size, 4) Q-values for fire/zap combinations
+    - continuous_spinner: (batch_size, 1) spinner values in [-0.9, +0.9]
+    """
+    def __init__(self, state_size: int, discrete_actions: int = 4, 
+                 hidden_size: int = 512, num_layers: int = 3, 
+                 use_dueling: bool = False, use_noisy: bool = False, noisy_std: float = 0.1):
+        super(HybridDQN, self).__init__()
+        
+        self.state_size = state_size
+        self.discrete_actions = discrete_actions
+        self.use_dueling = use_dueling
+        self.use_noisy = use_noisy
+        
+        # Shared trunk for feature extraction
+        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
+        
+        # Progressive network sizing for efficiency
+        if hidden_size >= 2048:
+            sizes = [hidden_size, hidden_size // 2, hidden_size // 4, hidden_size // 8]
+        elif hidden_size >= 1024:
+            sizes = [hidden_size, 768, 384, 192]
+        else:
+            sizes = [hidden_size, 384, 192, 128]
+        
+        # Shared trunk
+        self.shared_fc1 = LinearOrNoisy(state_size, sizes[0], noisy_std) if use_noisy else LinearOrNoisy(state_size, sizes[0])
+        self.shared_fc2 = LinearOrNoisy(sizes[0], sizes[1], noisy_std) if use_noisy else LinearOrNoisy(sizes[0], sizes[1])
+        self.shared_fc3 = LinearOrNoisy(sizes[1], sizes[2], noisy_std) if use_noisy else LinearOrNoisy(sizes[1], sizes[2])
+        
+        shared_output_size = sizes[2]
+        
+        if use_dueling:
+            # Dueling architecture for discrete Q-values
+            self.discrete_val_fc = nn.Linear(shared_output_size, sizes[3])
+            self.discrete_adv_fc = nn.Linear(shared_output_size, sizes[3])
+            self.discrete_val_out = nn.Linear(sizes[3], 1)  # State value
+            self.discrete_adv_out = nn.Linear(sizes[3], discrete_actions)  # Advantages
+        else:
+            # Standard architecture for discrete Q-values
+            self.discrete_fc = nn.Linear(shared_output_size, sizes[3])
+            self.discrete_out = nn.Linear(sizes[3], discrete_actions)
+        
+        # Continuous head for spinner (always separate from dueling)
+        self.continuous_fc1 = nn.Linear(shared_output_size, sizes[3])
+        self.continuous_fc2 = nn.Linear(sizes[3], sizes[3] // 2) if sizes[3] > 64 else nn.Linear(sizes[3], 32)
+        self.continuous_out = nn.Linear(sizes[3] // 2 if sizes[3] > 64 else 32, 1)
+        
+        # Initialize continuous head with smaller weights for stable training
+        torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
+        torch.nn.init.constant_(self.continuous_out.bias, 0.0)
+    
+    def reset_noise(self):
+        """Reset noise layers if using noisy networks"""
+        if self.use_noisy:
+            for m in self.modules():
+                if isinstance(m, NoisyLinear):
+                    m.reset_noise()
+    
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning (discrete_q_values, continuous_spinner)
+        
+        Args:
+            x: Input state tensor (batch_size, state_size)
+            
+        Returns:
+            discrete_q_values: Q-values for fire/zap combinations (batch_size, 4)
+            continuous_spinner: Spinner values in [-0.9, +0.9] (batch_size, 1)
+        """
+        # Shared feature extraction
+        shared = F.relu(self.shared_fc1(x))
+        shared = F.relu(self.shared_fc2(shared))
+        shared = F.relu(self.shared_fc3(shared))
+        
+        # Discrete Q-values head
+        if self.use_dueling:
+            # Dueling network: V(s) + A(s,a) - mean(A(s,·))
+            discrete_val = F.relu(self.discrete_val_fc(shared))
+            discrete_val = self.discrete_val_out(discrete_val)  # (B, 1)
+            
+            discrete_adv = F.relu(self.discrete_adv_fc(shared))
+            discrete_adv = self.discrete_adv_out(discrete_adv)  # (B, discrete_actions)
+            
+            # Center advantages around their mean
+            discrete_q = discrete_val + (discrete_adv - discrete_adv.mean(dim=1, keepdim=True))
+        else:
+            # Standard Q-network
+            discrete = F.relu(self.discrete_fc(shared))
+            discrete_q = self.discrete_out(discrete)  # (B, discrete_actions)
+        
+        # Continuous spinner head
+        continuous = F.relu(self.continuous_fc1(shared))
+        continuous = F.relu(self.continuous_fc2(continuous))
+        continuous_raw = self.continuous_out(continuous)  # (B, 1)
+        
+        # Apply tanh to bound spinner to [-1, +1] then scale to [-0.9, +0.9]
+        continuous_spinner = torch.tanh(continuous_raw) * 0.9
+        
+        return discrete_q, continuous_spinner
+
+class HybridReplayBuffer:
+    """Experience replay buffer for hybrid discrete-continuous actions.
+    
+    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
+    - discrete_action: integer index for fire/zap combination (0-3)
+    - continuous_action: float spinner value in [-0.9, +0.9]
+    """
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.position = 0
+        self.size = 0
+        
+        # Pre-allocated arrays for maximum speed
+        self.states = np.empty((capacity,), dtype=object)
+        self.discrete_actions = np.empty((capacity,), dtype=np.int32)
+        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
+        self.rewards = np.empty((capacity,), dtype=np.float32)
+        self.next_states = np.empty((capacity,), dtype=object)
+        self.dones = np.empty((capacity,), dtype=np.bool_)
+    
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done):
+        """Add experience to buffer"""
+        # Coerce inputs to proper types
+        discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
+        continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        
+        # Clamp continuous action to valid range
+        continuous_val = max(-0.9, min(0.9, continuous_val))
+        
+        # Store experience
+        self.states[self.position] = state
+        self.discrete_actions[self.position] = discrete_idx
+        self.continuous_actions[self.position] = continuous_val
+        self.rewards[self.position] = reward
+        self.next_states[self.position] = next_state
+        self.dones[self.position] = done
+        
+        # Update position and size
+        self.position = (self.position + 1) % self.capacity
+        if self.size < self.capacity:
+            self.size += 1
+    
+    def sample(self, batch_size):
+        """Sample batch of experiences"""
+        if self.size < batch_size:
+            return None
+        
+        # Random sampling
+        indices = np.random.randint(0, self.size, size=batch_size)
+        
+        # Gather batch data
+        batch_states = [self.states[i] for i in indices]
+        batch_discrete_actions = self.discrete_actions[indices]
+        batch_continuous_actions = self.continuous_actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_next_states = [self.next_states[i] for i in indices]
+        batch_dones = self.dones[indices]
+        
+        # Convert to tensors
+        states = torch.from_numpy(np.vstack(batch_states)).float().to(training_device)
+        discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long().to(training_device)
+        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float().to(training_device)
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float().to(training_device)
+        next_states = torch.from_numpy(np.vstack(batch_next_states)).float().to(training_device)
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float().to(training_device)
+        
+        return states, discrete_actions, continuous_actions, rewards, next_states, dones
+    
+    def __len__(self):
+        return self.size
 
 class PrioritizedReplayMemory:
     """Prioritized experience replay using proportional priorities."""
@@ -1695,6 +1867,217 @@ def setup_environment():
     print(f"Server will listen on {SERVER_CONFIG.host}:{SERVER_CONFIG.port}")
     print(f"Ready to handle up to {SERVER_CONFIG.max_clients} clients")
 
+class HybridDQNAgent:
+    """Hybrid DQN Agent with discrete fire/zap actions + continuous spinner"""
+    
+    def __init__(self, state_size, discrete_actions=4, learning_rate=RL_CONFIG.lr, 
+                 gamma=RL_CONFIG.gamma, epsilon=RL_CONFIG.epsilon, 
+                 epsilon_min=RL_CONFIG.epsilon_min, memory_size=RL_CONFIG.memory_size, 
+                 batch_size=RL_CONFIG.batch_size):
+        
+        self.state_size = state_size
+        self.discrete_actions = discrete_actions
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.batch_size = batch_size
+        self.last_save_time = 0.0
+        
+        # Hybrid neural networks
+        self.qnetwork_local = HybridDQN(
+            state_size=state_size,
+            discrete_actions=discrete_actions,
+            hidden_size=RL_CONFIG.hidden_size,
+            num_layers=RL_CONFIG.num_layers,
+            use_dueling=RL_CONFIG.use_dueling,
+            use_noisy=RL_CONFIG.use_noisy_nets
+        ).to(training_device)
+        
+        self.qnetwork_target = HybridDQN(
+            state_size=state_size,
+            discrete_actions=discrete_actions,
+            hidden_size=RL_CONFIG.hidden_size,
+            num_layers=RL_CONFIG.num_layers,
+            use_dueling=RL_CONFIG.use_dueling,
+            use_noisy=RL_CONFIG.use_noisy_nets
+        ).to(training_device)
+        
+        # Create inference copy on inference device
+        if inference_device != training_device:
+            print(f"Creating dedicated hybrid inference network on {inference_device}")
+            self.qnetwork_inference = HybridDQN(
+                state_size=state_size,
+                discrete_actions=discrete_actions,
+                hidden_size=RL_CONFIG.hidden_size,
+                num_layers=RL_CONFIG.num_layers,
+                use_dueling=RL_CONFIG.use_dueling,
+                use_noisy=RL_CONFIG.use_noisy_nets
+            ).to(inference_device)
+        else:
+            self.qnetwork_inference = self.qnetwork_local
+        
+        # Initialize target network
+        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        
+        # Store device references
+        self.inference_device = inference_device
+        self.training_device = training_device
+        
+        # Optimizer with separate parameter groups for discrete and continuous components
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
+        
+        # Experience replay
+        self.memory = HybridReplayBuffer(memory_size)
+        
+        # Training queue and metrics
+        self.train_queue = queue.Queue(maxsize=100)
+        self.training_steps = 0
+        self.last_target_update = 0
+        self.last_inference_sync = 0
+        
+    def act(self, state, epsilon=0.0, add_noise=True):
+        """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
+        
+        Returns:
+            discrete_action: int (0-3) for fire/zap combination
+            continuous_action: float in [-0.9, +0.9] for spinner
+        """
+        state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
+        
+        self.qnetwork_inference.eval()
+        with torch.no_grad():
+            discrete_q, continuous_pred = self.qnetwork_inference(state)
+        self.qnetwork_inference.train()
+        
+        # Discrete action selection (epsilon-greedy)
+        if random.random() < epsilon:
+            discrete_action = random.randint(0, self.discrete_actions - 1)
+        else:
+            discrete_action = discrete_q.cpu().data.numpy().argmax()
+        
+        # Continuous action selection (predicted value + optional exploration noise)
+        continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
+        if add_noise and epsilon > 0:
+            # Add Gaussian noise scaled by epsilon for exploration
+            noise_scale = epsilon * 0.3  # 30% of action range at full epsilon
+            noise = np.random.normal(0, noise_scale)
+            continuous_action = np.clip(continuous_action + noise, -0.9, 0.9)
+        
+        return int(discrete_action), float(continuous_action)
+    
+    def step(self, state, discrete_action, continuous_action, reward, next_state, done):
+        """Add experience to memory and queue training"""
+        self.memory.push(state, discrete_action, continuous_action, reward, next_state, done)
+        
+        # Queue multiple training steps per experience
+        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
+        for _ in range(training_multiplier):
+            try:
+                self.train_queue.put_nowait(True)
+            except queue.Full:
+                break
+    
+    def train_step(self):
+        """Perform a single training step with hybrid loss function"""
+        if len(self.memory) < self.batch_size:
+            return 0.0
+        
+        # Sample experience batch
+        batch = self.memory.sample(self.batch_size)
+        if batch is None:
+            return 0.0
+        
+        states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+        
+        # Current Q-values and predictions
+        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+        
+        # Gather Q-values for taken discrete actions
+        discrete_q_targets = discrete_q_pred.gather(1, discrete_actions)
+        
+        # Next state predictions for target computation
+        with torch.no_grad():
+            discrete_q_next, continuous_next = self.qnetwork_target(next_states)
+            discrete_q_next_max = discrete_q_next.max(1)[0].detach().unsqueeze(1)
+            
+            # TD targets
+            discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
+            continuous_targets = continuous_actions  # Use actual actions as targets for regression
+        
+        # Compute losses
+        discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
+        continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
+        
+        # Combined loss with balanced weighting
+        total_loss = discrete_loss + 0.5 * continuous_loss  # Weight continuous loss lower
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        
+        # Gradient clipping
+        if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
+        
+        self.optimizer.step()
+        
+        # Update training counters
+        self.training_steps += 1
+        
+        # Soft target update
+        if getattr(RL_CONFIG, 'use_soft_target', True):
+            tau = getattr(RL_CONFIG, 'tau', 0.005)
+            for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
+                target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+        
+        # Hard target update
+        elif self.training_steps % RL_CONFIG.target_update_freq == 0:
+            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        
+        # Sync inference network
+        if inference_device != training_device and self.training_steps % 100 == 0:
+            self.qnetwork_inference.load_state_dict(self.qnetwork_local.state_dict())
+        
+        return total_loss.item()
+    
+    def save(self, filepath):
+        """Save hybrid model checkpoint"""
+        checkpoint = {
+            'local_state_dict': self.qnetwork_local.state_dict(),
+            'target_state_dict': self.qnetwork_target.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'training_steps': self.training_steps,
+            'state_size': self.state_size,
+            'discrete_actions': self.discrete_actions,
+            'memory_size': len(self.memory),
+            'architecture': 'hybrid'  # Mark as hybrid architecture
+        }
+        torch.save(checkpoint, filepath)
+    
+    def load(self, filepath):
+        """Load hybrid model checkpoint"""
+        if os.path.exists(filepath):
+            checkpoint = torch.load(filepath, map_location=training_device)
+            
+            # Verify architecture compatibility
+            if checkpoint.get('architecture') != 'hybrid':
+                print("Warning: Loading non-hybrid checkpoint into hybrid agent")
+                return False
+            
+            self.qnetwork_local.load_state_dict(checkpoint['local_state_dict'])
+            self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.training_steps = checkpoint.get('training_steps', 0)
+            
+            # Sync inference network
+            if inference_device != training_device:
+                self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
+            
+            print(f"Loaded hybrid model from {filepath}")
+            return True
+        return False
+
 # Thread-safe metrics storage
 class SafeMetrics:
     def __init__(self, metrics):
@@ -1806,7 +2189,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         try:
             _FMT_OOB
         except NameError:
-            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBBffffff"
+            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBB"
             _HDR_OOB = struct.calcsize(_FMT_OOB)
 
         if len(data) < _HDR_OOB:
@@ -1816,8 +2199,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
         (num_values, reward, gamestate, game_mode, done, frame_counter, score_high, score_low,
          save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
-         expert_fire, expert_zap, level_number,
-         rc_safety, rc_proximity, rc_shots, rc_threats, rc_pulsar, rc_score) = values
+         expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
         
         # Combine score components
@@ -1871,13 +2253,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
             expert_zap=bool(expert_zap),
-            level_number=level_number,
-            rc_safety=float(rc_safety),
-            rc_proximity=float(rc_proximity),
-            rc_shots=float(rc_shots),
-            rc_threats=float(rc_threats),
-            rc_pulsar=float(rc_pulsar),
-            rc_score=float(rc_score)
+            level_number=level_number
         )
         
         return frame_data
@@ -2023,6 +2399,84 @@ def encode_action_to_game(fire, zap, spinner):
     """Convert action values to game-compatible format"""
     spinner_val = spinner * 31
     return int(fire), int(zap), int(spinner_val)
+
+def fire_zap_to_discrete(fire, zap):
+    """Convert fire/zap booleans to discrete action index (0-3)"""
+    return int(fire) * 2 + int(zap)
+
+def discrete_to_fire_zap(discrete_action):
+    """Convert discrete action index (0-3) to fire/zap booleans"""
+    discrete_action = int(discrete_action)
+    fire = (discrete_action >> 1) & 1  # Extract fire bit
+    zap = discrete_action & 1         # Extract zap bit
+    return bool(fire), bool(zap)
+
+def get_expert_hybrid_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
+    """Get expert action in hybrid format (discrete_action, continuous_spinner)
+    
+    Returns:
+        discrete_action: int (0-3) for fire/zap combination
+        continuous_spinner: float in [-0.9, +0.9] for movement (full expert range)
+    """
+    # Get continuous expert action
+    fire, zap, spinner = get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire, expert_zap)
+    
+    # Convert to hybrid format - preserve full expert system range!
+    discrete_action = fire_zap_to_discrete(fire, zap)
+    continuous_spinner = float(spinner)  # No clamping - use expert's full range
+    
+    return discrete_action, continuous_spinner
+
+def hybrid_to_game_action(discrete_action, continuous_spinner):
+    """Convert hybrid action to game format
+    
+    Args:
+        discrete_action: int (0-3) for fire/zap combination
+        continuous_spinner: float in [-0.3, +0.3] for movement
+        
+    Returns:
+        fire_cmd: int (0 or 1)
+        zap_cmd: int (0 or 1) 
+        spinner_cmd: int (-9 to +9, scaled from spinner * 31)
+    """
+    fire, zap = discrete_to_fire_zap(discrete_action)
+    return encode_action_to_game(fire, zap, continuous_spinner)
+
+def legacy_action_to_hybrid(action_idx):
+    """Convert legacy 18-discrete action to hybrid format for backward compatibility
+    
+    Args:
+        action_idx: int (0-17) legacy action index
+        
+    Returns:
+        discrete_action: int (0-3) for fire/zap combination
+        continuous_spinner: float in [-0.3, +0.3] for movement
+    """
+    from config import ACTION_MAPPING
+    
+    if action_idx not in ACTION_MAPPING:
+        # Default to no action
+        return 0, 0.0
+    
+    fire, zap, spinner = ACTION_MAPPING[action_idx]
+    discrete_action = fire_zap_to_discrete(fire, zap)
+    
+    return discrete_action, float(spinner)
+
+def hybrid_to_legacy_action(discrete_action, continuous_spinner):
+    """Convert hybrid action to closest legacy action index for backward compatibility
+    
+    Args:
+        discrete_action: int (0-3) for fire/zap combination
+        continuous_spinner: float in [-0.3, +0.3] for movement
+        
+    Returns:
+        action_idx: int (0-17) closest legacy action index
+    """
+    fire, zap = discrete_to_fire_zap(discrete_action)
+    
+    # Use existing expert_action_to_index for backward compatibility
+    return expert_action_to_index(fire, zap, continuous_spinner)
 
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate using step-based decay with adaptive floor.

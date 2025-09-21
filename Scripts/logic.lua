@@ -45,6 +45,8 @@ local LastRewardState = 0
 local previous_superzapper_active = 0
 local previous_superzapper_uses_in_level = 0
 local previous_zap_detected = 0
+-- Track previous player position for positioning reward
+local previous_player_position = 0
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -852,6 +854,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         shots = 0.0,
         threats = 0.0,
         pulsar = 0.0,
+        positioning = 0.0,
         score = 0.0,
         total = 0.0
     }
@@ -1006,7 +1009,49 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             reward = reward + pulsar_reward
             reward_components.pulsar = reward_components.pulsar + pulsar_reward
 
-            -- 6. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
+            -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
+            -- Reward the DQN for following expert system's strategic positioning recommendations
+            local positioning_reward = 0.0
+            local expert_target_seg, _, _, _ = M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
+            
+            if expert_target_seg ~= -1 then
+                local current_player_seg = player_abs_seg
+                local prev_player_seg = previous_player_position & 0x0F
+                
+                -- Calculate distances to expert target (current and previous)
+                local current_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg, is_open))
+                local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg, is_open))
+                
+                -- Award for being on target segment
+                if current_distance == 0 then
+                    positioning_reward = 0.008  -- Strong positive reward for optimal positioning
+                -- Award for moving toward target
+                elseif current_distance < previous_distance then
+                    local progress = previous_distance - current_distance
+                    positioning_reward = 0.003 * progress  -- Fractional reward based on progress
+                -- Small penalty for moving away from target or not moving when needed
+                elseif current_distance > 0 then
+                    if current_distance > previous_distance then
+                        -- Moving away from target
+                        positioning_reward = -0.002
+                    elseif current_distance == previous_distance and current_distance > 1 then
+                        -- Not moving when movement toward target is needed
+                        positioning_reward = -0.001
+                    end
+                end
+                
+                -- Apply level-specific scaling
+                if level_type == 2 then -- Open levels
+                    positioning_reward = positioning_reward * 1.1  -- Slightly increase positioning importance on open levels
+                elseif level_type == 0 then -- Basic levels
+                    positioning_reward = positioning_reward * 0.9  -- Slightly reduce on simpler levels
+                end
+            end
+            
+            reward = reward + positioning_reward
+            reward_components.positioning = reward_components.positioning + positioning_reward
+
+            -- 7. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
             -- Apply a small penalty when spinning while already aligned (or no target)
             -- and not in immediate danger. Keeps behavior calm instead of fidgety.
             do
@@ -1045,6 +1090,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     previous_level = level_state.level_number or 0
     previous_alive_state = player_state.alive or 0
     previous_zap_detected = player_state.zap_detected or 0
+    previous_player_position = player_state.position or 0
     LastRewardState = reward
 
     return reward, bDone
@@ -1063,6 +1109,7 @@ function M.getLastRewardComponents()
         shots = 0.0,
         threats = 0.0,
         pulsar = 0.0,
+        positioning = 0.0,
         score = 0.0,
         total = 0.0
     }
