@@ -178,20 +178,29 @@ local controls = nil -- Initialized after MAME interface confirmed
 local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
     local insert = table.insert -- Local alias for performance
 
-    -- Helpers for normalized float32 packing - much cleaner approach!
-    local function clamp(v, lo, hi)
-        if v < lo then return lo elseif v > hi then return hi else return v end
+    -- Helpers for normalized float32 packing - fail fast on out-of-range values!
+    local function assert_range(v, lo, hi, context)
+        if v < lo or v > hi then
+            error(string.format("Value %g out of range [%g,%g] in %s", v, lo, hi, context or "unknown"))
+        end
+        return v
     end
     
     local function push_float32(parts, v)
         local val = tonumber(v) or 0.0
+        -- CRITICAL: Assert final normalized value is within expected range [-1,1]
+        if val < -1.0 or val > 1.0 then
+            error(string.format("FINAL NORMALIZED VALUE %g out of range [-1,1] before serialization!", val))
+        end
         insert(parts, string.pack(">f", val))  -- Big-endian float32
         return 1
     end
     
     -- Normalize natural 8-bit values [0,255] to [0,1]
     local function push_natural_norm(parts, v)
-        local val = clamp(tonumber(v) or 0, 0, 255) / 255.0
+        local num = tonumber(v) or 0
+        local validated = assert_range(num, 0, 255, "natural_8bit")
+        local val = validated / 255.0
         return push_float32(parts, val)
     end
     
@@ -202,9 +211,9 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         if num == INVALID_SEGMENT then
             return push_float32(parts, -1.0)  -- INVALID sentinel
         end
-        -- Clamp to actual Tempest range and normalize to [-1,+1]
-        local clamped = clamp(num, -15, 15)
-        local normalized = clamped / 15.0  -- [-15,+15] → [-1,+1]
+        -- Assert actual Tempest range and normalize to [-1,+1]
+        local validated = assert_range(num, -15, 15, "relative_segment")
+        local normalized = validated / 15.0  -- [-15,+15] → [-1,+1]
         return push_float32(parts, normalized)
     end
     
@@ -214,10 +223,11 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         return push_float32(parts, val)
     end
     
-    -- Normalize unit float [0,1] (already normalized)
+    -- Normalize unit float [0,1] (should already be normalized - assert if not)
     local function push_unit_norm(parts, v)
-        local val = clamp(tonumber(v) or 0, 0.0, 1.0)
-        return push_float32(parts, val)
+        local num = tonumber(v) or 0
+        local validated = assert_range(num, 0.0, 1.0, "unit_float")
+        return push_float32(parts, validated)
     end
 
     local binary_data_parts = {}
@@ -360,15 +370,13 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     end
 
     -- Fetch last reward components to transmit out-of-band (avoid recomputation in Python)
-    local rc = logic.getLastRewardComponents()
-
-    -- Pack OOB data (extended with 6 floats for reward components at the end)
+    -- Pack OOB data (header only, reward components removed for simplicity)
     -- Format legend:
-    --   >HdBBBHHHBBBhBhBBBBBffffff
+    --   >HdBBBHHHBBBhBhBBBBB
     --   H: num_values, d: reward, BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
     --   BBB: (save, fire, zap), h: spinner, B: attract, h: expert_target_seg, B: player_seg, B: is_open,
-    --   BB: (expert_fire, expert_zap), B: level_number, ffffff: (rc_safety, rc_proximity, rc_shots, rc_threats, rc_pulsar, rc_score)
-    local oob_format = ">HdBBBHHHBBBhBhBBBBBffffff"
+    --   BB: (expert_fire, expert_zap), B: level_number
+    local oob_format = ">HdBBBHHHBBBhBhBBBBB"
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
@@ -388,20 +396,14 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
         expert_zap_packed,          -- B: Expert Zap (uchar)
-        ls.level_number,            -- B: Current Level Number (uchar)
-        tonumber(rc.safety or 0.0),     -- f: Reward Component - Safety
-        tonumber(rc.proximity or 0.0),  -- f: Reward Component - Proximity
-        tonumber(rc.shots or 0.0),      -- f: Reward Component - Shots
-        tonumber(rc.threats or 0.0),    -- f: Reward Component - Threats
-        tonumber(rc.pulsar or 0.0),     -- f: Reward Component - Pulsar
-        tonumber(rc.score or 0.0)       -- f: Reward Component - Score
+        ls.level_number             -- B: Current Level Number (uchar)
     )
 
     -- Combine OOB header + main data
     local final_data = oob_data .. binary_data
 
-    -- DEBUG: Updated length info for float32 payload: OOB ~56 bytes, Main=704 bytes -> Total ~760 bytes  
-    -- print(string.format("Packed lengths: OOB~%d, Main=%d, Total=%d, Num values: %d", 56, #binary_data, #final_data, num_values_packed))
+    -- DEBUG: Updated length info for float32 payload: OOB ~32 bytes, Main=704 bytes -> Total ~736 bytes  
+    -- print(string.format("Packed lengths: OOB~%d, Main=%d, Total=%d, Num values: %d", 32, #binary_data, #final_data, num_values_packed))
 
     return final_data, num_values_packed
 end

@@ -54,7 +54,10 @@ SERVER_CONFIG = ServerConfigData()
 class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
-    action_size: int = 18                 
+    # Hybrid action space: 4 discrete fire/zap combinations + 1 continuous spinner
+    discrete_action_size: int = 4  # fire/zap combinations: (0,0), (1,0), (0,1), (1,1)
+    continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
+    action_size: int = 18  # Legacy - keep for backward compatibility during transition                 
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
     batch_size: int = 4096                # Reverted from 8192 - larger batch made plateau worse
     lr: float = 0.001                   # Q-explosion prevention: Reduced from 0.001 for 1024 model stability
@@ -366,7 +369,20 @@ class MetricsData:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nExpert mode: {'ON' if self.expert_mode else 'OFF'}\r")
 
-# Define action space
+# Define hybrid action space
+# Discrete fire/zap combinations (4 total)
+FIRE_ZAP_MAPPING = {
+    0: (0, 0),  # No fire, no zap
+    1: (1, 0),  # Fire, no zap  
+    2: (0, 1),  # No fire, zap
+    3: (1, 1),  # Fire, zap
+}
+
+# Continuous spinner range - matches expert system full range
+SPINNER_MIN = -0.9
+SPINNER_MAX = 0.9
+
+# Legacy discrete action mapping - kept for backward compatibility and comparison
 ACTION_MAPPING = {
     0: (0, 0, -0.3),   # Hard left, no fire, no zap
     1: (0, 0, -0.2),   # Medium left, no fire, no zap
