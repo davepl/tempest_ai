@@ -105,8 +105,6 @@ from config import (
     RL_CONFIG,
     MODEL_DIR,
     LATEST_MODEL_PATH,
-    ACTION_MAPPING,
-    ZAP_ACTIONS,
     metrics as config_metrics,
     ServerConfigData,
     RLConfigData,
@@ -1436,28 +1434,9 @@ class DQNAgent:
         # Set training mode back
         self.qnetwork_inference.train()
         
-        # Epsilon-greedy action selection with zap-downscaling
+        # Epsilon-greedy action selection (legacy zap-downscaling removed in pure hybrid)
         if random.random() < epsilon:
-            # Build a weighted choice where zap actions are downscaled
-            zap_scale = max(0.0, min(1.0, getattr(RL_CONFIG, 'zap_random_scale', 1.0)))
-            # Uniform base weights for all actions
-            weights = [1.0] * self.action_size
-            # Apply zap scaling
-            for idx in ZAP_ACTIONS:
-                if 0 <= idx < self.action_size:
-                    weights[idx] *= zap_scale
-            # If all weights zero (zap_scale=0 and all zap), fall back safely to center no-zap
-            total_w = sum(weights)
-            if total_w <= 0:
-                return 3  # center, no fire, no zap
-            # Sample according to weights
-            r = random.random() * total_w
-            cum = 0.0
-            for i, w in enumerate(weights):
-                cum += w
-                if r <= cum:
-                    return i
-            return self.action_size - 1
+            return random.randrange(self.action_size)
         else:
             selected_action = action_values.cpu().data.numpy().argmax()
             return selected_action
@@ -1935,6 +1914,22 @@ class HybridDQNAgent:
         self.training_steps = 0
         self.last_target_update = 0
         self.last_inference_sync = 0
+
+        # Background training worker(s)
+        self.running = True
+        self.num_training_workers = int(getattr(RL_CONFIG, 'training_workers', 1) or 1)
+        # Serialize optimizer updates across threads to avoid race conditions
+        self.training_lock = threading.Lock()
+        self.training_threads = []
+        for i in range(self.num_training_workers):
+            t = threading.Thread(target=self.background_train, daemon=True, name=f"HybridTrainWorker-{i}")
+            t.start()
+            self.training_threads.append(t)
+
+        # Inference sync heartbeat to ensure periodic sync even if training is sparse
+        self._sync_interval_seconds = float(getattr(RL_CONFIG, 'inference_sync_interval_sec', 10.0) or 10.0)
+        self._sync_thread = threading.Thread(target=self._inference_sync_heartbeat, daemon=True, name="HybridInferenceSyncHeartbeat")
+        self._sync_thread.start()
         
     def act(self, state, epsilon=0.0, add_noise=True):
         """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
@@ -1977,9 +1972,38 @@ class HybridDQNAgent:
                 self.train_queue.put_nowait(True)
             except queue.Full:
                 break
+
+    def background_train(self):
+        """Background worker that drains the train_queue and performs train steps."""
+        worker_id = threading.current_thread().name
+        print(f"Training thread {worker_id} started on {self.training_device}")
+        while self.running:
+            try:
+                _ = self.train_queue.get()  # block until work arrives
+                steps_per_req = int(getattr(RL_CONFIG, 'training_steps_per_sample', 2) or 1)
+                for _ in range(steps_per_req):
+                    loss_val = self.train_step()
+                    if loss_val is None:
+                        loss_val = 0.0
+                self.train_queue.task_done()
+            except AssertionError:
+                raise
+            except Exception as e:
+                print(f"Hybrid training error in {worker_id}: {e}")
+                import traceback; traceback.print_exc()
+                time.sleep(0.01)
     
     def train_step(self):
         """Perform a single training step with hybrid loss function"""
+        # Post-load burn-in: require some fresh frames after loading before training
+        try:
+            loaded_fc = int(getattr(metrics, 'loaded_frame_count', 0) or 0)
+            require_new = int(getattr(RL_CONFIG, 'min_new_frames_after_load_to_train', 0) or 0)
+            if loaded_fc > 0 and (metrics.frame_count - loaded_fc) < require_new:
+                return 0.0
+        except Exception:
+            pass
+
         if len(self.memory) < self.batch_size:
             return 0.0
         
@@ -2012,37 +2036,166 @@ class HybridDQNAgent:
         # Combined loss with balanced weighting
         total_loss = discrete_loss + 0.5 * continuous_loss  # Weight continuous loss lower
         
-        # Optimize
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        
-        # Gradient clipping
+        # Optimize (thread-safe for multi-worker training)
+        with self.training_lock:
+            self.optimizer.zero_grad()
+            total_loss.backward()
+
+        # Measure gradient norms and optionally clip (outside lock is fine for read-only)
+        preclip_grad_norm = 0.0
+        try:
+            sq_sum = 0.0
+            for p in self.qnetwork_local.parameters():
+                if p.grad is not None:
+                    # L2 norm per-parameter, accumulate squared
+                    g = p.grad.data.norm(2).item()
+                    sq_sum += g * g
+            preclip_grad_norm = (sq_sum ** 0.5)
+        except Exception:
+            preclip_grad_norm = 0.0
+
+        postclip_grad_norm = preclip_grad_norm
         if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
+            try:
+                torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
+                # Recompute norm after clipping
+                sq_sum = 0.0
+                for p in self.qnetwork_local.parameters():
+                    if p.grad is not None:
+                        g = p.grad.data.norm(2).item()
+                        sq_sum += g * g
+                postclip_grad_norm = (sq_sum ** 0.5)
+            except Exception:
+                postclip_grad_norm = preclip_grad_norm
         
-        self.optimizer.step()
+        # Step optimizer under lock to avoid interleaved updates
+        with self.training_lock:
+            self.optimizer.step()
         
-        # Update training counters
+        # Update training counters and metrics
         self.training_steps += 1
-        
+        try:
+            metrics.total_training_steps += 1
+            metrics.training_steps_interval += 1
+            metrics.memory_buffer_size = len(self.memory)
+        except Exception:
+            pass
+        # Track loss values for display
+        try:
+            metrics.losses.append(float(total_loss.item()))
+            metrics.loss_sum_interval += float(total_loss.item())
+            metrics.loss_count_interval += 1
+        except Exception:
+            pass
+        # Publish grad diagnostics
+        try:
+            if preclip_grad_norm > 0:
+                metrics.grad_clip_delta = float(postclip_grad_norm / max(preclip_grad_norm, 1e-12))
+            else:
+                metrics.grad_clip_delta = 1.0
+            metrics.grad_norm = float(preclip_grad_norm)
+        except Exception:
+            pass
+
         # Soft target update
         if getattr(RL_CONFIG, 'use_soft_target', True):
             tau = getattr(RL_CONFIG, 'tau', 0.005)
             for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
                 target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+            # Telemetry for target updates (soft)
+            try:
+                metrics.last_target_update_frame = metrics.frame_count
+                metrics.last_target_update_time = time.time()
+            except Exception:
+                pass
         
         # Hard target update
         elif self.training_steps % RL_CONFIG.target_update_freq == 0:
             self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+            # Telemetry for hard target updates
+            try:
+                metrics.last_target_update_frame = metrics.frame_count
+                metrics.last_target_update_time = time.time()
+                metrics.last_hard_target_update_frame = metrics.frame_count
+                metrics.last_hard_target_update_time = time.time()
+            except Exception:
+                pass
         
         # Sync inference network
         if inference_device != training_device and self.training_steps % 100 == 0:
-            self.qnetwork_inference.load_state_dict(self.qnetwork_local.state_dict())
+            self.sync_inference_network()
+        elif self.training_steps % 100 == 0:
+            # Even in single-device mode, update sync telemetry periodically
+            try:
+                metrics.last_inference_sync_frame = metrics.frame_count
+                metrics.last_inference_sync_time = time.time()
+            except Exception:
+                pass
         
         return total_loss.item()
+
+    def sync_inference_network(self):
+        """Synchronize inference network weights and record telemetry."""
+        did_copy = False
+        try:
+            if hasattr(self, 'qnetwork_inference') and self.qnetwork_inference is not self.qnetwork_local:
+                with torch.no_grad():
+                    state = {}
+                    for k, p in self.qnetwork_local.state_dict().items():
+                        state[k] = p.to(self.inference_device)
+                    self.qnetwork_inference.load_state_dict(state)
+                did_copy = True
+        finally:
+            try:
+                metrics.last_inference_sync_frame = metrics.frame_count
+                metrics.last_inference_sync_time = time.time()
+            except Exception:
+                pass
+        return did_copy
+
+    def _inference_sync_heartbeat(self):
+        """Periodic sync to keep inference network fresh even with low training activity."""
+        while self.running:
+            try:
+                now = time.time()
+                last = getattr(metrics, 'last_inference_sync_time', 0.0)
+                if last <= 0.0 or (now - last) >= self._sync_interval_seconds:
+                    self.sync_inference_network()
+                time.sleep(1.0)
+            except Exception:
+                time.sleep(1.0)
+
+    def update_target_network(self):
+        """Hard update target network from local and record telemetry."""
+        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        try:
+            metrics.last_target_update_frame = metrics.frame_count
+            metrics.last_target_update_time = time.time()
+            metrics.last_hard_target_update_frame = metrics.frame_count
+            metrics.last_hard_target_update_time = time.time()
+        except Exception:
+            pass
+
+    def force_hard_target_update(self):
+        """Alias for explicit hard target refresh (server compatibility)."""
+        self.update_target_network()
     
     def save(self, filepath):
-        """Save hybrid model checkpoint"""
+        """Save hybrid model checkpoint with basic rate limiting"""
+        is_forced_save = ("exit" in str(filepath)) or ("shutdown" in str(filepath))
+        now = time.time()
+        min_interval = 30.0
+        if not is_forced_save and (now - self.last_save_time) < min_interval:
+            return
+        # Persist key training/metrics to avoid losing progress on restart
+        # Respect saved_expert_ratio when override/expert_mode is active
+        try:
+            if metrics.expert_mode or metrics.override_expert:
+                ratio_to_save = metrics.saved_expert_ratio
+            else:
+                ratio_to_save = metrics.expert_ratio
+        except Exception:
+            ratio_to_save = float(getattr(metrics, 'expert_ratio', 0.0))
         checkpoint = {
             'local_state_dict': self.qnetwork_local.state_dict(),
             'target_state_dict': self.qnetwork_target.state_dict(),
@@ -2051,32 +2204,206 @@ class HybridDQNAgent:
             'state_size': self.state_size,
             'discrete_actions': self.discrete_actions,
             'memory_size': len(self.memory),
-            'architecture': 'hybrid'  # Mark as hybrid architecture
+            'architecture': 'hybrid',  # Mark as hybrid architecture
+            # Metrics/state for persistence
+            'frame_count': int(getattr(metrics, 'frame_count', 0)),
+            'epsilon': float(getattr(metrics, 'epsilon', getattr(RL_CONFIG, 'epsilon_start', 0.1))),
+            'expert_ratio': float(ratio_to_save),
+            'last_decay_step': int(getattr(metrics, 'last_decay_step', 0)),
+            'last_epsilon_decay_step': int(getattr(metrics, 'last_epsilon_decay_step', 0)),
+            'episode_rewards': list(getattr(metrics, 'episode_rewards', []) or []),
+            'dqn_rewards': list(getattr(metrics, 'dqn_rewards', []) or []),
+            'expert_rewards': list(getattr(metrics, 'expert_rewards', []) or []),
         }
         torch.save(checkpoint, filepath)
+        self.last_save_time = now
+        if is_forced_save:
+            print(f"Hybrid model saved to {filepath} (frame {getattr(metrics, 'frame_count', 0)})")
     
     def load(self, filepath):
         """Load hybrid model checkpoint"""
+        from config import RESET_METRICS, SERVER_CONFIG, FORCE_FRESH_MODEL
+
+        if FORCE_FRESH_MODEL:
+            print("FORCE_FRESH_MODEL is True - skipping model load, starting fresh weights")
+            return False
+
         if os.path.exists(filepath):
-            checkpoint = torch.load(filepath, map_location=training_device)
-            
-            # Verify architecture compatibility
-            if checkpoint.get('architecture') != 'hybrid':
-                print("Warning: Loading non-hybrid checkpoint into hybrid agent")
+            try:
+                checkpoint = torch.load(filepath, map_location=training_device)
+
+                # Verify architecture compatibility
+                if checkpoint.get('architecture') != 'hybrid':
+                    print("Warning: Loading non-hybrid checkpoint into hybrid agent")
+                    return False
+
+                # Load weights (tolerate minor shape mismatches by strict=True here as it's same arch)
+                self.qnetwork_local.load_state_dict(checkpoint['local_state_dict'])
+                self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    # Ensure LR honors current config
+                    for g in self.optimizer.param_groups:
+                        g['lr'] = RL_CONFIG.lr
+                    print(f"Optimizer state loaded. LR set to config value: {RL_CONFIG.lr}")
+                except Exception:
+                    print("Optimizer state not loaded (mismatch). Using fresh optimizer.")
+
+                self.training_steps = int(checkpoint.get('training_steps', 0))
+
+                # Sync inference network
+                if inference_device != training_device:
+                    self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
+
+                # Sanity-check Q-values on load to catch corruption/explosion
+                try:
+                    with torch.no_grad():
+                        dummy = torch.zeros(1, self.state_size, device=self.training_device)
+                        dq, _ = self.qnetwork_local(dummy)
+                        qmax = float(dq.max().item())
+                        qmin = float(dq.min().item())
+                        if max(abs(qmax), abs(qmin)) > 10.0:
+                            print("WARNING: Loaded hybrid model has extreme Q-values. Rescaling weights...")
+                            scale = 5.0 / max(abs(qmax), abs(qmin))
+                            for p in self.qnetwork_local.parameters():
+                                p.data.mul_(scale)
+                            for p in self.qnetwork_target.parameters():
+                                p.data.mul_(scale)
+                            dq2, _ = self.qnetwork_local(dummy)
+                            print(f"Rescaled Q-value range: [{float(dq2.min().item()):.3f}, {float(dq2.max().item()):.3f}]")
+                except Exception:
+                    pass
+
+                # Restore metrics unless explicitly reset
+                if RESET_METRICS:
+                    print("RESET_METRICS=True: resetting epsilon/expert_ratio; leaving frame_count at 0")
+                    metrics.epsilon = RL_CONFIG.epsilon_start
+                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                    metrics.last_decay_step = 0
+                    metrics.last_epsilon_decay_step = 0
+                    metrics.frame_count = 0
+                    metrics.loaded_frame_count = 0
+                    try:
+                        metrics.episode_rewards.clear(); metrics.dqn_rewards.clear(); metrics.expert_rewards.clear()
+                    except Exception:
+                        pass
+                else:
+                    # Frame count and training schedule
+                    metrics.frame_count = int(checkpoint.get('frame_count', 0))
+                    metrics.loaded_frame_count = int(metrics.frame_count)
+                    # Epsilon/Expert
+                    metrics.epsilon = float(checkpoint.get('epsilon', RL_CONFIG.epsilon_start))
+                    metrics.expert_ratio = float(checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start))
+                    metrics.last_decay_step = int(checkpoint.get('last_decay_step', 0))
+                    metrics.last_epsilon_decay_step = int(checkpoint.get('last_epsilon_decay_step', 0))
+                    # Reward histories (bounded by deque maxlen)
+                    try:
+                        if hasattr(metrics, 'episode_rewards'):
+                            metrics.episode_rewards.clear()
+                            for v in (checkpoint.get('episode_rewards', []) or [])[-metrics.episode_rewards.maxlen:]:
+                                metrics.episode_rewards.append(float(v))
+                        if hasattr(metrics, 'dqn_rewards'):
+                            metrics.dqn_rewards.clear()
+                            for v in (checkpoint.get('dqn_rewards', []) or [])[-metrics.dqn_rewards.maxlen:]:
+                                metrics.dqn_rewards.append(float(v))
+                        if hasattr(metrics, 'expert_rewards'):
+                            metrics.expert_rewards.clear()
+                            for v in (checkpoint.get('expert_rewards', []) or [])[-metrics.expert_rewards.maxlen:]:
+                                metrics.expert_rewards.append(float(v))
+                    except Exception:
+                        pass
+
+                    # Respect server toggles that may force resets regardless of checkpoint
+                    if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):
+                        print(f"Resetting expert_ratio to start per SERVER_CONFIG: {SERVER_CONFIG.expert_ratio_start}")
+                        metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                    if getattr(SERVER_CONFIG, 'reset_epsilon', False):
+                        print(f"Resetting epsilon to start per SERVER_CONFIG: {RL_CONFIG.epsilon_start}")
+                        metrics.epsilon = RL_CONFIG.epsilon_start
+                        metrics.last_epsilon_decay_step = 0
+                    if getattr(SERVER_CONFIG, 'force_expert_ratio_recalc', False):
+                        print(f"Force recalculating expert_ratio based on {metrics.frame_count:,} frames...")
+                        decay_expert_ratio(metrics.frame_count)
+                        print(f"Expert ratio recalculated to: {metrics.expert_ratio:.4f}")
+                    if getattr(SERVER_CONFIG, 'reset_frame_count', False):
+                        print("Resetting frame count per SERVER_CONFIG")
+                        metrics.frame_count = 0
+                        metrics.loaded_frame_count = 0
+                        metrics.last_decay_step = 0
+                        metrics.last_epsilon_decay_step = 0
+
+                print(f"Loaded hybrid model from {filepath}")
+                print(f"  - Resuming from frame: {metrics.frame_count}")
+                print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
+                print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
+                print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")
+                return True
+            except Exception as e:
+                print(f"Error loading hybrid checkpoint: {e}")
                 return False
-            
-            self.qnetwork_local.load_state_dict(checkpoint['local_state_dict'])
-            self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.training_steps = checkpoint.get('training_steps', 0)
-            
-            # Sync inference network
-            if inference_device != training_device:
-                self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
-            
-            print(f"Loaded hybrid model from {filepath}")
-            return True
-        return False
+        else:
+            print(f"No checkpoint found at {filepath}. Starting new hybrid model.")
+            return False
+
+    def stop(self, join: bool = True, timeout: float = 2.0):
+        """Gracefully stop background threads and heartbeat."""
+        self.running = False
+        # Unblock workers by enqueueing no-op tokens
+        try:
+            for _ in range(max(1, self.num_training_workers)):
+                self.train_queue.put_nowait(True)
+        except Exception:
+            pass
+        if join:
+            for t in self.training_threads:
+                try:
+                    t.join(timeout=timeout)
+                except Exception:
+                    pass
+            try:
+                self._sync_thread.join(timeout=timeout)
+            except Exception:
+                pass
+
+    def get_q_value_range(self):
+        """Return min/max Q-values from the discrete head over a representative batch.
+
+        We prefer sampling the replay buffer; if insufficient data, we probe a zero state.
+        """
+        try:
+            with torch.no_grad():
+                self.qnetwork_inference.eval()
+                min_q = max_q = None
+
+                buf_len = 0
+                try:
+                    buf_len = len(self.memory)
+                except Exception:
+                    buf_len = 0
+
+                probe_bs = 256
+                min_required = max(64, min(probe_bs, getattr(RL_CONFIG, 'batch_size', 64)))
+
+                if buf_len >= min_required:
+                    sample = self.memory.sample(min(probe_bs, buf_len))
+                    if sample is not None:
+                        states = sample[0]
+                        if isinstance(states, torch.Tensor):
+                            states = states.to(self.inference_device, non_blocking=True)
+                            discrete_q, _ = self.qnetwork_inference(states)
+                            min_q = discrete_q.min().item()
+                            max_q = discrete_q.max().item()
+
+                if min_q is None or max_q is None:
+                    dummy = torch.zeros(1, self.state_size, device=self.inference_device)
+                    discrete_q, _ = self.qnetwork_inference(dummy)
+                    min_q = discrete_q.min().item()
+                    max_q = discrete_q.max().item()
+
+                self.qnetwork_inference.train()
+                return float(min_q), float(max_q)
+        except Exception:
+            return float('nan'), float('nan')
 
 # Thread-safe metrics storage
 class SafeMetrics:
@@ -2175,6 +2502,39 @@ class SafeMetrics:
     def get_fps(self):
         with self.lock:
             return self.metrics.fps
+
+    # Thread-safe helpers for common aggregated metrics
+    def add_inference_time(self, t: float):
+        """Accumulate inference time and count in a thread-safe way."""
+        try:
+            dt = float(t)
+        except Exception:
+            dt = 0.0
+        with self.lock:
+            # Underlying MetricsData holds these fields
+            try:
+                self.metrics.total_inference_time += dt
+                self.metrics.total_inference_requests += 1
+            except Exception:
+                # If fields are missing for any reason, initialize defensively
+                try:
+                    if not hasattr(self.metrics, 'total_inference_time'):
+                        self.metrics.total_inference_time = 0.0
+                    if not hasattr(self.metrics, 'total_inference_requests'):
+                        self.metrics.total_inference_requests = 0
+                    self.metrics.total_inference_time += dt
+                    self.metrics.total_inference_requests += 1
+                except Exception:
+                    pass
+
+    def update_reward_components(self, components: dict):
+        """Forward reward component updates to underlying metrics with locking."""
+        try:
+            with self.lock:
+                if hasattr(self.metrics, 'update_reward_components'):
+                    self.metrics.update_reward_components(components)
+        except Exception:
+            pass
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state - SIMPLIFIED with float32 payload"""
@@ -2367,37 +2727,27 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
 
     return expert_fire, expert_zap, spinner
 
-def expert_action_to_index(fire, zap, spinner):
-    """Convert continuous expert actions to discrete action index"""
-    # Clamp spinner value between -0.3 and 0.3 to match ACTION_MAPPING
-    spinner_value = max(-0.3, min(0.3, spinner))
-    
-    # Map spinner to 0-6 range based on ACTION_MAPPING values
-    # -0.3 -> 0, -0.2 -> 1, -0.1 -> 2, 0.0 -> 3, 0.1 -> 4, 0.2 -> 5, 0.3 -> 6
-    spinner_idx = int((spinner_value + 0.3) / 0.1)
-    spinner_idx = min(6, max(0, spinner_idx))  # Ensure we don't exceed valid range
-    
-    # Handle zap actions properly - preserve movement and fire state
-    if zap:
-        if fire:
-            # Zap + Fire + movement: only one option in ACTION_MAPPING
-            return 14  # (1, 1, 0.0) - Force center for zap+fire combo
-        else:
-            # Zap + No fire + movement: actions 15-17 cover left/center/right
-            if spinner_value < -0.05:
-                return 15  # (0, 1, -0.1) - Zap + No fire + Soft left
-            elif spinner_value > 0.05:
-                return 17  # (0, 1, 0.1) - Zap + No fire + Soft right  
-            else:
-                return 16  # (0, 1, 0.0) - Zap + No fire + Center
-    
-    # Non-zap actions: normal mapping based on fire and spinner
-    base_idx = 7 if fire else 0
-    return base_idx + spinner_idx
+### Legacy conversion helpers removed (pure hybrid model)
 
 def encode_action_to_game(fire, zap, spinner):
-    """Convert action values to game-compatible format"""
-    spinner_val = spinner * 31
+    """Convert action values to game-compatible format.
+
+    Spinner mapping:
+    - Game expects an integer spinner command in [-32, +31]
+    - We interpret 'spinner' here as a normalized float roughly in [-1.0, +1.0]
+    - Encode by scaling with 32 and rounding, then clamp to the valid range
+    """
+    # Scale and round symmetrically with 32 to match original semantics
+    try:
+        sval = float(spinner)
+    except Exception:
+        sval = 0.0
+    spinner_val = int(round(sval * 32.0))
+    # Clamp to hardware range [-32, +31]
+    if spinner_val > 31:
+        spinner_val = 31
+    elif spinner_val < -32:
+        spinner_val = -32
     return int(fire), int(zap), int(spinner_val)
 
 def fire_zap_to_discrete(fire, zap):
@@ -2443,40 +2793,12 @@ def hybrid_to_game_action(discrete_action, continuous_spinner):
     return encode_action_to_game(fire, zap, continuous_spinner)
 
 def legacy_action_to_hybrid(action_idx):
-    """Convert legacy 18-discrete action to hybrid format for backward compatibility
-    
-    Args:
-        action_idx: int (0-17) legacy action index
-        
-    Returns:
-        discrete_action: int (0-3) for fire/zap combination
-        continuous_spinner: float in [-0.3, +0.3] for movement
-    """
-    from config import ACTION_MAPPING
-    
-    if action_idx not in ACTION_MAPPING:
-        # Default to no action
-        return 0, 0.0
-    
-    fire, zap, spinner = ACTION_MAPPING[action_idx]
-    discrete_action = fire_zap_to_discrete(fire, zap)
-    
-    return discrete_action, float(spinner)
+    """Legacy path removed. Placeholder returns no-op hybrid action."""
+    return 0, 0.0
 
 def hybrid_to_legacy_action(discrete_action, continuous_spinner):
-    """Convert hybrid action to closest legacy action index for backward compatibility
-    
-    Args:
-        discrete_action: int (0-3) for fire/zap combination
-        continuous_spinner: float in [-0.3, +0.3] for movement
-        
-    Returns:
-        action_idx: int (0-17) closest legacy action index
-    """
-    fire, zap = discrete_to_fire_zap(discrete_action)
-    
-    # Use existing expert_action_to_index for backward compatibility
-    return expert_action_to_index(fire, zap, continuous_spinner)
+    """Legacy path removed. Placeholder returns center legacy index (unused)."""
+    return 3
 
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate using step-based decay with adaptive floor.

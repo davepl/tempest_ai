@@ -57,7 +57,7 @@ class RLConfigData:
     # Hybrid action space: 4 discrete fire/zap combinations + 1 continuous spinner
     discrete_action_size: int = 4  # fire/zap combinations: (0,0), (1,0), (0,1), (1,1)
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
-    action_size: int = 18  # Legacy - keep for backward compatibility during transition                 
+    # Legacy removed: discrete 18-action size (pure hybrid model)
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
     batch_size: int = 4096                # Reverted from 8192 - larger batch made plateau worse
     lr: float = 0.001                   # Q-explosion prevention: Reduced from 0.001 for 1024 model stability
@@ -101,9 +101,7 @@ class RLConfigData:
     warmup_hard_refresh_every_steps: int = 200
     # Watchdog: ensure a hard refresh happens at least every N seconds once training is active
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
-    # Scale factor applied to epsilon-random zap probability (1.0 = uniform baseline, 0.0 = never choose zap during epsilon)
-    # Quick Win: allow a little zap exploration during epsilon (down-weighted)
-    zap_random_scale: float = 0.20
+    # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
     n_step: int = 7
     # Enable dueling architecture for better value/advantage separation
@@ -382,30 +380,7 @@ FIRE_ZAP_MAPPING = {
 SPINNER_MIN = -0.9
 SPINNER_MAX = 0.9
 
-# Legacy discrete action mapping - kept for backward compatibility and comparison
-ACTION_MAPPING = {
-    0: (0, 0, -0.3),   # Hard left, no fire, no zap
-    1: (0, 0, -0.2),   # Medium left, no fire, no zap
-    2: (0, 0, -0.1),   # Soft left, no fire, no zap
-    3: (0, 0, 0.0),    # Center, no fire, no zap
-    4: (0, 0, 0.1),    # Soft right, no fire, no zap
-    5: (0, 0, 0.2),    # Medium right, no fire, no zap
-    6: (0, 0, 0.3),    # Hard right, no fire, no zap
-    7: (1, 0, -0.3),   # Hard left, fire, no zap
-    8: (1, 0, -0.2),   # Medium left, fire, no zap
-    9: (1, 0, -0.1),   # Soft left, fire, no zap
-    10: (1, 0, 0.0),   # Center, fire, no zap
-    11: (1, 0, 0.1),   # Soft right, fire, no zap
-    12: (1, 0, 0.2),   # Medium right, fire, no zap
-    13: (1, 0, 0.3),   # Hard right, fire, no zap
-    14: (1, 1, 0.0),   # Zap+Fire+Center
-    15: (0, 1, -0.1),  # Zap+No fire+Soft left
-    16: (0, 1, 0.0),   # Zap+No fire+Center  
-    17: (0, 1, 0.1),   # Zap+No fire+Soft right
-}
-
-# Indices corresponding to zap actions in ACTION_MAPPING
-ZAP_ACTIONS = [idx for idx, triplet in ACTION_MAPPING.items() if len(triplet) >= 2 and triplet[1] == 1]
+# Legacy discrete action mapping removed (pure hybrid model)
 
 # Create instances of config classes
 metrics = MetricsData()
