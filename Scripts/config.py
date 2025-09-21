@@ -59,9 +59,9 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
-    batch_size: int = 4096                # Reverted from 8192 - larger batch made plateau worse
-    lr: float = 0.001                   # Q-explosion prevention: Reduced from 0.001 for 1024 model stability
-    gradient_accumulation_steps: int = 2  # RECOVERY: Reduced for more responsive updates during Q-value recovery
+    batch_size: int = 8192                # Reverted from 8192 - larger batch made plateau worse
+    lr: float = 0.0025                   # Q-explosion prevention: Reduced from 0.001 for 1024 model stability
+    gradient_accumulation_steps: int = 4  # RECOVERY: Reduced for more responsive updates during Q-value recovery
     gamma: float = 0.95                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.35                 # BOOSTED from 0.25 to increase exploration during plateau
     epsilon_start: float = 0.25           # BOOSTED from 0.15 for more initial exploration
@@ -78,7 +78,7 @@ class RLConfigData:
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
     # Quick Win: Turn on PER with conservative, clamped settings
-    use_per: bool = False                 # DISABLED: Simplify to basic DQN for debugging
+    use_per: bool = True                  # ENABLED: Hybrid agents use PER with discrete TD error priorities
     per_alpha: float = 0.6
     per_eps: float = 1e-6
     per_beta_start: float = 0.6           # Increased from 0.4 for better importance sampling
