@@ -917,7 +917,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 reward_components.safety = reward_components.safety + safety_penalty
             else
                 local safety_bonus = 0.005 * safety_scale
-                reward = reward + safety_bonus
+                -- reward = reward + safety_bonus
                 reward_components.safety = reward_components.safety + safety_bonus
             end
             
@@ -940,7 +940,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     prox_reward = -0.003 * proximity_scale  -- Too far penalty (lower efficiency)
                 end
                 -- Neutral reward for 3-5 segments (acceptable range)
-                reward = reward + prox_reward
+                -- reward = reward + prox_reward
                 prox_reward = prox_reward / 5
                 reward_components.proximity = reward_components.proximity + prox_reward
             end
@@ -990,7 +990,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             if critical_threats > 1 then
                 threat_reward = threat_reward - (critical_threats * 0.002)
             end
-            reward = reward + threat_reward
+            -- reward = reward + threat_reward
             reward_components.threats = reward_components.threats + threat_reward
             
             -- 5. PULSAR SAFETY REWARD (Objective Hazard Assessment)
@@ -1006,7 +1006,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     end
                 end
             end
-            reward = reward + pulsar_reward
+            -- reward = reward + pulsar_reward
             reward_components.pulsar = reward_components.pulsar + pulsar_reward
 
             -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
