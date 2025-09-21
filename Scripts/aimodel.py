@@ -65,6 +65,15 @@ from stable_baselines3.common.logger import configure
 import socket
 import traceback
 from torch.nn import SmoothL1Loss # Import SmoothL1Loss
+# Robust import for running as script (Scripts on sys.path) and as package (repo root on sys.path)
+try:
+    from nstep_buffer import NStepReplayBuffer  # when running `python Scripts/main.py`
+except Exception:
+    try:
+        from Scripts.nstep_buffer import NStepReplayBuffer  # when repo root is on sys.path
+    except Exception:
+        # If executed as package (python -m Scripts.main) and Scripts is a package
+        from .nstep_buffer import NStepReplayBuffer
 
 # Platform-specific imports for KeyboardHandler
 import sys
@@ -198,6 +207,7 @@ print(f"Learning rate: {RL_CONFIG.lr}")
 print(f"Batch size: {RL_CONFIG.batch_size}")
 print(f"Memory size: {RL_CONFIG.memory_size:,}")
 print(f"Hidden size: {RL_CONFIG.hidden_size}")
+print(f"Dueling: {'enabled' if getattr(RL_CONFIG, 'use_dueling', False) else 'disabled' } ")
 if getattr(RL_CONFIG, 'use_per', False):
     print(f"Using PER with alpha: {getattr(RL_CONFIG, 'per_alpha', 0.6)}")
 else:
@@ -216,85 +226,6 @@ metrics.global_server = None
 
 # Experience replay memory
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
-
-class ReplayMemory:
-    """Replay buffer with O(1) sampling using numpy circular buffer"""
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.size = 0
-        self.index = 0
-        
-        # Pre-allocate numpy arrays for O(1) access - will be initialized on first push
-        self.states = None
-        self.actions = None 
-        self.rewards = None
-        self.next_states = None
-        self.dones = None
-        
-    def push(self, state, action, reward, next_state, done):
-        """Add experience to memory - O(1) operation with thread safety"""
-        # Normalize inputs first
-        try:
-            a = int(action)
-        except Exception:
-            a = int(np.array(action).reshape(-1)[0])
-        action_val = np.array([a], dtype=np.int64)
-        reward_val = np.array([float(reward)], dtype=np.float32)
-        done_val = np.array([float(done)], dtype=np.float32)
-        
-        # Initialize arrays on first push - thread safe
-        if self.states is None:
-            # Initialize all arrays atomically
-            states = np.zeros((self.capacity,) + state.shape, dtype=np.float32)
-            actions = np.zeros((self.capacity, 1), dtype=np.int64)
-            rewards = np.zeros((self.capacity, 1), dtype=np.float32)
-            next_states = np.zeros((self.capacity,) + next_state.shape, dtype=np.float32)
-            dones = np.zeros((self.capacity, 1), dtype=np.float32)
-            
-            # Assign all at once to avoid race conditions
-            self.states = states
-            self.actions = actions
-            self.rewards = rewards
-            self.next_states = next_states
-            self.dones = dones
-            
-        # Store data in circular buffer
-        self.states[self.index] = state
-        self.actions[self.index] = action_val
-        self.rewards[self.index] = reward_val
-        self.next_states[self.index] = next_state  
-        self.dones[self.index] = done_val
-        
-        # Update pointers
-        self.index = (self.index + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-        
-    def sample(self, batch_size):
-        """Sample random batch of experiences - TRUE O(1) operation"""
-        if self.size == 0:
-            return None
-            
-        batch_size = min(batch_size, self.size)
-        
-        # O(1) random sampling using numpy indexing - no loops!
-        indices = np.random.randint(0, self.size, size=batch_size)
-        
-        # O(1) batch extraction using numpy advanced indexing
-        batch_states = self.states[indices]
-        batch_actions = self.actions[indices]
-        batch_rewards = self.rewards[indices]
-        batch_next_states = self.next_states[indices]
-        batch_dones = self.dones[indices]
-        
-        # Direct GPU transfer with pinned memory
-        return (torch.from_numpy(batch_states).pin_memory().to(training_device, non_blocking=True),
-                torch.from_numpy(batch_actions).pin_memory().to(training_device, non_blocking=True),
-                torch.from_numpy(batch_rewards).pin_memory().to(training_device, non_blocking=True),
-                torch.from_numpy(batch_next_states).pin_memory().to(training_device, non_blocking=True),
-                torch.from_numpy(batch_dones).pin_memory().to(training_device, non_blocking=True))
-        
-    def __len__(self):
-        return self.size
 
 class NoisyLinear(nn.Module):
     """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
@@ -674,13 +605,20 @@ class DQNAgent:
             gamma = getattr(RL_CONFIG, 'scheduler_gamma', 0.5)
             self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
         
+        # N-step learning buffer
+        self.n_step = getattr(RL_CONFIG, 'n_step', 1)
+        if self.n_step > 1:
+            self.n_step_buffer = NStepReplayBuffer(n_step=self.n_step, gamma=RL_CONFIG.gamma)
+        else:
+            self.n_step_buffer = None
+
         # Replay memory (optionally prioritized)
         if getattr(RL_CONFIG, 'use_per', False):
             print("Using Prioritized Experience Replay (PER)")
             self.memory = PrioritizedReplayMemory(memory_size, alpha=getattr(RL_CONFIG, 'per_alpha', 0.6), eps=getattr(RL_CONFIG, 'per_eps', 1e-6))
         else:
             print("Using standard Replay Memory")
-            self.memory = ReplayMemory(memory_size)
+            self.memory = SimpleReplayBuffer(memory_size)
 
         # Initialize target network with same weights as local network (force hard copy)
         self.force_hard_target_update()
@@ -798,24 +736,43 @@ class DQNAgent:
         
         # Optionally clamp targets to prevent runaway bootstrap
         if bool(getattr(RL_CONFIG, 'clamp_targets', True)):
-            Q_targets = Q_targets.clamp(min=-10.0, max=10.0)
+            clamp_v = float(getattr(RL_CONFIG, 'target_clamp_value', 10.0))
+            Q_targets = Q_targets.clamp(min=-clamp_v, max=clamp_v)
 
         # Compute TD errors AFTER any clamping so PER priorities reflect effective loss
         td_errors = (Q_expected - Q_targets).abs()
 
         # Compute loss (with or without importance sampling weights)
-        # Use SmoothL1 (Huber) loss for stability against outliers
+        # Choose loss function based on configuration
+        loss_type = getattr(RL_CONFIG, 'loss_type', 'huber')  # Default to huber for backward compatibility
+        
         if is_weights is not None:
-            huber = F.smooth_l1_loss(Q_expected, Q_targets, reduction='none')
-            loss = (is_weights * huber).mean()
+            if loss_type == 'mse':
+                mse_loss = F.mse_loss(Q_expected, Q_targets, reduction='none')
+                loss = (is_weights * mse_loss).mean()
+            else:  # huber/smooth_l1
+                huber = F.smooth_l1_loss(Q_expected, Q_targets, reduction='none')
+                loss = (is_weights * huber).mean()
         else:
-            loss = F.smooth_l1_loss(Q_expected, Q_targets, reduction='mean')
+            if loss_type == 'mse':
+                loss = F.mse_loss(Q_expected, Q_targets, reduction='mean')
+            else:  # huber/smooth_l1
+                loss = F.smooth_l1_loss(Q_expected, Q_targets, reduction='mean')
         
         return loss, td_errors, Q_expected, Q_targets
 
     def train_step(self):
         """Perform a single training step - optimized for single thread maximum throughput"""
         buffer_size = len(self.memory)
+        
+        # Post-load burn-in: ensure we have accrued enough fresh frames since last load
+        try:
+            loaded_fc = int(getattr(metrics, 'loaded_frame_count', 0) or 0)
+            require_new = int(getattr(RL_CONFIG, 'min_new_frames_after_load_to_train', 0) or 0)
+            if loaded_fc > 0 and (metrics.frame_count - loaded_fc) < require_new:
+                return
+        except Exception:
+            pass
         
         # CRITICAL FIX #6: Enhanced cold start protection for PER
         min_buffer_size = RL_CONFIG.batch_size
@@ -1022,7 +979,8 @@ class DQNAgent:
                         preclip_grad_norm = sq_sum ** 0.5
 
                         # Clip and then measure post-clip norm
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=5.0)
+                        max_norm = float(getattr(RL_CONFIG, 'max_grad_norm', 5.0))
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
                         # clipped_grad_norm is already the total norm after clipping, but compute explicitly for clarity
                         sq_sum = 0.0
                         for p in self.qnetwork_local.parameters():
@@ -1042,7 +1000,8 @@ class DQNAgent:
                         preclip_grad_norm = sq_sum ** 0.5
 
                         # Clip and step
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=5.0)
+                        max_norm = float(getattr(RL_CONFIG, 'max_grad_norm', 5.0))
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
                         # Measure post-clip
                         sq_sum = 0.0
                         for p in self.qnetwork_local.parameters():
@@ -1056,8 +1015,10 @@ class DQNAgent:
                     try:
                         if preclip_grad_norm is not None and preclip_grad_norm > 0:
                             metrics.grad_clip_delta = float(postclip_grad_norm / max(preclip_grad_norm, 1e-12))
+                            metrics.grad_norm = float(preclip_grad_norm)  # Store pre-clip magnitude
                         else:
                             metrics.grad_clip_delta = 1.0
+                            metrics.grad_norm = 0.0
                     except Exception:
                         pass
                     optimizer_time = time.time() - optimizer_start
@@ -1094,10 +1055,10 @@ class DQNAgent:
             total_time = time.time() - step_start
             
             # Print timing every 100 steps for debugging
-            # if metrics.total_training_steps % 100 == 0:
+            #if metrics.total_training_steps % 100 == 0:
             #    print(f"Training step timing - Total: {total_time*1000:.1f}ms, "
-            #          f"Sampling: {sampling_time*1000:.1f}ms, Forward: {forward_time*1000:.1f}ms, "
-            #          f"Backward: {backward_time*1000:.1f}ms, Optimizer: {optimizer_time*1000:.1f}ms")
+            #          f"  {sampling_time*1000:.1f}ms, Forward: {forward_time*1000:.1f}ms, "
+            #            gradient_accumulation_steps: int = 8  # Double current          f"Backward: {backward_time*1000:.1f}ms, Optimizer: {optimizer_time*1000:.1f}ms")
                     
         except AssertionError:
             # CRITICAL: Re-raise AssertionErrors to stop execution immediately
@@ -1230,24 +1191,58 @@ class DQNAgent:
                 time.sleep(1.0)
     
     def get_q_value_range(self):
-        """Get current Q-value range from the network for monitoring"""
+        """Get current Q-value range from the network for monitoring.
+
+        Prefer a representative batch of replay states (if buffer is sufficiently warm)
+        to avoid misleading readings from an all-zero dummy state. Falls back to the
+        dummy probe early in runs or if sampling fails.
+        """
         try:
             with torch.no_grad():
-                # Test Q-values on a dummy state using inference network
-                dummy_state = torch.zeros(1, self.state_size).to(self.inference_device)
                 self.qnetwork_inference.eval()
-                
-                if getattr(RL_CONFIG, 'use_distributional', False):
-                    q_dist = self.qnetwork_inference(dummy_state)  # (1, A, N)
-                    test_q_values = q_dist.mean(dim=2)   # (1, A)
-                else:
-                    test_q_values = self.qnetwork_inference(dummy_state)
-                
+
+                min_q = max_q = None
+
+                # Try to sample a batch of real states from replay (lightweight, read-only)
+                try:
+                    buf_len = len(self.memory)
+                except Exception:
+                    buf_len = 0
+
+                # Probe size: modest to keep this cheap in the metrics loop
+                probe_bs = 512
+                # Require a minimum warm buffer to ensure sample() succeeds
+                min_required = max(128, min(probe_bs, getattr(RL_CONFIG, 'batch_size', 64)))
+
+                if buf_len >= min_required:
+                    try:
+                        sample = self.memory.sample(min(probe_bs, buf_len))
+                        # Unpack states depending on buffer type
+                        # PER: (states, actions, rewards, next_states, dones, is_weights, indices)
+                        # Simple: (states, actions, rewards, next_states, dones)
+                        states = sample[0] if sample is not None else None
+                        if states is not None and isinstance(states, torch.Tensor):
+                            states = states.to(self.inference_device, non_blocking=True)
+                            q_vals = self.qnetwork_inference(states)
+                            if getattr(RL_CONFIG, 'use_distributional', False):
+                                q_vals = q_vals.mean(dim=2)  # (B, A)
+                            min_q = q_vals.min().item()
+                            max_q = q_vals.max().item()
+                    except Exception:
+                        # Fall back to dummy state probe
+                        states = None
+
+                if min_q is None or max_q is None:
+                    # Fallback: probe with an all-zero dummy state (legacy behavior)
+                    dummy_state = torch.zeros(1, self.state_size, device=self.inference_device)
+                    q_vals = self.qnetwork_inference(dummy_state)
+                    if getattr(RL_CONFIG, 'use_distributional', False):
+                        q_vals = q_vals.mean(dim=2)
+                    min_q = q_vals.min().item()
+                    max_q = q_vals.max().item()
+
                 self.qnetwork_inference.train()
-                
-                max_q = test_q_values.max().item()
-                min_q = test_q_values.min().item()
-                return min_q, max_q
+                return float(min_q), float(max_q)
         except Exception:
             return float('nan'), float('nan')
 
@@ -1292,22 +1287,25 @@ class DQNAgent:
                     return i
             return self.action_size - 1
         else:
-            return action_values.cpu().data.numpy().argmax()
+            selected_action = action_values.cpu().data.numpy().argmax()
+            return selected_action
             
     def step(self, state, action, reward, next_state, done):
         """Add experience to memory and queue for training"""
-        # Save experience in replay memory
-        self.memory.push(state, action, reward, next_state, done)
+        if self.n_step_buffer:
+            matured = self.n_step_buffer.add(state, action, reward, next_state, done)
+            for (s, a, r, ns, d) in matured:
+                self.memory.push(s, a, r, ns, d)
+        else:
+            self.memory.push(state, action, reward, next_state, done)
         
-        # BALANCED TRAINING: Moderate training intensity to maintain client responsiveness
-        # This balances learning speed with inference performance
-        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)  # Align with config default
-        for _ in range(training_multiplier):  # Reasonable training frequency
+        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
+        for _ in range(training_multiplier):
             try:
                 self.train_queue.put_nowait(True)
             except queue.Full:
-                break  # Queue full - stop trying
-            
+                break
+
     def save(self, filename):
         """Save model weights, rate-limited unless forced."""
         is_forced_save = "exit" in filename or "shutdown" in filename
@@ -1450,6 +1448,8 @@ class DQNAgent:
                 
                 # Load training state (frame count, epsilon, expert ratio, decay step)
                 metrics.frame_count = checkpoint.get('frame_count', 0)
+                # Store loaded frame count snapshot for post-load burn-in gating
+                metrics.loaded_frame_count = int(metrics.frame_count)
                 
                 # CRITICAL FIX: Detect and fix Q-value explosion in loaded model
                 print("Checking loaded model for Q-value corruption...")
@@ -1554,6 +1554,9 @@ class DQNAgent:
             print(f"No checkpoint found at {filename}. Starting new model.")
         return False
 
+# N-step learning: pre-processor that emits matured n-step experiences and flushes on terminal
+## NStepReplayBuffer is imported from Scripts.nstep_buffer
+    
 class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""
     def __init__(self):
@@ -1940,7 +1943,7 @@ def display_metrics_row(agent, kb=None):
     targ_col = f"{targ_df:6d}/{(f'{targ_dt:6.1f}s' if targ_dt is not None else '   n/a')}"
     
     row = (
-        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:7d} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
+        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:>7} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
         f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
     f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:>3} | {'ON' if metrics.expert_mode else 'OFF':>6} | "
         f"{sync_col:>16} | {targ_col:>17} | {q_range:>14}"
@@ -1990,9 +1993,6 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
 
 def expert_action_to_index(fire, zap, spinner):
     """Convert continuous expert actions to discrete action index"""
-    if zap:
-        return 14  # Special case for zap action
-        
     # Clamp spinner value between -0.3 and 0.3 to match ACTION_MAPPING
     spinner_value = max(-0.3, min(0.3, spinner))
     
@@ -2001,9 +2001,22 @@ def expert_action_to_index(fire, zap, spinner):
     spinner_idx = int((spinner_value + 0.3) / 0.1)
     spinner_idx = min(6, max(0, spinner_idx))  # Ensure we don't exceed valid range
     
-    # If firing, offset by 7 to get into the firing action range (7-13)
-    base_idx = 7 if fire else 0
+    # Handle zap actions properly - preserve movement and fire state
+    if zap:
+        if fire:
+            # Zap + Fire + movement: only one option in ACTION_MAPPING
+            return 14  # (1, 1, 0.0) - Force center for zap+fire combo
+        else:
+            # Zap + No fire + movement: actions 15-17 cover left/center/right
+            if spinner_value < -0.05:
+                return 15  # (0, 1, -0.1) - Zap + No fire + Soft left
+            elif spinner_value > 0.05:
+                return 17  # (0, 1, 0.1) - Zap + No fire + Soft right  
+            else:
+                return 16  # (0, 1, 0.0) - Zap + No fire + Center
     
+    # Non-zap actions: normal mapping based on fire and spinner
+    base_idx = 7 if fire else 0
     return base_idx + spinner_idx
 
 def encode_action_to_game(fire, zap, spinner):
@@ -2012,27 +2025,55 @@ def encode_action_to_game(fire, zap, spinner):
     return int(fire), int(zap), int(spinner_val)
 
 def decay_epsilon(frame_count):
-    """Calculate decayed exploration rate using step-based decay."""
+    """Calculate decayed exploration rate using step-based decay with adaptive floor.
+
+    Goal: when stuck near the ~2.5 band, temporarily raise the epsilon floor to
+    encourage exploration without destabilizing training.
+    """
     step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
-    
+
     # Only decay if a new step interval is reached
     if step_interval > metrics.last_epsilon_decay_step:
         # Apply decay multiplicatively for the number of steps missed
         num_steps_to_apply = step_interval - metrics.last_epsilon_decay_step
         decay_multiplier = RL_CONFIG.epsilon_decay_factor ** num_steps_to_apply
         metrics.epsilon *= decay_multiplier
-        
+
         # Update the last step tracker
         metrics.last_epsilon_decay_step = step_interval
 
+        # Adaptive epsilon floor to break the 2.5 plateau
+        try:
+            dqn5m_avg = float(getattr(metrics, 'dqn5m_avg', 0.0))
+            dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
+        except Exception:
+            dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
+
+        dynamic_floor = RL_CONFIG.epsilon_end
+        try:
+            # If clearly regressing within the band, bump a bit higher
+            if 2.2 <= dqn5m_avg <= 2.6 and dqn5m_slopeM < -0.02:
+                dynamic_floor = max(dynamic_floor, 0.22)
+            # If flat within the plateau band, give a gentle bump
+            elif 2.35 <= dqn5m_avg <= 2.60 and abs(dqn5m_slopeM) < 0.05:
+                dynamic_floor = max(dynamic_floor, 0.20)
+        except Exception:
+            pass
+
         # Ensure epsilon doesn't go below the minimum effective exploration rate
-        metrics.epsilon = max(RL_CONFIG.epsilon_end, metrics.epsilon)
+        metrics.epsilon = max(dynamic_floor, metrics.epsilon)
 
     # Always return the current epsilon value (which might have just been decayed)
     return metrics.epsilon
 
 def decay_expert_ratio(current_step):
-    """Update expert ratio based on 10,000 frame intervals"""
+    """Update expert ratio periodically with a performance- and slope-aware floor.
+
+    Stronger hold when near the 2.5 plateau:
+    - Hold >=50% expert until BOTH (DQN5M > 2.55) AND (slope >= +0.03)
+    - Then allow >=45% expert while 2.55 < DQN5M <= 2.70 and slope >= 0.00
+    - Above that, revert to configured min (e.g., 0.40)
+    """
     # Skip decay if expert mode or override is active
     if metrics.expert_mode or metrics.override_expert:
         return metrics.expert_ratio
@@ -2046,17 +2087,96 @@ def decay_expert_ratio(current_step):
 
     step_interval = current_step // SERVER_CONFIG.expert_ratio_decay_steps
 
-    # Only update if we've moved to a new interval
+    # Apply scheduled decay when we cross an interval boundary
     if step_interval > metrics.last_decay_step:
-        # Apply decay for each step we've advanced
         steps_to_apply = step_interval - metrics.last_decay_step
         for _ in range(steps_to_apply):
             metrics.expert_ratio *= SERVER_CONFIG.expert_ratio_decay
-        
         metrics.last_decay_step = step_interval
 
-        # Ensure we don't go below the minimum (unless override is active forcing 0.0)
-        if not metrics.override_expert:
-            metrics.expert_ratio = max(SERVER_CONFIG.expert_ratio_min, metrics.expert_ratio)
+    # Determine dynamic floor based on performance and trend (evaluate every call)
+    dynamic_floor = SERVER_CONFIG.expert_ratio_min
+    try:
+        dqn5m_avg = float(getattr(metrics, 'dqn5m_avg', 0.0))
+        dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
+        if not np.isnan(dqn5m_avg):
+            # Strong hold until we have both sufficient level and positive momentum
+            if (dqn5m_avg <= 2.55) or (dqn5m_slopeM < 0.03):
+                dynamic_floor = max(dynamic_floor, 0.50)
+            # Gentle handoff band when above ~2.55 and non-negative slope
+            elif (dqn5m_avg <= 2.70) and (dqn5m_slopeM >= 0.00):
+                dynamic_floor = max(dynamic_floor, 0.45)
+            else:
+                dynamic_floor = max(dynamic_floor, SERVER_CONFIG.expert_ratio_min)
+    except Exception:
+        dynamic_floor = SERVER_CONFIG.expert_ratio_min
+
+    # Enforce floor continuously (unless override forces 0.0)
+    if not metrics.override_expert:
+        metrics.expert_ratio = max(dynamic_floor, metrics.expert_ratio)
 
     return metrics.expert_ratio
+
+class SimpleReplayBuffer:
+    """Ultra-fast pre-allocated circular buffer with O(1) sampling."""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # Pre-allocate flat arrays for maximum speed
+        self.states = np.empty((capacity,), dtype=object)
+        self.actions = np.empty((capacity,), dtype=np.int32)
+        self.rewards = np.empty((capacity,), dtype=np.float32)
+        self.next_states = np.empty((capacity,), dtype=object)
+        self.dones = np.empty((capacity,), dtype=np.bool_)
+        
+        self.position = 0
+        self.size = 0
+
+    def push(self, state, action, reward, next_state, done):
+        # Coerce action to a scalar index if needed
+        try:
+            if isinstance(action, np.ndarray):
+                a_idx = int(action.reshape(-1)[0])
+            elif isinstance(action, (list, tuple)):
+                a_idx = int(action[0])
+            else:
+                a_idx = int(action)
+        except Exception:
+            a_idx = int(action)
+        
+        # Direct array assignment - O(1)
+        self.states[self.position] = state
+        self.actions[self.position] = a_idx
+        self.rewards[self.position] = reward
+        self.next_states[self.position] = next_state
+        self.dones[self.position] = done
+        
+        # Circular buffer logic
+        self.position = (self.position + 1) % self.capacity
+        if self.size < self.capacity:
+            self.size += 1
+
+    def sample(self, batch_size):
+        if self.size < batch_size:
+            return None
+        
+        # O(1) random integer generation instead of O(n) random.sample()
+        indices = np.random.randint(0, self.size, size=batch_size)
+        
+        # Direct array indexing - much faster than deque sampling
+        batch_states = [self.states[i] for i in indices]
+        batch_actions = self.actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_next_states = [self.next_states[i] for i in indices]
+        batch_dones = self.dones[indices]
+
+        # Convert to tensors
+        states = torch.from_numpy(np.vstack(batch_states)).float().to(training_device)
+        actions = torch.from_numpy(batch_actions.reshape(-1, 1)).long().to(training_device)
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float().to(training_device)
+        next_states = torch.from_numpy(np.vstack(batch_next_states)).float().to(training_device)
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float().to(training_device)
+
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self):
+        return self.size

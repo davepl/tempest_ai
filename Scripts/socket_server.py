@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import random
 import traceback
 from datetime import datetime
-from collections import deque
+from collections import deque, defaultdict
 
 # Import from config.py
 from config import (
@@ -53,7 +53,44 @@ class SocketServer:
         self.client_states = {}  # Dictionary to store per-client state
         self.client_lock = threading.Lock()  # Lock for client dictionaries
         self.shutdown_event = threading.Event()  # Event to signal shutdown to client threads
+        
+        # Action distribution tracking for debugging
+        self.expert_action_counts = defaultdict(int)
+        self.dqn_action_counts = defaultdict(int)
+        self.last_action_report = 0
+        
         # SIMPLIFIED: No longer need complex segment masking with float32 normalization
+        
+    def report_action_distribution(self):
+        """Print action distribution statistics for debugging"""
+        from config import ACTION_MAPPING
+        
+        print("\n=== ACTION DISTRIBUTION REPORT ===")
+        
+        total_expert = sum(self.expert_action_counts.values())
+        total_dqn = sum(self.dqn_action_counts.values())
+        
+        print(f"Expert actions: {total_expert}, DQN actions: {total_dqn}")
+        
+        if total_expert > 0:
+            print("\nExpert Action Distribution:")
+            for action_idx in range(18):
+                count = self.expert_action_counts[action_idx]
+                if count > 0:
+                    fire, zap, spinner = ACTION_MAPPING[action_idx]
+                    pct = (count / total_expert) * 100
+                    print(f"  Action {action_idx:2d}: fire={fire}, zap={zap}, spin={spinner:+.1f} -> {count:4d} ({pct:4.1f}%)")
+        
+        if total_dqn > 0:
+            print("\nDQN Action Distribution:")
+            for action_idx in range(18):
+                count = self.dqn_action_counts[action_idx]
+                if count > 0:
+                    fire, zap, spinner = ACTION_MAPPING[action_idx]
+                    pct = (count / total_dqn) * 100
+                    print(f"  Action {action_idx:2d}: fire={fire}, zap={zap}, spin={spinner:+.1f} -> {count:4d} ({pct:4.1f}%)")
+        
+        print("===================================\n")
         
     def start(self):
         """Start the socket server"""
@@ -559,10 +596,14 @@ class SocketServer:
                             self.metrics.increment_guided_count()
                             action_source = "expert"
                             action_idx = expert_action_to_index(fire, zap, spinner)
+                            
+                            # Track expert action distribution
+                            self.expert_action_counts[action_idx] += 1
                         else:
-                            # Use DQN with current epsilon
+                            # Use DQN - with epsilon=0 if override mode is active (pure DQN)
                             start_time = time.perf_counter()
-                            action_idx = self.agent.act(frame.state, self.metrics.get_epsilon())
+                            epsilon = 0.0 if self.metrics.is_override_active() else self.metrics.get_epsilon()
+                            action_idx = self.agent.act(frame.state, epsilon)
                             end_time = time.perf_counter()
                             inference_time = end_time - start_time
                             
@@ -573,6 +614,9 @@ class SocketServer:
                                 
                             fire, zap, spinner = ACTION_MAPPING[action_idx]
                             action_source = "dqn"
+                            
+                            # Track DQN action distribution
+                            self.dqn_action_counts[action_idx] += 1
                     else:
                          print(f"Client {client_id}: Agent not available for action generation.")
                          # Keep default action (0,0,0)
@@ -586,6 +630,12 @@ class SocketServer:
 
                     # Send action to game
                     game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner)
+                    
+                    # Periodic action distribution report (every 5000 frames)
+                    if self.metrics.frame_count - self.last_action_report >= 5000:
+                        self.report_action_distribution()
+                        self.last_action_report = self.metrics.frame_count
+                    
                     try:
                         client_socket.sendall(struct.pack("bbb", game_fire, game_zap, game_spinner))
                     except (BrokenPipeError, ConnectionResetError):

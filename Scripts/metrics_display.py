@@ -131,7 +131,7 @@ def display_metrics_header():
         f"{'Rwrd':>6} {'DQN':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} "
         f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
-        f"{'AvgInf':>7} {'Steps/s':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'AvgInf':>7} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -221,6 +221,14 @@ def display_metrics_row(agent, kb_handler):
     except Exception:
         dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
 
+    # Publish DQN5M stats to global metrics for gating logic elsewhere
+    try:
+        with metrics.lock:
+            metrics.dqn5m_avg = float(dqn5m_avg)
+            metrics.dqn5m_slopeM = float(dqn5m_slopeM)
+    except Exception:
+        pass
+
     # steps_per_1k_frames already computed above using the same interval counts
     
     # Calculate frames since last target update  
@@ -265,6 +273,7 @@ def display_metrics_row(agent, kb_handler):
         f"{sync_col:>12} {targ_col:>13} "
         f"{avg_inference_time_ms:>7.2f} "
         f"{steps_per_sec:>8.1f} "
+        f"{metrics.grad_norm:>8.3f} "
         f"{metrics.grad_clip_delta:>6.3f} "
         f"{q_range:>14} {training_stats:>15}"
     )

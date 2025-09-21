@@ -20,7 +20,7 @@ from collections import deque
 IS_INTERACTIVE = sys.stdin.isatty()
 
 # Flag to control metric reset on load
-RESET_METRICS = False # Set to True to ignore saved epsilon/expert ratio - FRESH START
+RESET_METRICS = False  # Set to True to ignore saved epsilon/expert ratio - FRESH START
 FORCE_FRESH_MODEL = False # Set to True to completely ignore saved model and start fresh
 
 # Directory paths
@@ -35,9 +35,9 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
     # Expert ratio configuration - only used for brand new models
-    expert_ratio_start: float = 0.75  # Lower start value for new models (was 0.50)
+    expert_ratio_start: float = 0.90  # HIGH START: Let expert provide clean initial training data
     # Quick Win: keep more expert in the loop to avoid premature handoff
-    expert_ratio_min: float = 0.20    # Lowered from 0.30 to 0.20 to give DQN more control sooner
+    expert_ratio_min: float = 0.40    # TEMP HOLD: Keep at least 40% expert while slope is weak
     expert_ratio_decay: float = 0.9995 # Decay stays the same for now; adaptive options possible
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     
@@ -56,26 +56,26 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     action_size: int = 18                 
     # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
-    batch_size: int = 1024                # Reduced from 4096 - too large for learning signal with large network
-    lr: float = 0.0005                    # Increased slightly for larger network (12M params)
-    gradient_accumulation_steps: int = 2  # Reduced - GPU utilization is now good
-    gamma: float = 0.99                   # Discount factor
-    epsilon: float = 0.25                 # Initial exploration rate
-    epsilon_start: float = 0.15           # Starting epsilon value
+    batch_size: int = 4096                # Reverted from 8192 - larger batch made plateau worse
+    lr: float = 0.001                   # Q-explosion prevention: Reduced from 0.001 for 1024 model stability
+    gradient_accumulation_steps: int = 2  # RECOVERY: Reduced for more responsive updates during Q-value recovery
+    gamma: float = 0.95                   # Reverted from 0.92 - lower gamma made plateau worse
+    epsilon: float = 0.35                 # BOOSTED from 0.25 to increase exploration during plateau
+    epsilon_start: float = 0.25           # BOOSTED from 0.15 for more initial exploration
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.050
-    epsilon_end: float = 0.050
+    epsilon_min: float = 0.150            # BOOSTED from 0.100 to maintain exploration
+    epsilon_end: float = 0.150            # BOOSTED from 0.100 to maintain exploration
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 4096               # Reduced from 4096 to 512 for better learning
+    hidden_size: int = 2048               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 3                  # Simplified to 3 layers
-    target_update_freq: int = 2000        # Increased from 200 to 2000 for stability
-    update_target_every: int = 2000       # Alias for target_update_freq
+    target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
+    update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
-    use_noisy_nets: bool = True           # Use noisy networks for exploration
+    use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
     # Quick Win: Turn on PER with conservative, clamped settings
-    use_per: bool = True
+    use_per: bool = False                 # DISABLED: Simplify to basic DQN for debugging
     per_alpha: float = 0.6
     per_eps: float = 1e-6
     per_beta_start: float = 0.6           # Increased from 0.4 for better importance sampling
@@ -84,13 +84,13 @@ class RLConfigData:
     per_active_size: int = 100000         # Increased from 50k to 100k for better GPU utilization per sampling operation
     per_strict_checks_every: int = 1000 # Run full priority validation every N samples (0 to disable)
     use_distributional: bool = False      # Disabled - too complex
-    gradient_accumulation_steps: int = 8  # Increased from 4 to 8 for massive effective batch size (1024*8=8192)
+    # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
-    training_steps_per_sample: int = 24    # Increased from 4 to 6 - more training per sample to combat flattening
+    training_steps_per_sample: int = 6    # Slightly reduce per-sample training to limit drift/overfit
     training_workers: int = 1             # Reverted to 1 - multi-threaded training causes autograd conflicts
     use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
-    tau: float = 0.005                    # Reduced from 0.03 to 0.005 for more stable updates
+    tau: float = 0.012                    # Slight bump for more responsive soft target tracking
     # Optional hard refresh of target net even when using soft updates
     hard_target_refresh_every_steps: int = 25000  # Slightly faster hard refresh cadence to re-anchor periodically
     # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
@@ -102,9 +102,18 @@ class RLConfigData:
     # Quick Win: allow a little zap exploration during epsilon (down-weighted)
     zap_random_scale: float = 0.20
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 3
+    n_step: int = 7
     # Enable dueling architecture for better value/advantage separation
-    use_dueling: bool = True
+    use_dueling: bool = False             
+    # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
+    loss_type: str = 'huber'              # Use Huber for robustness to outliers
+    # Gradient clipping configuration
+    max_grad_norm: float = 5.0            # Clip threshold for total grad norm (L2)
+    # Target clamp to stabilize bootstrapping near plateaus - DISABLED to observe natural Q-value range with gamma=0.95
+    clamp_targets: bool = False           # DISABLED: Let Q-values grow naturally to detect any remaining inflation
+    target_clamp_value: float = 8.0       # Value preserved for potential re-enable if needed
+    # Require fresh frames after load before resuming training
+    min_new_frames_after_load_to_train: int = 100000
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -141,6 +150,7 @@ class MetricsData:
     average_priority: float = 0.0  # Average priority value across all transitions
     # Gradient clipping diagnostics
     grad_clip_delta: float = 1.0   # post-clip L2 norm divided by pre-clip L2 norm (should be ~1.0 if not clipping)
+    grad_norm: float = 0.0         # pre-clip gradient L2 norm magnitude for monitoring learning dynamics
     # Loss averaging since last metrics print
     loss_sum_interval: float = 0.0
     loss_count_interval: int = 0
@@ -160,6 +170,11 @@ class MetricsData:
     # Hard target update telemetry (full copy)
     last_hard_target_update_frame: int = 0
     last_hard_target_update_time: float = 0.0
+    # Rolling performance metrics (from metrics_display)
+    dqn5m_avg: float = 0.0  # Weighted average DQN reward across last 5M frames
+    dqn5m_slopeM: float = 0.0  # Weighted regression slope per million frames
+    # Frame count at load time for enforcing post-load burn-in
+    loaded_frame_count: int = 0
     
     # Reward component tracking (for analysis and display)
     last_reward_components: Dict[str, float] = field(default_factory=dict)

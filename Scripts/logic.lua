@@ -856,25 +856,25 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         total = 0.0
     }
 
-    -- Terminal: death (edge-triggered) - INCREASED penalty for better learning
+    -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = reward - 5.0                                                   -- REDUCED from -5.0 to -1.0 for proper scaling
-        reward_components.score = -5.0                                          -- Death penalty counts as score component
+        reward = reward - 1.0                                                   -- Scaled to match 20k points = 1 life exchange rate
+        reward_components.score = -1.0                                          -- Death penalty counts as score component
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
         if score_delta ~= 0 and score_delta < 1000 then                         -- Filter our large completion bonuses
-            local r_score = score_delta / 500.0                               -- REDUCED from 5000.0 for stronger learning signal
+            local r_score = score_delta / 20000.0                               -- Scaled: 20k points = 1 life = 1.0 reward unit
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
             reward = reward + r_score
             reward_components.score = reward_components.score + r_score
         end
 
-        -- Level completion bonus (edge-triggered) - BOOSTED for breakthrough
+        -- Level completion bonus (edge-triggered) - Scaled to match death penalty magnitude
         if (level_state.level_number or 0) > (previous_level or 0) then
-            local level_bonus = 5.0                                             -- REDUCED from 5.0 to 1.0 for proper scaling
+            local level_bonus = 1.0                                             -- Scaled to match 1 life = 1.0 reward unit
             reward = reward + level_bonus
             reward_components.score = reward_components.score + level_bonus
             bDone = true
