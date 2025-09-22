@@ -59,33 +59,25 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 32768               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.005                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
-    gradient_accumulation_steps: int = 2  # Increased to simulate 131k effective batch for throughput
+    batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
+    lr: float = 0.0025                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.30                 # PLATEAU BREAKER: Boost from 0.15 to rediscover strategies
     epsilon_start: float = 0.30           # PLATEAU BREAKER: Higher exploration for breakthrough
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.200            # PLATEAU BREAKER: Raise minimum to maintain exploration
-    epsilon_end: float = 0.200            # PLATEAU BREAKER: Higher floor for continued discovery
+    epsilon_min: float = 0.100            # PLATEAU BREAKER: Raise minimum to maintain exploration
+    epsilon_end: float = 0.100            # PLATEAU BREAKER: Higher floor for continued discovery
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
-    memory_size: int = 1000000           # Balanced buffer size (was 4000000)
+    memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 6                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
-    # Quick Win: Turn on PER with conservative, clamped settings
-    use_per: bool = False                  # ENABLED: Hybrid agents use PER with discrete TD error priorities
-    per_alpha: float = 0.6
-    per_eps: float = 1e-6
-    per_beta_start: float = 0.6           # Increased from 0.4 for better importance sampling
-    per_beta_frames: int = 200000
-    # PER performance tuning
-    per_active_size: int = 100000         # Increased from 50k to 100k for better GPU utilization per sampling operation
-    per_strict_checks_every: int = 1000 # Run full priority validation every N samples (0 to disable)
+    # Prioritized Replay (PER) removed - hybrid-only simple replay
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
     # Phase 1 Optimization: More frequent updates for faster convergence
@@ -114,7 +106,32 @@ class RLConfigData:
     clamp_targets: bool = False           # DISABLED: Let Q-values grow naturally to detect any remaining inflation
     target_clamp_value: float = 8.0       # Value preserved for potential re-enable if needed
     # Require fresh frames after load before resuming training
-    min_new_frames_after_load_to_train: int = 100000
+    min_new_frames_after_load_to_train: int = 50000
+
+    # Optimization: learning-rate schedule (frame-based)
+    # Options: 'none', 'cosine'
+    lr_schedule: str = 'cosine'
+    lr_base: float = 0.001
+    lr_min: float = 5e-05
+    lr_warmup_frames: int = 250_000       # linear warmup from lr_min -> lr_base
+    lr_hold_until_frames: int = 1_000_000 # hold at lr_base until this frame
+    lr_decay_until_frames: int = 12_000_000 # cosine decay from hold -> this frame
+
+    # Targets: use Double DQN bootstrapping for discrete head
+    use_double_dqn: bool = True
+
+    # Replay sampling bias toward most recent data (windowed uniform)
+    # If bias > 0, sample this fraction from the most recent (window_frac) of the buffer
+    recent_sample_bias: float = 0.5       # 0.0 disables; 0.5 = half recent, half global
+    recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
+
+    # Exploration policy: allow adaptive epsilon floor adjustments as performance improves
+    adaptive_epsilon_floor: bool = True
+    # Expert policy: allow adaptive expert-ratio floor adjustments based on performance trend
+    adaptive_expert_floor: bool = True
+
+    # Loss weighting: balance continuous head relative to discrete head
+    continuous_loss_weight: float = 0.5
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -147,8 +164,7 @@ class MetricsData:
     total_inference_time: float = 0.0
     total_inference_requests: int = 0
     average_level: float = 0  # Average level number across all clients
-    beta: float = 0.6  # Starting beta value for prioritized replay
-    average_priority: float = 0.0  # Average priority value across all transitions
+    # PER-specific metrics removed
     # Gradient clipping diagnostics
     grad_clip_delta: float = 1.0   # post-clip L2 norm divided by pre-clip L2 norm (should be ~1.0 if not clipping)
     grad_norm: float = 0.0         # pre-clip gradient L2 norm magnitude for monitoring learning dynamics
@@ -178,16 +194,6 @@ class MetricsData:
     loaded_frame_count: int = 0
     
     # Reward component tracking (for analysis and display)
-    last_reward_components: Dict[str, float] = field(default_factory=dict)
-    reward_component_history: Dict[str, Deque[float]] = field(default_factory=lambda: {
-        'safety': deque(maxlen=100),
-        'proximity': deque(maxlen=100), 
-        'shots': deque(maxlen=100),
-        'threats': deque(maxlen=100),
-        'pulsar': deque(maxlen=100),
-        'score': deque(maxlen=100),
-        'total': deque(maxlen=100)
-    })
     # State summary stats (rolling)
     state_mean: float = 0.0
     state_std: float = 0.0
@@ -329,15 +335,6 @@ class MetricsData:
         with self.lock:
             return self.fps
     
-    def update_reward_components(self, components: Dict[str, float]):
-        """Update reward component tracking"""
-        with self.lock:
-            self.last_reward_components = components.copy()
-            # Add to history for each component
-            for component, value in components.items():
-                if component in self.reward_component_history:
-                    self.reward_component_history[component].append(value)
-            # Note: components may come from Lua OOB header (preferred) or Python fallback
     
     def get_reward_component_averages(self) -> Dict[str, float]:
         """Get recent averages of reward components"""

@@ -11,7 +11,7 @@ from datetime import datetime
 import traceback
 
 from aimodel import (
-    DQNAgent, HybridDQNAgent, KeyboardHandler
+    HybridDQNAgent, KeyboardHandler
 )
 from config import (
     RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG

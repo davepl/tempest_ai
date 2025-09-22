@@ -52,8 +52,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
-from torch.cuda.amp import GradScaler, autocast  # For mixed precision training
+# Removed StepLR and AMP imports (hybrid-only path doesn't use them)
 import select
 import threading
 import queue
@@ -212,10 +211,7 @@ for i in range(1, len(layer_sizes)):
 print(f"  Head layers: {layer_sizes[-1]} → {max(64, layer_sizes[-1] // 2)}")
 
 print(f"Dueling: {'enabled' if getattr(RL_CONFIG, 'use_dueling', False) else 'disabled' } ")
-if getattr(RL_CONFIG, 'use_per', False):
-    print(f"Using PER with alpha: {getattr(RL_CONFIG, 'per_alpha', 0.6)}")
-else:
-    print("Using standard experience replay")
+print("Replay: hybrid experience buffer (discrete + continuous)")
 print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision', False) else 'disabled'}")
 print(f"State size: {RL_CONFIG.state_size}")
 
@@ -228,76 +224,9 @@ metrics = config_metrics
 # Global reference to server for metrics display
 metrics.global_server = None
 
-# Experience replay memory
-Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
+# Legacy discrete-only replay types removed; hybrid-only
 
-class QNetwork(nn.Module):
-    """Standard DQN MLP with optional noisy layers and dueling head.
-
-    Uses the same dynamic pair-halving pattern as HybridDQN for consistency.
-    """
-    def __init__(self, state_size: int, action_size: int, hidden_size: int = 512, num_layers: int = 3,
-                 use_dueling: bool = False, use_noisy: bool = False, noisy_std: float = 0.1):
-        super().__init__()
-        self.state_size = state_size
-        self.action_size = action_size
-        self.use_dueling = use_dueling
-        self.use_noisy = use_noisy
-
-        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
-
-        # Compute dynamic layer sizes (pair-halving)
-        layer_sizes = []
-        for i in range(num_layers):
-            pair_index = i // 2
-            layer_sizes.append(max(32, hidden_size // (2 ** pair_index)))
-
-        self.layers = nn.ModuleList()
-        # First layer
-        if use_noisy:
-            self.layers.append(LinearOrNoisy(state_size, layer_sizes[0], noisy_std))
-        else:
-            self.layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
-        # Subsequent layers
-        for i in range(1, num_layers):
-            if use_noisy:
-                self.layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i], noisy_std))
-            else:
-                self.layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
-
-        shared_out = layer_sizes[-1]
-        head_size = max(64, shared_out // 2)
-
-        if use_dueling:
-            self.val_fc = nn.Linear(shared_out, head_size)
-            self.adv_fc = nn.Linear(shared_out, head_size)
-            self.val_out = nn.Linear(head_size, 1)
-            self.adv_out = nn.Linear(head_size, action_size)
-        else:
-            self.head_fc = nn.Linear(shared_out, head_size)
-            self.head_out = nn.Linear(head_size, action_size)
-
-    def reset_noise(self):
-        if self.use_noisy:
-            for m in self.modules():
-                if isinstance(m, NoisyLinear):
-                    m.reset_noise()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = x
-        for layer in self.layers:
-            y = F.relu(layer(y))
-        if self.use_dueling:
-            v = F.relu(self.val_fc(y))
-            v = self.val_out(v)
-            a = F.relu(self.adv_fc(y))
-            a = self.adv_out(a)
-            q = v + (a - a.mean(dim=1, keepdim=True))
-            return q
-        else:
-            h = F.relu(self.head_fc(y))
-            q = self.head_out(h)
-            return q
+# Discrete-only QNetwork removed (hybrid-only)
 
 class NoisyLinear(nn.Module):
     """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
@@ -514,12 +443,36 @@ class HybridReplayBuffer:
             self.size += 1
     
     def sample(self, batch_size):
-        """Sample batch of experiences"""
+        """Sample batch of experiences with optional recent-window bias."""
         if self.size < batch_size:
             return None
-        
-        # Random sampling
-        indices = np.random.randint(0, self.size, size=batch_size)
+
+        # Default: uniform over buffer
+        indices = None
+        try:
+            bias = float(getattr(RL_CONFIG, 'recent_sample_bias', 0.0) or 0.0)
+            window_frac = float(getattr(RL_CONFIG, 'recent_window_frac', 0.0) or 0.0)
+        except Exception:
+            bias, window_frac = 0.0, 0.0
+
+        if bias <= 0.0 or window_frac <= 0.0:
+            indices = np.random.randint(0, self.size, size=batch_size)
+        else:
+            # Split batch: some from recent window, remainder from full buffer
+            recent_count = int(batch_size * min(max(bias, 0.0), 1.0))
+            global_count = batch_size - recent_count
+            # Recent window range [start, size)
+            recent_window = int(self.size * (1.0 - min(max(window_frac, 0.0), 1.0)))
+            recent_low = max(0, min(recent_window, self.size - 1))
+            if recent_count > 0 and recent_low < self.size:
+                recent_idx = np.random.randint(recent_low, self.size, size=recent_count)
+            else:
+                recent_idx = np.empty((0,), dtype=np.int64)
+            if global_count > 0:
+                global_idx = np.random.randint(0, self.size, size=global_count)
+            else:
+                global_idx = np.empty((0,), dtype=np.int64)
+            indices = np.concatenate([recent_idx, global_idx])
         
         # Gather batch data
         batch_states = [self.states[i] for i in indices]
@@ -542,1127 +495,8 @@ class HybridReplayBuffer:
     def __len__(self):
         return self.size
 
-class PrioritizedReplayMemory:
-    """Prioritized experience replay using proportional priorities."""
-    def __init__(self, capacity: int, alpha: float = 0.6, eps: float = 1e-6):
-        self.capacity = capacity
-        self.alpha = alpha
-        self.eps = eps
-        self.pos = 0
-        self.full = False
-        # Thread-safety: protect concurrent push/sample/update from different threads
-        self._lock = threading.Lock()
-        self.states = np.zeros((capacity, RL_CONFIG.state_size), dtype=np.float32)
-        self.actions = np.zeros((capacity, 1), dtype=np.int64)
-        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
-        self.next_states = np.zeros((capacity, RL_CONFIG.state_size), dtype=np.float32)
-        self.dones = np.zeros((capacity, 1), dtype=np.float32)
-        self.priorities = np.full((capacity, 1), self.eps, dtype=np.float32)  # CRITICAL FIX: Initialize with eps, not zero!
-
-        # Running average and max for monitoring and fast push priority init
-        self.avg_priority = 0.0
-        self._max_priority = 1.0
-        self._sample_calls = 0
-
-    def __len__(self):
-        # Atomic read of size-related fields
-        with self._lock:
-            return self.capacity if self.full else self.pos
-
-    def push(self, state, action, reward, next_state, done):
-        with self._lock:
-            idx = self.pos
-            self.states[idx] = state
-            # Coerce action to scalar index
-            try:
-                if isinstance(action, np.ndarray):
-                    a_idx = int(action.reshape(-1)[0])
-                elif isinstance(action, (list, tuple)):
-                    a_idx = int(action[0])
-                else:
-                    a_idx = int(action)
-            except Exception:
-                a_idx = int(action)
-
-            self.actions[idx, 0] = a_idx
-            self.rewards[idx, 0] = reward
-            self.next_states[idx] = next_state
-            self.dones[idx, 0] = float(done)
-
-            # Initialize priority for new experience to current max priority
-            max_prio = float(self._max_priority) if np.isfinite(self._max_priority) and self._max_priority > 0 else 1.0
-            self.priorities[idx, 0] = max_prio
-
-            # Update position
-            self.pos = (self.pos + 1) % self.capacity
-            if self.pos == 0:
-                self.full = True
-
-    def sample(self, batch_size: int, beta: float = 0.4):
-        """Sample batch with importance sampling weights - STRICT MODE with early assertions"""
-        with self._lock:
-            size = self.capacity if self.full else self.pos
-            assert size > 0, "Cannot sample from empty buffer"
-            assert batch_size <= size, f"Cannot sample {batch_size} items from buffer of size {size}"
-
-            # Use only the most recent active window to reduce O(N) cost
-            active_size_cfg = int(getattr(RL_CONFIG, 'per_active_size', 0) or 0)
-            active_size = min(size, active_size_cfg) if active_size_cfg > 0 else size
-
-            if active_size == size:
-                window_indices = np.arange(size, dtype=np.int64)
-            else:
-                if self.full:
-                    start = (self.pos - active_size) % self.capacity
-                    if start + active_size <= self.capacity:
-                        window_indices = np.arange(start, start + active_size, dtype=np.int64)
-                    else:
-                        first = np.arange(start, self.capacity, dtype=np.int64)
-                        second = np.arange(0, (start + active_size) % self.capacity, dtype=np.int64)
-                        window_indices = np.concatenate([first, second])
-                else:
-                    window_indices = np.arange(size - active_size, size, dtype=np.int64)
-
-            prios = self.priorities[window_indices, 0]
-
-            # Throttle deep validation checks
-            self._sample_calls += 1
-            strict_every = int(getattr(RL_CONFIG, 'per_strict_checks_every', 0) or 0)
-            if strict_every > 0 and (self._sample_calls % strict_every == 0):
-                zero_count = np.sum(prios <= 0)
-                assert zero_count == 0, f"CRITICAL BUG: Found {zero_count} zero/negative priorities in buffer window!"
-                nan_count = np.sum(~np.isfinite(prios))
-                assert nan_count == 0, f"CRITICAL BUG: Found {nan_count} NaN/Inf priorities in buffer window!"
-
-            # Calculate probabilities with alpha weighting over the active window
-            prob_alpha = prios ** self.alpha
-            probs = prob_alpha / prob_alpha.sum()
-
-            # Sample within window, then map to buffer indices
-            chosen = np.random.choice(active_size if active_size > 0 else size, batch_size, p=probs, replace=False)
-            indices = window_indices[chosen]
-
-            # Importance weights: use total buffer size for N term (approximation when windowed)
-            sampled_probs = probs[chosen]
-            weights = (size * sampled_probs) ** (-beta)
-            weights = weights / max(weights.max(), 1e-12)  # Normalize by max weight
-
-        # Return sampled batch as PyTorch tensors on training device (outside lock for speed)
-        states = torch.from_numpy(self.states[indices]).float().to(training_device)
-        actions = torch.from_numpy(self.actions[indices]).long().to(training_device)
-        rewards = torch.from_numpy(self.rewards[indices]).float().to(training_device)
-        next_states = torch.from_numpy(self.next_states[indices]).float().to(training_device)
-        dones = torch.from_numpy(self.dones[indices]).float().to(training_device)
-        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float().to(training_device)
-
-        return states, actions, rewards, next_states, dones, is_weights, indices
-
-
-    def validate_priorities(self):
-        """Debug function to validate priority buffer integrity"""
-        with self._lock:
-            size = self.capacity if self.full else self.pos
-            if size == 0:
-                return
-            prios = self.priorities[:size, 0]
-        print(f"Priority Validation (size {size}):")
-        print(f"  Min: {prios.min():.6f}, Max: {prios.max():.6f}")
-        print(f"  Mean: {prios.mean():.6f}, Std: {prios.std():.6f}")
-        print(f"  NaN count: {np.isnan(prios).sum()}")
-        print(f"  Inf count: {np.isinf(prios).sum()}")
-        print(f"  Zero count: {(prios == 0).sum()}")
-        print(f"  Negative count: {(prios < 0).sum()}")
-
-    def update_priorities(self, indices, td_errors):
-        """Update priorities with strict assertions - fails fast on any issues"""
-        assert td_errors is not None and len(td_errors) > 0, "update_priorities called with empty/None td_errors"
-        
-        # Convert to numpy and validate
-        td = td_errors.detach().abs().cpu().numpy().reshape(-1)
-        
-        # STRICT ASSERTION: TD errors must be finite and positive
-        assert not np.any(np.isnan(td)) and not np.any(np.isinf(td)), f"CRITICAL BUG: TD errors contain NaN/Inf! This indicates training instability."
-        assert not np.any(td < 0), f"CRITICAL BUG: TD errors are negative after abs()! Min value: {td.min()}"
-        
-        # DIAGNOSTIC: Log TD error distribution before clamping
-        # if len(self) > 1000 and np.random.random() < 0.01:  # 1% chance to log
-        #     print(f"TD errors before clamping: min={td.min():.4f}, max={td.max():.4f}, mean={td.mean():.4f}")
-        
-        # CRITICAL FIX: Clamp TD errors to prevent priority explosion feedback loop
-        # This breaks the cycle where large TD errors -> high priorities -> more sampling -> larger gradients -> larger TD errors
-        td = np.clip(td, 0.0, 5.0)  # Clamp TD errors to max 5.0 to prevent priority explosion
-        
-        # STRICT ASSERTION: TD errors should be reasonable (not exploded)
-        max_td = td.max()
-        assert max_td <= 5.0, f"CRITICAL BUG: TD error still too large after clamping! Max TD error = {max_td:.6f}."
-        
-        # Validate indices and update under lock against concurrent push/sample
-        with self._lock:
-            size = self.capacity if self.full else self.pos
-            indices = np.asarray(indices)
-            assert len(indices) == len(td), f"Mismatched lengths: {len(indices)} indices vs {len(td)} TD errors"
-            assert not np.any(indices < 0) and not np.any(indices >= size), f"Invalid indices: range [{indices.min()}, {indices.max()}] for buffer size {size}"
-            # Update priorities (add epsilon for stability)
-            new_priorities = td + self.eps
-            self.priorities[indices, 0] = new_priorities
-            # Update running max priority
-            try:
-                self._max_priority = float(max(self._max_priority, float(new_priorities.max())))
-            except Exception:
-                pass
-
-        # DIAGNOSTIC: Track priority updates
-        # if len(self) > 1000 and np.random.random() < 0.01:  # 1% chance to log
-        #     print(f"Priority update: old_max={old_priorities.max():.4f}, new_max={new_priorities.max():.4f}")
-        
-        # Update running average
-        self.avg_priority = float(new_priorities.mean())
-
-class DQNAgent:
-    """DQN Agent with experience replay and target network"""
-    def __init__(self, state_size, action_size, learning_rate=RL_CONFIG.lr, gamma=RL_CONFIG.gamma, 
-                 epsilon=RL_CONFIG.epsilon, epsilon_min=RL_CONFIG.epsilon_min, 
-                 memory_size=RL_CONFIG.memory_size, batch_size=RL_CONFIG.batch_size):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.last_save_time = 0.0 # Initialize last save time
-        
-        # Q-Networks on separate devices for optimal performance (standard DQN only)
-        self.qnetwork_local = QNetwork(
-            state_size, action_size,
-            hidden_size=getattr(RL_CONFIG, 'hidden_size', 512),
-            num_layers=getattr(RL_CONFIG, 'num_layers', 3),
-            use_dueling=getattr(RL_CONFIG, 'use_dueling', False),
-            use_noisy=getattr(RL_CONFIG, 'use_noisy_nets', False)
-        ).to(training_device)
-        self.qnetwork_target = QNetwork(
-            state_size, action_size,
-            hidden_size=getattr(RL_CONFIG, 'hidden_size', 512),
-            num_layers=getattr(RL_CONFIG, 'num_layers', 3),
-            use_dueling=getattr(RL_CONFIG, 'use_dueling', False),
-            use_noisy=getattr(RL_CONFIG, 'use_noisy_nets', False)
-        ).to(training_device)
-        
-        # Create inference copy on inference device for low-latency serving
-        if inference_device != training_device:
-            print(f"Creating dedicated inference network on {inference_device} for low-latency serving")
-            self.qnetwork_inference = QNetwork(
-                state_size, action_size,
-                hidden_size=getattr(RL_CONFIG, 'hidden_size', 512),
-                num_layers=getattr(RL_CONFIG, 'num_layers', 3),
-                use_dueling=getattr(RL_CONFIG, 'use_dueling', False),
-                use_noisy=getattr(RL_CONFIG, 'use_noisy_nets', False)
-            ).to(inference_device)
-        else:
-            # Same device - use training network for inference
-            self.qnetwork_inference = self.qnetwork_local
-        
-        # torch.compile removed from forward pass - causes CUDA graph issues with multi-threaded clients
-        print("Using standard (uncompiled) neural networks for stability.")
-        
-        # Store device references
-        self.inference_device = inference_device
-        self.training_device = training_device
-
-        # Optional small weight decay for regularization
-        wd = float(getattr(RL_CONFIG, 'adam_weight_decay', 0.0))
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate, weight_decay=wd)
-        # Optional LR scheduler
-        self.scheduler = None
-        if getattr(RL_CONFIG, 'use_lr_scheduler', False):
-            step_size = getattr(RL_CONFIG, 'scheduler_step_size', 100000)
-            gamma = getattr(RL_CONFIG, 'scheduler_gamma', 0.5)
-            self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
-        
-        # N-step learning buffer
-        self.n_step = getattr(RL_CONFIG, 'n_step', 1)
-        if self.n_step > 1:
-            self.n_step_buffer = NStepReplayBuffer(n_step=self.n_step, gamma=RL_CONFIG.gamma)
-        else:
-            self.n_step_buffer = None
-
-        # Replay memory (optionally prioritized)
-        if getattr(RL_CONFIG, 'use_per', False):
-            print("Using Prioritized Experience Replay (PER)")
-            self.memory = PrioritizedReplayMemory(memory_size, alpha=getattr(RL_CONFIG, 'per_alpha', 0.6), eps=getattr(RL_CONFIG, 'per_eps', 1e-6))
-        else:
-            print("Using standard Replay Memory")
-            self.memory = SimpleReplayBuffer(memory_size)
-
-        # Initialize target network with same weights as local network (force hard copy)
-        self.force_hard_target_update()
-
-        # Training queue for background thread - much larger to prevent throttling
-        self.train_queue = queue.Queue(maxsize=50000)  # Increased from 20000 to 50000
-        self.training_thread = None
-        self.running = True
-        # Multi-threaded training with gradient synchronization
-        self.num_training_workers = getattr(RL_CONFIG, 'training_workers', 1)  # Configurable worker count
-        self.training_threads = []
-        self._train_step_counter = 0
-        self._gradient_accumulation_counter = 0  # Track gradient accumulation steps
-        self.training_lock = threading.Lock()  # Lock for optimizer updates only
-        self.gradient_lock = threading.Lock()  # Separate lock for gradient accumulation
-        
-        # Mixed precision training setup
-        self.use_mixed_precision = getattr(RL_CONFIG, 'use_mixed_precision', False)
-        if self.use_mixed_precision and torch.cuda.is_available():
-            self.scaler = GradScaler()
-            print("Mixed precision training enabled")
-        else:
-            self.scaler = None
-        
-        # torch.compile for training computation - safe in single-threaded training context
-        self._compiled_loss_computation = None
-        if (torch.cuda.is_available() and hasattr(torch, 'compile') and 
-            getattr(RL_CONFIG, 'use_torch_compile', False)):
-            try:
-                print("Attempting to compile loss computation for training acceleration...")
-                self._compiled_loss_computation = torch.compile(
-                    self._compute_dqn_loss,
-                    mode='default',  # Conservative compilation mode to avoid memory issues
-                    fullgraph=False  # Allow graph breaks for compatibility
-                )
-                print("Loss computation compilation successful")
-            except Exception as e:
-                print(f"Loss computation compilation failed: {e}")
-                self._compiled_loss_computation = None
-        
-        # CRITICAL FIX: Initialize training enabled flag to ensure training happens
-        self.training_enabled = True
-
-        # Memory optimizations for dual GPU training
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # Clear any existing cache
-            torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
-            torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
-            # Additional GPU optimizations for dual GPU setup
-            torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster matmul on Ampere+
-            torch.backends.cudnn.allow_tf32 = True        # Enable TF32 for cuDNN
-            # Moderate GPU memory allocation for dual GPU stability
-            torch.cuda.set_per_process_memory_fraction(0.7)  # Use up to 70% of GPU memory per GPU
-
-        # Start multiple background threads for parallel training
-        for i in range(self.num_training_workers):
-            worker_thread = threading.Thread(target=self.background_train, daemon=True, name=f"TrainingWorker-{i}")
-            worker_thread.start()
-            self.training_threads.append(worker_thread)
-        print(f"Started {self.num_training_workers} training worker threads")
-
-        # Start inference sync heartbeat to ensure regular syncing at least every N seconds
-        self._sync_interval_seconds = float(getattr(RL_CONFIG, 'inference_sync_interval_sec', 10.0))
-        self._sync_thread = threading.Thread(target=self._inference_sync_heartbeat, daemon=True, name="InferenceSyncHeartbeat")
-        self._sync_thread.start()
-        
-    def background_train(self):
-        """High-throughput training loop on dedicated GPU for maximum utilization"""
-        worker_id = threading.current_thread().name
-        print(f"Training thread {worker_id} started on {self.training_device}")
-        
-        while self.running: 
-            try:
-                # Get training request (blocking)
-                _ = self.train_queue.get()
-                
-                # Process multiple training steps per request for maximum GPU utilization
-                steps_per_batch = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
-                for _ in range(steps_per_batch):
-                    if len(self.memory) >= RL_CONFIG.batch_size:
-                        self._train_step_counter += 1
-                        self.train_step()
-                        
-                        # Sync inference network every 1000 training steps for responsiveness
-                        if self._train_step_counter % 1000 == 0:
-                            self.sync_inference_network()
-                    else:
-                        break
-                        
-                self.train_queue.task_done()
-
-            except AssertionError:
-                # CRITICAL: Re-raise AssertionErrors to stop execution immediately
-                raise
-            except Exception as e:
-                print(f"Training error in {worker_id}: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(0.01)
-    
-    def _compute_dqn_loss(self, states, actions, rewards, next_states, dones, is_weights=None):
-        """
-        Compiled core DQN loss computation - separate method for torch.compile optimization.
-        This method handles the most computationally intensive parts of training.
-        """
-        # Standard DQN loss with Double DQN to reduce overestimation bias
-        Q_expected = self.qnetwork_local(states).gather(1, actions)
-        
-        with torch.no_grad():
-            # Double DQN: Use local network to select actions, target network to evaluate them
-            next_state_q_all = self.qnetwork_local(next_states)  # Local net selects actions
-            best_actions = next_state_q_all.argmax(1, keepdim=True)
-            Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)  # Target net evaluates
-            # If using n-step returns, rewards already contain n-step discounted sum.
-            # Therefore the bootstrap term must be discounted by gamma^n.
-            if hasattr(self, 'n_step') and isinstance(self.n_step, int) and self.n_step > 1:
-                gamma_boot = (RL_CONFIG.gamma ** self.n_step)
-            else:
-                gamma_boot = RL_CONFIG.gamma
-            Q_targets = rewards + (gamma_boot * Q_targets_next * (1 - dones))
-        
-        # Optionally clamp targets to prevent runaway bootstrap
-        if bool(getattr(RL_CONFIG, 'clamp_targets', True)):
-            clamp_v = float(getattr(RL_CONFIG, 'target_clamp_value', 10.0))
-            Q_targets = Q_targets.clamp(min=-clamp_v, max=clamp_v)
-
-        # Compute TD errors AFTER any clamping so PER priorities reflect effective loss
-        td_errors = (Q_expected - Q_targets).abs()
-
-        # Compute loss (with or without importance sampling weights)
-        # Choose loss function based on configuration
-        loss_type = getattr(RL_CONFIG, 'loss_type', 'huber')  # Default to huber for backward compatibility
-        
-        if is_weights is not None:
-            if loss_type == 'mse':
-                mse_loss = F.mse_loss(Q_expected, Q_targets, reduction='none')
-                loss = (is_weights * mse_loss).mean()
-            else:  # huber/smooth_l1
-                huber = F.smooth_l1_loss(Q_expected, Q_targets, reduction='none')
-                loss = (is_weights * huber).mean()
-        else:
-            if loss_type == 'mse':
-                loss = F.mse_loss(Q_expected, Q_targets, reduction='mean')
-            else:  # huber/smooth_l1
-                loss = F.smooth_l1_loss(Q_expected, Q_targets, reduction='mean')
-        
-        return loss, td_errors, Q_expected, Q_targets
-
-    def train_step(self):
-        """Perform a single training step - optimized for single thread maximum throughput"""
-        buffer_size = len(self.memory)
-        
-        # Post-load burn-in: ensure we have accrued enough fresh frames since last load
-        try:
-            loaded_fc = int(getattr(metrics, 'loaded_frame_count', 0) or 0)
-            require_new = int(getattr(RL_CONFIG, 'min_new_frames_after_load_to_train', 0) or 0)
-            if loaded_fc > 0 and (metrics.frame_count - loaded_fc) < require_new:
-                return
-        except Exception:
-            pass
-        
-        # CRITICAL FIX #6: Enhanced cold start protection for PER
-        min_buffer_size = RL_CONFIG.batch_size
-        if hasattr(RL_CONFIG, 'use_per') and RL_CONFIG.use_per:
-            # PER needs extra buffer to handle priority sampling effectively
-            # Reasonable requirement for dual GPU setup
-            min_buffer_size = max(RL_CONFIG.batch_size * 2, 12288)  # Reduced requirements for faster training start
-            
-        if buffer_size < min_buffer_size:
-            return
-            
-        try:
-            import time
-            step_start = time.time()
-            
-            # Thread-safe gradient accumulation and counter management
-            with self.gradient_lock:
-                # Update training metrics (thread-safe)
-                metrics.total_training_steps += 1
-                # Count steps for Steps/s interval metric
-                try:
-                    metrics.training_steps_interval += 1
-                except Exception:
-                    pass
-                metrics.memory_buffer_size = buffer_size
-                
-                # Update gradient accumulation counter
-                self._gradient_accumulation_counter += 1
-                current_accumulation_step = self._gradient_accumulation_counter
-                
-                # Check if we need to zero gradients (start of new accumulation cycle)
-                accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
-                should_zero_gradients = (current_accumulation_step - 1) % accumulation_steps == 0
-                should_step_optimizer = current_accumulation_step % accumulation_steps == 0
-            
-            # Zero gradients outside lock (but coordinate via flag)
-            if should_zero_gradients:
-                self.optimizer.zero_grad()
-                
-            # If using NoisyNets, sample noise once per train step for consistency
-            if getattr(RL_CONFIG, 'use_noisy_nets', False):
-                if hasattr(self.qnetwork_local, 'reset_noise'):
-                    self.qnetwork_local.reset_noise()
-                if hasattr(self.qnetwork_target, 'reset_noise'):
-                    self.qnetwork_target.reset_noise()
-            
-            sampling_start = time.time()
-            use_per = getattr(RL_CONFIG, 'use_per', False)
-            if use_per:
-                # Anneal beta towards 1.0
-                frame = metrics.frame_count
-                beta_start = getattr(RL_CONFIG, 'per_beta_start', 0.4)
-                beta_frames = max(1, getattr(RL_CONFIG, 'per_beta_frames', 200000))
-                beta = min(1.0, beta_start + (1.0 - beta_start) * (frame / beta_frames))
-                
-                # DEBUG: Log beta calculation
-                # if metrics.total_training_steps % 1000 == 0:
-                #     print(f"PER Beta: {beta:.4f} (frame {frame}, beta_frames {beta_frames})")
-                
-                states, actions, rewards, next_states, dones, is_weights, indices = self.memory.sample(RL_CONFIG.batch_size, beta=beta)
-            else:
-                states, actions, rewards, next_states, dones = self.memory.sample(RL_CONFIG.batch_size)
-            sampling_time = time.time() - sampling_start
-            
-            forward_start = time.time()
-            # Standard DQN loss computation - use compiled version if available
-            if self._compiled_loss_computation is not None:
-                # Use compiled loss computation for performance
-                is_weights_tensor = is_weights if use_per else None
-                loss, td_errors, Q_expected, Q_targets = self._compiled_loss_computation(
-                    states, actions, rewards, next_states, dones, is_weights_tensor)
-            else:
-                # Fallback to original computation if compilation failed
-                loss, td_errors, Q_expected, Q_targets = self._compute_dqn_loss(
-                    states, actions, rewards, next_states, dones, 
-                    is_weights if use_per else None)
-            
-            # DIAGNOSTIC: Track Q-value statistics (extracted from compiled computation)
-            q_exp_max = Q_expected.max().item()
-            q_exp_min = Q_expected.min().item()
-            q_exp_mean = Q_expected.mean().item()
-            q_exp_std = Q_expected.std().item()
-            
-            # STRICT ASSERTION: Q_expected should be reasonable (not exploded)
-            assert abs(q_exp_max) < 30.0 and abs(q_exp_min) < 30.0, f"CRITICAL BUG: Q_expected explosion! Q_expected range: [{q_exp_min:.3f}, {q_exp_max:.3f}]. Neural network is broken - restart with fresh model."
-            
-            # Additional diagnostic checks for targets and rewards
-            q_tgt_max = Q_targets.max().item()
-            q_tgt_min = Q_targets.min().item()
-            q_tgt_mean = Q_targets.mean().item()
-            
-            reward_max = rewards.max().item()
-            reward_min = rewards.min().item()
-            assert abs(reward_max) < 50.0 and abs(reward_min) < 50.0, f"CRITICAL BUG: Reward corruption! Reward range: [{reward_min:.3f}, {reward_max:.3f}]"
-
-            if use_per:
-                # DIAGNOSTIC: Track TD error distribution before explosion check
-                td_max = td_errors.max().item()
-                td_min = td_errors.min().item()
-                td_mean = td_errors.mean().item()
-                td_std = td_errors.std().item()
-                
-                # DIAGNOSTIC: Track priority distribution health
-                if hasattr(self.memory, 'priorities'):
-                    current_priorities = self.memory.priorities[:len(self.memory), 0]
-                    prio_max = current_priorities.max()
-                    prio_mean = current_priorities.mean()
-                    high_prio_count = np.sum(current_priorities > td_mean * 3)  # Count priorities > 3x mean TD error
-                
-                # STRICT ASSERTION: TD errors should be reasonable (catch Q-value explosion)
-                max_td_error = td_errors.max().item()
-                if max_td_error >= 25.0:
-                    print(f"\n!!! CRITICAL BUG DETECTED !!!")
-                    print(f"TD error explosion! Max TD error = {max_td_error:.6f}")
-                    print(f"Q_expected: [{q_exp_min:.3f}, {q_exp_max:.3f}], mean={q_exp_mean:.3f}")
-                    print(f"Q_targets: [{q_tgt_min:.3f}, {q_tgt_max:.3f}], mean={q_tgt_mean:.3f}")
-                    print(f"Rewards: [{rewards.min().item():.3f}, {rewards.max().item():.3f}]")
-                    print(f"This indicates Q-value explosion - neural network is broken.")
-                    print(f"FORCING APPLICATION SHUTDOWN...")
-                    import os
-                    os._exit(1)  # Force immediate process termination
-                
-                # DEBUG: Check for zero loss issues
-                if loss.item() < 1e-8:
-                    print(f"PER ZERO LOSS DEBUG:")
-                    print(f"  Q_expected range: [{Q_expected.min():.4f}, {Q_expected.max():.4f}]")
-                    print(f"  Q_targets range: [{Q_targets.min():.4f}, {Q_targets.max():.4f}]")  
-                    print(f"  TD errors range: [{td_errors.min():.4f}, {td_errors.max():.4f}]")
-                    print(f"  IS weights range: [{is_weights.min():.4f}, {is_weights.max():.4f}]")
-                    print(f"  Final loss: {loss.item():.8f}")
-            forward_time = time.time() - forward_start
-
-            # Calculate loss scaling for gradient accumulation
-            accumulation_steps = getattr(RL_CONFIG, 'gradient_accumulation_steps', 1)
-            loss = loss / accumulation_steps  # Scale loss for accumulation
-            
-            # Backward pass with mixed precision support (can be done in parallel)
-            backward_start = time.time()
-            if self.use_mixed_precision and self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            backward_time = time.time() - backward_start
-            
-            # Thread-safe optimizer stepping - CRITICAL SECTION
-            if should_step_optimizer:
-                with self.training_lock:  # Serialize optimizer updates across all threads
-                    optimizer_start = time.time()
-                    
-                    # Unscale (if AMP) so logged norms are meaningful, then measure/clip
-                    preclip_grad_norm = None
-                    postclip_grad_norm = None
-
-                    if self.use_mixed_precision and self.scaler is not None:
-                        # Unscale the gradients to real values before measuring/clipping
-                        self.scaler.unscale_(self.optimizer)
-
-                        # Measure pre-clip L2 grad norm
-                        sq_sum = 0.0
-                        for p in self.qnetwork_local.parameters():
-                            if p.grad is not None:
-                                sq_sum += p.grad.data.norm(2).item() ** 2
-                        preclip_grad_norm = sq_sum ** 0.5
-
-                        # Clip and then measure post-clip norm
-                        max_norm = float(getattr(RL_CONFIG, 'max_grad_norm', 5.0))
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
-                        # clipped_grad_norm is already the total norm after clipping, but compute explicitly for clarity
-                        sq_sum = 0.0
-                        for p in self.qnetwork_local.parameters():
-                            if p.grad is not None:
-                                sq_sum += p.grad.data.norm(2).item() ** 2
-                        postclip_grad_norm = sq_sum ** 0.5
-
-                        # Optimizer step/update
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        # Measure pre-clip L2 grad norm (fp32 path)
-                        sq_sum = 0.0
-                        for p in self.qnetwork_local.parameters():
-                            if p.grad is not None:
-                                sq_sum += p.grad.data.norm(2).item() ** 2
-                        preclip_grad_norm = sq_sum ** 0.5
-
-                        # Clip and step
-                        max_norm = float(getattr(RL_CONFIG, 'max_grad_norm', 5.0))
-                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
-                        # Measure post-clip
-                        sq_sum = 0.0
-                        for p in self.qnetwork_local.parameters():
-                            if p.grad is not None:
-                                sq_sum += p.grad.data.norm(2).item() ** 2
-                        postclip_grad_norm = sq_sum ** 0.5
-
-                        self.optimizer.step()
-
-                    # Update gradient clipping delta metric (post / pre); avoid divide-by-zero
-                    try:
-                        if preclip_grad_norm is not None and preclip_grad_norm > 0:
-                            metrics.grad_clip_delta = float(postclip_grad_norm / max(preclip_grad_norm, 1e-12))
-                            metrics.grad_norm = float(preclip_grad_norm)  # Store pre-clip magnitude
-                        else:
-                            metrics.grad_clip_delta = 1.0
-                            metrics.grad_norm = 0.0
-                    except Exception:
-                        pass
-                    optimizer_time = time.time() - optimizer_start
-            else:
-                optimizer_time = 0
-        
-            # Always update loss metrics (use unscaled loss for reporting)
-            _loss_item = (loss * accumulation_steps).item()
-            metrics.losses.append(_loss_item)
-            # Track loss since last display row
-            try:
-                metrics.loss_sum_interval += float(_loss_item)
-                metrics.loss_count_interval += 1
-            except Exception:
-                pass
-
-            # PER: update priorities and track average
-            if use_per:
-                with torch.no_grad():
-                    self.memory.update_priorities(indices, td_errors)
-                metrics.average_priority = self.memory.avg_priority
-                
-                # DEBUG: Validate priorities periodically
-                # if metrics.total_training_steps % 1000 == 0:
-                #     self.memory.validate_priorities()            # Only update target network and scheduler on actual optimizer steps
-            if should_step_optimizer:
-                # Unified target update management (soft + hard)
-                self._manage_target_updates()
-
-                # Step LR scheduler if enabled
-                if self.scheduler is not None:
-                    self.scheduler.step()
-            
-            total_time = time.time() - step_start
-            
-            # Print timing every 100 steps for debugging
-            #if metrics.total_training_steps % 100 == 0:
-            #    print(f"Training step timing - Total: {total_time*1000:.1f}ms, "
-            #          f"  {sampling_time*1000:.1f}ms, Forward: {forward_time*1000:.1f}ms, "
-            #            gradient_accumulation_steps: int = 8  # Double current          f"Backward: {backward_time*1000:.1f}ms, Optimizer: {optimizer_time*1000:.1f}ms")
-                    
-        except AssertionError:
-            # CRITICAL: Re-raise AssertionErrors to stop execution immediately
-            raise
-        except Exception as e:
-            print(f"Training error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def update_target_network(self):
-        """Update target network with weights from local network"""
-        # Track when target network was last updated (any kind of update)
-        metrics.last_target_update_frame = metrics.frame_count
-        metrics.last_target_update_time = time.time()
-
-        if getattr(RL_CONFIG, 'use_soft_target', False):
-            # Soft update only (do not mark as hard)
-            tau = getattr(RL_CONFIG, 'tau', 0.005)
-            self.soft_update(tau)
-        else:
-            # Hard copy path
-            self._hard_copy_target_from_local()
-            # Mark this as a FULL (hard) update for telemetry
-            metrics.last_hard_target_update_frame = metrics.frame_count
-            metrics.last_hard_target_update_time = time.time()
-
-    def _manage_target_updates(self):
-        """Centralized policy for soft updates and scheduled hard refreshes."""
-        # Soft update each optimizer step if enabled
-        if getattr(RL_CONFIG, 'use_soft_target', False):
-            tau = getattr(RL_CONFIG, 'tau', 0.005)
-            self.soft_update(tau)
-            # Record that a target update happened (soft)
-            metrics.last_target_update_frame = metrics.frame_count
-            metrics.last_target_update_time = time.time()
-
-            # Warmup hard refresh cadence (to anchor target early on)
-            steps = metrics.total_training_steps
-            warm_until = int(getattr(RL_CONFIG, 'warmup_hard_refresh_until_steps', 0))
-            warm_every = max(1, int(getattr(RL_CONFIG, 'warmup_hard_refresh_every_steps', 0)))
-            if warm_until > 0 and steps < warm_until and steps % warm_every == 0:
-                self.force_hard_target_update()
-
-            # Periodic hard refresh (longer cadence) after warmup
-            refresh_steps = int(getattr(RL_CONFIG, 'hard_target_refresh_every_steps', 0))
-            if refresh_steps > 0 and steps % refresh_steps == 0:
-                self.force_hard_target_update()
-
-            # Watchdog: if too long since last hard update, force one (time-based)
-            watchdog_sec = float(getattr(RL_CONFIG, 'hard_update_watchdog_seconds', 0.0))
-            if watchdog_sec > 0.0:
-                last_t = getattr(metrics, 'last_hard_target_update_time', 0.0)
-                now = time.time()
-                if last_t <= 0.0 or (now - last_t) >= watchdog_sec:
-                    self.force_hard_target_update()
-        else:
-            # No soft targets: do standard periodic hard updates by steps
-            target_freq = getattr(RL_CONFIG, 'target_update_freq', 200)
-            if target_freq > 0 and metrics.total_training_steps % target_freq == 0:
-                self.update_target_network()
-
-    def force_hard_target_update(self):
-        """Force a full hard copy of local -> target, regardless of soft-target setting."""
-        # Track any target update
-        metrics.last_target_update_frame = metrics.frame_count
-        metrics.last_target_update_time = time.time()
-        # Perform actual hard copy
-        self._hard_copy_target_from_local()
-        # Telemetry for hard update
-        metrics.last_hard_target_update_frame = metrics.frame_count
-        metrics.last_hard_target_update_time = time.time()
-
-    def _hard_copy_target_from_local(self):
-        """Helper to copy local network weights to target network across devices."""
-        # Handle cross-device state dict copying
-        local_state_dict = self.qnetwork_local.state_dict()
-        local_device = next(self.qnetwork_local.parameters()).device
-        target_device = next(self.qnetwork_target.parameters()).device
-        if target_device != local_device:
-            # Move state dict to target device
-            target_state_dict = {}
-            for key, param in local_state_dict.items():
-                target_state_dict[key] = param.to(target_device)
-            self.qnetwork_target.load_state_dict(target_state_dict)
-        else:
-            # Same device - direct load
-            self.qnetwork_target.load_state_dict(local_state_dict)
-
-    def soft_update(self, tau: float = 0.005):
-        """Soft-update target network parameters: θ_target = τ*θ_local + (1-τ)*θ_target"""
-        with torch.no_grad():
-            for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
-                # Handle cross-device parameter updates
-                if target_param.device != local_param.device:
-                    # Move local parameter to target device for computation
-                    local_data = local_param.data.to(target_param.device)
-                    target_param.data.copy_(tau * local_data + (1.0 - tau) * target_param.data)
-                else:
-                    # Same device - direct update
-                    target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
-
-    def sync_inference_network(self):
-        """Synchronize inference network with training updates"""
-        did_copy = False
-        if hasattr(self, 'qnetwork_inference'):
-            if self.qnetwork_inference != self.qnetwork_local:
-                # Copy weights from training network to inference network across devices
-                with torch.no_grad():
-                    inference_state_dict = {}
-                    for key, param in self.qnetwork_local.state_dict().items():
-                        inference_state_dict[key] = param.to(self.inference_device)
-                    self.qnetwork_inference.load_state_dict(inference_state_dict)
-                did_copy = True
-        # Track sync timing for metrics even if copy is a no-op (single-GPU case)
-        metrics.last_inference_sync_frame = metrics.frame_count
-        metrics.last_inference_sync_time = time.time()
-        return did_copy
-
-    def _inference_sync_heartbeat(self):
-        """Background thread to ensure inference network syncing at least every N seconds."""
-        while self.running:
-            try:
-                now = time.time()
-                last = getattr(metrics, 'last_inference_sync_time', 0.0)
-                if last <= 0.0 or (now - last) >= self._sync_interval_seconds:
-                    self.sync_inference_network()
-                time.sleep(1.0)
-            except Exception:
-                # Be resilient to transient errors
-                time.sleep(1.0)
-    
-    def get_q_value_range(self):
-        """Get current Q-value range from the network for monitoring.
-
-        Prefer a representative batch of replay states (if buffer is sufficiently warm)
-        to avoid misleading readings from an all-zero dummy state. Falls back to the
-        dummy probe early in runs or if sampling fails.
-        """
-        try:
-            with torch.no_grad():
-                self.qnetwork_inference.eval()
-
-                min_q = max_q = None
-
-                # Try to sample a batch of real states from replay (lightweight, read-only)
-                try:
-                    buf_len = len(self.memory)
-                except Exception:
-                    buf_len = 0
-
-                # Probe size: modest to keep this cheap in the metrics loop
-                probe_bs = 512
-                # Require a minimum warm buffer to ensure sample() succeeds
-                min_required = max(128, min(probe_bs, getattr(RL_CONFIG, 'batch_size', 64)))
-
-                if buf_len >= min_required:
-                    try:
-                        sample = self.memory.sample(min(probe_bs, buf_len))
-                        # Unpack states depending on buffer type
-                        # PER: (states, actions, rewards, next_states, dones, is_weights, indices)
-                        # Simple: (states, actions, rewards, next_states, dones)
-                        states = sample[0] if sample is not None else None
-                        if states is not None and isinstance(states, torch.Tensor):
-                            states = states.to(self.inference_device, non_blocking=True)
-                            q_vals = self.qnetwork_inference(states)
-                            min_q = q_vals.min().item()
-                            max_q = q_vals.max().item()
-                    except Exception:
-                        # Fall back to dummy state probe
-                        states = None
-
-                if min_q is None or max_q is None:
-                    # Fallback: probe with an all-zero dummy state (legacy behavior)
-                    dummy_state = torch.zeros(1, self.state_size, device=self.inference_device)
-                    q_vals = self.qnetwork_inference(dummy_state)
-                    min_q = q_vals.min().item()
-                    max_q = q_vals.max().item()
-
-                self.qnetwork_inference.train()
-                return float(min_q), float(max_q)
-        except Exception:
-            return float('nan'), float('nan')
-
-    def act(self, state, epsilon=0.0):
-        """Select action using epsilon-greedy policy - optimized for low-latency inference"""
-        # Convert state to tensor on inference device
-        state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
-        
-        # Set evaluation mode
-        self.qnetwork_inference.eval()
-        
-        with torch.no_grad():
-            action_values = self.qnetwork_inference(state)
-            
-        # Set training mode back
-        self.qnetwork_inference.train()
-        
-        # Epsilon-greedy action selection (legacy zap-downscaling removed in pure hybrid)
-        if random.random() < epsilon:
-            return random.randrange(self.action_size)
-        else:
-            selected_action = action_values.cpu().data.numpy().argmax()
-            return selected_action
-            
-    def step(self, state, action, reward, next_state, done):
-        """Add experience to memory and queue for training"""
-        if self.n_step_buffer:
-            matured = self.n_step_buffer.add(state, action, reward, next_state, done)
-            for (s, a, r, ns, d) in matured:
-                self.memory.push(s, a, r, ns, d)
-        else:
-            self.memory.push(state, action, reward, next_state, done)
-        
-        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
-        for _ in range(training_multiplier):
-            try:
-                self.train_queue.put_nowait(True)
-            except queue.Full:
-                break
-
-    def save(self, filename):
-        """Save model weights, rate-limited unless forced."""
-        is_forced_save = "exit" in filename or "shutdown" in filename
-        current_time = time.time()
-        save_interval = 30.0  # Minimum seconds between saves
-        # Rate limit non-forced saves
-        if not is_forced_save:
-            if current_time - self.last_save_time < save_interval:
-                return  # Skip save
-        
-        # Proceed with save if forced or interval elapsed
-        try:
-            # Determine the actual expert ratio to save (not the override value)
-            if metrics.expert_mode or metrics.override_expert:
-                ratio_to_save = metrics.saved_expert_ratio
-            else:
-                ratio_to_save = metrics.expert_ratio
-
-            payload = {
-                'policy_state_dict': self.qnetwork_local.state_dict(),
-                'target_state_dict': self.qnetwork_target.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'memory_size': len(self.memory),
-                'epsilon': metrics.epsilon,
-                'frame_count': metrics.frame_count,
-                'expert_ratio': ratio_to_save, # Save the determined ratio
-                'last_decay_step': metrics.last_decay_step,
-                'last_epsilon_decay_step': metrics.last_epsilon_decay_step,
-                # Persist recent reward histories (last N values)
-                'episode_rewards': list(metrics.episode_rewards) if hasattr(metrics, 'episode_rewards') else [],
-                'dqn_rewards': list(metrics.dqn_rewards) if hasattr(metrics, 'dqn_rewards') else [],
-                'expert_rewards': list(metrics.expert_rewards) if hasattr(metrics, 'expert_rewards') else []
-            }
-            # Save scheduler state if present
-            if self.scheduler is not None:
-                payload['scheduler_state_dict'] = self.scheduler.state_dict()
-            torch.save(payload, filename)
-            
-            # Update last save time ONLY on successful save
-            self.last_save_time = current_time
-            
-            # Only print on forced exit/shutdown saves
-            if is_forced_save:
-                print(f"Model saved to {filename} (frame {metrics.frame_count}, expert ratio {ratio_to_save:.2f})")
-        except Exception as e:
-            print(f"ERROR saving model to {filename}: {e}")
-
-    def load(self, filename):
-        """Load model weights"""
-        from config import FORCE_FRESH_MODEL
-        
-        if FORCE_FRESH_MODEL:
-            print(f"FORCE_FRESH_MODEL is True - skipping model loading and starting with fresh weights")
-            return
-            
-        if os.path.exists(filename):
-            try:
-                print(f"Loading model checkpoint from {filename}")
-                checkpoint = torch.load(filename, map_location=training_device)
-                policy_sd = checkpoint['policy_state_dict']
-                target_sd = checkpoint['target_state_dict']
-
-                def _try_load(model: nn.Module, sd: dict) -> bool:
-                    try:
-                        model.load_state_dict(sd)
-                        return True
-                    except Exception:
-                        return False
-
-                ok_local = _try_load(self.qnetwork_local, policy_sd)
-                ok_target = _try_load(self.qnetwork_target, target_sd)
-
-                used_compat = False
-                if not (ok_local and ok_target):
-                    # Compatibility path: map Linear <-> NoisyLinear differences
-                    def _compat_remap(model: nn.Module, sd: dict) -> dict:
-                        model_sd = model.state_dict()
-                        new_sd = {}
-                        for k in model_sd.keys():
-                            if k in sd:
-                                new_sd[k] = sd[k]
-                                continue
-                            # Noisy expecting mu from Linear
-                            if k.endswith('weight_mu'):
-                                base = k[:-3]  # strip '_mu' -> 'weight'
-                                if base in sd:
-                                    new_sd[k] = sd[base]
-                                    continue
-                            if k.endswith('bias_mu'):
-                                base = k[:-3]  # strip '_mu' -> 'bias'
-                                if base in sd:
-                                    new_sd[k] = sd[base]
-                                    continue
-                            # Linear expecting weight/bias from Noisy mu
-                            if k.endswith('weight') and (k + '_mu') in sd:
-                                new_sd[k] = sd[k + '_mu']
-                                continue
-                            if k.endswith('bias') and (k + '_mu') in sd:
-                                new_sd[k] = sd[k + '_mu']
-                                continue
-                            # Otherwise keep initialized tensor (for sigma/eps etc.)
-                            new_sd[k] = model_sd[k]
-                        return new_sd
-
-                    remapped_policy = _compat_remap(self.qnetwork_local, policy_sd)
-                    remapped_target = _compat_remap(self.qnetwork_target, target_sd)
-                    self.qnetwork_local.load_state_dict(remapped_policy, strict=False)
-                    self.qnetwork_target.load_state_dict(remapped_target, strict=False)
-                    used_compat = True
-
-                if used_compat:
-                    print("Checkpoint loaded with compatibility remap (Linear<->Noisy).")
-                else:
-                    print("Checkpoint loaded with strict key match.")
-
-                # Optimizer/Scheduler may fail to load if param shapes changed; guard it
-                try:
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    print("Optimizer state loaded.")
-                    
-                    # CRITICAL FIX: Override loaded learning rate with current config value
-                    # This ensures config changes actually take effect!
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = RL_CONFIG.lr
-                    print(f"Learning rate overridden to config value: {RL_CONFIG.lr}")
-                    
-                except Exception:
-                    print("Optimizer state not loaded (shape mismatch). Using freshly initialized optimizer.")
-                # Load scheduler state if present and configured
-                if 'scheduler_state_dict' in checkpoint and getattr(RL_CONFIG, 'use_lr_scheduler', False):
-                    if self.scheduler is None:
-                        step_size = getattr(RL_CONFIG, 'scheduler_step_size', 100000)
-                        gamma = getattr(RL_CONFIG, 'scheduler_gamma', 0.5)
-                        self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
-                    try:
-                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                        print("LR scheduler state loaded.")
-                    except Exception:
-                        print("LR scheduler state not loaded (mismatch). Using freshly initialized scheduler.")
-                
-                # Load training state (frame count, epsilon, expert ratio, decay step)
-                metrics.frame_count = checkpoint.get('frame_count', 0)
-                # Store loaded frame count snapshot for post-load burn-in gating
-                metrics.loaded_frame_count = int(metrics.frame_count)
-                
-                # CRITICAL FIX: Detect and fix Q-value explosion in loaded model
-                print("Checking loaded model for Q-value corruption...")
-                with torch.no_grad():
-                    # Test Q-values on a dummy state
-                    dummy_state = torch.zeros(1, self.state_size).to(device)
-                    test_q_values = self.qnetwork_local(dummy_state)
-                    max_q = test_q_values.max().item()
-                    min_q = test_q_values.min().item()
-                    
-                    print(f"Loaded model Q-value range: [{min_q:.3f}, {max_q:.3f}]")
-                    
-                    # If Q-values are corrupted (too large), rescale the network weights
-                    if abs(max_q) > 10.0 or abs(min_q) > 10.0:
-                        print(f"WARNING: Loaded model has corrupted Q-values! Rescaling network weights...")
-                        scale_factor = 5.0 / max(abs(max_q), abs(min_q))  # Scale to max ±5.0
-                        print(f"Applying scale factor: {scale_factor:.4f}")
-                        
-                        # Rescale all weights in both networks
-                        for param in self.qnetwork_local.parameters():
-                            param.data *= scale_factor
-                        for param in self.qnetwork_target.parameters():
-                            param.data *= scale_factor
-                            
-                        # Verify the fix
-                        test_q_values_fixed = self.qnetwork_local(dummy_state)
-                        max_q_fixed = test_q_values_fixed.max().item()
-                        min_q_fixed = test_q_values_fixed.min().item()
-                        print(f"Rescaled Q-value range: [{min_q_fixed:.3f}, {max_q_fixed:.3f}]")
-                    else:
-                        print("Model Q-values are in acceptable range.")
-                
-                # Load or reset metrics based on RESET_METRICS flag from config
-                if RESET_METRICS:
-                    print("RESET_METRICS flag is True. Resetting epsilon/expert_ratio.")
-                    metrics.epsilon = RL_CONFIG.epsilon_start
-                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
-                    metrics.last_decay_step = 0
-                    metrics.last_epsilon_decay_step = 0 # Reset epsilon step tracker
-                    # Clear recent reward histories on explicit reset
-                    try:
-                        if hasattr(metrics, 'episode_rewards'): metrics.episode_rewards.clear()
-                        if hasattr(metrics, 'dqn_rewards'): metrics.dqn_rewards.clear()
-                        if hasattr(metrics, 'expert_rewards'): metrics.expert_rewards.clear()
-                    except Exception:
-                        pass
-                else:
-                    # Load metrics from checkpoint
-                    metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
-                    metrics.expert_ratio = checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start)
-                    metrics.last_decay_step = checkpoint.get('last_decay_step', 0)
-                    metrics.last_epsilon_decay_step = checkpoint.get('last_epsilon_decay_step', 0) # Load epsilon step tracker
-                    # Restore recent reward histories if present (bounded by deque maxlen)
-                    try:
-                        if hasattr(metrics, 'episode_rewards'):
-                            metrics.episode_rewards.clear()
-                            for v in checkpoint.get('episode_rewards', [])[-metrics.episode_rewards.maxlen:]:
-                                metrics.episode_rewards.append(float(v))
-                        if hasattr(metrics, 'dqn_rewards'):
-                            metrics.dqn_rewards.clear()
-                            for v in checkpoint.get('dqn_rewards', [])[-metrics.dqn_rewards.maxlen:]:
-                                metrics.dqn_rewards.append(float(v))
-                        if hasattr(metrics, 'expert_rewards'):
-                            metrics.expert_rewards.clear()
-                            for v in checkpoint.get('expert_rewards', [])[-metrics.expert_rewards.maxlen:]:
-                                metrics.expert_rewards.append(float(v))
-                    except Exception:
-                        pass
-
-                # Respect server flags to reset at startup regardless of checkpoint values
-                if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):
-                    print(f"Resetting expert_ratio to start value per SERVER_CONFIG: {SERVER_CONFIG.expert_ratio_start}")
-                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
-                if getattr(SERVER_CONFIG, 'reset_epsilon', False):
-                    print(f"Resetting epsilon to start value per SERVER_CONFIG: {RL_CONFIG.epsilon_start}")
-                    metrics.epsilon = RL_CONFIG.epsilon_start
-                    metrics.last_epsilon_decay_step = 0
-                # One-time flag to force expert ratio recalculation based on current training progress
-                if getattr(SERVER_CONFIG, 'force_expert_ratio_recalc', False):
-                    print(f"Force recalculating expert_ratio based on {metrics.frame_count:,} frames...")
-                    decay_expert_ratio(metrics.frame_count)
-                    print(f"Expert ratio recalculated to: {metrics.expert_ratio:.4f}")
-                if getattr(SERVER_CONFIG, 'reset_frame_count', False):
-                    print("Resetting frame count/epsilon per SERVER_CONFIG.")
-                    metrics.frame_count = 0
-                    metrics.last_decay_step = 0
-                    metrics.last_epsilon_decay_step = 0
-                    metrics.epsilon = RL_CONFIG.epsilon_start
-                                
-                print(f"Loaded model from {filename}")
-                print(f"  - Resuming from frame: {metrics.frame_count}")
-                print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
-                print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
-                print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")
-
-                return True
-            except Exception as e:
-                print(f"Error loading model: {e}")
-                print("Starting with fresh model parameters.")
-                return False
-        else:
-            print(f"No checkpoint found at {filename}. Starting new model.")
-        return False
-
-# N-step learning: pre-processor that emits matured n-step experiences and flushes on terminal
-## NStepReplayBuffer is imported from Scripts.nstep_buffer
+## Hybrid-only path: legacy discrete-only DQNAgent removed
+## N-step learning handled upstream (server) or via dedicated buffer; hybrid agent expects 1-step or n-step rewards provided.
     
 class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""
@@ -1854,6 +688,14 @@ class HybridDQNAgent:
         
         # Initialize target network
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        # Establish persistent modes:
+        # - training (local) stays in train mode
+        # - target stays in eval mode
+        # - inference stays in eval mode if it's a dedicated copy
+        self.qnetwork_local.train()
+        self.qnetwork_target.eval()
+        if self.qnetwork_inference is not self.qnetwork_local:
+            self.qnetwork_inference.eval()
         
         # Store device references
         self.inference_device = inference_device
@@ -1898,10 +740,9 @@ class HybridDQNAgent:
         """
         state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         
-        self.qnetwork_inference.eval()
+        # Do not flip modes every call; rely on persistent .eval() for dedicated inference model
         with torch.no_grad():
             discrete_q, continuous_pred = self.qnetwork_inference(state)
-        self.qnetwork_inference.train()
         
         # Discrete action selection (epsilon-greedy)
         if random.random() < epsilon:
@@ -1926,12 +767,17 @@ class HybridDQNAgent:
         # Queue multiple training steps per experience
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
             return
-        training_multiplier = getattr(RL_CONFIG, 'training_steps_per_sample', 2)
-        for _ in range(training_multiplier):
-            try:
-                self.train_queue.put_nowait(True)
-            except queue.Full:
-                break
+        # Apply training_steps_per_sample ONLY in the background trainer to avoid double-counting here.
+        # Enqueue a single token per environment sample to minimize queue overhead.
+        try:
+            self.train_queue.put_nowait(True)
+        except queue.Full:
+            pass
+        # Optional telemetry
+        try:
+            metrics.training_queue_size = int(self.train_queue.qsize())
+        except Exception:
+            pass
 
     def background_train(self):
         """Background worker that drains the train_queue and performs train steps."""
@@ -1949,6 +795,11 @@ class HybridDQNAgent:
                     loss_val = self.train_step()
                     if loss_val is None:
                         loss_val = 0.0
+                # Optional telemetry after consuming a token
+                try:
+                    metrics.training_queue_size = int(self.train_queue.qsize())
+                except Exception:
+                    pass
                 self.train_queue.task_done()
             except AssertionError:
                 raise
@@ -1982,15 +833,41 @@ class HybridDQNAgent:
         states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
         
         # Current Q-values and predictions
-        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+        use_amp = bool(getattr(RL_CONFIG, 'use_mixed_precision', False))
+        scaler = None
+        if use_amp:
+            try:
+                from torch.cuda.amp import autocast, GradScaler
+                scaler = GradScaler(enabled=True)
+            except Exception:
+                use_amp = False
+        
+        def _forward_local(s):
+            return self.qnetwork_local(s)
+
+        def _forward_target(s):
+            return self.qnetwork_target(s)
+
+        if use_amp:
+            with autocast():
+                discrete_q_pred, continuous_pred = _forward_local(states)
+        else:
+            discrete_q_pred, continuous_pred = _forward_local(states)
         
         # Gather Q-values for taken discrete actions
         discrete_q_targets = discrete_q_pred.gather(1, discrete_actions)
         
         # Next state predictions for target computation
         with torch.no_grad():
-            discrete_q_next, continuous_next = self.qnetwork_target(next_states)
-            discrete_q_next_max = discrete_q_next.max(1)[0].detach().unsqueeze(1)
+            if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
+                # Action selection from local, evaluation with target
+                next_q_local, _ = self.qnetwork_local(next_states)
+                next_actions = next_q_local.argmax(dim=1, keepdim=True)
+                next_q_target, _ = self.qnetwork_target(next_states)
+                discrete_q_next_max = next_q_target.gather(1, next_actions)
+            else:
+                next_q_target, _ = self.qnetwork_target(next_states)
+                discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
             # If upstream provided n-step returns in rewards, discount bootstrap by gamma^n
             n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
             gamma_boot = (self.gamma ** n_step) if n_step > 1 else self.gamma
@@ -1998,20 +875,46 @@ class HybridDQNAgent:
             discrete_targets = rewards + (gamma_boot * discrete_q_next_max * (1 - dones))
             continuous_targets = continuous_actions  # Use actual actions as targets for regression
         
-        # Compute losses
-        discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
-        continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
+        # When using AMP, ensure target tensors match prediction dtypes to avoid Float/Half mismatches
+        if use_amp:
+            try:
+                discrete_targets = discrete_targets.to(discrete_q_targets.dtype)
+                continuous_targets = continuous_targets.to(continuous_pred.dtype)
+            except Exception:
+                pass
+
+        # Compute losses (under autocast when enabled for stability)
+        if use_amp:
+            with autocast():
+                discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
+                continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
+        else:
+            discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
+            continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
         
         # Combined loss with balanced weighting
-        total_loss = discrete_loss + 0.5 * continuous_loss  # Weight continuous loss lower
+        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
+        total_loss = discrete_loss + w_cont * continuous_loss  # Weight continuous loss lower
         
         # Optimize (thread-safe for multi-worker training)
         with self.training_lock:
             self.optimizer.zero_grad()
-            total_loss.backward()
+            if use_amp and scaler is not None:
+                from torch.cuda.amp import autocast, GradScaler
+                scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
 
         # Measure gradient norms and optionally clip (outside lock is fine for read-only)
         preclip_grad_norm = 0.0
+        did_unscale = False
+        # Unscale once before measuring/clipping so norms are meaningful and inf/nan are detected by scaler
+        if use_amp and scaler is not None:
+            try:
+                scaler.unscale_(self.optimizer)
+                did_unscale = True
+            except Exception:
+                pass
         try:
             sq_sum = 0.0
             for p in self.qnetwork_local.parameters():
@@ -2026,6 +929,9 @@ class HybridDQNAgent:
         postclip_grad_norm = preclip_grad_norm
         if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
             try:
+                # If not already unscaled above, unscale once before clipping
+                if use_amp and scaler is not None and not did_unscale:
+                    scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
                 # Recompute norm after clipping
                 sq_sum = 0.0
@@ -2037,9 +943,19 @@ class HybridDQNAgent:
             except Exception:
                 postclip_grad_norm = preclip_grad_norm
         
+        # LR scheduling (frame-based)
+        try:
+            self._apply_lr_schedule()
+        except Exception:
+            pass
+
         # Step optimizer under lock to avoid interleaved updates
         with self.training_lock:
-            self.optimizer.step()
+            if use_amp and scaler is not None:
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                self.optimizer.step()
         
         # Update training counters and metrics
         self.training_steps += 1
@@ -2063,6 +979,27 @@ class HybridDQNAgent:
             else:
                 metrics.grad_clip_delta = 1.0
             metrics.grad_norm = float(preclip_grad_norm)
+        except Exception:
+            pass
+
+        # Periodic hard refresh during warmup or watchdog interval
+        try:
+            # Hard refresh during warmup steps
+            warm_until = int(getattr(RL_CONFIG, 'warmup_hard_refresh_until_steps', 0) or 0)
+            warm_every = int(getattr(RL_CONFIG, 'warmup_hard_refresh_every_steps', 0) or 0)
+            if warm_until > 0 and self.training_steps <= warm_until and warm_every > 0:
+                if (self.training_steps % warm_every) == 0:
+                    self.update_target_network()
+            # Time-based watchdog
+            watchdog_secs = float(getattr(RL_CONFIG, 'hard_update_watchdog_seconds', 0.0) or 0.0)
+            if watchdog_secs > 0.0:
+                last_t = float(getattr(metrics, 'last_hard_target_update_time', 0.0) or 0.0)
+                if last_t <= 0.0 or (time.time() - last_t) >= watchdog_secs:
+                    self.update_target_network()
+            # Step-based periodic refresh even when using soft target
+            step_every = int(getattr(RL_CONFIG, 'hard_target_refresh_every_steps', 0) or 0)
+            if step_every > 0 and (self.training_steps % step_every) == 0:
+                self.update_target_network()
         except Exception:
             pass
 
@@ -2102,6 +1039,41 @@ class HybridDQNAgent:
                 pass
         
         return total_loss.item()
+
+    def _apply_lr_schedule(self):
+        """Compute and apply per-frame LR based on RL_CONFIG schedule."""
+        sched = str(getattr(RL_CONFIG, 'lr_schedule', 'none') or 'none').lower()
+        if sched == 'none':
+            return
+        # Determine current global frame
+        try:
+            fc = int(getattr(metrics, 'frame_count', 0) or 0)
+        except Exception:
+            fc = 0
+        lr_base = float(getattr(RL_CONFIG, 'lr_base', RL_CONFIG.lr) or RL_CONFIG.lr)
+        lr_min = float(getattr(RL_CONFIG, 'lr_min', lr_base * 0.1) or (lr_base * 0.1))
+        warm = int(getattr(RL_CONFIG, 'lr_warmup_frames', 0) or 0)
+        hold = int(getattr(RL_CONFIG, 'lr_hold_until_frames', 0) or 0)
+        decay_end = int(getattr(RL_CONFIG, 'lr_decay_until_frames', 0) or 0)
+
+        # Piecewise: warmup -> hold -> cosine decay -> floor
+        if fc <= warm and warm > 0:
+            # Linear from lr_min to lr_base
+            t = fc / max(warm, 1)
+            lr_now = lr_min + (lr_base - lr_min) * t
+        elif fc <= hold or decay_end <= hold:
+            lr_now = lr_base
+        elif fc <= decay_end:
+            # Cosine from lr_base to lr_min over [hold, decay_end]
+            import math
+            t = (fc - hold) / max(decay_end - hold, 1)
+            lr_now = lr_min + 0.5 * (lr_base - lr_min) * (1 + math.cos(math.pi * t))
+        else:
+            lr_now = lr_min
+
+        # Apply to optimizer groups
+        for g in self.optimizer.param_groups:
+            g['lr'] = float(lr_now)
 
     def set_training_enabled(self, enabled: bool):
         """Enable/disable training at runtime. When disabling, drain pending work."""
@@ -2358,7 +1330,6 @@ class HybridDQNAgent:
         """
         try:
             with torch.no_grad():
-                self.qnetwork_inference.eval()
                 min_q = max_q = None
 
                 buf_len = 0
@@ -2386,7 +1357,6 @@ class HybridDQNAgent:
                     min_q = discrete_q.min().item()
                     max_q = discrete_q.max().item()
 
-                self.qnetwork_inference.train()
                 return float(min_q), float(max_q)
         except Exception:
             return float('nan'), float('nan')
@@ -2521,14 +1491,6 @@ class SafeMetrics:
                 except Exception:
                     pass
 
-    def update_reward_components(self, components: dict):
-        """Forward reward component updates to underlying metrics with locking."""
-        try:
-            with self.lock:
-                if hasattr(self.metrics, 'update_reward_components'):
-                    self.metrics.update_reward_components(components)
-        except Exception:
-            pass
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     """Parse binary frame data from Lua into game state - SIMPLIFIED with float32 payload"""
@@ -2822,7 +1784,7 @@ def decay_epsilon(frame_count):
         dynamic_floor = RL_CONFIG.epsilon_end
         try:
             # If clearly regressing within the band, bump a bit higher
-            if dqn5m_avg <= 1.3:
+            if bool(getattr(RL_CONFIG, 'adaptive_epsilon_floor', True)) and dqn5m_avg <= 1.3:
                 dynamic_floor = max(dynamic_floor, 0.25)
         except Exception:
             pass
@@ -2868,10 +1830,10 @@ def decay_expert_ratio(current_step):
         dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
         if not np.isnan(dqn5m_avg):
             # Strong hold until we have both sufficient level and positive momentum
-            if (dqn5m_avg <= 1.55) or (dqn5m_slopeM < 0.03):
+            if bool(getattr(RL_CONFIG, 'adaptive_expert_floor', True)) and ((dqn5m_avg <= 1.55) or (dqn5m_slopeM < 0.03)):
                 dynamic_floor = max(dynamic_floor, 0.25)
             # Gentle handoff band when above ~2.55 and non-negative slope
-            elif (dqn5m_avg <= 1.70) and (dqn5m_slopeM >= 0.00):
+            elif bool(getattr(RL_CONFIG, 'adaptive_expert_floor', True)) and ((dqn5m_avg <= 1.70) and (dqn5m_slopeM >= 0.00)):
                 dynamic_floor = max(dynamic_floor, 0.10)
             else:
                 dynamic_floor = max(dynamic_floor, SERVER_CONFIG.expert_ratio_min)
@@ -2884,67 +1846,4 @@ def decay_expert_ratio(current_step):
 
     return metrics.expert_ratio
 
-class SimpleReplayBuffer:
-    """Ultra-fast pre-allocated circular buffer with O(1) sampling."""
-    def __init__(self, capacity):
-        self.capacity = capacity
-        # CRITICAL FIX: Pre-allocate flat numpy arrays for maximum speed
-        state_size = getattr(RL_CONFIG, 'state_size', 175)
-        self.states = np.empty((capacity, state_size), dtype=np.float32)  # 2D array, not object array
-        self.actions = np.empty((capacity,), dtype=np.int32)
-        self.rewards = np.empty((capacity,), dtype=np.float32)
-        self.next_states = np.empty((capacity, state_size), dtype=np.float32)  # 2D array, not object array
-        self.dones = np.empty((capacity,), dtype=np.bool_)
-        
-        self.position = 0
-        self.size = 0
-
-    def push(self, state, action, reward, next_state, done):
-        # Coerce action to a scalar index if needed
-        try:
-            if isinstance(action, np.ndarray):
-                a_idx = int(action.reshape(-1)[0])
-            elif isinstance(action, (list, tuple)):
-                a_idx = int(action[0])
-            else:
-                a_idx = int(action)
-        except Exception:
-            a_idx = int(action)
-        
-        # CRITICAL FIX: Direct array assignment to 2D slices - O(1)
-        self.states[self.position] = state.flatten() if hasattr(state, 'flatten') else state
-        self.actions[self.position] = a_idx
-        self.rewards[self.position] = reward
-        self.next_states[self.position] = next_state.flatten() if hasattr(next_state, 'flatten') else next_state
-        self.dones[self.position] = done
-        
-        # Circular buffer logic
-        self.position = (self.position + 1) % self.capacity
-        if self.size < self.capacity:
-            self.size += 1
-
-    def sample(self, batch_size):
-        if self.size < batch_size:
-            return None
-        
-        # O(1) random integer generation instead of O(n) random.sample()
-        indices = np.random.randint(0, self.size, size=batch_size)
-        
-        # CRITICAL FIX: Direct numpy indexing - eliminates vstack bottleneck
-        batch_states = self.states[indices]  # Already 2D array
-        batch_actions = self.actions[indices]
-        batch_rewards = self.rewards[indices]
-        batch_next_states = self.next_states[indices]  # Already 2D array  
-        batch_dones = self.dones[indices]
-
-        # PERFORMANCE: Use pin_memory=True for faster GPU transfers
-        states = torch.from_numpy(batch_states).float().pin_memory().to(training_device, non_blocking=True)
-        actions = torch.from_numpy(batch_actions.reshape(-1, 1)).long().pin_memory().to(training_device, non_blocking=True)
-        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float().pin_memory().to(training_device, non_blocking=True)
-        next_states = torch.from_numpy(batch_next_states).float().pin_memory().to(training_device, non_blocking=True)
-        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float().pin_memory().to(training_device, non_blocking=True)
-
-        return states, actions, rewards, next_states, dones
-
-    def __len__(self):
-        return self.size
+# Discrete-only SimpleReplayBuffer removed (hybrid-only)

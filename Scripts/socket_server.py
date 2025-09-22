@@ -276,7 +276,6 @@ class SocketServer:
 
                     # reward accounting
                     state['total_reward'] = state.get('total_reward', 0.0) + frame.reward
-                    self._update_reward_components(float(frame.reward))
                     src = state.get('last_action_source')
                     if src == 'dqn':
                         state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + frame.reward
@@ -467,16 +466,3 @@ class SocketServer:
             return self.metrics.fps
 
     # Internal helpers
-    def _update_reward_components(self, total_reward: float):
-        """Safely update reward components in metrics if available."""
-        try:
-            # Preferred: SafeMetrics exposes update_reward_components
-            if hasattr(self.metrics, 'update_reward_components'):
-                self.metrics.update_reward_components({'total': float(total_reward)})
-                return
-            # Fallback: underlying metrics object might have it
-            if hasattr(self.metrics, 'metrics') and hasattr(self.metrics.metrics, 'update_reward_components'):
-                with self.metrics.lock:
-                    self.metrics.metrics.update_reward_components({'total': float(total_reward)})
-        except Exception:
-            pass
