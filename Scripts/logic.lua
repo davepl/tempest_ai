@@ -846,23 +846,10 @@ end
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local reward, bDone = 0.0, false
-    
-    -- Component tracking for metrics
-    local reward_components = {
-        safety = 0.0,
-        proximity = 0.0,
-        shots = 0.0,
-        threats = 0.0,
-        pulsar = 0.0,
-        positioning = 0.0,
-        score = 0.0,
-        total = 0.0
-    }
 
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = reward - 1.0                                                   -- Scaled to match 20k points = 1 life exchange rate
-        reward_components.score = -1.0                                          -- Death penalty counts as score component
+        reward = 0
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
@@ -871,15 +858,13 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             local r_score = score_delta / 20000.0                               -- Scaled: 20k points = 1 life = 1.0 reward unit
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
-            reward = reward + r_score
-            reward_components.score = reward_components.score + r_score
+            reward = 1
         end
 
         -- Level completion bonus (edge-triggered) - Scaled to match death penalty magnitude
         if (level_state.level_number or 0) > (previous_level or 0) then
             local level_bonus = 1.0                                             -- Scaled to match 1 life = 1.0 reward unit
-            reward = reward + level_bonus
-            reward_components.score = reward_components.score + level_bonus
+            reward = 1
             bDone = true
         end
 
@@ -887,7 +872,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local zap_now = player_state.zap_detected or 0
         if zap_now == 1 and previous_zap_detected == 0 then
             reward = reward - 0.01
-            reward_components.shots = reward_components.shots - 0.05
         end
 
         -- === OBJECTIVE DENSE REWARD COMPONENTS ===
@@ -914,11 +898,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             if M.is_danger_lane(player_abs_seg, enemies_state) then
                 local safety_penalty = -0.015 * safety_scale
                 reward = reward + safety_penalty
-                reward_components.safety = reward_components.safety + safety_penalty
             else
                 local safety_bonus = 0.005 * safety_scale
                 -- reward = reward + safety_bonus
-                reward_components.safety = reward_components.safety + safety_bonus
             end
             
             -- 2. PROXIMITY OPTIMIZATION REWARD (Distance-based Positioning)
@@ -942,7 +924,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 -- Neutral reward for 3-5 segments (acceptable range)
                 -- reward = reward + prox_reward
                 prox_reward = prox_reward / 5
-                reward_components.proximity = reward_components.proximity + prox_reward
             end
             
             -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)
@@ -966,7 +947,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
             
             reward = reward + shot_reward
-            reward_components.shots = reward_components.shots + shot_reward
             
             -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
             -- Bonus for appropriate responses to critical threats
@@ -990,8 +970,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             if critical_threats > 1 then
                 threat_reward = threat_reward - (critical_threats * 0.002)
             end
-            -- reward = reward + threat_reward
-            reward_components.threats = reward_components.threats + threat_reward
             
             -- 5. PULSAR SAFETY REWARD (Objective Hazard Assessment)
             -- Extra penalty for being in pulsing pulsar lanes (objectively lethal)
@@ -1006,8 +984,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     end
                 end
             end
-            -- reward = reward + pulsar_reward
-            reward_components.pulsar = reward_components.pulsar + pulsar_reward
 
             -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
             -- Reward the DQN for following expert system's strategic positioning recommendations
@@ -1049,7 +1025,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
             
             reward = reward + positioning_reward
-            reward_components.positioning = reward_components.positioning + positioning_reward
 
             -- 7. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
             -- Apply a small penalty when spinning while already aligned (or no target)
@@ -1072,18 +1047,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local move_penalty = -0.0002 * units
                         -- reward = reward + move_penalty
                         -- Attribute to proximity shaping bucket for metrics
-                        -- reward_components.proximity = reward_components.proximity + move_penalty
                     end
                 end
             end
         end
     end
-
-    -- Set total reward
-    reward_components.total = reward
-    
-    -- Store components for potential external access
-    M.last_reward_components = reward_components
 
     -- State updates
     previous_score = player_state.score or 0
@@ -1101,18 +1069,5 @@ function M.getLastReward()
     return LastRewardState
 end
 
--- Function to retrieve the last reward components (for metrics)
-function M.getLastRewardComponents()
-    return M.last_reward_components or {
-        safety = 0.0,
-        proximity = 0.0,
-        shots = 0.0,
-        threats = 0.0,
-        pulsar = 0.0,
-        positioning = 0.0,
-        score = 0.0,
-        total = 0.0
-    }
-end
 
 return M 
