@@ -18,26 +18,34 @@ class NStepReplayBuffer:
       Input: (state, action, reward, next_state, done)
       Output: List[Tuple(state, action, R_n, next_state_n, done_n)]
     """
-    def __init__(self, n_step: int, gamma: float):
+    def __init__(self, n_step: int, gamma: float, store_aux_action: bool = False):
         assert n_step >= 1
         self.n_step = int(n_step)
         self.gamma = float(gamma)
-        self._deque: Deque[Tuple[np.ndarray, int, float, np.ndarray, bool]] = deque()
+        # When store_aux_action=True, we will store an extra per-step auxiliary action
+        # (e.g., a continuous action) alongside the discrete action and return it in outputs.
+        self.store_aux_action = bool(store_aux_action)
+        self._deque: Deque[Tuple] = deque()
 
     def reset(self):
         self._deque.clear()
 
-    def _make_experience_from_start(self) -> Tuple[np.ndarray, int, float, np.ndarray, bool]:
+    def _make_experience_from_start(self):
         R = 0.0
         done_flag = False
         last_next_state = None
-
-        s0, a0, _, _, _ = self._deque[0]
+        if self.store_aux_action:
+            s0, a0, aux0, _, _, _ = self._deque[0]
+        else:
+            s0, a0, _, _, _ = self._deque[0]
 
         for i in range(self.n_step):
             if i >= len(self._deque):
                 break
-            _, _, r, ns, d = self._deque[i]
+            if self.store_aux_action:
+                _, _, _, r, ns, d = self._deque[i]
+            else:
+                _, _, r, ns, d = self._deque[i]
             R += (self.gamma ** i) * float(r)
             last_next_state = ns
             if d:
@@ -45,9 +53,12 @@ class NStepReplayBuffer:
                 break
 
         assert last_next_state is not None
-        return (s0, a0, R, last_next_state, done_flag)
+        if self.store_aux_action:
+            return (s0, a0, aux0, R, last_next_state, done_flag)
+        else:
+            return (s0, a0, R, last_next_state, done_flag)
 
-    def add(self, state, action, reward, next_state, done) -> List[Tuple[np.ndarray, int, float, np.ndarray, bool]]:
+    def add(self, state, action, reward, next_state, done, aux_action=None):
         # Normalize action to int
         try:
             if isinstance(action, np.ndarray):
@@ -59,9 +70,13 @@ class NStepReplayBuffer:
         except Exception:
             a_idx = int(action)
 
-        self._deque.append((state, a_idx, float(reward), next_state, bool(done)))
+        if self.store_aux_action:
+            self._deque.append((state, a_idx, float(aux_action) if aux_action is not None else 0.0,
+                                float(reward), next_state, bool(done)))
+        else:
+            self._deque.append((state, a_idx, float(reward), next_state, bool(done)))
 
-        outputs: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
+        outputs: List[Tuple] = []
 
         if not done:
             if len(self._deque) >= self.n_step:

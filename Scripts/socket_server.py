@@ -29,6 +29,7 @@ from aimodel import (
     fire_zap_to_discrete,
     SafeMetrics,
 )
+from nstep_buffer import NStepReplayBuffer
 from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
 
 
@@ -53,6 +54,25 @@ class SocketServer:
         # Action distribution stats
         self.expert_action_counts = np.zeros(16, dtype=np.int64)  # 4 discrete * 4 spinner buckets (diagnostic only)
         self.dqn_action_counts = np.zeros(16, dtype=np.int64)
+
+    def _server_nstep_enabled(self) -> bool:
+        """Decide whether this server should perform n-step preprocessing.
+
+        Rules:
+        - If RL_CONFIG.n_step <= 1: no server-side n-step.
+        - If the agent already exposes its own n_step_buffer (non-None), let the agent handle n-step.
+        - Otherwise, perform server-side n-step (typical for HybridDQNAgent).
+        """
+        try:
+            n = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
+        except Exception:
+            n = 1
+        if n <= 1:
+            return False
+        # If the agent has its own n-step buffer, skip server-side n-step to avoid double application
+        if hasattr(self.agent, 'n_step_buffer') and getattr(self.agent, 'n_step_buffer') is not None:
+            return False
+        return True
 
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -115,7 +135,11 @@ class SocketServer:
                 'episode_dqn_reward': 0.0,
                 'episode_expert_reward': 0.0,
                 'was_done': False,
-                'nstep_buf': deque(maxlen=max(1, int(getattr(RL_CONFIG, 'n_step', 1))))
+                # Only create an n-step buffer if the server is responsible for n-step preprocessing
+                'nstep_buffer': (
+                    NStepReplayBuffer(RL_CONFIG.n_step, RL_CONFIG.gamma, store_aux_action=True)
+                    if self._server_nstep_enabled() else None
+                )
             }
             metrics.client_count = len(self.client_states)
 
@@ -208,31 +232,45 @@ class SocketServer:
                         pass
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
 
-                # previous step (n-step)
+                # N-step experience processing (server-side only when enabled) or direct 1-step fallback
                 if state.get('last_state') is not None and state.get('last_action_hybrid') is not None:
-                    n = int(getattr(RL_CONFIG, 'n_step', 1))
-                    if n <= 1:
-                        if self.agent:
-                            da, ca = state['last_action_hybrid']
-                            try:
-                                self.agent.step(state['last_state'], int(da), float(ca), frame.reward, frame.state, frame.done)
-                            except TypeError:
-                                # If agent does not support hybrid step, skip (pure hybrid expected)
-                                pass
+                    da, ca = state['last_action_hybrid']
+
+                    if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
+                        # Add experience to n-step buffer and get matured experiences
+                        experiences = state['nstep_buffer'].add(
+                            state['last_state'],
+                            int(da),
+                            frame.reward,
+                            frame.state,
+                            frame.done,
+                            aux_action=float(ca)
+                        )
+
+                        # Push all matured experiences to agent
+                        if self.agent and experiences:
+                            for item in experiences:
+                                try:
+                                    # Handle both shapes depending on store_aux_action flag
+                                    if len(item) == 6:
+                                        exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done = item
+                                        self.agent.step(exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done)
+                                    else:
+                                        exp_state, exp_action, exp_reward, exp_next_state, exp_done = item
+                                        # For legacy agents without continuous action
+                                        self.agent.step(exp_state, exp_action, exp_reward, exp_next_state, exp_done)
+                                except TypeError:
+                                    pass
                     else:
-                        state['nstep_buf'].append((state['last_state'], tuple(state['last_action_hybrid']), frame.reward))
-                        if len(state['nstep_buf']) >= n and self.agent:
-                            gamma = RL_CONFIG.gamma
-                            R = 0.0
-                            for i in range(n):
-                                R += (gamma ** i) * state['nstep_buf'][i][2]
-                            s0, (da0, ca0), _ = state['nstep_buf'][0]
+                        # Server is not handling n-step: push single-step transition directly to the agent
+                        try:
+                            if self.agent:
+                                # Hybrid agents expect (state, discrete, continuous, reward, next_state, done)
+                                self.agent.step(state['last_state'], int(da), float(ca), float(frame.reward), frame.state, bool(frame.done))
+                        except TypeError:
+                            # Fallback for agents without continuous action in signature
                             try:
-                                self.agent.step(s0, int(da0), float(ca0), R, frame.state, bool(frame.done))
-                            except TypeError:
-                                pass
-                            try:
-                                state['nstep_buf'].popleft()
+                                self.agent.step(state['last_state'], int(da), float(frame.reward), frame.state, bool(frame.done))
                             except Exception:
                                 pass
 
@@ -255,25 +293,12 @@ class SocketServer:
                         )
                     state['was_done'] = True
 
-                    # flush remaining n-step
-                    n = int(getattr(RL_CONFIG, 'n_step', 1))
-                    if n > 1 and self.agent and state.get('nstep_buf') is not None:
-                        gamma = RL_CONFIG.gamma
-                        buf = state['nstep_buf']
-                        while len(buf) > 0:
-                            L = len(buf)
-                            R = 0.0
-                            for i in range(L):
-                                R += (gamma ** i) * buf[i][2]
-                            s0, (da0, ca0), _ = buf[0]
-                            try:
-                                self.agent.step(s0, int(da0), float(ca0), R, frame.state, True)
-                            except TypeError:
-                                pass
-                            try:
-                                buf.popleft()
-                            except Exception:
-                                break
+                    # Reset n-step buffer only if server-side n-step is enabled
+                    try:
+                        if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
+                            state['nstep_buffer'].reset()
+                    except Exception:
+                        pass
 
                     # confirm done
                     try:

@@ -36,9 +36,9 @@ class ServerConfigData:
     params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
     # Expert ratio configuration - only used for brand new models
     expert_ratio_start: float = 0.90  # HIGH START: Let expert provide clean initial training data
-    # Quick Win: keep more expert in the loop to avoid premature handoff
-    expert_ratio_min: float = 0.40    # TEMP HOLD: Keep at least 40% expert while slope is weak
-    expert_ratio_decay: float = 0.9995 # Decay stays the same for now; adaptive options possible
+    # PLATEAU BREAKER: Reduce expert dependency to force model innovation
+    expert_ratio_min: float = 0.05    # REDUCED: From 25% to 15% to push model beyond expert limits
+    expert_ratio_decay: float = 0.999 # Decay stays the same for now; adaptive options possible
     expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
     
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
@@ -58,27 +58,27 @@ class RLConfigData:
     discrete_action_size: int = 4  # fire/zap combinations: (0,0), (1,0), (0,1), (1,1)
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
-    # Quick Win: smaller batch for snappier updates; keep accumulation for throughput
-    batch_size: int = 8192                # Reverted from 8192 - larger batch made plateau worse
-    lr: float = 0.0025                   # Q-explosion prevention: Reduced from 0.001 for 1024 model stability
-    gradient_accumulation_steps: int = 4  # RECOVERY: Reduced for more responsive updates during Q-value recovery
-    gamma: float = 0.95                   # Reverted from 0.92 - lower gamma made plateau worse
-    epsilon: float = 0.35                 # BOOSTED from 0.25 to increase exploration during plateau
-    epsilon_start: float = 0.25           # BOOSTED from 0.15 for more initial exploration
+    # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
+    batch_size: int = 32768               # Increased for better GPU utilization with AMP enabled
+    lr: float = 0.005                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    gradient_accumulation_steps: int = 2  # Increased to simulate 131k effective batch for throughput
+    gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
+    epsilon: float = 0.30                 # PLATEAU BREAKER: Boost from 0.15 to rediscover strategies
+    epsilon_start: float = 0.30           # PLATEAU BREAKER: Higher exploration for breakthrough
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.150            # BOOSTED from 0.100 to maintain exploration
-    epsilon_end: float = 0.150            # BOOSTED from 0.100 to maintain exploration
+    epsilon_min: float = 0.200            # PLATEAU BREAKER: Raise minimum to maintain exploration
+    epsilon_end: float = 0.200            # PLATEAU BREAKER: Higher floor for continued discovery
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
-    memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 2048               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 3                  # Simplified to 3 layers
+    memory_size: int = 1000000           # Balanced buffer size (was 4000000)
+    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 6                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
     # Quick Win: Turn on PER with conservative, clamped settings
-    use_per: bool = True                  # ENABLED: Hybrid agents use PER with discrete TD error priorities
+    use_per: bool = False                  # ENABLED: Hybrid agents use PER with discrete TD error priorities
     per_alpha: float = 0.6
     per_eps: float = 1e-6
     per_beta_start: float = 0.6           # Increased from 0.4 for better importance sampling
@@ -86,10 +86,10 @@ class RLConfigData:
     # PER performance tuning
     per_active_size: int = 100000         # Increased from 50k to 100k for better GPU utilization per sampling operation
     per_strict_checks_every: int = 1000 # Run full priority validation every N samples (0 to disable)
-    use_distributional: bool = False      # Disabled - too complex
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
-    training_steps_per_sample: int = 6    # Slightly reduce per-sample training to limit drift/overfit
+    # Phase 1 Optimization: More frequent updates for faster convergence
+    training_steps_per_sample: int = 8    # Increased from 12 for better sample efficiency
     training_workers: int = 1             # Reverted to 1 - multi-threaded training causes autograd conflicts
     use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
@@ -105,7 +105,7 @@ class RLConfigData:
     # Modest n-step to aid credit assignment without destabilizing
     n_step: int = 7
     # Enable dueling architecture for better value/advantage separation
-    use_dueling: bool = False             
+    use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
     # Gradient clipping configuration
