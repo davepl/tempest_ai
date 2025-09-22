@@ -59,9 +59,7 @@ import threading
 import queue
 from collections import deque, namedtuple
 from datetime import datetime
-from stable_baselines3 import DQN
-from stable_baselines3.common.buffers import ReplayBuffer
-from stable_baselines3.common.logger import configure
+# Removed stable_baselines3 imports (no longer used after refactor)
 import socket
 import traceback
 from torch.nn import SmoothL1Loss # Import SmoothL1Loss
@@ -198,6 +196,21 @@ print(f"Learning rate: {RL_CONFIG.lr}")
 print(f"Batch size: {RL_CONFIG.batch_size}")
 print(f"Memory size: {RL_CONFIG.memory_size:,}")
 print(f"Hidden size: {RL_CONFIG.hidden_size}")
+print(f"Number of layers: {RL_CONFIG.num_layers}")
+
+# Calculate and display layer architecture
+layer_sizes = []
+for i in range(RL_CONFIG.num_layers):
+    pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
+    layer_size = max(32, RL_CONFIG.hidden_size // (2 ** pair_index))
+    layer_sizes.append(layer_size)
+
+print(f"Layer architecture:")
+print(f"  Layer 1: {RL_CONFIG.state_size} → {layer_sizes[0]}")
+for i in range(1, len(layer_sizes)):
+    print(f"  Layer {i+1}: {layer_sizes[i-1]} → {layer_sizes[i]}")
+print(f"  Head layers: {layer_sizes[-1]} → {max(64, layer_sizes[-1] // 2)}")
+
 print(f"Dueling: {'enabled' if getattr(RL_CONFIG, 'use_dueling', False) else 'disabled' } ")
 if getattr(RL_CONFIG, 'use_per', False):
     print(f"Using PER with alpha: {getattr(RL_CONFIG, 'per_alpha', 0.6)}")
@@ -217,6 +230,74 @@ metrics.global_server = None
 
 # Experience replay memory
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
+
+class QNetwork(nn.Module):
+    """Standard DQN MLP with optional noisy layers and dueling head.
+
+    Uses the same dynamic pair-halving pattern as HybridDQN for consistency.
+    """
+    def __init__(self, state_size: int, action_size: int, hidden_size: int = 512, num_layers: int = 3,
+                 use_dueling: bool = False, use_noisy: bool = False, noisy_std: float = 0.1):
+        super().__init__()
+        self.state_size = state_size
+        self.action_size = action_size
+        self.use_dueling = use_dueling
+        self.use_noisy = use_noisy
+
+        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
+
+        # Compute dynamic layer sizes (pair-halving)
+        layer_sizes = []
+        for i in range(num_layers):
+            pair_index = i // 2
+            layer_sizes.append(max(32, hidden_size // (2 ** pair_index)))
+
+        self.layers = nn.ModuleList()
+        # First layer
+        if use_noisy:
+            self.layers.append(LinearOrNoisy(state_size, layer_sizes[0], noisy_std))
+        else:
+            self.layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
+        # Subsequent layers
+        for i in range(1, num_layers):
+            if use_noisy:
+                self.layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i], noisy_std))
+            else:
+                self.layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
+
+        shared_out = layer_sizes[-1]
+        head_size = max(64, shared_out // 2)
+
+        if use_dueling:
+            self.val_fc = nn.Linear(shared_out, head_size)
+            self.adv_fc = nn.Linear(shared_out, head_size)
+            self.val_out = nn.Linear(head_size, 1)
+            self.adv_out = nn.Linear(head_size, action_size)
+        else:
+            self.head_fc = nn.Linear(shared_out, head_size)
+            self.head_out = nn.Linear(head_size, action_size)
+
+    def reset_noise(self):
+        if self.use_noisy:
+            for m in self.modules():
+                if isinstance(m, NoisyLinear):
+                    m.reset_noise()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = x
+        for layer in self.layers:
+            y = F.relu(layer(y))
+        if self.use_dueling:
+            v = F.relu(self.val_fc(y))
+            v = self.val_out(v)
+            a = F.relu(self.adv_fc(y))
+            a = self.adv_out(a)
+            q = v + (a - a.mean(dim=1, keepdim=True))
+            return q
+        else:
+            h = F.relu(self.head_fc(y))
+            q = self.head_out(h)
+            return q
 
 class NoisyLinear(nn.Module):
     """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
@@ -265,115 +346,6 @@ class NoisyLinear(nn.Module):
             bias = self.bias_mu
         return F.linear(input, weight, bias)
 
-class DQN(nn.Module):
-    """Simplified DQN model for better learning on high-dimensional state space."""
-    def __init__(self, state_size, action_size):
-        super(DQN, self).__init__()
-        use_noisy = RL_CONFIG.use_noisy_nets
-        use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
-        noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
-        hidden_size = RL_CONFIG.hidden_size  # Reduced to 512 for better learning
-        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
-
-        # Simplified 3-layer architecture for better learning
-        self.fc1 = nn.Linear(state_size, hidden_size)         # 175 -> 512
-        self.fc2 = nn.Linear(hidden_size, hidden_size//2)     # 512 -> 256
-        self.fc3 = nn.Linear(hidden_size//2, hidden_size//4)  # 256 -> 128
-        
-        # Apply noisy layers if enabled
-        if use_noisy:
-            self.fc2 = NoisyLinear(hidden_size, hidden_size//2, noisy_std)
-            self.fc3 = NoisyLinear(hidden_size//2, hidden_size//4, noisy_std)
-
-        self.use_dueling = use_dueling
-        if use_dueling:
-            # Dueling streams with balanced sizes
-            self.val_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 128 -> 64
-            self.adv_fc = nn.Linear(hidden_size//4, hidden_size//8)  # 128 -> 64
-            self.val_out = nn.Linear(hidden_size//8, 1)              # 64 -> 1
-            self.adv_out = nn.Linear(hidden_size//8, action_size)    # 64 -> 18
-        else:
-            # Single stream
-            self.fc4 = nn.Linear(hidden_size//4, hidden_size//8)     # 128 -> 64
-            self.out = nn.Linear(hidden_size//8, action_size)        # 64 -> 18
-
-    def reset_noise(self):
-        # Reset noise for all NoisyLinear layers
-        for m in self.modules():
-            if isinstance(m, NoisyLinear):
-                m.reset_noise()
-
-    def forward(self, x):
-        # Simplified forward pass for better learning
-        x = F.relu(self.fc1(x))    # 175 -> 512
-        x = F.relu(self.fc2(x))    # 512 -> 256
-        x = F.relu(self.fc3(x))    # 256 -> 128
-        
-        if self.use_dueling:
-            v = F.relu(self.val_fc(x))  # 128 -> 64
-            v = self.val_out(v)         # 64 -> 1
-            a = F.relu(self.adv_fc(x))  # 128 -> 64
-            a = self.adv_out(a)         # 64 -> 18
-            # Subtract mean advantage to keep Q identifiable
-            q = v + (a - a.mean(dim=1, keepdim=True))
-            return q
-        else:
-            x = F.relu(self.fc4(x))     # 128 -> 64
-            return self.out(x)          # 64 -> 18
-
-class QRDQN(nn.Module):
-    """Quantile Regression DQN (distributional), optional dueling streams.
-    Outputs shape: (batch, action_size, num_quantiles)
-    """
-    def __init__(self, state_size: int, action_size: int, num_quantiles: int):
-        super().__init__()
-        use_noisy = RL_CONFIG.use_noisy_nets
-        use_dueling = getattr(RL_CONFIG, 'use_dueling', False)
-        noisy_std = getattr(RL_CONFIG, 'noisy_std_init', 0.5)
-        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
-
-        self.num_quantiles = num_quantiles
-        self.action_size = action_size
-        self.use_dueling = use_dueling
-
-        # Shared trunk
-        self.fc1 = nn.Linear(state_size, 512)
-        self.fc2 = LinearOrNoisy(512, 384, noisy_std) if use_noisy else LinearOrNoisy(512, 384)
-        self.fc3 = LinearOrNoisy(384, 192, noisy_std) if use_noisy else LinearOrNoisy(384, 192)
-
-        if use_dueling:
-            self.val_fc = nn.Linear(192, 128)
-            self.adv_fc = nn.Linear(192, 128)
-            self.val_out = nn.Linear(128, num_quantiles)             # (B, N)
-            self.adv_out = nn.Linear(128, action_size * num_quantiles) # (B, A*N)
-        else:
-            self.fc4 = nn.Linear(192, 128)
-            self.out = nn.Linear(128, action_size * num_quantiles)
-
-    def reset_noise(self):
-        for m in self.modules():
-            if isinstance(m, NoisyLinear):
-                m.reset_noise()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        if self.use_dueling:
-            v = F.relu(self.val_fc(x))
-            v = self.val_out(v)  # (B, N)
-            a = F.relu(self.adv_fc(x))
-            a = self.adv_out(a)  # (B, A*N)
-            a = a.view(-1, self.action_size, self.num_quantiles)
-            v = v.unsqueeze(1)  # (B, 1, N)
-            # Center advantages over actions
-            q = v + (a - a.mean(dim=1, keepdim=True))
-            return q  # (B, A, N)
-        else:
-            x = F.relu(self.fc4(x))
-            out = self.out(x)  # (B, A*N)
-            return out.view(-1, self.action_size, self.num_quantiles)
-
 class HybridDQN(nn.Module):
     """Hybrid DQN with discrete fire/zap actions + continuous spinner.
     
@@ -395,40 +367,57 @@ class HybridDQN(nn.Module):
         self.discrete_actions = discrete_actions
         self.use_dueling = use_dueling
         self.use_noisy = use_noisy
+        self.num_layers = num_layers
         
         # Shared trunk for feature extraction
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
         
-        # Progressive network sizing for efficiency
-        if hidden_size >= 2048:
-            sizes = [hidden_size, hidden_size // 2, hidden_size // 4, hidden_size // 8]
-        elif hidden_size >= 1024:
-            sizes = [hidden_size, 768, 384, 192]
+        # Dynamic layer sizing with pairs: A,A -> A/2,A/2 -> A/4,A/4 -> ...
+        # Pattern: 512,512 -> 256,256 -> 128,128 -> ...
+        layer_sizes = []
+        current_size = hidden_size
+        for i in range(num_layers):
+            # Determine size for this layer pair
+            pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
+            layer_size = max(32, hidden_size // (2 ** pair_index))
+            layer_sizes.append(layer_size)
+        
+        # Create shared layers dynamically
+        self.shared_layers = nn.ModuleList()
+        
+        # First layer: state_size -> hidden_size
+        if use_noisy:
+            self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0], noisy_std))
         else:
-            sizes = [hidden_size, 384, 192, 128]
+            self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
         
-        # Shared trunk
-        self.shared_fc1 = LinearOrNoisy(state_size, sizes[0], noisy_std) if use_noisy else LinearOrNoisy(state_size, sizes[0])
-        self.shared_fc2 = LinearOrNoisy(sizes[0], sizes[1], noisy_std) if use_noisy else LinearOrNoisy(sizes[0], sizes[1])
-        self.shared_fc3 = LinearOrNoisy(sizes[1], sizes[2], noisy_std) if use_noisy else LinearOrNoisy(sizes[1], sizes[2])
+        # Subsequent layers: hidden_size -> hidden_size/2 -> hidden_size/4 -> ...
+        for i in range(1, num_layers):
+            if use_noisy:
+                self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i], noisy_std))
+            else:
+                self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
         
-        shared_output_size = sizes[2]
+        # Final layer size for heads
+        shared_output_size = layer_sizes[-1]
+        head_size = max(64, shared_output_size // 2)  # Head layer size
         
         if use_dueling:
             # Dueling architecture for discrete Q-values
-            self.discrete_val_fc = nn.Linear(shared_output_size, sizes[3])
-            self.discrete_adv_fc = nn.Linear(shared_output_size, sizes[3])
-            self.discrete_val_out = nn.Linear(sizes[3], 1)  # State value
-            self.discrete_adv_out = nn.Linear(sizes[3], discrete_actions)  # Advantages
+            self.discrete_val_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_adv_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_val_out = nn.Linear(head_size, 1)  # State value
+            self.discrete_adv_out = nn.Linear(head_size, discrete_actions)  # Advantages
         else:
             # Standard architecture for discrete Q-values
-            self.discrete_fc = nn.Linear(shared_output_size, sizes[3])
-            self.discrete_out = nn.Linear(sizes[3], discrete_actions)
+            self.discrete_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_out = nn.Linear(head_size, discrete_actions)
         
         # Continuous head for spinner (always separate from dueling)
-        self.continuous_fc1 = nn.Linear(shared_output_size, sizes[3])
-        self.continuous_fc2 = nn.Linear(sizes[3], sizes[3] // 2) if sizes[3] > 64 else nn.Linear(sizes[3], 32)
-        self.continuous_out = nn.Linear(sizes[3] // 2 if sizes[3] > 64 else 32, 1)
+        self.continuous_fc1 = nn.Linear(shared_output_size, head_size)
+        continuous_head_size = max(32, head_size // 2)
+        self.continuous_fc2 = nn.Linear(head_size, continuous_head_size)
+        self.continuous_out = nn.Linear(continuous_head_size, 1)
         
         # Initialize continuous head with smaller weights for stable training
         torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
@@ -451,10 +440,10 @@ class HybridDQN(nn.Module):
             discrete_q_values: Q-values for fire/zap combinations (batch_size, 4)
             continuous_spinner: Spinner values in [-0.9, +0.9] (batch_size, 1)
         """
-        # Shared feature extraction
-        shared = F.relu(self.shared_fc1(x))
-        shared = F.relu(self.shared_fc2(shared))
-        shared = F.relu(self.shared_fc3(shared))
+        # Shared feature extraction through dynamic layers
+        shared = x
+        for layer in self.shared_layers:
+            shared = F.relu(layer(shared))
         
         # Discrete Q-values head
         if self.use_dueling:
@@ -738,22 +727,32 @@ class DQNAgent:
         self.action_size = action_size
         self.last_save_time = 0.0 # Initialize last save time
         
-        # Q-Networks on separate devices for optimal performance
-        if getattr(RL_CONFIG, 'use_distributional', False):
-            n_quant = getattr(RL_CONFIG, 'num_atoms', 51)
-            self.qnetwork_local = QRDQN(state_size, action_size, n_quant).to(training_device)
-            self.qnetwork_target = QRDQN(state_size, action_size, n_quant).to(training_device)
-        else:
-            self.qnetwork_local = DQN(state_size, action_size).to(training_device)
-            self.qnetwork_target = DQN(state_size, action_size).to(training_device)
+        # Q-Networks on separate devices for optimal performance (standard DQN only)
+        self.qnetwork_local = QNetwork(
+            state_size, action_size,
+            hidden_size=getattr(RL_CONFIG, 'hidden_size', 512),
+            num_layers=getattr(RL_CONFIG, 'num_layers', 3),
+            use_dueling=getattr(RL_CONFIG, 'use_dueling', False),
+            use_noisy=getattr(RL_CONFIG, 'use_noisy_nets', False)
+        ).to(training_device)
+        self.qnetwork_target = QNetwork(
+            state_size, action_size,
+            hidden_size=getattr(RL_CONFIG, 'hidden_size', 512),
+            num_layers=getattr(RL_CONFIG, 'num_layers', 3),
+            use_dueling=getattr(RL_CONFIG, 'use_dueling', False),
+            use_noisy=getattr(RL_CONFIG, 'use_noisy_nets', False)
+        ).to(training_device)
         
         # Create inference copy on inference device for low-latency serving
         if inference_device != training_device:
             print(f"Creating dedicated inference network on {inference_device} for low-latency serving")
-            if getattr(RL_CONFIG, 'use_distributional', False):
-                self.qnetwork_inference = QRDQN(state_size, action_size, n_quant).to(inference_device)
-            else:
-                self.qnetwork_inference = DQN(state_size, action_size).to(inference_device)
+            self.qnetwork_inference = QNetwork(
+                state_size, action_size,
+                hidden_size=getattr(RL_CONFIG, 'hidden_size', 512),
+                num_layers=getattr(RL_CONFIG, 'num_layers', 3),
+                use_dueling=getattr(RL_CONFIG, 'use_dueling', False),
+                use_noisy=getattr(RL_CONFIG, 'use_noisy_nets', False)
+            ).to(inference_device)
         else:
             # Same device - use training network for inference
             self.qnetwork_inference = self.qnetwork_local
@@ -872,8 +871,8 @@ class DQNAgent:
                         self._train_step_counter += 1
                         self.train_step()
                         
-                        # Sync inference network every 100 training steps for responsiveness
-                        if self._train_step_counter % 100 == 0:
+                        # Sync inference network every 1000 training steps for responsiveness
+                        if self._train_step_counter % 1000 == 0:
                             self.sync_inference_network()
                     else:
                         break
@@ -902,7 +901,13 @@ class DQNAgent:
             next_state_q_all = self.qnetwork_local(next_states)  # Local net selects actions
             best_actions = next_state_q_all.argmax(1, keepdim=True)
             Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)  # Target net evaluates
-            Q_targets = rewards + (RL_CONFIG.gamma * Q_targets_next * (1 - dones))
+            # If using n-step returns, rewards already contain n-step discounted sum.
+            # Therefore the bootstrap term must be discounted by gamma^n.
+            if hasattr(self, 'n_step') and isinstance(self.n_step, int) and self.n_step > 1:
+                gamma_boot = (RL_CONFIG.gamma ** self.n_step)
+            else:
+                gamma_boot = RL_CONFIG.gamma
+            Q_targets = rewards + (gamma_boot * Q_targets_next * (1 - dones))
         
         # Optionally clamp targets to prevent runaway bootstrap
         if bool(getattr(RL_CONFIG, 'clamp_targets', True)):
@@ -1008,112 +1013,71 @@ class DQNAgent:
             sampling_time = time.time() - sampling_start
             
             forward_start = time.time()
-            if getattr(RL_CONFIG, 'use_distributional', False):
-                # Distributional QR loss
-                num_quant = getattr(RL_CONFIG, 'num_atoms', 51)
-                # Current quantiles for taken actions: (B, N)
-                z_pred_all = self.qnetwork_local(states)  # (B, A, N)
-                batch_indices = torch.arange(z_pred_all.size(0), device=states.device)
-                z_pred = z_pred_all[batch_indices, actions.squeeze(1)]  # (B, N)
-
-                with torch.no_grad():
-                    # Next action by mean over quantiles of local net
-                    z_next_local = self.qnetwork_local(next_states)  # (B, A, N)
-                    q_next_local = z_next_local.mean(dim=2)  # (B, A)
-                    next_actions = q_next_local.argmax(dim=1)  # (B,)
-                    # Target quantiles for those actions from target net
-                    z_next_target_all = self.qnetwork_target(next_states)  # (B, A, N)
-                    z_next_target = z_next_target_all[batch_indices, next_actions]  # (B, N)
-                    # Bellman update for quantiles
-                    z_target = rewards + (RL_CONFIG.gamma * (1 - dones)) * z_next_target  # (B, N)
-
-                # Pairwise TD errors: (B, N_pred, N_tgt) => (B, N, N)
-                z_pred_exp = z_pred.unsqueeze(2)
-                z_target_exp = z_target.unsqueeze(1)
-                td = z_target_exp - z_pred_exp  # (B, N, N)
-
-                # Huber loss
-                huber_k = 1.0
-                abs_td = td.abs()
-                huber_loss = torch.where(abs_td <= huber_k, 0.5 * td.pow(2), huber_k * (abs_td - 0.5 * huber_k))
-
-                # Quantile weights
-                with torch.no_grad():
-                    taus = (torch.arange(num_quant, device=states.device, dtype=states.dtype) + 0.5) / num_quant  # (N,)
-                taus = taus.view(1, -1, 1)  # (1, N, 1)
-                quantile_weight = (taus - (td.detach() < 0).float()).abs()
-                qr_loss = (quantile_weight * huber_loss).mean(dim=2).sum(dim=1).mean()
-
-                loss = qr_loss if not use_per else (is_weights.view(-1) * (quantile_weight * huber_loss).mean(dim=2).sum(dim=1)).mean()
-
-                # For PER priority updates, define td_errors as mean absolute TD per sample
-                td_errors = td.abs().mean(dim=(1, 2))  # CRITICAL FIX: Use abs() for priority updates
+            # Standard DQN loss computation - use compiled version if available
+            if self._compiled_loss_computation is not None:
+                # Use compiled loss computation for performance
+                is_weights_tensor = is_weights if use_per else None
+                loss, td_errors, Q_expected, Q_targets = self._compiled_loss_computation(
+                    states, actions, rewards, next_states, dones, is_weights_tensor)
             else:
-                # Standard DQN loss computation - use compiled version if available
-                if self._compiled_loss_computation is not None:
-                    # Use compiled loss computation for performance
-                    is_weights_tensor = is_weights if use_per else None
-                    loss, td_errors, Q_expected, Q_targets = self._compiled_loss_computation(
-                        states, actions, rewards, next_states, dones, is_weights_tensor)
-                else:
-                    # Fallback to original computation if compilation failed
-                    loss, td_errors, Q_expected, Q_targets = self._compute_dqn_loss(
-                        states, actions, rewards, next_states, dones, 
-                        is_weights if use_per else None)
-                
-                # DIAGNOSTIC: Track Q-value statistics (extracted from compiled computation)
-                q_exp_max = Q_expected.max().item()
-                q_exp_min = Q_expected.min().item()
-                q_exp_mean = Q_expected.mean().item()
-                q_exp_std = Q_expected.std().item()
-                
-                # STRICT ASSERTION: Q_expected should be reasonable (not exploded)
-                assert abs(q_exp_max) < 30.0 and abs(q_exp_min) < 30.0, f"CRITICAL BUG: Q_expected explosion! Q_expected range: [{q_exp_min:.3f}, {q_exp_max:.3f}]. Neural network is broken - restart with fresh model."
-                
-                # Additional diagnostic checks for targets and rewards
-                q_tgt_max = Q_targets.max().item()
-                q_tgt_min = Q_targets.min().item()
-                q_tgt_mean = Q_targets.mean().item()
-                
-                reward_max = rewards.max().item()
-                reward_min = rewards.min().item()
-                assert abs(reward_max) < 50.0 and abs(reward_min) < 50.0, f"CRITICAL BUG: Reward corruption! Reward range: [{reward_min:.3f}, {reward_max:.3f}]"
+                # Fallback to original computation if compilation failed
+                loss, td_errors, Q_expected, Q_targets = self._compute_dqn_loss(
+                    states, actions, rewards, next_states, dones, 
+                    is_weights if use_per else None)
+            
+            # DIAGNOSTIC: Track Q-value statistics (extracted from compiled computation)
+            q_exp_max = Q_expected.max().item()
+            q_exp_min = Q_expected.min().item()
+            q_exp_mean = Q_expected.mean().item()
+            q_exp_std = Q_expected.std().item()
+            
+            # STRICT ASSERTION: Q_expected should be reasonable (not exploded)
+            assert abs(q_exp_max) < 30.0 and abs(q_exp_min) < 30.0, f"CRITICAL BUG: Q_expected explosion! Q_expected range: [{q_exp_min:.3f}, {q_exp_max:.3f}]. Neural network is broken - restart with fresh model."
+            
+            # Additional diagnostic checks for targets and rewards
+            q_tgt_max = Q_targets.max().item()
+            q_tgt_min = Q_targets.min().item()
+            q_tgt_mean = Q_targets.mean().item()
+            
+            reward_max = rewards.max().item()
+            reward_min = rewards.min().item()
+            assert abs(reward_max) < 50.0 and abs(reward_min) < 50.0, f"CRITICAL BUG: Reward corruption! Reward range: [{reward_min:.3f}, {reward_max:.3f}]"
 
-                if use_per:
-                    # DIAGNOSTIC: Track TD error distribution before explosion check
-                    td_max = td_errors.max().item()
-                    td_min = td_errors.min().item()
-                    td_mean = td_errors.mean().item()
-                    td_std = td_errors.std().item()
-                    
-                    # DIAGNOSTIC: Track priority distribution health
-                    if hasattr(self.memory, 'priorities'):
-                        current_priorities = self.memory.priorities[:len(self.memory), 0]
-                        prio_max = current_priorities.max()
-                        prio_mean = current_priorities.mean()
-                        high_prio_count = np.sum(current_priorities > td_mean * 3)  # Count priorities > 3x mean TD error
-                    
-                    # STRICT ASSERTION: TD errors should be reasonable (catch Q-value explosion)
-                    max_td_error = td_errors.max().item()
-                    if max_td_error >= 25.0:
-                        print(f"\n!!! CRITICAL BUG DETECTED !!!")
-                        print(f"TD error explosion! Max TD error = {max_td_error:.6f}")
-                        print(f"Q_expected: [{q_exp_min:.3f}, {q_exp_max:.3f}], mean={q_exp_mean:.3f}")
-                        print(f"Q_targets: [{q_tgt_min:.3f}, {q_tgt_max:.3f}], mean={q_tgt_mean:.3f}")
-                        print(f"Rewards: [{rewards.min().item():.3f}, {rewards.max().item():.3f}]")
-                        print(f"This indicates Q-value explosion - neural network is broken.")
-                        print(f"FORCING APPLICATION SHUTDOWN...")
-                        import os
-                        os._exit(1)  # Force immediate process termination
-                    
-                    # DEBUG: Check for zero loss issues
-                    if loss.item() < 1e-8:
-                        print(f"PER ZERO LOSS DEBUG:")
-                        print(f"  Q_expected range: [{Q_expected.min():.4f}, {Q_expected.max():.4f}]")
-                        print(f"  Q_targets range: [{Q_targets.min():.4f}, {Q_targets.max():.4f}]")  
-                        print(f"  TD errors range: [{td_errors.min():.4f}, {td_errors.max():.4f}]")
-                        print(f"  IS weights range: [{is_weights.min():.4f}, {is_weights.max():.4f}]")
-                        print(f"  Final loss: {loss.item():.8f}")
+            if use_per:
+                # DIAGNOSTIC: Track TD error distribution before explosion check
+                td_max = td_errors.max().item()
+                td_min = td_errors.min().item()
+                td_mean = td_errors.mean().item()
+                td_std = td_errors.std().item()
+                
+                # DIAGNOSTIC: Track priority distribution health
+                if hasattr(self.memory, 'priorities'):
+                    current_priorities = self.memory.priorities[:len(self.memory), 0]
+                    prio_max = current_priorities.max()
+                    prio_mean = current_priorities.mean()
+                    high_prio_count = np.sum(current_priorities > td_mean * 3)  # Count priorities > 3x mean TD error
+                
+                # STRICT ASSERTION: TD errors should be reasonable (catch Q-value explosion)
+                max_td_error = td_errors.max().item()
+                if max_td_error >= 25.0:
+                    print(f"\n!!! CRITICAL BUG DETECTED !!!")
+                    print(f"TD error explosion! Max TD error = {max_td_error:.6f}")
+                    print(f"Q_expected: [{q_exp_min:.3f}, {q_exp_max:.3f}], mean={q_exp_mean:.3f}")
+                    print(f"Q_targets: [{q_tgt_min:.3f}, {q_tgt_max:.3f}], mean={q_tgt_mean:.3f}")
+                    print(f"Rewards: [{rewards.min().item():.3f}, {rewards.max().item():.3f}]")
+                    print(f"This indicates Q-value explosion - neural network is broken.")
+                    print(f"FORCING APPLICATION SHUTDOWN...")
+                    import os
+                    os._exit(1)  # Force immediate process termination
+                
+                # DEBUG: Check for zero loss issues
+                if loss.item() < 1e-8:
+                    print(f"PER ZERO LOSS DEBUG:")
+                    print(f"  Q_expected range: [{Q_expected.min():.4f}, {Q_expected.max():.4f}]")
+                    print(f"  Q_targets range: [{Q_targets.min():.4f}, {Q_targets.max():.4f}]")  
+                    print(f"  TD errors range: [{td_errors.min():.4f}, {td_errors.max():.4f}]")
+                    print(f"  IS weights range: [{is_weights.min():.4f}, {is_weights.max():.4f}]")
+                    print(f"  Final loss: {loss.item():.8f}")
             forward_time = time.time() - forward_start
 
             # Calculate loss scaling for gradient accumulation
@@ -1394,8 +1358,6 @@ class DQNAgent:
                         if states is not None and isinstance(states, torch.Tensor):
                             states = states.to(self.inference_device, non_blocking=True)
                             q_vals = self.qnetwork_inference(states)
-                            if getattr(RL_CONFIG, 'use_distributional', False):
-                                q_vals = q_vals.mean(dim=2)  # (B, A)
                             min_q = q_vals.min().item()
                             max_q = q_vals.max().item()
                     except Exception:
@@ -1406,8 +1368,6 @@ class DQNAgent:
                     # Fallback: probe with an all-zero dummy state (legacy behavior)
                     dummy_state = torch.zeros(1, self.state_size, device=self.inference_device)
                     q_vals = self.qnetwork_inference(dummy_state)
-                    if getattr(RL_CONFIG, 'use_distributional', False):
-                        q_vals = q_vals.mean(dim=2)
                     min_q = q_vals.min().item()
                     max_q = q_vals.max().item()
 
@@ -1425,11 +1385,7 @@ class DQNAgent:
         self.qnetwork_inference.eval()
         
         with torch.no_grad():
-            if getattr(RL_CONFIG, 'use_distributional', False):
-                q_dist = self.qnetwork_inference(state)  # (1, A, N)
-                action_values = q_dist.mean(dim=2)   # (1, A)
-            else:
-                action_values = self.qnetwork_inference(state)
+            action_values = self.qnetwork_inference(state)
             
         # Set training mode back
         self.qnetwork_inference.train()
@@ -2035,9 +1991,11 @@ class HybridDQNAgent:
         with torch.no_grad():
             discrete_q_next, continuous_next = self.qnetwork_target(next_states)
             discrete_q_next_max = discrete_q_next.max(1)[0].detach().unsqueeze(1)
-            
+            # If upstream provided n-step returns in rewards, discount bootstrap by gamma^n
+            n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
+            gamma_boot = (self.gamma ** n_step) if n_step > 1 else self.gamma
             # TD targets
-            discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
+            discrete_targets = rewards + (gamma_boot * discrete_q_next_max * (1 - dones))
             continuous_targets = continuous_actions  # Use actual actions as targets for regression
         
         # Compute losses
@@ -2864,11 +2822,8 @@ def decay_epsilon(frame_count):
         dynamic_floor = RL_CONFIG.epsilon_end
         try:
             # If clearly regressing within the band, bump a bit higher
-            if 2.2 <= dqn5m_avg <= 2.6 and dqn5m_slopeM < -0.02:
-                dynamic_floor = max(dynamic_floor, 0.22)
-            # If flat within the plateau band, give a gentle bump
-            elif 2.35 <= dqn5m_avg <= 2.60 and abs(dqn5m_slopeM) < 0.05:
-                dynamic_floor = max(dynamic_floor, 0.20)
+            if dqn5m_avg <= 1.3:
+                dynamic_floor = max(dynamic_floor, 0.25)
         except Exception:
             pass
 
@@ -2913,11 +2868,11 @@ def decay_expert_ratio(current_step):
         dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
         if not np.isnan(dqn5m_avg):
             # Strong hold until we have both sufficient level and positive momentum
-            if (dqn5m_avg <= 2.55) or (dqn5m_slopeM < 0.03):
-                dynamic_floor = max(dynamic_floor, 0.50)
+            if (dqn5m_avg <= 1.55) or (dqn5m_slopeM < 0.03):
+                dynamic_floor = max(dynamic_floor, 0.25)
             # Gentle handoff band when above ~2.55 and non-negative slope
-            elif (dqn5m_avg <= 2.70) and (dqn5m_slopeM >= 0.00):
-                dynamic_floor = max(dynamic_floor, 0.45)
+            elif (dqn5m_avg <= 1.70) and (dqn5m_slopeM >= 0.00):
+                dynamic_floor = max(dynamic_floor, 0.10)
             else:
                 dynamic_floor = max(dynamic_floor, SERVER_CONFIG.expert_ratio_min)
     except Exception:
@@ -2933,11 +2888,12 @@ class SimpleReplayBuffer:
     """Ultra-fast pre-allocated circular buffer with O(1) sampling."""
     def __init__(self, capacity):
         self.capacity = capacity
-        # Pre-allocate flat arrays for maximum speed
-        self.states = np.empty((capacity,), dtype=object)
+        # CRITICAL FIX: Pre-allocate flat numpy arrays for maximum speed
+        state_size = getattr(RL_CONFIG, 'state_size', 175)
+        self.states = np.empty((capacity, state_size), dtype=np.float32)  # 2D array, not object array
         self.actions = np.empty((capacity,), dtype=np.int32)
         self.rewards = np.empty((capacity,), dtype=np.float32)
-        self.next_states = np.empty((capacity,), dtype=object)
+        self.next_states = np.empty((capacity, state_size), dtype=np.float32)  # 2D array, not object array
         self.dones = np.empty((capacity,), dtype=np.bool_)
         
         self.position = 0
@@ -2955,11 +2911,11 @@ class SimpleReplayBuffer:
         except Exception:
             a_idx = int(action)
         
-        # Direct array assignment - O(1)
-        self.states[self.position] = state
+        # CRITICAL FIX: Direct array assignment to 2D slices - O(1)
+        self.states[self.position] = state.flatten() if hasattr(state, 'flatten') else state
         self.actions[self.position] = a_idx
         self.rewards[self.position] = reward
-        self.next_states[self.position] = next_state
+        self.next_states[self.position] = next_state.flatten() if hasattr(next_state, 'flatten') else next_state
         self.dones[self.position] = done
         
         # Circular buffer logic
@@ -2974,19 +2930,19 @@ class SimpleReplayBuffer:
         # O(1) random integer generation instead of O(n) random.sample()
         indices = np.random.randint(0, self.size, size=batch_size)
         
-        # Direct array indexing - much faster than deque sampling
-        batch_states = [self.states[i] for i in indices]
+        # CRITICAL FIX: Direct numpy indexing - eliminates vstack bottleneck
+        batch_states = self.states[indices]  # Already 2D array
         batch_actions = self.actions[indices]
         batch_rewards = self.rewards[indices]
-        batch_next_states = [self.next_states[i] for i in indices]
+        batch_next_states = self.next_states[indices]  # Already 2D array  
         batch_dones = self.dones[indices]
 
-        # Convert to tensors
-        states = torch.from_numpy(np.vstack(batch_states)).float().to(training_device)
-        actions = torch.from_numpy(batch_actions.reshape(-1, 1)).long().to(training_device)
-        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float().to(training_device)
-        next_states = torch.from_numpy(np.vstack(batch_next_states)).float().to(training_device)
-        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float().to(training_device)
+        # PERFORMANCE: Use pin_memory=True for faster GPU transfers
+        states = torch.from_numpy(batch_states).float().pin_memory().to(training_device, non_blocking=True)
+        actions = torch.from_numpy(batch_actions.reshape(-1, 1)).long().pin_memory().to(training_device, non_blocking=True)
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float().pin_memory().to(training_device, non_blocking=True)
+        next_states = torch.from_numpy(batch_next_states).float().pin_memory().to(training_device, non_blocking=True)
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float().pin_memory().to(training_device, non_blocking=True)
 
         return states, actions, rewards, next_states, dones
 
