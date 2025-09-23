@@ -220,6 +220,8 @@ class MetricsData:
     reward_count_interval_total: int = 0
     reward_sum_interval_dqn: float = 0.0
     reward_count_interval_dqn: int = 0
+    reward_sum_interval_expert: float = 0.0
+    reward_count_interval_expert: int = 0
     # Training enable/disable (UI toggle). When False, background workers do no training.
     training_enabled: bool = True
     # Epsilon override: when True, force epsilon=0.0 (pure greedy) regardless of other overrides
@@ -308,6 +310,8 @@ class MetricsData:
                 self.reward_count_interval_total += 1
                 self.reward_sum_interval_dqn += float(dqn_reward)
                 self.reward_count_interval_dqn += 1
+                self.reward_sum_interval_expert += float(expert_reward)
+                self.reward_count_interval_expert += 1
             except Exception:
                 pass
     

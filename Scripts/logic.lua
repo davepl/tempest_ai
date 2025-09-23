@@ -38,9 +38,9 @@ local M = {} -- Module table
 
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
-local SCORE_UNIT = 20000.0           -- 20k points ~= 1 life worth of reward
-local LEVEL_COMPLETION_BONUS = 5.0   -- Edge-triggered bonus when level increments
-local DEATH_PENALTY = 2.5            -- Edge-triggered penalty when dying (raised to better balance vs completion)
+local SCORE_UNIT = 10000.0           -- 20k points ~= 1 life worth of reward
+local LEVEL_COMPLETION_BONUS = 1.0   -- Edge-triggered bonus when level increments
+local DEATH_PENALTY = 1.0            -- Edge-triggered penalty when dying (raised to better balance vs completion)
 local ZAP_COST = 0.01                -- Small cost per zap press (edge-triggered)
 
 local previous_score = 0
@@ -421,6 +421,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local nearest_pulsar_rel = nil
     local min_pulsar_abs_rel = 100
 
+        -- Track flipper-side presence separately so non-flipper threats don't disable open-level retreat
+        local flipper_left_exists, flipper_right_exists = false, false
         for i = 1, 7 do
             local depth = enemies_state.enemy_depths[i]
             if depth > 0 and depth <= TOP_RAIL_DEPTH then
@@ -484,6 +486,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                              nearest_flipper_rel = rel_float
                              nearest_flipper_frac_pos = frac_pos
                         end
+                        -- Record flipper presence by side using integer relative sign
+                        if rel_int > 0 then flipper_right_exists = true end
+                        if rel_int < 0 then flipper_left_exists = true end
                     elseif core_type == ENEMY_TYPE_PULSAR then
                         if abs_rel_float < min_pulsar_abs_rel then
                             min_pulsar_abs_rel = abs_rel_float
@@ -636,7 +641,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             proposed_fire_prio = base_fire_priority -- Start with base priority (might be overridden by safety checks below)
         end
 
-    if not conserve_override_active and enemy_left_exists and enemy_right_exists then
+    if not conserve_override_active and (
+            (not is_open and enemy_left_exists and enemy_right_exists) or
+            (is_open and flipper_left_exists and flipper_right_exists)
+        ) then
             -- Case 1: Both Sides (Closed levels) - Stay stationary and conserve fire until thresholds, then fire
             if not is_open then
                 proposed_target_seg = player_abs_seg
@@ -695,17 +703,32 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     end
                 end
             end
+    elseif not conserve_override_active and is_open and flipper_right_exists and not flipper_left_exists then
+            -- Case 2 (Open): Flippers only on Right - Fixed retreat lane
+            proposed_target_seg = RIGHT_RETREAT_SEGMENT
+            if nr_dist_float <= FLIPPER_REACT_DISTANCE_R then
+                proposed_fire_prio = 15 -- High priority fire when in range
+            else
+                proposed_fire_prio = 1 -- Conserve shots while waiting
+            end
+    elseif not conserve_override_active and is_open and flipper_left_exists and not flipper_right_exists then
+            -- Case 3 (Open): Flippers only on Left - Fixed retreat lane
+            proposed_target_seg = LEFT_RETREAT_SEGMENT
+            if nl_dist_float <= FLIPPER_REACT_DISTANCE_L then
+                proposed_fire_prio = 15
+            else
+                proposed_fire_prio = 1
+            end
     elseif not conserve_override_active and enemy_right_exists then
             -- Case 2: Right Only - Simplified retreat and fire logic
             if is_open then 
-                -- Always retreat to segment 1 when flippers exist to the right
-                proposed_target_seg = RIGHT_RETREAT_SEGMENT
-                
-                -- Fire from retreat position when enemy is close enough
-                if nr_dist_float <= FLIPPER_REACT_DISTANCE_R then
-                    proposed_fire_prio = 15 -- High priority fire when in range
+                -- For open levels, this branch now handles non-flipper right-side threats only
+                -- Keep player position unless dangerously close
+                proposed_target_seg = player_abs_seg 
+                if nr_dist < SAFE_DISTANCE then
+                    proposed_fire_prio = FREEZE_FIRE_PRIO_HIGH
                 else
-                    proposed_fire_prio = 1 -- Low priority, conserve shots while waiting
+                    proposed_fire_prio = 1
                 end
             else 
                 if nr_dist < SAFE_DISTANCE then
@@ -720,14 +743,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     elseif not conserve_override_active and enemy_left_exists then
             -- Case 3: Left Only - Simplified retreat and fire logic  
             if is_open then 
-                -- Always retreat to segment 14 when flippers exist to the left
-                proposed_target_seg = LEFT_RETREAT_SEGMENT
-                
-                -- Fire from retreat position when enemy is close enough
-                if nl_dist_float <= FLIPPER_REACT_DISTANCE_L then
-                    proposed_fire_prio = 15 -- High priority fire when in range
+                -- For open levels, this branch now handles non-flipper left-side threats only
+                proposed_target_seg = player_abs_seg
+                if nl_dist < SAFE_DISTANCE then
+                    proposed_fire_prio = FREEZE_FIRE_PRIO_HIGH
                 else
-                    proposed_fire_prio = 1 -- Low priority, conserve shots while waiting
+                    proposed_fire_prio = 1
                 end
             else 
                 if nl_dist < SAFE_DISTANCE then
