@@ -885,7 +885,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             end
 
             self.active_top_rail_enemies[i] = rel_float
-            print("Top rail at: " .. string.format("%.3f", rel_float) .. " (slot " .. i .. ")")
+            -- print("Top rail at: " .. string.format("%.3f", rel_float) .. " (slot " .. i .. ")")
         end
     end
 
