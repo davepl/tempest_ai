@@ -673,6 +673,10 @@ function M.EnemiesState:new()
     self.enemy_can_shoot = {}      -- Bit 6 from state byte (0/1)
     self.enemy_split_behavior = {} -- Bits 0-1 from state byte
 
+    -- Raw angle/progress per enemy (Size 7)
+    -- Mirrors more_enemy_info at $02CC..$02D2; low nibble (0-15) increments/decrements while between segments
+    self.more_enemy_info = {}
+
     -- Enemy Shot Info (Size 4)
     self.shot_positions = {}          -- Absolute depth/position ($02DB + i - 1)
     self.enemy_shot_segments = {}     -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
@@ -720,6 +724,7 @@ function M.EnemiesState:new()
         self.enemy_moving_away[i] = 0
         self.enemy_can_shoot[i] = 0
         self.enemy_split_behavior[i] = 0
+        self.more_enemy_info[i] = 0
     end
     for i = 1, 4 do
         self.shot_positions[i] = 0
@@ -770,7 +775,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
     -- Read and process enemy slots (1-7)
     for i = 1, 7 do
-        -- Read depth and segment first to determine activity
+    -- Read depth and segment first to determine activity
         local enemy_depth_raw = mem:read_u8(0x02DF + i - 1) -- EnemyPositions ($02DF-$02E5)
         local abs_segment_raw = mem:read_u8(0x02B9 + i - 1) -- EnemySegments ($02B9-$02BF)
 
@@ -809,6 +814,9 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.enemy_moving_away[i] = (state_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Moving Away?
             self.enemy_can_shoot[i] = (state_byte & 0x40) ~= 0 and 1 or 0   -- Bit 6: Can Shoot?
             self.enemy_split_behavior[i] = state_byte & 0x03                -- Bits 0-1: Split Behavior
+
+            -- Read raw more_enemy_info angle/progress byte ($02CC-$02D2)
+            self.more_enemy_info[i] = mem:read_u8(0x02CC + i - 1)
         end -- End if enemy active
     end -- End enemy slot loop
 
@@ -832,44 +840,40 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
         -- Check if it's a top rail Pulsar or Flipper (close to top)
         if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] <= 0x30) then
-            -- Combine integer relative segment with fractional offset for smoother targeting.
-            -- rel_int in [-8,+8] (closed) or [-15,+15] (open)
-            local rel_int = self.enemy_segments[i]
-            -- Fraction is provided as signed 12-bit fixed-point in fractional_enemy_segments_by_slot (scaled by 4096).
-            -- If unavailable, treat as 0 (no between-segment progress).
+            -- Build absolute floating segment using between-segment progress (from more_enemy_info low nibble)
+            local abs_int = self.enemy_abs_segments[i]
+            local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
             local frac = 0.0
-            local frac_fixed = self.fractional_enemy_segments_by_slot[i]
-            if frac_fixed ~= INVALID_SEGMENT then
-                frac = frac_fixed / 4096.0
-                -- Ensure within [0,1) if source encoding is unit fraction
-                if frac < 0 then frac = -frac end
-                if frac >= 1.0 then frac = frac - math.floor(frac) end
+            if self.enemy_between_segments[i] == 1 then
+                frac = angle_nibble / 16.0 -- in [0,1)
             end
 
-            -- Determine direction sign: prefer rel_int sign; if zero, fall back to direction bit
-            local dir_sign = 0
-            if rel_int > 0 then
-                dir_sign = 1
-            elseif rel_int < 0 then
-                dir_sign = -1
+            -- Absolute float: move in the current motion direction by frac
+            local abs_float
+            if self.enemy_between_segments[i] == 1 then
+                if self.enemy_direction_moving[i] == 1 then
+                    abs_float = abs_int + frac
+                else
+                    abs_float = abs_int - frac
+                end
             else
-                dir_sign = (self.enemy_direction_moving[i] == 1) and 1 or -1
+                abs_float = abs_int
             end
 
-            -- Compose float position: advance toward the target lane by fractional amount
+            -- Normalize to [0,16)
+            abs_float = abs_float % 16.0
+            if abs_float < 0 then abs_float = abs_float + 16.0 end
+
+            -- Convert to relative float
             local rel_float
-            if rel_int > 0 then
-                rel_float = rel_int + frac
-            elseif rel_int < 0 then
-                rel_float = rel_int - (1.0 - frac)
+            if is_open then
+                rel_float = abs_float - player_abs_segment
             else
-                rel_float = dir_sign * frac
+                -- Wrap into [-8,+8]
+                rel_float = abs_float - player_abs_segment
+                while rel_float > 8.0 do rel_float = rel_float - 16.0 end
+                while rel_float < -8.0 do rel_float = rel_float + 16.0 end
             end
-
-            -- Clamp to legal ring range (safety)
-            local max_rel = is_open and 15.0 or 8.0
-            if rel_float >  max_rel then rel_float =  max_rel end
-            if rel_float < -max_rel then rel_float = -max_rel end
 
             self.active_top_rail_enemies[i] = rel_float
             print("Top rail at: " .. string.format("%.3f", rel_float) .. " (slot " .. i .. ")")
@@ -917,14 +921,19 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
     end
     
-    -- Calculate fractional enemy segments (scaled to 12 bits)
+    -- Calculate true between-segment fraction per slot (scaled to 12-bit, 0..4095)
     for i = 1, 7 do
-        if self.enemy_segments[i] == INVALID_SEGMENT then
-            self.fractional_enemy_segments_by_slot[i] = INVALID_SEGMENT -- Keep as invalid
+        if self.enemy_abs_segments[i] == INVALID_SEGMENT then
+            self.fractional_enemy_segments_by_slot[i] = INVALID_SEGMENT
         else
-            -- Convert fractional segment to a 12-bit value
-            local scaled_value = math.floor(self.enemy_segments[i] * 4096) -- Scale to 12 bits
-            scaled_value = math.max(-4095, math.min(4095, scaled_value)) -- Clamp to signed 12-bit range
+            local frac = 0.0
+            if self.enemy_between_segments[i] == 1 then
+                local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
+                frac = angle_nibble / 16.0 -- [0,1)
+            end
+            local scaled_value = math.floor(frac * 4096.0 + 0.5) -- Round to nearest
+            if scaled_value >= 4096 then scaled_value = 4095 end
+            if scaled_value < 0 then scaled_value = 0 end
             self.fractional_enemy_segments_by_slot[i] = scaled_value
         end
     end
