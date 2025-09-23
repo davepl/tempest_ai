@@ -414,23 +414,22 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             if depth > 0 and depth <= TOP_RAIL_DEPTH then
                 local seg = enemies_state.enemy_abs_segments[i]
                 if seg ~= INVALID_SEGMENT then
-                    -- Get fractional position (scaled to 0-1 range)
+                    -- Progress (0..1) from state; already direction-aware
                     local frac_pos = 0
                     if enemies_state.fractional_enemy_segments_by_slot[i] ~= INVALID_SEGMENT then
                         frac_pos = enemies_state.fractional_enemy_segments_by_slot[i] / 4096.0
                     end
-                    
-                    -- Get both integer and floating point relative positions
+
+                    -- Integer relative position for coarse logic
                     local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
-                    
-                    -- Store fractional position for detailed calculations but use integer position for main logic
-                    local rel_float = rel_int
-                    if rel_int > 0 then
-                        rel_float = rel_int + frac_pos
-                    elseif rel_int < 0 then
-                        rel_float = rel_int - (1 - frac_pos)  -- Adjust for negative direction
+
+                    -- Authoritative relative float from state (uses more_enemy_info + direction)
+                    local rel_float = enemies_state.active_top_rail_enemies[i]
+                    if rel_float == 0 and enemies_state.enemy_between_segments[i] == 0 then
+                        -- Not between segments; use integer relative
+                        rel_float = rel_int
                     end
-                    
+
                     -- Use integer-based absolute distance for coarse comparisons; keep float for precision
                     local abs_rel_int = math.abs(rel_int)
                     local abs_rel_float = math.abs(rel_float)
@@ -846,7 +845,7 @@ end
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local reward, bDone = 0.0, false
-    
+
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 then
         reward = 0
