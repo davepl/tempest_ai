@@ -133,6 +133,14 @@ class RLConfigData:
     # Loss weighting: balance continuous head relative to discrete head
     continuous_loss_weight: float = 0.5
 
+    # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
+    reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target
+    reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
+    reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
+
+    # Optional gradient value clamp (0.0 disables)
+    max_grad_value: float = 0.0
+
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
 

@@ -938,12 +938,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 shot_reward = -0.010  -- Small penalty for being defenseless
             elseif shot_count >= 1 and shot_count <= 6 then
                 -- Good range: defensive coverage with adequate reserves
-                local segment_safety_bonus = 0.0004  -- Small reward for segment protection
-                local reserve_bonus = (max_shots - shot_count) * 0.0002  -- Bonus for keeping reserves
+                local segment_safety_bonus = 0.04  -- Small reward for segment protection
+                local reserve_bonus = (max_shots - shot_count) * 0.02  -- Bonus for keeping reserves
                 shot_reward = segment_safety_bonus + reserve_bonus
             elseif shot_count >= 7 then
                 -- Too many shots active - insufficient reserves for emergencies
-                shot_reward = -0.001  -- Penalty for poor resource management
+                shot_reward = -0.01  -- Penalty for poor resource management
             end
             
             reward = reward + shot_reward
@@ -1000,19 +1000,19 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 
                 -- Award for being on target segment
                 if current_distance == 0 then
-                    positioning_reward = 0.008  -- Strong positive reward for optimal positioning
+                    positioning_reward = 0.8  -- Strong positive reward for optimal positioning
                 -- Award for moving toward target
                 elseif current_distance < previous_distance then
                     local progress = previous_distance - current_distance
-                    positioning_reward = 0.003 * progress  -- Fractional reward based on progress
+                    positioning_reward = 0.3 * progress  -- Fractional reward based on progress
                 -- Small penalty for moving away from target or not moving when needed
                 elseif current_distance > 0 then
                     if current_distance > previous_distance then
                         -- Moving away from target
-                        positioning_reward = -0.002
+                        positioning_reward = -0.2
                     elseif current_distance == previous_distance and current_distance > 1 then
                         -- Not moving when movement toward target is needed
-                        positioning_reward = -0.001
+                        positioning_reward = -0.1
                     end
                 end
                 
