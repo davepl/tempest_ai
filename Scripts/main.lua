@@ -392,7 +392,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         save_signal,                -- B: Save Signal (uchar)
         ps.fire_commanded,          -- B: Commanded Fire (uchar)
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
-        ps.spinner_commanded,       -- h: Commanded Spinner (short)
+        ps.spinner_commanded,       -- h: Commanded Spinner (short)o
         is_attract_mode and 1 or 0, -- B: Is Attract Mode (uchar)
         oob_nearest_enemy_abs_seg,  -- h: Nearest Enemy ABS Segment (short)
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)

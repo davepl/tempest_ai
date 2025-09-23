@@ -830,9 +830,49 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.active_pulsar[i] = self.enemy_segments[i]
         end
 
-        -- Check if it's a top rail Pulsar or Flipper at depth 0x20
-        if (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] == 0x10 then
-            self.active_top_rail_enemies[i] = self.enemy_segments[i]
+        -- Check if it's a top rail Pulsar or Flipper (close to top)
+        if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] <= 0x30) then
+            -- Combine integer relative segment with fractional offset for smoother targeting.
+            -- rel_int in [-8,+8] (closed) or [-15,+15] (open)
+            local rel_int = self.enemy_segments[i]
+            -- Fraction is provided as signed 12-bit fixed-point in fractional_enemy_segments_by_slot (scaled by 4096).
+            -- If unavailable, treat as 0 (no between-segment progress).
+            local frac = 0.0
+            local frac_fixed = self.fractional_enemy_segments_by_slot[i]
+            if frac_fixed ~= INVALID_SEGMENT then
+                frac = frac_fixed / 4096.0
+                -- Ensure within [0,1) if source encoding is unit fraction
+                if frac < 0 then frac = -frac end
+                if frac >= 1.0 then frac = frac - math.floor(frac) end
+            end
+
+            -- Determine direction sign: prefer rel_int sign; if zero, fall back to direction bit
+            local dir_sign = 0
+            if rel_int > 0 then
+                dir_sign = 1
+            elseif rel_int < 0 then
+                dir_sign = -1
+            else
+                dir_sign = (self.enemy_direction_moving[i] == 1) and 1 or -1
+            end
+
+            -- Compose float position: advance toward the target lane by fractional amount
+            local rel_float
+            if rel_int > 0 then
+                rel_float = rel_int + frac
+            elseif rel_int < 0 then
+                rel_float = rel_int - (1.0 - frac)
+            else
+                rel_float = dir_sign * frac
+            end
+
+            -- Clamp to legal ring range (safety)
+            local max_rel = is_open and 15.0 or 8.0
+            if rel_float >  max_rel then rel_float =  max_rel end
+            if rel_float < -max_rel then rel_float = -max_rel end
+
+            self.active_top_rail_enemies[i] = rel_float
+            print("Top rail at: " .. string.format("%.3f", rel_float) .. " (slot " .. i .. ")")
         end
     end
 
