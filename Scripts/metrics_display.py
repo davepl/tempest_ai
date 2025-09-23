@@ -136,6 +136,17 @@ def display_metrics_header():
     
     print_metrics_line(header, is_header=True)
 
+    # Initialize the timing anchor for Steps/s so the first row divides by real elapsed seconds
+    try:
+        now = time.time()
+        with metrics.lock:
+            last_t = getattr(metrics, 'last_metrics_row_time', 0.0)
+            if not isinstance(last_t, (int, float)) or last_t <= 0.0:
+                metrics.last_metrics_row_time = now
+    except Exception:
+        # If metrics.lock or attributes aren't available yet, skip init safely
+        pass
+
 def display_metrics_row(agent, kb_handler):
     """Display a row of metrics data"""
     global row_counter
