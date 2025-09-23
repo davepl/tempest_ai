@@ -371,12 +371,15 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
 
     -- Fetch last reward components to transmit out-of-band (avoid recomputation in Python)
     -- Pack OOB data (header only, reward components removed for simplicity)
+    -- NOTE: The short (h) after attract encodes the NEAREST ENEMY ABSOLUTE SEGMENT for Python expert steering.
     -- Format legend:
     --   >HdBBBHHHBBBhBhBBBBB
     --   H: num_values, d: reward, BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
-    --   BBB: (save, fire, zap), h: spinner, B: attract, h: expert_target_seg, B: player_seg, B: is_open,
+    --   BBB: (save, fire, zap), h: spinner, B: attract, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number
     local oob_format = ">HdBBBHHHBBBhBhBBBBB"
+    -- Determine nearest enemy absolute segment to transmit (or -1 if none)
+    local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         reward,                     -- d: Reward (double)
@@ -391,7 +394,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
         ps.spinner_commanded,       -- h: Commanded Spinner (short)
         is_attract_mode and 1 or 0, -- B: Is Attract Mode (uchar)
-        expert_target_seg or -1,    -- h: Expert Target Segment (short)
+        oob_nearest_enemy_abs_seg,  -- h: Nearest Enemy ABS Segment (short)
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
