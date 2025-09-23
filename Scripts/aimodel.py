@@ -857,7 +857,7 @@ class HybridDQNAgent:
         # Gather Q-values for taken discrete actions
         discrete_q_targets = discrete_q_pred.gather(1, discrete_actions)
         
-        # Next state predictions for target computation
+    # Next state predictions for target computation
         with torch.no_grad():
             if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
                 # Action selection from local, evaluation with target
@@ -871,8 +871,21 @@ class HybridDQNAgent:
             # If upstream provided n-step returns in rewards, discount bootstrap by gamma^n
             n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
             gamma_boot = (self.gamma ** n_step) if n_step > 1 else self.gamma
+            # Reward transform to stabilize scale after environment reward changes
+            r = rewards
+            try:
+                rs = float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
+                if rs != 1.0:
+                    r = r * rs
+                rc = float(getattr(RL_CONFIG, 'reward_clamp_abs', 0.0) or 0.0)
+                if rc > 0.0:
+                    r = torch.clamp(r, -rc, rc)
+                if bool(getattr(RL_CONFIG, 'reward_tanh', False)):
+                    r = torch.tanh(r)
+            except Exception:
+                pass
             # TD targets
-            discrete_targets = rewards + (gamma_boot * discrete_q_next_max * (1 - dones))
+            discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
             continuous_targets = continuous_actions  # Use actual actions as targets for regression
         
         # When using AMP, ensure target tensors match prediction dtypes to avoid Float/Half mismatches
@@ -916,12 +929,16 @@ class HybridDQNAgent:
             except Exception:
                 pass
         try:
+            # Replace non-finite grads with zeros to keep metrics stable
             sq_sum = 0.0
             for p in self.qnetwork_local.parameters():
                 if p.grad is not None:
-                    # L2 norm per-parameter, accumulate squared
-                    g = p.grad.data.norm(2).item()
-                    sq_sum += g * g
+                    # Sanitize non-finite values
+                    if not torch.isfinite(p.grad).all():
+                        p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
+                    g = p.grad.data.norm(2)
+                    if torch.isfinite(g):
+                        sq_sum += float(g.item() ** 2)
             preclip_grad_norm = (sq_sum ** 0.5)
         except Exception:
             preclip_grad_norm = 0.0
@@ -932,13 +949,21 @@ class HybridDQNAgent:
                 # If not already unscaled above, unscale once before clipping
                 if use_amp and scaler is not None and not did_unscale:
                     scaler.unscale_(self.optimizer)
+                # Optional per-value clamp before norm clip
+                max_gv = float(getattr(RL_CONFIG, 'max_grad_value', 0.0) or 0.0)
+                if max_gv > 0.0:
+                    for p in self.qnetwork_local.parameters():
+                        if p.grad is not None:
+                            p.grad.data.clamp_(-max_gv, max_gv)
                 torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
                 # Recompute norm after clipping
                 sq_sum = 0.0
                 for p in self.qnetwork_local.parameters():
                     if p.grad is not None:
-                        g = p.grad.data.norm(2).item()
-                        sq_sum += g * g
+                        g = p.grad.data.norm(2)
+                        if torch.isfinite(g):
+                            x = float(g.item())
+                            sq_sum += x * x
                 postclip_grad_norm = (sq_sum ** 0.5)
             except Exception:
                 postclip_grad_norm = preclip_grad_norm
@@ -974,11 +999,13 @@ class HybridDQNAgent:
             pass
         # Publish grad diagnostics
         try:
-            if preclip_grad_norm > 0:
+            # Only publish finite diagnostics
+            if preclip_grad_norm > 0 and np.isfinite(preclip_grad_norm) and np.isfinite(postclip_grad_norm):
                 metrics.grad_clip_delta = float(postclip_grad_norm / max(preclip_grad_norm, 1e-12))
+                metrics.grad_norm = float(preclip_grad_norm)
             else:
                 metrics.grad_clip_delta = 1.0
-            metrics.grad_norm = float(preclip_grad_norm)
+                metrics.grad_norm = 0.0
         except Exception:
             pass
 
