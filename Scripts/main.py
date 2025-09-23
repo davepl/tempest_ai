@@ -59,7 +59,17 @@ def keyboard_input_handler(agent, keyboard_handler):
                 # Handle different keys
                 if key == 'q':
                     print("Quit command received, shutting down...")
-                    metrics.global_server.running = False
+                    try:
+                        if metrics.global_server:
+                            metrics.global_server.running = False
+                            metrics.global_server.stop()
+                    except Exception:
+                        pass
+                    try:
+                        if agent:
+                            agent.stop(join=True)
+                    except Exception:
+                        pass
                     break
                 elif key == 's':
                     print("Save command received, saving model...")
@@ -169,6 +179,24 @@ def main():
         # Restore terminal settings
         if IS_INTERACTIVE and keyboard_handler:
             keyboard_handler.restore_terminal()
+        
+        # Stop server and agent gracefully
+        try:
+            if server:
+                server.stop()
+        except Exception:
+            pass
+        try:
+            if agent:
+                agent.stop(join=True)
+        except Exception:
+            pass
+        
+        # Join server thread to avoid abrupt abort on exit
+        try:
+            server_thread.join(timeout=2.0)
+        except Exception:
+            pass
         
         print("Application shutdown complete")
 

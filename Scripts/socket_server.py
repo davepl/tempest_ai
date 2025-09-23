@@ -212,6 +212,7 @@ class SocketServer:
                     state['level_number'] = frame.level_number
                     state['prev_frame'] = state.get('current_frame')
                     state['current_frame'] = frame
+                    # No per-level frame tracking needed for probabilistic zap gate
                     now = time.time()
                     elapsed = now - state['last_frame_time']
                     if elapsed >= 1.0:
@@ -322,6 +323,7 @@ class SocketServer:
                     state['total_reward'] = 0.0
                     state['episode_dqn_reward'] = 0.0
                     state['episode_expert_reward'] = 0.0
+                    # No per-level frame tracking
 
                 # choose action (hybrid-only)
                 self.metrics.increment_total_controls()
@@ -376,6 +378,18 @@ class SocketServer:
                             except Exception:
                                 pass
                         discrete_action, continuous_spinner = int(da), float(ca)
+                        # Probabilistic superzap gate for DQN actions: allow zap with probability superzap_prob
+                        try:
+                            pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))
+                        except Exception:
+                            pzap = 0.01
+                        try:
+                            # If DQN chose a zap (bit0==1), keep it only with probability pzap
+                            if (discrete_action & 1) == 1:
+                                if random.random() >= max(0.0, min(1.0, pzap)):
+                                    discrete_action = (discrete_action & 2)  # clear zap bit, preserve fire
+                        except Exception:
+                            pass
                         action_source = 'dqn'
                 else:
                     action_source = 'none'

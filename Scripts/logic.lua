@@ -37,6 +37,12 @@ local PULSAR_PREF_TOLERANCE = 0.15 -- acceptable window around preferred distanc
 local M = {} -- Module table
 
 -- Global variables needed by calculate_reward (scoped within this module)
+-- Reward shaping parameters (tunable)
+local SCORE_UNIT = 20000.0           -- 20k points ~= 1 life worth of reward
+local LEVEL_COMPLETION_BONUS = 5.0   -- Edge-triggered bonus when level increments
+local DEATH_PENALTY = 2.5            -- Edge-triggered penalty when dying (raised to better balance vs completion)
+local ZAP_COST = 0.01                -- Small cost per zap press (edge-triggered)
+
 local previous_score = 0
 local previous_level = 0
 local previous_alive_state = 1 -- Track previous alive state, initialize as alive
@@ -48,6 +54,8 @@ local previous_zap_detected = 0
 local previous_fire_detected = 0
 -- Track previous player position for positioning reward
 local previous_player_position = 0
+-- Track score at the beginning of the current level (for optional ratio-based bonuses)
+local score_at_level_start = 0
 
 -- Track previous top-rail alignment (for progress reward)
 local previous_toprail_min_abs_rel = nil
@@ -852,29 +860,29 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = 0
+        reward = reward - DEATH_PENALTY
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
         if score_delta ~= 0 and score_delta < 1000 then                         -- Filter our large completion bonuses
-            local r_score = score_delta / 20000.0                               -- Scaled: 20k points = 1 life = 1.0 reward unit
+            local r_score = score_delta / SCORE_UNIT                            -- Scaled: 20k points = 1.0 reward unit
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
-            reward = 1
+            reward = reward + r_score
         end
 
         -- Level completion bonus (edge-triggered) - Scaled to match death penalty magnitude
         if (level_state.level_number or 0) > (previous_level or 0) then
-            local level_bonus = 1.0                                             -- Scaled to match 1 life = 1.0 reward unit
-            reward = 1
+            -- Fixed completion bonus; optional ratio-based scaling can be added later using score_at_level_start
+            reward = reward + LEVEL_COMPLETION_BONUS
             bDone = true
         end
 
         -- Zap cost (edge-triggered on button press)
         local zap_now = player_state.zap_detected or 0
         if zap_now == 1 and previous_zap_detected == 0 then
-            reward = reward - 0.01
+            reward = reward - ZAP_COST
         end
 
         -- === OBJECTIVE DENSE REWARD COMPONENTS ===
@@ -1002,19 +1010,21 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 
                 -- Award for being on target segment
                 if current_distance == 0 then
-                    positioning_reward = 0.8  -- Strong positive reward for optimal positioning
+                    -- Worth ~10 points when perfectly aligned (10 / SCORE_UNIT)
+                    positioning_reward = 10.0 / SCORE_UNIT
                 -- Award for moving toward target
                 elseif current_distance < previous_distance then
                     local progress = previous_distance - current_distance
-                    positioning_reward = 0.3 * progress  -- Fractional reward based on progress
+                    -- Scale small progress reward so it remains below score/death signals
+                    positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
                 -- Small penalty for moving away from target or not moving when needed
                 elseif current_distance > 0 then
                     if current_distance > previous_distance then
                         -- Moving away from target
-                        positioning_reward = -0.2
+                        positioning_reward = -0.25 * (10.0 / SCORE_UNIT)
                     elseif current_distance == previous_distance and current_distance > 1 then
                         -- Not moving when movement toward target is needed
-                        positioning_reward = -0.1
+                        positioning_reward = -0.10 * (10.0 / SCORE_UNIT)
                     end
                 end
                 
@@ -1053,8 +1063,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     if previous_toprail_min_abs_rel then
                         local delta = previous_toprail_min_abs_rel - min_abs_rel_float
                         if delta > 0 then
-                            -- Small reward proportional to progress, capped
-                            reward = reward + math.min(0.05, 0.03 * delta)
+                            -- Small reward proportional to progress, capped and scaled under 10 pts
+                            local progress_bonus = math.min(1.0, delta) * (3.0 / SCORE_UNIT)
+                            reward = reward + progress_bonus
                         end
                     end
 
@@ -1062,12 +1073,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local fire_now = (player_state.fire_detected or 0)
                     local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                     if min_abs_rel_float <= 0.30 and fire_edge then
-                        reward = reward + 0.08
+                        reward = reward + (4.0 / SCORE_UNIT) -- small bonus (~4 pts) for well-timed shot
                     end
 
                     -- Mild penalty for not firing while very close (nudges behavior)
                     if min_abs_rel_float <= 0.50 and fire_now == 0 then
-                        reward = reward - 0.01
+                        reward = reward - (1.0 / SCORE_UNIT)
                     end
                 end
             end
@@ -1100,8 +1111,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     end
 
     -- State updates
-    previous_score = player_state.score or 0
-    previous_level = level_state.level_number or 0
+    -- Detect level increment to reset per-level trackers
+    local current_level = level_state.level_number or 0
+    local current_score = player_state.score or 0
+    if current_level > (previous_level or 0) then
+        score_at_level_start = current_score
+    end
+    previous_score = current_score
+    previous_level = current_level
     previous_alive_state = player_state.alive or 0
     previous_zap_detected = player_state.zap_detected or 0
     previous_fire_detected = player_state.fire_detected or 0
