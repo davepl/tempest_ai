@@ -18,6 +18,7 @@ import struct
 import threading
 import traceback
 import random
+import errno
 from collections import deque
 
 import numpy as np
@@ -86,9 +87,33 @@ class SocketServer:
 
         try:
             while self.running and not self.shutdown_event.is_set():
-                readable, _, _ = select.select([self.server_socket], [], [], 0.05)
+                # select may raise or the socket may be closed concurrently during shutdown; handle gracefully
+                try:
+                    readable, _, _ = select.select([self.server_socket], [], [], 0.05)
+                except (OSError, ValueError) as e:
+                    # If we're shutting down, break quietly
+                    if self.shutdown_event.is_set() or not self.running:
+                        break
+                    # If the server socket was closed, EBADF/EINVAL are expected; exit loop silently
+                    if isinstance(e, OSError) and getattr(e, 'errno', None) in (errno.EBADF, errno.EINVAL):
+                        break
+                    # Otherwise, re-raise to outer handler
+                    raise
+
+                if not self.server_socket:
+                    break
+
                 if self.server_socket in readable:
-                    client_socket, addr = self.server_socket.accept()
+                    try:
+                        client_socket, addr = self.server_socket.accept()
+                    except OSError as e:
+                        # During shutdown accept may see EBADF/EINVAL; exit loop quietly
+                        if (self.shutdown_event.is_set() or not self.running) and getattr(e, 'errno', None) in (errno.EBADF, errno.EINVAL):
+                            break
+                        # EAGAIN/EWOULDBLOCK can happen with non-blocking sockets; continue loop
+                        if getattr(e, 'errno', None) in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            continue
+                        raise
                     client_id = self._allocate_client_id()
                     self._init_client_state(client_id)
                     t = threading.Thread(target=self.handle_client, args=(client_socket, client_id), daemon=True)
@@ -96,8 +121,10 @@ class SocketServer:
                         self.clients[client_id] = t
                     t.start()
         except Exception as e:
-            print(f"Server loop error: {e}")
-            traceback.print_exc()
+            # Suppress noisy tracebacks if we're shutting down intentionally
+            if not (self.shutdown_event.is_set() or not self.running):
+                print(f"Server loop error: {e}")
+                traceback.print_exc()
         finally:
             self.stop()
 
@@ -106,7 +133,12 @@ class SocketServer:
         self.shutdown_event.set()
         try:
             if self.server_socket:
+                try:
+                    self.server_socket.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
                 self.server_socket.close()
+                self.server_socket = None
         except Exception:
             pass
 
