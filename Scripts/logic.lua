@@ -903,6 +903,13 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 proximity_scale = 0.9  -- Slightly reduce proximity rewards on simpler levels
                 safety_scale = 1.1     -- Increase safety emphasis on basic levels
             end
+
+            -- Compute expert target once for reward gating (avoid rewarding moves toward danger)
+            local expert_target_seg_cached = -1
+            do
+                local ets, _, _, _ = M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
+                expert_target_seg_cached = ets or -1
+            end
             
             -- 1. DANGER AVOIDANCE REWARD (Objective Safety Assessment)
             -- Penalty for being in objectively dangerous positions
@@ -916,47 +923,47 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             
             -- 2. PROXIMITY OPTIMIZATION REWARD (Distance-based Positioning)
             -- Reward optimal distance to nearest enemy (not too close, not too far)
-            local nearest_distance = enemies_state.alignment_error_magnitude or 1.0
-            if enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT then
-                -- Convert normalized distance (0-1) to segments for clearer logic
-                local max_dist = is_open and 15.0 or 8.0
-                local distance_segments = nearest_distance * max_dist
-                
-                -- Optimal range: 1-3 segments (allows reaction time but maintains offensive capability)
-                local optimal_min, optimal_max = 1.0, 3.0
-                local prox_reward = 0.0
-                if distance_segments >= optimal_min and distance_segments <= optimal_max then
-                    prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
-                elseif distance_segments < optimal_min then
-                    prox_reward = -0.05 * proximity_scale  -- Too close penalty (higher risk)
-                elseif distance_segments > 5.0 then
-                    prox_reward = -0.03 * proximity_scale  -- Too far penalty (lower efficiency)
+            -- IMPORTANT: If expert target lane is dangerous, skip proximity shaping entirely.
+            do
+                local danger_target_lane = (expert_target_seg_cached ~= -1) and M.is_danger_lane(expert_target_seg_cached, enemies_state)
+                local nearest_distance = enemies_state.alignment_error_magnitude or 1.0
+                if not danger_target_lane and enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT then
+                    -- Convert normalized distance (0-1) to segments for clearer logic
+                    local max_dist = is_open and 15.0 or 8.0
+                    local distance_segments = nearest_distance * max_dist
+                    
+                    -- Optimal range: 1-3 segments (allows reaction time but maintains offensive capability)
+                    local optimal_min, optimal_max = 1.0, 3.0
+                    local prox_reward = 0.0
+                    if distance_segments >= optimal_min and distance_segments <= optimal_max then
+                        prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
+                    elseif distance_segments < optimal_min then
+                        prox_reward = -0.05 * proximity_scale  -- Too close penalty (higher risk)
+                    elseif distance_segments > 5.0 then
+                        prox_reward = -0.03 * proximity_scale  -- Too far penalty (lower efficiency)
+                    end
+                    -- Neutral reward for 3-5 segments (acceptable range)
+                    reward = reward + prox_reward
                 end
-                -- Neutral reward for 3-5 segments (acceptable range)
-                reward = reward + prox_reward
             end
             
             -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)
-            -- Encourage defensive shots in current segment while preserving ammo for critical threats
-            local shot_count = player_state.shot_count or 0
-            local max_shots = 8  -- Actual Tempest game limit
-            local shot_reward = 0.0
-            
-            -- Optimal shot count: 1-6 active (keeping 2-7 in reserve)
-            if shot_count == 0 then
-                -- No shots active - vulnerable to enemies in current segment
-                shot_reward = -0.010  -- Small penalty for being defenseless
-            elseif shot_count >= 1 and shot_count <= 6 then
-                -- Good range: defensive coverage with adequate reserves
-                local segment_safety_bonus = 0.04  -- Small reward for segment protection
-                local reserve_bonus = (max_shots - shot_count) * 0.02  -- Bonus for keeping reserves
-                shot_reward = segment_safety_bonus + reserve_bonus
-            elseif shot_count >= 7 then
-                -- Too many shots active - insufficient reserves for emergencies
-                shot_reward = -0.01  -- Penalty for poor resource management
+            -- Requested policy:
+            --   0-2 shots: penalty (too few shots)
+            --   4-7 shots: reward (good management)
+            --   8 shots: penalty (overuse)
+            do
+                local shot_count = player_state.shot_count or 0
+                local shot_reward = 0.0
+                if shot_count <= 2 then
+                    shot_reward = -1
+                elseif shot_count >= 4 and shot_count <= 7 then
+                    shot_reward = 1
+                elseif shot_count >= 8 then
+                    shot_reward = -1
+                end
+                reward = reward + shot_reward / SCORE_UNIT
             end
-            
-            reward = reward + shot_reward
             
             -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
             -- Bonus for appropriate responses to critical threats
@@ -989,7 +996,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and 
                        enemies_state.enemy_abs_segments[i] == player_abs_seg and
                        enemies_state.enemy_depths[i] > 0 then
-                        pulsar_reward = -0.1  -- Strong penalty for pulsar lane 
+                        pulsar_reward = -100 -- Strong penalty for pulsar lane 
                         break
                     end
                 end
@@ -997,46 +1004,49 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
             -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
             -- Reward the DQN for following expert system's strategic positioning recommendations
-            local positioning_reward = 0.0
-            local expert_target_seg, _, _, _ = M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
-            
-            if expert_target_seg ~= -1 then
-                local current_player_seg = player_abs_seg
-                local prev_player_seg = previous_player_position & 0x0F
-                
-                -- Calculate distances to expert target (current and previous)
-                local current_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg, is_open))
-                local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg, is_open))
-                
-                -- Award for being on target segment
-                if current_distance == 0 then
-                    -- Worth ~10 points when perfectly aligned (10 / SCORE_UNIT)
-                    positioning_reward = 10.0 / SCORE_UNIT
-                -- Award for moving toward target
-                elseif current_distance < previous_distance then
-                    local progress = previous_distance - current_distance
-                    -- Scale small progress reward so it remains below score/death signals
-                    positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
-                -- Small penalty for moving away from target or not moving when needed
-                elseif current_distance > 0 then
-                    if current_distance > previous_distance then
-                        -- Moving away from target
-                        positioning_reward = -0.25 * (10.0 / SCORE_UNIT)
-                    elseif current_distance == previous_distance and current_distance > 1 then
-                        -- Not moving when movement toward target is needed
-                        positioning_reward = -0.10 * (10.0 / SCORE_UNIT)
+            -- IMPORTANT: If expert target lane is dangerous, skip positioning shaping entirely.
+            do
+                local positioning_reward = 0.0
+                if expert_target_seg_cached ~= -1 then
+                    local danger_target_lane = M.is_danger_lane(expert_target_seg_cached, enemies_state)
+                    if not danger_target_lane then
+                        local current_player_seg = player_abs_seg
+                        local prev_player_seg = previous_player_position & 0x0F
+                        
+                        -- Calculate distances to expert target (current and previous)
+                        local current_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
+                        local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
+                        
+                        -- Award for being on target segment
+                        if current_distance == 0 then
+                            -- Worth ~10 points when perfectly aligned (10 / SCORE_UNIT)
+                            positioning_reward = 10.0 / SCORE_UNIT
+                        -- Award for moving toward target
+                        elseif current_distance < previous_distance then
+                            local progress = previous_distance - current_distance
+                            -- Scale small progress reward so it remains below score/death signals
+                            positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
+                        -- Small penalty for moving away from target or not moving when needed
+                        elseif current_distance > 0 then
+                            if current_distance > previous_distance then
+                                -- Moving away from target
+                                positioning_reward = -0.25 * (10.0 / SCORE_UNIT)
+                            elseif current_distance == previous_distance and current_distance > 1 then
+                                -- Not moving when movement toward target is needed
+                                positioning_reward = -0.10 * (10.0 / SCORE_UNIT)
+                            end
+                        end
+                        
+                        -- Apply level-specific scaling
+                        if level_type == 2 then -- Open levels
+                            positioning_reward = positioning_reward * 1.1  -- Slightly increase positioning importance on open levels
+                        elseif level_type == 0 then -- Basic levels
+                            positioning_reward = positioning_reward * 0.9  -- Slightly reduce on simpler levels
+                        end
                     end
                 end
-                
-                -- Apply level-specific scaling
-                if level_type == 2 then -- Open levels
-                    positioning_reward = positioning_reward * 1.1  -- Slightly increase positioning importance on open levels
-                elseif level_type == 0 then -- Basic levels
-                    positioning_reward = positioning_reward * 0.9  -- Slightly reduce on simpler levels
-                end
+                reward = reward + positioning_reward
             end
-            
-            reward = reward + positioning_reward
 
             -- 8. TOP-RAIL FLIPPER ENGAGEMENT REWARD (dense shaping using fractional rel positions)
             do
