@@ -845,7 +845,7 @@ end
 
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local reward, bDone = 0.0, false
+    local reward, bDone = false, false
 
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 then
@@ -915,15 +915,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local optimal_min, optimal_max = 1.0, 3.0
                 local prox_reward = 0.0
                 if distance_segments >= optimal_min and distance_segments <= optimal_max then
-                    prox_reward = 0.010 * proximity_scale  -- Good positioning bonus
+                    prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
                 elseif distance_segments < optimal_min then
-                    prox_reward = -0.005 * proximity_scale  -- Too close penalty (higher risk)
+                    prox_reward = -0.05 * proximity_scale  -- Too close penalty (higher risk)
                 elseif distance_segments > 5.0 then
-                    prox_reward = -0.003 * proximity_scale  -- Too far penalty (lower efficiency)
+                    prox_reward = -0.03 * proximity_scale  -- Too far penalty (lower efficiency)
                 end
                 -- Neutral reward for 3-5 segments (acceptable range)
-                -- reward = reward + prox_reward
-                prox_reward = prox_reward / 5
+                reward = reward + prox_reward
             end
             
             -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)
@@ -1051,7 +1050,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 end
             end
         end
-        return reward, bDone
     end
 
     -- State updates
