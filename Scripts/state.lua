@@ -843,18 +843,27 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             -- Build absolute floating segment using between-segment progress (from more_enemy_info low nibble)
             local abs_int = self.enemy_abs_segments[i]
             local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
-            local frac = 0.0
+            -- Compute a monotonically increasing progress [0,1) based on direction semantics:
+            -- Direction bit set (increasing): nibble DECREMENTS each tick -> progress = (15 - nibble)/16
+            -- Direction bit clear (decreasing): nibble INCREMENTS each tick -> progress = nibble/16
+            local progress = 0.0
             if self.enemy_between_segments[i] == 1 then
-                frac = angle_nibble / 16.0 -- in [0,1)
+                if self.enemy_direction_moving[i] == 1 then
+                    progress = (15.0 - angle_nibble) / 16.0
+                else
+                    progress = angle_nibble / 16.0
+                end
             end
 
-            -- Absolute float: move in the current motion direction by frac
+            -- Absolute float using StartFlip semantics:
+            -- When increasing, enemy_seg already points to the DESTINATION segment; position is (dest - (1 - progress)).
+            -- When decreasing, enemy_seg points to the SOURCE segment; position is (source - progress).
             local abs_float
             if self.enemy_between_segments[i] == 1 then
                 if self.enemy_direction_moving[i] == 1 then
-                    abs_float = abs_int + frac
+                    abs_float = abs_int + progress - 1.0
                 else
-                    abs_float = abs_int - frac
+                    abs_float = abs_int - progress
                 end
             else
                 abs_float = abs_int
@@ -921,17 +930,22 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
     end
     
-    -- Calculate true between-segment fraction per slot (scaled to 12-bit, 0..4095)
+    -- Calculate true between-segment progress per slot (scaled to 12-bit, 0..4095)
     for i = 1, 7 do
         if self.enemy_abs_segments[i] == INVALID_SEGMENT then
             self.fractional_enemy_segments_by_slot[i] = INVALID_SEGMENT
         else
-            local frac = 0.0
+            -- Use the same direction-aware progress as above
+            local progress = 0.0
             if self.enemy_between_segments[i] == 1 then
                 local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
-                frac = angle_nibble / 16.0 -- [0,1)
+                if self.enemy_direction_moving[i] == 1 then
+                    progress = (15.0 - angle_nibble) / 16.0
+                else
+                    progress = angle_nibble / 16.0
+                end
             end
-            local scaled_value = math.floor(frac * 4096.0 + 0.5) -- Round to nearest
+            local scaled_value = math.floor(progress * 4096.0 + 0.5) -- Round to nearest
             if scaled_value >= 4096 then scaled_value = 4095 end
             if scaled_value < 0 then scaled_value = 0 end
             self.fractional_enemy_segments_by_slot[i] = scaled_value
