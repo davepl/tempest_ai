@@ -18,7 +18,7 @@ local logic = require("logic") -- ADDED: Require the new logic module
 local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
-local SHOW_DISPLAY            = true
+local SHOW_DISPLAY            = false
 local START_ADVANCED          = false
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
@@ -590,7 +590,7 @@ local function determine_final_actions()
         -- Start remains 0
     else
         -- Unknown state, all commands default to 0
-        print(string.format("[WARN] Unknown game state 0x%02X encountered in determine_final_actions", game_state.gamestate))
+        -- print(string.format("[WARN] Unknown game state 0x%02X encountered in determine_final_actions", game_state.gamestate))
     end
 
     return final_fire_cmd, final_zap_cmd, final_spinner_cmd, final_p1_start_cmd
