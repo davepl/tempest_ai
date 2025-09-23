@@ -45,8 +45,12 @@ local LastRewardState = 0
 local previous_superzapper_active = 0
 local previous_superzapper_uses_in_level = 0
 local previous_zap_detected = 0
+local previous_fire_detected = 0
 -- Track previous player position for positioning reward
 local previous_player_position = 0
+
+-- Track previous top-rail alignment (for progress reward)
+local previous_toprail_min_abs_rel = nil
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -1024,6 +1028,50 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             
             reward = reward + positioning_reward
 
+            -- 8. TOP-RAIL FLIPPER ENGAGEMENT REWARD (dense shaping using fractional rel positions)
+            do
+                local min_abs_rel_float = nil
+                local aligned_fire_bonus = 0.0
+                local hold_penalty = 0.0
+
+                -- Find nearest top-rail flipper using authoritative fractional relative pos
+                for i = 1, 7 do
+                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                        local relf = enemies_state.active_top_rail_enemies[i]
+                        if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
+                            local d = math.abs(relf)
+                            if not min_abs_rel_float or d < min_abs_rel_float then
+                                min_abs_rel_float = d
+                            end
+                        end
+                    end
+                end
+
+                if min_abs_rel_float then
+                    -- Progress toward alignment (reward getting closer)
+                    if previous_toprail_min_abs_rel then
+                        local delta = previous_toprail_min_abs_rel - min_abs_rel_float
+                        if delta > 0 then
+                            -- Small reward proportional to progress, capped
+                            reward = reward + math.min(0.05, 0.03 * delta)
+                        end
+                    end
+
+                    -- Reward firing when well aligned (tight aim window)
+                    local fire_now = (player_state.fire_detected or 0)
+                    local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
+                    if min_abs_rel_float <= 0.30 and fire_edge then
+                        reward = reward + 0.08
+                    end
+
+                    -- Mild penalty for not firing while very close (nudges behavior)
+                    if min_abs_rel_float <= 0.50 and fire_now == 0 then
+                        reward = reward - 0.01
+                    end
+                end
+            end
+
             -- 7. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
             -- Apply a small penalty when spinning while already aligned (or no target)
             -- and not in immediate danger. Keeps behavior calm instead of fidgety.
@@ -1056,7 +1104,25 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     previous_level = level_state.level_number or 0
     previous_alive_state = player_state.alive or 0
     previous_zap_detected = player_state.zap_detected or 0
+    previous_fire_detected = player_state.fire_detected or 0
     previous_player_position = player_state.position or 0
+    -- Update top-rail tracking
+    do
+        local min_abs_rel_float = nil
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                local relf = enemies_state.active_top_rail_enemies[i]
+                if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
+                    local d = math.abs(relf)
+                    if not min_abs_rel_float or d < min_abs_rel_float then
+                        min_abs_rel_float = d
+                    end
+                end
+            end
+        end
+        previous_toprail_min_abs_rel = min_abs_rel_float
+    end
     LastRewardState = reward
 
     return reward, bDone
