@@ -190,6 +190,21 @@ else:
     inference_device = torch.device("cpu")
     print(f"Using CPU for both inference and training: {training_device}")
 
+# Low-risk math speedups (CUDA only): allow TF32 and tune matmul/cudnn
+try:
+    if training_device.type == 'cuda':
+        # Enable TF32 where available for faster matmuls
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        # Prefer faster algorithms for float32 matmul in PyTorch 2+
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+except Exception:
+    pass
+
 # Display key configuration parameters
 print(f"Learning rate: {RL_CONFIG.lr}")
 print(f"Batch size: {RL_CONFIG.batch_size}")
@@ -407,17 +422,18 @@ class HybridReplayBuffer:
     - discrete_action: integer index for fire/zap combination (0-3)
     - continuous_action: float spinner value in [-0.9, +0.9]
     """
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
         self.position = 0
         self.size = 0
+        self.state_size = int(state_size)
         
         # Pre-allocated arrays for maximum speed
-        self.states = np.empty((capacity,), dtype=object)
+        self.states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.discrete_actions = np.empty((capacity,), dtype=np.int32)
         self.continuous_actions = np.empty((capacity,), dtype=np.float32)
         self.rewards = np.empty((capacity,), dtype=np.float32)
-        self.next_states = np.empty((capacity,), dtype=object)
+        self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
     
     def push(self, state, discrete_action, continuous_action, reward, next_state, done):
@@ -430,11 +446,36 @@ class HybridReplayBuffer:
         continuous_val = max(-0.9, min(0.9, continuous_val))
         
         # Store experience
-        self.states[self.position] = state
+        try:
+            s = np.asarray(state, dtype=np.float32)
+            if s.ndim > 1:
+                s = s.reshape(-1)
+            if s.size < self.state_size:
+                tmp = np.zeros((self.state_size,), dtype=np.float32)
+                tmp[:s.size] = s
+                s = tmp
+            elif s.size > self.state_size:
+                s = s[:self.state_size]
+            self.states[self.position, :] = s
+        except Exception:
+            # Fallback to zeros if something went wrong
+            self.states[self.position, :] = 0.0
         self.discrete_actions[self.position] = discrete_idx
         self.continuous_actions[self.position] = continuous_val
         self.rewards[self.position] = reward
-        self.next_states[self.position] = next_state
+        try:
+            ns = np.asarray(next_state, dtype=np.float32)
+            if ns.ndim > 1:
+                ns = ns.reshape(-1)
+            if ns.size < self.state_size:
+                tmp = np.zeros((self.state_size,), dtype=np.float32)
+                tmp[:ns.size] = ns
+                ns = tmp
+            elif ns.size > self.state_size:
+                ns = ns[:self.state_size]
+            self.next_states[self.position, :] = ns
+        except Exception:
+            self.next_states[self.position, :] = 0.0
         self.dones[self.position] = done
         
         # Update position and size
@@ -474,21 +515,38 @@ class HybridReplayBuffer:
                 global_idx = np.empty((0,), dtype=np.int64)
             indices = np.concatenate([recent_idx, global_idx])
         
-        # Gather batch data
-        batch_states = [self.states[i] for i in indices]
+        # Vectorized gather for batch data
+        states_np = self.states[indices]
+        next_states_np = self.next_states[indices]
         batch_discrete_actions = self.discrete_actions[indices]
         batch_continuous_actions = self.continuous_actions[indices]
         batch_rewards = self.rewards[indices]
-        batch_next_states = [self.next_states[i] for i in indices]
         batch_dones = self.dones[indices]
-        
-        # Convert to tensors
-        states = torch.from_numpy(np.vstack(batch_states)).float().to(training_device)
-        discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long().to(training_device)
-        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float().to(training_device)
-        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float().to(training_device)
-        next_states = torch.from_numpy(np.vstack(batch_next_states)).float().to(training_device)
-        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float().to(training_device)
+
+        # Convert to tensors (pin memory for fast H2D when on CUDA)
+        use_pinned = (training_device.type == 'cuda')
+        states = torch.from_numpy(states_np).float()
+        next_states = torch.from_numpy(next_states_np).float()
+        discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
+        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+
+        if use_pinned:
+            states = states.pin_memory()
+            next_states = next_states.pin_memory()
+            discrete_actions = discrete_actions.pin_memory()
+            continuous_actions = continuous_actions.pin_memory()
+            rewards = rewards.pin_memory()
+            dones = dones.pin_memory()
+
+        non_block = True if training_device.type == 'cuda' else False
+        states = states.to(training_device, non_blocking=non_block)
+        next_states = next_states.to(training_device, non_blocking=non_block)
+        discrete_actions = discrete_actions.to(training_device, non_blocking=non_block)
+        continuous_actions = continuous_actions.to(training_device, non_blocking=non_block)
+        rewards = rewards.to(training_device, non_blocking=non_block)
+        dones = dones.to(training_device, non_blocking=non_block)
         
         return states, discrete_actions, continuous_actions, rewards, next_states, dones
     
@@ -704,8 +762,25 @@ class HybridDQNAgent:
         # Optimizer with separate parameter groups for discrete and continuous components
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         
-        # Experience replay
-        self.memory = HybridReplayBuffer(memory_size)
+        # Experience replay (vectorized 2D storage)
+        self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+
+        # AMP persistent settings
+        self.use_amp = bool(getattr(RL_CONFIG, 'use_mixed_precision', False) and self.training_device.type == 'cuda')
+        if self.use_amp:
+            try:
+                from torch.cuda.amp import autocast as _autocast, GradScaler
+                self.autocast = _autocast
+                self.scaler = GradScaler(enabled=True)
+            except Exception:
+                self.use_amp = False
+                import contextlib
+                self.autocast = contextlib.nullcontext
+                self.scaler = None
+        else:
+            import contextlib
+            self.autocast = contextlib.nullcontext
+            self.scaler = None
         
         # Training queue and metrics
         self.train_queue = queue.Queue(maxsize=100)
@@ -833,14 +908,8 @@ class HybridDQNAgent:
         states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
         
         # Current Q-values and predictions
-        use_amp = bool(getattr(RL_CONFIG, 'use_mixed_precision', False))
-        scaler = None
-        if use_amp:
-            try:
-                from torch.cuda.amp import autocast, GradScaler
-                scaler = GradScaler(enabled=True)
-            except Exception:
-                use_amp = False
+        use_amp = self.use_amp
+        scaler = self.scaler
         
         def _forward_local(s):
             return self.qnetwork_local(s)
@@ -849,7 +918,7 @@ class HybridDQNAgent:
             return self.qnetwork_target(s)
 
         if use_amp:
-            with autocast():
+            with self.autocast():
                 discrete_q_pred, continuous_pred = _forward_local(states)
         else:
             discrete_q_pred, continuous_pred = _forward_local(states)
@@ -898,7 +967,7 @@ class HybridDQNAgent:
 
         # Compute losses (under autocast when enabled for stability)
         if use_amp:
-            with autocast():
+            with self.autocast():
                 discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
                 continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
         else:
@@ -909,78 +978,67 @@ class HybridDQNAgent:
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
         total_loss = discrete_loss + w_cont * continuous_loss  # Weight continuous loss lower
         
-        # Optimize (thread-safe for multi-worker training)
+        # Optimize (thread-safe for multi-worker training). Also compute grad norms/clipping inside the lock.
         with self.training_lock:
             self.optimizer.zero_grad()
             if use_amp and scaler is not None:
-                from torch.cuda.amp import autocast, GradScaler
                 scaler.scale(total_loss).backward()
+                # Unscale once before measuring/clipping so norms are meaningful
+                try:
+                    scaler.unscale_(self.optimizer)
+                except Exception:
+                    pass
             else:
                 total_loss.backward()
 
-        # Measure gradient norms and optionally clip (outside lock is fine for read-only)
-        preclip_grad_norm = 0.0
-        did_unscale = False
-        # Unscale once before measuring/clipping so norms are meaningful and inf/nan are detected by scaler
-        if use_amp and scaler is not None:
+            # Replace non-finite grads with zeros to keep metrics stable and compute pre-clip norm
+            preclip_sq_sum = 0.0
             try:
-                scaler.unscale_(self.optimizer)
-                did_unscale = True
-            except Exception:
-                pass
-        try:
-            # Replace non-finite grads with zeros to keep metrics stable
-            sq_sum = 0.0
-            for p in self.qnetwork_local.parameters():
-                if p.grad is not None:
-                    # Sanitize non-finite values
-                    if not torch.isfinite(p.grad).all():
-                        p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
-                    g = p.grad.data.norm(2)
-                    if torch.isfinite(g):
-                        sq_sum += float(g.item() ** 2)
-            preclip_grad_norm = (sq_sum ** 0.5)
-        except Exception:
-            preclip_grad_norm = 0.0
-
-        postclip_grad_norm = preclip_grad_norm
-        if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
-            try:
-                # If not already unscaled above, unscale once before clipping
-                if use_amp and scaler is not None and not did_unscale:
-                    scaler.unscale_(self.optimizer)
-                # Optional per-value clamp before norm clip
-                max_gv = float(getattr(RL_CONFIG, 'max_grad_value', 0.0) or 0.0)
-                if max_gv > 0.0:
-                    for p in self.qnetwork_local.parameters():
-                        if p.grad is not None:
-                            p.grad.data.clamp_(-max_gv, max_gv)
-                torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
-                # Recompute norm after clipping
-                sq_sum = 0.0
                 for p in self.qnetwork_local.parameters():
                     if p.grad is not None:
+                        if not torch.isfinite(p.grad).all():
+                            p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
                         g = p.grad.data.norm(2)
                         if torch.isfinite(g):
-                            x = float(g.item())
-                            sq_sum += x * x
-                postclip_grad_norm = (sq_sum ** 0.5)
+                            preclip_sq_sum += float(g.item() ** 2)
+                preclip_grad_norm = (preclip_sq_sum ** 0.5)
             except Exception:
-                postclip_grad_norm = preclip_grad_norm
-        
-        # LR scheduling (frame-based)
-        try:
-            self._apply_lr_schedule()
-        except Exception:
-            pass
+                preclip_grad_norm = 0.0
 
-        # Step optimizer under lock to avoid interleaved updates
-        with self.training_lock:
+            # Optional clip
+            postclip_grad_norm = preclip_grad_norm
+            if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
+                try:
+                    max_gv = float(getattr(RL_CONFIG, 'max_grad_value', 0.0) or 0.0)
+                    if max_gv > 0.0:
+                        for p in self.qnetwork_local.parameters():
+                            if p.grad is not None:
+                                p.grad.data.clamp_(-max_gv, max_gv)
+                    torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
+                    # Recompute norm after clipping
+                    post_sq_sum = 0.0
+                    for p in self.qnetwork_local.parameters():
+                        if p.grad is not None:
+                            g = p.grad.data.norm(2)
+                            if torch.isfinite(g):
+                                x = float(g.item())
+                                post_sq_sum += x * x
+                    postclip_grad_norm = (post_sq_sum ** 0.5)
+                except Exception:
+                    postclip_grad_norm = preclip_grad_norm
+
+            # Step optimizer under lock to avoid interleaved updates
             if use_amp and scaler is not None:
                 scaler.step(self.optimizer)
                 scaler.update()
             else:
                 self.optimizer.step()
+
+        # LR scheduling (frame-based)
+        try:
+            self._apply_lr_schedule()
+        except Exception:
+            pass
         
         # Update training counters and metrics
         self.training_steps += 1

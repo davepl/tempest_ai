@@ -17,7 +17,7 @@ from typing import Optional, List, Dict, Any
 from collections import deque
 
 # Import from config.py
-from config import metrics, IS_INTERACTIVE
+from config import metrics, IS_INTERACTIVE, RL_CONFIG
 
 # Add a counter to track the number of rows printed
 row_counter = 0
@@ -131,7 +131,7 @@ def display_metrics_header():
         f"{'Rwrd':>6} {'DQN':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
         f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
-        f"{'AvgInf':>7} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -182,6 +182,7 @@ def display_metrics_row(agent, kb_handler):
     loss_avg = latest_loss
     avg_inference_time_ms = 0.0
     steps_per_sec = 0.0
+    samples_per_sec = 0.0
     steps_per_1k_frames = 0.0
     with metrics.lock:
         # Average inference time and reset
@@ -207,6 +208,11 @@ def display_metrics_row(agent, kb_handler):
             steps_per_sec = steps_int / elapsed
         else:
             steps_per_sec = float(steps_int)
+        # Samples/s reflects batch_size * Steps/s; this makes batch size changes visible
+        try:
+            samples_per_sec = steps_per_sec * float(RL_CONFIG.batch_size)
+        except Exception:
+            samples_per_sec = 0.0
         # Interval Steps/1kF using the same interval counts
         denom_frames = max(1, frames_int)
         steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
@@ -290,6 +296,7 @@ def display_metrics_row(agent, kb_handler):
         f"{'ON' if metrics.training_enabled else 'OFF':>5} "
         f"{sync_col:>12} {targ_col:>13} "
         f"{avg_inference_time_ms:>7.2f} "
+        f"{samples_per_sec:>8.0f} "
         f"{steps_per_sec:>8.1f} "
         f"{metrics.grad_norm:>8.3f} "
         f"{metrics.grad_clip_delta:>6.3f} "
