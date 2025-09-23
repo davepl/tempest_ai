@@ -1051,6 +1051,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 end
             end
         end
+        return reward, bDone
     end
 
     -- State updates
