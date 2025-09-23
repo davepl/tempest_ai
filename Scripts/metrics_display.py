@@ -128,7 +128,7 @@ def display_metrics_header():
     # Header with Q-Value Range moved before Training Stats, reward components removed
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
-        f"{'Rwrd':>6} {'DQN':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
+        f"{'Rwrd':>6} {'DQN':>6} {'Exp':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
         f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
         f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
@@ -156,26 +156,39 @@ def display_metrics_row(agent, kb_handler):
     if row_counter > 0 and row_counter % 30 == 0:
         display_metrics_header()
     
-    # Compute reward averages since last print; fallback to recent deque averages
+    # Compute reward averages since last print; fallback to recent deque averages (aligned across all three)
     mean_reward = 0.0
     mean_dqn_reward = 0.0
+    mean_expert_reward = 0.0
+    used_fallback_aligned = False
     with metrics.lock:
         if getattr(metrics, 'reward_count_interval_total', 0) > 0:
             mean_reward = metrics.reward_sum_interval_total / max(metrics.reward_count_interval_total, 1)
         if getattr(metrics, 'reward_count_interval_dqn', 0) > 0:
             mean_dqn_reward = metrics.reward_sum_interval_dqn / max(metrics.reward_count_interval_dqn, 1)
+        if getattr(metrics, 'reward_count_interval_expert', 0) > 0:
+            mean_expert_reward = metrics.reward_sum_interval_expert / max(metrics.reward_count_interval_expert, 1)
         # Reset interval counters so next print is fresh
         metrics.reward_sum_interval_total = 0.0
         metrics.reward_count_interval_total = 0
         metrics.reward_sum_interval_dqn = 0.0
         metrics.reward_count_interval_dqn = 0
-    # Fallback if no interval episodes finished
-    if mean_reward == 0.0 and metrics.episode_rewards:
-        rewards_list = list(metrics.episode_rewards)
-        mean_reward = sum(rewards_list[-20:]) / min(len(rewards_list), 20)
-    if mean_dqn_reward == 0.0 and metrics.dqn_rewards:
-        dqn_rewards_list = list(metrics.dqn_rewards)
-        mean_dqn_reward = sum(dqn_rewards_list[-20:]) / min(len(dqn_rewards_list), 20)
+        metrics.reward_sum_interval_expert = 0.0
+        metrics.reward_count_interval_expert = 0
+    # Fallback if no interval episodes finished: compute aligned means across the same last-N episodes
+    if mean_reward == 0.0 and mean_dqn_reward == 0.0 and mean_expert_reward == 0.0:
+        try:
+            total_q = list(metrics.episode_rewards) if metrics.episode_rewards else []
+            dqn_q = list(metrics.dqn_rewards) if metrics.dqn_rewards else []
+            exp_q = list(metrics.expert_rewards) if metrics.expert_rewards else []
+            n = min(len(total_q), len(dqn_q), len(exp_q), 20)
+            if n > 0:
+                mean_reward = sum(total_q[-n:]) / float(n)
+                mean_dqn_reward = sum(dqn_q[-n:]) / float(n)
+                mean_expert_reward = sum(exp_q[-n:]) / float(n)
+                used_fallback_aligned = True
+        except Exception:
+            pass
     
     # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time and Steps/s
     latest_loss = metrics.losses[-1] if metrics.losses else 0.0
@@ -288,7 +301,7 @@ def display_metrics_row(agent, kb_handler):
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
-    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_dqn_reward:>6.2f} "
+    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_dqn_reward:>6.2f} {mean_expert_reward:>6.2f} "
         f"{dqn5m_avg:>6.2f} {dqn5m_slopeM:>6.2f} {loss_avg:>10.6f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{'ON' if metrics.override_expert else 'OFF':>3} "

@@ -1515,13 +1515,34 @@ class SafeMetrics:
             return self.metrics.expert_ratio
     
     def add_episode_reward(self, total_reward, dqn_reward, expert_reward):
+        """Record per-episode rewards in a thread-safe way.
+
+        Forward to the underlying MetricsData.add_episode_reward when available so that:
+        - All episodes (including zero/negative totals) are recorded to keep deques aligned
+        - Interval accumulators (for per-row means) are updated consistently for Rwrd/DQN/Exp
+        Fallback to direct appends if the underlying metrics object lacks the method.
+        """
         with self.lock:
-            if total_reward > 0:
-                self.metrics.episode_rewards.append(total_reward)
-            if dqn_reward > 0:
-                self.metrics.dqn_rewards.append(dqn_reward)
-            if expert_reward > 0:
-                self.metrics.expert_rewards.append(expert_reward)
+            try:
+                add_fn = getattr(self.metrics, 'add_episode_reward', None)
+                if callable(add_fn):
+                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward))
+                    return
+            except Exception:
+                pass
+            # Fallback: append directly without filtering to preserve alignment
+            try:
+                self.metrics.episode_rewards.append(float(total_reward))
+            except Exception:
+                pass
+            try:
+                self.metrics.dqn_rewards.append(float(dqn_reward))
+            except Exception:
+                pass
+            try:
+                self.metrics.expert_rewards.append(float(expert_reward))
+            except Exception:
+                pass
     
     def increment_guided_count(self):
         with self.lock:
