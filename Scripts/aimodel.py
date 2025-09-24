@@ -1880,23 +1880,6 @@ def decay_epsilon(frame_count):
         # Update the last step tracker
         metrics.last_epsilon_decay_step = step_interval
 
-        # Adaptive epsilon floor to break the 2.5 plateau
-        try:
-            dqn5m_avg = float(getattr(metrics, 'dqn5m_avg', 0.0))
-            dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
-        except Exception:
-            dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
-
-        dynamic_floor = RL_CONFIG.epsilon_end
-        try:
-            # If clearly regressing within the band, bump a bit higher
-            if bool(getattr(RL_CONFIG, 'adaptive_epsilon_floor', True)) and dqn5m_avg <= 1.3:
-                dynamic_floor = max(dynamic_floor, 0.25)
-        except Exception:
-            pass
-
-        # Ensure epsilon doesn't go below the minimum effective exploration rate
-        metrics.epsilon = max(dynamic_floor, metrics.epsilon)
 
     # Always return the current epsilon value (which might have just been decayed)
     return metrics.epsilon
@@ -1928,27 +1911,6 @@ def decay_expert_ratio(current_step):
         for _ in range(steps_to_apply):
             metrics.expert_ratio *= RL_CONFIG.expert_ratio_decay
         metrics.last_decay_step = step_interval
-
-    # Determine dynamic floor based on performance and trend (evaluate every call)
-    dynamic_floor = RL_CONFIG.expert_ratio_min
-    try:
-        dqn5m_avg = float(getattr(metrics, 'dqn5m_avg', 0.0))
-        dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
-        if not np.isnan(dqn5m_avg):
-            # Strong hold until we have both sufficient level and positive momentum
-            if bool(getattr(RL_CONFIG, 'adaptive_expert_floor', True)) and ((dqn5m_avg <= 1.55) or (dqn5m_slopeM < 0.03)):
-                dynamic_floor = max(dynamic_floor, 0.25)
-            # Gentle handoff band when above ~2.55 and non-negative slope
-            elif bool(getattr(RL_CONFIG, 'adaptive_expert_floor', True)) and ((dqn5m_avg <= 1.70) and (dqn5m_slopeM >= 0.00)):
-                dynamic_floor = max(dynamic_floor, 0.10)
-            else:
-                dynamic_floor = max(dynamic_floor, RL_CONFIG.expert_ratio_min)
-    except Exception:
-        dynamic_floor = RL_CONFIG.expert_ratio_min
-
-    # Enforce floor continuously (unless override forces 0.0)
-    if not metrics.override_expert:
-        metrics.expert_ratio = max(dynamic_floor, metrics.expert_ratio)
 
     return metrics.expert_ratio
 
