@@ -20,12 +20,24 @@ end
 
 -- Helper function to format a fixed-width segment value for our enemy tables
 local function format_enemy_segment(value)
-    if value == 0 then
-        return "---"
-    else
-        -- Use %+03d: always show sign, pad with 0 to total width 3
-        return string.format("%+03d", value)
+    -- Display as '---' when zero/absent (matches prior convention)
+    if value == nil or value == 0 then
+        return string.format("%7s", "---")
     end
+
+    -- Use integer format for true integers; otherwise print as signed float with 2 decimals
+    if type(value) == "number" then
+        if value == math.floor(value) then
+            -- Pad to a fixed width for column alignment
+            return string.format("%7s", string.format("%+03d", value))
+        else
+            -- Two-decimal float, signed, then pad to fixed width
+            return string.format("%7s", string.format("%+.2f", value))
+        end
+    end
+
+    -- Fallback to tostring padded
+    return string.format("%7s", tostring(value))
 end
 
 -- Helper to format a segment with a fixed overall width (including sign)
