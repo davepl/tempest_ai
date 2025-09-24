@@ -402,6 +402,68 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         return player_abs_seg, 0, false, false
     end
 
+    -- Immediate fuseball avoidance: if a charging fuseball is in our lane or adjacent and near the top,
+    -- move one segment away and keep firing. This preempts other targeting logic.
+    do
+        local FUSEBALL_NEAR_DEPTH = 0x50 -- consider near-top fuseballs (<= 0x50) as immediate threats
+        local best_threat_rel = nil
+        local best_threat_abs_seg = -1
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and
+               enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+                local depth = enemies_state.enemy_depths[i]
+                local moving_away = (enemies_state.active_enemy_info and ((enemies_state.active_enemy_info[i] or 0) & 0x80) ~= 0) or false
+                if depth > 0 and depth <= FUSEBALL_NEAR_DEPTH and not moving_away then
+                    local rel = abs_to_rel_func(player_abs_seg, enemies_state.enemy_abs_segments[i], is_open)
+                    local abs_rel = math.abs(rel)
+                    if abs_rel <= 1 then
+                        -- choose the closest such threat
+                        if not best_threat_rel or abs_rel < math.abs(best_threat_rel) then
+                            best_threat_rel = rel
+                            best_threat_abs_seg = enemies_state.enemy_abs_segments[i]
+                        end
+                    end
+                end
+            end
+        end
+        if best_threat_rel ~= nil then
+            local move_right = (best_threat_rel <= 0) -- threat aligned/left -> move right
+            local candidate = -1
+            if move_right then
+                if is_open then
+                    if player_abs_seg < 15 then candidate = player_abs_seg + 1 end
+                else
+                    candidate = (player_abs_seg + 1) % 16
+                end
+            else
+                if is_open then
+                    if player_abs_seg > 0 then candidate = player_abs_seg - 1 end
+                else
+                    candidate = (player_abs_seg - 1 + 16) % 16
+                end
+            end
+            -- Fallback to the opposite side if open edge blocked
+            if candidate == -1 then
+                if move_right then
+                    if is_open then
+                        if player_abs_seg > 0 then candidate = player_abs_seg - 1 end
+                    else
+                        candidate = (player_abs_seg - 1 + 16) % 16
+                    end
+                else
+                    if is_open then
+                        if player_abs_seg < 15 then candidate = player_abs_seg + 1 end
+                    else
+                        candidate = (player_abs_seg + 1) % 16
+                    end
+                end
+            end
+            if candidate ~= -1 then
+                return candidate, 0, true, false
+            end
+        end
+    end
+
     -- Scan top-rail threats (flippers and pulsars are equivalent once on top rail)
     local nr_seg, nl_seg = nil, nil
     local nr_dist, nl_dist = 999, 999
