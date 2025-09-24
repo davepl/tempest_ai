@@ -41,7 +41,7 @@ local M = {} -- Module table
 local SCORE_UNIT = 10000.0           -- 10k points ~= 1 life worth of reward
 local LEVEL_COMPLETION_BONUS = 2.0   -- Edge-triggered bonus when level increments
 local DEATH_PENALTY = 0.3            -- Edge-triggered penalty when dying (raised to better balance vs completion)
-local ZAP_COST = 0.2                 -- Small cost per zap frame
+local ZAP_COST = 0.2                 -- Edge-triggered Small cost per zap frame
  
 local previous_score = 0
 local previous_level = 0
@@ -572,7 +572,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- Penalty for being in objectively dangerous positions
             if M.is_danger_lane(player_abs_seg, enemies_state) then
                 local safety_penalty = -0.015 * safety_scale
-                reward = reward + safety_penalty
+                -- reward = reward + safety_penalty
             else
                 local safety_bonus = 0.005 * safety_scale
                 -- reward = reward + safety_bonus
