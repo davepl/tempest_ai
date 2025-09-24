@@ -395,6 +395,19 @@ class SocketServer:
                                 epsilon = float(self.metrics.get_epsilon())
                         except Exception:
                             epsilon = float(self.metrics.get_epsilon())
+
+                        # Reduce random exploration while zooming: use a fraction of the current epsilon
+                        try:
+                            if frame.gamestate == 0x20:  # GS_ZoomingDown
+                                scale = float(getattr(RL_CONFIG, 'zoom_epsilon_scale', 0.25) or 0.25)
+                                epsilon = epsilon * scale
+                                # Clamp to sane [0,1] bounds; intentionally allow below epsilon_min as this is an effective runtime scale
+                                if epsilon < 0.0:
+                                    epsilon = 0.0
+                                elif epsilon > 1.0:
+                                    epsilon = 1.0
+                        except Exception:
+                            pass
                         start_t = time.perf_counter()
                         da, ca = self.agent.act(frame.state, epsilon)
                         infer_t = time.perf_counter() - start_t
