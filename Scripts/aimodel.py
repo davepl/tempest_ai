@@ -1504,6 +1504,32 @@ class SafeMetrics:
                 return 0.0 if getattr(self.metrics, 'override_epsilon', False) else float(self.metrics.epsilon)
             except Exception:
                 return float(self.metrics.epsilon)
+
+    def get_effective_epsilon_with_state(self, gamestate: int):
+        """Return effective epsilon possibly adjusted by game state.
+
+        Currently: if GS_ZoomingDown (0x20), return epsilon * RL_CONFIG.zoom_epsilon_scale (default 0.25).
+        Honors override_epsilon by returning 0.0 regardless of state.
+        """
+        with self.lock:
+            try:
+                if getattr(self.metrics, 'override_epsilon', False):
+                    return 0.0
+                eps = float(self.metrics.epsilon)
+                if gamestate == 0x20:
+                    try:
+                        scale = float(getattr(RL_CONFIG, 'zoom_epsilon_scale', 0.25) or 0.25)
+                    except Exception:
+                        scale = 0.25
+                    eps = eps * scale
+                # Bound within [0,1] as an effective runtime parameter
+                if eps < 0.0:
+                    eps = 0.0
+                elif eps > 1.0:
+                    eps = 1.0
+                return eps
+            except Exception:
+                return float(self.metrics.epsilon)
             
     def update_epsilon(self):
         with self.lock:

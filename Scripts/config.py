@@ -36,7 +36,7 @@ class ServerConfigData:
     params_count: int = 175
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
-    reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
+    reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
      
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
@@ -61,10 +61,12 @@ class RLConfigData:
     # Quick Win: keep a bit more random exploration while DQN catches up
     epsilon_min: float = 0.01            # Floor for exploration
     epsilon_end: float = 0.01            # Target floor
-    epsilon_decay_steps: int = 1000000     # Decay applied every 10k frames
-    epsilon_decay_factor: float = 0.99402 # Calibrated: 0.20 -> ~0.01 over ~5M frames (500 intervals)
+    epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
+    epsilon_decay_factor: float = 0.995
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
+    # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
+    zoom_epsilon_scale: float = 0.25
     expert_ratio_min: float = 0.01        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay

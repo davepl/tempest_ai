@@ -429,12 +429,42 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     if not initial_should_fire then -- Only override if not already firing
         for i = 1, 7 do
             if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
-                local flipper_abs_seg = enemies_state.enemy_abs_segments[i]
-                if flipper_abs_seg ~= INVALID_SEGMENT then
-                    local flipper_rel_seg = abs_to_rel_func(player_abs_seg, flipper_abs_seg, is_open)
-                    if math.abs(flipper_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
-                        should_fire = true -- Force firing recommendation
-                        break -- Found a dangerous flipper, no need to check others
+                local threat_abs_seg = enemies_state.enemy_abs_segments[i]
+                if threat_abs_seg ~= INVALID_SEGMENT then
+                    local threat_rel_seg = abs_to_rel_func(player_abs_seg, threat_abs_seg, is_open)
+                    if math.abs(threat_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
+                        -- Always recommend firing at close threats
+                        should_fire = true
+
+                        -- Expert tweak: if shot buffer is full, still press FIRE but move one segment away
+                        -- Apply only for Flipper/Pulsar top-rail threats per design intent
+                        if player_state.shot_count >= 8 then
+                            local core_type = enemies_state.enemy_core_type[i]
+                            if core_type == ENEMY_TYPE_FLIPPER or core_type == ENEMY_TYPE_PULSAR then
+                                -- Move away by one segment opposite the threat direction.
+                                local move_right = (threat_rel_seg <= 0) -- threat at/aligned-left -> move right
+                                local candidate = -1
+                                if move_right then
+                                    if is_open then
+                                        if player_abs_seg < 15 then candidate = player_abs_seg + 1 end
+                                    else
+                                        candidate = (player_abs_seg + 1) % 16
+                                    end
+                                else
+                                    if is_open then
+                                        if player_abs_seg > 0 then candidate = player_abs_seg - 1 end
+                                    else
+                                        candidate = (player_abs_seg - 1 + 16) % 16
+                                    end
+                                end
+                                if candidate ~= -1 then
+                                    final_target_seg_abs = candidate
+                                    target_depth = 0 -- Depth not critical for lateral dodge
+                                end
+                            end
+                        end
+
+                        break -- Found a dangerous close threat, no need to check others
                     end
                 end
             end
