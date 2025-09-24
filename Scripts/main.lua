@@ -23,7 +23,7 @@ local START_ADVANCED          = false
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
-local SOCKET_READ_TIMEOUT_S   = 3.5  -- Increased from 0.5 to 3.5 (7x increase)
+local SOCKET_READ_TIMEOUT_S   = 3.5  
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
 
