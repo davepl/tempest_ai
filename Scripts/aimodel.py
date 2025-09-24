@@ -884,7 +884,13 @@ class HybridDQNAgent:
                 time.sleep(0.01)
     
     def train_step(self):
-        """Perform a single training step with hybrid loss function"""
+        """Perform one optimizer update with gradient accumulation over micro-batches.
+
+        Accumulates gradients over RL_CONFIG.gradient_accumulation_steps micro-batches,
+        each of size RL_CONFIG.batch_size, then applies a single optimizer.step().
+        The entire accumulation window is performed under a lock to keep weights
+        consistent across micro-batches when multiple training workers are enabled.
+        """
         # Global gate
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
             return 0.0
@@ -897,101 +903,113 @@ class HybridDQNAgent:
         except Exception:
             pass
 
+        # Require at least one micro-batch worth of data
         if len(self.memory) < self.batch_size:
             return 0.0
-        
-        # Sample experience batch
-        batch = self.memory.sample(self.batch_size)
-        if batch is None:
-            return 0.0
-        
-        states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
-        
-        # Current Q-values and predictions
+
+        # Accumulation setup
+        grad_accum_steps = max(1, int(getattr(RL_CONFIG, 'gradient_accumulation_steps', 1) or 1))
         use_amp = self.use_amp
         scaler = self.scaler
-        
-        def _forward_local(s):
-            return self.qnetwork_local(s)
-
-        def _forward_target(s):
-            return self.qnetwork_target(s)
-
-        if use_amp:
-            with self.autocast():
-                discrete_q_pred, continuous_pred = _forward_local(states)
-        else:
-            discrete_q_pred, continuous_pred = _forward_local(states)
-        
-        # Gather Q-values for taken discrete actions
-        discrete_q_targets = discrete_q_pred.gather(1, discrete_actions)
-        
-    # Next state predictions for target computation
-        with torch.no_grad():
-            if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
-                # Action selection from local, evaluation with target
-                next_q_local, _ = self.qnetwork_local(next_states)
-                next_actions = next_q_local.argmax(dim=1, keepdim=True)
-                next_q_target, _ = self.qnetwork_target(next_states)
-                discrete_q_next_max = next_q_target.gather(1, next_actions)
-            else:
-                next_q_target, _ = self.qnetwork_target(next_states)
-                discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
-            # If upstream provided n-step returns in rewards, discount bootstrap by gamma^n
-            n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
-            gamma_boot = (self.gamma ** n_step) if n_step > 1 else self.gamma
-            # Reward transform to stabilize scale after environment reward changes
-            r = rewards
-            try:
-                rs = float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
-                if rs != 1.0:
-                    r = r * rs
-                rc = float(getattr(RL_CONFIG, 'reward_clamp_abs', 0.0) or 0.0)
-                if rc > 0.0:
-                    r = torch.clamp(r, -rc, rc)
-                if bool(getattr(RL_CONFIG, 'reward_tanh', False)):
-                    r = torch.tanh(r)
-            except Exception:
-                pass
-            # TD targets
-            discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
-            continuous_targets = continuous_actions  # Use actual actions as targets for regression
-        
-        # When using AMP, ensure target tensors match prediction dtypes to avoid Float/Half mismatches
-        if use_amp:
-            try:
-                discrete_targets = discrete_targets.to(discrete_q_targets.dtype)
-                continuous_targets = continuous_targets.to(continuous_pred.dtype)
-            except Exception:
-                pass
-
-        # Compute losses (under autocast when enabled for stability)
-        if use_amp:
-            with self.autocast():
-                discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
-                continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
-        else:
-            discrete_loss = F.huber_loss(discrete_q_targets, discrete_targets)
-            continuous_loss = F.mse_loss(continuous_pred, continuous_targets)
-        
-        # Combined loss with balanced weighting
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
-        total_loss = discrete_loss + w_cont * continuous_loss  # Weight continuous loss lower
-        
-        # Optimize (thread-safe for multi-worker training). Also compute grad norms/clipping inside the lock.
+
+        # Keep track of loss for telemetry
+        total_loss_value = 0.0
+
+        # Perform accumulation and optimizer step atomically for thread safety
         with self.training_lock:
-            self.optimizer.zero_grad()
+            # Zero gradients before accumulation
+            self.optimizer.zero_grad(set_to_none=True)
+
+            preclip_grad_norm = 0.0
+            postclip_grad_norm = 0.0
+
+            for acc_idx in range(grad_accum_steps):
+                # Sample micro-batch
+                batch = self.memory.sample(self.batch_size)
+                if batch is None:
+                    if acc_idx == 0:
+                        return 0.0
+                    else:
+                        break
+
+                states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+
+                # Forward pass (local) under autocast as configured
+                if use_amp:
+                    with self.autocast():
+                        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+                        discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+                else:
+                    discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+                    discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+
+                # Target computation detached
+                with torch.no_grad():
+                    if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
+                        next_q_local, _ = self.qnetwork_local(next_states)
+                        next_actions = next_q_local.argmax(dim=1, keepdim=True)
+                        next_q_target, _ = self.qnetwork_target(next_states)
+                        discrete_q_next_max = next_q_target.gather(1, next_actions)
+                    else:
+                        next_q_target, _ = self.qnetwork_target(next_states)
+                        discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
+
+                    # n-step gamma and reward transforms
+                    n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
+                    gamma_boot = (self.gamma ** n_step) if n_step > 1 else self.gamma
+                    r = rewards
+                    try:
+                        rs = float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
+                        if rs != 1.0:
+                            r = r * rs
+                        rc = float(getattr(RL_CONFIG, 'reward_clamp_abs', 0.0) or 0.0)
+                        if rc > 0.0:
+                            r = torch.clamp(r, -rc, rc)
+                        if bool(getattr(RL_CONFIG, 'reward_tanh', False)):
+                            r = torch.tanh(r)
+                    except Exception:
+                        pass
+                    discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
+                    continuous_targets = continuous_actions
+
+                # Match dtypes under AMP
+                if use_amp:
+                    try:
+                        discrete_targets = discrete_targets.to(discrete_q_selected.dtype)
+                        continuous_targets = continuous_targets.to(continuous_pred.dtype)
+                    except Exception:
+                        pass
+
+                # Losses per micro-batch (autocast already applied for forward)
+                if use_amp:
+                    with self.autocast():
+                        d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
+                        c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                        micro_total = d_loss + w_cont * c_loss
+                        # Scale loss for accumulation so effective LR remains constant
+                        micro_total = micro_total / float(grad_accum_steps)
+                else:
+                    d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
+                    c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                    micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
+
+                total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
+
+                # Backward accumulate
+                if use_amp and scaler is not None:
+                    scaler.scale(micro_total).backward()
+                else:
+                    micro_total.backward()
+
+            # Unscale once before measuring/clipping
             if use_amp and scaler is not None:
-                scaler.scale(total_loss).backward()
-                # Unscale once before measuring/clipping so norms are meaningful
                 try:
                     scaler.unscale_(self.optimizer)
                 except Exception:
                     pass
-            else:
-                total_loss.backward()
 
-            # Replace non-finite grads with zeros to keep metrics stable and compute pre-clip norm
+            # Replace non-finite grads and compute pre-clip norm
             preclip_sq_sum = 0.0
             try:
                 for p in self.qnetwork_local.parameters():
@@ -1005,7 +1023,7 @@ class HybridDQNAgent:
             except Exception:
                 preclip_grad_norm = 0.0
 
-            # Optional clip
+            # Optional gradient value clamp and norm clip
             postclip_grad_norm = preclip_grad_norm
             if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
                 try:
@@ -1015,7 +1033,6 @@ class HybridDQNAgent:
                             if p.grad is not None:
                                 p.grad.data.clamp_(-max_gv, max_gv)
                     torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
-                    # Recompute norm after clipping
                     post_sq_sum = 0.0
                     for p in self.qnetwork_local.parameters():
                         if p.grad is not None:
@@ -1027,7 +1044,7 @@ class HybridDQNAgent:
                 except Exception:
                     postclip_grad_norm = preclip_grad_norm
 
-            # Step optimizer under lock to avoid interleaved updates
+            # Optimizer step
             if use_amp and scaler is not None:
                 scaler.step(self.optimizer)
                 scaler.update()
@@ -1050,8 +1067,8 @@ class HybridDQNAgent:
             pass
         # Track loss values for display
         try:
-            metrics.losses.append(float(total_loss.item()))
-            metrics.loss_sum_interval += float(total_loss.item())
+            metrics.losses.append(float(total_loss_value))
+            metrics.loss_sum_interval += float(total_loss_value)
             metrics.loss_count_interval += 1
         except Exception:
             pass
@@ -1123,7 +1140,7 @@ class HybridDQNAgent:
             except Exception:
                 pass
         
-        return total_loss.item()
+        return float(total_loss_value)
 
     def _apply_lr_schedule(self):
         """Compute and apply per-frame LR based on RL_CONFIG schedule."""
