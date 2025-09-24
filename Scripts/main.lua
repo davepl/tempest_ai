@@ -334,7 +334,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
     end
 
-    -- Total main payload size: 176 float32 values = 176 * 4 = 704 bytes
+    -- Total main payload size: 175
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)

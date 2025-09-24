@@ -1052,4 +1052,6 @@ Override mode: ON
  23,592,888 1491.3   0.10   0.0% 215.83 215.83 224.93   0.10   0.230196 0032   3.8  ON    OFF    ON    7k/  4.7s 5165k/3226.2s   12.71   302509      4.6    1.411  1.000  [0.22, 17.73] 4000k/47271/3.0/0k
 
  - Changed reward back to points-based, but with 5.0 death penalty, 1/20000th of a reward point per point
+ - Changed reward again, trained fast 2M could hunting
  
+  

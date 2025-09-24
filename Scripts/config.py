@@ -33,10 +33,10 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
+    params_count: int = 175
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
-    reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
+    reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
      
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
@@ -56,13 +56,13 @@ class RLConfigData:
     lr: float = 0.0025                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
-    epsilon: float = 0.30                 # PLATEAU BREAKER: Boost from 0.15 to rediscover strategies
-    epsilon_start: float = 0.30           # PLATEAU BREAKER: Higher exploration for breakthrough
+    epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
+    epsilon_start: float = 0.25           # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.01            # PLATEAU BREAKER: Raise minimum to maintain exploration
-    epsilon_end: float = 0.01            # PLATEAU BREAKER: Higher floor for continued discovery
-    epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
-    epsilon_decay_factor: float = 0.995   # More aggressive decay for practical training (was 0.995)
+    epsilon_min: float = 0.01            # Floor for exploration
+    epsilon_end: float = 0.01            # Target floor
+    epsilon_decay_steps: int = 1000000     # Decay applied every 10k frames
+    epsilon_decay_factor: float = 0.99402 # Calibrated: 0.20 -> ~0.01 over ~5M frames (500 intervals)
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     expert_ratio_min: float = 0.01        # Minimum expert control probability

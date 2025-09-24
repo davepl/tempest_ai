@@ -1363,7 +1363,11 @@ class HybridDQNAgent:
                     if getattr(SERVER_CONFIG, 'reset_epsilon', False):
                         print(f"Resetting epsilon to start per SERVER_CONFIG: {RL_CONFIG.epsilon_start}")
                         metrics.epsilon = RL_CONFIG.epsilon_start
-                        metrics.last_epsilon_decay_step = 0
+                        # Continue decays from the current frame interval so we don't retroactively overshoot
+                        try:
+                            metrics.last_epsilon_decay_step = int(metrics.frame_count // RL_CONFIG.epsilon_decay_steps)
+                        except Exception:
+                            metrics.last_epsilon_decay_step = 0
                     if getattr(SERVER_CONFIG, 'force_expert_ratio_recalc', False):
                         print(f"Force recalculating expert_ratio based on {metrics.frame_count:,} frames...")
                         decay_expert_ratio(metrics.frame_count)
@@ -1880,6 +1884,14 @@ def decay_epsilon(frame_count):
         # Update the last step tracker
         metrics.last_epsilon_decay_step = step_interval
 
+
+    # Enforce floor so epsilon doesn't decay below target minimum
+    try:
+        floor = float(getattr(RL_CONFIG, 'epsilon_end', getattr(RL_CONFIG, 'epsilon_min', 0.0)))
+    except Exception:
+        floor = 0.0
+    if metrics.epsilon < floor:
+        metrics.epsilon = floor
 
     # Always return the current epsilon value (which might have just been decayed)
     return metrics.epsilon
