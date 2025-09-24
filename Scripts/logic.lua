@@ -568,15 +568,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 expert_target_seg_cached = ets or -1
             end
             
-            -- 1. DANGER AVOIDANCE REWARD (Objective Safety Assessment)
-            -- Penalty for being in objectively dangerous positions
-            if M.is_danger_lane(player_abs_seg, enemies_state) then
-                local safety_penalty = -0.015 * safety_scale
-                -- reward = reward + safety_penalty
-            else
-                local safety_bonus = 0.005 * safety_scale
-                -- reward = reward + safety_bonus
-            end
+            -- 1. DANGER AVOIDANCE REWARD (Penalties removed per spec)
+            -- No penalty for being in dangerous positions; optional safe bonus remains disabled
             
             -- 2. PROXIMITY OPTIMIZATION REWARD (Distance-based Positioning)
             -- Reward optimal distance to nearest enemy (not too close, not too far)
@@ -594,10 +587,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local prox_reward = 0.0
                     if distance_segments >= optimal_min and distance_segments <= optimal_max then
                         prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
-                    elseif distance_segments < optimal_min then
-                        prox_reward = -0.05 * proximity_scale  -- Too close penalty (higher risk)
-                    elseif distance_segments > 5.0 then
-                        prox_reward = -0.03 * proximity_scale  -- Too far penalty (lower efficiency)
+                    else
+                        prox_reward = 0.0 -- Penalties removed
                     end
                     -- Neutral reward for 3-5 segments (acceptable range)
                     reward = reward + prox_reward
@@ -613,11 +604,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local shot_count = player_state.shot_count or 0
                 local shot_reward = 0.0
                 if shot_count <= 2 then
-                    shot_reward = -1
+                    shot_reward = 0 -- Penalty removed
                 elseif shot_count >= 4 and shot_count <= 7 then
                     shot_reward = 1
                 elseif shot_count >= 8 then
-                    shot_reward = -1
+                    shot_reward = 0 -- Penalty removed
                 end
                 reward = reward + shot_reward / SCORE_UNIT
             end
@@ -625,7 +616,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
             -- Bonus for appropriate responses to critical threats
             local critical_threats = 0
-            local threat_reward = 0.0
             for i = 1, 7 do
                 local abs_seg = enemies_state.enemy_abs_segments[i]
                 local depth = enemies_state.enemy_depths[i]
@@ -633,31 +623,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 
                 if abs_seg == player_abs_seg and depth > 0 and depth <= 0x30 then
                     critical_threats = critical_threats + 1
-                    -- Extra penalty for fuseballs (fatal on contact)
-                    if enemy_type == ENEMY_TYPE_FUSEBALL and depth <= 0x20 then
-                        threat_reward = threat_reward - 0.004
-                    end
                 end
             end
             
-            -- Penalty for being in lanes with multiple threats
-            if critical_threats > 1 then
-                threat_reward = threat_reward - (critical_threats * 0.002)
-            end
+            -- Threat penalties removed per spec (no subtraction)
             
             -- 5. PULSAR SAFETY REWARD (Objective Hazard Assessment)
             -- Extra penalty for being in pulsing pulsar lanes (objectively lethal)
-            local pulsar_reward = 0.0
-            if enemies_state.pulsing > 0 then
-                for i = 1, 7 do
-                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and 
-                       enemies_state.enemy_abs_segments[i] == player_abs_seg and
-                       enemies_state.enemy_depths[i] > 0 then
-                        pulsar_reward = -100 -- Strong penalty for pulsar lane 
-                        break
-                    end
-                end
-            end
+            -- Pulsar safety penalties removed per spec
 
             -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
             -- Reward the DQN for following expert system's strategic positioning recommendations
@@ -685,13 +658,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                             positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
                         -- Small penalty for moving away from target or not moving when needed
                         elseif current_distance > 0 then
-                            if current_distance > previous_distance then
-                                -- Moving away from target
-                                positioning_reward = -0.25 * (10.0 / SCORE_UNIT)
-                            elseif current_distance == previous_distance and current_distance > 1 then
-                                -- Not moving when movement toward target is needed
-                                positioning_reward = -0.10 * (10.0 / SCORE_UNIT)
-                            end
+                            -- Penalties removed for moving away or not moving
                         end
                         
                         -- Apply level-specific scaling
@@ -743,10 +710,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         reward = reward + (4.0 / SCORE_UNIT) -- small bonus (~4 pts) for well-timed shot
                     end
 
-                    -- Mild penalty for not firing while very close (nudges behavior)
-                    if min_abs_rel_float <= 0.50 and fire_now == 0 then
-                        reward = reward - (1.0 / SCORE_UNIT)
-                    end
+                    -- Penalty for not firing while very close removed per spec
                 end
             end
 
