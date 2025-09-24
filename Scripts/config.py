@@ -36,7 +36,7 @@ class ServerConfigData:
     params_count: int = 175
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
-    reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
+    reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
      
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
@@ -59,8 +59,8 @@ class RLConfigData:
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
     epsilon_start: float = 0.25           # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.01            # Floor for exploration
-    epsilon_end: float = 0.01            # Target floor
+    epsilon_min: float = 0.10            # Floor for exploration
+    epsilon_end: float = 0.10            # Target floor
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
@@ -71,7 +71,7 @@ class RLConfigData:
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
+    hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 6                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
@@ -82,7 +82,7 @@ class RLConfigData:
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
     # Phase 1 Optimization: More frequent updates for faster convergence
     training_steps_per_sample: int = 8    # Increased from 12 for better sample efficiency
-    training_workers: int = 1             # Reverted to 1 - multi-threaded training causes autograd conflicts
+    training_workers: int = 4             # Reverted to 1 - multi-threaded training causes autograd conflicts
     use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
     tau: float = 0.012                    # Slight bump for more responsive soft target tracking
@@ -95,7 +95,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 7
+    n_step: int = 3
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
