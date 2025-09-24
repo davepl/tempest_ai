@@ -28,6 +28,17 @@ local function format_enemy_segment(value)
     end
 end
 
+-- Helper to format a segment with a fixed overall width (including sign)
+local function format_segment_wide(value, width)
+    width = width or 6
+    if value == INVALID_SEGMENT or value == nil then
+        return string.format("%" .. width .. "s", "---")
+    else
+        -- Right-align the signed integer within the given width
+        return string.format("%" .. width .. "s", string.format("%+d", value))
+    end
+end
+
 -- Function to format section for display
 local function format_section(title, metrics)
     local width = 80 -- Adjusted width for standard terminal
@@ -166,8 +177,11 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     local e_shots_pos_str = ""
     local e_shots_seg_str = ""
     for i = 1, 4 do
-        e_shots_pos_str = e_shots_pos_str .. string.format(" %02X ", enemies_state.shot_positions[i])
-        e_shots_seg_str = e_shots_seg_str .. " " .. format_segment(enemies_state.enemy_shot_segments[i])
+        -- Show precise shot positions with two decimals, width-aligned
+        local pos = enemies_state.shot_positions[i] or 0.0
+        e_shots_pos_str = e_shots_pos_str .. string.format(" %6.2f", pos)
+        -- Widen segment formatting to align with positions
+        e_shots_seg_str = e_shots_seg_str .. " " .. format_segment_wide(enemies_state.enemy_shot_segments[i], 6)
     end
     display_str = display_str .. "Enemy Shots Pos:" .. e_shots_pos_str .. "\n"
     display_str = display_str .. "Enemy Shots Seg:" .. e_shots_seg_str .. "\n\n"

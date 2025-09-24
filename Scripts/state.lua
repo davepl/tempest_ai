@@ -679,6 +679,7 @@ function M.EnemiesState:new()
 
     -- Enemy Shot Info (Size 4)
     self.shot_positions = {}          -- Absolute depth/position ($02DB + i - 1)
+    self.shot_positions_lsb = {}      -- Fractional LSB for enemy shots ($02E6 + i - 1)
     self.enemy_shot_segments = {}     -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
     self.enemy_shot_abs_segments = {} -- Absolute segment (0-15, or INVALID_SEGMENT)
 
@@ -728,6 +729,7 @@ function M.EnemiesState:new()
     end
     for i = 1, 4 do
         self.shot_positions[i] = 0
+        self.shot_positions_lsb[i] = 0
         self.enemy_shot_segments[i] = INVALID_SEGMENT
         self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
     end
@@ -891,13 +893,16 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
     -- Read and process enemy shots (1-4)
     for i = 1, 4 do
-        -- Read shot depth/position first
-        self.shot_positions[i] = mem:read_u8(0x02DB + i - 1) -- EnemyShotPositions ($02DB-$02DE)
+        -- Read integer depth/position and fractional LSB
+        local pos_int = mem:read_u8(0x02DB + i - 1)  -- EnemyShotPositions ($02DB-$02DE)
+        local pos_lsb = mem:read_u8(0x02E6 + i - 1)  -- enm_shot_lsb ($02E6-$02E9)
 
-        -- If shot position is 0, it's inactive
-        if self.shot_positions[i] == 0 then
+        -- If integer position is 0, shot is inactive regardless of LSB
+        if pos_int == 0 then
             self.enemy_shot_segments[i] = INVALID_SEGMENT
             self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
+            self.shot_positions_lsb[i] = 0
+            self.shot_positions[i] = 0
         else
             -- Read shot segment byte
             local abs_segment_raw = mem:read_u8(0x02B5 + i - 1) -- EnemyShotSegments ($02B5-$02B8)
@@ -905,11 +910,16 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             if abs_segment_raw == 0 then
                 self.enemy_shot_segments[i] = INVALID_SEGMENT
                 self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
+                self.shot_positions_lsb[i] = 0
                 self.shot_positions[i] = 0 -- Ensure position is zeroed
             else
                 local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
                 self.enemy_shot_abs_segments[i] = abs_segment
                 self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
+                -- Combine integer position with LSB to form full 8.8 fixed-point as a float
+                -- Range remains < 256.0 (pos_int in [1,255], pos_lsb in [0,255])
+                self.shot_positions_lsb[i] = pos_lsb
+                self.shot_positions[i] = pos_int + (pos_lsb / 256.0)
             end
         end
     end

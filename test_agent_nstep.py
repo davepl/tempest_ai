@@ -12,7 +12,7 @@ class MockRLConfig:
     state_size = 175
     lr = 0.0001
     epsilon = 0.1
-    epsilon_min = 0.01
+    epsilon_min = 0.05
     memory_size = 10000
     batch_size = 32
     use_per = False
