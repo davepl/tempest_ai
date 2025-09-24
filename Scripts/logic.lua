@@ -39,10 +39,10 @@ local M = {} -- Module table
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
 local SCORE_UNIT = 10000.0           -- 10k points ~= 1 life worth of reward
-local LEVEL_COMPLETION_BONUS = 1.0   -- Edge-triggered bonus when level increments
-local DEATH_PENALTY = 1.0            -- Edge-triggered penalty when dying (raised to better balance vs completion)
-local ZAP_COST = 0.5                 -- Small cost per zap frame
-
+local LEVEL_COMPLETION_BONUS = 2.0   -- Edge-triggered bonus when level increments
+local DEATH_PENALTY = 0.3            -- Edge-triggered penalty when dying (raised to better balance vs completion)
+local ZAP_COST = 0.2                 -- Small cost per zap frame
+ 
 local previous_score = 0
 local previous_level = 0
 local previous_alive_state = 1 -- Track previous alive state, initialize as alive

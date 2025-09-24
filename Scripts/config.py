@@ -59,14 +59,14 @@ class RLConfigData:
     epsilon: float = 0.30                 # PLATEAU BREAKER: Boost from 0.15 to rediscover strategies
     epsilon_start: float = 0.30           # PLATEAU BREAKER: Higher exploration for breakthrough
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.05            # PLATEAU BREAKER: Raise minimum to maintain exploration
-    epsilon_end: float = 0.05            # PLATEAU BREAKER: Higher floor for continued discovery
+    epsilon_min: float = 0.01            # PLATEAU BREAKER: Raise minimum to maintain exploration
+    epsilon_end: float = 0.01            # PLATEAU BREAKER: Higher floor for continued discovery
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
-    epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
+    epsilon_decay_factor: float = 0.995   # More aggressive decay for practical training (was 0.995)
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     expert_ratio_min: float = 0.01        # Minimum expert control probability
-    expert_ratio_decay: float = 0.995     # Multiplicative decay factor per step interval
+    expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
