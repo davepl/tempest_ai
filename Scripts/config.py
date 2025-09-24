@@ -34,17 +34,10 @@ class ServerConfigData:
     port: int = 9999
     max_clients: int = 36
     params_count: int = 175  # FIXED: Updated from 176 to match Lua after removing duplicate nearest_enemy_seg
-    # Expert ratio configuration - only used for brand new models
-    expert_ratio_start: float = 0.90  # HIGH START: Let expert provide clean initial training data
-    # PLATEAU BREAKER: Reduce expert dependency to force model innovation
-    expert_ratio_min: float = 0.05    # REDUCED: From 25% to 15% to push model beyond expert limits
-    expert_ratio_decay: float = 0.999 # Decay stays the same for now; adaptive options possible
-    expert_ratio_decay_steps: int = 10000  # More frequent updates (was 25000)
-    
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
-    
+     
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
 # Create instance of ServerConfigData first
@@ -66,10 +59,15 @@ class RLConfigData:
     epsilon: float = 0.30                 # PLATEAU BREAKER: Boost from 0.15 to rediscover strategies
     epsilon_start: float = 0.30           # PLATEAU BREAKER: Higher exploration for breakthrough
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.100            # PLATEAU BREAKER: Raise minimum to maintain exploration
-    epsilon_end: float = 0.100            # PLATEAU BREAKER: Higher floor for continued discovery
+    epsilon_min: float = 0.05            # PLATEAU BREAKER: Raise minimum to maintain exploration
+    epsilon_end: float = 0.05            # PLATEAU BREAKER: Higher floor for continued discovery
     epsilon_decay_steps: int = 10000     # Much shorter intervals for faster learning (was 200000)
     epsilon_decay_factor: float = 0.999   # More aggressive decay for practical training (was 0.995)
+    # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
+    expert_ratio_start: float = 0.95      # Initial probability of expert control
+    expert_ratio_min: float = 0.01        # Minimum expert control probability
+    expert_ratio_decay: float = 0.995     # Multiplicative decay factor per step interval
+    expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 6                  
@@ -128,7 +126,7 @@ class RLConfigData:
     # Exploration policy: allow adaptive epsilon floor adjustments as performance improves
     adaptive_epsilon_floor: bool = True
     # Expert policy: allow adaptive expert-ratio floor adjustments based on performance trend
-    adaptive_expert_floor: bool = True
+    adaptive_expert_floor: bool = False
 
     # Loss weighting: balance continuous head relative to discrete head
     continuous_loss_weight: float = 0.5
@@ -159,7 +157,7 @@ class MetricsData:
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = field(default_factory=lambda: RL_CONFIG.epsilon_start)
-    expert_ratio: float = SERVER_CONFIG.expert_ratio_start
+    expert_ratio: float = RL_CONFIG.expert_ratio_start
     last_decay_step: int = 0
     last_epsilon_decay_step: int = 0 # Added tracker for epsilon decay
     enemy_seg: int = -1

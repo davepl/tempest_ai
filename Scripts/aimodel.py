@@ -1321,7 +1321,7 @@ class HybridDQNAgent:
                 if RESET_METRICS:
                     print("RESET_METRICS=True: resetting epsilon/expert_ratio; leaving frame_count at 0")
                     metrics.epsilon = RL_CONFIG.epsilon_start
-                    metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                    metrics.expert_ratio = RL_CONFIG.expert_ratio_start
                     metrics.last_decay_step = 0
                     metrics.last_epsilon_decay_step = 0
                     metrics.frame_count = 0
@@ -1336,7 +1336,7 @@ class HybridDQNAgent:
                     metrics.loaded_frame_count = int(metrics.frame_count)
                     # Epsilon/Expert
                     metrics.epsilon = float(checkpoint.get('epsilon', RL_CONFIG.epsilon_start))
-                    metrics.expert_ratio = float(checkpoint.get('expert_ratio', SERVER_CONFIG.expert_ratio_start))
+                    metrics.expert_ratio = float(checkpoint.get('expert_ratio', RL_CONFIG.expert_ratio_start))
                     metrics.last_decay_step = int(checkpoint.get('last_decay_step', 0))
                     metrics.last_epsilon_decay_step = int(checkpoint.get('last_epsilon_decay_step', 0))
                     # Reward histories (bounded by deque maxlen)
@@ -1358,8 +1358,8 @@ class HybridDQNAgent:
 
                     # Respect server toggles that may force resets regardless of checkpoint
                     if getattr(SERVER_CONFIG, 'reset_expert_ratio', False):
-                        print(f"Resetting expert_ratio to start per SERVER_CONFIG: {SERVER_CONFIG.expert_ratio_start}")
-                        metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+                        print(f"Resetting expert_ratio to start per RL_CONFIG: {RL_CONFIG.expert_ratio_start}")
+                        metrics.expert_ratio = RL_CONFIG.expert_ratio_start
                     if getattr(SERVER_CONFIG, 'reset_epsilon', False):
                         print(f"Resetting epsilon to start per SERVER_CONFIG: {RL_CONFIG.epsilon_start}")
                         metrics.epsilon = RL_CONFIG.epsilon_start
@@ -1916,21 +1916,21 @@ def decay_expert_ratio(current_step):
     # DON'T auto-initialize to start value at frame 0 - respect loaded checkpoint values
     # Only initialize if expert_ratio is somehow invalid (negative or > 1)
     if current_step == 0 and (metrics.expert_ratio < 0 or metrics.expert_ratio > 1):
-        metrics.expert_ratio = SERVER_CONFIG.expert_ratio_start
+        metrics.expert_ratio = RL_CONFIG.expert_ratio_start
         metrics.last_decay_step = 0
         return metrics.expert_ratio
 
-    step_interval = current_step // SERVER_CONFIG.expert_ratio_decay_steps
+    step_interval = current_step // RL_CONFIG.expert_ratio_decay_steps
 
     # Apply scheduled decay when we cross an interval boundary
     if step_interval > metrics.last_decay_step:
         steps_to_apply = step_interval - metrics.last_decay_step
         for _ in range(steps_to_apply):
-            metrics.expert_ratio *= SERVER_CONFIG.expert_ratio_decay
+            metrics.expert_ratio *= RL_CONFIG.expert_ratio_decay
         metrics.last_decay_step = step_interval
 
     # Determine dynamic floor based on performance and trend (evaluate every call)
-    dynamic_floor = SERVER_CONFIG.expert_ratio_min
+    dynamic_floor = RL_CONFIG.expert_ratio_min
     try:
         dqn5m_avg = float(getattr(metrics, 'dqn5m_avg', 0.0))
         dqn5m_slopeM = float(getattr(metrics, 'dqn5m_slopeM', 0.0))
@@ -1942,9 +1942,9 @@ def decay_expert_ratio(current_step):
             elif bool(getattr(RL_CONFIG, 'adaptive_expert_floor', True)) and ((dqn5m_avg <= 1.70) and (dqn5m_slopeM >= 0.00)):
                 dynamic_floor = max(dynamic_floor, 0.10)
             else:
-                dynamic_floor = max(dynamic_floor, SERVER_CONFIG.expert_ratio_min)
+                dynamic_floor = max(dynamic_floor, RL_CONFIG.expert_ratio_min)
     except Exception:
-        dynamic_floor = SERVER_CONFIG.expert_ratio_min
+        dynamic_floor = RL_CONFIG.expert_ratio_min
 
     # Enforce floor continuously (unless override forces 0.0)
     if not metrics.override_expert:
