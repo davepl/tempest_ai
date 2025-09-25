@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.005                    # PLATEAU BREAKER: Increased from 0.0025
+    lr: float = 0.0025                    # PLATEAU BREAKER: Increased from 0.0025
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
@@ -67,7 +67,7 @@ class RLConfigData:
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
-    expert_ratio_min: float = 0.01        # Minimum expert control probability
+    expert_ratio_min: float = 0.00        # Minimum expert control probability
     expert_ratio_decay: float = 0.9977     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
@@ -111,7 +111,7 @@ class RLConfigData:
     # Optimization: learning-rate schedule (frame-based)
     # Options: 'none', 'cosine'
     lr_schedule: str = 'cosine'
-    lr_base: float = 0.005
+    lr_base: float = 0.0025
     lr_min: float = 5e-05
     lr_warmup_frames: int = 250_000       # linear warmup from lr_min -> lr_base
     lr_hold_until_frames: int = 1_000_000 # hold at lr_base until this frame
@@ -134,7 +134,7 @@ class RLConfigData:
     continuous_loss_weight: float = 0.5
 
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
-    reward_scale: float = 0.2            # Multiply incoming rewards by this factor before TD target - INCREASED
+    reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target - INCREASED
     reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
     reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
 

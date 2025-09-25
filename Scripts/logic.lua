@@ -636,7 +636,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         if (level_state.level_number or 0) > (previous_level or 0) then
             -- Fixed completion bonus; optional ratio-based scaling can be added later using score_at_level_start
             reward = reward + LEVEL_COMPLETION_BONUS
-            bDone = true
+            -- bDone = true  -- REMOVED: Episodes now terminate only on death for longer trajectories
         end
 
         -- Zap cost (edge-triggered on button press)
