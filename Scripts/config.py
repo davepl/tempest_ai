@@ -36,7 +36,7 @@ class ServerConfigData:
     params_count: int = 175
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
-    reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
+    reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
      
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
@@ -53,22 +53,22 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.0025                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    lr: float = 0.005                    # PLATEAU BREAKER: Increased from 0.0025
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
-    epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
-    epsilon_start: float = 0.25           # Start at 0.20 on next run
+    epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
+    epsilon_start: float = 0.5            # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.10            # Floor for exploration
-    epsilon_end: float = 0.10            # Target floor
+    epsilon_min: float = 0.20            # Floor for exploration - TEMPORARILY INCREASED
+    epsilon_end: float = 0.20            # Target floor - TEMPORARILY INCREASED
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
-    epsilon_decay_factor: float = 0.995
+    epsilon_decay_factor: float = 0.997
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
     expert_ratio_min: float = 0.01        # Minimum expert control probability
-    expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
+    expert_ratio_decay: float = 0.9977     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
@@ -95,7 +95,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 3
+    n_step: int = 5
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
@@ -111,7 +111,7 @@ class RLConfigData:
     # Optimization: learning-rate schedule (frame-based)
     # Options: 'none', 'cosine'
     lr_schedule: str = 'cosine'
-    lr_base: float = 0.001
+    lr_base: float = 0.005
     lr_min: float = 5e-05
     lr_warmup_frames: int = 250_000       # linear warmup from lr_min -> lr_base
     lr_hold_until_frames: int = 1_000_000 # hold at lr_base until this frame
@@ -134,7 +134,7 @@ class RLConfigData:
     continuous_loss_weight: float = 0.5
 
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
-    reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target
+    reward_scale: float = 0.2            # Multiply incoming rewards by this factor before TD target - INCREASED
     reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
     reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
 

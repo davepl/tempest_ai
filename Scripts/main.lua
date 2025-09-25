@@ -211,9 +211,11 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         if num == INVALID_SEGMENT then
             return push_float32(parts, -1.0)  -- INVALID sentinel
         end
-        -- Assert actual Tempest range and normalize to [-1,+1]
-        local validated = assert_range(num, -15, 15, "relative_segment")
-        local normalized = validated / 15.0  -- [-15,+15] → [-1,+1]
+        -- Allow float values, normalize to [-1,+1] assuming max distance 15 segments
+        local normalized = num / 15.0
+        -- Ensure within [-1,1] after normalization
+        if normalized > 1.0 then normalized = 1.0
+        elseif normalized < -1.0 then normalized = -1.0 end
         return push_float32(parts, normalized)
     end
     

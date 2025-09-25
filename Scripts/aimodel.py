@@ -1967,6 +1967,9 @@ def decay_expert_ratio(current_step):
             metrics.expert_ratio *= RL_CONFIG.expert_ratio_decay
         metrics.last_decay_step = step_interval
 
+    # Enforce minimum to prevent expert ratio from decaying below configured floor
+    metrics.expert_ratio = max(metrics.expert_ratio, RL_CONFIG.expert_ratio_min)
+
     return metrics.expert_ratio
 
 # Discrete-only SimpleReplayBuffer removed (hybrid-only)

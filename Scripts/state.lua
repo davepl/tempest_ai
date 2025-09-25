@@ -992,6 +992,43 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         end
     end
 
+    -- Compute fractional relative positions for all enemies to enable precise timing learning
+    for i = 1, 7 do
+        if self.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+            local abs_int = self.enemy_abs_segments[i]
+            local progress = 0.0
+            if self.enemy_between_segments[i] == 1 then
+                local angle_nibble = self.more_enemy_info[i] & 0x0F
+                if self.enemy_direction_moving[i] == 1 then
+                    progress = (15.0 - angle_nibble) / 16.0
+                else
+                    progress = angle_nibble / 16.0
+                end
+            end
+            local abs_float
+            if self.enemy_between_segments[i] == 1 then
+                if self.enemy_direction_moving[i] == 1 then
+                    abs_float = abs_int + progress - 1.0
+                else
+                    abs_float = abs_int - progress
+                end
+            else
+                abs_float = abs_int
+            end
+            abs_float = abs_float % 16.0
+            if abs_float < 0 then abs_float = abs_float + 16.0 end
+            local rel_float
+            if is_open then
+                rel_float = abs_float - player_abs_segment
+            else
+                rel_float = abs_float - player_abs_segment
+                while rel_float > 8.0 do rel_float = rel_float - 16.0 end
+                while rel_float < -8.0 do rel_float = rel_float + 16.0 end
+            end
+            self.enemy_segments[i] = rel_float  -- Update to fractional relative position
+        end
+    end
+
     -- === Calculate and store nearest enemy segment and engineered features ===
     -- Reset zap recommendation before calculation
     self.nearest_enemy_should_zap = false

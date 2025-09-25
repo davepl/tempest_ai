@@ -2008,7 +2008,7 @@ class ServerConfigData:
     params_count: int = 175
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
-    reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
+    reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
      
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
