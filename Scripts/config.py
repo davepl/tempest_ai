@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.0020                    
+    lr: float = 0.0025                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
@@ -129,6 +129,9 @@ class RLConfigData:
     adaptive_epsilon_floor: bool = True
     # Expert policy: allow adaptive expert-ratio floor adjustments based on performance trend
     adaptive_expert_floor: bool = False
+
+    # Epsilon when zooming: fixed value used during GS_ZoomingDown ($20)
+    epsilon_when_zooming: float = 0.05
 
     # Loss weighting: balance continuous head relative to discrete head
     continuous_loss_weight: float = 0.5
@@ -233,6 +236,12 @@ class MetricsData:
     deaths_collision: int = 0  # direct enemy collision ($09)
     deaths_spike: int = 0      # spike or pulsar pulse ($07)
     deaths_other: int = 0      # any other code
+    # Interval counters (since last metrics row)
+    deaths_total_interval: int = 0
+    deaths_shot_interval: int = 0
+    deaths_collision_interval: int = 0
+    deaths_spike_interval: int = 0
+    deaths_other_interval: int = 0
     last_player_alive: bool = True
     last_death_reason: int = 0
     
@@ -376,14 +385,39 @@ class MetricsData:
             if was_alive and not now_alive:
                 # A death just occurred; classify by reason
                 self.deaths_total += 1
+                self.deaths_total_interval += 1
                 if death_reason == -1:
                     self.deaths_shot += 1
+                    self.deaths_shot_interval += 1
                 elif death_reason == 9:
                     self.deaths_collision += 1
+                    self.deaths_collision_interval += 1
                 elif death_reason == 7:
                     self.deaths_spike += 1
+                    self.deaths_spike_interval += 1
                 else:
                     self.deaths_other += 1
+                    self.deaths_other_interval += 1
+
+    def pop_death_intervals(self) -> tuple[int, int, int, int, int]:
+        """Atomically get and reset interval death counters.
+
+        Returns tuple: (total, shot, collision, spike, other)
+        """
+        with self.lock:
+            totals = (
+                int(self.deaths_total_interval),
+                int(self.deaths_shot_interval),
+                int(self.deaths_collision_interval),
+                int(self.deaths_spike_interval),
+                int(self.deaths_other_interval),
+            )
+            self.deaths_total_interval = 0
+            self.deaths_shot_interval = 0
+            self.deaths_collision_interval = 0
+            self.deaths_spike_interval = 0
+            self.deaths_other_interval = 0
+            return totals
     
     
     def get_reward_component_averages(self) -> Dict[str, float]:

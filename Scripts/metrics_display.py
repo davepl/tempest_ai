@@ -291,18 +291,26 @@ def display_metrics_row(agent, kb_handler):
         except Exception:
             q_range = "Error"
 
-    # Compute death breakdown percentages
-    with metrics.lock:
-        d_tot = int(getattr(metrics, 'deaths_total', 0))
-        d_shot = int(getattr(metrics, 'deaths_shot', 0))
-        d_col = int(getattr(metrics, 'deaths_collision', 0))
-        d_spk = int(getattr(metrics, 'deaths_spike', 0))
-        d_oth = int(getattr(metrics, 'deaths_other', 0))
-    denom = max(1, d_tot)
-    pct_shot = 100.0 * d_shot / denom
-    pct_col = 100.0 * d_col / denom
-    pct_spk = 100.0 * d_spk / denom
-    pct_oth = 100.0 * d_oth / denom
+    # Compute death breakdown percentages since last row (interval), and reset interval counters
+    try:
+        d_tot, d_shot, d_col, d_spk, d_oth = metrics.pop_death_intervals()
+    except Exception:
+        with metrics.lock:
+            d_tot = int(getattr(metrics, 'deaths_total_interval', 0))
+            d_shot = int(getattr(metrics, 'deaths_shot_interval', 0))
+            d_col = int(getattr(metrics, 'deaths_collision_interval', 0))
+            d_spk = int(getattr(metrics, 'deaths_spike_interval', 0))
+            d_oth = int(getattr(metrics, 'deaths_other_interval', 0))
+            metrics.deaths_total_interval = 0
+            metrics.deaths_shot_interval = 0
+            metrics.deaths_collision_interval = 0
+            metrics.deaths_spike_interval = 0
+            metrics.deaths_other_interval = 0
+    denom = max(1, int(d_tot))
+    pct_shot = 100.0 * int(d_shot) / denom
+    pct_col = 100.0 * int(d_col) / denom
+    pct_spk = 100.0 * int(d_spk) / denom
+    pct_oth = 100.0 * int(d_oth) / denom
 
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
     # Show effective epsilon (0.00 when epsilon override is ON)
