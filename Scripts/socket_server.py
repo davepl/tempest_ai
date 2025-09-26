@@ -167,6 +167,8 @@ class SocketServer:
                 'episode_dqn_reward': 0.0,
                 'episode_expert_reward': 0.0,
                 'was_done': False,
+                'last_player_alive': 1,  # For edge-triggered death detection
+                'death_counted_this_episode': False,  # Prevent multiple deaths per episode
                 # Only create an n-step buffer if the server is responsible for n-step preprocessing
                 'nstep_buffer': (
                     NStepReplayBuffer(RL_CONFIG.n_step, RL_CONFIG.gamma, store_aux_action=True)
@@ -264,11 +266,15 @@ class SocketServer:
                     except Exception:
                         pass
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
-                # Edge-triggered death counting using player_alive and death_reason from Lua
-                try:
-                    self.metrics.record_death_reason(bool(frame.player_alive), int(frame.death_reason))
-                except Exception:
-                    pass
+                # Count deaths on edge from alive to dead, with valid death reason, once per episode
+                if (not frame.player_alive and state['last_player_alive'] == 1 and 
+                    frame.death_reason != 0 and not state['death_counted_this_episode']):
+                    try:
+                        self.metrics.record_death(int(frame.death_reason))
+                        state['death_counted_this_episode'] = True
+                    except Exception:
+                        pass
+                state['last_player_alive'] = frame.player_alive
 
                 # N-step experience processing (server-side only when enabled) or direct 1-step fallback
                 if state.get('last_state') is not None and state.get('last_action_hybrid') is not None:
@@ -346,6 +352,8 @@ class SocketServer:
                     # reset for next episode
                     state['last_state'] = None
                     state['last_action_hybrid'] = None
+                    state['last_player_alive'] = 1  # Reset for new episode
+                    state['death_counted_this_episode'] = False  # Reset death count flag
                     try:
                         state['nstep_buf'].clear()
                     except Exception:

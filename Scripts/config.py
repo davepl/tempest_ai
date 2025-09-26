@@ -372,7 +372,7 @@ class MetricsData:
     def record_death_reason(self, player_alive: bool, death_reason: int):
         """Edge-triggered death accounting. Call once per frame with alive flag and reason code.
 
-        Increments totals only when transitioning from alive (True) to dead (False).
+        Increments totals only when transitioning from alive (False) to dead (True).
         death_reason is a signed byte: -1 (0xFF) for shot, 9 for collision, 7 for spike/pulsar.
         Unknown codes go to deaths_other.
         """
@@ -398,6 +398,28 @@ class MetricsData:
                 else:
                     self.deaths_other += 1
                     self.deaths_other_interval += 1
+
+    def record_death(self, death_reason: int):
+        """Record a death with the given reason code.
+        
+        death_reason is a signed byte: -1 (0xFF) for shot, 9 for collision, 7 for spike/pulsar.
+        Unknown codes go to deaths_other.
+        """
+        with self.lock:
+            self.deaths_total += 1
+            self.deaths_total_interval += 1
+            if death_reason == -1:
+                self.deaths_shot += 1
+                self.deaths_shot_interval += 1
+            elif death_reason == 9:
+                self.deaths_collision += 1
+                self.deaths_collision_interval += 1
+            elif death_reason == 7:
+                self.deaths_spike += 1
+                self.deaths_spike_interval += 1
+            else:
+                self.deaths_other += 1
+                self.deaths_other_interval += 1
 
     def pop_death_intervals(self) -> tuple[int, int, int, int, int]:
         """Atomically get and reset interval death counters.

@@ -1624,12 +1624,12 @@ class SafeMetrics:
         with self.lock:
             return self.metrics.fps
 
-    def record_death_reason(self, player_alive: bool, death_reason: int):
-        """Thread-safe passthrough to MetricsData.record_death_reason if available."""
+    def record_death(self, death_reason: int):
+        """Thread-safe passthrough to MetricsData.record_death if available."""
         with self.lock:
             try:
-                if hasattr(self.metrics, 'record_death_reason') and callable(self.metrics.record_death_reason):
-                    self.metrics.record_death_reason(bool(player_alive), int(death_reason))
+                if hasattr(self.metrics, 'record_death') and callable(self.metrics.record_death):
+                    self.metrics.record_death(int(death_reason))
             except Exception:
                 pass
 

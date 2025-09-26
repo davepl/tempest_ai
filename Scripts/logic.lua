@@ -60,6 +60,9 @@ local score_at_level_start = 0
 -- Track previous top-rail alignment (for progress reward)
 local previous_toprail_min_abs_rel = nil
 
+-- Track episode termination to prevent multiple bDone signals per episode
+local episode_ended = false
+
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
 local function find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func)
@@ -619,10 +622,15 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     local reward, bDone = 0.0, false
 
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
-    if player_state.alive == 0 and previous_alive_state == 1 then
+    if player_state.alive == 0 and previous_alive_state == 1 and not episode_ended then
         reward = reward - DEATH_PENALTY
         bDone = true
+        episode_ended = true
     else
+        -- Reset episode_ended flag when player respawns (alive goes from 0 to 1)
+        if player_state.alive == 1 and previous_alive_state == 0 then
+            episode_ended = false
+        end
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
         if score_delta ~= 0 and score_delta < 1000 then                         -- Filter our large completion bonuses
