@@ -130,7 +130,7 @@ def display_metrics_header():
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
         f"{'Rwrd':>6} {'DQN':>6} {'Exp':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
-        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'Fresh%':>7} {'GradNorm':>8} {'ClipΔ':>6} "
+        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'Fresh%':>7} {'BufAge':>7} {'GradNorm':>8} {'ClipΔ':>6} "
         f"{'Deaths':>6} {'%Sht':>5} {'%Col':>5} {'%Spk':>5} {'%Oth':>5} "
         f"{'Q-Value Range':>14} {'Training Stats':>15}"
     )
@@ -198,6 +198,7 @@ def display_metrics_row(agent, kb_handler):
     steps_per_sec = 0.0
     samples_per_sec = 0.0
     freshness_pct = 0.0
+    buffer_age_avg = 0.0
     steps_per_1k_frames = 0.0
     with metrics.lock:
         # Average inference time and reset
@@ -239,6 +240,14 @@ def display_metrics_row(agent, kb_handler):
             freshness_pct = freshness_ratio * 100.0
         else:
             freshness_pct = 0.0
+        
+        # Buffer age statistics (average age of sampled experiences in frames)
+        try:
+            if agent and hasattr(agent, 'memory') and hasattr(agent.memory, 'get_buffer_age_stats'):
+                age_mean, _, _ = agent.memory.get_buffer_age_stats(metrics.frame_count)
+                buffer_age_avg = age_mean / 1000.0  # Convert to thousands of frames for display
+        except Exception:
+            buffer_age_avg = 0.0
         # Interval Steps/1kF using the same interval counts
         denom_frames = max(1, frames_int)
         steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
@@ -331,6 +340,7 @@ def display_metrics_row(agent, kb_handler):
         f"{samples_per_sec:>8.0f} "
         f"{steps_per_sec:>8.1f} "
         f"{freshness_pct:>7.3f} "
+        f"{buffer_age_avg:>7.1f} "
         f"{metrics.grad_norm:>8.3f} "
         f"{metrics.grad_clip_delta:>6.3f} "
         f"{d_tot:>6d} "

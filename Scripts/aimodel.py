@@ -419,18 +419,98 @@ class HybridDQN(nn.Module):
         
         return discrete_q, continuous_spinner
 
-class HybridReplayBuffer:
-    """Experience replay buffer for hybrid discrete-continuous actions.
+class SegmentTree:
+    """Segment tree for efficient prioritized sampling with O(log n) updates and sampling."""
     
-    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
-    - discrete_action: integer index for fire/zap combination (0-3)
-    - continuous_action: float spinner value in [-0.9, +0.9]
-    """
-    def __init__(self, capacity: int, state_size: int):
+    def __init__(self, capacity: int):
         self.capacity = capacity
-        self.position = 0
+        self.tree = np.zeros(2 * capacity, dtype=np.float32)
+        self.data = np.zeros(capacity, dtype=np.int32)  # Store indices
         self.size = 0
+        
+    def _propagate(self, idx: int, change: float):
+        """Propagate change up the tree iteratively."""
+        while idx > 0:
+            parent = idx // 2
+            if parent >= 0:
+                self.tree[parent] += change
+            idx = parent
+    
+    def update(self, idx: int, priority: float):
+        """Update priority for an index."""
+        idx = int(idx)
+        if idx < 0 or idx >= self.capacity:
+            return
+            
+        # Calculate change
+        old_priority = self.tree[self.capacity + idx]
+        change = priority - old_priority
+        
+        # Update leaf
+        self.tree[self.capacity + idx] = priority
+        
+        # Propagate up
+        self._propagate(self.capacity + idx, change)
+        
+        # Update size
+        if priority > 0 and idx >= self.size:
+            self.size = idx + 1
+    
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample indices based on priorities."""
+        if self.size == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+            
+        indices = np.zeros(batch_size, dtype=np.int32)
+        priorities = np.zeros(batch_size, dtype=np.float32)
+        
+        for i in range(batch_size):
+            # Sample a value between 0 and total priority
+            total_priority = self.tree[1]  # Root node
+            if total_priority <= 0:
+                # Fallback to uniform sampling
+                idx = np.random.randint(0, self.size)
+                indices[i] = idx
+                priorities[i] = 1.0
+                continue
+                
+            sample_val = np.random.uniform(0, total_priority)
+            
+            # Find the leaf node
+            node = 1
+            while node < self.capacity:
+                left_child = 2 * node
+                right_child = 2 * node + 1
+                
+                if sample_val <= self.tree[left_child]:
+                    node = left_child
+                else:
+                    sample_val -= self.tree[left_child]
+                    node = right_child
+            
+            # Convert back to data index
+            data_idx = node - self.capacity
+            indices[i] = data_idx
+            priorities[i] = self.tree[node]
+        
+        return indices, priorities
+    
+    def get_total_priority(self) -> float:
+        """Get total priority (root node value)."""
+        return self.tree[1] if len(self.tree) > 1 else 0.0
+
+
+class PrioritizedReplayBuffer:
+    """Prioritized Experience Replay buffer using segment tree for efficient sampling."""
+    
+    def __init__(self, capacity: int, state_size: int, alpha: float = 0.6, beta: float = 0.4, 
+                 beta_increment: float = 1e-6, max_priority: float = 1.0):
+        self.capacity = capacity
         self.state_size = int(state_size)
+        self.alpha = alpha  # Priority exponent
+        self.beta = beta    # Importance sampling exponent
+        self.beta_increment = beta_increment
+        self.max_priority = max_priority
         
         # Pre-allocated arrays for maximum speed
         self.states = np.empty((capacity, self.state_size), dtype=np.float32)
@@ -439,9 +519,22 @@ class HybridReplayBuffer:
         self.rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
+        self.priorities = np.full(capacity, max_priority, dtype=np.float32)
+        self.frame_indices = np.zeros(capacity, dtype=np.int64)  # For age tracking
+        
+        # Segment tree for efficient sampling
+        self.tree = SegmentTree(capacity)
+        
+        self.position = 0
+        self.size = 0
+        self.frame_count = 0  # Track current frame count for age calculation
+        
+        # Initialize all priorities
+        for i in range(capacity):
+            self.tree.update(i, max_priority)
     
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done):
-        """Add experience to buffer"""
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done, frame_idx: int = 0):
+        """Add experience to buffer with high initial priority."""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
@@ -481,43 +574,36 @@ class HybridReplayBuffer:
         except Exception:
             self.next_states[self.position, :] = 0.0
         self.dones[self.position] = done
+        self.frame_indices[self.position] = frame_idx
+        
+        # Set high priority for new experiences
+        self.priorities[self.position] = self.max_priority
+        self.tree.update(self.position, self.max_priority ** self.alpha)
         
         # Update position and size
         self.position = (self.position + 1) % self.capacity
         if self.size < self.capacity:
             self.size += 1
     
-    def sample(self, batch_size):
-        """Sample batch of experiences with optional recent-window bias."""
+    def sample(self, batch_size, frame_count: int = 0):
+        """Sample batch using prioritized sampling with importance sampling weights."""
         if self.size < batch_size:
             return None
-
-        # Default: uniform over buffer
-        indices = None
-        try:
-            bias = float(getattr(RL_CONFIG, 'recent_sample_bias', 0.0) or 0.0)
-            window_frac = float(getattr(RL_CONFIG, 'recent_window_frac', 0.0) or 0.0)
-        except Exception:
-            bias, window_frac = 0.0, 0.0
-
-        if bias <= 0.0 or window_frac <= 0.0:
-            indices = np.random.randint(0, self.size, size=batch_size)
+            
+        # Update beta for importance sampling
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        
+        # Sample indices and priorities from segment tree
+        indices, sampled_priorities = self.tree.sample(batch_size)
+        
+        # Calculate importance sampling weights
+        total_priority = self.tree.get_total_priority()
+        if total_priority > 0:
+            probs = sampled_priorities / total_priority
+            weights = (self.size * probs) ** (-self.beta)
+            weights /= weights.max()  # Normalize
         else:
-            # Split batch: some from recent window, remainder from full buffer
-            recent_count = int(batch_size * min(max(bias, 0.0), 1.0))
-            global_count = batch_size - recent_count
-            # Recent window range [start, size)
-            recent_window = int(self.size * (1.0 - min(max(window_frac, 0.0), 1.0)))
-            recent_low = max(0, min(recent_window, self.size - 1))
-            if recent_count > 0 and recent_low < self.size:
-                recent_idx = np.random.randint(recent_low, self.size, size=recent_count)
-            else:
-                recent_idx = np.empty((0,), dtype=np.int64)
-            if global_count > 0:
-                global_idx = np.random.randint(0, self.size, size=global_count)
-            else:
-                global_idx = np.empty((0,), dtype=np.int64)
-            indices = np.concatenate([recent_idx, global_idx])
+            weights = np.ones(batch_size, dtype=np.float32)
         
         # Vectorized gather for batch data
         states_np = self.states[indices]
@@ -526,8 +612,15 @@ class HybridReplayBuffer:
         batch_continuous_actions = self.continuous_actions[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
-
-        # Convert to tensors (pin memory for fast H2D when on CUDA)
+        batch_weights = weights
+        batch_indices = indices  # For priority updates
+        
+        # Calculate buffer age statistics
+        current_frame_idx = frame_count
+        ages = current_frame_idx - self.frame_indices[indices]
+        avg_age = np.mean(ages) if len(ages) > 0 else 0.0
+        
+        # Convert to tensors
         use_pinned = (training_device.type == 'cuda')
         states = torch.from_numpy(states_np).float()
         next_states = torch.from_numpy(next_states_np).float()
@@ -535,6 +628,7 @@ class HybridReplayBuffer:
         continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        importance_weights = torch.from_numpy(batch_weights.reshape(-1, 1)).float()
 
         if use_pinned:
             states = states.pin_memory()
@@ -543,6 +637,7 @@ class HybridReplayBuffer:
             continuous_actions = continuous_actions.pin_memory()
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
+            importance_weights = importance_weights.pin_memory()
 
         non_block = True if training_device.type == 'cuda' else False
         states = states.to(training_device, non_blocking=non_block)
@@ -551,11 +646,172 @@ class HybridReplayBuffer:
         continuous_actions = continuous_actions.to(training_device, non_blocking=non_block)
         rewards = rewards.to(training_device, non_blocking=non_block)
         dones = dones.to(training_device, non_blocking=non_block)
+        importance_weights = importance_weights.to(training_device, non_blocking=non_block)
         
-        return states, discrete_actions, continuous_actions, rewards, next_states, dones
+        return (states, discrete_actions, continuous_actions, rewards, next_states, dones, 
+                importance_weights, batch_indices, avg_age)
+    
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
+        """Update priorities for sampled experiences."""
+        for idx, priority in zip(indices, priorities):
+            idx = int(idx)
+            priority = float(priority)
+            if idx < 0 or idx >= self.capacity:
+                continue
+            self.priorities[idx] = priority
+            self.tree.update(idx, priority ** self.alpha)
+    
+    def get_buffer_age_stats(self, frame_count: int) -> Tuple[float, float, float]:
+        """Get buffer age statistics: mean, min, max age in frames."""
+        if self.size == 0:
+            return 0.0, 0.0, 0.0
+            
+        valid_indices = np.arange(self.size)
+        ages = frame_count - self.frame_indices[valid_indices]
+        return float(np.mean(ages)), float(np.min(ages)), float(np.max(ages))
     
     def __len__(self):
         return self.size
+
+
+class HybridReplayBuffer:
+    """Experience replay buffer for hybrid discrete-continuous actions.
+    
+    Supports both uniform and prioritized sampling modes.
+    """
+    def __init__(self, capacity: int, state_size: int, use_prioritized: bool = True):
+        self.capacity = capacity
+        self.state_size = int(state_size)
+        self.use_prioritized = use_prioritized
+        
+        if use_prioritized:
+            self.buffer = PrioritizedReplayBuffer(capacity, state_size)
+        else:
+            # Fallback to uniform sampling buffer
+            self.buffer = self._create_uniform_buffer(capacity, state_size)
+    
+    def _create_uniform_buffer(self, capacity: int, state_size: int):
+        """Create a simple uniform sampling buffer."""
+        class UniformBuffer:
+            def __init__(self, cap, state_sz):
+                self.capacity = cap
+                self.state_size = state_sz
+                self.states = np.empty((cap, state_sz), dtype=np.float32)
+                self.discrete_actions = np.empty((cap,), dtype=np.int32)
+                self.continuous_actions = np.empty((cap,), dtype=np.float32)
+                self.rewards = np.empty((cap,), dtype=np.float32)
+                self.next_states = np.empty((cap, state_sz), dtype=np.float32)
+                self.dones = np.empty((cap,), dtype=np.bool_)
+                self.position = 0
+                self.size = 0
+                
+            def push(self, state, discrete_action, continuous_action, reward, next_state, done, frame_idx=0):
+                # Same push logic as original
+                discrete_idx = int(discrete_action)
+                continuous_val = float(continuous_action)
+                continuous_val = max(-0.9, min(0.9, continuous_val))
+                
+                try:
+                    s = np.asarray(state, dtype=np.float32).reshape(-1)
+                    if s.size < self.state_size:
+                        tmp = np.zeros((self.state_size,), dtype=np.float32)
+                        tmp[:s.size] = s
+                        s = tmp
+                    elif s.size > self.state_size:
+                        s = s[:self.state_size]
+                    self.states[self.position, :] = s
+                except:
+                    self.states[self.position, :] = 0.0
+                    
+                self.discrete_actions[self.position] = discrete_idx
+                self.continuous_actions[self.position] = continuous_val
+                self.rewards[self.position] = reward
+                
+                try:
+                    ns = np.asarray(next_state, dtype=np.float32).reshape(-1)
+                    if ns.size < self.state_size:
+                        tmp = np.zeros((self.state_size,), dtype=np.float32)
+                        tmp[:ns.size] = ns
+                        ns = tmp
+                    elif ns.size > self.state_size:
+                        ns = ns[:self.state_size]
+                    self.next_states[self.position, :] = ns
+                except:
+                    self.next_states[self.position, :] = 0.0
+                    
+                self.dones[self.position] = done
+                self.position = (self.position + 1) % self.capacity
+                if self.size < self.capacity:
+                    self.size += 1
+            
+            def sample(self, batch_size, frame_count=0):
+                if self.size < batch_size:
+                    return None
+                indices = np.random.randint(0, self.size, size=batch_size)
+                
+                # Same tensor conversion logic
+                use_pinned = (training_device.type == 'cuda')
+                states = torch.from_numpy(self.states[indices]).float()
+                next_states = torch.from_numpy(self.next_states[indices]).float()
+                discrete_actions = torch.from_numpy(self.discrete_actions[indices].reshape(-1, 1)).long()
+                continuous_actions = torch.from_numpy(self.continuous_actions[indices].reshape(-1, 1)).float()
+                rewards = torch.from_numpy(self.rewards[indices].reshape(-1, 1)).float()
+                dones = torch.from_numpy(self.dones[indices].reshape(-1, 1).astype(np.uint8)).float()
+                
+                if use_pinned:
+                    states = states.pin_memory()
+                    next_states = next_states.pin_memory()
+                    discrete_actions = discrete_actions.pin_memory()
+                    continuous_actions = continuous_actions.pin_memory()
+                    rewards = rewards.pin_memory()
+                    dones = dones.pin_memory()
+                
+                non_block = True if training_device.type == 'cuda' else False
+                states = states.to(training_device, non_blocking=non_block)
+                next_states = next_states.to(training_device, non_blocking=non_block)
+                discrete_actions = discrete_actions.to(training_device, non_blocking=non_block)
+                continuous_actions = continuous_actions.to(training_device, non_blocking=non_block)
+                rewards = rewards.to(training_device, non_blocking=non_block)
+                dones = dones.to(training_device, non_blocking=non_block)
+                
+                # Return uniform weights and dummy indices for compatibility
+                importance_weights = torch.ones_like(rewards)
+                batch_indices = torch.from_numpy(indices.reshape(-1, 1)).long()
+                avg_age = 0.0  # Not tracked in uniform buffer
+                
+                return (states, discrete_actions, continuous_actions, rewards, next_states, dones,
+                       importance_weights, batch_indices, avg_age)
+            
+            def update_priorities(self, indices, priorities):
+                pass  # No-op for uniform buffer
+                
+            def get_buffer_age_stats(self, frame_count):
+                return 0.0, 0.0, 0.0
+                
+            def __len__(self):
+                return self.size
+                
+        return UniformBuffer(capacity, state_size)
+    
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done, frame_idx: int = 0):
+        """Add experience to buffer."""
+        self.buffer.push(state, discrete_action, continuous_action, reward, next_state, done, frame_idx)
+    
+    def sample(self, batch_size, frame_count: int = 0):
+        """Sample batch from buffer."""
+        return self.buffer.sample(batch_size, frame_count)
+    
+    def update_priorities(self, indices, priorities):
+        """Update priorities (no-op for uniform buffer)."""
+        if hasattr(self.buffer, 'update_priorities'):
+            self.buffer.update_priorities(indices, priorities)
+    
+    def get_buffer_age_stats(self, frame_count: int):
+        """Get buffer age statistics."""
+        return self.buffer.get_buffer_age_stats(frame_count)
+    
+    def __len__(self):
+        return len(self.buffer)
 
 ## Hybrid-only path: legacy discrete-only DQNAgent removed
 ## N-step learning handled upstream (server) or via dedicated buffer; hybrid agent expects 1-step or n-step rewards provided.
@@ -766,8 +1022,9 @@ class HybridDQNAgent:
         # Optimizer with separate parameter groups for discrete and continuous components
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         
-        # Experience replay (vectorized 2D storage)
-        self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+        # Experience replay (vectorized 2D storage with PER support)
+        use_per = bool(getattr(RL_CONFIG, 'use_prioritized_replay', True))
+        self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size, use_prioritized=use_per)
 
         # AMP persistent settings
         self.use_amp = bool(getattr(RL_CONFIG, 'use_mixed_precision', False) and self.training_device.type == 'cuda')
@@ -841,7 +1098,7 @@ class HybridDQNAgent:
     
     def step(self, state, discrete_action, continuous_action, reward, next_state, done):
         """Add experience to memory and queue training"""
-        self.memory.push(state, discrete_action, continuous_action, reward, next_state, done)
+        self.memory.push(state, discrete_action, continuous_action, reward, next_state, done, metrics.frame_count)
         
         # Queue multiple training steps per experience
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
@@ -930,14 +1187,26 @@ class HybridDQNAgent:
 
             for acc_idx in range(grad_accum_steps):
                 # Sample micro-batch
-                batch = self.memory.sample(self.batch_size)
+                batch = self.memory.sample(self.batch_size, metrics.frame_count)
                 if batch is None:
                     if acc_idx == 0:
                         return 0.0
                     else:
                         break
 
-                states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                # Handle both PER (9 elements) and uniform (6 elements) sampling
+                if len(batch) == 9:
+                    # PER enabled: (states, discrete_actions, continuous_actions, rewards, next_states, dones, 
+                    #               importance_weights, batch_indices, avg_age)
+                    states, discrete_actions, continuous_actions, rewards, next_states, dones, importance_weights, batch_indices, avg_age = batch
+                elif len(batch) == 6:
+                    # Uniform sampling: (states, discrete_actions, continuous_actions, rewards, next_states, dones)
+                    states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                    importance_weights, batch_indices, avg_age = None, None, 0.0
+                else:
+                    # Unexpected format
+                    print(f"Unexpected batch format with {len(batch)} elements")
+                    return 0.0
 
                 # Forward pass (local) under autocast as configured
                 if use_amp:
@@ -1143,6 +1412,21 @@ class HybridDQNAgent:
                 metrics.last_inference_sync_time = time.time()
             except Exception:
                 pass
+        
+        # Update PER priorities if enabled
+        try:
+            if hasattr(self.memory, 'update_priorities') and len(batch) >= 8:
+                _, _, _, _, _, _, importance_weights, batch_indices, _ = batch
+                if batch_indices is not None:  # Only update if PER is enabled
+                    # Calculate TD errors for priority updates (simplified - using loss magnitude)
+                    # In a full implementation, you'd compute the full TD error here
+                    # For now, use a simple heuristic based on loss magnitude
+                    if total_loss_value > 0:
+                        # Scale priorities by loss magnitude, with minimum priority
+                        new_priorities = np.maximum(total_loss_value, 0.01) * np.ones(len(batch_indices))
+                        self.memory.update_priorities(batch_indices.cpu().numpy(), new_priorities)
+        except Exception:
+            pass  # Silently skip priority updates if anything goes wrong
         
         return float(total_loss_value)
 

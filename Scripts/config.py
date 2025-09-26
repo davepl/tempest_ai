@@ -52,16 +52,16 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
+    batch_size: int = 2048               # Reduced from 65536 - was causing extreme slowdown
     lr: float = 0.0025                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
     epsilon_start: float = 0.5            # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.40            # Floor for exploration - TEMPORARILY INCREASED
-    epsilon_end: float = 0.40            # Target floor - TEMPORARILY INCREASED
-    epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
+    epsilon_min: float = 0.10            # Floor for exploration - set to 0.10 for proper decay
+    epsilon_end: float = 0.10            # Target floor - set to 0.10 for proper decay
+    epsilon_decay_steps: int = 1000     # Decay applied every 1k frames (faster decay)
     epsilon_decay_factor: float = 0.9975
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
@@ -81,8 +81,8 @@ class RLConfigData:
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
     # Phase 1 Optimization: More frequent updates for faster convergence
-    training_steps_per_sample: int = 8    # Increased from 12 for better sample efficiency
-    training_workers: int = 4             # Reverted to 1 - multi-threaded training causes autograd conflicts
+    training_steps_per_sample: int = 1    # Reduced from 8 - was causing excessive training overhead
+    training_workers: int = 1             # Reverted to 1 - multi-threaded training causes autograd conflicts
     use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
     tau: float = 0.012                    # Slight bump for more responsive soft target tracking
@@ -122,8 +122,15 @@ class RLConfigData:
 
     # Replay sampling bias toward most recent data (windowed uniform)
     # If bias > 0, sample this fraction from the most recent (window_frac) of the buffer
-    recent_sample_bias: float = 0.5       # 0.0 disables; 0.5 = half recent, half global
+    recent_sample_bias: float = 0.75       # 0.0 disables; 0.75 = 75% recent, 25% global
     recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
+
+    # Prioritized Experience Replay settings
+    use_prioritized_replay: bool = True    # Enable PER for better sample efficiency
+    per_alpha: float = 0.6                 # Priority exponent (0 = uniform, 1 = full prioritization)
+    per_beta_start: float = 0.4            # Initial importance sampling exponent
+    per_beta_increment: float = 1e-6       # Beta increment per step (anneals to 1.0)
+    per_max_priority: float = 1.0          # Initial priority for new experiences
 
     # Exploration policy: allow adaptive epsilon floor adjustments as performance improves
     adaptive_epsilon_floor: bool = True
