@@ -310,6 +310,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i], is_open_level_flag)
     end
     -- DEBUG: Print 7 enemy segment values in +00.00 format
+    --[[
     local debug_parts = {}
     for i = 1, 7 do
         local val = es.enemy_segments[i]
@@ -320,6 +321,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         end
     end
     print(table.concat(debug_parts, " "))
+    --]]
     -- Enemy depths (7) - natural values
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_depths[i])
