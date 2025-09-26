@@ -127,11 +127,11 @@ def display_metrics_header():
     
     # Header updated: remove ISync/HardUpd, add death totals and percentages
     header = (
-        f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
+        f"{'Frame':>11} {'FPS':>6} {'LR':>6} {'Epsi':>6} {'Xprt':>6} "
         f"{'Rwrd':>6} {'DQN':>6} {'Exp':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
         f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'Fresh%':>7} {'BufAge':>7} {'GradNorm':>8} {'ClipΔ':>6} "
-        f"{'Deaths':>6} {'%Sht':>5} {'%Col':>5} {'%Spk':>5} {'%Oth':>5} "
+        f"{'Deaths':>6} "
         f"{'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
@@ -290,6 +290,15 @@ def display_metrics_row(agent, kb_handler):
     mem_k = getattr(metrics, 'memory_buffer_size', 0) // 1000
     training_stats = f"{mem_k}k/{metrics.total_training_steps}/{steps_per_1k_frames:.1f}/{frames_since_target_update//1000}k"
 
+    # Get current learning rate from agent optimizer
+    current_lr = "N/A"
+    if agent and hasattr(agent, 'optimizer'):
+        try:
+            # Get LR from first param group (assuming all groups have same LR)
+            current_lr = f"{agent.optimizer.param_groups[0]['lr']:.4f}"
+        except Exception:
+            current_lr = "N/A"
+
     # Get Q-value range from the agent
     q_range = "N/A"
     if agent:
@@ -329,7 +338,7 @@ def display_metrics_row(agent, kb_handler):
         effective_eps = metrics.epsilon
 
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {current_lr:>6} {effective_eps:>6.2f} "
     f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_dqn_reward:>6.2f} {mean_expert_reward:>6.2f} "
         f"{dqn5m_avg:>6.2f} {dqn5m_slopeM:>6.2f} {loss_avg:>10.6f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
@@ -344,10 +353,6 @@ def display_metrics_row(agent, kb_handler):
         f"{metrics.grad_norm:>8.3f} "
         f"{metrics.grad_clip_delta:>6.3f} "
         f"{d_tot:>6d} "
-        f"{pct_shot:>5.1f} "
-        f"{pct_col:>5.1f} "
-        f"{pct_spk:>5.1f} "
-        f"{pct_oth:>5.1f} "
         f"{q_range:>14} {training_stats:>15}"
     )
     

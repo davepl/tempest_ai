@@ -825,7 +825,44 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 end
             end
 
-            -- 7. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
+            -- 9. FLIPPER SAFETY REWARD (Encourage stepping away when shots depleted)
+            -- Penalize proximity to top-rail flippers when all shots are in use (shot_count >= 8)
+            do
+                local shot_count = player_state.shot_count or 0
+                if shot_count >= 8 then
+                    local nearest_flipper_dist = nil
+                    -- Find nearest top-rail flipper distance
+                    for i = 1, 7 do
+                        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+                           enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                            local relf = enemies_state.active_top_rail_enemies[i]
+                            if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
+                                local d = math.abs(relf)
+                                if not nearest_flipper_dist or d < nearest_flipper_dist then
+                                    nearest_flipper_dist = d
+                                end
+                            end
+                        end
+                    end
+
+                    -- Apply safety penalty based on proximity when shots are depleted
+                    if nearest_flipper_dist then
+                        local safety_penalty = 0.0
+                        if nearest_flipper_dist <= 1.0 then
+                            -- Severe penalty when flipper is very close (adjacent or aligned)
+                            safety_penalty = -0.05 * safety_scale  -- ~50 points penalty
+                        elseif nearest_flipper_dist <= 2.0 then
+                            -- Moderate penalty when flipper is within 2 segments
+                            safety_penalty = -0.02 * safety_scale  -- ~20 points penalty
+                        elseif nearest_flipper_dist <= 3.0 then
+                            -- Light penalty when flipper is within 3 segments
+                            safety_penalty = -0.01 * safety_scale  -- ~10 points penalty
+                        end
+                        reward = reward + safety_penalty
+                    end
+                end
+            end
+            -- 10. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
             -- Apply a small penalty when spinning while already aligned (or no target)
             -- and not in immediate danger. Keeps behavior calm instead of fidgety.
             do

@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 2048               # Reduced from 65536 - was causing extreme slowdown
-    lr: float = 0.0025                     
+    lr: float = 0.0030                     # Increased for PER efficiency                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
@@ -111,7 +111,7 @@ class RLConfigData:
     # Optimization: learning-rate schedule (frame-based)
     # Options: 'none', 'cosine'
     lr_schedule: str = 'none'
-    lr_base: float = 0.0020
+    lr_base: float = 0.0030
     lr_min: float = 5e-05
     lr_warmup_frames: int = 250_000       # linear warmup from lr_min -> lr_base
     lr_hold_until_frames: int = 1_000_000 # hold at lr_base until this frame

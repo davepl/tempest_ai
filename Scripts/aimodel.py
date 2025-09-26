@@ -1257,14 +1257,38 @@ class HybridDQNAgent:
                 # Losses per micro-batch (autocast already applied for forward)
                 if use_amp:
                     with self.autocast():
-                        d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
-                        c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                        # Compute per-sample losses (reduction='none') for importance weighting
+                        d_loss_per_sample = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+                        c_loss_per_sample = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                        
+                        # Apply importance sampling weights if PER is enabled
+                        if importance_weights is not None:
+                            # Weight each sample's loss by its importance weight
+                            d_loss = (importance_weights.squeeze() * d_loss_per_sample).mean()
+                            c_loss = (importance_weights.squeeze() * c_loss_per_sample).mean()
+                        else:
+                            # Uniform sampling - use mean of per-sample losses
+                            d_loss = d_loss_per_sample.mean()
+                            c_loss = c_loss_per_sample.mean()
+                            
                         micro_total = d_loss + w_cont * c_loss
                         # Scale loss for accumulation so effective LR remains constant
                         micro_total = micro_total / float(grad_accum_steps)
                 else:
-                    d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
-                    c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                    # Compute per-sample losses (reduction='none') for importance weighting
+                    d_loss_per_sample = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+                    c_loss_per_sample = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                    
+                    # Apply importance sampling weights if PER is enabled
+                    if importance_weights is not None:
+                        # Weight each sample's loss by its importance weight
+                        d_loss = (importance_weights.squeeze() * d_loss_per_sample).mean()
+                        c_loss = (importance_weights.squeeze() * c_loss_per_sample).mean()
+                    else:
+                        # Uniform sampling - use mean of per-sample losses
+                        d_loss = d_loss_per_sample.mean()
+                        c_loss = c_loss_per_sample.mean()
+                        
                     micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
 
                 total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
@@ -1418,13 +1442,19 @@ class HybridDQNAgent:
             if hasattr(self.memory, 'update_priorities') and len(batch) >= 8:
                 _, _, _, _, _, _, importance_weights, batch_indices, _ = batch
                 if batch_indices is not None:  # Only update if PER is enabled
-                    # Calculate TD errors for priority updates (simplified - using loss magnitude)
-                    # In a full implementation, you'd compute the full TD error here
-                    # For now, use a simple heuristic based on loss magnitude
-                    if total_loss_value > 0:
-                        # Scale priorities by loss magnitude, with minimum priority
-                        new_priorities = np.maximum(total_loss_value, 0.01) * np.ones(len(batch_indices))
-                        self.memory.update_priorities(batch_indices.cpu().numpy(), new_priorities)
+                    # Compute individual TD errors for proper priority updates
+                    # TD error = |Q(s,a) - (r + γ * max_a' Q(s',a'))|
+                    with torch.no_grad():
+                        # Get current Q values for selected actions (already computed above)
+                        current_q = discrete_q_selected.detach()
+                        # Targets already computed above as discrete_targets
+                        td_errors = torch.abs(current_q - discrete_targets).cpu().numpy()
+                        
+                        # Add small epsilon to avoid zero priorities
+                        td_errors = np.maximum(td_errors, 0.01)
+                        
+                        # Update priorities in the replay buffer
+                        self.memory.update_priorities(batch_indices.cpu().numpy(), td_errors)
         except Exception:
             pass  # Silently skip priority updates if anything goes wrong
         
