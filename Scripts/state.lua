@@ -557,6 +557,7 @@ function M.PlayerState:new()
     local self = setmetatable({}, M.PlayerState)
     self.position = 0           -- Raw position byte from $0200
     self.alive = 0              -- 1 if alive, 0 if dead
+    self.death_reason = 0       -- Death reason code from $013B (signed byte semantics)
     self.score = 0              -- Player score (decimal)
     self.superzapper_uses = 0
     self.superzapper_active = 0
@@ -589,6 +590,9 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     self.position = mem:read_u8(0x0200) -- Player position byte
     self.player_state = mem:read_u8(0x0201) -- Player state value at $201
     self.player_depth = mem:read_u8(0x0202) -- Player depth along the tube
+    -- Read death reason byte ($013B). Assembly uses values like $FF (enemy shot), $09 (collision), $07 (spike/pulsar).
+    -- We keep it as 0..255 here; packing uses signed byte semantics so $FF will be -1 on Python side.
+    self.death_reason = mem:read_u8(0x013B)
 
     -- Player alive state: High bit of player_state ($201) is set when dead
     self.alive = ((self.player_state & 0x80) == 0) and 1 or 0

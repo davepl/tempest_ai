@@ -141,6 +141,8 @@ class FrameData:
     expert_fire: bool  # Added: Expert system fire recommendation
     expert_zap: bool   # Added: Expert system zap recommendation
     level_number: int  # Added: Current level number from Lua
+    player_alive: bool  # Added: Player alive flag (from $0201 high bit inverted)
+    death_reason: int   # Added: Death reason signed byte from $013B (-1, 7, 9, etc.)
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
@@ -159,7 +161,9 @@ class FrameData:
             open_level=data["open_level"],
             expert_fire=data["expert_fire"],
             expert_zap=data["expert_zap"],
-            level_number=data.get("level_number", 0)  # Default to 0 if not provided
+            level_number=data.get("level_number", 0),  # Default to 0 if not provided
+            player_alive=bool(data.get("player_alive", True)),
+            death_reason=int(data.get("death_reason", 0))
         )
 
 # Configuration constants
@@ -1620,6 +1624,15 @@ class SafeMetrics:
         with self.lock:
             return self.metrics.fps
 
+    def record_death_reason(self, player_alive: bool, death_reason: int):
+        """Thread-safe passthrough to MetricsData.record_death_reason if available."""
+        with self.lock:
+            try:
+                if hasattr(self.metrics, 'record_death_reason') and callable(self.metrics.record_death_reason):
+                    self.metrics.record_death_reason(bool(player_alive), int(death_reason))
+            except Exception:
+                pass
+
     # Thread-safe helpers for common aggregated metrics
     def add_inference_time(self, t: float):
         """Accumulate inference time and count in a thread-safe way."""
@@ -1653,12 +1666,12 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
         
         # Fixed OOB header format (must match Lua exactly). Precompute once.
-        # Format: ">HdBBBHHHBBBhBhBBBBBffffff"
+        # Format: ">HdBBBHHHBBBhBhBBBBBBb"
         global _FMT_OOB, _HDR_OOB
         try:
             _FMT_OOB
         except NameError:
-            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBB"
+            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBBBb"
             _HDR_OOB = struct.calcsize(_FMT_OOB)
 
         if len(data) < _HDR_OOB:
@@ -1668,7 +1681,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
         (num_values, reward, gamestate, game_mode, done, frame_counter, score_high, score_low,
          save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
-         expert_fire, expert_zap, level_number) = values
+         expert_fire, expert_zap, level_number, player_alive, death_reason) = values
         header_size = _HDR_OOB
         
         # Combine score components
@@ -1722,7 +1735,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
             expert_zap=bool(expert_zap),
-            level_number=level_number
+            level_number=level_number,
+            player_alive=bool(player_alive),
+            death_reason=int(death_reason)
         )
         
         return frame_data

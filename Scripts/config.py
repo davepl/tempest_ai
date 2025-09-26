@@ -53,16 +53,16 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.0025                    # PLATEAU BREAKER: Increased from 0.0025
+    lr: float = 0.0020                    
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
     epsilon_start: float = 0.5            # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.20            # Floor for exploration - TEMPORARILY INCREASED
-    epsilon_end: float = 0.20            # Target floor - TEMPORARILY INCREASED
+    epsilon_min: float = 0.40            # Floor for exploration - TEMPORARILY INCREASED
+    epsilon_end: float = 0.40            # Target floor - TEMPORARILY INCREASED
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
-    epsilon_decay_factor: float = 0.997
+    epsilon_decay_factor: float = 0.9975
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
@@ -71,8 +71,8 @@ class RLConfigData:
     expert_ratio_decay: float = 0.9977     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 6                  
+    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 7                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
@@ -95,7 +95,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 5
+    n_step: int = 7
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
@@ -110,8 +110,8 @@ class RLConfigData:
 
     # Optimization: learning-rate schedule (frame-based)
     # Options: 'none', 'cosine'
-    lr_schedule: str = 'cosine'
-    lr_base: float = 0.0025
+    lr_schedule: str = 'none'
+    lr_base: float = 0.0020
     lr_min: float = 5e-05
     lr_warmup_frames: int = 250_000       # linear warmup from lr_min -> lr_base
     lr_hold_until_frames: int = 1_000_000 # hold at lr_base until this frame
@@ -226,6 +226,15 @@ class MetricsData:
     training_enabled: bool = True
     # Epsilon override: when True, force epsilon=0.0 (pure greedy) regardless of other overrides
     override_epsilon: bool = False
+
+    # Death tracking (totals and by cause). Updated edge-triggered on alive->dead transitions.
+    deaths_total: int = 0
+    deaths_shot: int = 0       # enemy shot ($FF -> -1)
+    deaths_collision: int = 0  # direct enemy collision ($09)
+    deaths_spike: int = 0      # spike or pulsar pulse ($07)
+    deaths_other: int = 0      # any other code
+    last_player_alive: bool = True
+    last_death_reason: int = 0
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
@@ -350,6 +359,31 @@ class MetricsData:
         """Get current FPS"""
         with self.lock:
             return self.fps
+
+    def record_death_reason(self, player_alive: bool, death_reason: int):
+        """Edge-triggered death accounting. Call once per frame with alive flag and reason code.
+
+        Increments totals only when transitioning from alive (True) to dead (False).
+        death_reason is a signed byte: -1 (0xFF) for shot, 9 for collision, 7 for spike/pulsar.
+        Unknown codes go to deaths_other.
+        """
+        with self.lock:
+            was_alive = bool(self.last_player_alive)
+            now_alive = bool(player_alive)
+            # Update last seen for next frame
+            self.last_player_alive = now_alive
+            self.last_death_reason = int(death_reason)
+            if was_alive and not now_alive:
+                # A death just occurred; classify by reason
+                self.deaths_total += 1
+                if death_reason == -1:
+                    self.deaths_shot += 1
+                elif death_reason == 9:
+                    self.deaths_collision += 1
+                elif death_reason == 7:
+                    self.deaths_spike += 1
+                else:
+                    self.deaths_other += 1
     
     
     def get_reward_component_averages(self) -> Dict[str, float]:

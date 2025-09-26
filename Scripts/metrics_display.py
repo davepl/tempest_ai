@@ -125,13 +125,14 @@ def display_metrics_header():
     row_counter = 0
     # clear_screen()
     
-    # Header with Q-Value Range moved before Training Stats, reward components removed
+    # Header updated: remove ISync/HardUpd, add death totals and percentages
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
         f"{'Rwrd':>6} {'DQN':>6} {'Exp':>6} {'DQN5M':>6} {'SlpM':>6} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
-        f"{'ISync F/T':>12} {'HardUpd F/T':>13} "
-        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'Fresh%':>7} {'GradNorm':>8} {'ClipΔ':>6} "
+        f"{'Deaths':>6} {'%Sht':>5} {'%Col':>5} {'%Spk':>5} {'%Oth':>5} "
+        f"{'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -196,6 +197,7 @@ def display_metrics_row(agent, kb_handler):
     avg_inference_time_ms = 0.0
     steps_per_sec = 0.0
     samples_per_sec = 0.0
+    freshness_pct = 0.0
     steps_per_1k_frames = 0.0
     with metrics.lock:
         # Average inference time and reset
@@ -226,6 +228,17 @@ def display_metrics_row(agent, kb_handler):
             samples_per_sec = steps_per_sec * float(RL_CONFIG.batch_size)
         except Exception:
             samples_per_sec = 0.0
+        # Freshness ratio (interval): new frames / consumed samples (effective batch accounts for grad accumulation)
+        try:
+            grad_accum = max(1, int(getattr(RL_CONFIG, 'gradient_accumulation_steps', 1) or 1))
+        except Exception:
+            grad_accum = 1
+        consumed_samples = steps_int * float(getattr(RL_CONFIG, 'batch_size', RL_CONFIG.batch_size)) * grad_accum
+        if consumed_samples > 0:
+            freshness_ratio = frames_int / consumed_samples
+            freshness_pct = freshness_ratio * 100.0
+        else:
+            freshness_pct = 0.0
         # Interval Steps/1kF using the same interval counts
         denom_frames = max(1, frames_int)
         steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
@@ -278,19 +291,18 @@ def display_metrics_row(agent, kb_handler):
         except Exception:
             q_range = "Error"
 
-    # Compute frames/time since last inference sync and last target update
-    now = time.time()
-    # Frames since
-    sync_df = metrics.frame_count - getattr(metrics, 'last_inference_sync_frame', 0)
-    targ_df = metrics.frame_count - getattr(metrics, 'last_hard_target_update_frame', 0)
-
-    # Seconds since (guard against unset timestamps which default to 0.0)
-    last_sync_time = getattr(metrics, 'last_inference_sync_time', 0.0)
-    last_targ_time = getattr(metrics, 'last_hard_target_update_time', 0.0)
-    sync_dt = (now - last_sync_time) if last_sync_time > 0.0 else None
-    targ_dt = (now - last_targ_time) if last_targ_time > 0.0 else None
-    sync_col = f"{sync_df//1000}k/{(f'{sync_dt:>4.1f}s' if sync_dt is not None else 'n/a'):>6}"
-    targ_col = f"{targ_df//1000}k/{(f'{targ_dt:>4.1f}s' if targ_dt is not None else 'n/a'):>6}"
+    # Compute death breakdown percentages
+    with metrics.lock:
+        d_tot = int(getattr(metrics, 'deaths_total', 0))
+        d_shot = int(getattr(metrics, 'deaths_shot', 0))
+        d_col = int(getattr(metrics, 'deaths_collision', 0))
+        d_spk = int(getattr(metrics, 'deaths_spike', 0))
+        d_oth = int(getattr(metrics, 'deaths_other', 0))
+    denom = max(1, d_tot)
+    pct_shot = 100.0 * d_shot / denom
+    pct_col = 100.0 * d_col / denom
+    pct_spk = 100.0 * d_spk / denom
+    pct_oth = 100.0 * d_oth / denom
 
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
     # Show effective epsilon (0.00 when epsilon override is ON)
@@ -307,12 +319,17 @@ def display_metrics_row(agent, kb_handler):
         f"{'ON' if metrics.override_expert else 'OFF':>3} "
         f"{'ON' if metrics.expert_mode else 'OFF':>6} "
         f"{'ON' if metrics.training_enabled else 'OFF':>5} "
-        f"{sync_col:>12} {targ_col:>13} "
         f"{avg_inference_time_ms:>7.2f} "
         f"{samples_per_sec:>8.0f} "
         f"{steps_per_sec:>8.1f} "
+        f"{freshness_pct:>7.3f} "
         f"{metrics.grad_norm:>8.3f} "
         f"{metrics.grad_clip_delta:>6.3f} "
+        f"{d_tot:>6d} "
+        f"{pct_shot:>5.1f} "
+        f"{pct_col:>5.1f} "
+        f"{pct_spk:>5.1f} "
+        f"{pct_oth:>5.1f} "
         f"{q_range:>14} {training_stats:>15}"
     )
     

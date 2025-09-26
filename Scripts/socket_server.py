@@ -264,6 +264,11 @@ class SocketServer:
                     except Exception:
                         pass
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
+                # Edge-triggered death counting using player_alive and death_reason from Lua
+                try:
+                    self.metrics.record_death_reason(bool(frame.player_alive), int(frame.death_reason))
+                except Exception:
+                    pass
 
                 # N-step experience processing (server-side only when enabled) or direct 1-step fallback
                 if state.get('last_state') is not None and state.get('last_action_hybrid') is not None:

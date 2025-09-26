@@ -206,13 +206,15 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     
     -- Normalize relative segments with proper Tempest range handling
     local INVALID_SEGMENT = state_defs.INVALID_SEGMENT or -32768
-    local function push_relative_norm(parts, v)
+    -- Normalize relative segment distances; dynamic scale:
+    -- Open level (linear) max distance = 15, Closed (wrapped) canonical max = 8 (we wrap to minimal signed distance)
+    local function push_relative_norm(parts, v, is_open)
         local num = tonumber(v) or 0
         if num == INVALID_SEGMENT then
             return push_float32(parts, -1.0)  -- INVALID sentinel
         end
-        -- Allow float values, normalize to [-1,+1] assuming max distance 15 segments
-        local normalized = num / 15.0
+        local denom = is_open and 15.0 or 8.0
+        local normalized = num / denom
         -- Ensure within [-1,1] after normalization
         if normalized > 1.0 then normalized = 1.0
         elseif normalized < -1.0 then normalized = -1.0 end
@@ -243,7 +245,8 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_level)
 
     -- Targeting / Engineered Features (4) - FIXED: Removed duplicate nearest_enemy_seg
-    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
+    local is_open_level_flag = (ls.level_type == 0xFF) -- true linear topology
+    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg, is_open_level_flag)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.nearest_enemy_depth_raw)
     num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, es.is_aligned_with_nearest > 0)
     num_values_packed = num_values_packed + push_unit_norm(binary_data_parts, es.alignment_error_magnitude)
@@ -260,7 +263,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.shot_positions[i])
     end
     for i = 1, 8 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i], is_open_level_flag)
     end
 
     -- Level state (3 + 16 + 16 = 35) - all natural values
@@ -304,7 +307,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
 
     -- Enemy segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i])
+    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i], is_open_level_flag)
     end
     -- Enemy depths (7) - natural values
     for i = 1, 7 do
@@ -313,7 +316,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Top Enemy Segments (7) - relative values
     for i = 1, 7 do
         local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg, is_open_level_flag)
     end
     -- Enemy shot positions (4) - natural values
     for i = 1, 4 do
@@ -321,22 +324,22 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     end
     -- Enemy shot segments (4) - relative values
     for i = 1, 4 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_shot_segments[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_shot_segments[i], is_open_level_flag)
     end
     -- Charging Fuseball segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.charging_fuseball[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.charging_fuseball[i], is_open_level_flag)
     end
     -- Active Pulsar segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_pulsar[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_pulsar[i], is_open_level_flag)
     end
     -- Top Rail Enemy segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i], is_open_level_flag)
     end
 
-    -- Total main payload size: 175
+    -- Total main payload size: 175 (values unchanged; only relative scaling denominator differs by topology)
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
@@ -372,14 +375,15 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     end
 
     -- Fetch last reward components to transmit out-of-band (avoid recomputation in Python)
-    -- Pack OOB data (header only, reward components removed for simplicity)
+    -- Pack OOB data (header only)
     -- NOTE: The short (h) after attract encodes the NEAREST ENEMY ABSOLUTE SEGMENT for Python expert steering.
+    -- Added: player_alive (B) and death_reason (b) so Python can edge-trigger death counters by reading $013B
     -- Format legend:
-    --   >HdBBBHHHBBBhBhBBBBB
+    --   >HdBBBHHHBBBhBhBBBBBBb
     --   H: num_values, d: reward, BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
     --   BBB: (save, fire, zap), h: spinner, B: attract, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
-    --   BB: (expert_fire, expert_zap), B: level_number
-    local oob_format = ">HdBBBHHHBBBhBhBBBBB"
+    --   BB: (expert_fire, expert_zap), B: level_number, B: player_alive, b: death_reason (signed)
+    local oob_format = ">HdBBBHHHBBBhBhBBBBBBb"
     -- Determine nearest enemy absolute segment to transmit (or -1 if none)
     local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
     local oob_data = string.pack(oob_format,
@@ -401,7 +405,9 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
         expert_zap_packed,          -- B: Expert Zap (uchar)
-        ls.level_number             -- B: Current Level Number (uchar)
+        ls.level_number,            -- B: Current Level Number (uchar)
+        ps.alive,                   -- B: Player alive flag (1 alive, 0 dead)
+        (ps.death_reason >= 128 and ps.death_reason - 256 or ps.death_reason) -- b: signed death reason ($FF -> -1)
     )
 
     -- Combine OOB header + main data
