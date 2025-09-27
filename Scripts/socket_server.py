@@ -380,7 +380,10 @@ class SocketServer:
                     # expert vs dqn mixture with override forcing pure dqn
                     expert_ratio = self.metrics.get_expert_ratio()
                     if frame.gamestate == 0x20:  # GS_ZoomingDown
-                        expert_ratio = 0.9  # Hard 90% expert mode during tube zoom
+                        if self.metrics.is_override_active():
+                            expert_ratio = 0.0  # No expert guidance during override, even in tube zoom
+                        else:
+                            expert_ratio = 0.9  # Hard 90% expert mode during tube zoom
                     use_expert = (random.random() < expert_ratio) and (not self.metrics.is_override_active())
 
                     if use_expert:

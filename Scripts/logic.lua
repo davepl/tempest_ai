@@ -700,7 +700,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local optimal_min, optimal_max = 1.0, 3.0
                     local prox_reward = 0.0
                     if distance_segments >= optimal_min and distance_segments <= optimal_max then
-                        prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
+                        prox_reward = 0.02 * proximity_scale  -- Good positioning bonus (reduced to prevent over-emphasis)
                     else
                         prox_reward = 0.0 -- Penalties removed
                     end

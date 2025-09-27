@@ -1369,6 +1369,11 @@ class HybridDQNAgent:
             metrics.loss_count_interval += 1
         except Exception:
             pass
+        
+        # Check for NaN loss - indicates corrupted training state, stop execution
+        if not np.isfinite(total_loss_value):
+            raise RuntimeError(f"Training loss became NaN/Inf: {total_loss_value}. Training state is corrupted - stopping execution.")
+        
         # Publish grad diagnostics
         try:
             # Only publish finite diagnostics
