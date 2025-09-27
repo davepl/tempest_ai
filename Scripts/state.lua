@@ -828,6 +828,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         -- Check if enemy is active (depth > 0 and segment raw byte > 0)
         if enemy_depth_raw > 0 and abs_segment_raw > 0 then
             local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+            -- Sanitize abs_segment
+            if abs_segment ~= abs_segment then
+                print(string.format("WARNING: NaN detected in abs_segment_raw for enemy %d, replacing with 0", i))
+                abs_segment = 0
+            end
             self.enemy_abs_segments[i] = abs_segment
             self.enemy_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
             self.enemy_depths[i] = enemy_depth_raw
@@ -887,6 +892,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                     progress = angle_nibble / 16.0
                 end
             end
+            -- Sanitize progress
+            if progress ~= progress then
+                print(string.format("WARNING: NaN detected in progress calculation for enemy %d, replacing with 0.0", i))
+                progress = 0.0
+            end
 
             -- Absolute float using StartFlip semantics:
             -- When increasing, enemy_seg already points to the DESTINATION segment; position is (dest - (1 - progress)).
@@ -899,6 +909,12 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                     abs_float = abs_int - progress
                 end
             else
+                abs_float = abs_int
+            end
+
+            -- Sanitize abs_float
+            if abs_float ~= abs_float then
+                print(string.format("WARNING: NaN detected in abs_float calculation for enemy %d, replacing with abs_int %d", i, abs_int))
                 abs_float = abs_int
             end
 
@@ -915,6 +931,12 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                 rel_float = abs_float - player_abs_segment
                 while rel_float > 8.0 do rel_float = rel_float - 16.0 end
                 while rel_float < -8.0 do rel_float = rel_float + 16.0 end
+            end
+
+            -- Sanitize rel_float to prevent NaN propagation
+            if rel_float ~= rel_float then
+                print(string.format("WARNING: NaN detected in rel_float calculation for enemy %d, replacing with 0.0", i))
+                rel_float = 0.0
             end
 
             self.active_top_rail_enemies[i] = rel_float
@@ -1006,6 +1028,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                     progress = angle_nibble / 16.0
                 end
             end
+            -- Sanitize progress
+            if progress ~= progress then
+                print(string.format("WARNING: NaN detected in fractional progress calculation for enemy %d, replacing with 0.0", i))
+                progress = 0.0
+            end
             local abs_float
             if self.enemy_between_segments[i] == 1 then
                 if self.enemy_direction_moving[i] == 1 then
@@ -1014,6 +1041,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                     abs_float = abs_int - progress
                 end
             else
+                abs_float = abs_int
+            end
+            -- Sanitize abs_float
+            if abs_float ~= abs_float then
+                print(string.format("WARNING: NaN detected in fractional abs_float calculation for enemy %d, replacing with abs_int %d", i, abs_int))
                 abs_float = abs_int
             end
             abs_float = abs_float % 16.0
@@ -1025,6 +1057,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                 rel_float = abs_float - player_abs_segment
                 while rel_float > 8.0 do rel_float = rel_float - 16.0 end
                 while rel_float < -8.0 do rel_float = rel_float + 16.0 end
+            end
+            -- Sanitize rel_float to prevent NaN propagation
+            if rel_float ~= rel_float then
+                print(string.format("WARNING: NaN detected in enemy_segments rel_float calculation for enemy %d, replacing with 0.0", i))
+                rel_float = 0.0
             end
             self.enemy_segments[i] = rel_float  -- Update to fractional relative position
         end

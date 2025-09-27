@@ -188,9 +188,14 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     
     local function push_float32(parts, v)
         local val = tonumber(v) or 0.0
-        -- CRITICAL: Assert final normalized value is within expected range [-1,1]
-        if val < -1.0 or val > 1.0 then
-            error(string.format("FINAL NORMALIZED VALUE %g out of range [-1,1] before serialization!", val))
+        -- Check for NaN and log it
+        if val ~= val then
+            print(string.format("WARNING: NaN detected in push_float32, value was %s, replacing with 0.0", tostring(v)))
+            val = 0.0
+        end
+        -- CRITICAL: Assert final normalized value is within expected range [-1,1] and not NaN
+        if val ~= val or val < -1.0 or val > 1.0 then
+            error(string.format("FINAL NORMALIZED VALUE %g out of range [-1,1] or NaN before serialization!", val))
         end
         insert(parts, string.pack(">f", val))  -- Big-endian float32
         return 1
@@ -199,6 +204,11 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Normalize natural 8-bit values [0,255] to [0,1]
     local function push_natural_norm(parts, v)
         local num = tonumber(v) or 0
+        -- Check for NaN
+        if num ~= num then
+            print(string.format("WARNING: NaN detected in push_natural_norm, value was %s, replacing with 0", tostring(v)))
+            num = 0
+        end
         local validated = assert_range(num, 0, 255, "natural_8bit")
         local val = validated / 255.0
         return push_float32(parts, val)
@@ -210,6 +220,11 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Open level (linear) max distance = 15, Closed (wrapped) canonical max = 8 (we wrap to minimal signed distance)
     local function push_relative_norm(parts, v, is_open)
         local num = tonumber(v) or 0
+        -- Check for NaN
+        if num ~= num then
+            print(string.format("WARNING: NaN detected in push_relative_norm, value was %s, replacing with 0", tostring(v)))
+            num = 0
+        end
         if num == INVALID_SEGMENT then
             return push_float32(parts, -1.0)  -- INVALID sentinel
         end
@@ -230,6 +245,11 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Normalize unit float [0,1] (should already be normalized - assert if not)
     local function push_unit_norm(parts, v)
         local num = tonumber(v) or 0
+        -- Check for NaN
+        if num ~= num then
+            print(string.format("WARNING: NaN detected in push_unit_norm, value was %s, replacing with 0", tostring(v)))
+            num = 0
+        end
         local validated = assert_range(num, 0.0, 1.0, "unit_float")
         return push_float32(parts, validated)
     end
