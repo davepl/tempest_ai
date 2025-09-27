@@ -11,7 +11,7 @@ local ENEMY_TYPE_FUSEBALL = 4
 local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
-local TOP_RAIL_DEPTH = 0x15
+local TOP_RAIL_DEPTH = 0x20
 local SAFE_DISTANCE = 1
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
@@ -59,6 +59,9 @@ local score_at_level_start = 0
 
 -- Track previous top-rail alignment (for progress reward)
 local previous_toprail_min_abs_rel = nil
+
+-- Track flipper count for elimination detection
+local previous_flipper_count = nil
 
 -- Track episode termination to prevent multiple bDone signals per episode
 local episode_ended = false
@@ -792,7 +795,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 -- Find nearest top-rail flipper using authoritative fractional relative pos
                 for i = 1, 7 do
                     if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
-                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x40 then
                         local relf = enemies_state.active_top_rail_enemies[i]
                         if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
                             local d = math.abs(relf)
@@ -809,7 +812,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local delta = previous_toprail_min_abs_rel - min_abs_rel_float
                         if delta > 0 then
                             -- Small reward proportional to progress, capped and scaled under 10 pts
-                            local progress_bonus = math.min(1.0, delta) * (3.0 / SCORE_UNIT)
+                            local progress_bonus = math.min(1.0, delta) * (5.0 / SCORE_UNIT)
                             reward = reward + progress_bonus
                         end
                     end
@@ -818,7 +821,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local fire_now = (player_state.fire_detected or 0)
                     local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                     if min_abs_rel_float <= 0.30 and fire_edge then
-                        reward = reward + (4.0 / SCORE_UNIT) -- small bonus (~4 pts) for well-timed shot
+                        reward = reward + (8.0 / SCORE_UNIT) -- increased bonus (~8 pts) for well-timed shot
                     end
 
                     -- Penalty for not firing while very close removed per spec
@@ -831,10 +834,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local shot_count = player_state.shot_count or 0
                 if shot_count >= 8 then
                     local nearest_flipper_dist = nil
-                    -- Find nearest top-rail flipper distance
+                    -- Find nearest top-rail flipper distance (extended to 0x40 depth for earlier detection)
                     for i = 1, 7 do
                         if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
-                           enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                           enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x40 then
                             local relf = enemies_state.active_top_rail_enemies[i]
                             if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
                                 local d = math.abs(relf)
@@ -845,20 +848,116 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
                     end
 
-                    -- Apply safety penalty based on proximity when shots are depleted
+                    -- Apply safety reward/penalty based on proximity when shots are depleted
                     if nearest_flipper_dist then
-                        local safety_penalty = 0.0
-                        if nearest_flipper_dist <= 1.0 then
-                            -- Severe penalty when flipper is very close (adjacent or aligned)
-                            safety_penalty = -0.05 * safety_scale  -- ~50 points penalty
-                        elseif nearest_flipper_dist <= 2.0 then
-                            -- Moderate penalty when flipper is within 2 segments
-                            safety_penalty = -0.02 * safety_scale  -- ~20 points penalty
-                        elseif nearest_flipper_dist <= 3.0 then
-                            -- Light penalty when flipper is within 3 segments
-                            safety_penalty = -0.01 * safety_scale  -- ~10 points penalty
+                        local safety_signal = 0.0
+                        if nearest_flipper_dist >= 3.0 then
+                            -- Positive reward for maintaining safe distance (3+ segments away)
+                            safety_signal = 0.002 * safety_scale
+                        elseif nearest_flipper_dist >= 2.0 then
+                            -- Neutral for moderate distance
+                            safety_signal = 0.0
+                        elseif nearest_flipper_dist >= 1.0 then
+                            -- Light penalty for close proximity
+                            safety_signal = -0.001 * safety_scale
+                        else
+                            -- Stronger penalty when very close
+                            safety_signal = -0.003 * safety_scale
                         end
-                        reward = reward + safety_penalty
+                        reward = reward + safety_signal
+                    end
+                end
+            end
+
+            -- 9.5. GENERAL FLIPPER PROXIMITY MANAGEMENT (Always active, even with shots available)
+            -- Encourage safer positioning around flippers overall, not just when shots depleted
+            do
+                local nearest_flipper_dist = nil
+                local nearest_flipper_depth = nil
+                -- Find nearest top-rail flipper distance and depth
+                for i = 1, 7 do
+                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
+                        local relf = enemies_state.active_top_rail_enemies[i]
+                        if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
+                            local d = math.abs(relf)
+                            if not nearest_flipper_dist or d < nearest_flipper_dist then
+                                nearest_flipper_dist = d
+                                nearest_flipper_depth = enemies_state.enemy_depths[i]
+                            end
+                        end
+                    end
+                end
+
+                -- Apply general proximity management (lighter penalties than depleted-shots case)
+                if nearest_flipper_dist then
+                    local proximity_penalty = 0.0
+                    if nearest_flipper_dist < 1.0 then
+                        -- Light penalty for being in the same segment as a flipper
+                        proximity_penalty = -0.0005 * safety_scale
+                    elseif nearest_flipper_dist < 2.0 then
+                        -- Very light penalty for adjacent segments
+                        proximity_penalty = -0.0002 * safety_scale
+                    end
+                    -- No penalty for 2+ segments away - encourages strategic positioning
+                    reward = reward + proximity_penalty
+                end
+            end
+
+            -- 9.6. FLIPPER ELIMINATION BONUS (Reward successful kills)
+            -- Track flipper disappearances and reward eliminations more than movement costs
+            do
+                -- Track previous flipper count for edge detection
+                local current_flipper_count = 0
+                for i = 1, 7 do
+                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
+                        current_flipper_count = current_flipper_count + 1
+                    end
+                end
+
+                -- Compare to previous count
+                if previous_flipper_count and current_flipper_count < previous_flipper_count then
+                    -- Flipper was eliminated - give bonus reward (~15 points worth)
+                    local elimination_bonus = 15.0 / SCORE_UNIT
+                    reward = reward + elimination_bonus
+                end
+            end
+
+            -- 9.7. STRATEGIC RETREAT REWARD (Reward moving away from close flippers)
+            -- When shots are available but flipper is very close, reward retreating
+            do
+                local shot_count = player_state.shot_count or 0
+                if shot_count < 8 then  -- Shots available
+                    local nearest_flipper_dist = nil
+                    local nearest_flipper_rel = nil
+                    -- Find nearest top-rail flipper
+                    for i = 1, 7 do
+                        if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+                           enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
+                            local relf = enemies_state.active_top_rail_enemies[i]
+                            if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
+                                local d = math.abs(relf)
+                                if not nearest_flipper_dist or d < nearest_flipper_dist then
+                                    nearest_flipper_dist = d
+                                    nearest_flipper_rel = relf
+                                end
+                            end
+                        end
+                    end
+
+                    -- Reward retreating from very close flippers when shots available
+                    if nearest_flipper_dist and nearest_flipper_dist < 1.5 then
+                        local current_pos = player_state.position & 0x0F
+                        local prev_pos = previous_player_position & 0x0F
+                        local pos_change = current_pos - prev_pos
+
+                        -- If flipper is to the right and we moved left, or vice versa
+                        if (nearest_flipper_rel > 0 and pos_change < 0) or (nearest_flipper_rel < 0 and pos_change > 0) then
+                            -- Successful retreat from close flipper (~5 points)
+                            local retreat_bonus = 5.0 / SCORE_UNIT
+                            reward = reward + retreat_bonus
+                        end
                     end
                 end
             end
@@ -881,7 +980,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         -- Scale a gentle penalty with movement magnitude, capped
                         local units = math.min(4, spin_delta)
                         local move_penalty = -0.0002 * units
-                        -- reward = reward + move_penalty
+                        reward = reward + move_penalty
                         -- Attribute to proximity shaping bucket for metrics
                     end
                 end
@@ -907,7 +1006,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local min_abs_rel_float = nil
         for i = 1, 7 do
             if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
-               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x40 then
                 local relf = enemies_state.active_top_rail_enemies[i]
                 if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
                     local d = math.abs(relf)
@@ -918,6 +1017,18 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
         end
         previous_toprail_min_abs_rel = min_abs_rel_float
+    end
+
+    -- Update flipper count tracking
+    do
+        local current_flipper_count = 0
+        for i = 1, 7 do
+            if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
+               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
+                current_flipper_count = current_flipper_count + 1
+            end
+        end
+        previous_flipper_count = current_flipper_count
     end
     LastRewardState = reward
 

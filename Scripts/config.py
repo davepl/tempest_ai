@@ -61,14 +61,14 @@ class RLConfigData:
     # Quick Win: keep a bit more random exploration while DQN catches up
     epsilon_min: float = 0.10            # Floor for exploration - set to 0.10 for proper decay
     epsilon_end: float = 0.10            # Target floor - set to 0.10 for proper decay
-    epsilon_decay_steps: int = 1000     # Decay applied every 1k frames (faster decay)
+    epsilon_decay_steps: int = 10000     # Decay applied every 1k frames (faster decay)
     epsilon_decay_factor: float = 0.9975
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
     expert_ratio_min: float = 0.00        # Minimum expert control probability
-    expert_ratio_decay: float = 0.9977     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
+    expert_ratio_decay: float = 0.997     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
@@ -101,7 +101,7 @@ class RLConfigData:
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
     # Gradient clipping configuration
-    max_grad_norm: float = 5.0            # Clip threshold for total grad norm (L2)
+    max_grad_norm: float = 10.0            # Clip threshold for total grad norm (L2) - INCREASED from 5.0
     # Target clamp to stabilize bootstrapping near plateaus - DISABLED to observe natural Q-value range with gamma=0.95
     clamp_targets: bool = False           # DISABLED: Let Q-values grow naturally to detect any remaining inflation
     target_clamp_value: float = 8.0       # Value preserved for potential re-enable if needed
@@ -127,8 +127,8 @@ class RLConfigData:
 
     # Prioritized Experience Replay settings
     use_prioritized_replay: bool = True    # Enable PER for better sample efficiency
-    per_alpha: float = 0.6                 # Priority exponent (0 = uniform, 1 = full prioritization)
-    per_beta_start: float = 0.4            # Initial importance sampling exponent
+    per_alpha: float = 0.5                 # Priority exponent (0 = uniform, 1 = full prioritization) - REDUCED from 0.6
+    per_beta_start: float = 0.3            # Initial importance sampling exponent - REDUCED from 0.4
     per_beta_increment: float = 1e-6       # Beta increment per step (anneals to 1.0)
     per_max_priority: float = 1.0          # Initial priority for new experiences
 
@@ -141,7 +141,7 @@ class RLConfigData:
     epsilon_when_zooming: float = 0.05
 
     # Loss weighting: balance continuous head relative to discrete head
-    continuous_loss_weight: float = 0.5
+    continuous_loss_weight: float = 0.3    # REDUCED from 0.5 to 0.3
 
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
     reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target - INCREASED
