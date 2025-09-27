@@ -328,7 +328,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     end
     -- Top Enemy Segments (7) - relative values
     for i = 1, 7 do
-        local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
+        local seg = (es.enemy_depths[i] <= 0x30) and es.enemy_segments[i] or INVALID_SEGMENT
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg, is_open_level_flag)
     end
     -- Enemy shot positions (4) - natural values

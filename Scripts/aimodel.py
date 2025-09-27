@@ -220,7 +220,7 @@ print(f"Number of layers: {RL_CONFIG.num_layers}")
 layer_sizes = []
 for i in range(RL_CONFIG.num_layers):
     pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
-    layer_size = max(32, RL_CONFIG.hidden_size // (2 ** pair_index))
+    layer_size = max(64, int(RL_CONFIG.hidden_size * (0.6 ** pair_index)))
     layer_sizes.append(layer_size)
 
 print(f"Layer architecture:")
@@ -320,14 +320,14 @@ class HybridDQN(nn.Module):
         # Shared trunk for feature extraction
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
         
-        # Dynamic layer sizing with pairs: A,A -> A/2,A/2 -> A/4,A/4 -> ...
-        # Pattern: 512,512 -> 256,256 -> 128,128 -> ...
+        # Dynamic layer sizing with pairs: A,A -> A*0.75,A*0.75 -> A*0.5625,A*0.5625 -> ...
+        # Pattern: 512,512 -> 384,384 -> 288,288 -> ...
         layer_sizes = []
         current_size = hidden_size
         for i in range(num_layers):
             # Determine size for this layer pair
             pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
-            layer_size = max(32, hidden_size // (2 ** pair_index))
+            layer_size = max(64, int(hidden_size * (0.6 ** pair_index)))
             layer_sizes.append(layer_size)
         
         # Create shared layers dynamically

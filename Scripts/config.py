@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 2048               # Reduced from 65536 - was causing extreme slowdown
-    lr: float = 0.0030                     # Increased for PER efficiency                     
+    lr: float = 0.0025                     # Increased for PER efficiency                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
@@ -62,7 +62,7 @@ class RLConfigData:
     epsilon_min: float = 0.10            # Floor for exploration - set to 0.10 for proper decay
     epsilon_end: float = 0.10            # Target floor - set to 0.10 for proper decay
     epsilon_decay_steps: int = 10000     # Decay applied every 1k frames (faster decay)
-    epsilon_decay_factor: float = 0.9975
+    epsilon_decay_factor: float = 0.998
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
@@ -71,8 +71,8 @@ class RLConfigData:
     expert_ratio_decay: float = 0.997     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 7                  
+    hidden_size: int = 768               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 8                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
