@@ -611,9 +611,6 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     -- Determine if level is open based on the level type flag (might be unreliable)
     local level_type_flag = mem:read_u8(0x0111)
     local is_open = (level_type_flag == 0xFF)
-    -- Or use level number pattern if flag is known bad:
-    -- local level_num_zero_based = (mem:read_u8(0x009F) - 1)
-    -- local is_open = (level_num_zero_based % 4 == 2)
 
     local player_abs_segment = self.position & 0x0F
     for i = 1, 8 do

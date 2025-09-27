@@ -663,16 +663,16 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             local is_open = (level_state.level_type == 0xFF)
             
             -- Level-specific scaling factors
-            local level_type = (level_state.level_number - 1) % 4
+            local level_type = level_state.level_type
             local proximity_scale = 1.0
             local safety_scale = 1.0
             
-            if level_type == 2 then -- Open levels (every 4th level starting from 3)
+            if level_type == 0xFF then -- Open levels
                 proximity_scale = 1.2  -- Increase proximity rewards on open levels
                 safety_scale = 0.8     -- Reduce safety emphasis (more space available)
-            elseif level_type == 0 then -- Level 1 type (every 4th level starting from 1)
-                proximity_scale = 0.9  -- Slightly reduce proximity rewards on simpler levels
-                safety_scale = 1.1     -- Increase safety emphasis on basic levels
+            elseif level_type == 0x00 then -- Closed levels
+                proximity_scale = 0.9  -- Slightly reduce proximity rewards on closed levels
+                safety_scale = 1.1     -- Increase safety emphasis on closed levels
             end
 
             -- Compute expert target once for reward gating (avoid rewarding moves toward danger)
@@ -776,10 +776,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
                         
                         -- Apply level-specific scaling
-                        if level_type == 2 then -- Open levels
+                        if level_type == 0xFF then -- Open levels
                             positioning_reward = positioning_reward * 1.1  -- Slightly increase positioning importance on open levels
-                        elseif level_type == 0 then -- Basic levels
-                            positioning_reward = positioning_reward * 0.9  -- Slightly reduce on simpler levels
+                        elseif level_type == 0x00 then -- Closed levels
+                            positioning_reward = positioning_reward * 0.9  -- Slightly reduce on closed levels
                         end
                     end
                 end

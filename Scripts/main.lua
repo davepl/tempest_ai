@@ -359,13 +359,14 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
 
     -- VALIDATION: Debug print to verify key segment encodings (first few frames only)
     if gs.frame_counter < 5 then
+        local debug_denom = is_open_level_flag and 15.0 or 8.0
         print(string.format("[DEBUG] Frame %d: Nearest enemy seg=%.3f, Player shot segs=[%.3f,%.3f,%.3f,%.3f]",
             gs.frame_counter,
-            (es.nearest_enemy_seg == INVALID_SEGMENT) and -1.0 or (es.nearest_enemy_seg / 15.0),
-            (ps.shot_segments[1] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[1] / 15.0),
-            (ps.shot_segments[2] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[2] / 15.0),
-            (ps.shot_segments[3] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[3] / 15.0),
-            (ps.shot_segments[4] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[4] / 15.0)
+            (es.nearest_enemy_seg == INVALID_SEGMENT) and -1.0 or (es.nearest_enemy_seg / debug_denom),
+            (ps.shot_segments[1] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[1] / debug_denom),
+            (ps.shot_segments[2] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[2] / debug_denom),
+            (ps.shot_segments[3] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[3] / debug_denom),
+            (ps.shot_segments[4] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[4] / debug_denom)
         ))
     end
 
@@ -517,7 +518,7 @@ local function handle_ai_interaction()
     local reward, episode_done = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
     
     -- NOTE: Removed reward clamping [-1,1] since rewards are now properly scaled in logic.calculate_reward()    -- Calculate expert advice (target segment, fire, zap)
-    local is_open_level = (level_state.level_number - 1) % 4 == 2
+    local is_open_level = level_state.level_type == 0xFF
     local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = logic.find_target_segment(
         game_state, player_state, level_state, enemies_state, logic.absolute_to_relative_segment, is_open_level
     )
