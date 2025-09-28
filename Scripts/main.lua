@@ -175,7 +175,7 @@ local enemies_state = state_defs.EnemiesState:new()
 local controls = nil -- Initialized after MAME interface confirmed
 
 -- Flatten game state to binary format for sending over socket
-local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
+local function flatten_game_state_to_binary(total_reward, obj_reward, sub_reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
     local insert = table.insert -- Local alias for performance
 
     -- Helpers for normalized float32 packing - fail fast on out-of-range values!
@@ -405,16 +405,17 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- NOTE: The short (h) after attract encodes the NEAREST ENEMY ABSOLUTE SEGMENT for Python expert steering.
     -- Added: player_alive (B) and death_reason (b) so Python can edge-trigger death counters by reading $013B
     -- Format legend:
-    --   >HdBBBHHHBBBhBhBBBBBBb
-    --   H: num_values, d: reward, BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
+    --   >HddBBBHHHBBBhBhBBBBBBb
+    --   H: num_values, dd: (obj_reward, sub_reward), BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
     --   BBB: (save, fire, zap), h: spinner, B: attract, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number, B: player_alive, b: death_reason (signed)
-    local oob_format = ">HdBBBHHHBBBhBhBBBBBBb"
+    local oob_format = ">HddBBBHHHBBBhBhBBBBBBb"
     -- Determine nearest enemy absolute segment to transmit (or -1 if none)
     local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
-        reward,                     -- d: Reward (double)
+        obj_reward,                 -- d: Objective reward (double)
+        sub_reward,                 -- d: Subjective reward (double)
         gs.gamestate,               -- B: Gamestate (uchar) - was placeholder
         gs.game_mode,               -- B: Game Mode (uchar)
         bDone and 1 or 0,           -- B: Done flag (uchar)
@@ -527,7 +528,8 @@ end
 -- Perform AI interaction (calculate reward, expert advice, send state, receive action)
 local function handle_ai_interaction()
     -- Calculate reward based on current state and detected actions
-    local reward, episode_done = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
+    local obj_reward, sub_reward, episode_done = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
+    local total_reward = obj_reward + sub_reward
     
     -- NOTE: Removed reward clamping [-1,1] since rewards are now properly scaled in logic.calculate_reward()    -- Calculate expert advice (target segment, fire, zap)
     local is_open_level = level_state.level_type == 0xFF
@@ -546,7 +548,7 @@ local function handle_ai_interaction()
     if current_socket then
         -- Flatten current state (s') including reward (r) and done (d)
         local frame_data -- Declare frame_data here
-        frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, episode_done, expert_target_seg, expert_fire_packed, expert_zap_packed)
+        frame_data, num_values = flatten_game_state_to_binary(total_reward, obj_reward, sub_reward, game_state, level_state, player_state, enemies_state, episode_done, expert_target_seg, expert_fire_packed, expert_zap_packed)
 
         -- Send s', r, d; Receive action a for s'
         received_fire_cmd, received_zap_cmd, received_spinner_cmd, socket_ok = process_frame_via_socket(frame_data)

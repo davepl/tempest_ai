@@ -2105,12 +2105,12 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
         
         # Fixed OOB header format (must match Lua exactly). Precompute once.
-        # Format: ">HdBBBHHHBBBhBhBBBBBBb"
+        # Format: ">HddBBBHHHBBBhBhBBBBBBb"
         global _FMT_OOB, _HDR_OOB
         try:
             _FMT_OOB
         except NameError:
-            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBBBb"
+            _FMT_OOB = ">HddBBBHHHBBBhBhBBBBBBb"
             _HDR_OOB = struct.calcsize(_FMT_OOB)
 
         if len(data) < _HDR_OOB:
@@ -2118,7 +2118,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
 
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
-        (num_values, reward, gamestate, game_mode, done, frame_counter, score_high, score_low,
+        (num_values, obj_reward, sub_reward, gamestate, game_mode, done, frame_counter, score_high, score_low,
          save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
          expert_fire, expert_zap, level_number, player_alive, death_reason) = values
         header_size = _HDR_OOB
@@ -2159,6 +2159,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         if out_of_range_count > 0:
             print(f"[WARNING] Frame {frame_counter}: {out_of_range_count} values outside [-1,1] range", flush=True)
             state = np.clip(state, -1.0, 1.0)
+        
+        # Sum objective and subjective rewards for backward compatibility
+        reward = obj_reward + sub_reward
         
         frame_data = FrameData(
             state=state,

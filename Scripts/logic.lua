@@ -670,11 +670,12 @@ end
 
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local reward, bDone = 0.0, false
+    local obj_reward, sub_reward, bDone = 0.0, 0.0, false
 
+    -- OBJECTIVE REWARDS: Measurable game outcomes (score, death, level completion)
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 and not episode_ended then
-        reward = reward - DEATH_PENALTY
+        obj_reward = obj_reward - DEATH_PENALTY
         bDone = true
         episode_ended = true
     else
@@ -688,25 +689,167 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             local r_score = score_delta / SCORE_UNIT                            -- Scaled: 20k points = 1.0 reward unit
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
-            reward = reward + r_score
+            obj_reward = obj_reward + r_score
         end
 
         -- Level completion bonus (edge-triggered) - Scaled to match death penalty magnitude
         if (level_state.level_number or 0) > (previous_level or 0) then
             -- Fixed completion bonus; optional ratio-based scaling can be added later using score_at_level_start
-            reward = reward + LEVEL_COMPLETION_BONUS
+            obj_reward = obj_reward + LEVEL_COMPLETION_BONUS
             -- bDone = true  -- REMOVED: Episodes now terminate only on death for longer trajectories
         end
 
         -- Zap cost (edge-triggered on button press)
         local zap_now = player_state.zap_detected or 0
         if zap_now == 1 and previous_zap_detected == 0 then
-            reward = reward - ZAP_COST
+            obj_reward = obj_reward - ZAP_COST
+        end
+    end
+
+    -- SUBJECTIVE REWARDS: Shaping and behavioral incentives
+    -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
+    if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
+        local player_abs_seg = player_state.position & 0x0F
+        local is_open = (level_state.level_type == 0xFF)
+        
+        -- Level-specific scaling factors
+        local level_type = level_state.level_type
+        local proximity_scale = 1.0
+        local safety_scale = 1.0
+        
+        if level_type == 0xFF then -- Open levels
+            proximity_scale = 1.2  -- Increase proximity rewards on open levels
+            safety_scale = 0.8     -- Reduce safety emphasis (more space available)
+        elseif level_type == 0x00 then -- Closed levels
+            proximity_scale = 0.9  -- Slightly reduce proximity rewards on closed levels
+            safety_scale = 1.1     -- Increase safety emphasis on closed levels
         end
 
-        -- === OBJECTIVE DENSE REWARD COMPONENTS ===
-        -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
-        if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
+        -- Compute expert target once for reward gating (avoid rewarding moves toward danger)
+        local expert_target_seg_cached = -1
+        do
+            local ets, _, _, _ = M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
+            expert_target_seg_cached = ets or -1
+        end
+        
+        -- 1. DANGER AVOIDANCE REWARD (Penalties removed per spec)
+        -- No penalty for being in dangerous positions; optional safe bonus remains disabled
+        
+        -- 2. PROXIMITY OPTIMIZATION REWARD (Distance-based Positioning)
+        -- Reward optimal distance to nearest enemy (not too close, not too far)
+        -- IMPORTANT: If expert target lane is dangerous, skip proximity shaping entirely.
+        do
+            local danger_target_lane = (expert_target_seg_cached ~= -1) and M.is_danger_lane(expert_target_seg_cached, enemies_state)
+            local nearest_distance = enemies_state.alignment_error_magnitude or 1.0
+            if not danger_target_lane and enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT then
+                -- Convert normalized distance (0-1) to segments for clearer logic
+                local max_dist = is_open and 15.0 or 8.0
+                local distance_segments = nearest_distance * max_dist
+                
+                -- Optimal range: 1-3 segments (allows reaction time but maintains offensive capability)
+                local optimal_min, optimal_max = 1.0, 3.0
+                local prox_reward = 0.0
+                if distance_segments >= optimal_min and distance_segments <= optimal_max then
+                    prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
+                else
+                    prox_reward = 0.0 -- Penalties removed
+                end
+                -- Neutral reward for 3-5 segments (acceptable range)
+                sub_reward = sub_reward + prox_reward
+            end
+        end
+        
+        -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)
+        -- Requested policy:
+        --   0-2 shots: penalty (too few shots)
+        --   4-7 shots: reward (good management)
+        --   8 shots: penalty (overuse)
+        do
+            local shot_count = player_state.shot_count or 0
+            local shot_reward = 0.0
+            if shot_count <= 2 then
+                shot_reward = 0 -- Penalty removed
+            elseif shot_count >= 4 and shot_count <= 7 then
+                shot_reward = 1
+            elseif shot_count >= 8 then
+                shot_reward = 0 -- Penalty removed
+            end
+            sub_reward = sub_reward + shot_reward / SCORE_UNIT
+        end
+        
+        -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
+        -- Bonus for appropriate responses to critical threats
+        local critical_threats = 0
+        for i = 1, 7 do
+            local abs_seg = enemies_state.enemy_abs_segments[i]
+            local depth = enemies_state.enemy_depths[i]
+            local enemy_type = enemies_state.enemy_core_type[i]
+            
+            if abs_seg == player_abs_seg and depth > 0 and depth <= 0x30 then
+                critical_threats = critical_threats + 1
+            end
+        end
+        
+        -- Threat penalties removed per spec (no subtraction)
+        
+        -- 5. PULSAR SAFETY REWARD (Objective Hazard Assessment)
+        -- Extra penalty for being in pulsing pulsar lanes (objectively lethal)
+        -- Pulsar safety penalties removed per spec
+
+        -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
+        -- Reward the DQN for following expert system's strategic positioning recommendations
+        -- IMPORTANT: Less restrictive danger lane detection for positioning rewards
+        do
+            local positioning_reward = 0.0
+            if expert_target_seg_cached ~= -1 then
+                -- Less restrictive: only skip if target has immediate lethal threats (depth <= 0x20)
+                local danger_target_lane = false
+                for i = 1, 7 do
+                    if enemies_state.enemy_abs_segments[i] == expert_target_seg_cached and 
+                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x20 then
+                        danger_target_lane = true
+                        break
+                    end
+                end
+                
+                if not danger_target_lane then
+                    local current_player_seg = player_abs_seg
+                    local prev_player_seg = previous_player_position & 0x0F
+                    
+                    -- Calculate distances to expert target (current and previous)
+                    local current_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
+                    local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
+                    
+                    -- Award for being on target segment (increased scale: 100x larger)
+                    if current_distance == 0 then
+                        -- Worth ~1000 points when perfectly aligned (100 * 10 / SCORE_UNIT)
+                        positioning_reward = 100.0 * (10.0 / SCORE_UNIT)
+                    -- Award for moving toward target (increased scale and more granular)
+                    elseif current_distance < previous_distance then
+                        local progress = previous_distance - current_distance
+                        -- Scale progress reward: larger base reward with distance-based scaling
+                        local base_progress_reward = 50.0 / SCORE_UNIT  -- Increased from 0.5
+                        positioning_reward = progress * base_progress_reward
+                    -- RESTORED: Small penalties for moving away from target or not moving when needed
+                    elseif current_distance > previous_distance then
+                        -- Moving away from target (restored penalty)
+                        local away_penalty = current_distance - previous_distance
+                        positioning_reward = -0.5 * away_penalty * (10.0 / SCORE_UNIT)
+                    elseif current_distance == previous_distance and current_distance > 1 then
+                        -- Not moving when movement toward target is needed (restored penalty)
+                        positioning_reward = -0.2 * (10.0 / SCORE_UNIT)
+                    end
+                    
+                    -- Apply level-specific scaling
+                    if level_type == 0xFF then -- Open levels
+                        positioning_reward = positioning_reward * 1.1  -- Slightly increase positioning importance on open levels
+                    elseif level_type == 0x00 then -- Closed levels
+                        positioning_reward = positioning_reward * 0.9  -- Slightly reduce on closed levels
+                    end
+                end
+            end
+            sub_reward = sub_reward + positioning_reward
+        end
             local player_abs_seg = player_state.position & 0x0F
             local is_open = (level_state.level_type == 0xFF)
             
@@ -753,7 +896,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         prox_reward = 0.0 -- Penalties removed
                     end
                     -- Neutral reward for 3-5 segments (acceptable range)
-                    reward = reward + prox_reward
+                    sub_reward = sub_reward + prox_reward
                 end
             end
             
@@ -772,7 +915,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 elseif shot_count >= 8 then
                     shot_reward = 0 -- Penalty removed
                 end
-                reward = reward + shot_reward / SCORE_UNIT
+                sub_reward = sub_reward + shot_reward / SCORE_UNIT
             end
             
             -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
@@ -831,7 +974,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
                     end
                 end
-                reward = reward + positioning_reward
+                sub_reward = sub_reward + positioning_reward
             end
 
             -- 8. TOP-RAIL FLIPPER ENGAGEMENT REWARD (dense shaping using fractional rel positions)
@@ -861,7 +1004,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         if delta > 0 then
                             -- Small reward proportional to progress, capped and scaled under 10 pts
                             local progress_bonus = math.min(1.0, delta) * (5.0 / SCORE_UNIT)
-                            reward = reward + progress_bonus
+                            sub_reward = sub_reward + progress_bonus
                         end
                     end
 
@@ -869,7 +1012,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local fire_now = (player_state.fire_detected or 0)
                     local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                     if min_abs_rel_float <= 0.30 and fire_edge then
-                        reward = reward + (8.0 / SCORE_UNIT) -- increased bonus (~8 pts) for well-timed shot
+                        sub_reward = sub_reward + (8.0 / SCORE_UNIT) -- increased bonus (~8 pts) for well-timed shot
                     end
 
                     -- Penalty for not firing while very close removed per spec
@@ -912,7 +1055,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                             -- Stronger penalty when very close
                             safety_signal = -0.003 * safety_scale
                         end
-                        reward = reward + safety_signal
+                        sub_reward = sub_reward + safety_signal
                     end
                 end
             end
@@ -948,7 +1091,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         proximity_penalty = -0.0002 * safety_scale
                     end
                     -- No penalty for 2+ segments away - encourages strategic positioning
-                    reward = reward + proximity_penalty
+                    sub_reward = sub_reward + proximity_penalty
                 end
             end
 
@@ -968,7 +1111,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 if previous_flipper_count and current_flipper_count < previous_flipper_count then
                     -- Flipper was eliminated - give bonus reward (~15 points worth)
                     local elimination_bonus = 15.0 / SCORE_UNIT
-                    reward = reward + elimination_bonus
+                    sub_reward = sub_reward + elimination_bonus
                 end
             end
 
@@ -1006,7 +1149,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         if (nearest_flipper_rel > 0 and pos_change < 0) or (nearest_flipper_rel < 0 and pos_change > 0) then
                             -- Successful retreat from close flipper (~5 points)
                             local retreat_bonus = 5.0 / SCORE_UNIT
-                            reward = reward + retreat_bonus
+                            sub_reward = sub_reward + retreat_bonus
                         end
                     end
                 end
@@ -1030,7 +1173,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         -- Scale a gentle penalty with movement magnitude, capped
                         local units = math.min(4, spin_delta)
                         local move_penalty = -0.0002 * units
-                        reward = reward + move_penalty
+                        sub_reward = sub_reward + move_penalty
                         -- Attribute to proximity shaping bucket for metrics
                     end
                 end
@@ -1080,9 +1223,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         end
         previous_flipper_count = current_flipper_count
     end
-    LastRewardState = reward
+    LastRewardState = obj_reward + sub_reward
 
-    return reward, bDone
+    return obj_reward, sub_reward, bDone
 end
 
 -- Function to retrieve the last calculated reward (for display)
