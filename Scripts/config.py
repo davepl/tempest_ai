@@ -52,7 +52,7 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 8192               # Reduced from 65536 - was causing extreme slowdown
+    batch_size: int = 2048               # FURTHER REDUCED from 4096 - PER overhead scales with batch size
     lr: float = 0.003                     # REDUCED from 0.0025 - loss explosion suggests instability                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
@@ -127,9 +127,9 @@ class RLConfigData:
     recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
 
     # Prioritized Experience Replay settings
-    use_prioritized_replay: bool = True    # TEMPORARILY DISABLED - may be causing NaN issues
-    per_alpha: float = 0.75                 # Priority exponent (0 = uniform, 1 = full prioritization) - REDUCED from 0.6
-    per_beta_start: float = 0.3            # Initial importance sampling exponent - REDUCED from 0.4
+    use_prioritized_replay: bool = True    # OPTIMIZED: Reduced overhead with less frequent updates
+    per_alpha: float = 0.4                 # REDUCED from 0.75 - less aggressive prioritization for better performance
+    per_beta_start: float = 0.3            # Initial importance sampling exponent
     per_beta_increment: float = 1e-6       # Beta increment per step (anneals to 1.0)
     per_max_priority: float = 1.0          # Initial priority for new experiences
 

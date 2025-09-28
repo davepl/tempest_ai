@@ -452,26 +452,28 @@ class SegmentTree:
             self.size = idx + 1
     
     def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Sample indices based on priorities."""
+        """Sample indices based on priorities using vectorized operations for better performance."""
         if self.size == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
             
         indices = np.zeros(batch_size, dtype=np.int32)
         priorities = np.zeros(batch_size, dtype=np.float32)
         
+        total_priority = self.tree[1]  # Root node
+        if total_priority <= 0:
+            # Fallback to uniform sampling
+            indices[:] = np.random.randint(0, self.size, size=batch_size)
+            priorities[:] = 1.0
+            return indices, priorities
+        
+        # Vectorized sampling: generate all random values at once
+        sample_vals = np.random.uniform(0, total_priority, size=batch_size)
+        
+        # For each sample, find the corresponding leaf node
         for i in range(batch_size):
-            # Sample a value between 0 and total priority
-            total_priority = self.tree[1]  # Root node
-            if total_priority <= 0:
-                # Fallback to uniform sampling
-                idx = np.random.randint(0, self.size)
-                indices[i] = idx
-                priorities[i] = 1.0
-                continue
-                
-            sample_val = np.random.uniform(0, total_priority)
+            sample_val = sample_vals[i]
             
-            # Find the leaf node
+            # Find the leaf node using binary search down the tree
             node = 1
             while node < self.capacity:
                 left_child = 2 * node
@@ -1483,24 +1485,26 @@ class HybridDQNAgent:
             except Exception:
                 pass
         
-        # Update PER priorities if enabled
+        # Update PER priorities if enabled (less frequently to reduce overhead)
         try:
             if hasattr(self.memory, 'update_priorities') and len(batch) >= 8:
-                _, _, _, _, _, _, importance_weights, batch_indices, _ = batch
-                if batch_indices is not None:  # Only update if PER is enabled
-                    # Compute individual TD errors for proper priority updates
-                    # TD error = |Q(s,a) - (r + γ * max_a' Q(s',a'))|
-                    with torch.no_grad():
-                        # Get current Q values for selected actions (already computed above)
-                        current_q = discrete_q_selected.detach()
-                        # Targets already computed above as discrete_targets
-                        td_errors = torch.abs(current_q - discrete_targets).cpu().numpy()
-                        
-                        # Add small epsilon to avoid zero priorities
-                        td_errors = np.maximum(td_errors, 0.01)
-                        
-                        # Update priorities in the replay buffer
-                        self.memory.update_priorities(batch_indices.cpu().numpy(), td_errors)
+                # Only update priorities every 10 training steps to reduce overhead
+                if self.training_steps % 10 == 0:
+                    _, _, _, _, _, _, importance_weights, batch_indices, _ = batch
+                    if batch_indices is not None:  # Only update if PER is enabled
+                        # Compute individual TD errors for proper priority updates
+                        # TD error = |Q(s,a) - (r + γ * max_a' Q(s',a'))|
+                        with torch.no_grad():
+                            # Get current Q values for selected actions (already computed above)
+                            current_q = discrete_q_selected.detach()
+                            # Targets already computed above as discrete_targets
+                            td_errors = torch.abs(current_q - discrete_targets).cpu().numpy()
+                            
+                            # Add small epsilon to avoid zero priorities
+                            td_errors = np.maximum(td_errors, 0.01)
+                            
+                            # Update priorities in the replay buffer
+                            self.memory.update_priorities(batch_indices.cpu().numpy(), td_errors)
         except Exception:
             pass  # Silently skip priority updates if anything goes wrong
         
