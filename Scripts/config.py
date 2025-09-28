@@ -52,8 +52,8 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 2048               # Reduced from 65536 - was causing extreme slowdown
-    lr: float = 0.0025                     # Increased for PER efficiency                     
+    batch_size: int = 4096               # Reduced from 65536 - was causing extreme slowdown
+    lr: float = 0.0010                     # REDUCED from 0.0025 - loss explosion suggests instability                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
@@ -68,18 +68,19 @@ class RLConfigData:
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
     expert_ratio_min: float = 0.00        # Minimum expert control probability
-    expert_ratio_decay: float = 0.997     # Multiplicative decay factor per step interval - adjusted to hit min by ~20M frames
+    expert_ratio_decay: float = 0.995     # FASTER decay - 0.5% reduction per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 768               # More moderate size - 2048 too slow for rapid experimentation
+    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 8                  
+    layer_taper_factor: float = 0.75     # Factor for tapering layer sizes (0.75 ** i)                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
     # Prioritized Replay (PER) removed - hybrid-only simple replay
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
-    use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
+    use_mixed_precision: bool = False     # TEMPORARILY DISABLED - may be causing numerical issues  
     # Phase 1 Optimization: More frequent updates for faster convergence
     training_steps_per_sample: int = 1    # Reduced from 8 - was causing excessive training overhead
     training_workers: int = 1             # Reverted to 1 - multi-threaded training causes autograd conflicts
@@ -101,7 +102,7 @@ class RLConfigData:
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
     # Gradient clipping configuration
-    max_grad_norm: float = 10.0            # Clip threshold for total grad norm (L2) - INCREASED from 5.0
+    max_grad_norm: float = 5.0            # REDUCED from 10.0 - more aggressive clipping for stability
     # Target clamp to stabilize bootstrapping near plateaus - DISABLED to observe natural Q-value range with gamma=0.95
     clamp_targets: bool = False           # DISABLED: Let Q-values grow naturally to detect any remaining inflation
     target_clamp_value: float = 8.0       # Value preserved for potential re-enable if needed
@@ -126,7 +127,7 @@ class RLConfigData:
     recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
 
     # Prioritized Experience Replay settings
-    use_prioritized_replay: bool = True    # Enable PER for better sample efficiency
+    use_prioritized_replay: bool = False    # TEMPORARILY DISABLED - may be causing NaN issues
     per_alpha: float = 0.5                 # Priority exponent (0 = uniform, 1 = full prioritization) - REDUCED from 0.6
     per_beta_start: float = 0.3            # Initial importance sampling exponent - REDUCED from 0.4
     per_beta_increment: float = 1e-6       # Beta increment per step (anneals to 1.0)
@@ -141,10 +142,10 @@ class RLConfigData:
     epsilon_when_zooming: float = 0.05
 
     # Loss weighting: balance continuous head relative to discrete head
-    continuous_loss_weight: float = 0.3    # REDUCED from 0.5 to 0.3
+    continuous_loss_weight: float = 0.01   # FURTHER REDUCED from 0.1 - isolate continuous head instability
 
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
-    reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target - INCREASED
+    reward_scale: float = 1.0            # INCREASED from 0.1 - aggressive scaling causing numerical instability
     reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
     reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
 

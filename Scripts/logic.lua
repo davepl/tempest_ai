@@ -121,6 +121,26 @@ function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment,
     end
 end
 
+-- NEW: Function to calculate effective angular distance between two segments
+-- Returns effective distance where 1.0 = parallel, 0.5 = perpendicular, 0.0 = opposite
+function M.calculate_angular_distance(player_abs_seg, enemy_abs_seg, level_state, is_open)
+    -- Get angle values for both segments
+    local player_angle = level_state.level_angles[player_abs_seg] or 0
+    local enemy_angle = level_state.level_angles[enemy_abs_seg] or 0
+    
+    -- Calculate minimum angular difference (circular)
+    local angle_diff = math.abs(player_angle - enemy_angle)
+    if angle_diff > 8 then
+        angle_diff = 16 - angle_diff
+    end
+    
+    -- Convert to effective distance: 1.0 - (diff/8.0)
+    -- This gives: 0° diff = 1.0, 90° diff = 0.5, 180° diff = 0.0
+    local effective_distance = 1.0 - (angle_diff / 8.0)
+    
+    return effective_distance, angle_diff
+end
+
 -- Helper function to hunt enemies in preference order
 function M.hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
     local hunt_order = {
@@ -471,11 +491,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     end
 
     -- Scan top-rail threats (flippers and pulsars are equivalent once on top rail)
+    -- UPDATED: Now uses angular distances instead of simple segment distances
     local nr_seg, nl_seg = nil, nil
-    local nr_dist, nl_dist = 999, 999
+    local nr_angular_dist, nl_angular_dist = 999, 999
     local nr_dist_float, nl_dist_float = 999, 999
     local right_exists, left_exists = false, false
-    local min_abs_rel_float = 999 -- nearest top-rail flipper/pulsar fractional distance
+    local min_angular_effective = 999 -- nearest top-rail flipper/pulsar angular effective distance
     for i = 1, 7 do
         local depth = enemies_state.enemy_depths[i]
         if depth > 0 and depth <= TOP_RAIL_DEPTH then
@@ -483,6 +504,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
                 local seg = enemies_state.enemy_abs_segments[i]
                 if seg ~= INVALID_SEGMENT then
+                    -- Calculate angular distance instead of simple segment distance
+                    local angular_effective, angular_diff = M.calculate_angular_distance(player_abs_seg, seg, level_state, is_open)
                     local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
                     local rel_float = enemies_state.active_top_rail_enemies[i]
                     if rel_float == 0 and enemies_state.enemy_between_segments[i] == 0 then
@@ -490,9 +513,17 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     end
                     local abs_int = math.abs(rel_int)
                     local abs_float = math.abs(rel_float)
-                    if rel_int > 0 and abs_int < nr_dist then nr_dist, nr_dist_float, nr_seg, right_exists = abs_int, abs_float, seg, true end
-                    if rel_int < 0 and abs_int < nl_dist then nl_dist, nl_dist_float, nl_seg, left_exists = abs_int, abs_float, seg, true end
-                    if abs_float < min_abs_rel_float then min_abs_rel_float = abs_float end
+                    
+                    -- Use angular effective distance for primary threat assessment
+                    if rel_int > 0 and angular_effective < nr_angular_dist then 
+                        nr_angular_dist, nr_dist_float, nr_seg, right_exists = angular_effective, abs_float, seg, true 
+                    end
+                    if rel_int < 0 and angular_effective < nl_angular_dist then 
+                        nl_angular_dist, nl_dist_float, nl_seg, left_exists = angular_effective, abs_float, seg, true 
+                    end
+                    if angular_effective < min_angular_effective then 
+                        min_angular_effective = angular_effective 
+                    end
                 end
             end
         end
@@ -509,23 +540,25 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     end
 
     -- Closed-level (and open with both sides) movement policy
+    -- UPDATED: Now uses angular distances for threat assessment
     if (not is_open) or (is_open and right_exists and left_exists) then
         if right_exists and not left_exists then
-            -- Right-only: move left if within safe distance
-            if nr_dist <= SAFE_DISTANCE then
+            -- Right-only: move left if angular distance indicates close threat
+            -- Lower angular distance = closer angular proximity = higher threat
+            if nr_angular_dist < 0.8 then  -- Threat within ~60° angular proximity
                 target_seg = (nr_seg - 1 + 16) % 16
             else
                 target_seg = player_abs_seg
             end
         elseif left_exists and not right_exists then
-            -- Left-only: move right if within safe distance
-            if nl_dist <= SAFE_DISTANCE then
+            -- Left-only: move right if angular distance indicates close threat
+            if nl_angular_dist < 0.8 then  -- Threat within ~60° angular proximity
                 target_seg = (nl_seg + 1) % 16
             else
                 target_seg = player_abs_seg
             end
         elseif right_exists and left_exists then
-            -- Both sides: freeze (hold position)
+            -- Both sides: freeze (hold position) - threats on both sides
             target_seg = player_abs_seg
         else
             -- No top-rail flippers/pulsars: hold
@@ -534,13 +567,14 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     end
 
     -- Firing policy
-    -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within shooting distance (~0.8)
-    local SHOOT_DIST = 0.80
+    -- UPDATED: Now uses angular effective distance for shooting decisions
+    -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within angular shooting distance
+    local ANGULAR_SHOOT_DIST = 0.75  -- Angular distance threshold (corresponds to ~45° difference)
     local lane_has_threat = M.check_segment_threat(player_abs_seg, enemies_state)
-    local within_shooting_distance = (min_abs_rel_float <= SHOOT_DIST)
+    local within_angular_shooting_distance = (min_angular_effective <= ANGULAR_SHOOT_DIST)
 
     local should_fire
-    if lane_has_threat or within_shooting_distance then
+    if lane_has_threat or within_angular_shooting_distance then
         should_fire = true
     else
         -- Keep only 3 shots onscreen
@@ -549,21 +583,19 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Expert tweak: When we would fire at a top-rail flipper/pulsar but the shot buffer is full (>=8),
     -- still recommend FIRE and also MOVE AWAY by one segment opposite the nearest threat.
+    -- UPDATED: Now uses angular distances for threat assessment
     -- Applies only if there is at least one top-rail flipper/pulsar detected (right_exists/left_exists)
     if should_fire and shot_count >= 8 and (right_exists or left_exists) then
-        -- Determine nearest side using fractional distances if available
+        -- Determine nearest side using angular effective distances
         local move_right -- boolean: true => move to player_abs_seg+1, false => -1
         if right_exists and left_exists then
-            -- Choose the smaller fractional distance; fall back to integer distances if needed
-            local dR = nr_dist_float or nr_dist or 999
-            local dL = nl_dist_float or nl_dist or 999
-            -- If threat is closer/equal on left, move right; else move left
-            move_right = (dL <= dR)
+            -- Choose the side with lower angular distance (higher threat)
+            move_right = (nr_angular_dist > nl_angular_dist)  -- Move away from closer threat
         elseif right_exists then
-            -- Threat only on the right -> move left
+            -- Threat only on the right -> move left (away from threat)
             move_right = false
         else -- left_exists only
-            -- Threat only on the left -> move right
+            -- Threat only on the left -> move right (away from threat)
             move_right = true
         end
 

@@ -219,11 +219,10 @@ print(f"Number of layers: {RL_CONFIG.num_layers}")
 # Calculate and display layer architecture
 layer_sizes = []
 for i in range(RL_CONFIG.num_layers):
-    pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
-    layer_size = max(64, int(RL_CONFIG.hidden_size * (0.6 ** pair_index)))
+    layer_size = max(64, int(RL_CONFIG.hidden_size * (RL_CONFIG.layer_taper_factor ** i)))
     layer_sizes.append(layer_size)
 
-print(f"Layer architecture:")
+print(f"Layer architecture (tapering by {RL_CONFIG.layer_taper_factor} factor):")
 print(f"  Layer 1: {RL_CONFIG.state_size} → {layer_sizes[0]}")
 for i in range(1, len(layer_sizes)):
     print(f"  Layer {i+1}: {layer_sizes[i-1]} → {layer_sizes[i]}")
@@ -320,14 +319,10 @@ class HybridDQN(nn.Module):
         # Shared trunk for feature extraction
         LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
         
-        # Dynamic layer sizing with pairs: A,A -> A*0.75,A*0.75 -> A*0.5625,A*0.5625 -> ...
-        # Pattern: 512,512 -> 384,384 -> 288,288 -> ...
-        layer_sizes = []
-        current_size = hidden_size
+        # Dynamic layer sizing: step down by factor of layer_taper_factor, starting from hidden_size
+
         for i in range(num_layers):
-            # Determine size for this layer pair
-            pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
-            layer_size = max(64, int(hidden_size * (0.6 ** pair_index)))
+            layer_size = max(64, int(hidden_size * (RL_CONFIG.layer_taper_factor ** i)))
             layer_sizes.append(layer_size)
         
         # Create shared layers dynamically
@@ -538,6 +533,10 @@ class PrioritizedReplayBuffer:
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        
+        # Check for NaN/Inf in continuous action and sanitize
+        if not np.isfinite(continuous_val):
+            continuous_val = 0.0
         
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
@@ -1217,6 +1216,12 @@ class HybridDQNAgent:
                     discrete_q_pred, continuous_pred = self.qnetwork_local(states)
                     discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
 
+                # Check for NaN in network outputs
+                if not torch.isfinite(discrete_q_pred).all() or not torch.isfinite(continuous_pred).all():
+                    print(f"WARNING: NaN in network outputs at frame {metrics.frame_count}. Skipping training step.")
+                    print(f"  states range: [{states.min().item():.3f}, {states.max().item():.3f}]")
+                    return 0.0
+
                 # Target computation detached
                 with torch.no_grad():
                     if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
@@ -1246,6 +1251,13 @@ class HybridDQNAgent:
                     discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
                     continuous_targets = continuous_actions
 
+                # Check for NaN in targets before loss computation
+                if not torch.isfinite(discrete_targets).all() or not torch.isfinite(continuous_targets).all():
+                    print(f"WARNING: NaN in targets at frame {metrics.frame_count}. Skipping training step.")
+                    print(f"  rewards range: [{rewards.min().item():.3f}, {rewards.max().item():.3f}]")
+                    print(f"  continuous_actions range: [{continuous_actions.min().item():.3f}, {continuous_actions.max().item():.3f}]")
+                    return 0.0
+
                 # Match dtypes under AMP
                 if use_amp:
                     try:
@@ -1261,8 +1273,21 @@ class HybridDQNAgent:
                         d_loss_per_sample = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
                         c_loss_per_sample = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
                         
+                        # Check for NaN in loss components
+                        if not torch.isfinite(d_loss_per_sample).all() or not torch.isfinite(c_loss_per_sample).all():
+                            print(f"WARNING: NaN in loss components at frame {metrics.frame_count}")
+                            print(f"  discrete_q_selected: {torch.isfinite(discrete_q_selected).all().item()}")
+                            print(f"  discrete_targets: {torch.isfinite(discrete_targets).all().item()}")
+                            print(f"  continuous_pred: {torch.isfinite(continuous_pred).all().item()}")
+                            print(f"  continuous_targets: {torch.isfinite(continuous_targets).all().item()}")
+                            return 0.0
+                        
                         # Apply importance sampling weights if PER is enabled
                         if importance_weights is not None:
+                            # Check importance weights are finite
+                            if not torch.isfinite(importance_weights).all():
+                                print(f"WARNING: NaN in importance weights at frame {metrics.frame_count}. Skipping training step.")
+                                return 0.0
                             # Weight each sample's loss by its importance weight
                             d_loss = (importance_weights.squeeze() * d_loss_per_sample).mean()
                             c_loss = (importance_weights.squeeze() * c_loss_per_sample).mean()
@@ -1279,8 +1304,21 @@ class HybridDQNAgent:
                     d_loss_per_sample = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
                     c_loss_per_sample = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
                     
+                    # Check for NaN in loss components
+                    if not torch.isfinite(d_loss_per_sample).all() or not torch.isfinite(c_loss_per_sample).all():
+                        print(f"WARNING: NaN in loss components at frame {metrics.frame_count}")
+                        print(f"  discrete_q_selected: {torch.isfinite(discrete_q_selected).all().item()}")
+                        print(f"  discrete_targets: {torch.isfinite(discrete_targets).all().item()}")
+                        print(f"  continuous_pred: {torch.isfinite(continuous_pred).all().item()}")
+                        print(f"  continuous_targets: {torch.isfinite(continuous_targets).all().item()}")
+                        return 0.0
+                    
                     # Apply importance sampling weights if PER is enabled
                     if importance_weights is not None:
+                        # Check importance weights are finite
+                        if not torch.isfinite(importance_weights).all():
+                            print(f"WARNING: NaN in importance weights at frame {metrics.frame_count}. Skipping training step.")
+                            return 0.0
                         # Weight each sample's loss by its importance weight
                         d_loss = (importance_weights.squeeze() * d_loss_per_sample).mean()
                         c_loss = (importance_weights.squeeze() * c_loss_per_sample).mean()
@@ -1290,6 +1328,14 @@ class HybridDQNAgent:
                         c_loss = c_loss_per_sample.mean()
                         
                     micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
+
+                # Check for NaN loss before proceeding
+                if not torch.isfinite(micro_total).all():
+                    print(f"WARNING: NaN detected in loss computation at frame {metrics.frame_count}. Skipping training step.")
+                    print(f"  d_loss: {d_loss.item():.6f}, c_loss: {c_loss.item():.6f}, w_cont: {w_cont}")
+                    print(f"  discrete_q_selected range: [{discrete_q_selected.min().item():.3f}, {discrete_q_selected.max().item():.3f}]")
+                    print(f"  continuous_pred range: [{continuous_pred.min().item():.3f}, {continuous_pred.max().item():.3f}]")
+                    return 0.0
 
                 total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
 
@@ -1523,6 +1569,39 @@ class HybridDQNAgent:
                         state[k] = p.to(self.inference_device)
                     self.qnetwork_inference.load_state_dict(state)
                 did_copy = True
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                print(f"WARNING: Inference network sync failed due to architecture mismatch: {e}")
+                print("Recreating inference network with current training network architecture...")
+                try:
+                    # Recreate inference network to match training network
+                    self.qnetwork_inference = HybridDQN(
+                        state_size=self.state_size,
+                        discrete_actions=self.discrete_actions,
+                        hidden_size=RL_CONFIG.hidden_size,
+                        num_layers=RL_CONFIG.num_layers,
+                        use_dueling=RL_CONFIG.use_dueling,
+                        use_noisy=RL_CONFIG.use_noisy_nets
+                    ).to(self.inference_device)
+                    self.qnetwork_inference.eval()
+                    
+                    # Now try to sync again
+                    with torch.no_grad():
+                        state = {}
+                        for k, p in self.qnetwork_local.state_dict().items():
+                            state[k] = p.to(self.inference_device)
+                        self.qnetwork_inference.load_state_dict(state)
+                    did_copy = True
+                    print("Inference network recreated and synced successfully")
+                except Exception as recreate_error:
+                    print(f"CRITICAL: Failed to recreate and sync inference network: {recreate_error}")
+                    # Fall back to using training network directly for inference
+                    print("Falling back to using training network for inference")
+                    self.qnetwork_inference = self.qnetwork_local
+            else:
+                print(f"WARNING: Inference network sync failed: {e}")
+        except Exception as e:
+            print(f"WARNING: Unexpected error during inference sync: {e}")
         finally:
             try:
                 metrics.last_inference_sync_frame = metrics.frame_count
@@ -1583,6 +1662,8 @@ class HybridDQNAgent:
             'discrete_actions': self.discrete_actions,
             'memory_size': len(self.memory),
             'architecture': 'hybrid',  # Mark as hybrid architecture
+            'hidden_size': RL_CONFIG.hidden_size,  # Include architecture parameters
+            'num_layers': RL_CONFIG.num_layers,
             # Metrics/state for persistence
             'frame_count': int(getattr(metrics, 'frame_count', 0)),
             'epsilon': float(getattr(metrics, 'epsilon', getattr(RL_CONFIG, 'epsilon_start', 0.1))),
@@ -1614,6 +1695,32 @@ class HybridDQNAgent:
                 if checkpoint.get('architecture') != 'hybrid':
                     print("Warning: Loading non-hybrid checkpoint into hybrid agent")
                     return False
+                
+                # Check for architecture mismatch and recreate inference network if needed
+                checkpoint_hidden_size = checkpoint.get('hidden_size', RL_CONFIG.hidden_size)
+                checkpoint_num_layers = checkpoint.get('num_layers', RL_CONFIG.num_layers)
+                architecture_changed = (checkpoint_hidden_size != RL_CONFIG.hidden_size or 
+                                       checkpoint_num_layers != RL_CONFIG.num_layers)
+                
+                if architecture_changed:
+                    print(f"Architecture mismatch detected: checkpoint(hidden_size={checkpoint_hidden_size}, num_layers={checkpoint_num_layers}) "
+                          f"vs current config(hidden_size={RL_CONFIG.hidden_size}, num_layers={RL_CONFIG.num_layers})")
+                    print("Recreating inference network with current architecture...")
+                    
+                    # Recreate inference network with current config
+                    if inference_device != training_device:
+                        self.qnetwork_inference = HybridDQN(
+                            state_size=self.state_size,
+                            discrete_actions=self.discrete_actions,
+                            hidden_size=RL_CONFIG.hidden_size,
+                            num_layers=RL_CONFIG.num_layers,
+                            use_dueling=RL_CONFIG.use_dueling,
+                            use_noisy=RL_CONFIG.use_noisy_nets
+                        ).to(inference_device)
+                        self.qnetwork_inference.eval()
+                        print(f"Inference network recreated on {inference_device}")
+                    else:
+                        self.qnetwork_inference = self.qnetwork_local
 
                 # Load weights (tolerate minor shape mismatches by strict=True here as it's same arch)
                 self.qnetwork_local.load_state_dict(checkpoint['local_state_dict'])
@@ -1629,9 +1736,27 @@ class HybridDQNAgent:
 
                 self.training_steps = int(checkpoint.get('training_steps', 0))
 
-                # Sync inference network
+                # Sync inference network - handle architecture changes gracefully
                 if inference_device != training_device:
-                    self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
+                    try:
+                        if architecture_changed:
+                            # If architecture changed, we already recreated the inference network above
+                            # Try to load the checkpoint weights, but handle shape mismatches
+                            try:
+                                self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
+                                print("Inference network loaded checkpoint weights after architecture change")
+                            except RuntimeError as e:
+                                if "size mismatch" in str(e):
+                                    print(f"Inference network architecture changed - using fresh weights: {e}")
+                                    # Keep the fresh weights from recreation
+                                else:
+                                    raise
+                        else:
+                            # Normal case: load checkpoint weights into existing inference network
+                            self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
+                    except Exception as e:
+                        print(f"Failed to load inference network weights: {e}")
+                        # Continue with fresh weights if loading fails
 
                 # Sanity-check Q-values on load to catch corruption/explosion
                 try:

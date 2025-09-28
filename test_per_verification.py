@@ -31,7 +31,7 @@ def main():
 	alpha = float(getattr(aimodel.RL_CONFIG, 'per_alpha', 0.6))
 	eps = float(getattr(aimodel.RL_CONFIG, 'per_eps', 1e-6))
 
-	mem = aimodel.PrioritizedReplayMemory(capacity, alpha=alpha, eps=eps)
+	mem = aimodel.HybridReplayBuffer(capacity, state_size=state_size, use_prioritized=True)
 
 	# Push enough items to enable sampling
 	n_push = max(batch_size * 3, 8192)
@@ -42,24 +42,26 @@ def main():
 		r = float(rng.normal())
 		ns = rng.standard_normal(state_size, dtype=np.float32)
 		d = bool(rng.integers(0, 2))
-		mem.push(s, int(a), r, ns, d)
+		mem.push(s, int(a), 0.0, float(r), ns, bool(d), i)
 
 	size = len(mem)
 	print(f"Buffer filled: size={size}")
 
 	# Validate initial priority stats
-	prios = mem.priorities[:size, 0]
+	prios = mem.buffer.priorities[:size]
 	assert np.all(np.isfinite(prios)), "Found NaN/Inf in priorities after push"
 	assert np.all(prios > 0), "Found non-positive priorities after push"
 	print(f"Priorities OK: min={prios.min():.6g}, max={prios.max():.6g}, mean={prios.mean():.6g}")
 
 	# Sample a batch and verify shapes and values
 	beta = float(getattr(aimodel.RL_CONFIG, 'per_beta_start', 0.4))
-	states, actions, rewards, next_states, dones, is_weights, indices = mem.sample(batch_size, beta=beta)
+	mem.buffer.beta = beta  # Set beta on the underlying buffer
+	states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices, avg_age = mem.sample(batch_size)
 
 	# Basic shape checks
 	assert states.shape == (batch_size, state_size)
-	assert actions.shape == (batch_size, 1)
+	assert discrete_actions.shape == (batch_size, 1)
+	assert continuous_actions.shape == (batch_size, 1)
 	assert rewards.shape == (batch_size, 1)
 	assert next_states.shape == (batch_size, state_size)
 	assert dones.shape == (batch_size, 1)
@@ -80,7 +82,7 @@ def main():
 	print("Priority update OK")
 
 	# Spot-check updated entries
-	updated = mem.priorities[indices, 0]
+	updated = mem.buffer.priorities[indices]
 	assert np.all(updated > 0), "Updated priorities must be positive"
 	assert np.all(np.isfinite(updated)), "Updated priorities contain NaN/Inf"
 	print("Updated priorities OK")
