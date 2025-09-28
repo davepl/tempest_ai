@@ -759,6 +759,76 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
         end
         
+        -- 2.5. FUNDAMENTAL TARGETING REWARD (Direct Enemy-Based Positioning)
+        -- Reward positioning relative to actual enemy locations, not just expert recommendations
+        -- This ensures the AI learns targeting principles even without engineered features
+        do
+            local targeting_reward = 0.0
+            
+            -- Find the best actual targeting opportunity based on raw enemy positions
+            local best_target_score = 0
+            local best_target_distance = 255
+            
+            for i = 1, 7 do
+                if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
+                    local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
+                    local enemy_depth = enemies_state.enemy_depths[i]
+                    local enemy_type = enemies_state.enemy_core_type[i]
+                    
+                    -- Calculate angular distance for targeting quality
+                    local angular_effective, _ = M.calculate_angular_distance(player_abs_seg, enemy_abs_seg, level_state, is_open)
+                    local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
+                    local abs_rel_dist = math.abs(rel_dist)
+                    
+                    -- Score targeting opportunities based on enemy type and positioning
+                    local target_score = 0
+                    
+                    -- Fuseballs are high priority when close to top rail
+                    if enemy_type == ENEMY_TYPE_FUSEBALL and enemy_depth <= TOP_RAIL_DEPTH then
+                        target_score = 10
+                    -- Flippers on top rail are primary targets
+                    elseif enemy_type == ENEMY_TYPE_FLIPPER and enemy_depth <= TOP_RAIL_DEPTH then
+                        target_score = 8
+                    -- Pulsars on top rail are secondary targets
+                    elseif enemy_type == ENEMY_TYPE_PULSAR and enemy_depth <= TOP_RAIL_DEPTH then
+                        target_score = 6
+                    -- Tankers and spikers are lower priority
+                    elseif enemy_type == ENEMY_TYPE_TANKER or enemy_type == ENEMY_TYPE_SPIKER then
+                        target_score = 4
+                    end
+                    
+                    -- Boost score for better angular alignment (closer to parallel)
+                    target_score = target_score * (1.0 + angular_effective * 0.5)
+                    
+                    -- Reduce score for very close enemies (dangerous)
+                    if abs_rel_dist < 1 then
+                        target_score = target_score * 0.3
+                    end
+                    
+                    if target_score > best_target_score then
+                        best_target_score = target_score
+                        best_target_distance = abs_rel_dist
+                    end
+                end
+            end
+            
+            -- Reward based on distance to best actual target
+            if best_target_score > 0 then
+                -- Optimal firing distance: 1-4 segments for most enemies
+                local optimal_min, optimal_max = 1.0, 4.0
+                if best_target_distance >= optimal_min and best_target_distance <= optimal_max then
+                    -- Scale reward by target priority
+                    targeting_reward = 0.05 * (best_target_score / 10.0) * proximity_scale
+                elseif best_target_distance < optimal_min then
+                    -- Too close - small penalty for being in danger
+                    targeting_reward = -0.02 * (best_target_score / 10.0)
+                end
+                -- No penalty for being too far - focus on rewarding good positioning
+            end
+            
+            sub_reward = sub_reward + targeting_reward
+        end
+        
         -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)
         -- Requested policy:
         --   0-2 shots: penalty (too few shots)
