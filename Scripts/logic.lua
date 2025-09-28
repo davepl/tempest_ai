@@ -996,11 +996,13 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
                     -- Reward retreating from very close flippers when shots available
                     if nearest_flipper_dist and nearest_flipper_dist < 1.5 then
-                        local current_pos = player_state.position & 0x0F
+                        local current_pos = player_abs_seg
                         local prev_pos = previous_player_position & 0x0F
-                        local pos_change = current_pos - prev_pos
-
-                        -- If flipper is to the right and we moved left, or vice versa
+                        local pos_change = abs_to_rel_func(current_pos, prev_pos, is_open)
+                        
+                        -- Check if we moved away from the flipper
+                        -- If flipper is to the right (rel > 0), moving left (pos_change < 0) is retreat
+                        -- If flipper is to the left (rel < 0), moving right (pos_change > 0) is retreat
                         if (nearest_flipper_rel > 0 and pos_change < 0) or (nearest_flipper_rel < 0 and pos_change > 0) then
                             -- Successful retreat from close flipper (~5 points)
                             local retreat_bonus = 5.0 / SCORE_UNIT
