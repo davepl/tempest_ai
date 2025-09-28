@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 4096               # Reduced from 65536 - was causing extreme slowdown
-    lr: float = 0.0010                     # REDUCED from 0.0025 - loss explosion suggests instability                     
+    lr: float = 0.0025                    # REDUCED from 0.0025 - loss explosion suggests instability                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)

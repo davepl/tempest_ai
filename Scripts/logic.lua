@@ -497,6 +497,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local nr_dist_float, nl_dist_float = 999, 999
     local right_exists, left_exists = false, false
     local min_angular_effective = 999 -- nearest top-rail flipper/pulsar angular effective distance
+    local min_angle_diff = 999 -- corresponding angular difference for head start adjustment
     for i = 1, 7 do
         local depth = enemies_state.enemy_depths[i]
         if depth > 0 and depth <= TOP_RAIL_DEPTH then
@@ -523,6 +524,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     end
                     if angular_effective < min_angular_effective then 
                         min_angular_effective = angular_effective 
+                        min_angle_diff = angular_diff
                     end
                 end
             end
@@ -541,18 +543,28 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Closed-level (and open with both sides) movement policy
     -- UPDATED: Now uses angular distances for threat assessment
+    -- Accounts for "head start" at narrower angles by adjusting movement thresholds
     if (not is_open) or (is_open and right_exists and left_exists) then
+        -- Calculate dynamic thresholds based on head start
+        local base_move_threshold = 0.8  -- Base threshold for ~60° angular proximity
+        local _, right_angle_diff = nr_seg and M.calculate_angular_distance(player_abs_seg, nr_seg, level_state, is_open) or 0, 8
+        local _, left_angle_diff = nl_seg and M.calculate_angular_distance(player_abs_seg, nl_seg, level_state, is_open) or 0, 8
+        local right_head_start_bonus = (8 - right_angle_diff) / 16.0
+        local left_head_start_bonus = (8 - left_angle_diff) / 16.0
+        
         if right_exists and not left_exists then
             -- Right-only: move left if angular distance indicates close threat
             -- Lower angular distance = closer angular proximity = higher threat
-            if nr_angular_dist < 0.8 then  -- Threat within ~60° angular proximity
+            local right_threshold = base_move_threshold + right_head_start_bonus
+            if nr_angular_dist < right_threshold then  -- Threat within adjusted angular proximity
                 target_seg = (nr_seg - 1 + 16) % 16
             else
                 target_seg = player_abs_seg
             end
         elseif left_exists and not right_exists then
             -- Left-only: move right if angular distance indicates close threat
-            if nl_angular_dist < 0.8 then  -- Threat within ~60° angular proximity
+            local left_threshold = base_move_threshold + left_head_start_bonus
+            if nl_angular_dist < left_threshold then  -- Threat within adjusted angular proximity
                 target_seg = (nl_seg + 1) % 16
             else
                 target_seg = player_abs_seg
@@ -568,8 +580,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Firing policy
     -- UPDATED: Now uses angular effective distance for shooting decisions
+    -- Accounts for "head start" at narrower angles by adjusting threshold dynamically
     -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within angular shooting distance
-    local ANGULAR_SHOOT_DIST = 0.75  -- Angular distance threshold (corresponds to ~45° difference)
+    local base_shoot_dist = 0.75  -- Base angular distance threshold (corresponds to ~45° difference)
+    -- Adjust threshold for head start: narrower angles (smaller diff) get higher threshold (shoot from farther)
+    local head_start_bonus = (8 - min_angle_diff) / 16.0  -- Max bonus 0.5 for 0° diff
+    local ANGULAR_SHOOT_DIST = base_shoot_dist + head_start_bonus
     local lane_has_threat = M.check_segment_threat(player_abs_seg, enemies_state)
     local within_angular_shooting_distance = (min_angular_effective <= ANGULAR_SHOOT_DIST)
 
