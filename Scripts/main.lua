@@ -277,7 +277,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_angles[i] or 0)
     end
 
-    -- Enemies state (counts: 10 + other: 6 = 16) - all natural values
+    -- Enemies state (counts: 10 + speed: 11 + other: 6 = 27) - all natural values
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_flippers)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_pulsars)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_tankers)
@@ -288,6 +288,18 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_tankers)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_spikers)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_fuseballs)
+    -- Enemy speed parameters (level-dependent)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.fuse_move_prb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_flipper_lsb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_pulsar_lsb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_tanker_lsb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_lsb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_lsb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_flipper_msb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_pulsar_msb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_tanker_msb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_msb)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_msb)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.num_enemies_in_tube)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.num_enemies_on_top)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemies_pending)
@@ -307,7 +319,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
 
     -- Enemy segments (7) - relative values
     for i = 1, 7 do
-    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i], is_open_level_flag)
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i], is_open_level_flag)
     end
     -- DEBUG: Print 7 enemy segment values in +00.00 format
     --[[
@@ -352,7 +364,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i], is_open_level_flag)
     end
 
-    -- Total main payload size: 175 (values unchanged; only relative scaling denominator differs by topology)
+    -- Total main payload size: 186 (added 11 enemy speed parameters; relative scaling denominator differs by topology)
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
@@ -427,7 +439,7 @@ local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, exper
     -- Combine OOB header + main data
     local final_data = oob_data .. binary_data
 
-    -- DEBUG: Updated length info for float32 payload: OOB ~32 bytes, Main=704 bytes -> Total ~736 bytes  
+    -- DEBUG: Updated length info for float32 payload: OOB ~32 bytes, Main=744 bytes -> Total ~776 bytes  
     -- print(string.format("Packed lengths: OOB~%d, Main=%d, Total=%d, Num values: %d", 32, #binary_data, #final_data, num_values_packed))
 
     return final_data, num_values_packed

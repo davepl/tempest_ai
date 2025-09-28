@@ -681,6 +681,18 @@ function M.EnemiesState:new()
     self.spawn_slots_tankers = 0
     self.spawn_slots_spikers = 0
     self.spawn_slots_fuseballs = 0
+    -- Enemy speed parameters (level-dependent)
+    self.fuse_move_prb = 0         -- Fuseball movement probability
+    self.spd_flipper_lsb = 0       -- Flipper speed LSB
+    self.spd_pulsar_lsb = 0        -- Pulsar speed LSB
+    self.spd_tanker_lsb = 0        -- Tanker speed LSB
+    self.spd_spiker_lsb = 0        -- Spiker speed LSB
+    self.spd_fuseball_lsb = 0      -- Fuseball speed LSB
+    self.spd_flipper_msb = 0       -- Flipper speed MSB
+    self.spd_pulsar_msb = 0        -- Pulsar speed MSB
+    self.spd_tanker_msb = 0        -- Tanker speed MSB
+    self.spd_spiker_msb = 0        -- Spiker speed MSB
+    self.spd_fuseball_msb = 0      -- Fuseball speed MSB
     -- Other enemy state
     self.pulse_beat = 0      -- Pulsar pulse beat counter ($0147)
     self.pulsing = 0         -- Pulsar pulsing state ($0148)
@@ -805,6 +817,19 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     self.spawn_slots_tankers = mem:read_u8(0x013F)   -- avl_tankers
     self.spawn_slots_spikers = mem:read_u8(0x0140)   -- avl_spikers
     self.spawn_slots_fuseballs = mem:read_u8(0x0141) -- avl_fuseballs
+
+    -- Read enemy speed parameters (level-dependent)
+    self.fuse_move_prb = mem:read_u8(0x015F)         -- Fuseball movement probability
+    self.spd_flipper_lsb = mem:read_u8(0x0160)       -- Flipper speed LSB
+    self.spd_pulsar_lsb = mem:read_u8(0x0161)        -- Pulsar speed LSB
+    self.spd_tanker_lsb = mem:read_u8(0x0162)        -- Tanker speed LSB
+    self.spd_spiker_lsb = mem:read_u8(0x0163)        -- Spiker speed LSB
+    self.spd_fuseball_lsb = mem:read_u8(0x0164)      -- Fuseball speed LSB
+    self.spd_flipper_msb = mem:read_u8(0x0165)       -- Flipper speed MSB
+    self.spd_pulsar_msb = mem:read_u8(0x0166)        -- Pulsar speed MSB
+    self.spd_tanker_msb = mem:read_u8(0x0167)        -- Tanker speed MSB
+    self.spd_spiker_msb = mem:read_u8(0x0168)        -- Spiker speed MSB
+    self.spd_fuseball_msb = mem:read_u8(0x0169)      -- Fuseball speed MSB
 
     -- Read and process enemy slots (1-7)
     for i = 1, 7 do
