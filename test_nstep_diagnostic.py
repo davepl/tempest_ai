@@ -17,7 +17,7 @@ def test_realistic_tempest_scenario():
     buffer = NStepReplayBuffer(n_step=7, gamma=0.99)
     
     # Simulate typical Tempest rewards (small values)
-    states = [np.random.randn(175).astype(np.float32) for _ in range(20)]
+    states = [np.random.randn(182).astype(np.float32) for _ in range(20)]
     rewards = [0.01, -0.005, 0.0, 0.02, -0.01, 0.015, 0.0, 0.05, -0.02, 0.0]
     
     experiences = []
@@ -60,7 +60,7 @@ def test_episode_end_behavior():
     buffer = NStepReplayBuffer(n_step=7, gamma=0.99)
     
     # Simulate episode that ends after just a few steps
-    states = [np.random.randn(175).astype(np.float32) for _ in range(5)]
+    states = [np.random.randn(182).astype(np.float32) for _ in range(5)]
     
     # Add 3 steps then terminal
     buffer.add(states[0], 5, 1.0, states[1], False)
@@ -104,7 +104,7 @@ def test_training_volume():
     steps_taken = 0
     
     # Simulate 100 steps of continuous play
-    states = [np.random.randn(175).astype(np.float32) for _ in range(101)]
+    states = [np.random.randn(182).astype(np.float32) for _ in range(101)]
     
     for i in range(100):
         reward = np.random.normal(0, 0.01)  # Small random rewards

@@ -44,7 +44,7 @@ def test_hybrid_dqn_network():
     """Test HybridDQN network architecture"""
     print("\n=== Testing HybridDQN Network ===")
     
-    state_size = 175
+    state_size = 182
     discrete_actions = 4
     batch_size = 32
     
@@ -89,7 +89,7 @@ def test_hybrid_replay_buffer():
     assert buffer.sample(32) is None
     
     # Add experiences
-    state_size = 175
+    state_size = 182
     num_experiences = 100
     
     for i in range(num_experiences):
@@ -142,7 +142,7 @@ def test_hybrid_agent_action_selection():
     """Test HybridDQNAgent action selection"""
     print("\n=== Testing HybridDQNAgent Action Selection ===")
     
-    state_size = 175
+    state_size = 182
     agent = HybridDQNAgent(state_size=state_size, discrete_actions=4)
     
     # Test deterministic action selection (epsilon=0)
@@ -247,7 +247,7 @@ def test_hybrid_training_loop():
     """Test hybrid agent training step"""
     print("\n=== Testing Hybrid Training Loop ===")
     
-    state_size = 175
+    state_size = 182
     agent = HybridDQNAgent(state_size=state_size, discrete_actions=4, batch_size=16)
     
     # Add training experiences
@@ -275,7 +275,7 @@ def test_model_save_load():
     """Test hybrid model save/load functionality"""
     print("\n=== Testing Model Save/Load ===")
     
-    state_size = 175
+    state_size = 182
     agent1 = HybridDQNAgent(state_size=state_size, discrete_actions=4)
     
     # Create temporary save path

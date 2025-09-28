@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(__file__))
 class MockRLConfig:
     n_step = 7
     gamma = 0.99
-    state_size = 175
+    state_size = 182
     lr = 0.0001
     epsilon = 0.1
     epsilon_min = 0.05
@@ -40,7 +40,7 @@ def test_agent_nstep_usage():
         Scripts.aimodel.training_device = torch.device("cpu")
         Scripts.aimodel.inference_device = torch.device("cpu")
         
-        agent = DQNAgent(state_size=175, action_size=18)
+        agent = DQNAgent(state_size=182, action_size=18)
         
         # Check if n_step buffer was created
         print(f"Agent n_step setting: {agent.n_step}")
@@ -51,8 +51,8 @@ def test_agent_nstep_usage():
             print(f"Buffer gamma: {agent.n_step_buffer.gamma}")
         
         # Test a few steps to see if experiences are generated correctly
-        state = np.random.randn(175).astype(np.float32)
-        next_state = np.random.randn(175).astype(np.float32)
+        state = np.random.randn(182).astype(np.float32)
+        next_state = np.random.randn(182).astype(np.float32)
         
         initial_memory_size = len(agent.memory)
         print(f"Initial memory size: {initial_memory_size}")

@@ -33,7 +33,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 186
+    params_count: int = 182
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
@@ -52,7 +52,7 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 16384               # Reduced from 65536 - was causing extreme slowdown
+    batch_size: int = 8192               # Reduced from 65536 - was causing extreme slowdown
     lr: float = 0.003                     # REDUCED from 0.0025 - loss explosion suggests instability                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse

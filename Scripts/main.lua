@@ -244,13 +244,6 @@ local function flatten_game_state_to_binary(total_reward, obj_reward, sub_reward
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_lives)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_level)
 
-    -- Targeting / Engineered Features (4) - FIXED: Removed duplicate nearest_enemy_seg
-    local is_open_level_flag = (ls.level_type == 0xFF) -- true linear topology
-    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg, is_open_level_flag)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.nearest_enemy_depth_raw)
-    num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, es.is_aligned_with_nearest > 0)
-    num_values_packed = num_values_packed + push_unit_norm(binary_data_parts, es.alignment_error_magnitude)
-
     -- Player state (7 + 8 + 8 = 23)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.position)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.alive)
@@ -364,7 +357,7 @@ local function flatten_game_state_to_binary(total_reward, obj_reward, sub_reward
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i], is_open_level_flag)
     end
 
-    -- Total main payload size: 186 (added 11 enemy speed parameters; relative scaling denominator differs by topology)
+    -- Total main payload size: 178 (removed 4 engineered features; added 11 enemy speed parameters; relative scaling denominator differs by topology)
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)

@@ -2160,6 +2160,17 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             print(f"[WARNING] Frame {frame_counter}: {out_of_range_count} values outside [-1,1] range", flush=True)
             state = np.clip(state, -1.0, 1.0)
         
+        # Calculate expert ratio for curriculum learning (scale subjective rewards over time)
+        # Use same decay logic as decay_expert_ratio but based on frame_counter
+        expert_ratio = RL_CONFIG.expert_ratio_start
+        step_interval = frame_counter // RL_CONFIG.expert_ratio_decay_steps
+        for _ in range(step_interval):
+            expert_ratio *= RL_CONFIG.expert_ratio_decay
+        expert_ratio = max(expert_ratio, RL_CONFIG.expert_ratio_min)
+        
+        # Apply curriculum learning: scale subjective rewards by expert ratio
+        sub_reward *= expert_ratio
+        
         # Sum objective and subjective rewards for backward compatibility
         reward = obj_reward + sub_reward
         
