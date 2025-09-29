@@ -1088,7 +1088,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     end
 
     -- Add debug print for hints
-    -- print(string.format("STATE HINTS DEBUG: Expert=%d, Actual=%d, Fire=%s, Zap=%s", expert_target_abs_seg, actual_nearest_abs_seg, tostring(self.nearest_enemy_should_fire), tostring(self.nearest_enemy_should_zap)))
+    if game_state.frame_counter < 10 then -- Debug for first 10 frames
+        print(string.format("STATE DEBUG Frame %d: Expert=%d, Actual=%d, Fire=%s, Zap=%s", 
+            game_state.frame_counter, expert_target_abs_seg, actual_nearest_abs_seg, 
+            tostring(self.nearest_enemy_should_fire), tostring(self.nearest_enemy_should_zap)))
+    end
 
     if actual_nearest_abs_seg == -1 then -- No actual enemy found
         self.nearest_enemy_seg = INVALID_SEGMENT
