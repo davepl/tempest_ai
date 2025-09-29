@@ -33,6 +33,8 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
+    # Must match the number of float32 values packed by Lua (flatten_game_state_to_binary)
+    # Keep this in sync with Scripts/main.lua flattening. Current payload packs 178 values.
     params_count: int = 182
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False   # Resume from checkpoint - don't reset expert ratio  
@@ -49,11 +51,11 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Hybrid action space: 4 discrete fire/zap combinations + 1 continuous spinner
     discrete_action_size: int = 4  # fire/zap combinations: (0,0), (1,0), (0,1), (1,1)
-    continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
+    continuous_action_size: int = 1  # spinner value in [-0.9, +0.9]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 2048               # FURTHER REDUCED from 4096 - PER overhead scales with batch size
-    lr: float = 0.003                     # REDUCED from 0.0025 - loss explosion suggests instability                     
+    lr: float = 0.0025                     # REDUCED from 0.0025 - loss explosion suggests instability                     
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.5                  # Next-run start: exploration rate (see decay schedule below)
@@ -68,11 +70,11 @@ class RLConfigData:
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
     expert_ratio_min: float = 0.20        # Minimum expert control probability
-    expert_ratio_decay: float = 0.9965    # SLOWER decay - 0.35% reduction per step interval (for 20M frame curriculum)
+    expert_ratio_decay: float = 1.0      # 0.9965    # SLOWER decay - 0.35% reduction per step interval (for 20M frame curriculum)
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 4                  
+    num_layers: int = 3                  
     layer_taper_factor: float = 0.75     # Factor for tapering layer sizes (0.75 ** i)                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse

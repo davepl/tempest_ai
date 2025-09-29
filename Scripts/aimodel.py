@@ -1251,7 +1251,23 @@ class HybridDQNAgent:
                     except Exception:
                         pass
                     discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
-                    continuous_targets = continuous_actions
+                    # For continuous actions in hybrid DQN, use behavioral cloning with reward modulation.
+                    # Move toward the taken action when the discrete advantage is positive; otherwise fade toward zero.
+                    with torch.no_grad():
+                        # Calculate advantage: how much better this action was than batch-average
+                        current_q_value = discrete_q_selected.squeeze()              # (B,)
+                        mean_q = discrete_q_pred.mean(dim=1)                         # (B,)
+                        advantage = current_q_value - mean_q                         # (B,)
+
+                        # Map advantage to a [0,1] scale to avoid inverting the action direction
+                        # 0 -> no learning toward action (bad/neutral), 1 -> fully imitate (good)
+                        advantage_scale = (torch.tanh(advantage * 0.5) + 1.0) * 0.5  # (B,) in [0,1]
+
+                        # Blend between zero-action (when bad) and taken action (when good)
+                        continuous_targets = continuous_actions * advantage_scale.unsqueeze(1)  # (B,1)
+
+                        # Clamp to valid action range
+                        continuous_targets = torch.clamp(continuous_targets, -0.9, 0.9)
 
                 # Check for NaN in targets before loss computation
                 if not torch.isfinite(discrete_targets).all() or not torch.isfinite(continuous_targets).all():
