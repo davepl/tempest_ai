@@ -163,6 +163,7 @@ class SocketServer:
                 'last_state': None,
                 'last_action_hybrid': None,  # (discrete, continuous)
                 'last_action_source': None,
+                'last_log_prob': 0.0,  # For actor-critic training
                 'total_reward': 0.0,
                 'episode_dqn_reward': 0.0,
                 'episode_expert_reward': 0.0,
@@ -287,7 +288,8 @@ class SocketServer:
                                     # Handle both shapes depending on store_aux_action flag
                                     if len(item) == 6:
                                         exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done = item
-                                        self.agent.step(exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done)
+                                        # Legacy: n-step buffer doesn't store log_prob, use 0.0 as placeholder
+                                        self.agent.step(exp_state, exp_action, exp_continuous, 0.0, exp_reward, exp_next_state, exp_done)
                                     else:
                                         exp_state, exp_action, exp_reward, exp_next_state, exp_done = item
                                         # For legacy agents without continuous action
@@ -299,7 +301,7 @@ class SocketServer:
                         try:
                             if self.agent:
                                 # Hybrid agents expect (state, discrete, continuous, reward, next_state, done)
-                                self.agent.step(state['last_state'], int(da), float(ca), float(frame.reward), frame.state, bool(frame.done))
+                                self.agent.step(state['last_state'], int(da), float(ca), float(state['last_log_prob']), float(frame.reward), frame.state, bool(frame.done))
                         except TypeError:
                             # Fallback for agents without continuous action in signature
                             try:
@@ -381,6 +383,12 @@ class SocketServer:
                         discrete_action = fire_zap_to_discrete(fire, zap)
                         continuous_spinner = float(spin)
                         action_source = 'expert'
+                        
+                        # For actor-critic training, compute log_prob of expert's continuous action under current policy
+                        try:
+                            log_prob = self.agent.compute_log_prob(frame.state, continuous_spinner)
+                        except Exception:
+                            log_prob = 0.0  # Fallback if computation fails
                     else:
                         # Epsilon policy: when override_epsilon is ON, force 0.0 (pure greedy).
                         # Otherwise, always use the current decayed epsilon even during expert/inference overrides.
@@ -409,7 +417,7 @@ class SocketServer:
                         except Exception:
                             pass
                         start_t = time.perf_counter()
-                        da, ca = self.agent.act(frame.state, epsilon)
+                        da, ca, log_prob = self.agent.act(frame.state, epsilon)
                         infer_t = time.perf_counter() - start_t
                         # Record inference timing via SafeMetrics API
                         if hasattr(self.metrics, 'add_inference_time'):
@@ -423,6 +431,10 @@ class SocketServer:
                             except Exception:
                                 pass
                         discrete_action, continuous_spinner = int(da), float(ca)
+                        
+                        # Store current action and log_prob for next step
+                        state['last_log_prob'] = float(log_prob)
+                        
                         # Probabilistic superzap gate for DQN actions: allow zap with probability superzap_prob
                         try:
                             pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))

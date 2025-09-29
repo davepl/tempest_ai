@@ -175,7 +175,8 @@ local enemies_state = state_defs.EnemiesState:new()
 local controls = nil -- Initialized after MAME interface confirmed
 
 -- Flatten game state to binary format for sending over socket
-local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
+-- Note: No expert/targeting fields are included in the float32 payload; expert flags are OOB only.
+local function flatten_game_state_to_binary(reward, gs, ls, ps, es, bDone, expert_fire_packed, expert_zap_packed)
     local insert = table.insert -- Local alias for performance
 
     -- Helpers for normalized float32 packing - fail fast on out-of-range values!
@@ -512,7 +513,7 @@ local function handle_ai_interaction()
     if current_socket then
         -- Flatten current state (s') including reward (r) and done (d)
         local frame_data -- Declare frame_data here
-        frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, episode_done, expert_target_seg, expert_fire_packed, expert_zap_packed)
+    frame_data, num_values = flatten_game_state_to_binary(reward, game_state, level_state, player_state, enemies_state, episode_done, expert_fire_packed, expert_zap_packed)
 
         -- Send s', r, d; Receive action a for s'
         received_fire_cmd, received_zap_cmd, received_spinner_cmd, socket_ok = process_frame_via_socket(frame_data)

@@ -114,7 +114,7 @@ warnings.filterwarnings('ignore')
 # Global flag to track if running interactively
 # Check this early before any potential tty interaction
 IS_INTERACTIVE = sys.stdin.isatty()
-print(f"Script Start: sys.stdin.isatty() = {IS_INTERACTIVE}") # DEBUG
+# Script initialization (debug output removed)
 
 # Initialize configuration
 server_config = ServerConfigData()
@@ -291,16 +291,19 @@ class NoisyLinear(nn.Module):
         return F.linear(input, weight, bias)
 
 class HybridDQN(nn.Module):
-    """Hybrid DQN with discrete fire/zap actions + continuous spinner.
+    """Hybrid Actor-Critic with discrete fire/zap actions + continuous spinner.
     
     Architecture:
     - Shared trunk: processes state features
     - Discrete head: outputs Q-values for 4 fire/zap combinations
-    - Continuous head: outputs single continuous spinner value in [-0.9, +0.9]
+    - Actor head: outputs mean and log_std for Gaussian spinner policy
+    - Critic head: outputs state value V(s) for advantage computation
     
-    Forward pass returns: (discrete_q_values, continuous_spinner)
+    Forward pass returns: (discrete_q_values, actor_mean, actor_log_std, critic_value)
     - discrete_q_values: (batch_size, 4) Q-values for fire/zap combinations
-    - continuous_spinner: (batch_size, 1) spinner values in [-0.9, +0.9]
+    - actor_mean: (batch_size, 1) mean of spinner Gaussian policy
+    - actor_log_std: (batch_size, 1) log std of spinner Gaussian policy  
+    - critic_value: (batch_size, 1) state value estimate
     """
     def __init__(self, state_size: int, discrete_actions: int = 4, 
                  hidden_size: int = 512, num_layers: int = 3, 
@@ -357,15 +360,24 @@ class HybridDQN(nn.Module):
             self.discrete_fc = nn.Linear(shared_output_size, head_size)
             self.discrete_out = nn.Linear(head_size, discrete_actions)
         
-        # Continuous head for spinner (always separate from dueling)
-        self.continuous_fc1 = nn.Linear(shared_output_size, head_size)
-        continuous_head_size = max(32, head_size // 2)
-        self.continuous_fc2 = nn.Linear(head_size, continuous_head_size)
-        self.continuous_out = nn.Linear(continuous_head_size, 1)
+        # Actor head for spinner policy (Gaussian)
+        self.actor_fc1 = nn.Linear(shared_output_size, head_size)
+        self.actor_fc2 = nn.Linear(head_size, max(32, head_size // 2))
+        self.actor_mean = nn.Linear(max(32, head_size // 2), 1)
+        self.actor_log_std = nn.Linear(max(32, head_size // 2), 1)
         
-        # Initialize continuous head with smaller weights for stable training
-        torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
-        torch.nn.init.constant_(self.continuous_out.bias, 0.0)
+        # Critic head for state value
+        self.critic_fc1 = nn.Linear(shared_output_size, head_size)
+        self.critic_fc2 = nn.Linear(head_size, max(32, head_size // 2))
+        self.critic_out = nn.Linear(max(32, head_size // 2), 1)
+        
+        # Initialize actor and critic with smaller weights for stable training
+        for layer in [self.actor_mean, self.actor_log_std, self.critic_out]:
+            torch.nn.init.xavier_normal_(layer.weight, gain=0.1)
+            torch.nn.init.constant_(layer.bias, 0.0)
+        
+        # Initialize log_std to produce reasonable std (around 0.1-0.2 for smoother actions)
+        torch.nn.init.constant_(self.actor_log_std.bias, -1.6)
     
     def reset_noise(self):
         """Reset noise layers if using noisy networks"""
@@ -374,15 +386,17 @@ class HybridDQN(nn.Module):
                 if isinstance(m, NoisyLinear):
                     m.reset_noise()
     
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning (discrete_q_values, continuous_spinner)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass returning (discrete_q_values, actor_mean, actor_log_std, critic_value)
         
         Args:
             x: Input state tensor (batch_size, state_size)
             
         Returns:
             discrete_q_values: Q-values for fire/zap combinations (batch_size, 4)
-            continuous_spinner: Spinner values in [-0.9, +0.9] (batch_size, 1)
+            actor_mean: Mean of spinner Gaussian policy (batch_size, 1)
+            actor_log_std: Log std of spinner Gaussian policy (batch_size, 1)
+            critic_value: State value estimate (batch_size, 1)
         """
         # Shared feature extraction through dynamic layers
         shared = x
@@ -405,15 +419,20 @@ class HybridDQN(nn.Module):
             discrete = F.relu(self.discrete_fc(shared))
             discrete_q = self.discrete_out(discrete)  # (B, discrete_actions)
         
-        # Continuous spinner head
-        continuous = F.relu(self.continuous_fc1(shared))
-        continuous = F.relu(self.continuous_fc2(continuous))
-        continuous_raw = self.continuous_out(continuous)  # (B, 1)
+        # Actor head for spinner policy
+        actor = F.relu(self.actor_fc1(shared))
+        actor = F.relu(self.actor_fc2(actor))
+        actor_mean = self.actor_mean(actor)  # (B, 1)
+        actor_log_std = self.actor_log_std(actor)  # (B, 1)
+        # Clamp log_std to prevent numerical issues and excessive exploration
+        actor_log_std = torch.clamp(actor_log_std, min=-2.5, max=-0.5)
         
-        # Apply tanh to bound spinner to [-1, +1] then scale to [-0.9, +0.9]
-        continuous_spinner = torch.tanh(continuous_raw) * 0.9
+        # Critic head for state value
+        critic = F.relu(self.critic_fc1(shared))
+        critic = F.relu(self.critic_fc2(critic))
+        critic_value = self.critic_out(critic)  # (B, 1)
         
-        return discrete_q, continuous_spinner
+        return discrete_q, actor_mean, actor_log_std, critic_value
 
 class HybridReplayBuffer:
     """Experience replay buffer for hybrid discrete-continuous actions.
@@ -428,19 +447,21 @@ class HybridReplayBuffer:
         self.size = 0
         self.state_size = int(state_size)
         
-        # Pre-allocated arrays for maximum speed
-        self.states = np.empty((capacity, self.state_size), dtype=np.float32)
-        self.discrete_actions = np.empty((capacity,), dtype=np.int32)
-        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
-        self.rewards = np.empty((capacity,), dtype=np.float32)
-        self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
-        self.dones = np.empty((capacity,), dtype=np.bool_)
+        # Pre-allocated arrays for maximum speed (initialized to ensure clean data)
+        self.states = np.zeros((capacity, self.state_size), dtype=np.float32)
+        self.discrete_actions = np.zeros((capacity,), dtype=np.int32)
+        self.continuous_actions = np.zeros((capacity,), dtype=np.float32)
+        self.log_probs = np.zeros((capacity,), dtype=np.float32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, self.state_size), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.bool_)
     
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def push(self, state, discrete_action, continuous_action, log_prob, reward, next_state, done):
         """Add experience to buffer"""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        log_prob_val = float(log_prob) if not isinstance(log_prob, float) else log_prob
         
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
@@ -462,6 +483,7 @@ class HybridReplayBuffer:
             self.states[self.position, :] = 0.0
         self.discrete_actions[self.position] = discrete_idx
         self.continuous_actions[self.position] = continuous_val
+        self.log_probs[self.position] = log_prob_val
         self.rewards[self.position] = reward
         try:
             ns = np.asarray(next_state, dtype=np.float32)
@@ -520,6 +542,7 @@ class HybridReplayBuffer:
         next_states_np = self.next_states[indices]
         batch_discrete_actions = self.discrete_actions[indices]
         batch_continuous_actions = self.continuous_actions[indices]
+        batch_log_probs = self.log_probs[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
 
@@ -529,6 +552,7 @@ class HybridReplayBuffer:
         next_states = torch.from_numpy(next_states_np).float()
         discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
         continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
+        log_probs = torch.from_numpy(batch_log_probs.reshape(-1, 1)).float()
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
 
@@ -537,6 +561,7 @@ class HybridReplayBuffer:
             next_states = next_states.pin_memory()
             discrete_actions = discrete_actions.pin_memory()
             continuous_actions = continuous_actions.pin_memory()
+            log_probs = log_probs.pin_memory()
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
 
@@ -545,10 +570,11 @@ class HybridReplayBuffer:
         next_states = next_states.to(training_device, non_blocking=non_block)
         discrete_actions = discrete_actions.to(training_device, non_blocking=non_block)
         continuous_actions = continuous_actions.to(training_device, non_blocking=non_block)
+        log_probs = log_probs.to(training_device, non_blocking=non_block)
         rewards = rewards.to(training_device, non_blocking=non_block)
         dones = dones.to(training_device, non_blocking=non_block)
         
-        return states, discrete_actions, continuous_actions, rewards, next_states, dones
+        return states, discrete_actions, continuous_actions, log_probs, rewards, next_states, dones
     
     def __len__(self):
         return self.size
@@ -789,7 +815,7 @@ class HybridDQNAgent:
         self.last_inference_sync = 0
         # Honor global training enable toggle
         self.training_enabled = True
-
+        
         # Background training worker(s)
         self.running = True
         self.num_training_workers = int(getattr(RL_CONFIG, 'training_workers', 1) or 1)
@@ -806,18 +832,23 @@ class HybridDQNAgent:
         self._sync_thread = threading.Thread(target=self._inference_sync_heartbeat, daemon=True, name="HybridInferenceSyncHeartbeat")
         self._sync_thread.start()
         
+        # Action smoothing for less twitchy behavior
+        self.last_continuous_action = 0.0
+        self.action_smoothing = float(getattr(RL_CONFIG, 'action_smoothing', 0.0) or 0.0)
+        
     def act(self, state, epsilon=0.0, add_noise=True):
-        """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
+        """Select hybrid action using epsilon-greedy for discrete + actor sampling for continuous
         
         Returns:
             discrete_action: int (0-3) for fire/zap combination
             continuous_action: float in [-0.9, +0.9] for spinner
+            log_prob: float log probability of continuous action (for actor-critic)
         """
         state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         
         # Do not flip modes every call; rely on persistent .eval() for dedicated inference model
         with torch.no_grad():
-            discrete_q, continuous_pred = self.qnetwork_inference(state)
+            discrete_q, actor_mean, actor_log_std, critic_value = self.qnetwork_inference(state)
         
         # Discrete action selection (epsilon-greedy)
         if random.random() < epsilon:
@@ -825,19 +856,83 @@ class HybridDQNAgent:
         else:
             discrete_action = discrete_q.cpu().data.numpy().argmax()
         
-        # Continuous action selection (predicted value + optional exploration noise)
-        continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
-        if add_noise and epsilon > 0:
-            # Add Gaussian noise scaled by epsilon for exploration
-            noise_scale = epsilon * 0.3  # 30% of action range at full epsilon
-            noise = np.random.normal(0, noise_scale)
-            continuous_action = np.clip(continuous_action + noise, -0.9, 0.9)
+        # Continuous action selection (sample from actor policy)
+        # Use tanh to naturally bound actions without breaking probability distribution
         
-        return int(discrete_action), float(continuous_action)
+        dist = torch.distributions.Normal(actor_mean.squeeze(), torch.exp(actor_log_std.squeeze()))
+        
+        # Sample from unbounded Gaussian
+        unbounded_action = dist.sample()
+        
+        # Compute log_prob BEFORE applying tanh transformation
+        log_prob = dist.log_prob(unbounded_action)
+        
+        # Apply tanh transformation to bound to (-1, 1), then scale to (-0.9, 0.9)
+        bounded_action = torch.tanh(unbounded_action)
+        continuous_action = bounded_action * 0.9
+        
+        # Correction for tanh transformation in log_prob
+        # log_prob(tanh(x)) = log_prob(x) - log(1 - tanh²(x))
+        tanh_correction = torch.log(1 - bounded_action.pow(2) + 1e-8)  # Add epsilon for numerical stability
+        log_prob = log_prob - tanh_correction
+        
+        # Convert to numpy
+        continuous_action = continuous_action.cpu().data.numpy().item()
+        log_prob = log_prob.cpu().data.numpy().item()
+        
+        # Apply action smoothing to reduce twitchy behavior
+        if self.action_smoothing > 0.0:
+            # Exponential moving average: new_action = α * raw_action + (1-α) * last_action
+            continuous_action = (self.action_smoothing * continuous_action + 
+                               (1.0 - self.action_smoothing) * self.last_continuous_action)
+            self.last_continuous_action = continuous_action
+        
+        return int(discrete_action), float(continuous_action), float(log_prob)
     
-    def step(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def compute_log_prob(self, state, continuous_action):
+        """Compute log probability of a given continuous action under current policy
+        
+        Args:
+            state: Current state tensor
+            continuous_action: The continuous action to compute log_prob for
+            
+        Returns:
+            log_prob: Log probability of the action under current policy
+        """
+        state = torch.from_numpy(state).float().to(self.inference_device)
+        if len(state.shape) == 1:
+            state = state.unsqueeze(0)
+        
+        with torch.no_grad():
+            discrete_q, actor_mean, actor_log_std, critic_value = self.qnetwork_inference(state)
+            
+            # Create distribution
+            dist = torch.distributions.Normal(actor_mean.squeeze(), torch.exp(actor_log_std.squeeze()))
+            
+            # Convert continuous_action back to unbounded space
+            # continuous_action is in [-0.9, 0.9], so scale back to [-1, 1] then apply inverse tanh
+            bounded_action = continuous_action / 0.9
+            bounded_action = max(-0.99, min(0.99, bounded_action))  # Clamp to prevent inf in arctanh
+            
+            # Convert to tensor and compute arctanh properly
+            bounded_action_tensor = torch.tensor(bounded_action, device=self.inference_device)
+            unbounded_action = 0.5 * torch.log((1 + bounded_action_tensor) / (1 - bounded_action_tensor))
+            
+            # Compute log_prob of unbounded action
+            log_prob = dist.log_prob(unbounded_action)
+            
+            # Apply tanh correction
+            tanh_correction = torch.log(1 - bounded_action_tensor**2 + 1e-8)
+            log_prob = log_prob - tanh_correction
+            
+            final_log_prob = float(log_prob.cpu().item())
+            
+            return final_log_prob
+    
+    
+    def step(self, state, discrete_action, continuous_action, log_prob, reward, next_state, done):
         """Add experience to memory and queue training"""
-        self.memory.push(state, discrete_action, continuous_action, reward, next_state, done)
+        self.memory.push(state, discrete_action, continuous_action, log_prob, reward, next_state, done)
         
         # Queue multiple training steps per experience
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
@@ -933,26 +1028,30 @@ class HybridDQNAgent:
                     else:
                         break
 
-                states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                states, discrete_actions, continuous_actions, log_probs, rewards, next_states, dones = batch
 
                 # Forward pass (local) under autocast as configured
                 if use_amp:
                     with self.autocast():
-                        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+                        discrete_q_pred, actor_mean, actor_log_std, critic_value = self.qnetwork_local(states)
                         discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+                        # For non-AC modes, use actor_mean as continuous_pred (behavior cloning target)
+                        continuous_pred = actor_mean
                 else:
-                    discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+                    discrete_q_pred, actor_mean, actor_log_std, critic_value = self.qnetwork_local(states)
                     discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+                    # For non-AC modes, use actor_mean as continuous_pred (behavior cloning target)
+                    continuous_pred = actor_mean
 
                 # Target computation detached
                 with torch.no_grad():
                     if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
-                        next_q_local, _ = self.qnetwork_local(next_states)
+                        next_q_local, _, _, next_critic_local = self.qnetwork_local(next_states)
                         next_actions = next_q_local.argmax(dim=1, keepdim=True)
-                        next_q_target, _ = self.qnetwork_target(next_states)
+                        next_q_target, _, _, next_critic_target = self.qnetwork_target(next_states)
                         discrete_q_next_max = next_q_target.gather(1, next_actions)
                     else:
-                        next_q_target, _ = self.qnetwork_target(next_states)
+                        next_q_target, _, _, next_critic_target = self.qnetwork_target(next_states)
                         discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
 
                     # n-step gamma and reward transforms
@@ -971,7 +1070,84 @@ class HybridDQNAgent:
                     except Exception:
                         pass
                     discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
-                    continuous_targets = continuous_actions
+
+                    # Determine continuous training mode
+                    mode = str(getattr(RL_CONFIG, 'continuous_training_mode', 'bc') or 'bc').lower()
+                    
+                    if mode == 'bc':
+                        # Pure behavior cloning (baseline, proven stable)
+                        continuous_targets = continuous_actions
+                    elif mode == 'ac':
+                        # Actor-critic mode
+                        # Use proper gamma (not gamma_boot) for meaningful temporal differences
+                        ac_gamma = self.gamma  # Use base gamma (0.995) for better learning signal
+                        
+                        # Compute target values for critic (only once)
+                        critic_targets = r + ac_gamma * next_critic_target * (1 - dones)
+                        
+                        # Validate log_probs for NaN/Inf before using in policy loss
+                        log_probs_finite = torch.isfinite(log_probs).all()
+                        log_probs_stats = {
+                            'min': log_probs.min().item(),
+                            'max': log_probs.max().item(), 
+                            'mean': log_probs.mean().item(),
+                            'finite_count': torch.isfinite(log_probs).sum().item(),
+                            'total_count': log_probs.numel()
+                        }
+                        
+                        if not log_probs_finite:
+                            print(f"Warning: Invalid log_probs detected: {log_probs_stats}")
+                            print(f"Log_probs sample: {log_probs[:5].flatten()}")
+                            # Set policy loss to zero for this batch
+                            ac_policy_loss = torch.tensor(0.0, device=log_probs.device, requires_grad=True)
+                        else:
+                            # Advantages (detach targets to prevent policy gradients affecting critic targets)
+                            advantages = critic_targets.detach() - critic_value
+                            # Policy loss: -log_prob * advantage (advantage already detached)
+                            ac_policy_loss = -(log_probs * advantages).mean()
+                            
+                        # Value loss (separate from policy loss)
+                        ac_value_loss = F.mse_loss(critic_value, critic_targets.detach())
+                        
+                        # Entropy bonus for exploration
+                        entropy_coeff = float(getattr(RL_CONFIG, 'entropy_coeff', 0.01) or 0.01)
+                        dist = torch.distributions.Normal(actor_mean, torch.exp(actor_log_std))
+                        ac_entropy = dist.entropy().mean()
+                        
+                        # Total actor-critic loss (clear variable naming)
+                        ac_total_loss = ac_policy_loss + ac_value_loss - entropy_coeff * ac_entropy
+                        continuous_targets = continuous_actions  # dummy, not used in AC mode
+                    else:
+                        # Gated behavior cloning using TD error or advantage
+                        try:
+                            k = float(getattr(RL_CONFIG, 'continuous_gate_gain', 1.0) or 1.0)
+                        except Exception:
+                            k = 1.0
+                        try:
+                            floor = float(getattr(RL_CONFIG, 'continuous_gate_floor', 0.0) or 0.0)
+                        except Exception:
+                            floor = 0.0
+                        gtype = str(getattr(RL_CONFIG, 'continuous_gate_type', 'td') or 'td').lower()
+
+                        if gtype == 'adv':
+                            # Advantage gate: Q_selected - mean(Q_all)
+                            with torch.no_grad():
+                                # Use local discrete_q_pred computed above
+                                q_all = discrete_q_pred.detach()
+                                q_mean = q_all.mean(dim=1, keepdim=True)
+                                advantage = discrete_q_selected.detach() - q_mean
+                            signal = advantage
+                        else:
+                            # TD error gate: (target - predicted)
+                            signal = (discrete_targets - discrete_q_selected).detach()
+
+                        gate = torch.tanh(k * signal)  # (-1,1)
+                        gate = (gate + 1.0) * 0.5      # (0,1)
+                        if floor > 0.0:
+                            gate = torch.clamp(gate, min=floor, max=1.0)
+                        # Blend taken spinner toward neutral when signal is weak/negative
+                        continuous_targets = gate * continuous_actions
+                        continuous_targets = torch.clamp(continuous_targets, -0.9, 0.9)
 
                 # Match dtypes under AMP
                 if use_amp:
@@ -985,16 +1161,30 @@ class HybridDQNAgent:
                 if use_amp:
                     with self.autocast():
                         d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
-                        c_loss = F.mse_loss(continuous_pred, continuous_targets)
-                        micro_total = d_loss + w_cont * c_loss
+                        if mode == 'ac':
+                            # AC loss should NOT be scaled by w_cont - it's already a complete loss
+                            c_loss = ac_total_loss
+                            micro_total = d_loss + c_loss  # Equal weighting for discrete and AC
+                        else:
+                            c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                            micro_total = d_loss + w_cont * c_loss
                         # Scale loss for accumulation so effective LR remains constant
                         micro_total = micro_total / float(grad_accum_steps)
                 else:
                     d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
-                    c_loss = F.mse_loss(continuous_pred, continuous_targets)
-                    micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
+                    if mode == 'ac':
+                        # AC loss should NOT be scaled by w_cont - it's already a complete loss
+                        c_loss = ac_total_loss
+                        micro_total = (d_loss + c_loss) / float(grad_accum_steps)  # Equal weighting
+                    else:
+                        c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                        micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
 
-                total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
+                # Compute total loss for logging (matching the actual training loss)
+                if mode == 'ac':
+                    total_loss_value += float((d_loss + c_loss).item()) / float(grad_accum_steps)
+                else:
+                    total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
 
                 # Backward accumulate
                 if use_amp and scaler is not None:
@@ -1453,13 +1643,13 @@ class HybridDQNAgent:
                         states = sample[0]
                         if isinstance(states, torch.Tensor):
                             states = states.to(self.inference_device, non_blocking=True)
-                            discrete_q, _ = self.qnetwork_inference(states)
+                            discrete_q, _, _, _ = self.qnetwork_inference(states)
                             min_q = discrete_q.min().item()
                             max_q = discrete_q.max().item()
 
                 if min_q is None or max_q is None:
                     dummy = torch.zeros(1, self.state_size, device=self.inference_device)
-                    discrete_q, _ = self.qnetwork_inference(dummy)
+                    discrete_q, _, _, _ = self.qnetwork_inference(dummy)
                     min_q = discrete_q.min().item()
                     max_q = discrete_q.max().item()
 

@@ -147,7 +147,7 @@ def test_hybrid_agent_action_selection():
     
     # Test deterministic action selection (epsilon=0)
     state = np.random.randn(state_size).astype(np.float32)
-    discrete_action, continuous_action = agent.act(state, epsilon=0.0, add_noise=False)
+    discrete_action, continuous_action, log_prob = agent.act(state, epsilon=0.0, add_noise=False)
     
     # Verify output types and ranges
     assert isinstance(discrete_action, int), f"Discrete action type: {type(discrete_action)}"
@@ -162,7 +162,7 @@ def test_hybrid_agent_action_selection():
     continuous_actions = []
     
     for _ in range(100):
-        discrete, continuous = agent.act(state, epsilon=0.5, add_noise=True)
+        discrete, continuous, log_prob = agent.act(state, epsilon=0.5, add_noise=True)
         discrete_actions.append(discrete)
         continuous_actions.append(continuous)
     
@@ -255,11 +255,12 @@ def test_hybrid_training_loop():
         state = np.random.randn(state_size).astype(np.float32)
         discrete_action = np.random.randint(0, 4)
         continuous_action = np.random.uniform(-0.9, 0.9)
+        log_prob = np.random.uniform(-2.0, 0.0)  # Reasonable log probability range
         reward = np.random.randn()
         next_state = np.random.randn(state_size).astype(np.float32)
         done = np.random.random() < 0.1
         
-        agent.step(state, discrete_action, continuous_action, reward, next_state, done)
+        agent.step(state, discrete_action, continuous_action, log_prob, reward, next_state, done)
     
     # Perform training step
     loss = agent.train_step()

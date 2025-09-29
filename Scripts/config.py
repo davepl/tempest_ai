@@ -33,7 +33,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 175
+    params_count: int = 171
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
@@ -52,7 +52,7 @@ class RLConfigData:
     continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
+    batch_size: int = 65536                # Temporarily reduced for faster AC testing (was 65536)
     lr: float = 0.0025                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
@@ -95,7 +95,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 3
+    n_step: int = 1  # Disabled for actor-critic training (log_prob support needed)
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
@@ -106,7 +106,7 @@ class RLConfigData:
     clamp_targets: bool = False           # DISABLED: Let Q-values grow naturally to detect any remaining inflation
     target_clamp_value: float = 8.0       # Value preserved for potential re-enable if needed
     # Require fresh frames after load before resuming training
-    min_new_frames_after_load_to_train: int = 50000
+    min_new_frames_after_load_to_train: int = 65536
 
     # Optimization: learning-rate schedule (frame-based)
     # Options: 'none', 'cosine'
@@ -131,7 +131,17 @@ class RLConfigData:
     adaptive_expert_floor: bool = False
 
     # Loss weighting: balance continuous head relative to discrete head
-    continuous_loss_weight: float = 0.5
+    # Tuned for gated_bc to keep discrete RL dominant while enabling spinner learning
+    continuous_loss_weight: float = 0.1
+    # Continuous training mode: 'bc' (behavior cloning), 'gated_bc' (TD/advantage-gated cloning)
+    continuous_training_mode: str = 'ac'
+    # Gate parameters for 'gated_bc' mode
+    continuous_gate_gain: float = 2.0    # k in tanh(k * signal)
+    continuous_gate_floor: float = 0.3   # minimum gate to avoid collapse to zero movement
+    continuous_gate_type: str = 'td'    # 'td' (TD-error) or 'adv' (advantage over mean Q)
+    # Actor-critic parameters
+    entropy_coeff: float = 0.02          # Entropy bonus coefficient for exploration (increased for better learning)
+    action_smoothing: float = 0.1         # EMA coefficient for action smoothing (0=no smoothing, 0.1=light, 0.3=heavy)
 
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
     reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target
