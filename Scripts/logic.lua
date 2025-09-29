@@ -1000,6 +1000,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         previous_flipper_count = current_flipper_count
     end
     LastRewardState = obj_reward + sub_reward
+    
+    -- Debug reward components for first few frames
+    if game_state.frame_counter < 10 then
+        print(string.format("REWARD DEBUG Frame %d: obj=%.4f, sub=%.4f, total=%.4f", 
+            game_state.frame_counter, obj_reward, sub_reward, obj_reward + sub_reward))
+    end
 
     return obj_reward, sub_reward, bDone
 end

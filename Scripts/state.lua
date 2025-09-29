@@ -1058,27 +1058,52 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- === Calculate and store nearest enemy segment and engineered features ===
     -- Reset zap recommendation before calculation
     self.nearest_enemy_should_zap = false
-    -- Use the internal helper function find_target_segment, passing the calculated is_open
-    local nearest_abs_seg, nearest_depth, should_fire_target, should_zap_target = find_target_segment(game_state, player_state, level_state, self, abs_to_rel_func, is_open)
+    
+    -- First, get expert targeting information for strategic recommendations
+    local expert_target_abs_seg, expert_target_depth, should_fire_target, should_zap_target = find_target_segment(game_state, player_state, level_state, self, abs_to_rel_func, is_open)
 
-    -- Store results in the object's fields
-    self.nearest_enemy_abs_seg_internal = nearest_abs_seg -- Store absolute segment (-1 if none)
+    -- Store expert results in the object's fields  
+    self.nearest_enemy_abs_seg_internal = expert_target_abs_seg -- Store absolute segment (-1 if none)
     self.nearest_enemy_should_fire = should_fire_target   -- Store firing recommendation
     self.nearest_enemy_should_zap = should_zap_target     -- Store zapping recommendation
 
-    -- Add debug print for hints
-    -- print(string.format("STATE HINTS DEBUG: Abs=%d, Fire=%s, Zap=%s", self.nearest_enemy_abs_seg_internal, tostring(self.nearest_enemy_should_fire), tostring(self.nearest_enemy_should_zap)))
+    -- Second, find the ACTUAL nearest enemy for reward calculation (independent of expert strategy)
+    local actual_nearest_abs_seg = -1
+    local actual_nearest_depth = 255
+    local min_distance = 999
+    
+    for i = 1, 7 do
+        if self.enemy_abs_segments[i] ~= INVALID_SEGMENT and self.enemy_depths[i] > 0 then
+            local enemy_abs_seg = self.enemy_abs_segments[i]
+            local rel_dist = abs_to_rel_func(player_abs_segment, enemy_abs_seg, is_open)
+            local abs_dist = math.abs(rel_dist)
+            
+            -- Find closest enemy by distance
+            if abs_dist < min_distance then
+                min_distance = abs_dist
+                actual_nearest_abs_seg = enemy_abs_seg
+                actual_nearest_depth = self.enemy_depths[i]
+            end
+        end
+    end
 
-    if nearest_abs_seg == -1 then -- No target found
+    -- Add debug print for hints
+    if game_state.frame_counter < 10 then -- Debug for first 10 frames
+        print(string.format("STATE DEBUG Frame %d: Expert=%d, Actual=%d, Fire=%s, Zap=%s", 
+            game_state.frame_counter, expert_target_abs_seg, actual_nearest_abs_seg, 
+            tostring(self.nearest_enemy_should_fire), tostring(self.nearest_enemy_should_zap)))
+    end
+
+    if actual_nearest_abs_seg == -1 then -- No actual enemy found
         self.nearest_enemy_seg = INVALID_SEGMENT
         self.is_aligned_with_nearest = 0.0
         self.nearest_enemy_depth_raw = 255 -- Use max depth as sentinel
         self.alignment_error_magnitude = 0.0
-    else -- Valid target found
+    else -- Actual enemy found - use for reward calculation
         -- Use the is_open calculated at the start of this function
-        local nearest_rel_seg = abs_to_rel_func(player_abs_segment, nearest_abs_seg, is_open)
+        local nearest_rel_seg = abs_to_rel_func(player_abs_segment, actual_nearest_abs_seg, is_open)
         self.nearest_enemy_seg = nearest_rel_seg     -- Store relative segment
-        self.nearest_enemy_depth_raw = nearest_depth -- Store raw depth
+        self.nearest_enemy_depth_raw = actual_nearest_depth -- Store raw depth
 
         -- Calculate Is_Aligned
         self.is_aligned_with_nearest = (nearest_rel_seg == 0) and 1.0 or 0.0

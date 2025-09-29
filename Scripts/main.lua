@@ -236,6 +236,9 @@ local function flatten_game_state_to_binary(total_reward, obj_reward, sub_reward
 
     local binary_data_parts = {}
     local num_values_packed = 0
+    
+    -- Calculate is_open_level flag early for use in relative segment normalization
+    local is_open_level_flag = ls.level_type == 0xFF
 
     -- Game state (5) - all natural values
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.gamestate)
