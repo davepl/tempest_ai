@@ -145,7 +145,7 @@ class RLConfigData:
     continuous_loss_weight: float = 0.01   # FURTHER REDUCED from 0.1 - isolate continuous head instability
 
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
-    reward_scale: float = 1.0            # INCREASED from 0.1 - aggressive scaling causing numerical instability
+    reward_scale: float = 0.1            # INCREASED from 0.1 - aggressive scaling causing numerical instability
     reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
     reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
 

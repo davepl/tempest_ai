@@ -2173,7 +2173,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         expert_ratio = max(expert_ratio, RL_CONFIG.expert_ratio_min)
         
         # Apply curriculum learning: scale subjective rewards by expert ratio
-        sub_reward *= expert_ratio
+        # DISABLED: sub_reward *= expert_ratio
         
         # Sum objective and subjective rewards for backward compatibility
         reward = obj_reward + sub_reward

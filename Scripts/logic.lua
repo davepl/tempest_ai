@@ -819,6 +819,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 if best_target_distance >= optimal_min and best_target_distance <= optimal_max then
                     -- Scale reward by target priority - INCREASED from 0.05 to 0.25
                     targeting_reward = 0.25 * (best_target_score / 10.0) * proximity_scale
+                    -- BONUS: Extra reward for perfect alignment (distance = 0)
+                    if best_target_distance == 0 then
+                        targeting_reward = targeting_reward + 0.50 * (best_target_score / 10.0) * proximity_scale
+                    end
                 elseif best_target_distance < optimal_min then
                     -- Too close - small penalty for being in danger - INCREASED penalty
                     targeting_reward = -0.10 * (best_target_score / 10.0)
