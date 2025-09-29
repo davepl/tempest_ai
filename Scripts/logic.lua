@@ -750,7 +750,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local optimal_min, optimal_max = 1.0, 3.0
                 local prox_reward = 0.0
                 if distance_segments >= optimal_min and distance_segments <= optimal_max then
-                    prox_reward = 0.10 * proximity_scale  -- Good positioning bonus
+                    prox_reward = 0.25 * proximity_scale  -- INCREASED from 0.10 to 0.25
                 else
                     prox_reward = 0.0 -- Penalties removed
                 end
@@ -817,16 +817,47 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 -- Optimal firing distance: 1-4 segments for most enemies
                 local optimal_min, optimal_max = 1.0, 4.0
                 if best_target_distance >= optimal_min and best_target_distance <= optimal_max then
-                    -- Scale reward by target priority
-                    targeting_reward = 0.05 * (best_target_score / 10.0) * proximity_scale
+                    -- Scale reward by target priority - INCREASED from 0.05 to 0.25
+                    targeting_reward = 0.25 * (best_target_score / 10.0) * proximity_scale
                 elseif best_target_distance < optimal_min then
-                    -- Too close - small penalty for being in danger
-                    targeting_reward = -0.02 * (best_target_score / 10.0)
+                    -- Too close - small penalty for being in danger - INCREASED penalty
+                    targeting_reward = -0.10 * (best_target_score / 10.0)
                 end
                 -- No penalty for being too far - focus on rewarding good positioning
             end
             
             sub_reward = sub_reward + targeting_reward
+        end
+        
+        -- 2.6. SHOT EFFECTIVENESS REWARD (Reward shooting when enemies are targetable)
+        -- Bonus for firing when there are good targets available
+        do
+            local shot_effectiveness_reward = 0.0
+            local fire_now = player_state.fire_detected or 0
+            
+            -- Check if there are targetable enemies
+            local has_good_targets = false
+            for i = 1, 7 do
+                if enemies_state.enemy_abs_segments[i] ~= INVALID_SEGMENT and enemies_state.enemy_depths[i] > 0 then
+                    local enemy_abs_seg = enemies_state.enemy_abs_segments[i]
+                    local enemy_depth = enemies_state.enemy_depths[i]
+                    local rel_dist = abs_to_rel_func(player_abs_seg, enemy_abs_seg, is_open)
+                    local abs_rel_dist = math.abs(rel_dist)
+                    
+                    -- Consider enemies targetable if within 1-5 segments and not too deep
+                    if abs_rel_dist >= 1 and abs_rel_dist <= 5 and enemy_depth <= 0x80 then
+                        has_good_targets = true
+                        break
+                    end
+                end
+            end
+            
+            -- Reward firing when targets are available, but don't penalize not firing
+            if fire_now == 1 and has_good_targets then
+                shot_effectiveness_reward = 0.15 * proximity_scale  -- Moderate reward for shooting at targets
+            end
+            
+            sub_reward = sub_reward + shot_effectiveness_reward
         end
         
         -- 3. STRATEGIC SHOT MANAGEMENT REWARD (Smart Resource Management)

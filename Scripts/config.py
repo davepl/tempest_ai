@@ -35,7 +35,7 @@ class ServerConfigData:
     max_clients: int = 36
     params_count: int = 182
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
-    reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
+    reset_expert_ratio: bool = False   # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = False       # Resume from checkpoint - don't reset epsilon
      
     force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
@@ -67,12 +67,12 @@ class RLConfigData:
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
-    expert_ratio_min: float = 0.00        # Minimum expert control probability
-    expert_ratio_decay: float = 0.995     # FASTER decay - 0.5% reduction per step interval
+    expert_ratio_min: float = 0.20        # Minimum expert control probability
+    expert_ratio_decay: float = 0.9965    # SLOWER decay - 0.35% reduction per step interval (for 20M frame curriculum)
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 6                  
+    hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 4                  
     layer_taper_factor: float = 0.75     # Factor for tapering layer sizes (0.75 ** i)                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
@@ -127,7 +127,7 @@ class RLConfigData:
     recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
 
     # Prioritized Experience Replay settings
-    use_prioritized_replay: bool = True    # OPTIMIZED: Reduced overhead with less frequent updates
+    use_prioritized_replay: bool = False    # OPTIMIZED: Reduced overhead with less frequent updates
     per_alpha: float = 0.4                 # REDUCED from 0.75 - less aggressive prioritization for better performance
     per_beta_start: float = 0.3            # Initial importance sampling exponent
     per_beta_increment: float = 1e-6       # Beta increment per step (anneals to 1.0)
