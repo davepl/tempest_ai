@@ -2315,3 +2315,191 @@ def decay_expert_ratio(current_step):
     return metrics.expert_ratio
 
 # Discrete-only SimpleReplayBuffer removed (hybrid-only)
+
+# Thread-safe metrics storage
+class SafeMetrics:
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.lock = threading.Lock()
+    
+    def update_frame_count(self, delta: int = 1):
+        with self.lock:
+            # Update total frame count
+            if delta < 1:
+                delta = 1
+            self.metrics.frame_count += delta
+            # Track interval frames for display rate
+            try:
+                self.metrics.frames_count_interval += delta
+            except Exception:
+                pass
+            
+            # Update FPS tracking
+            current_time = time.time()
+            
+            # Initialize last_fps_time if this is the first frame
+            if self.metrics.last_fps_time == 0:
+                self.metrics.last_fps_time = current_time
+                
+            # Count frames for this second
+            self.metrics.frames_last_second += delta
+            
+            # Calculate FPS every second
+            elapsed = current_time - self.metrics.last_fps_time
+            if elapsed >= 1.0:
+                # Calculate frames per second with more accuracy
+                new_fps = self.metrics.frames_last_second / elapsed
+                
+                # Store the new FPS value
+                self.metrics.fps = new_fps
+                
+                # Reset counters
+                self.metrics.frames_last_second = 0
+                self.metrics.last_fps_time = current_time
+                
+            return self.metrics.frame_count
+            
+    def get_epsilon(self):
+        with self.lock:
+            return self.metrics.epsilon
+
+    def get_effective_epsilon(self):
+        """Thread-safe access to effective epsilon (0.0 when override_epsilon is ON)."""
+        with self.lock:
+            try:
+                return 0.0 if getattr(self.metrics, 'override_epsilon', False) else float(self.metrics.epsilon)
+            except Exception:
+                return float(self.metrics.epsilon)
+
+    def get_effective_epsilon_with_state(self, gamestate: int):
+        """Return effective epsilon possibly adjusted by game state.
+
+        Currently: if GS_ZoomingDown (0x20), return epsilon * RL_CONFIG.zoom_epsilon_scale (default 0.25).
+        Honors override_epsilon by returning 0.0 regardless of state.
+        """
+        with self.lock:
+            try:
+                if getattr(self.metrics, 'override_epsilon', False):
+                    return 0.0
+                eps = float(self.metrics.epsilon)
+                if gamestate == 0x20:
+                    try:
+                        scale = float(getattr(RL_CONFIG, 'zoom_epsilon_scale', 0.25) or 0.25)
+                    except Exception:
+                        scale = 0.25
+                    eps = eps * scale
+                # Bound within [0,1] as an effective runtime parameter
+                if eps < 0.0:
+                    eps = 0.0
+                elif eps > 1.0:
+                    eps = 1.0
+                return eps
+            except Exception:
+                return float(self.metrics.epsilon)
+            
+    def update_epsilon(self):
+        with self.lock:
+            self.metrics.epsilon = decay_epsilon(self.metrics.frame_count)
+            return self.metrics.epsilon
+            
+    def update_expert_ratio(self):
+        with self.lock:
+            # Respect override_expert: freeze expert_ratio at 0 while override is ON
+            # Also respect manual_expert_override: freeze expert_ratio while manual override is ON
+            if self.metrics.override_expert or getattr(self.metrics, 'manual_expert_override', False):
+                return self.metrics.expert_ratio
+            decay_expert_ratio(self.metrics.frame_count)
+            return self.metrics.expert_ratio
+    
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None):
+        """Record per-episode rewards in a thread-safe way.
+
+        Forward to the underlying MetricsData.add_episode_reward when available so that:
+        - All episodes (including zero/negative totals) are recorded to keep deques aligned
+        - Interval accumulators (for per-row means) are updated consistently for Rwrd/DQN/Exp
+        Fallback to direct appends if the underlying metrics object lacks the method.
+        """
+        with self.lock:
+            try:
+                add_fn = getattr(self.metrics, 'add_episode_reward', None)
+                if callable(add_fn):
+                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward), subj_reward, obj_reward)
+                    return
+            except Exception:
+                pass
+            # Fallback: append directly without filtering to preserve alignment
+            try:
+                self.metrics.episode_rewards.append(float(total_reward))
+            except Exception:
+                pass
+            try:
+                self.metrics.dqn_rewards.append(float(dqn_reward))
+            except Exception:
+                pass
+            try:
+                self.metrics.expert_rewards.append(float(expert_reward))
+            except Exception:
+                pass
+            try:
+                if subj_reward is not None:
+                    self.metrics.subj_rewards.append(float(subj_reward))
+            except Exception:
+                pass
+            try:
+                if obj_reward is not None:
+                    self.metrics.obj_rewards.append(float(obj_reward))
+            except Exception:
+                pass
+    
+    def increment_guided_count(self):
+        with self.lock:
+            self.metrics.guided_count += 1
+    
+    def increment_total_controls(self):
+        with self.lock:
+            self.metrics.total_controls += 1
+            
+    def update_action_source(self, source):
+        with self.lock:
+            self.metrics.last_action_source = source
+            
+    def update_game_state(self, enemy_seg, open_level):
+        with self.lock:
+            self.metrics.enemy_seg = enemy_seg
+            self.open_level = open_level
+    
+    def get_expert_ratio(self):
+        with self.lock:
+            return self.metrics.expert_ratio
+            
+    def is_override_active(self):
+        with self.lock:
+            return self.metrics.override_expert
+
+    def get_fps(self):
+        with self.lock:
+            return self.metrics.fps
+
+    # Thread-safe helpers for common aggregated metrics
+    def add_inference_time(self, t: float):
+        """Accumulate inference time and count in a thread-safe way."""
+        try:
+            dt = float(t)
+        except Exception:
+            dt = 0.0
+        with self.lock:
+            # Underlying MetricsData holds these fields
+            try:
+                self.metrics.total_inference_time += dt
+                self.metrics.total_inference_requests += 1
+            except Exception:
+                # If fields are missing for any reason, initialize defensively
+                try:
+                    if not hasattr(self.metrics, 'total_inference_time'):
+                        self.metrics.total_inference_time = 0.0
+                    if not hasattr(self.metrics, 'total_inference_requests'):
+                        self.metrics.total_inference_requests = 0
+                    self.metrics.total_inference_time += dt
+                    self.metrics.total_inference_requests += 1
+                except Exception:
+                    pass
