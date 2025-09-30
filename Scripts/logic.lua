@@ -628,7 +628,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
         if score_delta ~= 0 and score_delta < 10000 then                         -- Filter our large completion bonuses
-            local r_score = score_delta / 100                            -- Scaled: 20k points = 1.0 reward unit
+            local r_score = score_delta / 50                            -- Scaled: 20k points = 1.0 reward unit
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
             obj_reward = obj_reward + r_score
