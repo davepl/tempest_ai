@@ -146,6 +146,9 @@ class RLConfigData:
     reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
     reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
 
+    # Subjective reward scaling (for movement/aiming rewards)
+    subj_reward_scale: float = 0.35       # Scale factor applied to subjective rewards from OOB
+
     # Optional gradient value clamp (0.0 disables)
     max_grad_value: float = 0.0
 

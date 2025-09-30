@@ -1960,6 +1960,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
          expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
         
+        # Apply subjective reward scaling
+        subjreward *= RL_CONFIG.subj_reward_scale
+        
         # Combine score components
         score = (score_high * 65536) + score_low
         
