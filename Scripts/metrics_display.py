@@ -184,7 +184,7 @@ def display_metrics_header():
     # Header with Q-Value Range moved before Training Stats, reward components removed
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
-        f"{'Rwrd':>6} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'Loss':>10} "
+        f"{'Rwrd':>6} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
         f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
@@ -377,7 +377,7 @@ def display_metrics_row(agent, kb_handler):
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
-    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {loss_avg:>10.6f} "
+    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{'ON' if metrics.override_expert else 'OFF':>3} "
         f"{'ON' if metrics.expert_mode else 'OFF':>6} "
