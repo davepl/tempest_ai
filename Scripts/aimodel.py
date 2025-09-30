@@ -1840,19 +1840,19 @@ class SafeMetrics:
             decay_expert_ratio(self.metrics.frame_count)
             return self.metrics.expert_ratio
     
-    def add_episode_reward(self, total_reward, dqn_reward, expert_reward):
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None):
         """Record per-episode rewards in a thread-safe way.
 
         Forward to the underlying MetricsData.add_episode_reward when available so that:
         - All episodes (including zero/negative totals) are recorded to keep deques aligned
-        - Interval accumulators (for per-row means) are updated consistently for Rwrd/DQN/Exp
+        - Interval accumulators (for per-row means) are updated consistently for Rwrd/DQN/Exp/Subj/Obj
         Fallback to direct appends if the underlying metrics object lacks the method.
         """
         with self.lock:
             try:
                 add_fn = getattr(self.metrics, 'add_episode_reward', None)
                 if callable(add_fn):
-                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward))
+                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward), subj_reward, obj_reward)
                     return
             except Exception:
                 pass
@@ -1867,6 +1867,16 @@ class SafeMetrics:
                 pass
             try:
                 self.metrics.expert_rewards.append(float(expert_reward))
+            except Exception:
+                pass
+            try:
+                if subj_reward is not None:
+                    self.metrics.subj_rewards.append(float(subj_reward))
+            except Exception:
+                pass
+            try:
+                if obj_reward is not None:
+                    self.metrics.obj_rewards.append(float(obj_reward))
             except Exception:
                 pass
     
