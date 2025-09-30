@@ -47,6 +47,8 @@ local previous_score = 0
 local previous_level = 0
 local previous_alive_state = 1 -- Track previous alive state, initialize as alive
 local LastRewardState = 0
+local LastSubjRewardState = 0
+local LastObjRewardState = 0
 -- Track superzapper usage and activation edge per level (for one-time charging)
 local previous_superzapper_active = 0
 local previous_superzapper_uses_in_level = 0
@@ -616,33 +618,33 @@ end
 
 -- Function to calculate reward for the current frame
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
-    local reward, bDone = 0.0, false
+    local reward, subj_reward, obj_reward, bDone = 0.0, 0.0, 0.0, false
 
     -- Terminal: death (edge-triggered) - Scaled to match 1 life = 1.0 reward unit
     if player_state.alive == 0 and previous_alive_state == 1 then
-        reward = reward - DEATH_PENALTY
+        obj_reward = obj_reward - DEATH_PENALTY
         bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
-        if score_delta ~= 0 and score_delta < 1000 then                         -- Filter our large completion bonuses
+        if score_delta ~= 0 and score_delta < 10000 then                         -- Filter our large completion bonuses
             local r_score = score_delta / SCORE_UNIT                            -- Scaled: 20k points = 1.0 reward unit
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
-            reward = reward + r_score
+            obj_reward = obj_reward + r_score
         end
 
         -- Level completion bonus (edge-triggered) - Scaled to match death penalty magnitude
         if (level_state.level_number or 0) > (previous_level or 0) then
             -- Fixed completion bonus; optional ratio-based scaling can be added later using score_at_level_start
-            reward = reward + LEVEL_COMPLETION_BONUS
+            obj_reward = obj_reward + LEVEL_COMPLETION_BONUS
             bDone = true
         end
 
         -- Zap cost (edge-triggered on button press)
         local zap_now = player_state.zap_detected or 0
         if zap_now == 1 and previous_zap_detected == 0 then
-            reward = reward - ZAP_COST
+            subj_reward = subj_reward - ZAP_COST
         end
 
         -- === OBJECTIVE DENSE REWARD COMPONENTS ===
@@ -694,7 +696,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         prox_reward = 0.0 -- Penalties removed
                     end
                     -- Neutral reward for 3-5 segments (acceptable range)
-                    reward = reward + prox_reward
+                    subj_reward = subj_reward + prox_reward
                 end
             end
             
@@ -713,7 +715,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 elseif shot_count >= 8 then
                     shot_reward = 0 -- Penalty removed
                 end
-                reward = reward + shot_reward / SCORE_UNIT
+                subj_reward = subj_reward + shot_reward / SCORE_UNIT
             end
             
             -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
@@ -772,7 +774,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
                     end
                 end
-                reward = reward + positioning_reward
+                subj_reward = subj_reward + positioning_reward
             end
 
             -- 8. TOP-RAIL FLIPPER ENGAGEMENT REWARD (dense shaping using fractional rel positions)
@@ -802,7 +804,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         if delta > 0 then
                             -- Small reward proportional to progress, capped and scaled under 10 pts
                             local progress_bonus = math.min(1.0, delta) * (3.0 / SCORE_UNIT)
-                            reward = reward + progress_bonus
+                            subj_reward = subj_reward + progress_bonus
                         end
                     end
 
@@ -810,7 +812,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local fire_now = (player_state.fire_detected or 0)
                     local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                     if min_abs_rel_float <= 0.30 and fire_edge then
-                        reward = reward + (4.0 / SCORE_UNIT) -- small bonus (~4 pts) for well-timed shot
+                        subj_reward = subj_reward + (4.0 / SCORE_UNIT) -- small bonus (~4 pts) for well-timed shot
                     end
 
                     -- Penalty for not firing while very close removed per spec
@@ -836,13 +838,16 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         -- Scale a gentle penalty with movement magnitude, capped
                         local units = math.min(4, spin_delta)
                         local move_penalty = -0.0002 * units
-                        -- reward = reward + move_penalty
+                        -- subj_reward = subj_reward + move_penalty
                         -- Attribute to proximity shaping bucket for metrics
                     end
                 end
             end
         end
     end
+
+    -- Calculate total reward as sum of subjective and objective components
+    reward = subj_reward + obj_reward
 
     -- State updates
     -- Detect level increment to reset per-level trackers
@@ -875,13 +880,20 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         previous_toprail_min_abs_rel = min_abs_rel_float
     end
     LastRewardState = reward
+    LastSubjRewardState = subj_reward
+    LastObjRewardState = obj_reward
 
-    return reward, bDone
+    return reward, subj_reward, obj_reward, bDone
 end
 
 -- Function to retrieve the last calculated reward (for display)
 function M.getLastReward()
     return LastRewardState
+end
+
+-- Function to retrieve the last calculated reward components
+function M.getLastRewardComponents()
+    return LastSubjRewardState, LastObjRewardState
 end
 
 

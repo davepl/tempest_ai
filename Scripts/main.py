@@ -98,6 +98,24 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == ' ':  # Handle space key
                     # Print only one row (no header)
                     display_metrics_row(agent, keyboard_handler)
+                elif key == '7':
+                    metrics.decrease_expert_ratio(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == '8':
+                    metrics.restore_natural_expert_ratio(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == '9':
+                    metrics.increase_expert_ratio(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == '4':
+                    metrics.decrease_epsilon(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == '5':
+                    metrics.restore_natural_epsilon(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == '6':
+                    metrics.increase_epsilon(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)
         except Exception as e:
