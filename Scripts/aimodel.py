@@ -129,6 +129,8 @@ class FrameData:
     """Game state data for a single frame"""
     state: np.ndarray
     reward: float
+    subjreward: float  # Subjective reward (movement/aiming)
+    objreward: float   # Objective reward (scoring)
     action: Tuple[bool, bool, float]  # fire, zap, spinner
     mode: int
     gamestate: int    # Added: Game state value from Lua
@@ -148,6 +150,8 @@ class FrameData:
         return cls(
             state=data["state"],
             reward=data["reward"],
+            subjreward=data.get("subjreward", 0.0),  # Default to 0.0 if not provided
+            objreward=data.get("objreward", 0.0),    # Default to 0.0 if not provided
             action=data["action"],
             mode=data["mode"],
             gamestate=data.get("gamestate", 0),  # Default to 0 if not provided
@@ -414,6 +418,218 @@ class HybridDQN(nn.Module):
         continuous_spinner = torch.tanh(continuous_raw) * 0.9
         
         return discrete_q, continuous_spinner
+
+class PrioritizedReplayMemory:
+    """Prioritized Experience Replay buffer for hybrid discrete-continuous actions.
+    
+    Implements the prioritized sampling mechanism from:
+    "Prioritized Experience Replay" (Schaul et al. 2015)
+    
+    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
+    Maintains priorities in a sum tree for efficient sampling.
+    """
+    
+    def __init__(self, capacity: int, alpha: float = 0.6, eps: float = 1e-6, state_size: int = None):
+        self.capacity = capacity
+        self.alpha = alpha  # Prioritization exponent
+        self.eps = eps      # Small constant to prevent zero priorities
+        self.position = 0
+        self.size = 0
+        
+        # State size from config if not provided
+        if state_size is None:
+            state_size = getattr(RL_CONFIG, 'state_size', 175)
+        self.state_size = int(state_size)
+        
+        # Pre-allocated arrays for experiences
+        self.states = np.empty((capacity, self.state_size), dtype=np.float32)
+        self.discrete_actions = np.empty((capacity,), dtype=np.int32)
+        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
+        self.rewards = np.empty((capacity,), dtype=np.float32)
+        self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
+        self.dones = np.empty((capacity,), dtype=np.bool_)
+        
+        # Priority storage (using simple array for efficiency)
+        self.priorities = np.full((capacity, 1), fill_value=self.eps, dtype=np.float32)
+        self.max_priority = 1.0  # Track maximum priority for new experiences
+        
+    def push(self, state, action_or_discrete, reward_or_continuous=None, next_state_or_reward=None, done_or_next_state=None, done=None):
+        """Add experience to buffer with maximum priority.
+        
+        Supports both interfaces:
+        - Hybrid: push(state, discrete_action, continuous_action, reward, next_state, done)
+        - Simple: push(state, action, reward, next_state, done) 
+        """
+        # Detect interface by argument count
+        if done is not None:
+            # 6-argument hybrid interface
+            discrete_action = action_or_discrete
+            continuous_action = reward_or_continuous
+            reward = next_state_or_reward
+            next_state = done_or_next_state
+        else:
+            # 5-argument simple interface (for tests)
+            discrete_action = action_or_discrete
+            continuous_action = 0.0  # Default continuous action for test compatibility
+            reward = reward_or_continuous
+            next_state = next_state_or_reward
+            done = done_or_next_state
+        
+        # Coerce inputs to proper types
+        discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
+        continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        
+        # Clamp continuous action to valid range
+        continuous_val = max(-0.9, min(0.9, continuous_val))
+        
+        # Store experience
+        try:
+            s = np.asarray(state, dtype=np.float32)
+            if s.shape != (self.state_size,):
+                s = s.reshape(self.state_size)
+            self.states[self.position] = s
+            
+            ns = np.asarray(next_state, dtype=np.float32)
+            if ns.shape != (self.state_size,):
+                ns = ns.reshape(self.state_size)
+            self.next_states[self.position] = ns
+            
+            self.discrete_actions[self.position] = discrete_idx
+            self.continuous_actions[self.position] = continuous_val
+            self.rewards[self.position] = float(reward)
+            self.dones[self.position] = bool(done)
+            
+            # Set priority to maximum for new experiences
+            self.priorities[self.position, 0] = self.max_priority
+            
+            self.position = (self.position + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
+            
+        except Exception as e:
+            print(f"Error in PER push: {e}")
+            print(f"Shapes: state={state.shape if hasattr(state, 'shape') else type(state)}, "
+                  f"next_state={next_state.shape if hasattr(next_state, 'shape') else type(next_state)}")
+            raise
+    
+    def sample(self, batch_size: int, beta: float = 0.4):
+        """Sample batch of experiences with prioritized sampling.
+        
+        Returns test-compatible format: (states, actions, rewards, next_states, dones, is_weights, indices)
+        """
+        if self.size < batch_size:
+            raise AssertionError(f"Cannot sample {batch_size} from buffer of size {self.size}")
+        
+        # Get priorities for available experiences
+        prios = self.priorities[:self.size, 0] ** self.alpha
+        probs = prios / prios.sum()
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(len(probs), size=batch_size, replace=False, p=probs)
+        
+        # Calculate importance sampling weights
+        weights = (self.size * probs[indices]) ** (-beta)
+        weights = weights / weights.max()  # Normalize to [0, 1]
+        
+        # Gather experiences (vectorized)
+        states_np = self.states[indices]
+        next_states_np = self.next_states[indices]
+        batch_discrete_actions = self.discrete_actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_dones = self.dones[indices]
+        
+        # Convert to tensors (test-compatible format)
+        states = torch.from_numpy(states_np).float()
+        next_states = torch.from_numpy(next_states_np).float()
+        actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()  # Only discrete for test compatibility
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
+        
+        return states, actions, rewards, next_states, dones, is_weights, indices
+    
+    def sample_hybrid(self, batch_size: int, beta: float = 0.4):
+        """Sample batch for hybrid training with device movement.
+        
+        Returns: (states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices)
+        """
+        if self.size < batch_size:
+            return None
+        
+        # Get priorities for available experiences
+        prios = self.priorities[:self.size, 0] ** self.alpha
+        probs = prios / prios.sum()
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(len(probs), size=batch_size, replace=False, p=probs)
+        
+        # Calculate importance sampling weights
+        weights = (self.size * probs[indices]) ** (-beta)
+        weights = weights / weights.max()  # Normalize to [0, 1]
+        
+        # Gather experiences (vectorized)
+        states_np = self.states[indices]
+        next_states_np = self.next_states[indices]
+        batch_discrete_actions = self.discrete_actions[indices]
+        batch_continuous_actions = self.continuous_actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_dones = self.dones[indices]
+        
+        # Convert to tensors with device movement
+        use_pinned = (training_device.type == 'cuda')
+        states = torch.from_numpy(states_np).float()
+        next_states = torch.from_numpy(next_states_np).float()
+        discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
+        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
+        
+        if use_pinned:
+            states = states.pin_memory()
+            next_states = next_states.pin_memory()
+            discrete_actions = discrete_actions.pin_memory()
+            continuous_actions = continuous_actions.pin_memory()
+            rewards = rewards.pin_memory()
+            dones = dones.pin_memory()
+            is_weights = is_weights.pin_memory()
+        
+        # Move to training device
+        states = states.to(training_device, non_blocking=True)
+        next_states = next_states.to(training_device, non_blocking=True)
+        discrete_actions = discrete_actions.to(training_device, non_blocking=True)
+        continuous_actions = continuous_actions.to(training_device, non_blocking=True)
+        rewards = rewards.to(training_device, non_blocking=True)
+        dones = dones.to(training_device, non_blocking=True)
+        is_weights = is_weights.to(training_device, non_blocking=True)
+        
+        return states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices
+    
+    def update_priorities(self, indices, td_errors):
+        """Update priorities based on TD errors."""
+        if isinstance(td_errors, torch.Tensor):
+            td_errors = td_errors.detach().cpu().numpy()
+        
+        # Convert to numpy and ensure proper shape
+        td_errors = np.asarray(td_errors).flatten()
+        indices = np.asarray(indices)
+        
+        # Clamp TD errors to prevent priority explosion (max 1000x base priority)
+        td_errors = np.clip(td_errors, 0, 1000.0)
+        
+        # Update priorities: priority = |TD error| + eps
+        new_priorities = np.abs(td_errors) + self.eps
+        
+        # Update the priority array
+        for i, idx in enumerate(indices):
+            if 0 <= idx < self.size:
+                self.priorities[idx, 0] = new_priorities[i]
+        
+        # Update maximum priority for future new experiences
+        self.max_priority = max(self.max_priority, new_priorities.max())
+    
+    def __len__(self):
+        """Return current buffer size."""
+        return self.size
 
 class HybridReplayBuffer:
     """Experience replay buffer for hybrid discrete-continuous actions.
@@ -762,8 +978,27 @@ class HybridDQNAgent:
         # Optimizer with separate parameter groups for discrete and continuous components
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         
-        # Experience replay (vectorized 2D storage)
-        self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+        # Experience replay (choose buffer type based on config)
+        if getattr(RL_CONFIG, 'use_per', True):
+            self.memory = PrioritizedReplayMemory(
+                capacity=memory_size, 
+                state_size=self.state_size,
+                alpha=getattr(RL_CONFIG, 'per_alpha', 0.6),
+                eps=getattr(RL_CONFIG, 'per_eps', 1e-6)
+            )
+            self.use_per = True
+            print("Using Prioritized Experience Replay (PER)")
+        else:
+            self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+            self.use_per = False
+            print("Using standard HybridReplayBuffer")
+        
+        # PER beta annealing schedule
+        if self.use_per:
+            self.per_beta_start = getattr(RL_CONFIG, 'per_beta_start', 0.4)
+            self.per_beta_end = getattr(RL_CONFIG, 'per_beta_end', 1.0)
+            self.per_beta_decay_steps = getattr(RL_CONFIG, 'per_beta_decay_steps', 1000000)
+            self.training_step = 0
 
         # AMP persistent settings
         self.use_amp = bool(getattr(RL_CONFIG, 'use_mixed_precision', False) and self.training_device.type == 'cuda')
@@ -925,15 +1160,31 @@ class HybridDQNAgent:
             postclip_grad_norm = 0.0
 
             for acc_idx in range(grad_accum_steps):
-                # Sample micro-batch
-                batch = self.memory.sample(self.batch_size)
-                if batch is None:
-                    if acc_idx == 0:
-                        return 0.0
+                # Sample micro-batch (handle both PER and standard replay)
+                if self.use_per:
+                    # Calculate current beta for importance sampling
+                    beta = self.per_beta_start + (self.per_beta_end - self.per_beta_start) * \
+                           min(1.0, self.training_step / self.per_beta_decay_steps)
+                    
+                    batch_data = self.memory.sample_hybrid(self.batch_size, beta=beta)
+                    if batch_data is not None and len(batch_data) == 8:  # PER returns 8 elements
+                        states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices = batch_data
                     else:
-                        break
-
-                states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                        if acc_idx == 0:
+                            return 0.0
+                        else:
+                            break
+                else:
+                    # Standard replay buffer
+                    batch = self.memory.sample(self.batch_size)
+                    if batch is None:
+                        if acc_idx == 0:
+                            return 0.0
+                        else:
+                            break
+                    states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                    is_weights = None
+                    indices = None
 
                 # Forward pass (local) under autocast as configured
                 if use_amp:
@@ -984,15 +1235,40 @@ class HybridDQNAgent:
                 # Losses per micro-batch (autocast already applied for forward)
                 if use_amp:
                     with self.autocast():
-                        d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
-                        c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                        d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+                        c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                        
+                        # Apply importance weights if using PER
+                        if self.use_per and is_weights is not None:
+                            d_loss = d_loss * is_weights
+                            c_loss = c_loss * is_weights
+                        
+                        # Reduce losses to scalars
+                        d_loss = d_loss.mean()
+                        c_loss = c_loss.mean()
                         micro_total = d_loss + w_cont * c_loss
                         # Scale loss for accumulation so effective LR remains constant
                         micro_total = micro_total / float(grad_accum_steps)
                 else:
-                    d_loss = F.huber_loss(discrete_q_selected, discrete_targets)
-                    c_loss = F.mse_loss(continuous_pred, continuous_targets)
+                    d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+                    c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                    
+                    # Apply importance weights if using PER
+                    if self.use_per and is_weights is not None:
+                        d_loss = d_loss * is_weights
+                        c_loss = c_loss * is_weights
+                    
+                    # Reduce losses to scalars
+                    d_loss = d_loss.mean()
+                    c_loss = c_loss.mean()
                     micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
+
+                # Update PER priorities if using PER
+                if self.use_per and indices is not None:
+                    # Calculate TD errors for priority updates
+                    with torch.no_grad():
+                        td_errors = torch.abs(discrete_q_selected - discrete_targets)
+                        self.memory.update_priorities(indices, td_errors)
 
                 total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
 
@@ -1059,6 +1335,8 @@ class HybridDQNAgent:
         
         # Update training counters and metrics
         self.training_steps += 1
+        if self.use_per:
+            self.training_step += 1  # Track PER beta annealing
         try:
             metrics.total_training_steps += 1
             metrics.training_steps_interval += 1
@@ -1556,7 +1834,8 @@ class SafeMetrics:
     def update_expert_ratio(self):
         with self.lock:
             # Respect override_expert: freeze expert_ratio at 0 while override is ON
-            if self.metrics.override_expert:
+            # Also respect manual_expert_override: freeze expert_ratio while manual override is ON
+            if self.metrics.override_expert or getattr(self.metrics, 'manual_expert_override', False):
                 return self.metrics.expert_ratio
             decay_expert_ratio(self.metrics.frame_count)
             return self.metrics.expert_ratio
@@ -1658,7 +1937,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         try:
             _FMT_OOB
         except NameError:
-            _FMT_OOB = ">HdBBBHHHBBBhBhBBBBB"
+            _FMT_OOB = ">HdddBBBHHHBBBhBhBBBBB"
             _HDR_OOB = struct.calcsize(_FMT_OOB)
 
         if len(data) < _HDR_OOB:
@@ -1666,7 +1945,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
 
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
-        (num_values, reward, gamestate, game_mode, done, frame_counter, score_high, score_low,
+        (num_values, reward, subjreward, objreward, gamestate, game_mode, done, frame_counter, score_high, score_low,
          save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
          expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
@@ -1711,6 +1990,8 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         frame_data = FrameData(
             state=state,
             reward=reward,
+            subjreward=subjreward,
+            objreward=objreward,
             action=(bool(fire), bool(zap), spinner),
             mode=game_mode,
             gamestate=gamestate,
@@ -1730,13 +2011,69 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         print(f"ERROR parsing frame data: {e}", flush=True)
         sys.exit(1)
 
+# Rolling window for DQN reward over last 1M frames
+DQN1M_WINDOW_FRAMES = 1_000_000
+_dqn1m_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: float, frame_end: int)
+_dqn1m_window_frames = 0
+_last_frame_count_seen_1m = None
+
+def _update_dqn1m_window(mean_dqn_reward: float):
+    """Update the 1M-frames rolling window with the latest interval.
+
+    Uses the number of frames progressed since the last row as the weight.
+    """
+    global _dqn1m_window_frames, _last_frame_count_seen_1m
+    current_frame = metrics.frame_count
+    # Determine frames elapsed since last sample
+    if _last_frame_count_seen_1m is None:
+        delta_frames = 0
+    else:
+        delta_frames = max(0, current_frame - _last_frame_count_seen_1m)
+    _last_frame_count_seen_1m = current_frame
+
+    # If no frame progress (e.g., first row), just return without adding
+    if delta_frames <= 0:
+        return
+
+    # Append new interval
+    _dqn1m_window.append((delta_frames, float(mean_dqn_reward), int(current_frame)))
+    _dqn1m_window_frames += delta_frames
+
+    # Trim window to last 1M frames (may need partial trim of the oldest bucket)
+    while _dqn1m_window and _dqn1m_window_frames > DQN1M_WINDOW_FRAMES:
+        overflow = _dqn1m_window_frames - DQN1M_WINDOW_FRAMES
+        oldest_frames, oldest_val, oldest_end = _dqn1m_window[0]
+        if oldest_frames <= overflow:
+            _dqn1m_window.popleft()
+            _dqn1m_window_frames -= oldest_frames
+        else:
+            # Partially trim the oldest bucket
+            kept_frames = oldest_frames - overflow
+            _dqn1m_window[0] = (kept_frames, oldest_val, oldest_end)
+            _dqn1m_window_frames = DQN1M_WINDOW_FRAMES
+            break
+
+def _compute_dqn1m_window_stats():
+    """Compute weighted average for the 1M-frame window.
+
+    Returns avg.
+    """
+    if not _dqn1m_window or _dqn1m_window_frames <= 0:
+        return 0.0
+
+    # Weighted average
+    w_sum = float(_dqn1m_window_frames)
+    wy_sum = sum(fr * val for fr, val, _ in _dqn1m_window)
+    avg = wy_sum / w_sum if w_sum > 0 else 0.0
+    return avg
+
 def display_metrics_header(kb=None):
     """Display header for metrics table"""
     if not IS_INTERACTIVE: return
     header = (
-        f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Mean Reward':>12} | {'DQN Reward':>10} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Guided %':>8} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'OVR':>3} | {'Expert':>6} | "
-        f"{'InferSync ΔF/Δt':>16} | {'HardUpd ΔF/Δt':>17} | {'Q-Value Range':>14}"
+        f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Rwrd':>6} | {'Subj':>6} | {'Obj':>6} | {'DQN':>6} | {'DQN1M':>6} | {'Loss':>8} | "
+        f"{'Epsilon':>7} | {'Xprt':>6} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'OVR':>3} | {'Expert':>6} | "
+        f"{'Q-Value Range':>14}"
     )
     print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
     print_with_terminal_restore(kb, header)
@@ -1746,10 +2083,16 @@ def display_metrics_row(agent, kb=None):
     """Display current metrics in tabular format"""
     if not IS_INTERACTIVE: return
     mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
+    mean_subj_reward = np.mean(list(metrics.subj_rewards)) if metrics.subj_rewards else float('nan')
+    mean_obj_reward = np.mean(list(metrics.obj_rewards)) if metrics.obj_rewards else float('nan')
     dqn_reward = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
     mean_loss = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
     guided_ratio = metrics.expert_ratio
     mem_size = len(agent.memory) if agent else 0
+    
+    # Update DQN1M window and compute stats
+    _update_dqn1m_window(dqn_reward)
+    dqn1m_avg = _compute_dqn1m_window_stats()
     
     # Get client count from server if available
     client_count = 0
@@ -1775,23 +2118,11 @@ def display_metrics_row(agent, kb=None):
                 q_range = f"[{min_q:.2f}, {max_q:.2f}]"
         except Exception:
             q_range = "Error"
-
-    # Compute frames/time since last inference sync and last HARD target update
-    now = time.time()
-    sync_df = metrics.frame_count - getattr(metrics, 'last_inference_sync_frame', 0)
-    targ_df = metrics.frame_count - getattr(metrics, 'last_hard_target_update_frame', 0)
-    last_sync_time = getattr(metrics, 'last_inference_sync_time', 0.0)
-    last_targ_time = getattr(metrics, 'last_hard_target_update_time', 0.0)
-    sync_dt = (now - last_sync_time) if last_sync_time > 0.0 else None
-    targ_dt = (now - last_targ_time) if last_targ_time > 0.0 else None
-    sync_col = f"{sync_df:6d}/{(f'{sync_dt:6.1f}s' if sync_dt is not None else '   n/a')}"
-    targ_col = f"{targ_df:6d}/{(f'{targ_dt:6.1f}s' if targ_dt is not None else '   n/a')}"
     
     row = (
-        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:>7} | {mean_reward:12.2f} | {dqn_reward:10.2f} | "
-        f"{mean_loss:8.2f} | {metrics.epsilon:7.3f} | {guided_ratio*100:7.2f}% | "
-    f"{mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:>3} | {'ON' if metrics.expert_mode else 'OFF':>6} | "
-        f"{sync_col:>16} | {targ_col:>17} | {q_range:>14}"
+        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:>7} | {mean_reward:6.2f} | {mean_subj_reward:6.2f} | {mean_obj_reward:6.2f} | {dqn_reward:6.2f} | {dqn1m_avg:6.2f} | {mean_loss:8.2f} | "
+        f"{metrics.epsilon:7.3f} | {guided_ratio*100:6.1f} | {mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:>3} | {'ON' if metrics.expert_mode else 'OFF':>6} | "
+        f"{q_range:>14}"
     )
     print_with_terminal_restore(kb, row)
 
@@ -1915,6 +2246,10 @@ def decay_epsilon(frame_count):
     Goal: when stuck near the ~2.5 band, temporarily raise the epsilon floor to
     encourage exploration without destabilizing training.
     """
+    # Skip decay if override or manual override is active
+    if metrics.override_epsilon or getattr(metrics, 'manual_epsilon_override', False):
+        return metrics.epsilon
+    
     step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
 
     # Only decay if a new step interval is reached
@@ -1947,8 +2282,8 @@ def decay_expert_ratio(current_step):
     - Then allow >=45% expert while 2.55 < DQN5M <= 2.70 and slope >= 0.00
     - Above that, revert to configured min (e.g., 0.40)
     """
-    # Skip decay if expert mode or override is active
-    if metrics.expert_mode or metrics.override_expert:
+    # Skip decay if expert mode, override, or manual override is active
+    if metrics.expert_mode or metrics.override_expert or getattr(metrics, 'manual_expert_override', False):
         return metrics.expert_ratio
     
     # DON'T auto-initialize to start value at frame 0 - respect loaded checkpoint values

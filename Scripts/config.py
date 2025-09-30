@@ -33,7 +33,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"  # Listen on all interfaces
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 175
+    params_count: int = 171
     reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
     reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
     reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
@@ -53,31 +53,39 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 65536               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.0025                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    lr: float = 0.0035                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
     epsilon_start: float = 0.25           # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.10            # Floor for exploration
-    epsilon_end: float = 0.10            # Target floor
+    epsilon_min: float = 0.25            # Floor for exploration
+    epsilon_end: float = 0.25            # Target floor
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
-    expert_ratio_min: float = 0.01        # Minimum expert control probability
+    expert_ratio_min: float = 0.10        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 4000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 6                  
+    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 7                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
     use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
-    # Prioritized Replay (PER) removed - hybrid-only simple replay
+    
+    # Prioritized Experience Replay (PER) settings
+    use_per: bool = True                  # Enable Prioritized Experience Replay for better sample efficiency
+    per_alpha: float = 0.6                # Prioritization exponent (0=uniform, 1=fully prioritized)
+    per_beta_start: float = 0.4           # Initial importance sampling correction exponent
+    per_beta_end: float = 1.0             # Final importance sampling correction exponent
+    per_beta_decay_steps: int = 1000000   # Steps to linearly anneal beta from start to end
+    per_eps: float = 1e-6                 # Small constant to prevent zero priorities
+    
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
     # Phase 1 Optimization: More frequent updates for faster convergence
@@ -157,6 +165,8 @@ class MetricsData:
     episode_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     dqn_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
     expert_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    subj_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))  # Subjective rewards (movement/aiming)
+    obj_rewards: Deque[float] = field(default_factory=lambda: deque(maxlen=20))   # Objective rewards (scoring)
     losses: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     epsilon: float = field(default_factory=lambda: RL_CONFIG.epsilon_start)
     expert_ratio: float = RL_CONFIG.expert_ratio_start
@@ -167,6 +177,8 @@ class MetricsData:
     override_expert: bool = False
     saved_expert_ratio: float = 0.75
     expert_mode: bool = False
+    manual_expert_override: bool = False  # Track if manual +/- override is active
+    manual_epsilon_override: bool = False  # Track if manual epsilon override is active
     last_action_source: str = ""
     frames_last_second: int = 0
     last_fps_time: float = 0
@@ -222,6 +234,10 @@ class MetricsData:
     reward_count_interval_dqn: int = 0
     reward_sum_interval_expert: float = 0.0
     reward_count_interval_expert: int = 0
+    reward_sum_interval_subj: float = 0.0
+    reward_count_interval_subj: int = 0
+    reward_sum_interval_obj: float = 0.0
+    reward_count_interval_obj: int = 0
     # Training enable/disable (UI toggle). When False, background workers do no training.
     training_enabled: bool = True
     # Epsilon override: when True, force epsilon=0.0 (pure greedy) regardless of other overrides
@@ -292,18 +308,23 @@ class MetricsData:
         with self.lock:
             # Import here to avoid circular imports
             from aimodel import decay_expert_ratio
-            # Skip decay if expert mode or override mode is active
-            if self.expert_mode or self.override_expert:
+            # Skip decay if expert mode, override mode, or manual override is active
+            if self.expert_mode or self.override_expert or self.manual_expert_override:
                 return self.expert_ratio
             decay_expert_ratio(self.frame_count)
             return self.expert_ratio
     
-    def add_episode_reward(self, total_reward, dqn_reward, expert_reward):
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None):
         """Add episode rewards to tracking (include negatives/zeros for accurate means)"""
         with self.lock:
             self.episode_rewards.append(float(total_reward))
             self.dqn_rewards.append(float(dqn_reward))
             self.expert_rewards.append(float(expert_reward))
+            # Track subjective and objective rewards if provided
+            if subj_reward is not None:
+                self.subj_rewards.append(float(subj_reward))
+            if obj_reward is not None:
+                self.obj_rewards.append(float(obj_reward))
             # Track interval reward averages
             try:
                 self.reward_sum_interval_total += float(total_reward)
@@ -312,6 +333,12 @@ class MetricsData:
                 self.reward_count_interval_dqn += 1
                 self.reward_sum_interval_expert += float(expert_reward)
                 self.reward_count_interval_expert += 1
+                if subj_reward is not None:
+                    self.reward_sum_interval_subj += float(subj_reward)
+                    self.reward_count_interval_subj += 1
+                if obj_reward is not None:
+                    self.reward_sum_interval_obj += float(obj_reward)
+                    self.reward_count_interval_obj += 1
             except Exception:
                 pass
     
@@ -410,6 +437,133 @@ class MetricsData:
             if kb_handler and IS_INTERACTIVE:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nEpsilon override: {status}\r")
+    
+    def increase_expert_ratio(self, kb_handler=None):
+        """Increase expert ratio with smart stepping: 0.01 in decimals (0.00-0.09), 0.05 in tenths (0.10+)"""
+        with self.lock:
+            current_percent = int(self.expert_ratio * 100)
+            
+            if current_percent < 10:
+                # Single digits: step by 1%
+                next_percent = current_percent + 1
+            else:
+                # Double digits: step by 5% (round up to next multiple of 5)
+                next_percent = ((current_percent + 5) // 5) * 5
+            
+            # Cap at 100%
+            next_percent = min(next_percent, 100)
+            self.expert_ratio = next_percent / 100.0
+            self.manual_expert_override = True
+            # Auto-disable override_expert when manually setting ratio > 0
+            if self.override_expert and next_percent > 0:
+                self.override_expert = False
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nExpert ratio: {next_percent}% (manual override)\r")
+    
+    def decrease_expert_ratio(self, kb_handler=None):
+        """Decrease expert ratio with smart stepping: 0.01 in decimals (0.00-0.09), 0.05 in tenths (0.10+)"""
+        with self.lock:
+            current_percent = int(self.expert_ratio * 100)
+            
+            if current_percent <= 10:
+                # Single digits and 10%: step by 1%
+                next_percent = current_percent - 1
+            else:
+                # Above 10%: step by 5% (round down to previous multiple of 5)
+                next_percent = ((current_percent - 1) // 5) * 5
+            
+            # Floor at 0%
+            next_percent = max(next_percent, 0)
+            self.expert_ratio = next_percent / 100.0
+            self.manual_expert_override = True
+            # Auto-disable override_expert when manually setting ratio > 0
+            if self.override_expert and next_percent > 0:
+                self.override_expert = False
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nExpert ratio: {next_percent}% (manual override)\r")
+    
+    def restore_natural_expert_ratio(self, kb_handler=None):
+        """Restore natural decaying expert ratio (=key)"""
+        with self.lock:
+            self.manual_expert_override = False
+            # Recalculate the natural expert ratio based on current frame count
+            from aimodel import decay_expert_ratio
+            # Temporarily disable override to allow natural calculation
+            old_override = self.override_expert
+            old_expert_mode = self.expert_mode
+            self.override_expert = False
+            self.expert_mode = False
+            decay_expert_ratio(self.frame_count)
+            # Restore previous override states
+            self.override_expert = old_override
+            self.expert_mode = old_expert_mode
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nExpert ratio: {int(self.expert_ratio * 100)}% (natural decay)\r")
+    
+    def increase_epsilon(self, kb_handler=None):
+        """Increase epsilon with smart stepping: 0.01 in decimals (0.00-0.09), 0.05 in tenths (0.10+)"""
+        with self.lock:
+            current_percent = int(self.epsilon * 100)
+            
+            if current_percent < 10:
+                # At or under 9%: step by 0.01
+                next_percent = current_percent + 1
+            else:
+                # 10% and above: step by 0.05 (round up to next multiple of 5)
+                next_percent = ((current_percent + 5) // 5) * 5
+            
+            # Cap at 100%
+            next_percent = min(next_percent, 100)
+            self.epsilon = next_percent / 100.0
+            self.manual_epsilon_override = True
+            # Auto-disable override_epsilon when manually setting epsilon > 0
+            if self.override_epsilon and next_percent > 0:
+                self.override_epsilon = False
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nEpsilon: {self.epsilon:.3f} (manual override)\r")
+    
+    def decrease_epsilon(self, kb_handler=None):
+        """Decrease epsilon with smart stepping: 0.01 in decimals (0.00-0.09), 0.05 in tenths (0.10+)"""
+        with self.lock:
+            current_percent = int(self.epsilon * 100)
+            
+            if current_percent <= 10:
+                # At or under 10%: step by 0.01
+                next_percent = current_percent - 1
+            else:
+                # Above 10%: step by 0.05 (round down to previous multiple of 5)
+                next_percent = ((current_percent - 1) // 5) * 5
+            
+            # Floor at 0%
+            next_percent = max(next_percent, 0)
+            self.epsilon = next_percent / 100.0
+            self.manual_epsilon_override = True
+            # Auto-disable override_epsilon when manually setting epsilon > 0
+            if self.override_epsilon and next_percent > 0:
+                self.override_epsilon = False
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nEpsilon: {self.epsilon:.3f} (manual override)\r")
+    
+    def restore_natural_epsilon(self, kb_handler=None):
+        """Restore natural decaying epsilon (=key)"""
+        with self.lock:
+            self.manual_epsilon_override = False
+            # Recalculate the natural epsilon based on current frame count
+            from aimodel import decay_epsilon
+            # Temporarily disable override to allow natural calculation
+            old_override = self.override_epsilon
+            self.override_epsilon = False
+            decay_epsilon(self.frame_count)
+            # Restore previous override state
+            self.override_epsilon = old_override
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nEpsilon: {self.epsilon:.3f} (natural decay)\r")
 
 # Define hybrid action space
 # Discrete fire/zap combinations (4 total)

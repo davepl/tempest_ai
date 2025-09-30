@@ -309,6 +309,8 @@ class SocketServer:
 
                     # reward accounting
                     state['total_reward'] = state.get('total_reward', 0.0) + frame.reward
+                    state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + frame.subjreward
+                    state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + frame.objreward
                     src = state.get('last_action_source')
                     if src == 'dqn':
                         state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + frame.reward
@@ -321,7 +323,9 @@ class SocketServer:
                         self.metrics.add_episode_reward(
                             state.get('total_reward', 0.0),
                             state.get('episode_dqn_reward', 0.0),
-                            state.get('episode_expert_reward', 0.0)
+                            state.get('episode_expert_reward', 0.0),
+                            state.get('episode_subj_reward', 0.0),
+                            state.get('episode_obj_reward', 0.0)
                         )
                     state['was_done'] = True
 
@@ -348,6 +352,8 @@ class SocketServer:
                     state['total_reward'] = 0.0
                     state['episode_dqn_reward'] = 0.0
                     state['episode_expert_reward'] = 0.0
+                    state['episode_subj_reward'] = 0.0
+                    state['episode_obj_reward'] = 0.0
                     continue
 
                 elif state.get('was_done', False):
@@ -355,6 +361,8 @@ class SocketServer:
                     state['total_reward'] = 0.0
                     state['episode_dqn_reward'] = 0.0
                     state['episode_expert_reward'] = 0.0
+                    state['episode_subj_reward'] = 0.0
+                    state['episode_obj_reward'] = 0.0
                     # No per-level frame tracking
 
                 # choose action (hybrid-only)
