@@ -195,15 +195,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         insert(parts, string.pack(">b", val))  -- Big-endian int8
         return 1
     end
-    
-    -- Normalize natural 8-bit values [0,255] to [0,1]
-    local function push_natural_norm(parts, v)
-        local num = tonumber(v) or 0
-        local validated = assert_range(num, 0, 255, "natural_8bit")
-        local val = validated / 255.0
-        return push_float32(parts, val)
-    end
-    
+
     local function push_float32(parts, v)
         local val = tonumber(v) or 0.0
         -- CRITICAL: Assert final normalized value is within expected range [-1,1]
@@ -213,6 +205,16 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         insert(parts, string.pack(">f", val))  -- Big-endian float32
         return 1
     end
+
+    -- Normalize natural 8-bit values [0,255] to [0,1]
+    local function push_natural_norm(parts, v)
+        local num = tonumber(v) or 0
+        local validated = assert_range(num, 0, 255, "natural_8bit")
+        local val = validated / 255.0
+        return push_float32(parts, val)
+    end
+    
+
 
     -- Normalize relative segments with proper Tempest range handling
     local INVALID_SEGMENT = state_defs.INVALID_SEGMENT or -32768
