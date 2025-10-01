@@ -1064,7 +1064,7 @@ class HybridDQNAgent:
         continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
         if add_noise and epsilon > 0:
             # Add Gaussian noise scaled by epsilon for exploration
-            noise_scale = epsilon * 0.3  # 30% of action range at full epsilon
+            noise_scale = epsilon * 0.9  # 90% of action range at full epsilon
             noise = np.random.normal(0, noise_scale)
             continuous_action = np.clip(continuous_action + noise, -0.9, 0.9)
         

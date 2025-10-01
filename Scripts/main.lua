@@ -178,7 +178,7 @@ local controls = nil -- Initialized after MAME interface confirmed
 local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
     local insert = table.insert -- Local alias for performance
 
-    -- Helpers for normalized float32 packing - fail fast on out-of-range values!
+    -- Helpers for normalized 8-bit integer packing - fail fast on out-of-range values!
     local function assert_range(v, lo, hi, context)
         if v < lo or v > hi then
             error(string.format("Value %g out of range [%g,%g] in %s", v, lo, hi, context or "unknown"))
@@ -186,13 +186,13 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return v
     end
     
-    local function push_float32(parts, v)
-        local val = tonumber(v) or 0.0
-        -- CRITICAL: Assert final normalized value is within expected range [-1,1]
-        if val < -1.0 or val > 1.0 then
-            error(string.format("FINAL NORMALIZED VALUE %g out of range [-1,1] before serialization!", val))
+    local function push_int8(parts, v)
+        local val = tonumber(v) or 0
+        -- CRITICAL: Assert final normalized value is within expected range [-128,127]
+        if val < -128 or val > 127 then
+            error(string.format("FINAL NORMALIZED VALUE %g out of range [-128,127] before serialization!", val))
         end
-        insert(parts, string.pack(">f", val))  -- Big-endian float32
+        insert(parts, string.pack(">b", val))  -- Big-endian int8
         return 1
     end
     
@@ -253,7 +253,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_depth)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_uses)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.shot_count)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, 8 - ps.shot_count)
     for i = 1, 8 do
         num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.shot_positions[i])
     end

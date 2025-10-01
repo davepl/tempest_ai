@@ -266,13 +266,13 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
-                local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
+                local rel_dist = abs_to_rel_func(player_abs_segment, initial_target_seg_abs, is_open)
                 should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
@@ -433,35 +433,9 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                 if threat_abs_seg ~= INVALID_SEGMENT then
                     local threat_rel_seg = abs_to_rel_func(player_abs_seg, threat_abs_seg, is_open)
                     if math.abs(threat_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
-                        -- Always recommend firing at close threats
-                        should_fire = true
-
-                        -- Expert tweak: if shot buffer is full, still press FIRE but move one segment away
-                        -- Apply only for Flipper/Pulsar top-rail threats per design intent
-                        if player_state.shot_count >= 8 then
-                            local core_type = enemies_state.enemy_core_type[i]
-                            if core_type == ENEMY_TYPE_FLIPPER or core_type == ENEMY_TYPE_PULSAR then
-                                -- Move away by one segment opposite the threat direction.
-                                local move_right = (threat_rel_seg <= 0) -- threat at/aligned-left -> move right
-                                local candidate = -1
-                                if move_right then
-                                    if is_open then
-                                        if player_abs_seg < 15 then candidate = player_abs_seg + 1 end
-                                    else
-                                        candidate = (player_abs_seg + 1) % 16
-                                    end
-                                else
-                                    if is_open then
-                                        if player_abs_seg > 0 then candidate = player_abs_seg - 1 end
-                                    else
-                                        candidate = (player_abs_seg - 1 + 16) % 16
-                                    end
-                                end
-                                if candidate ~= -1 then
-                                    final_target_seg_abs = candidate
-                                    target_depth = 0 -- Depth not critical for lateral dodge
-                                end
-                            end
+                        -- Always recommend firing at close threats (unless out of ammo)
+                        if player_state.shot_count < 8 then
+                            should_fire = true
                         end
 
                         break -- Found a dangerous close threat, no need to check others
@@ -471,8 +445,10 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
         end
     end
 
-    -- Apply shot count override (happens last)
-    should_fire = should_fire or player_state.shot_count < 3
+    -- Apply shot count override (happens last, but never fire if out of ammo)
+    if player_state.shot_count < 8 then
+        should_fire = should_fire or player_state.shot_count < 3
+    end
 
     return final_target_seg_abs, target_depth, should_fire, should_zap
 end
