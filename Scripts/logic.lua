@@ -775,6 +775,16 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 end
             end
 
+            -- FIRING REWARD: Reward actual shot emission (only when shot is fired)
+            do
+                local fire_now = (player_state.fire_detected or 0)
+                local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
+                local shot_count = player_state.shot_count or 0
+                if fire_edge and shot_count < 8 then
+                    subj_reward = subj_reward + (4.0 / SCORE_UNIT) -- reward for successfully firing a shot (~20 pts)
+                end
+            end
+
             -- 7. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
             -- Apply a small penalty when spinning while already aligned (or no target)
             -- and not in immediate danger. Keeps behavior calm instead of fidgety.

@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.003                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    lr: float = 0.005                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
@@ -70,7 +70,7 @@ class RLConfigData:
     expert_ratio_min: float = 0.10        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
-    memory_size: int = 4000000           # Balanced buffer size (was 4000000)
+    memory_size: int = 12000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 7                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
