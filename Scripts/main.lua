@@ -7,9 +7,8 @@
 --]]
 
 -- Dynamically add the script's directory to the package path
-local script_path = debug.getinfo(1,"S").source:sub    for i = 1, 8 do
-        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, ps.shot_positions[i])
-    endocal script_dir = script_path:match("(.*[/\\])") or "./"
+local script_path = debug.getinfo(1,"S").source:sub(2)
+local script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = package.path .. ";" .. script_dir .. "?.lua"
 
 -- Require modules
@@ -279,9 +278,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, 8 - ps.shot_count)
     for i = 1, 8 do
-        local shot_pos_int = math.floor(ps.shot_positions[i] / 256)  -- Get integer part of 8.8 fixed point
-        local shot_pos_for_norm = (shot_pos_int == 0) and 0 or (shot_pos_int - 0x10)
-        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, shot_pos_for_norm)
+        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, ps.shot_positions[i])
     end
     for i = 1, 8 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i])
@@ -340,11 +337,9 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
     end
-    -- Enemy shot positions (4) - integer part only, offset by 0x10 like depths
+    -- Enemy shot positions (4) - fixed point values
     for i = 1, 4 do
-        local shot_pos_int = math.floor(es.shot_positions[i] / 256)  -- Get integer part of 8.8 fixed point
-        local shot_pos_for_norm = (shot_pos_int == 0) and 0 or (shot_pos_int - 0x10)
-        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, shot_pos_for_norm)
+        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, es.shot_positions[i])
     end
     -- Enemy shot segments (4) - relative values
     for i = 1, 4 do
