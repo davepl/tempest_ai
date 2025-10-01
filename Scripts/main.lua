@@ -213,8 +213,15 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         local val = validated / 255.0
         return push_float32(parts, val)
     end
-    
 
+    -- Normalize 8.8 fixed point values [0,255.996] to [0,1]
+    local function push_fixed_norm(parts, v)
+        local num = tonumber(v) or 0
+        local validated = assert_range(num, 0, 256, "fixed_8_8")  -- Allow up to 256
+        local val = validated / 256.0
+        return push_float32(parts, val)
+    end
+    
 
     -- Normalize relative segments with proper Tempest range handling
     local INVALID_SEGMENT = state_defs.INVALID_SEGMENT or -32768
@@ -267,7 +274,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, 8 - ps.shot_count)
     for i = 1, 8 do
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.shot_positions[i])
+        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, ps.shot_positions[i])
     end
     for i = 1, 8 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i])
@@ -325,9 +332,9 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
     end
-    -- Enemy shot positions (4) - natural values
+    -- Enemy shot positions (4) - fixed point values
     for i = 1, 4 do
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.shot_positions[i])
+        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, es.shot_positions[i])
     end
     -- Enemy shot segments (4) - relative values
     for i = 1, 4 do
