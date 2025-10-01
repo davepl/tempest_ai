@@ -785,9 +785,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 end
             end
 
-            -- 7. USELESS MOVEMENT PENALTY (Discourage random spinner when not needed)
-            -- Apply a small penalty when spinning while already aligned (or no target)
-            -- and not in immediate danger. Keeps behavior calm instead of fidgety.
+            -- 7. MOVEMENT INCENTIVE REWARD (Encourage active spinner control)
+            -- Add small bonus for appropriate spinner movement when not perfectly aligned
+            -- Helps prevent the AI from learning to stay completely still
             do
                 local spin_delta = math.abs(tonumber(player_state.spinner_detected or 0))
                 if spin_delta > 0 then
@@ -795,17 +795,19 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
                     local is_open2 = (level_state.level_type == 0xFF)
                     local need_move = false
+                    local distance_to_target = 0
                     if nearest_abs ~= -1 then
                         local rel = abs_to_rel_func(player_abs_seg2, nearest_abs, is_open2)
-                        need_move = math.abs(rel) > 1 -- require movement if more than one segment off
+                        distance_to_target = math.abs(rel)
+                        need_move = distance_to_target > 0 -- any misalignment needs movement
                     end
-                    local in_danger = M.is_danger_lane(player_abs_seg2, enemies_state)
-                    if not need_move and not in_danger then
-                        -- Scale a gentle penalty with movement magnitude, capped
+                    
+                    -- Give small bonus for movement when not perfectly aligned
+                    -- Scales with movement magnitude but capped to keep it subtle
+                    if need_move and distance_to_target > 0 then
                         local units = math.min(4, spin_delta)
-                        local move_penalty = -0.0002 * units
-                        -- subj_reward = subj_reward + move_penalty
-                        -- Attribute to proximity shaping bucket for metrics
+                        local movement_bonus = 0.0001 * units * (distance_to_target / 8.0) -- Scale by how far off target
+                        subj_reward = subj_reward + movement_bonus
                     end
                 end
             end
