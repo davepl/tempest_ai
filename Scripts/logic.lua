@@ -531,57 +531,20 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Firing policy
     -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within shooting distance (~0.8)
+    -- AND we have ammo available (shot_count < 8)
     local SHOOT_DIST = 0.80
     local lane_has_threat = M.check_segment_threat(player_abs_seg, enemies_state)
     local within_shooting_distance = (min_abs_rel_float <= SHOOT_DIST)
 
     local should_fire
-    if lane_has_threat or within_shooting_distance then
+    if shot_count >= 8 then
+        -- No ammo available, never fire
+        should_fire = false
+    elseif lane_has_threat or within_shooting_distance then
         should_fire = true
     else
         -- Keep only 3 shots onscreen
         should_fire = (shot_count < 3)
-    end
-
-    -- Expert tweak: When we would fire at a top-rail flipper/pulsar but the shot buffer is full (>=8),
-    -- still recommend FIRE and also MOVE AWAY by one segment opposite the nearest threat.
-    -- Applies only if there is at least one top-rail flipper/pulsar detected (right_exists/left_exists)
-    if should_fire and shot_count >= 8 and (right_exists or left_exists) then
-        -- Determine nearest side using fractional distances if available
-        local move_right -- boolean: true => move to player_abs_seg+1, false => -1
-        if right_exists and left_exists then
-            -- Choose the smaller fractional distance; fall back to integer distances if needed
-            local dR = nr_dist_float or nr_dist or 999
-            local dL = nl_dist_float or nl_dist or 999
-            -- If threat is closer/equal on left, move right; else move left
-            move_right = (dL <= dR)
-        elseif right_exists then
-            -- Threat only on the right -> move left
-            move_right = false
-        else -- left_exists only
-            -- Threat only on the left -> move right
-            move_right = true
-        end
-
-        -- Compute candidate adjacent segment respecting open/closed topology
-        local candidate = -1
-        if move_right then
-            if is_open then
-                if player_abs_seg < 15 then candidate = player_abs_seg + 1 end
-            else
-                candidate = (player_abs_seg + 1) % 16
-            end
-        else
-            if is_open then
-                if player_abs_seg > 0 then candidate = player_abs_seg - 1 end
-            else
-                candidate = (player_abs_seg - 1 + 16) % 16
-            end
-        end
-
-        if candidate ~= -1 then
-            target_seg = candidate
-        end
     end
 
     -- Superzap heuristic retained (3+ top-rail enemies)
