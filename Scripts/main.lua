@@ -246,6 +246,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     -- Maps: inactive enemies (0) → 0.063, collision depth (0) → 0.063, max depth (239+16=255) → 1.0
     local function push_depth_norm(parts, v)
         local num = tonumber(v) or 0
+        if num < 0 then num = 0 end
         local validated = assert_range(num, 0, 255, "depth")
         local val = validated / 255.0  
         return push_float32(parts, val)
