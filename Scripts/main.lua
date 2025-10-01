@@ -196,6 +196,12 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return 1
     end
     
+    -- Pack float32 value into binary parts
+    local function push_float32(parts, v)
+        table.insert(parts, string.pack("f", v))
+        return 1
+    end
+    
     -- Normalize natural 8-bit values [0,255] to [0,1]
     local function push_natural_norm(parts, v)
         local num = tonumber(v) or 0
