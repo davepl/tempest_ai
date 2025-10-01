@@ -173,7 +173,9 @@ RL_CONFIG = rl_config
 # Initialize devices (dual GPU setup: inference on GPU1, training on GPU0)
 if torch.cuda.is_available():
     # Check if both GPUs are available for dual GPU setup
-    if torch.cuda.device_count() >= 2:
+    if torch.cuda.device_count() >= 4    # In config.py
+    epsilon_min: float = 0.05  # Increase from 0.25 to allow some exploration
+    epsilon_end: float = 0.05  # Match the min value:
         training_device = torch.device("cuda:0")
         inference_device = torch.device("cuda:1")
         print(f"Using dual GPU setup: Training on {training_device}, Inference on {inference_device}")

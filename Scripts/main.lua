@@ -7,8 +7,9 @@
 --]]
 
 -- Dynamically add the script's directory to the package path
-local script_path = debug.getinfo(1,"S").source:sub(2)
-local script_dir = script_path:match("(.*[/\\])") or "./"
+local script_path = debug.getinfo(1,"S").source:sub    for i = 1, 8 do
+        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, ps.shot_positions[i])
+    endocal script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = package.path .. ";" .. script_dir .. "?.lua"
 
 -- Require modules
@@ -242,11 +243,13 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return push_float32(parts, val)
     end
     
-    -- Normalize unit float [0,1] (should already be normalized - assert if not)
-    local function push_unit_norm(parts, v)
+    -- Normalize offset depth values [-16, 239] to [0, 1] 
+    -- Maps: inactive enemies (0) → 0.063, collision depth (0) → 0.063, max depth (239+16=255) → 1.0
+    local function push_depth_norm(parts, v)
         local num = tonumber(v) or 0
-        local validated = assert_range(num, 0.0, 1.0, "unit_float")
-        return push_float32(parts, validated)
+        local validated = assert_range(num, 0, 255, "depth")
+        local val = validated / 255.0  
+        return push_float32(parts, val)
     end
 
     local binary_data_parts = {}
@@ -269,12 +272,16 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.position)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.alive)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_state)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_depth)
+    -- Player depth: offset by 0x10
+    local player_depth_for_norm = ps.player_depth - 0x10
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, player_depth_for_norm)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_uses)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, 8 - ps.shot_count)
     for i = 1, 8 do
-        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, ps.shot_positions[i])
+        local shot_pos_int = math.floor(ps.shot_positions[i] / 256)  -- Get integer part of 8.8 fixed point
+        local shot_pos_for_norm = (shot_pos_int == 0) and 0 or (shot_pos_int - 0x10)
+        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, shot_pos_for_norm)
     end
     for i = 1, 8 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i])
@@ -323,18 +330,21 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i])
     end
-    -- Enemy depths (7) - natural values
+    -- Enemy depths (7) - push 0 if inactive (depth=0), otherwise offset by 0x10
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_depths[i])
+        local enemy_depth_for_norm = (es.enemy_depths[i] == 0) and 0 or (es.enemy_depths[i] - 0x10)
+        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, enemy_depth_for_norm)
     end
-    -- Top Enemy Segments (7) - relative values
+    -- Top Enemy Segments (7) - relative values (enemies at collision depth 0x10)
     for i = 1, 7 do
         local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
     end
-    -- Enemy shot positions (4) - fixed point values
+    -- Enemy shot positions (4) - integer part only, offset by 0x10 like depths
     for i = 1, 4 do
-        num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, es.shot_positions[i])
+        local shot_pos_int = math.floor(es.shot_positions[i] / 256)  -- Get integer part of 8.8 fixed point
+        local shot_pos_for_norm = (shot_pos_int == 0) and 0 or (shot_pos_int - 0x10)
+        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, shot_pos_for_norm)
     end
     -- Enemy shot segments (4) - relative values
     for i = 1, 4 do

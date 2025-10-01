@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.005                    # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    lr: float = 0.01                      # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
@@ -70,9 +70,9 @@ class RLConfigData:
     expert_ratio_min: float = 0.10        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
-    memory_size: int = 12000000           # Balanced buffer size (was 4000000)
+    memory_size: int = 2000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 7                  
+    num_layers: int = 6                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
@@ -89,8 +89,8 @@ class RLConfigData:
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
     # Phase 1 Optimization: More frequent updates for faster convergence
-    training_steps_per_sample: int = 8    # Increased from 12 for better sample efficiency
-    training_workers: int = 4             # Reverted to 1 - multi-threaded training causes autograd conflicts
+    training_steps_per_sample: int = 8    # Reduced from 8 to 2 to prevent queue overflow
+    training_workers: int = 4             # Increased from 8 to 16 for better queue processing
     use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
     tau: float = 0.012                    # Slight bump for more responsive soft target tracking
@@ -103,7 +103,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 3
+    n_step: int = 7
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
