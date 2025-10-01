@@ -273,7 +273,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.alive)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_state)
     -- Player depth: offset by 0x10
-    local player_depth_for_norm = ps.player_depth - 0x10
+    local player_depth_for_norm = (ps.player_depth == 0) and 0 or (ps.player_depth - 0x10)
     num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, player_depth_for_norm)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_uses)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
