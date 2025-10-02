@@ -322,9 +322,10 @@ def display_metrics_row(agent, kb_handler):
             steps_per_sec = steps_int / elapsed
         else:
             steps_per_sec = float(steps_int)
-        # Samples/s reflects batch_size * Steps/s; this makes batch size changes visible
+        # Samples/s reflects batch_size * gradient_accumulation_steps * Steps/s
         try:
-            samples_per_sec = steps_per_sec * float(RL_CONFIG.batch_size)
+            grad_accum = float(getattr(RL_CONFIG, 'gradient_accumulation_steps', 1) or 1)
+            samples_per_sec = steps_per_sec * float(RL_CONFIG.batch_size) * grad_accum
         except Exception:
             samples_per_sec = 0.0
         # Interval Steps/1kF using the same interval counts

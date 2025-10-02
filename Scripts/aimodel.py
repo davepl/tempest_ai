@@ -47,6 +47,7 @@ import subprocess
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Deque
+from contextlib import contextmanager
 import numpy as np
 import torch
 import torch.nn as nn
@@ -110,6 +111,67 @@ from config import (
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
+
+
+class ReadWriteLock:
+    """A read/write lock allowing multiple concurrent readers or one exclusive writer.
+    
+    This enables parallel forward passes (reads) while serializing backward passes
+    and optimizer updates (writes) for thread safety and potential training speedup.
+    """
+    def __init__(self):
+        self._readers = 0
+        self._writers = 0
+        self._lock = threading.Lock()
+        self._can_read = threading.Condition(self._lock)
+        self._can_write = threading.Condition(self._lock)
+    
+    def acquire_read(self):
+        """Acquire read lock - blocks if writer is active."""
+        with self._lock:
+            while self._writers > 0:
+                self._can_read.wait()
+            self._readers += 1
+    
+    def release_read(self):
+        """Release read lock - wakes waiting writers if last reader."""
+        with self._lock:
+            self._readers -= 1
+            if self._readers == 0:
+                self._can_write.notify_all()
+    
+    def acquire_write(self):
+        """Acquire write lock - blocks until no readers or writers."""
+        with self._lock:
+            while self._writers > 0 or self._readers > 0:
+                self._can_write.wait()
+            self._writers += 1
+    
+    def release_write(self):
+        """Release write lock - wakes all waiting readers and writers."""
+        with self._lock:
+            self._writers -= 1
+            self._can_write.notify_all()
+            self._can_read.notify_all()
+    
+    @contextmanager
+    def read_lock(self):
+        """Context manager for read lock."""
+        self.acquire_read()
+        try:
+            yield
+        finally:
+            self.release_read()
+    
+    @contextmanager
+    def write_lock(self):
+        """Context manager for write lock."""
+        self.acquire_write()
+        try:
+            yield
+        finally:
+            self.release_write()
+
 
 # Global flag to track if running interactively
 # Check this early before any potential tty interaction
@@ -1028,8 +1090,9 @@ class HybridDQNAgent:
         # Background training worker(s)
         self.running = True
         self.num_training_workers = int(getattr(RL_CONFIG, 'training_workers', 1) or 1)
-        # Serialize optimizer updates across threads to avoid race conditions
-        self.training_lock = threading.Lock()
+        # Use R/W lock: multiple workers can do forward passes concurrently (read),
+        # but backward + optimizer step are serialized (write)
+        self.model_rwlock = ReadWriteLock()
         self.training_threads = []
         for i in range(self.num_training_workers):
             t = threading.Thread(target=self.background_train, daemon=True, name=f"HybridTrainWorker-{i}")
@@ -1214,15 +1277,15 @@ class HybridDQNAgent:
 
         # Keep track of loss for telemetry
         total_loss_value = 0.0
+        
+        # Accumulate losses and gradients outside write lock
+        accumulated_losses = []
+        preclip_grad_norm = 0.0
+        postclip_grad_norm = 0.0
 
-        # Perform accumulation and optimizer step atomically for thread safety
-        with self.training_lock:
-            # Zero gradients before accumulation
-            self.optimizer.zero_grad(set_to_none=True)
-
-            preclip_grad_norm = 0.0
-            postclip_grad_norm = 0.0
-
+        # === PHASE 1: READ LOCK - parallel forward passes allowed ===
+        # Multiple workers can execute this concurrently
+        with self.model_rwlock.read_lock():
             for acc_idx in range(grad_accum_steps):
                 # Sample micro-batch (handle both PER and standard replay)
                 if self.use_per:
@@ -1334,9 +1397,19 @@ class HybridDQNAgent:
                         td_errors = torch.abs(discrete_q_selected - discrete_targets)
                         self.memory.update_priorities(indices, td_errors)
 
+                # Store loss for telemetry and backward pass
                 total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
-
-                # Backward accumulate
+                accumulated_losses.append(micro_total)
+        # === END READ LOCK - forward computation done ===
+        
+        # === PHASE 2: WRITE LOCK - exclusive access for backward + optimizer ===
+        # Only one worker at a time can execute this section
+        with self.model_rwlock.write_lock():
+            # Zero gradients before accumulation
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            # Backward accumulate all micro-batches
+            for micro_total in accumulated_losses:
                 if use_amp and scaler is not None:
                     scaler.scale(micro_total).backward()
                 else:
@@ -1390,6 +1463,7 @@ class HybridDQNAgent:
                 scaler.update()
             else:
                 self.optimizer.step()
+        # === END WRITE LOCK - weights updated ===
 
         # LR scheduling (frame-based)
         try:
@@ -1447,29 +1521,31 @@ class HybridDQNAgent:
         except Exception:
             pass
 
-        # Soft target update
-        if getattr(RL_CONFIG, 'use_soft_target', True):
-            tau = getattr(RL_CONFIG, 'tau', 0.005)
-            for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
-                target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
-            # Telemetry for target updates (soft)
-            try:
-                metrics.last_target_update_frame = metrics.frame_count
-                metrics.last_target_update_time = time.time()
-            except Exception:
-                pass
-        
-        # Hard target update
-        elif self.training_steps % RL_CONFIG.target_update_freq == 0:
-            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-            # Telemetry for hard target updates
-            try:
-                metrics.last_target_update_frame = metrics.frame_count
-                metrics.last_target_update_time = time.time()
-                metrics.last_hard_target_update_frame = metrics.frame_count
-                metrics.last_hard_target_update_time = time.time()
-            except Exception:
-                pass
+        # Target network updates (protected by write lock)
+        with self.model_rwlock.write_lock():
+            # Soft target update
+            if getattr(RL_CONFIG, 'use_soft_target', True):
+                tau = getattr(RL_CONFIG, 'tau', 0.005)
+                for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
+                    target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+                # Telemetry for target updates (soft)
+                try:
+                    metrics.last_target_update_frame = metrics.frame_count
+                    metrics.last_target_update_time = time.time()
+                except Exception:
+                    pass
+            
+            # Hard target update
+            elif self.training_steps % RL_CONFIG.target_update_freq == 0:
+                self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+                # Telemetry for hard target updates
+                try:
+                    metrics.last_target_update_frame = metrics.frame_count
+                    metrics.last_target_update_time = time.time()
+                    metrics.last_hard_target_update_frame = metrics.frame_count
+                    metrics.last_hard_target_update_time = time.time()
+                except Exception:
+                    pass
         
         # Sync inference network
         if inference_device != training_device and self.training_steps % 100 == 0:
@@ -1541,12 +1617,14 @@ class HybridDQNAgent:
         did_copy = False
         try:
             if hasattr(self, 'qnetwork_inference') and self.qnetwork_inference is not self.qnetwork_local:
-                with torch.no_grad():
-                    state = {}
-                    for k, p in self.qnetwork_local.state_dict().items():
-                        state[k] = p.to(self.inference_device)
-                    self.qnetwork_inference.load_state_dict(state)
-                did_copy = True
+                # Use read lock to ensure we don't copy mid-optimizer-step
+                with self.model_rwlock.read_lock():
+                    with torch.no_grad():
+                        state = {}
+                        for k, p in self.qnetwork_local.state_dict().items():
+                            state[k] = p.to(self.inference_device)
+                        self.qnetwork_inference.load_state_dict(state)
+                    did_copy = True
         finally:
             try:
                 metrics.last_inference_sync_frame = metrics.frame_count
@@ -1569,7 +1647,8 @@ class HybridDQNAgent:
 
     def update_target_network(self):
         """Hard update target network from local and record telemetry."""
-        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        with self.model_rwlock.write_lock():
+            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
         try:
             metrics.last_target_update_frame = metrics.frame_count
             metrics.last_target_update_time = time.time()

@@ -53,8 +53,8 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.003                     # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
-    gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
+    lr: float = 0.001                     # STABILITY FIX: Reduced from 0.003 to prevent Q-value divergence
+    gradient_accumulation_steps: int = 4  # STABILITY FIX: Increased from 1 to smooth gradients
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
     epsilon_start: float = 0.25           # Start at 0.20 on next run
@@ -93,7 +93,7 @@ class RLConfigData:
     training_workers: int = 4             # Increased from 8 to 16 for better queue processing
     use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
     use_soft_target: bool = True          # Enable soft target updates for stability
-    tau: float = 0.012                    # Slight bump for more responsive soft target tracking
+    tau: float = 0.005                    # STABILITY FIX: Reduced from 0.012 for slower, more stable target tracking
     # Optional hard refresh of target net even when using soft updates
     hard_target_refresh_every_steps: int = 25000  # Slightly faster hard refresh cadence to re-anchor periodically
     # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
@@ -103,7 +103,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 8
+    n_step: int = 5  # STABILITY FIX: Reduced from 8 back to 5 to reduce error amplification
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
