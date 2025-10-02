@@ -60,10 +60,16 @@ class SocketServer:
         """Decide whether this server should perform n-step preprocessing.
 
         Rules:
+        - If agent.n_step_enabled is False: no n-step (respects hotkey toggle).
         - If RL_CONFIG.n_step <= 1: no server-side n-step.
         - If the agent already exposes its own n_step_buffer (non-None), let the agent handle n-step.
         - Otherwise, perform server-side n-step (typical for HybridDQNAgent).
         """
+        # Check agent's runtime toggle first (allows hotkey 'n' to work)
+        if self.agent and hasattr(self.agent, 'n_step_enabled'):
+            if not getattr(self.agent, 'n_step_enabled', True):
+                return False
+        
         try:
             n = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
         except Exception:
@@ -268,13 +274,26 @@ class SocketServer:
                 # N-step experience processing (server-side only when enabled) or direct 1-step fallback
                 if state.get('last_state') is not None and state.get('last_action_hybrid') is not None:
                     da, ca = state['last_action_hybrid']
+                    
+                    # Calculate diversity bonus if enabled
+                    diversity_bonus = 0.0
+                    if self.agent and hasattr(self.agent, 'calculate_diversity_bonus'):
+                        try:
+                            diversity_bonus = self.agent.calculate_diversity_bonus(
+                                state['last_state'], da, ca
+                            )
+                        except Exception:
+                            pass
+                    
+                    # Add diversity bonus to reward
+                    total_reward = float(frame.reward) + diversity_bonus
 
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
                             int(da),
-                            frame.reward,
+                            total_reward,  # Use reward with diversity bonus
                             frame.state,
                             frame.done,
                             aux_action=float(ca)
@@ -299,11 +318,11 @@ class SocketServer:
                         try:
                             if self.agent:
                                 # Hybrid agents expect (state, discrete, continuous, reward, next_state, done)
-                                self.agent.step(state['last_state'], int(da), float(ca), float(frame.reward), frame.state, bool(frame.done))
+                                self.agent.step(state['last_state'], int(da), float(ca), total_reward, frame.state, bool(frame.done))
                         except TypeError:
                             # Fallback for agents without continuous action in signature
                             try:
-                                self.agent.step(state['last_state'], int(da), float(frame.reward), frame.state, bool(frame.done))
+                                self.agent.step(state['last_state'], int(da), total_reward, frame.state, bool(frame.done))
                             except Exception:
                                 pass
 

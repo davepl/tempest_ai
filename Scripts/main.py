@@ -116,6 +116,30 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == '6':
                     metrics.increase_epsilon(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
+                elif key == 'l':
+                    metrics.decrease_learning_rate(keyboard_handler, agent)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == 'L':
+                    metrics.increase_learning_rate(keyboard_handler, agent)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == 'n':
+                    # Toggle n-step learning
+                    try:
+                        if hasattr(agent, 'set_n_step_enabled'):
+                            current = getattr(agent, 'n_step_enabled', True)
+                            agent.set_n_step_enabled(not current)
+                            display_metrics_row(agent, keyboard_handler)
+                    except Exception as e:
+                        print(f"Error toggling n-step learning: {e}")
+                elif key == 'd':
+                    # Toggle diversity bonus
+                    try:
+                        if hasattr(agent, 'set_diversity_bonus_enabled'):
+                            current = getattr(agent, 'diversity_bonus_enabled', True)
+                            agent.set_diversity_bonus_enabled(not current)
+                            display_metrics_row(agent, keyboard_handler)
+                    except Exception as e:
+                        print(f"Error toggling diversity bonus: {e}")
             
             time.sleep(0.1)
         except Exception as e:

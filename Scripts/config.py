@@ -53,7 +53,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.01                      # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
+    lr: float = 0.003                     # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
     gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
@@ -70,7 +70,7 @@ class RLConfigData:
     expert_ratio_min: float = 0.10        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
-    memory_size: int = 2000000           # Balanced buffer size (was 4000000)
+    memory_size: int = 5000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 6                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
@@ -85,7 +85,7 @@ class RLConfigData:
     per_beta_end: float = 1.0             # Final importance sampling correction exponent
     per_beta_decay_steps: int = 1000000   # Steps to linearly anneal beta from start to end
     per_eps: float = 1e-6                 # Small constant to prevent zero priorities
-    
+      
     # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
     use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
     # Phase 1 Optimization: More frequent updates for faster convergence
@@ -103,7 +103,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 7
+    n_step: int = 5
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
@@ -148,6 +148,11 @@ class RLConfigData:
 
     # Subjective reward scaling (for movement/aiming rewards)
     subj_reward_scale: float = 0.35       # Scale factor applied to subjective rewards from OOB
+    
+    # N-step returns: runtime toggle and diversity bonus settings
+    n_step_enabled: bool = True           # Runtime toggle for n-step returns (hotkey 'n')
+    diversity_bonus_enabled: bool = True  # Reward trying different actions in similar states (hotkey 'd')
+    diversity_bonus_weight: float = 0.5   # Base reward bonus for novel actions (decays with 1/sqrt(n))
 
     # Optional gradient value clamp (0.0 disables)
     max_grad_value: float = 0.0
@@ -371,6 +376,13 @@ class MetricsData:
         with self.lock:
             return self.expert_ratio
     
+    def get_effective_expert_ratio(self):
+        """Get the effective expert ratio used for decisions (0.0 when override is ON)"""
+        with self.lock:
+            if self.override_expert:
+                return 0.0
+            return self.expert_ratio
+    
     def is_override_active(self):
         """Check if override is active"""
         with self.lock:
@@ -567,6 +579,36 @@ class MetricsData:
             if kb_handler and IS_INTERACTIVE:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nEpsilon: {self.epsilon:.3f} (natural decay)\r")
+    
+    def increase_learning_rate(self, kb_handler=None, agent=None):
+        """Increase learning rate by 0.0005 (L key)"""
+        with self.lock:
+            RL_CONFIG.lr += 0.0005
+            # Apply to agent's optimizer if available
+            if agent:
+                try:
+                    for param_group in agent.optimizer.param_groups:
+                        param_group['lr'] = RL_CONFIG.lr
+                except Exception:
+                    pass
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nLearning Rate: {RL_CONFIG.lr:.5f}\r")
+    
+    def decrease_learning_rate(self, kb_handler=None, agent=None):
+        """Decrease learning rate by 0.0005, floor at 0.0001 (l key)"""
+        with self.lock:
+            RL_CONFIG.lr = max(0.0001, RL_CONFIG.lr - 0.0005)
+            # Apply to agent's optimizer if available
+            if agent:
+                try:
+                    for param_group in agent.optimizer.param_groups:
+                        param_group['lr'] = RL_CONFIG.lr
+                except Exception:
+                    pass
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nLearning Rate: {RL_CONFIG.lr:.5f}\r")
 
 # Define hybrid action space
 # Discrete fire/zap combinations (4 total)

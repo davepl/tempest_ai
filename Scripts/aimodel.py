@@ -1041,6 +1041,15 @@ class HybridDQNAgent:
         self._sync_thread = threading.Thread(target=self._inference_sync_heartbeat, daemon=True, name="HybridInferenceSyncHeartbeat")
         self._sync_thread.start()
         
+        # Action diversity tracking for better exploration
+        self.action_history = {}  # Track action diversity per state cluster
+        self.diversity_bonus_enabled = getattr(RL_CONFIG, 'diversity_bonus_enabled', True)
+        self.diversity_bonus_weight = getattr(RL_CONFIG, 'diversity_bonus_weight', 0.5)
+        
+        # N-step learning (uses RL_CONFIG.n_step for the actual n value)
+        self.n_step_enabled = getattr(RL_CONFIG, 'n_step_enabled', True)
+        self.n_step = getattr(RL_CONFIG, 'n_step', 5)
+        
     def act(self, state, epsilon=0.0, add_noise=True):
         """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
         
@@ -1069,6 +1078,61 @@ class HybridDQNAgent:
             continuous_action = np.clip(continuous_action + noise, -0.9, 0.9)
         
         return int(discrete_action), float(continuous_action)
+    
+    def calculate_diversity_bonus(self, state, discrete_action, continuous_action):
+        """Reward trying different actions in similar states
+        
+        This encourages exploration of counterfactual actions to discover
+        improvements beyond expert behavior. The bonus decays as more actions
+        are tried in a given state region.
+        
+        Args:
+            state: numpy array of state features
+            discrete_action: int (0-3) for fire/zap combination
+            continuous_action: float for spinner value
+            
+        Returns:
+            float: bonus reward for action diversity
+        """
+        if not self.diversity_bonus_enabled:
+            return 0.0
+        
+        try:
+            # Simple state clustering by rounding key features
+            # Use first 20 dimensions (player state + nearby enemies)
+            state_key = tuple(np.round(state[:min(20, len(state))], 1))
+            
+            if state_key not in self.action_history:
+                self.action_history[state_key] = set()
+            
+            # Discretize continuous action for tracking (round to 0.1)
+            continuous_rounded = round(float(continuous_action), 1)
+            action_taken = (int(discrete_action), continuous_rounded)
+            
+            if action_taken not in self.action_history[state_key]:
+                self.action_history[state_key].add(action_taken)
+                
+                # Bonus decays as we try more actions in this state (1/sqrt(n))
+                num_tried = len(self.action_history[state_key])
+                bonus = self.diversity_bonus_weight / np.sqrt(num_tried)
+                return float(bonus)
+        except Exception as e:
+            # Silently fail on errors to not disrupt training
+            pass
+        
+        return 0.0
+    
+    def set_diversity_bonus_enabled(self, enabled):
+        """Enable/disable diversity bonus"""
+        self.diversity_bonus_enabled = bool(enabled)
+        status = "enabled" if self.diversity_bonus_enabled else "disabled"
+        print(f"Action diversity bonus {status}")
+    
+    def set_n_step_enabled(self, enabled):
+        """Enable/disable n-step learning"""
+        self.n_step_enabled = bool(enabled)
+        status = "enabled" if self.n_step_enabled else "disabled"
+        print(f"N-step learning {status}")
     
     def step(self, state, discrete_action, continuous_action, reward, next_state, done):
         """Add experience to memory and queue training"""
@@ -2314,6 +2378,9 @@ def decay_expert_ratio(current_step):
         for _ in range(steps_to_apply):
             metrics.expert_ratio *= RL_CONFIG.expert_ratio_decay
         metrics.last_decay_step = step_interval
+    
+    # Enforce minimum floor to maintain exploration diversity and safety baseline
+    metrics.expert_ratio = max(metrics.expert_ratio, RL_CONFIG.expert_ratio_min)
 
     return metrics.expert_ratio
 

@@ -374,10 +374,16 @@ def display_metrics_row(agent, kb_handler):
         effective_eps = metrics.get_effective_epsilon()
     except Exception:
         effective_eps = metrics.epsilon
+    
+    # Show effective expert ratio (0.00 when override is ON, actual ratio otherwise)
+    try:
+        effective_expert = metrics.get_effective_expert_ratio()
+    except Exception:
+        effective_expert = metrics.expert_ratio
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
-    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
+    f"{effective_expert*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{'ON' if metrics.override_expert else 'OFF':>3} "
         f"{'ON' if metrics.expert_mode else 'OFF':>6} "
