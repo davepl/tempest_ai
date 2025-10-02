@@ -149,6 +149,38 @@ def _compute_dqn1m_window_stats():
     avg = wy_sum / w_sum if w_sum > 0 else 0.0
     return avg
 
+def _compute_reward_slope():
+    """Compute linear regression slope of total episode rewards history.
+    
+    Returns slope scaled to show change per 20 episodes (matching deque maxlen).
+    """
+    try:
+        rewards = list(metrics.episode_rewards) if metrics.episode_rewards else []
+        n = len(rewards)
+        if n < 2:
+            return 0.0
+        
+        # Simple linear regression: y = mx + b
+        x = np.arange(n, dtype=np.float64)
+        y = np.array(rewards, dtype=np.float64)
+        
+        # Calculate slope using least squares
+        x_mean = np.mean(x)
+        y_mean = np.mean(y)
+        
+        numerator = np.sum((x - x_mean) * (y - y_mean))
+        denominator = np.sum((x - x_mean) ** 2)
+        
+        if denominator == 0:
+            return 0.0
+        
+        slope = numerator / denominator
+        # Scale to show change per 20 episodes for interpretability
+        slope_per_20 = slope * 20.0
+        return slope_per_20
+    except Exception:
+        return 0.0
+
 def clear_screen():
     """Clear the screen and move cursor to home position"""
     if IS_INTERACTIVE:
@@ -184,8 +216,8 @@ def display_metrics_header():
     # Header with Q-Value Range moved before Training Stats, reward components removed
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
-        f"{'Rwrd':>6} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
-        f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
+        f"{'Rwrd':>6} {'RwdSlope':>9} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
+        f"{'Clnt':>4} {'Levl':>5} "
         f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
     
@@ -380,14 +412,20 @@ def display_metrics_row(agent, kb_handler):
         effective_expert = metrics.get_effective_expert_ratio()
     except Exception:
         effective_expert = metrics.expert_ratio
+    
+    # Compute reward slope
+    reward_slope = _compute_reward_slope()
+    
+    # Format epsilon column: show "OVR" if epsilon override is ON, otherwise show value
+    epsilon_str = "   OVR" if metrics.override_epsilon else f"{effective_eps:>6.2f}"
+    
+    # Format expert column: show "OVR" if expert override is ON, otherwise show percentage
+    expert_str = "   OVR" if metrics.override_expert else f"{effective_expert*100:>5.1f}%"
 
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
-    f"{effective_expert*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
-    f"{metrics.client_count:04d} {display_level:>5.1f} "
-        f"{'ON' if metrics.override_expert else 'OFF':>3} "
-        f"{'ON' if metrics.expert_mode else 'OFF':>6} "
-        f"{'ON' if metrics.training_enabled else 'OFF':>5} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {epsilon_str} "
+        f"{expert_str} {mean_reward:>6.2f} {reward_slope:>9.3f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
+        f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{avg_inference_time_ms:>7.2f} "
         f"{samples_per_sec:>8.0f} "
         f"{steps_per_sec:>8.1f} "

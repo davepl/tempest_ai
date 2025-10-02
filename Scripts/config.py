@@ -79,7 +79,7 @@ class RLConfigData:
     use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
     
     # Prioritized Experience Replay (PER) settings
-    use_per: bool = True                  # Enable Prioritized Experience Replay for better sample efficiency
+    use_per: bool = False                  # Enable Prioritized Experience Replay for better sample efficiency
     per_alpha: float = 0.6                # Prioritization exponent (0=uniform, 1=fully prioritized)
     per_beta_start: float = 0.4           # Initial importance sampling correction exponent
     per_beta_end: float = 1.0             # Final importance sampling correction exponent
@@ -103,7 +103,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 5
+    n_step: int = 8
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
