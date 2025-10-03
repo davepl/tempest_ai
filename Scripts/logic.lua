@@ -717,9 +717,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                             local progress = previous_distance - current_distance
                             -- Scale small progress reward so it remains below score/death signals
                             positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
-                        -- Small penalty for moving away from target or not moving when needed
+                        -- Penalty for moving away from target
+                        elseif current_distance > previous_distance then
+                            local regression = current_distance - previous_distance
+                            -- Scale penalty similar to reward
+                            positioning_reward = -0.5 * (regression / 8.0) * (10.0 / SCORE_UNIT)
+                        -- Penalty for not moving when misaligned
                         elseif current_distance > 0 then
-                            -- Penalties removed for moving away or not moving
+                            positioning_reward = -0.1 * (10.0 / SCORE_UNIT)  -- Small penalty for stagnation
                         end
                         
                         -- Apply level-specific scaling
@@ -802,7 +807,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     -- Penalize movement when not needed (aligned or no enemies)
                     if not need_move then
                         local units = math.min(4, spin_delta)
-                        local useless_penalty = -0.0001 * units  -- Small penalty for useless movement
+                        local useless_penalty = -0.001 * units  -- Increased penalty for useless movement
                         subj_reward = subj_reward + useless_penalty
                     end
                 end
