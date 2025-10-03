@@ -228,7 +228,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     local function push_relative_norm(parts, v)
         local num = tonumber(v) or 0
         if num == INVALID_SEGMENT then
-            return push_float32(parts, -1.0)  -- INVALID sentinel
+            return push_float32(parts, 0.0)  -- INVALID sentinel (center position)
         end
         -- Assert actual Tempest range and normalize to [-1,+1]
         local validated = assert_range(num, -15, 15, "relative_segment")
@@ -368,11 +368,11 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     if gs.frame_counter < 5 then
         print(string.format("[DEBUG] Frame %d: Nearest enemy seg=%.3f, Player shot segs=[%.3f,%.3f,%.3f,%.3f]",
             gs.frame_counter,
-            (es.nearest_enemy_seg == INVALID_SEGMENT) and -1.0 or (es.nearest_enemy_seg / 15.0),
-            (ps.shot_segments[1] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[1] / 15.0),
-            (ps.shot_segments[2] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[2] / 15.0),
-            (ps.shot_segments[3] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[3] / 15.0),
-            (ps.shot_segments[4] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[4] / 15.0)
+            (es.nearest_enemy_seg == INVALID_SEGMENT) and 0.0 or (es.nearest_enemy_seg / 15.0),
+            (ps.shot_segments[1] == INVALID_SEGMENT) and 0.0 or (ps.shot_segments[1] / 15.0),
+            (ps.shot_segments[2] == INVALID_SEGMENT) and 0.0 or (ps.shot_segments[2] / 15.0),
+            (ps.shot_segments[3] == INVALID_SEGMENT) and 0.0 or (ps.shot_segments[3] / 15.0),
+            (ps.shot_segments[4] == INVALID_SEGMENT) and 0.0 or (ps.shot_segments[4] / 15.0)
         ))
     end
 

@@ -399,6 +399,10 @@ class SocketServer:
                     expert_ratio = self.metrics.get_expert_ratio()
                     if frame.gamestate == 0x20:  # GS_ZoomingDown
                         expert_ratio *= 2
+                    # Force expert when no enemies to hunt (ensures stationary behavior)
+                    force_expert_no_enemies = (frame.enemy_seg == -1)
+                    if force_expert_no_enemies:
+                        expert_ratio = 1.0
                     use_expert = (random.random() < expert_ratio) and (not self.metrics.is_override_active())
 
                     if use_expert:

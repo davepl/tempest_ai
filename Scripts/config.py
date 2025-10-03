@@ -231,7 +231,7 @@ class MetricsData:
     state_std: float = 0.0
     state_min: float = 0.0
     state_max: float = 0.0
-    state_invalid_frac: float = 0.0  # Fraction of entries equal to -1.0 (our invalid sentinel)
+    state_invalid_frac: float = 0.0  # Fraction of entries equal to 0.0 (our invalid sentinel)
     # Level averaging since last metrics print (0-based levels)
     level_sum_interval: float = 0.0
     level_count_interval: int = 0
@@ -622,17 +622,17 @@ FIRE_ZAP_MAPPING = {
 # 9-action discrete spinner mapping (EXACT values aligned with game's /32 encoding)
 # Game encodes spinner as int(round(value * 32)), so we use exact multiples of 1/32
 # to ensure perfect round-trip: value → game_int → value
-# CRITICAL: Action 0 = center (no movement) so default/untrained network doesn't spin wildly
+
 SPINNER_MAPPING = {
     0: 0.0,
-    1: -18/64,
-    2: -9/64,
-    3: -4/64,
-    4: -2/64,
-    5: 2/64,
-    6: 4/64,
-    7: 9/64,
-    8: 18/64,
+    1: -0.9,
+    2: -0.6,
+    3: -0.3,
+    4: -0.1,
+    5:  0.1,
+    6:  0.3,
+    7:  0.6,
+    8:  0.9
 }
 
 # Reverse mapping for quantizing expert actions to discrete spinner actions
