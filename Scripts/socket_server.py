@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Socket server for Tempest AI (hybrid-only).
-Bridges Lua frames to a HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner).
+Socket server for Tempest AI (discrete-only).
+Bridges Lua frames to a HybridDQNAgent (4 discrete fire/zap + 9 discrete spinner).
 """
 
 # Prevent direct execution
@@ -31,7 +31,7 @@ from aimodel import (
     SafeMetrics,
 )
 from nstep_buffer import NStepReplayBuffer
-from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
+from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH, SPINNER_MAPPING, quantize_spinner_action
 
 
 class SocketServer:
@@ -167,7 +167,7 @@ class SocketServer:
                 'prev_frame': None,
                 'current_frame': None,
                 'last_state': None,
-                'last_action_hybrid': None,  # (discrete, continuous)
+                'last_action_hybrid': None,  # (discrete, discrete)
                 'last_action_source': None,
                 'total_reward': 0.0,
                 'episode_dqn_reward': 0.0,
@@ -273,14 +273,16 @@ class SocketServer:
 
                 # N-step experience processing (server-side only when enabled) or direct 1-step fallback
                 if state.get('last_state') is not None and state.get('last_action_hybrid') is not None:
-                    da, ca = state['last_action_hybrid']
+                    # CRITICAL FIX: Unpack discrete actions (both int)
+                    firezap_action, spinner_action = state['last_action_hybrid']
                     
-                    # Calculate diversity bonus if enabled
+                    # Calculate diversity bonus if enabled (uses discrete spinner action)
                     diversity_bonus = 0.0
                     if self.agent and hasattr(self.agent, 'calculate_diversity_bonus'):
                         try:
+                            spinner_value = SPINNER_MAPPING[spinner_action]  # Map discrete action to continuous value for diversity tracking
                             diversity_bonus = self.agent.calculate_diversity_bonus(
-                                state['last_state'], da, ca
+                                state['last_state'], firezap_action, spinner_value
                             )
                         except Exception:
                             pass
@@ -289,14 +291,14 @@ class SocketServer:
                     total_reward = float(frame.reward) + diversity_bonus
 
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
-                        # Add experience to n-step buffer and get matured experiences
+                        # CRITICAL FIX: Add discrete actions to n-step buffer
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
-                            int(da),
+                            int(firezap_action),
                             total_reward,  # Use reward with diversity bonus
                             frame.state,
                             frame.done,
-                            aux_action=float(ca)
+                            aux_action=int(spinner_action)  # Discrete spinner action
                         )
 
                         # Push all matured experiences to agent
@@ -305,24 +307,26 @@ class SocketServer:
                                 try:
                                     # Handle both shapes depending on store_aux_action flag
                                     if len(item) == 6:
-                                        exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done = item
-                                        self.agent.step(exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done)
+                                        exp_state, exp_firezap, exp_spinner, exp_reward, exp_next_state, exp_done = item
+                                        self.agent.step(exp_state, exp_firezap, exp_spinner, exp_reward, exp_next_state, exp_done)
                                     else:
+                                        # Legacy 5-tuple format (shouldn't happen with aux_action enabled)
                                         exp_state, exp_action, exp_reward, exp_next_state, exp_done = item
-                                        # For legacy agents without continuous action
-                                        self.agent.step(exp_state, exp_action, exp_reward, exp_next_state, exp_done)
+                                        # Assume spinner action = 4 (center) for legacy compatibility
+                                        self.agent.step(exp_state, exp_action, 4, exp_reward, exp_next_state, exp_done)
                                 except TypeError:
                                     pass
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
                         try:
                             if self.agent:
-                                # Hybrid agents expect (state, discrete, continuous, reward, next_state, done)
-                                self.agent.step(state['last_state'], int(da), float(ca), total_reward, frame.state, bool(frame.done))
+                                # CRITICAL FIX: Pass discrete actions (both int)
+                                self.agent.step(state['last_state'], int(firezap_action), int(spinner_action), 
+                                              total_reward, frame.state, bool(frame.done))
                         except TypeError:
-                            # Fallback for agents without continuous action in signature
+                            # Fallback for legacy agents (shouldn't happen)
                             try:
-                                self.agent.step(state['last_state'], int(da), total_reward, frame.state, bool(frame.done))
+                                self.agent.step(state['last_state'], int(firezap_action), total_reward, frame.state, bool(frame.done))
                             except Exception:
                                 pass
 
@@ -384,10 +388,10 @@ class SocketServer:
                     state['episode_obj_reward'] = 0.0
                     # No per-level frame tracking
 
-                # choose action (hybrid-only)
+                # choose action (discrete dual-head)
                 self.metrics.increment_total_controls()
 
-                discrete_action, continuous_spinner = 0, 0.0
+                discrete_action, spinner_value = 0, 0.0
                 action_source = 'unknown'
 
                 if self.agent:
@@ -406,8 +410,11 @@ class SocketServer:
                             frame.expert_zap,
                         )
                         discrete_action = fire_zap_to_discrete(fire, zap)
-                        continuous_spinner = float(spin)
+                        # CRITICAL FIX: Quantize expert's continuous spinner to discrete action
+                        spinner_action = quantize_spinner_action(float(spin))
+                        spinner_value = SPINNER_MAPPING[spinner_action]  # Map discrete action to continuous value for game
                         action_source = 'expert'
+                    
                     else:
                         # Epsilon policy: when override_epsilon is ON, force 0.0 (pure greedy).
                         # Otherwise, always use the current decayed epsilon even during expert/inference overrides.
@@ -449,7 +456,12 @@ class SocketServer:
                                     self.metrics.total_inference_requests += 1
                             except Exception:
                                 pass
-                        discrete_action, continuous_spinner = int(da), float(ca)
+                        discrete_action, spinner_value = int(da), float(ca)
+                        # CRITICAL FIX: Extract discrete spinner action for storage
+                        # Agent returns (firezap_action, spinner_value) where spinner_value is already mapped
+                        # Need to reverse-map to get discrete action for storage
+                        spinner_action = min(range(9), key=lambda i: abs(SPINNER_MAPPING[i] - spinner_value))
+                        
                         # Probabilistic superzap gate for DQN actions: allow zap with probability superzap_prob
                         try:
                             pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))
@@ -466,13 +478,13 @@ class SocketServer:
                 else:
                     action_source = 'none'
 
-                # store for next step
+                # store for next step - CRITICAL FIX: Store discrete actions for replay buffer
                 state['last_state'] = frame.state
-                state['last_action_hybrid'] = (discrete_action, continuous_spinner)
+                state['last_action_hybrid'] = (discrete_action, spinner_action)  # Both int (0-3, 0-8)
                 state['last_action_source'] = action_source
 
                 # send to game
-                game_fire, game_zap, game_spinner = hybrid_to_game_action(discrete_action, continuous_spinner)
+                game_fire, game_zap, game_spinner = hybrid_to_game_action(discrete_action, spinner_value)
                 try:
                     client_socket.sendall(struct.pack('bbb', game_fire, game_zap, game_spinner))
                 except Exception:

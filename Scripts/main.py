@@ -153,11 +153,11 @@ def main():
         os.makedirs(MODEL_DIR)
     
     # Initialize the Agent
-    # Use HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner)
-    # Fall back to legacy DQNAgent if needed by flipping this block.
+    # Use HybridDQNAgent with dual-head discrete architecture (4 fire/zap + 9 spinner)
     agent = HybridDQNAgent(
         state_size=RL_CONFIG.state_size,
         discrete_actions=4,
+        spinner_actions=9,
         learning_rate=RL_CONFIG.lr,
         gamma=RL_CONFIG.gamma,
         epsilon=RL_CONFIG.epsilon,

@@ -47,10 +47,10 @@ SERVER_CONFIG = ServerConfigData()
 class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
-    # Hybrid action space: 4 discrete fire/zap combinations + 1 continuous spinner
+    # Discrete action space: 4 discrete fire/zap + 9 discrete spinner actions
     discrete_action_size: int = 4  # fire/zap combinations: (0,0), (1,0), (0,1), (1,1)
-    continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
-    # Legacy removed: discrete 18-action size (pure hybrid model)
+    spinner_action_size: int = 9  # Spinner positions: -0.9, -0.6, -0.3, -0.1, 0, 0.1, 0.3, 0.6, 0.9
+    # Removed: continuous_action_size (now using discrete spinner)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
     lr: float = 0.001                     # STABILITY FIX: Reduced from 0.003 to prevent Q-value divergence
@@ -67,7 +67,7 @@ class RLConfigData:
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
-    expert_ratio_min: float = 0.10        # Minimum expert control probability
+    expert_ratio_min: float = 0.50        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 5000000           # Balanced buffer size (was 4000000)
@@ -103,7 +103,7 @@ class RLConfigData:
     hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
     # Legacy setting removed: zap_random_scale used only by legacy discrete agent
     # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 5  # STABILITY FIX: Reduced from 8 back to 5 to reduce error amplification
+    n_step: int = 10  # STABILITY FIX: Increased from 5 to 10 to better assign credit to spinner actions
     # Enable dueling architecture for better value/advantage separation
     use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
@@ -138,9 +138,6 @@ class RLConfigData:
     # Expert policy: allow adaptive expert-ratio floor adjustments based on performance trend
     adaptive_expert_floor: bool = False
 
-    # Loss weighting: balance continuous head relative to discrete head
-    continuous_loss_weight: float = 0.5
-
     # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
     reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target
     reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
@@ -160,6 +157,9 @@ class RLConfigData:
     # Superzap gate: probability that a DQN-selected zap is actually executed (0..1)
     # Expert-directed zaps are not gated.
     superzap_prob: float = 0.01
+
+    # Loss weighting: spinner head weight relative to fire/zap head (equal by default)
+    spinner_loss_weight: float = 1.0  # Equal weighting for spinner Q-learning
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -610,7 +610,7 @@ class MetricsData:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nLearning Rate: {RL_CONFIG.lr:.5f}\r")
 
-# Define hybrid action space
+# Define discrete action space
 # Discrete fire/zap combinations (4 total)
 FIRE_ZAP_MAPPING = {
     0: (0, 0),  # No fire, no zap
@@ -619,11 +619,50 @@ FIRE_ZAP_MAPPING = {
     3: (1, 1),  # Fire, zap
 }
 
-# Continuous spinner range - matches expert system full range
-SPINNER_MIN = -0.9
-SPINNER_MAX = 0.9
+# 9-action discrete spinner mapping (EXACT values aligned with game's /32 encoding)
+# Game encodes spinner as int(round(value * 32)), so we use exact multiples of 1/32
+# to ensure perfect round-trip: value → game_int → value
+# CRITICAL: Action 0 = center (no movement) so default/untrained network doesn't spin wildly
+SPINNER_MAPPING = {
+    0: 0.0,
+    1: -18/64,
+    2: -9/64,
+    3: -4/64,
+    4: -2/64,
+    5: 2/64,
+    6: 4/64,
+    7: 9/64,
+    8: 18/64,
+}
 
-# Legacy discrete action mapping removed (pure hybrid model)
+# Reverse mapping for quantizing expert actions to discrete spinner actions
+SPINNER_REVERSE_MAPPING = {v: k for k, v in SPINNER_MAPPING.items()}
+
+def quantize_spinner_action(spinner_value: float) -> int:
+    """Quantize a continuous spinner value to the nearest discrete action.
+    
+    Args:
+        spinner_value: Continuous spinner command in range [-0.9, 0.9]
+        
+    Returns:
+        Discrete spinner action index (0-8) from SPINNER_MAPPING
+    """
+    # Clamp to valid range
+    spinner_value = max(-0.9, min(0.9, spinner_value))
+    
+    # Find nearest discrete value
+    min_dist = float('inf')
+    best_action = 4  # Default to center (0.0)
+    
+    for action, value in SPINNER_MAPPING.items():
+        dist = abs(spinner_value - value)
+        if dist < min_dist:
+            min_dist = dist
+            best_action = action
+    
+    return best_action
+
+# Legacy continuous action mapping removed (now using discrete spinner)
 
 # Create instances of config classes
 metrics = MetricsData()

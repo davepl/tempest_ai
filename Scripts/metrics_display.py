@@ -34,6 +34,12 @@ _dqn1m_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: f
 _dqn1m_window_frames = 0
 _last_frame_count_seen_1m = None
 
+# Rolling window for total episode reward over last 5M frames (for RwdSlope)
+REWARD_WINDOW_FRAMES = 5_000_000
+_reward_window = deque()  # entries: (frames_in_interval: int, total_reward_mean: float, frame_end: int)
+_reward_window_frames = 0
+_last_frame_count_seen_reward = None
+
 def _update_dqn_window(mean_dqn_reward: float):
     """Update the 5M-frames rolling window with the latest interval.
 
@@ -149,8 +155,76 @@ def _compute_dqn1m_window_stats():
     avg = wy_sum / w_sum if w_sum > 0 else 0.0
     return avg
 
+def _update_reward_window(mean_total_reward: float):
+    """Update the 5M-frames rolling window for total episode rewards with the latest interval.
+
+    Uses the number of frames progressed since the last row as the weight.
+    """
+    global _reward_window_frames, _last_frame_count_seen_reward
+    current_frame = metrics.frame_count
+    # Determine frames elapsed since last sample
+    if _last_frame_count_seen_reward is None:
+        delta_frames = 0
+    else:
+        delta_frames = max(0, current_frame - _last_frame_count_seen_reward)
+    _last_frame_count_seen_reward = current_frame
+
+    # If no frame progress (e.g., first row), just return without adding
+    if delta_frames <= 0:
+        return
+
+    # Append new interval
+    _reward_window.append((delta_frames, float(mean_total_reward), int(current_frame)))
+    _reward_window_frames += delta_frames
+
+    # Trim window to last 5M frames (may need partial trim of the oldest bucket)
+    while _reward_window and _reward_window_frames > REWARD_WINDOW_FRAMES:
+        overflow = _reward_window_frames - REWARD_WINDOW_FRAMES
+        oldest_frames, oldest_val, oldest_end = _reward_window[0]
+        if oldest_frames <= overflow:
+            _reward_window.popleft()
+            _reward_window_frames -= oldest_frames
+        else:
+            # Partially trim the oldest bucket
+            kept_frames = oldest_frames - overflow
+            _reward_window[0] = (kept_frames, oldest_val, oldest_end)
+            _reward_window_frames = REWARD_WINDOW_FRAMES
+            break
+
+def _compute_reward_window_stats():
+    """Compute weighted average and weighted regression slope (per million frames) for the 5M-frame reward window.
+
+    Returns (avg, slope_per_million).
+    """
+    if not _reward_window or _reward_window_frames <= 0:
+        return 0.0, 0.0
+
+    # Weighted average
+    w_sum = float(_reward_window_frames)
+    wy_sum = sum(fr * val for fr, val, _ in _reward_window)
+    avg = wy_sum / w_sum if w_sum > 0 else 0.0
+
+    # Weighted linear regression slope of y vs x, with weights = frames
+    # Use frame_end as x for each bucket
+    wx_sum = sum(fr * x for fr, _, x in _reward_window)
+    wxx_sum = sum(fr * (x * x) for fr, _, x in _reward_window)
+    wy_sum = sum(fr * y for fr, y, _ in _reward_window)
+    wxy_sum = sum(fr * x * y for fr, y, x in _reward_window)
+
+    denom = (wxx_sum - (wx_sum * wx_sum) / w_sum) if w_sum > 0 else 0.0
+    if denom <= 0:
+        slope = 0.0
+    else:
+        slope = (wxy_sum - (wx_sum * wy_sum) / w_sum) / denom
+
+    slope_per_million = slope * 1_000_000.0
+    return avg, slope_per_million
+
 def _compute_reward_slope():
     """Compute linear regression slope of total episode rewards history.
+    
+    DEPRECATED: Use _compute_reward_window_stats() instead for smoother, frame-weighted slope.
+    This legacy version operates on the raw episode_rewards deque (last 20 episodes).
     
     Returns slope scaled to show change per 20 episodes (matching deque maxlen).
     """
@@ -360,6 +434,13 @@ def display_metrics_row(agent, kb_handler):
     except Exception:
         dqn1m_avg = 0.0
 
+    # Update 5M-frame total reward window stats now that we have this row's mean_reward
+    try:
+        _update_reward_window(mean_reward)
+        reward_avg, reward_slope = _compute_reward_window_stats()
+    except Exception:
+        reward_avg, reward_slope = 0.0, 0.0
+
     # Publish DQN5M stats to global metrics for gating logic elsewhere
     try:
         with metrics.lock:
@@ -413,9 +494,6 @@ def display_metrics_row(agent, kb_handler):
         effective_expert = metrics.get_effective_expert_ratio()
     except Exception:
         effective_expert = metrics.expert_ratio
-    
-    # Compute reward slope
-    reward_slope = _compute_reward_slope()
     
     # Format epsilon column: show "OVR" if epsilon override is ON, otherwise show value
     epsilon_str = "   OVR" if metrics.override_epsilon else f"{effective_eps:>6.2f}"

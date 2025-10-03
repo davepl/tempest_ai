@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
+Tempest AI Model: Discrete expert-guided and DQN-based gameplay system.
 - Makes intelligent decisions based on enemy positions and level types
-- Uses a Deep Q-Network (DQN) for reinforcement learning
+- Uses a Deep Q-Network (DQN) for reinforcement learning with discrete actions
 - Expert system provides guidance and training examples
 - Communicates with Tempest via socket connection
 """
@@ -53,7 +53,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# Removed StepLR and AMP imports (hybrid-only path doesn't use them)
+# Removed StepLR import (not used in current discrete implementation)
 import select
 import threading
 import queue
@@ -292,7 +292,7 @@ for i in range(1, len(layer_sizes)):
 print(f"  Head layers: {layer_sizes[-1]} → {max(64, layer_sizes[-1] // 2)}")
 
 print(f"Dueling: {'enabled' if getattr(RL_CONFIG, 'use_dueling', False) else 'disabled' } ")
-print("Replay: hybrid experience buffer (discrete + continuous)")
+print("Replay: dual-head discrete experience buffer (fire/zap + spinner)")
 print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision', False) else 'disabled'}")
 print(f"State size: {RL_CONFIG.state_size}")
 
@@ -305,9 +305,9 @@ metrics = config_metrics
 # Global reference to server for metrics display
 metrics.global_server = None
 
-# Legacy discrete-only replay types removed; hybrid-only
+# Legacy discrete-only replay types removed; now using dual-head discrete buffers
 
-# Discrete-only QNetwork removed (hybrid-only)
+# Legacy discrete-only QNetwork removed; now using dual-head discrete networks
 
 class NoisyLinear(nn.Module):
     """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
@@ -357,24 +357,25 @@ class NoisyLinear(nn.Module):
         return F.linear(input, weight, bias)
 
 class HybridDQN(nn.Module):
-    """Hybrid DQN with discrete fire/zap actions + continuous spinner.
+    """Dual-head DQN with discrete fire/zap actions + discrete spinner actions.
     
     Architecture:
     - Shared trunk: processes state features
-    - Discrete head: outputs Q-values for 4 fire/zap combinations
-    - Continuous head: outputs single continuous spinner value in [-0.9, +0.9]
+    - Fire/Zap head: outputs Q-values for 4 fire/zap combinations
+    - Spinner head: outputs Q-values for 9 discrete spinner positions
     
-    Forward pass returns: (discrete_q_values, continuous_spinner)
-    - discrete_q_values: (batch_size, 4) Q-values for fire/zap combinations
-    - continuous_spinner: (batch_size, 1) spinner values in [-0.9, +0.9]
+    Forward pass returns: (firezap_q_values, spinner_q_values)
+    - firezap_q_values: (batch_size, 4) Q-values for fire/zap combinations
+    - spinner_q_values: (batch_size, 9) Q-values for spinner positions
     """
-    def __init__(self, state_size: int, discrete_actions: int = 4, 
+    def __init__(self, state_size: int, discrete_actions: int = 4, spinner_actions: int = 9,
                  hidden_size: int = 512, num_layers: int = 3, 
                  use_dueling: bool = False, use_noisy: bool = False, noisy_std: float = 0.1):
         super(HybridDQN, self).__init__()
         
         self.state_size = state_size
         self.discrete_actions = discrete_actions
+        self.spinner_actions = spinner_actions
         self.use_dueling = use_dueling
         self.use_noisy = use_noisy
         self.num_layers = num_layers
@@ -423,15 +424,18 @@ class HybridDQN(nn.Module):
             self.discrete_fc = nn.Linear(shared_output_size, head_size)
             self.discrete_out = nn.Linear(head_size, discrete_actions)
         
-        # Continuous head for spinner (always separate from dueling)
-        self.continuous_fc1 = nn.Linear(shared_output_size, head_size)
-        continuous_head_size = max(32, head_size // 2)
-        self.continuous_fc2 = nn.Linear(head_size, continuous_head_size)
-        self.continuous_out = nn.Linear(continuous_head_size, 1)
-        
-        # Initialize continuous head with smaller weights for stable training
-        torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
-        torch.nn.init.constant_(self.continuous_out.bias, 0.0)
+        # Discrete spinner head for 9-action spinner control
+        # Uses same dueling architecture option as fire/zap head for consistency
+        if use_dueling:
+            # Dueling architecture for spinner Q-values
+            self.spinner_val_fc = nn.Linear(shared_output_size, head_size)
+            self.spinner_adv_fc = nn.Linear(shared_output_size, head_size)
+            self.spinner_val_out = nn.Linear(head_size, 1)  # State value
+            self.spinner_adv_out = nn.Linear(head_size, spinner_actions)  # Advantages
+        else:
+            # Standard architecture for spinner Q-values
+            self.spinner_fc = nn.Linear(shared_output_size, head_size)
+            self.spinner_out = nn.Linear(head_size, spinner_actions)
     
     def reset_noise(self):
         """Reset noise layers if using noisy networks"""
@@ -441,21 +445,21 @@ class HybridDQN(nn.Module):
                     m.reset_noise()
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning (discrete_q_values, continuous_spinner)
+        """Forward pass returning (firezap_q_values, spinner_q_values)
         
         Args:
             x: Input state tensor (batch_size, state_size)
             
         Returns:
-            discrete_q_values: Q-values for fire/zap combinations (batch_size, 4)
-            continuous_spinner: Spinner values in [-0.9, +0.9] (batch_size, 1)
+            firezap_q_values: Q-values for fire/zap combinations (batch_size, 4)
+            spinner_q_values: Q-values for 9 discrete spinner positions (batch_size, 9)
         """
         # Shared feature extraction through dynamic layers
         shared = x
         for layer in self.shared_layers:
             shared = F.relu(layer(shared))
         
-        # Discrete Q-values head
+        # Fire/Zap Q-values head
         if self.use_dueling:
             # Dueling network: V(s) + A(s,a) - mean(A(s,·))
             discrete_val = F.relu(self.discrete_val_fc(shared))
@@ -465,29 +469,39 @@ class HybridDQN(nn.Module):
             discrete_adv = self.discrete_adv_out(discrete_adv)  # (B, discrete_actions)
             
             # Center advantages around their mean
-            discrete_q = discrete_val + (discrete_adv - discrete_adv.mean(dim=1, keepdim=True))
+            firezap_q = discrete_val + (discrete_adv - discrete_adv.mean(dim=1, keepdim=True))
         else:
             # Standard Q-network
             discrete = F.relu(self.discrete_fc(shared))
-            discrete_q = self.discrete_out(discrete)  # (B, discrete_actions)
+            firezap_q = self.discrete_out(discrete)  # (B, discrete_actions)
         
-        # Continuous spinner head
-        continuous = F.relu(self.continuous_fc1(shared))
-        continuous = F.relu(self.continuous_fc2(continuous))
-        continuous_raw = self.continuous_out(continuous)  # (B, 1)
+        # Spinner Q-values head (9 discrete actions)
+        if self.use_dueling:
+            # Dueling network for spinner
+            spinner_val = F.relu(self.spinner_val_fc(shared))
+            spinner_val = self.spinner_val_out(spinner_val)  # (B, 1)
+            
+            spinner_adv = F.relu(self.spinner_adv_fc(shared))
+            spinner_adv = self.spinner_adv_out(spinner_adv)  # (B, spinner_actions)
+            
+            # Center advantages around their mean
+            spinner_q = spinner_val + (spinner_adv - spinner_adv.mean(dim=1, keepdim=True))
+        else:
+            # Standard Q-network for spinner
+            spinner = F.relu(self.spinner_fc(shared))
+            spinner_q = self.spinner_out(spinner)  # (B, spinner_actions)
         
-        # Apply tanh to bound spinner to [-1, +1] then scale to [-0.9, +0.9]
-        continuous_spinner = torch.tanh(continuous_raw) * 0.9
-        
-        return discrete_q, continuous_spinner
+        return firezap_q, spinner_q
 
 class PrioritizedReplayMemory:
-    """Prioritized Experience Replay buffer for hybrid discrete-continuous actions.
+    """Prioritized Experience Replay buffer for dual-head discrete actions.
     
     Implements the prioritized sampling mechanism from:
     "Prioritized Experience Replay" (Schaul et al. 2015)
     
-    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
+    Stores experiences as: (state, firezap_action, spinner_action, reward, next_state, done)
+    - firezap_action: int (0-3) for fire/zap combination
+    - spinner_action: int (0-8) for discrete spinner position
     Maintains priorities in a sum tree for efficient sampling.
     """
     
@@ -506,7 +520,7 @@ class PrioritizedReplayMemory:
         # Pre-allocated arrays for experiences
         self.states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.discrete_actions = np.empty((capacity,), dtype=np.int32)
-        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
+        self.spinner_actions = np.empty((capacity,), dtype=np.int32)  # Discrete spinner actions (0-8)
         self.rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
@@ -515,34 +529,34 @@ class PrioritizedReplayMemory:
         self.priorities = np.full((capacity, 1), fill_value=self.eps, dtype=np.float32)
         self.max_priority = 1.0  # Track maximum priority for new experiences
         
-    def push(self, state, action_or_discrete, reward_or_continuous=None, next_state_or_reward=None, done_or_next_state=None, done=None):
+    def push(self, state, action_or_discrete, reward_or_spinner=None, next_state_or_reward=None, done_or_next_state=None, done=None):
         """Add experience to buffer with maximum priority.
         
         Supports both interfaces:
-        - Hybrid: push(state, discrete_action, continuous_action, reward, next_state, done)
+        - Dual discrete: push(state, firezap_action, spinner_action, reward, next_state, done)
         - Simple: push(state, action, reward, next_state, done) 
         """
         # Detect interface by argument count
         if done is not None:
-            # 6-argument hybrid interface
+            # 6-argument dual discrete interface
             discrete_action = action_or_discrete
-            continuous_action = reward_or_continuous
+            spinner_action = reward_or_spinner
             reward = next_state_or_reward
             next_state = done_or_next_state
         else:
             # 5-argument simple interface (for tests)
             discrete_action = action_or_discrete
-            continuous_action = 0.0  # Default continuous action for test compatibility
-            reward = reward_or_continuous
+            spinner_action = 4  # Default to center (0.0) for test compatibility
+            reward = reward_or_spinner
             next_state = next_state_or_reward
             done = done_or_next_state
         
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
-        continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        spinner_idx = int(spinner_action) if not isinstance(spinner_action, int) else spinner_action
         
-        # Clamp continuous action to valid range
-        continuous_val = max(-0.9, min(0.9, continuous_val))
+        # Clamp spinner action to valid range [0, 8]
+        spinner_idx = max(0, min(8, spinner_idx))
         
         # Store experience
         try:
@@ -557,7 +571,7 @@ class PrioritizedReplayMemory:
             self.next_states[self.position] = ns
             
             self.discrete_actions[self.position] = discrete_idx
-            self.continuous_actions[self.position] = continuous_val
+            self.spinner_actions[self.position] = spinner_idx
             self.rewards[self.position] = float(reward)
             self.dones[self.position] = bool(done)
             
@@ -610,9 +624,9 @@ class PrioritizedReplayMemory:
         return states, actions, rewards, next_states, dones, is_weights, indices
     
     def sample_hybrid(self, batch_size: int, beta: float = 0.4):
-        """Sample batch for hybrid training with device movement.
+        """Sample batch for dual discrete training with device movement.
         
-        Returns: (states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices)
+        Returns: (states, discrete_actions, spinner_actions, rewards, next_states, dones, is_weights, indices)
         """
         if self.size < batch_size:
             return None
@@ -632,7 +646,7 @@ class PrioritizedReplayMemory:
         states_np = self.states[indices]
         next_states_np = self.next_states[indices]
         batch_discrete_actions = self.discrete_actions[indices]
-        batch_continuous_actions = self.continuous_actions[indices]
+        batch_spinner_actions = self.spinner_actions[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
         
@@ -641,7 +655,7 @@ class PrioritizedReplayMemory:
         states = torch.from_numpy(states_np).float()
         next_states = torch.from_numpy(next_states_np).float()
         discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
-        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
+        spinner_actions = torch.from_numpy(batch_spinner_actions.reshape(-1, 1)).long()  # Long for Q-value indexing
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
         is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
@@ -650,7 +664,7 @@ class PrioritizedReplayMemory:
             states = states.pin_memory()
             next_states = next_states.pin_memory()
             discrete_actions = discrete_actions.pin_memory()
-            continuous_actions = continuous_actions.pin_memory()
+            spinner_actions = spinner_actions.pin_memory()
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
             is_weights = is_weights.pin_memory()
@@ -659,12 +673,12 @@ class PrioritizedReplayMemory:
         states = states.to(training_device, non_blocking=True)
         next_states = next_states.to(training_device, non_blocking=True)
         discrete_actions = discrete_actions.to(training_device, non_blocking=True)
-        continuous_actions = continuous_actions.to(training_device, non_blocking=True)
+        spinner_actions = spinner_actions.to(training_device, non_blocking=True)
         rewards = rewards.to(training_device, non_blocking=True)
         dones = dones.to(training_device, non_blocking=True)
         is_weights = is_weights.to(training_device, non_blocking=True)
         
-        return states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices
+        return states, discrete_actions, spinner_actions, rewards, next_states, dones, is_weights, indices
     
     def update_priorities(self, indices, td_errors):
         """Update priorities based on TD errors."""
@@ -694,11 +708,11 @@ class PrioritizedReplayMemory:
         return self.size
 
 class HybridReplayBuffer:
-    """Experience replay buffer for hybrid discrete-continuous actions.
+    """Experience replay buffer for dual-head discrete actions.
     
-    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
-    - discrete_action: integer index for fire/zap combination (0-3)
-    - continuous_action: float spinner value in [-0.9, +0.9]
+    Stores experiences as: (state, firezap_action, spinner_action, reward, next_state, done)
+    - firezap_action: integer index for fire/zap combination (0-3)
+    - spinner_action: integer index for spinner position (0-8)
     """
     def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
@@ -709,19 +723,19 @@ class HybridReplayBuffer:
         # Pre-allocated arrays for maximum speed
         self.states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.discrete_actions = np.empty((capacity,), dtype=np.int32)
-        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
+        self.spinner_actions = np.empty((capacity,), dtype=np.int32)  # Discrete spinner actions (0-8)
         self.rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
     
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def push(self, state, discrete_action, spinner_action, reward, next_state, done):
         """Add experience to buffer"""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
-        continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        spinner_idx = int(spinner_action) if not isinstance(spinner_action, int) else spinner_action
         
-        # Clamp continuous action to valid range
-        continuous_val = max(-0.9, min(0.9, continuous_val))
+        # Clamp spinner action to valid range [0, 8]
+        spinner_idx = max(0, min(8, spinner_idx))
         
         # Store experience
         try:
@@ -739,7 +753,7 @@ class HybridReplayBuffer:
             # Fallback to zeros if something went wrong
             self.states[self.position, :] = 0.0
         self.discrete_actions[self.position] = discrete_idx
-        self.continuous_actions[self.position] = continuous_val
+        self.spinner_actions[self.position] = spinner_idx
         self.rewards[self.position] = reward
         try:
             ns = np.asarray(next_state, dtype=np.float32)
@@ -797,7 +811,7 @@ class HybridReplayBuffer:
         states_np = self.states[indices]
         next_states_np = self.next_states[indices]
         batch_discrete_actions = self.discrete_actions[indices]
-        batch_continuous_actions = self.continuous_actions[indices]
+        batch_spinner_actions = self.spinner_actions[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
 
@@ -806,7 +820,7 @@ class HybridReplayBuffer:
         states = torch.from_numpy(states_np).float()
         next_states = torch.from_numpy(next_states_np).float()
         discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
-        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
+        spinner_actions = torch.from_numpy(batch_spinner_actions.reshape(-1, 1)).long()  # Long for Q-value indexing
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
 
@@ -814,7 +828,7 @@ class HybridReplayBuffer:
             states = states.pin_memory()
             next_states = next_states.pin_memory()
             discrete_actions = discrete_actions.pin_memory()
-            continuous_actions = continuous_actions.pin_memory()
+            spinner_actions = spinner_actions.pin_memory()
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
 
@@ -822,17 +836,17 @@ class HybridReplayBuffer:
         states = states.to(training_device, non_blocking=non_block)
         next_states = next_states.to(training_device, non_blocking=non_block)
         discrete_actions = discrete_actions.to(training_device, non_blocking=non_block)
-        continuous_actions = continuous_actions.to(training_device, non_blocking=non_block)
+        spinner_actions = spinner_actions.to(training_device, non_blocking=non_block)
         rewards = rewards.to(training_device, non_blocking=non_block)
         dones = dones.to(training_device, non_blocking=non_block)
         
-        return states, discrete_actions, continuous_actions, rewards, next_states, dones
+        return states, discrete_actions, spinner_actions, rewards, next_states, dones
     
     def __len__(self):
         return self.size
 
-## Hybrid-only path: legacy discrete-only DQNAgent removed
-## N-step learning handled upstream (server) or via dedicated buffer; hybrid agent expects 1-step or n-step rewards provided.
+## Dual-head discrete path: legacy single-head discrete DQNAgent removed
+## N-step learning handled upstream (server) or via dedicated buffer; dual-head agent expects 1-step or n-step rewards provided.
     
 class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""
@@ -973,15 +987,16 @@ def setup_environment():
     print(f"Ready to handle up to {SERVER_CONFIG.max_clients} clients")
 
 class HybridDQNAgent:
-    """Hybrid DQN Agent with discrete fire/zap actions + continuous spinner"""
+    """Dual-head DQN Agent with discrete fire/zap actions + discrete spinner actions"""
     
-    def __init__(self, state_size, discrete_actions=4, learning_rate=RL_CONFIG.lr, 
+    def __init__(self, state_size, discrete_actions=4, spinner_actions=9, learning_rate=RL_CONFIG.lr, 
                  gamma=RL_CONFIG.gamma, epsilon=RL_CONFIG.epsilon, 
                  epsilon_min=RL_CONFIG.epsilon_min, memory_size=RL_CONFIG.memory_size, 
                  batch_size=RL_CONFIG.batch_size):
         
         self.state_size = state_size
         self.discrete_actions = discrete_actions
+        self.spinner_actions = spinner_actions
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.epsilon = epsilon
@@ -989,10 +1004,11 @@ class HybridDQNAgent:
         self.batch_size = batch_size
         self.last_save_time = 0.0
         
-        # Hybrid neural networks
+        # Dual-head discrete neural networks
         self.qnetwork_local = HybridDQN(
             state_size=state_size,
             discrete_actions=discrete_actions,
+            spinner_actions=spinner_actions,
             hidden_size=RL_CONFIG.hidden_size,
             num_layers=RL_CONFIG.num_layers,
             use_dueling=RL_CONFIG.use_dueling,
@@ -1002,6 +1018,7 @@ class HybridDQNAgent:
         self.qnetwork_target = HybridDQN(
             state_size=state_size,
             discrete_actions=discrete_actions,
+            spinner_actions=spinner_actions,
             hidden_size=RL_CONFIG.hidden_size,
             num_layers=RL_CONFIG.num_layers,
             use_dueling=RL_CONFIG.use_dueling,
@@ -1010,10 +1027,11 @@ class HybridDQNAgent:
         
         # Create inference copy on inference device
         if inference_device != training_device:
-            print(f"Creating dedicated hybrid inference network on {inference_device}")
+            print(f"Creating dedicated dual-head inference network on {inference_device}")
             self.qnetwork_inference = HybridDQN(
                 state_size=state_size,
                 discrete_actions=discrete_actions,
+                spinner_actions=spinner_actions,
                 hidden_size=RL_CONFIG.hidden_size,
                 num_layers=RL_CONFIG.num_layers,
                 use_dueling=RL_CONFIG.use_dueling,
@@ -1037,7 +1055,7 @@ class HybridDQNAgent:
         self.inference_device = inference_device
         self.training_device = training_device
         
-        # Optimizer with separate parameter groups for discrete and continuous components
+        # Optimizer for dual discrete heads (fire/zap + spinner)
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         
         # Experience replay (choose buffer type based on config)
@@ -1114,35 +1132,37 @@ class HybridDQNAgent:
         self.n_step = getattr(RL_CONFIG, 'n_step', 5)
         
     def act(self, state, epsilon=0.0, add_noise=True):
-        """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
+        """Select dual discrete actions using epsilon-greedy for both heads.
         
         Returns:
-            discrete_action: int (0-3) for fire/zap combination
-            continuous_action: float in [-0.9, +0.9] for spinner
+            firezap_action: int (0-3) for fire/zap combination
+            spinner_value: float in [-0.9, +0.9] mapped from discrete spinner action
         """
         state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         
         # Do not flip modes every call; rely on persistent .eval() for dedicated inference model
         with torch.no_grad():
-            discrete_q, continuous_pred = self.qnetwork_inference(state)
+            firezap_q, spinner_q = self.qnetwork_inference(state)
         
-        # Discrete action selection (epsilon-greedy)
+        # Fire/Zap action selection (epsilon-greedy)
         if random.random() < epsilon:
-            discrete_action = random.randint(0, self.discrete_actions - 1)
+            firezap_action = random.randint(0, self.discrete_actions - 1)
         else:
-            discrete_action = discrete_q.cpu().data.numpy().argmax()
+            firezap_action = firezap_q.cpu().data.numpy().argmax()
         
-        # Continuous action selection (predicted value + optional exploration noise)
-        continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
-        if add_noise and epsilon > 0:
-            # Add Gaussian noise scaled by epsilon for exploration
-            noise_scale = epsilon * 0.9  # 90% of action range at full epsilon
-            noise = np.random.normal(0, noise_scale)
-            continuous_action = np.clip(continuous_action + noise, -0.9, 0.9)
+        # Spinner action selection (epsilon-greedy)
+        if random.random() < epsilon:
+            spinner_action = random.randint(0, self.spinner_actions - 1)
+        else:
+            spinner_action = spinner_q.cpu().data.numpy().argmax()
+               
+        # Map discrete spinner action to continuous value using SPINNER_MAPPING
+        from config import SPINNER_MAPPING
+        spinner_value = SPINNER_MAPPING[int(spinner_action)]
         
-        return int(discrete_action), float(continuous_action)
+        return int(firezap_action), float(spinner_value)
     
-    def calculate_diversity_bonus(self, state, discrete_action, continuous_action):
+    def calculate_diversity_bonus(self, state, firezap_action, spinner_value):
         """Reward trying different actions in similar states
         
         This encourages exploration of counterfactual actions to discover
@@ -1151,8 +1171,8 @@ class HybridDQNAgent:
         
         Args:
             state: numpy array of state features
-            discrete_action: int (0-3) for fire/zap combination
-            continuous_action: float for spinner value
+            firezap_action: int (0-3) for fire/zap combination
+            spinner_value: float for spinner value (already mapped from discrete action)
             
         Returns:
             float: bonus reward for action diversity
@@ -1168,9 +1188,9 @@ class HybridDQNAgent:
             if state_key not in self.action_history:
                 self.action_history[state_key] = set()
             
-            # Discretize continuous action for tracking (round to 0.1)
-            continuous_rounded = round(float(continuous_action), 1)
-            action_taken = (int(discrete_action), continuous_rounded)
+            # Discretize spinner value for tracking (round to 0.1)
+            spinner_rounded = round(float(spinner_value), 1)
+            action_taken = (int(firezap_action), spinner_rounded)
             
             if action_taken not in self.action_history[state_key]:
                 self.action_history[state_key].add(action_taken)
@@ -1197,9 +1217,9 @@ class HybridDQNAgent:
         status = "enabled" if self.n_step_enabled else "disabled"
         print(f"N-step learning {status}")
     
-    def step(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def step(self, state, firezap_action, spinner_action, reward, next_state, done):
         """Add experience to memory and queue training"""
-        self.memory.push(state, discrete_action, continuous_action, reward, next_state, done)
+        self.memory.push(state, firezap_action, spinner_action, reward, next_state, done)
         
         # Queue multiple training steps per experience
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
@@ -1273,7 +1293,7 @@ class HybridDQNAgent:
         grad_accum_steps = max(1, int(getattr(RL_CONFIG, 'gradient_accumulation_steps', 1) or 1))
         use_amp = self.use_amp
         scaler = self.scaler
-        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
+        w_spinner = float(getattr(RL_CONFIG, 'spinner_loss_weight', 1.0) or 1.0)
 
         # Keep track of loss for telemetry
         total_loss_value = 0.0
@@ -1295,7 +1315,7 @@ class HybridDQNAgent:
                     
                     batch_data = self.memory.sample_hybrid(self.batch_size, beta=beta)
                     if batch_data is not None and len(batch_data) == 8:  # PER returns 8 elements
-                        states, discrete_actions, continuous_actions, rewards, next_states, dones, is_weights, indices = batch_data
+                        states, firezap_actions, spinner_actions, rewards, next_states, dones, is_weights, indices = batch_data
                     else:
                         if acc_idx == 0:
                             return 0.0
@@ -1309,29 +1329,38 @@ class HybridDQNAgent:
                             return 0.0
                         else:
                             break
-                    states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                    states, firezap_actions, spinner_actions, rewards, next_states, dones = batch
                     is_weights = None
                     indices = None
 
                 # Forward pass (local) under autocast as configured
                 if use_amp:
                     with self.autocast():
-                        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
-                        discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+                        firezap_q_pred, spinner_q_pred = self.qnetwork_local(states)
+                        firezap_q_selected = firezap_q_pred.gather(1, firezap_actions)
+                        spinner_q_selected = spinner_q_pred.gather(1, spinner_actions)
                 else:
-                    discrete_q_pred, continuous_pred = self.qnetwork_local(states)
-                    discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+                    firezap_q_pred, spinner_q_pred = self.qnetwork_local(states)
+                    firezap_q_selected = firezap_q_pred.gather(1, firezap_actions)
+                    spinner_q_selected = spinner_q_pred.gather(1, spinner_actions)
 
-                # Target computation detached
+                # Target computation detached - dual head Double DQN
                 with torch.no_grad():
                     if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
-                        next_q_local, _ = self.qnetwork_local(next_states)
-                        next_actions = next_q_local.argmax(dim=1, keepdim=True)
-                        next_q_target, _ = self.qnetwork_target(next_states)
-                        discrete_q_next_max = next_q_target.gather(1, next_actions)
+                        # Double DQN for fire/zap head
+                        next_firezap_q_local, next_spinner_q_local = self.qnetwork_local(next_states)
+                        next_firezap_actions = next_firezap_q_local.argmax(dim=1, keepdim=True)
+                        next_firezap_q_target, next_spinner_q_target = self.qnetwork_target(next_states)
+                        firezap_q_next_max = next_firezap_q_target.gather(1, next_firezap_actions)
+                        
+                        # Double DQN for spinner head
+                        next_spinner_actions = next_spinner_q_local.argmax(dim=1, keepdim=True)
+                        spinner_q_next_max = next_spinner_q_target.gather(1, next_spinner_actions)
                     else:
-                        next_q_target, _ = self.qnetwork_target(next_states)
-                        discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
+                        # Standard DQN (max over target network)
+                        next_firezap_q_target, next_spinner_q_target = self.qnetwork_target(next_states)
+                        firezap_q_next_max = next_firezap_q_target.max(1)[0].unsqueeze(1)
+                        spinner_q_next_max = next_spinner_q_target.max(1)[0].unsqueeze(1)
 
                     # n-step gamma and reward transforms
                     n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
@@ -1348,57 +1377,65 @@ class HybridDQNAgent:
                             r = torch.tanh(r)
                     except Exception:
                         pass
-                    discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
-                    continuous_targets = continuous_actions
+                    # TD targets for both heads (same reward, different next Q-values)
+                    firezap_targets = r + (gamma_boot * firezap_q_next_max * (1 - dones))
+                    spinner_targets = r + (gamma_boot * spinner_q_next_max * (1 - dones))
 
                 # Match dtypes under AMP
                 if use_amp:
                     try:
-                        discrete_targets = discrete_targets.to(discrete_q_selected.dtype)
-                        continuous_targets = continuous_targets.to(continuous_pred.dtype)
+                        firezap_targets = firezap_targets.to(firezap_q_selected.dtype)
+                        spinner_targets = spinner_targets.to(spinner_q_selected.dtype)
                     except Exception:
                         pass
 
+                # Dual discrete Q-learning: No weighting, pure TD learning for both heads
+                # Both heads learn from same reward signal via independent Q-value updates
+
                 # Losses per micro-batch (autocast already applied for forward)
+                # Dual discrete Q-learning: Huber loss for both heads
                 if use_amp:
                     with self.autocast():
-                        d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
-                        c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                        firezap_loss = F.huber_loss(firezap_q_selected, firezap_targets, reduction='none')
+                        spinner_loss = F.huber_loss(spinner_q_selected, spinner_targets, reduction='none')
                         
                         # Apply importance weights if using PER
                         if self.use_per and is_weights is not None:
-                            d_loss = d_loss * is_weights
-                            c_loss = c_loss * is_weights
+                            firezap_loss = firezap_loss * is_weights
+                            spinner_loss = spinner_loss * is_weights
                         
                         # Reduce losses to scalars
-                        d_loss = d_loss.mean()
-                        c_loss = c_loss.mean()
-                        micro_total = d_loss + w_cont * c_loss
+                        firezap_loss = firezap_loss.mean()
+                        spinner_loss = spinner_loss.mean()
+                        micro_total = firezap_loss + w_spinner * spinner_loss
                         # Scale loss for accumulation so effective LR remains constant
                         micro_total = micro_total / float(grad_accum_steps)
                 else:
-                    d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
-                    c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                    firezap_loss = F.huber_loss(firezap_q_selected, firezap_targets, reduction='none')
+                    spinner_loss = F.huber_loss(spinner_q_selected, spinner_targets, reduction='none')
                     
                     # Apply importance weights if using PER
                     if self.use_per and is_weights is not None:
-                        d_loss = d_loss * is_weights
-                        c_loss = c_loss * is_weights
+                        firezap_loss = firezap_loss * is_weights
+                        spinner_loss = spinner_loss * is_weights
                     
                     # Reduce losses to scalars
-                    d_loss = d_loss.mean()
-                    c_loss = c_loss.mean()
-                    micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
+                    firezap_loss = firezap_loss.mean()
+                    spinner_loss = spinner_loss.mean()
+                    micro_total = (firezap_loss + w_spinner * spinner_loss) / float(grad_accum_steps)
 
-                # Update PER priorities if using PER
+                # Update PER priorities if using PER (use max TD error from both heads)
                 if self.use_per and indices is not None:
-                    # Calculate TD errors for priority updates
+                    # Calculate TD errors for priority updates (use max of both heads)
                     with torch.no_grad():
-                        td_errors = torch.abs(discrete_q_selected - discrete_targets)
+                        firezap_td_errors = torch.abs(firezap_q_selected - firezap_targets)
+                        spinner_td_errors = torch.abs(spinner_q_selected - spinner_targets)
+                        # Use maximum TD error across both heads for priority
+                        td_errors = torch.maximum(firezap_td_errors, spinner_td_errors)
                         self.memory.update_priorities(indices, td_errors)
 
                 # Store loss for telemetry and backward pass
-                total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
+                total_loss_value += float((firezap_loss + w_spinner * spinner_loss).item()) / float(grad_accum_steps)
                 accumulated_losses.append(micro_total)
         # === END READ LOCK - forward computation done ===
         
@@ -2358,41 +2395,44 @@ def discrete_to_fire_zap(discrete_action):
     return bool(fire), bool(zap)
 
 def get_expert_hybrid_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
-    """Get expert action in hybrid format (discrete_action, continuous_spinner)
+    """Get expert action in dual discrete format (firezap_action, spinner_action)
     
     Returns:
-        discrete_action: int (0-3) for fire/zap combination
-        continuous_spinner: float in [-0.9, +0.9] for movement (full expert range)
+        firezap_action: int (0-3) for fire/zap combination
+        spinner_action: int (0-8) for discrete spinner position (quantized from expert)
     """
+    # Import quantization function
+    from config import quantize_spinner_action
+    
     # Get continuous expert action
     fire, zap, spinner = get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire, expert_zap)
     
-    # Convert to hybrid format - preserve full expert system range!
-    discrete_action = fire_zap_to_discrete(fire, zap)
-    continuous_spinner = float(spinner)  # No clamping - use expert's full range
+    # Convert to dual discrete format
+    firezap_action = fire_zap_to_discrete(fire, zap)
+    spinner_action = quantize_spinner_action(float(spinner))  # Quantize to nearest discrete action
     
-    return discrete_action, continuous_spinner
+    return firezap_action, spinner_action
 
-def hybrid_to_game_action(discrete_action, continuous_spinner):
-    """Convert hybrid action to game format
+def hybrid_to_game_action(firezap_action, spinner_value):
+    """Convert dual discrete action to game format
     
     Args:
-        discrete_action: int (0-3) for fire/zap combination
-        continuous_spinner: float in [-0.3, +0.3] for movement
+        firezap_action: int (0-3) for fire/zap combination
+        spinner_value: float in [-0.9, +0.9] for movement (already mapped from discrete)
         
     Returns:
         fire_cmd: int (0 or 1)
         zap_cmd: int (0 or 1) 
         spinner_cmd: int (-9 to +9, scaled from spinner * 31)
     """
-    fire, zap = discrete_to_fire_zap(discrete_action)
-    return encode_action_to_game(fire, zap, continuous_spinner)
+    fire, zap = discrete_to_fire_zap(firezap_action)
+    return encode_action_to_game(fire, zap, spinner_value)
 
 def legacy_action_to_hybrid(action_idx):
-    """Legacy path removed. Placeholder returns no-op hybrid action."""
-    return 0, 0.0
+    """Legacy path removed. Placeholder returns no-op dual discrete action."""
+    return 0, 4  # No-op: no fire/zap, center spinner
 
-def hybrid_to_legacy_action(discrete_action, continuous_spinner):
+def hybrid_to_legacy_action(firezap_action, spinner_value):
     """Legacy path removed. Placeholder returns center legacy index (unused)."""
     return 3
 
