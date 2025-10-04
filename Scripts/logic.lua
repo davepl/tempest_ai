@@ -42,6 +42,20 @@ local SCORE_UNIT = 10000.0           -- 10k points ~= 1 life worth of reward
 local LEVEL_COMPLETION_BONUS = 2.0   -- Edge-triggered bonus when level increments
 local DEATH_PENALTY = 0.3            -- Edge-triggered penalty when dying (raised to better balance vs completion)
 local ZAP_COST = 0.2                 -- Edge-triggered Small cost per zap frame
+
+-- Targeting reward shaping (values expressed in reward units)
+local TARGET_ALIGN_BONUS = 150.0 / SCORE_UNIT           -- Strong incentive to sit on expert lane (~0.015 reward)
+local TARGET_PROGRESS_BONUS_PER_SEG = 90.0 / SCORE_UNIT -- Reward per segment moved toward lane (~0.009)
+local TARGET_REGRESS_PENALTY_PER_SEG = 110.0 / SCORE_UNIT -- Penalty per segment moved away (~0.011)
+local TARGET_STALL_PENALTY = 25.0 / SCORE_UNIT          -- Mild penalty for idling while misaligned (~0.0025)
+local TARGET_DISTANCE_CLAMP = 6.0                       -- Clamp segment deltas when scaling progress/regression
+
+-- Spinner movement costs (applied every frame movement occurs)
+local SPINNER_MOVE_COST_BASE = 0.0005                   -- Baseline cost for any spinner movement
+local SPINNER_MOVE_COST_PER_UNIT = 0.004                -- Additional cost per normalized spinner unit (~32 HW ticks)
+local USELESS_SPINNER_EXTRA_COST_PER_UNIT = 0.003       -- Extra penalty when movement is unnecessary
+local SPINNER_UNITS_NORMALIZER = 32.0                   -- Convert raw accumulator delta to "spinner units"
+local SPINNER_NORMALIZED_CLAMP = 4.0                    -- Clamp normalized spinner units when scaling penalties
  
 local previous_score = 0
 local previous_level = 0
@@ -624,9 +638,24 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
             -- Compute expert target once for reward gating (avoid rewarding moves toward danger)
             local expert_target_seg_cached = -1
+            local target_lane_safe = false
+            local current_target_distance = nil
+            local previous_target_distance = nil
+            local same_level = (level_state.level_number == (previous_level or level_state.level_number))
             do
                 local ets, _, _, _ = M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
                 expert_target_seg_cached = ets or -1
+                if expert_target_seg_cached ~= -1 then
+                    target_lane_safe = not M.is_danger_lane(expert_target_seg_cached, enemies_state)
+                    if target_lane_safe then
+                        local current_player_seg = player_abs_seg
+                        local prev_player_seg = (previous_player_position or current_player_seg) & 0x0F
+                        current_target_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
+                        if same_level then
+                            previous_target_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
+                        end
+                    end
+                end
             end
             
             -- 1. DANGER AVOIDANCE REWARD (Penalties removed per spec)
@@ -636,9 +665,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- Reward optimal distance to nearest enemy (not too close, not too far)
             -- IMPORTANT: If expert target lane is dangerous, skip proximity shaping entirely.
             do
-                local danger_target_lane = (expert_target_seg_cached ~= -1) and M.is_danger_lane(expert_target_seg_cached, enemies_state)
                 local nearest_distance = enemies_state.alignment_error_magnitude or 1.0
-                if not danger_target_lane and enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT then
+                if target_lane_safe and enemies_state.nearest_enemy_seg ~= INVALID_SEGMENT then
                     -- Convert normalized distance (0-1) to segments for clearer logic
                     local max_dist = is_open and 15.0 or 8.0
                     local distance_segments = nearest_distance * max_dist
@@ -698,43 +726,42 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- IMPORTANT: If expert target lane is dangerous, skip positioning shaping entirely.
             do
                 local positioning_reward = 0.0
-                if expert_target_seg_cached ~= -1 then
-                    local danger_target_lane = M.is_danger_lane(expert_target_seg_cached, enemies_state)
-                    if not danger_target_lane then
-                        local current_player_seg = player_abs_seg
-                        local prev_player_seg = previous_player_position & 0x0F
-                        
-                        -- Calculate distances to expert target (current and previous)
-                        local current_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
-                        local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
-                        
-                        -- Award for being on target segment
-                        if current_distance == 0 then
-                            -- Worth ~10 points when perfectly aligned (10 / SCORE_UNIT)
-                            positioning_reward = 10.0 / SCORE_UNIT
-                        -- Award for moving toward target
-                        elseif current_distance < previous_distance then
-                            local progress = previous_distance - current_distance
-                            -- Scale small progress reward so it remains below score/death signals
-                            positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
-                        -- Penalty for moving away from target
-                        elseif current_distance > previous_distance then
-                            local regression = current_distance - previous_distance
-                            -- Scale penalty similar to reward
-                            positioning_reward = -0.5 * (regression / 8.0) * (10.0 / SCORE_UNIT)
-                        -- Penalty for not moving when misaligned
-                        elseif current_distance > 0 then
-                            positioning_reward = -0.1 * (10.0 / SCORE_UNIT)  -- Small penalty for stagnation
+                if target_lane_safe and current_target_distance ~= nil then
+                    local current_distance = current_target_distance
+                    local previous_distance = previous_target_distance
+
+                    if current_distance == 0 then
+                        positioning_reward = positioning_reward + TARGET_ALIGN_BONUS
+                    end
+
+                    if previous_distance ~= nil then
+                        local progress_segments = math.max(previous_distance - current_distance, 0.0)
+                        local regress_segments = math.max(current_distance - previous_distance, 0.0)
+
+                        if progress_segments > 0 then
+                            progress_segments = math.min(progress_segments, TARGET_DISTANCE_CLAMP)
+                            positioning_reward = positioning_reward + (progress_segments * TARGET_PROGRESS_BONUS_PER_SEG)
                         end
-                        
-                        -- Apply level-specific scaling
-                        if level_type == 2 then -- Open levels
-                            positioning_reward = positioning_reward * 1.1  -- Slightly increase positioning importance on open levels
-                        elseif level_type == 0 then -- Basic levels
-                            positioning_reward = positioning_reward * 0.9  -- Slightly reduce on simpler levels
+
+                        if regress_segments > 0 then
+                            regress_segments = math.min(regress_segments, TARGET_DISTANCE_CLAMP)
+                            positioning_reward = positioning_reward - (regress_segments * TARGET_REGRESS_PENALTY_PER_SEG)
+                        end
+
+                        if current_distance > 0 and progress_segments == 0 and regress_segments == 0 then
+                            positioning_reward = positioning_reward - TARGET_STALL_PENALTY
                         end
                     end
                 end
+
+                if positioning_reward ~= 0.0 then
+                    if level_type == 2 then -- Open levels
+                        positioning_reward = positioning_reward * 1.1
+                    elseif level_type == 0 then -- Basic levels
+                        positioning_reward = positioning_reward * 0.9
+                    end
+                end
+
                 subj_reward = subj_reward + positioning_reward
             end
 
@@ -793,22 +820,30 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- 7. USELESS MOVEMENT PENALTY (Discourage unnecessary spinner movement)
             -- Penalize spinner movement when it's not needed (aligned or no enemies)
             do
-                local spin_delta = math.abs(tonumber(player_state.spinner_detected or 0))
+                local raw_spin_delta = tonumber(player_state.spinner_detected or 0) or 0
+                local spin_delta = math.abs(raw_spin_delta)
                 if spin_delta > 0 then
-                    local player_abs_seg2 = player_state.position & 0x0F
-                    local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
-                    local is_open2 = (level_state.level_type == 0xFF)
+                    local normalized_units = spin_delta / SPINNER_UNITS_NORMALIZER
+                    normalized_units = math.min(normalized_units, SPINNER_NORMALIZED_CLAMP)
+
+                    -- Baseline movement cost applies regardless of intent
+                    local movement_cost = -SPINNER_MOVE_COST_BASE - (SPINNER_MOVE_COST_PER_UNIT * normalized_units)
+                    subj_reward = subj_reward + movement_cost
+
                     local need_move = false
-                    if nearest_abs ~= -1 then
-                        local rel = abs_to_rel_func(player_abs_seg2, nearest_abs, is_open2)
-                        need_move = math.abs(rel) > 0 -- misalignment needs movement
+                    if target_lane_safe and current_target_distance ~= nil then
+                        need_move = current_target_distance > 0.1
+                    else
+                        local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
+                        if nearest_abs ~= -1 then
+                            local rel = abs_to_rel_func(player_state.position & 0x0F, nearest_abs, is_open)
+                            need_move = math.abs(rel) > 0
+                        end
                     end
-                    
-                    -- Penalize movement when not needed (aligned or no enemies)
+
                     if not need_move then
-                        local units = math.min(4, spin_delta)
-                        local useless_penalty = -0.001 * units  -- Increased penalty for useless movement
-                        subj_reward = subj_reward + useless_penalty
+                        local extra_penalty = -USELESS_SPINNER_EXTRA_COST_PER_UNIT * (normalized_units + 0.25)
+                        subj_reward = subj_reward + extra_penalty
                     end
                 end
             end

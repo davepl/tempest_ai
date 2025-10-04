@@ -522,6 +522,8 @@ class PrioritizedReplayMemory:
         self.discrete_actions = np.empty((capacity,), dtype=np.int32)
         self.spinner_actions = np.empty((capacity,), dtype=np.int32)  # Discrete spinner actions (0-8)
         self.rewards = np.empty((capacity,), dtype=np.float32)
+        self.subj_rewards = np.empty((capacity,), dtype=np.float32)
+        self.obj_rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
         
@@ -529,7 +531,8 @@ class PrioritizedReplayMemory:
         self.priorities = np.full((capacity, 1), fill_value=self.eps, dtype=np.float32)
         self.max_priority = 1.0  # Track maximum priority for new experiences
         
-    def push(self, state, action_or_discrete, reward_or_spinner=None, next_state_or_reward=None, done_or_next_state=None, done=None):
+    def push(self, state, action_or_discrete, reward_or_spinner=None, next_state_or_reward=None,
+             done_or_next_state=None, done=None, subjreward=None, objreward=None):
         """Add experience to buffer with maximum priority.
         
         Supports both interfaces:
@@ -573,6 +576,8 @@ class PrioritizedReplayMemory:
             self.discrete_actions[self.position] = discrete_idx
             self.spinner_actions[self.position] = spinner_idx
             self.rewards[self.position] = float(reward)
+            self.subj_rewards[self.position] = float(reward if subjreward is None else subjreward)
+            self.obj_rewards[self.position] = float(reward if objreward is None else objreward)
             self.dones[self.position] = bool(done)
             
             # Set priority to maximum for new experiences
@@ -611,6 +616,8 @@ class PrioritizedReplayMemory:
         next_states_np = self.next_states[indices]
         batch_discrete_actions = self.discrete_actions[indices]
         batch_rewards = self.rewards[indices]
+        batch_subj_rewards = self.subj_rewards[indices]
+        batch_obj_rewards = self.obj_rewards[indices]
         batch_dones = self.dones[indices]
         
         # Convert to tensors (test-compatible format)
@@ -618,10 +625,12 @@ class PrioritizedReplayMemory:
         next_states = torch.from_numpy(next_states_np).float()
         actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()  # Only discrete for test compatibility
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        subj_rewards = torch.from_numpy(batch_subj_rewards.reshape(-1, 1)).float()
+        obj_rewards = torch.from_numpy(batch_obj_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
         is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
-        
-        return states, actions, rewards, next_states, dones, is_weights, indices
+
+        return states, actions, rewards, subj_rewards, obj_rewards, next_states, dones, is_weights, indices
     
     def sample_hybrid(self, batch_size: int, beta: float = 0.4):
         """Sample batch for dual discrete training with device movement.
@@ -648,6 +657,8 @@ class PrioritizedReplayMemory:
         batch_discrete_actions = self.discrete_actions[indices]
         batch_spinner_actions = self.spinner_actions[indices]
         batch_rewards = self.rewards[indices]
+        batch_subj_rewards = self.subj_rewards[indices]
+        batch_obj_rewards = self.obj_rewards[indices]
         batch_dones = self.dones[indices]
         
         # Convert to tensors with device movement
@@ -657,6 +668,8 @@ class PrioritizedReplayMemory:
         discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
         spinner_actions = torch.from_numpy(batch_spinner_actions.reshape(-1, 1)).long()  # Long for Q-value indexing
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        subj_rewards = torch.from_numpy(batch_subj_rewards.reshape(-1, 1)).float()
+        obj_rewards = torch.from_numpy(batch_obj_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
         is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
         
@@ -666,6 +679,8 @@ class PrioritizedReplayMemory:
             discrete_actions = discrete_actions.pin_memory()
             spinner_actions = spinner_actions.pin_memory()
             rewards = rewards.pin_memory()
+            subj_rewards = subj_rewards.pin_memory()
+            obj_rewards = obj_rewards.pin_memory()
             dones = dones.pin_memory()
             is_weights = is_weights.pin_memory()
         
@@ -675,10 +690,13 @@ class PrioritizedReplayMemory:
         discrete_actions = discrete_actions.to(training_device, non_blocking=True)
         spinner_actions = spinner_actions.to(training_device, non_blocking=True)
         rewards = rewards.to(training_device, non_blocking=True)
+        subj_rewards = subj_rewards.to(training_device, non_blocking=True)
+        obj_rewards = obj_rewards.to(training_device, non_blocking=True)
         dones = dones.to(training_device, non_blocking=True)
         is_weights = is_weights.to(training_device, non_blocking=True)
-        
-        return states, discrete_actions, spinner_actions, rewards, next_states, dones, is_weights, indices
+
+        return (states, discrete_actions, spinner_actions, rewards,
+                subj_rewards, obj_rewards, next_states, dones, is_weights, indices)
     
     def update_priorities(self, indices, td_errors):
         """Update priorities based on TD errors."""
@@ -725,10 +743,13 @@ class HybridReplayBuffer:
         self.discrete_actions = np.empty((capacity,), dtype=np.int32)
         self.spinner_actions = np.empty((capacity,), dtype=np.int32)  # Discrete spinner actions (0-8)
         self.rewards = np.empty((capacity,), dtype=np.float32)
+        self.subj_rewards = np.empty((capacity,), dtype=np.float32)
+        self.obj_rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
     
-    def push(self, state, discrete_action, spinner_action, reward, next_state, done):
+    def push(self, state, discrete_action, spinner_action, reward, next_state, done,
+             subjreward=None, objreward=None):
         """Add experience to buffer"""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
@@ -755,6 +776,8 @@ class HybridReplayBuffer:
         self.discrete_actions[self.position] = discrete_idx
         self.spinner_actions[self.position] = spinner_idx
         self.rewards[self.position] = reward
+        self.subj_rewards[self.position] = float(reward if subjreward is None else subjreward)
+        self.obj_rewards[self.position] = float(reward if objreward is None else objreward)
         try:
             ns = np.asarray(next_state, dtype=np.float32)
             if ns.ndim > 1:
@@ -813,6 +836,8 @@ class HybridReplayBuffer:
         batch_discrete_actions = self.discrete_actions[indices]
         batch_spinner_actions = self.spinner_actions[indices]
         batch_rewards = self.rewards[indices]
+        batch_subj_rewards = self.subj_rewards[indices]
+        batch_obj_rewards = self.obj_rewards[indices]
         batch_dones = self.dones[indices]
 
         # Convert to tensors (pin memory for fast H2D when on CUDA)
@@ -822,6 +847,8 @@ class HybridReplayBuffer:
         discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
         spinner_actions = torch.from_numpy(batch_spinner_actions.reshape(-1, 1)).long()  # Long for Q-value indexing
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        subj_rewards = torch.from_numpy(batch_subj_rewards.reshape(-1, 1)).float()
+        obj_rewards = torch.from_numpy(batch_obj_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
 
         if use_pinned:
@@ -830,6 +857,8 @@ class HybridReplayBuffer:
             discrete_actions = discrete_actions.pin_memory()
             spinner_actions = spinner_actions.pin_memory()
             rewards = rewards.pin_memory()
+            subj_rewards = subj_rewards.pin_memory()
+            obj_rewards = obj_rewards.pin_memory()
             dones = dones.pin_memory()
 
         non_block = True if training_device.type == 'cuda' else False
@@ -838,9 +867,11 @@ class HybridReplayBuffer:
         discrete_actions = discrete_actions.to(training_device, non_blocking=non_block)
         spinner_actions = spinner_actions.to(training_device, non_blocking=non_block)
         rewards = rewards.to(training_device, non_blocking=non_block)
+        subj_rewards = subj_rewards.to(training_device, non_blocking=non_block)
+        obj_rewards = obj_rewards.to(training_device, non_blocking=non_block)
         dones = dones.to(training_device, non_blocking=non_block)
         
-        return states, discrete_actions, spinner_actions, rewards, next_states, dones
+        return states, discrete_actions, spinner_actions, rewards, subj_rewards, obj_rewards, next_states, dones
     
     def __len__(self):
         return self.size
@@ -1217,9 +1248,19 @@ class HybridDQNAgent:
         status = "enabled" if self.n_step_enabled else "disabled"
         print(f"N-step learning {status}")
     
-    def step(self, state, firezap_action, spinner_action, reward, next_state, done):
+    def step(self, state, firezap_action, spinner_action, reward, next_state, done,
+             subjreward=None, objreward=None):
         """Add experience to memory and queue training"""
-        self.memory.push(state, firezap_action, spinner_action, reward, next_state, done)
+        self.memory.push(
+            state,
+            firezap_action,
+            spinner_action,
+            reward,
+            next_state,
+            done,
+            subjreward=subjreward,
+            objreward=objreward
+        )
         
         # Queue multiple training steps per experience
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
@@ -1314,8 +1355,14 @@ class HybridDQNAgent:
                            min(1.0, self.training_step / self.per_beta_decay_steps)
                     
                     batch_data = self.memory.sample_hybrid(self.batch_size, beta=beta)
-                    if batch_data is not None and len(batch_data) == 8:  # PER returns 8 elements
+                    if batch_data is not None and len(batch_data) == 10:  # PER returns extended tuple
+                        (states, firezap_actions, spinner_actions, rewards,
+                         subj_rewards, obj_rewards, next_states, dones,
+                         is_weights, indices) = batch_data
+                    elif batch_data is not None and len(batch_data) == 8:
                         states, firezap_actions, spinner_actions, rewards, next_states, dones, is_weights, indices = batch_data
+                        subj_rewards = rewards
+                        obj_rewards = rewards
                     else:
                         if acc_idx == 0:
                             return 0.0
@@ -1329,7 +1376,8 @@ class HybridDQNAgent:
                             return 0.0
                         else:
                             break
-                    states, firezap_actions, spinner_actions, rewards, next_states, dones = batch
+                    (states, firezap_actions, spinner_actions, rewards,
+                     subj_rewards, obj_rewards, next_states, dones) = batch
                     is_weights = None
                     indices = None
 
@@ -1365,21 +1413,28 @@ class HybridDQNAgent:
                     # n-step gamma and reward transforms
                     n_step = int(getattr(RL_CONFIG, 'n_step', 1) or 1)
                     gamma_boot = (self.gamma ** n_step) if n_step > 1 else self.gamma
-                    r = rewards
+
+                    firezap_rewards = rewards
+                    spinner_rewards = subj_rewards if subj_rewards is not None else rewards
+
                     try:
                         rs = float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
                         if rs != 1.0:
-                            r = r * rs
+                            firezap_rewards = firezap_rewards * rs
+                            spinner_rewards = spinner_rewards * rs
                         rc = float(getattr(RL_CONFIG, 'reward_clamp_abs', 0.0) or 0.0)
                         if rc > 0.0:
-                            r = torch.clamp(r, -rc, rc)
+                            firezap_rewards = torch.clamp(firezap_rewards, -rc, rc)
+                            spinner_rewards = torch.clamp(spinner_rewards, -rc, rc)
                         if bool(getattr(RL_CONFIG, 'reward_tanh', False)):
-                            r = torch.tanh(r)
+                            firezap_rewards = torch.tanh(firezap_rewards)
+                            spinner_rewards = torch.tanh(spinner_rewards)
                     except Exception:
                         pass
-                    # TD targets for both heads (same reward, different next Q-values)
-                    firezap_targets = r + (gamma_boot * firezap_q_next_max * (1 - dones))
-                    spinner_targets = r + (gamma_boot * spinner_q_next_max * (1 - dones))
+
+                    # TD targets for both heads (fire/zap uses total reward; spinner uses subjective component)
+                    firezap_targets = firezap_rewards + (gamma_boot * firezap_q_next_max * (1 - dones))
+                    spinner_targets = spinner_rewards + (gamma_boot * spinner_q_next_max * (1 - dones))
 
                 # Match dtypes under AMP
                 if use_amp:
@@ -1433,6 +1488,18 @@ class HybridDQNAgent:
                         # Use maximum TD error across both heads for priority
                         td_errors = torch.maximum(firezap_td_errors, spinner_td_errors)
                         self.memory.update_priorities(indices, td_errors)
+
+                # Telemetry updates for reward components (mean values)
+                try:
+                    if subj_rewards is not None:
+                        metrics.last_subj_reward = float(subj_rewards.mean().item())
+                except Exception:
+                    pass
+                try:
+                    if obj_rewards is not None:
+                        metrics.last_obj_reward = float(obj_rewards.mean().item())
+                except Exception:
+                    pass
 
                 # Store loss for telemetry and backward pass
                 total_loss_value += float((firezap_loss + w_spinner * spinner_loss).item()) / float(grad_accum_steps)

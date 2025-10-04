@@ -45,12 +45,15 @@ def test_basic_functionality():
     print(f"✓ Pushed 100 experiences, buffer size: {len(memory)}")
 
     # Test sampling
-    states, actions, rewards, next_states, dones, is_weights, indices = memory.sample(batch_size, beta=0.4)
+    (states, actions, rewards, subj_rewards, obj_rewards,
+     next_states, dones, is_weights, indices) = memory.sample(batch_size, beta=0.4)
 
     # Verify shapes
     assert states.shape == (batch_size, state_size), f"States shape: {states.shape}"
     assert actions.shape == (batch_size, 1), f"Actions shape: {actions.shape}"
     assert rewards.shape == (batch_size, 1), f"Rewards shape: {rewards.shape}"
+    assert subj_rewards.shape == (batch_size, 1), f"Subj rewards shape: {subj_rewards.shape}"
+    assert obj_rewards.shape == (batch_size, 1), f"Obj rewards shape: {obj_rewards.shape}"
     assert next_states.shape == (batch_size, state_size), f"Next states shape: {next_states.shape}"
     assert dones.shape == (batch_size, 1), f"Dones shape: {dones.shape}"
     assert is_weights.shape == (batch_size, 1), f"IS weights shape: {is_weights.shape}"
@@ -70,7 +73,7 @@ def test_basic_functionality():
     print("✓ Priority updates completed without errors")
 
     # Sample again and verify priorities were updated
-    _, _, _, _, _, is_weights2, _ = memory.sample(batch_size, beta=0.4)
+    _, _, _, _, _, _, _, is_weights2, _ = memory.sample(batch_size, beta=0.4)
     print(f"✓ Post-update importance weights range: [{is_weights2.min().item():.4f}, {is_weights2.max().item():.4f}]")
 
     return True
@@ -94,7 +97,7 @@ def test_priority_clamping():
 
     # Sample
     batch_size = 32
-    _, _, _, _, _, _, indices = memory.sample(batch_size, beta=0.4)
+    indices = memory.sample(batch_size, beta=0.4)[-1]
 
     # Test with extreme TD errors
     extreme_td_errors = torch.tensor([100.0, -50.0, 25.0, -25.0] * (batch_size // 4)).unsqueeze(1)
@@ -153,7 +156,7 @@ def test_thread_safety():
         try:
             for i in range(200):
                 if len(memory) >= batch_size:
-                    _, _, _, _, _, _, indices = memory.sample(batch_size, beta=0.4)
+                    indices = memory.sample(batch_size, beta=0.4)[-1]
                     td_errors = torch.randn(batch_size, 1)
                     memory.update_priorities(indices, td_errors)
                     sample_count[0] += 1
@@ -214,7 +217,8 @@ def test_edge_cases():
 
     # Test sampling from full buffer
     batch_size = 32
-    states, actions, rewards, next_states, dones, is_weights, indices = memory.sample(batch_size, beta=0.4)
+    (states, actions, rewards, subj_rewards, obj_rewards,
+     next_states, dones, is_weights, indices) = memory.sample(batch_size, beta=0.4)
 
     # Verify all indices are valid
     assert all(0 <= idx < capacity for idx in indices), f"Invalid indices: {indices}"
@@ -257,7 +261,7 @@ def test_active_window():
     batch_size = 64
     start_time = time.time()
     for _ in range(10):
-        _, _, _, _, _, _, indices = memory.sample(batch_size, beta=0.4)
+        indices = memory.sample(batch_size, beta=0.4)[-1]
     window_time = time.time() - start_time
 
     # Test without active window
@@ -265,7 +269,7 @@ def test_active_window():
 
     start_time = time.time()
     for _ in range(10):
-        _, _, _, _, _, _, indices = memory.sample(batch_size, beta=0.4)
+        indices = memory.sample(batch_size, beta=0.4)[-1]
     full_time = time.time() - start_time
 
     print(".2f")
@@ -298,7 +302,7 @@ def test_beta_annealing():
     # Test different beta values
     betas = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     for beta in betas:
-        _, _, _, _, _, is_weights, _ = memory.sample(batch_size, beta=beta)
+        is_weights = memory.sample(batch_size, beta=beta)[-2]
 
         # With beta=0, weights should be uniform (close to 1.0)
         # With beta=1, weights should vary more
@@ -376,7 +380,7 @@ def run_performance_test():
     print(f"Testing {num_samples} sampling operations...")
     start_time = time.time()
     for _ in range(num_samples):
-        _, _, _, _, _, _, indices = memory.sample(batch_size, beta=0.4)
+        indices = memory.sample(batch_size, beta=0.4)[-1]
         # Simulate priority updates
         td_errors = torch.randn(batch_size, 1) * 0.1
         memory.update_priorities(indices, td_errors)

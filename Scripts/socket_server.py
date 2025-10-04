@@ -298,6 +298,8 @@ class SocketServer:
                             total_reward,  # Use reward with diversity bonus
                             frame.state,
                             frame.done,
+                            subjreward=frame.subjreward,
+                            objreward=frame.objreward,
                             aux_action=int(spinner_action)  # Discrete spinner action
                         )
 
@@ -306,14 +308,49 @@ class SocketServer:
                             for item in experiences:
                                 try:
                                     # Handle both shapes depending on store_aux_action flag
-                                    if len(item) == 6:
-                                        exp_state, exp_firezap, exp_spinner, exp_reward, exp_next_state, exp_done = item
-                                        self.agent.step(exp_state, exp_firezap, exp_spinner, exp_reward, exp_next_state, exp_done)
+                                    if len(item) == 8:
+                                        (exp_state, exp_firezap, exp_spinner,
+                                         exp_reward, exp_subj, exp_obj,
+                                         exp_next_state, exp_done) = item
+                                        self.agent.step(
+                                            exp_state,
+                                            exp_firezap,
+                                            exp_spinner,
+                                            exp_reward,
+                                            exp_next_state,
+                                            exp_done,
+                                            subjreward=exp_subj,
+                                            objreward=exp_obj
+                                        )
+                                    elif len(item) == 6:
+                                        if state.get('nstep_buffer') and state['nstep_buffer'].store_aux_action:
+                                            exp_state, exp_firezap, exp_spinner, exp_reward, exp_next_state, exp_done = item
+                                            spinner_idx = exp_spinner
+                                        else:
+                                            exp_state, exp_firezap, exp_reward, exp_next_state, exp_done = item
+                                            spinner_idx = 4  # center
+                                        self.agent.step(
+                                            exp_state,
+                                            exp_firezap,
+                                            spinner_idx,
+                                            exp_reward,
+                                            exp_next_state,
+                                            exp_done,
+                                            subjreward=exp_reward,
+                                            objreward=exp_reward
+                                        )
                                     else:
-                                        # Legacy 5-tuple format (shouldn't happen with aux_action enabled)
                                         exp_state, exp_action, exp_reward, exp_next_state, exp_done = item
-                                        # Assume spinner action = 4 (center) for legacy compatibility
-                                        self.agent.step(exp_state, exp_action, 4, exp_reward, exp_next_state, exp_done)
+                                        self.agent.step(
+                                            exp_state,
+                                            exp_action,
+                                            4,
+                                            exp_reward,
+                                            exp_next_state,
+                                            exp_done,
+                                            subjreward=exp_reward,
+                                            objreward=exp_reward
+                                        )
                                 except TypeError:
                                     pass
                     else:
@@ -321,8 +358,16 @@ class SocketServer:
                         try:
                             if self.agent:
                                 # CRITICAL FIX: Pass discrete actions (both int)
-                                self.agent.step(state['last_state'], int(firezap_action), int(spinner_action), 
-                                              total_reward, frame.state, bool(frame.done))
+                                self.agent.step(
+                                    state['last_state'],
+                                    int(firezap_action),
+                                    int(spinner_action),
+                                    total_reward,
+                                    frame.state,
+                                    bool(frame.done),
+                                    subjreward=frame.subjreward,
+                                    objreward=frame.objreward
+                                )
                         except TypeError:
                             # Fallback for legacy agents (shouldn't happen)
                             try:

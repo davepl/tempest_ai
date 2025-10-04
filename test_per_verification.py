@@ -55,12 +55,15 @@ def main():
 
 	# Sample a batch and verify shapes and values
 	beta = float(getattr(aimodel.RL_CONFIG, 'per_beta_start', 0.4))
-	states, actions, rewards, next_states, dones, is_weights, indices = mem.sample(batch_size, beta=beta)
+	(states, actions, rewards, subj_rewards, obj_rewards,
+	 next_states, dones, is_weights, indices) = mem.sample(batch_size, beta=beta)
 
 	# Basic shape checks
 	assert states.shape == (batch_size, state_size)
 	assert actions.shape == (batch_size, 1)
 	assert rewards.shape == (batch_size, 1)
+	assert subj_rewards.shape == (batch_size, 1)
+	assert obj_rewards.shape == (batch_size, 1)
 	assert next_states.shape == (batch_size, state_size)
 	assert dones.shape == (batch_size, 1)
 	assert is_weights.shape == (batch_size, 1)

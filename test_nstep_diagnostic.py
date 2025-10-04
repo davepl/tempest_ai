@@ -28,8 +28,8 @@ def test_realistic_tempest_scenario():
         experiences.extend(out)
         if len(out) > 0:
             print(f"Step {i}: emitted {len(out)} experiences")
-            for j, (s, a, r, ns, d) in enumerate(out):
-                print(f"  Exp {j}: action={a}, n_step_return={r:.6f}")
+            for j, (s, a, r, r_subj, r_obj, ns, d) in enumerate(out):
+                print(f"  Exp {j}: action={a}, n_step_return={r:.6f}, subj={r_subj:.6f}, obj={r_obj:.6f}")
     
     print(f"Total experiences generated: {len(experiences)}")
     
@@ -69,11 +69,11 @@ def test_episode_end_behavior():
     
     print(f"Episode end produced {len(experiences)} experiences")
     
-    for i, (s, a, r, ns, d) in enumerate(experiences):
-        print(f"  Exp {i}: action={a}, return={r:.3f}, done={d}")
+    for i, (s, a, r, r_subj, r_obj, ns, d) in enumerate(experiences):
+        print(f"  Exp {i}: action={a}, return={r:.3f}, subj={r_subj:.3f}, obj={r_obj:.3f}, done={d}")
     
     # Check that all are marked as done
-    all_done = all(exp[4] for exp in experiences)
+    all_done = all(exp[6] for exp in experiences)
     if not all_done:
         print("❌ WARNING: Some experiences not marked as done!")
         return False
@@ -85,7 +85,7 @@ def test_episode_end_behavior():
         100.0                            # Terminal step gets 1-step return
     ]
     
-    for i, (expected, (_, _, actual, _, _)) in enumerate(zip(expected_returns, experiences)):
+    for i, (expected, (_, _, actual, _, _, _, _)) in enumerate(zip(expected_returns, experiences)):
         if abs(actual - expected) > 1e-6:
             print(f"❌ WARNING: Experience {i} return mismatch! Expected {expected:.3f}, got {actual:.3f}")
             return False

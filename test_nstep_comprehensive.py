@@ -25,8 +25,10 @@ def test_n_step_1_equivalent_to_standard():
     # Add one step
     out = buffer.add(s0, 5, 10.0, s1, False)
     assert len(out) == 1
-    s, a, r, ns, d = out[0]
+    s, a, r, r_subj, r_obj, ns, d = out[0]
     assert a == 5 and r == 10.0 and d == False
+    assert_close(r_subj, r)
+    assert_close(r_obj, r)
     np.testing.assert_array_equal(s, s0)
     np.testing.assert_array_equal(ns, s1)
     
@@ -34,8 +36,10 @@ def test_n_step_1_equivalent_to_standard():
     s2 = np.array([2.0])
     out = buffer.add(s1, 3, 5.0, s2, True)
     assert len(out) == 1
-    s, a, r, ns, d = out[0]
+    s, a, r, r_subj, r_obj, ns, d = out[0]
     assert a == 3 and r == 5.0 and d == True
+    assert_close(r_subj, r)
+    assert_close(r_obj, r)
     np.testing.assert_array_equal(s, s1)
     np.testing.assert_array_equal(ns, s2)
 
@@ -56,22 +60,26 @@ def test_mathematical_correctness():
     out = buffer.add(states[2], 3, 3.0, states[3], False)
     assert len(out) == 1
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     expected_R = 1.0 + 0.9*2.0 + 0.9*0.9*3.0  # 1 + 1.8 + 2.43 = 5.23
     assert_close(R, expected_R, msg="3-step return calculation")
     assert a == 1  # Action from first step
     np.testing.assert_array_equal(s, states[0])  # State from first step
     np.testing.assert_array_equal(ns, states[3])  # Next state from third step
     assert d == False
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
     
     # Fourth step should emit second n-step return
     out = buffer.add(states[3], 4, 4.0, states[4], False)
     assert len(out) == 1
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     expected_R = 2.0 + 0.9*3.0 + 0.9*0.9*4.0  # 2 + 2.7 + 3.24 = 7.94
     assert_close(R, expected_R, msg="Second 3-step return")
     assert a == 2
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def test_terminal_within_window():
@@ -91,23 +99,29 @@ def test_terminal_within_window():
     assert len(out) == 3
     
     # First transition: gets 3-step return (but truncated at terminal)
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     expected_R = 1.0 + 0.9*2.0 + 0.9*0.9*3.0  # Full 3-step
     assert_close(R, expected_R, msg="First transition n-step return")
     assert a == 1 and d == True  # Should be marked done
     np.testing.assert_array_equal(ns, states[3])  # Terminal next state
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
     
     # Second transition: gets 2-step return
-    s, a, R, ns, d = out[1]
+    s, a, R, R_subj, R_obj, ns, d = out[1]
     expected_R = 2.0 + 0.9*3.0  # 2-step return
     assert_close(R, expected_R, msg="Second transition 2-step return")
     assert a == 2 and d == True
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
     
     # Third transition: gets 1-step return
-    s, a, R, ns, d = out[2]
+    s, a, R, R_subj, R_obj, ns, d = out[2]
     expected_R = 3.0  # Just immediate reward
     assert_close(R, expected_R, msg="Third transition 1-step return")
     assert a == 3 and d == True
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def test_episode_boundary_isolation():
@@ -136,13 +150,15 @@ def test_episode_boundary_isolation():
     out = buffer.add(s2_states[2], 12, 300.0, s2_states[3], False)
     assert len(out) == 1
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     # Should be pure episode 2 data, no contamination from episode 1
     expected_R = 100.0 + 0.9*200.0 + 0.9*0.9*300.0
     assert_close(R, expected_R, msg="Episode 2 n-step return")
     assert a == 10  # First action of episode 2
     np.testing.assert_array_equal(s, s2_states[0])
     assert d == False
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def test_varying_gamma_values():
@@ -157,8 +173,10 @@ def test_varying_gamma_values():
     buffer.add(states[1], 2, 10.0, states[2], False)
     out = buffer.add(states[2], 3, 15.0, states[3], False)
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     assert_close(R, 5.0, msg="gamma=0 should only use immediate reward")
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
     
     # Test gamma = 1 (no discounting)
     buffer = NStepReplayBuffer(n_step=3, gamma=1.0)
@@ -166,8 +184,10 @@ def test_varying_gamma_values():
     buffer.add(states[1], 2, 10.0, states[2], False)
     out = buffer.add(states[2], 3, 15.0, states[3], False)
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     assert_close(R, 30.0, msg="gamma=1 should sum all rewards")  # 5 + 10 + 15
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def test_large_n_step():
@@ -186,12 +206,14 @@ def test_large_n_step():
     out = buffer.add(states[9], 9, 10.0, states[10], False)
     assert len(out) == 1
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     # Manual calculation for 10-step return
     expected_R = sum((0.95 ** i) * (i + 1) for i in range(10))
     assert_close(R, expected_R, msg="10-step return calculation")
     assert a == 0  # First action
     np.testing.assert_array_equal(ns, states[10])  # 10th next state
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def test_reset_functionality():
@@ -219,11 +241,13 @@ def test_reset_functionality():
     out = buffer.add(states[4], 12, 12.0, states[0], False)
     assert len(out) == 1
     
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     # Should be based on post-reset data only
     expected_R = 10.0 + 0.9*11.0 + 0.9*0.9*12.0
     assert_close(R, expected_R, msg="Post-reset n-step calculation")
     assert a == 10  # First action after reset
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def test_state_shape_preservation():
@@ -241,7 +265,7 @@ def test_state_shape_preservation():
     out = buffer.add(state_1d, 2, 2.0, state_scalar, False)
     
     assert len(out) == 1
-    s, a, R, ns, d = out[0]
+    s, a, R, R_subj, R_obj, ns, d = out[0]
     
     # Check shapes and dtypes preserved
     np.testing.assert_array_equal(s, state_2d)
@@ -250,6 +274,8 @@ def test_state_shape_preservation():
     assert ns.shape == (1,)
     assert s.dtype == np.float32
     assert ns.dtype == np.float32
+    assert_close(R_subj, R)
+    assert_close(R_obj, R)
 
 
 def run_all_tests():

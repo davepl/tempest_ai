@@ -53,7 +53,7 @@ class RLConfigData:
     # Removed: continuous_action_size (now using discrete spinner)
     # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
     batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.001                     # STABILITY FIX: Reduced from 0.003 to prevent Q-value divergence
+    lr: float = 0.003                     # STABILITY FIX: Reduced from 0.003 to prevent Q-value divergence
     gradient_accumulation_steps: int = 4  # STABILITY FIX: Increased from 1 to smooth gradients
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
@@ -72,7 +72,7 @@ class RLConfigData:
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
     memory_size: int = 5000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 6                  
+    num_layers: int = 8                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
@@ -144,7 +144,7 @@ class RLConfigData:
     reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
 
     # Subjective reward scaling (for movement/aiming rewards)
-    subj_reward_scale: float = 0.35       # Scale factor applied to subjective rewards from OOB
+    subj_reward_scale: float = 0.5       # Scale factor applied to subjective rewards from OOB
     
     # N-step returns: runtime toggle and diversity bonus settings
     n_step_enabled: bool = True           # Runtime toggle for n-step returns (hotkey 'n')
@@ -625,14 +625,14 @@ FIRE_ZAP_MAPPING = {
 
 SPINNER_MAPPING = {
     0: 0.0,
-    1: -0.9,
-    2: -0.6,
-    3: -0.3,
-    4: -0.1,
-    5:  0.1,
-    6:  0.3,
-    7:  0.6,
-    8:  0.9
+    1: -0.3,
+    2: -0.2,
+    3: -0.1,
+    4: -0.05,
+    5:  0.05,
+    6:  0.1,
+    7:  0.2,
+    8:  0.3
 }
 
 # Reverse mapping for quantizing expert actions to discrete spinner actions
