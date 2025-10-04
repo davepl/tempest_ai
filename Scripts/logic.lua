@@ -262,6 +262,44 @@ function M.is_danger_lane(segment, enemies_state)
     return false
 end
 
+-- Helper to decide if it's reasonable to reward spinner engagement in a lane.
+-- Allows shaping when a top-rail flipper/pulsar is present even though the lane
+-- is technically flagged as dangerous, while still blocking obviously lethal threats.
+local function is_lane_engageable_for_spinner(segment, enemies_state)
+    if segment == nil or segment == INVALID_SEGMENT or segment < 0 or segment > 15 then
+        return false
+    end
+
+    -- Immediate enemy shots make the lane too risky to encourage movement toward.
+    for i = 1, 4 do
+        if enemies_state.enemy_shot_abs_segments[i] == segment and
+           enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then
+            return false
+        end
+    end
+
+    if not M.is_danger_lane(segment, enemies_state) then
+        return true
+    end
+
+    local has_top_rail_target = false
+    for i = 1, 7 do
+        if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then
+            local enemy_type = enemies_state.enemy_core_type[i]
+            local depth = enemies_state.enemy_depths[i]
+            if enemy_type == ENEMY_TYPE_FUSEBALL then
+                return false -- never encourage moving into an active fuseball lane
+            end
+            if (enemy_type == ENEMY_TYPE_FLIPPER or enemy_type == ENEMY_TYPE_PULSAR) and depth <= TOP_RAIL_DEPTH then
+                has_top_rail_target = true
+                break
+            end
+        end
+    end
+
+    return has_top_rail_target
+end
+
 -- Helper function to find the segment of the nearest enemy at depth 0x10
 function M.find_nearest_top_rail_enemy_seg(player_abs_seg, enemies_state, abs_to_rel_func, is_open)
     local nearest_enemy_seg, min_dist = -1, 255
@@ -639,6 +677,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- Compute expert target once for reward gating (avoid rewarding moves toward danger)
             local expert_target_seg_cached = -1
             local target_lane_safe = false
+            local target_lane_engageable = false
             local current_target_distance = nil
             local previous_target_distance = nil
             local same_level = (level_state.level_number == (previous_level or level_state.level_number))
@@ -647,13 +686,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 expert_target_seg_cached = ets or -1
                 if expert_target_seg_cached ~= -1 then
                     target_lane_safe = not M.is_danger_lane(expert_target_seg_cached, enemies_state)
-                    if target_lane_safe then
-                        local current_player_seg = player_abs_seg
-                        local prev_player_seg = (previous_player_position or current_player_seg) & 0x0F
-                        current_target_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
-                        if same_level then
-                            previous_target_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
-                        end
+                    target_lane_engageable = is_lane_engageable_for_spinner(expert_target_seg_cached, enemies_state)
+                    local current_player_seg = player_abs_seg
+                    local prev_player_seg = (previous_player_position or current_player_seg) & 0x0F
+                    current_target_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
+                    if same_level then
+                        previous_target_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
                     end
                 end
             end
@@ -722,11 +760,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- Pulsar safety penalties removed per spec
 
             -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
-            -- Reward the DQN for following expert system's strategic positioning recommendations
-            -- IMPORTANT: If expert target lane is dangerous, skip positioning shaping entirely.
+            -- Reward the DQN for following expert system's strategic positioning recommendations.
+            -- Uses the "engageable" heuristic so we still encourage chasing top-rail flippers/pulsars
+            -- even though their lanes are technically flagged as dangerous.
             do
                 local positioning_reward = 0.0
-                if target_lane_safe and current_target_distance ~= nil then
+                if target_lane_engageable and current_target_distance ~= nil then
                     local current_distance = current_target_distance
                     local previous_distance = previous_target_distance
 
@@ -831,7 +870,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     subj_reward = subj_reward + movement_cost
 
                     local need_move = false
-                    if target_lane_safe and current_target_distance ~= nil then
+                    if target_lane_engageable and current_target_distance ~= nil then
                         need_move = current_target_distance > 0.1
                     else
                         local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
