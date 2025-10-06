@@ -251,6 +251,17 @@ class SocketServer:
                         state['fps'] = 1.0 / elapsed
                         state['last_frame_time'] = now
 
+                def require_actor_tag(context: str) -> str:
+                    actor_value = state.get('last_action_source')
+                    if actor_value is None:
+                        raise RuntimeError(f"{context}: missing actor tag for experience emission")
+                    actor_norm = str(actor_value).strip().lower()
+                    if not actor_norm:
+                        raise RuntimeError(f"{context}: blank actor tag for experience emission")
+                    if actor_norm in ('unknown', 'none', 'random'):
+                        raise RuntimeError(f"{context}: invalid actor tag '{actor_norm}'")
+                    return actor_norm
+
                 # global metrics batching
                 local_frame_accum += 1
                 if local_frame_accum >= METRICS_BATCH:
@@ -277,33 +288,128 @@ class SocketServer:
                             frame.reward,
                             frame.state,
                             frame.done,
-                            aux_action=float(ca)
+                            aux_action=float(ca),
+                            actor=require_actor_tag("n-step buffer push"),
                         )
 
                         # Push all matured experiences to agent
                         if self.agent and experiences:
                             for item in experiences:
                                 try:
-                                    # Handle both shapes depending on store_aux_action flag
-                                    if len(item) == 6:
-                                        exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done = item
-                                        self.agent.step(exp_state, exp_action, exp_continuous, exp_reward, exp_next_state, exp_done)
-                                    else:
-                                        exp_state, exp_action, exp_reward, exp_next_state, exp_done = item
-                                        # For legacy agents without continuous action
-                                        self.agent.step(exp_state, exp_action, exp_reward, exp_next_state, exp_done)
+                                    if len(item) == 8:
+                                        (exp_state,
+                                         exp_action,
+                                         exp_continuous,
+                                         exp_reward,
+                                         exp_next_state,
+                                         exp_done,
+                                         exp_steps,
+                                         exp_actor) = item
+                                        self.agent.step(
+                                            exp_state,
+                                            exp_action,
+                                            exp_continuous,
+                                            exp_reward,
+                                            exp_next_state,
+                                            exp_done,
+                                            actor=exp_actor,
+                                            horizon=exp_steps,
+                                        )
+                                    elif len(item) == 7:
+                                        (exp_state,
+                                         exp_action,
+                                         exp_reward,
+                                         exp_next_state,
+                                         exp_done,
+                                         exp_steps,
+                                         exp_actor) = item
+                                        self.agent.step(
+                                            exp_state,
+                                            exp_action,
+                                            exp_reward,
+                                            exp_next_state,
+                                            exp_done,
+                                            actor=exp_actor,
+                                            horizon=exp_steps,
+                                        )
                                 except TypeError:
-                                    pass
+                                    # Legacy agents without continuous head or actor support
+                                    try:
+                                        if len(item) == 8:
+                                            (exp_state,
+                                             exp_action,
+                                             _exp_continuous,
+                                             exp_reward,
+                                             exp_next_state,
+                                             exp_done,
+                                             exp_steps,
+                                             exp_actor) = item
+                                        else:
+                                            (exp_state,
+                                             exp_action,
+                                             exp_reward,
+                                             exp_next_state,
+                                             exp_done,
+                                             exp_steps,
+                                             exp_actor) = item
+                                        self.agent.step(
+                                            exp_state,
+                                            exp_action,
+                                            exp_reward,
+                                            exp_next_state,
+                                            exp_done,
+                                            actor=exp_actor,
+                                            horizon=exp_steps,
+                                        )
+                                    except TypeError:
+                                        try:
+                                            if len(item) == 8:
+                                                (exp_state,
+                                                 exp_action,
+                                                 _exp_continuous,
+                                                 exp_reward,
+                                                 exp_next_state,
+                                                 exp_done,
+                                                 _exp_steps,
+                                                 exp_actor) = item
+                                            else:
+                                                (exp_state,
+                                                 exp_action,
+                                                 exp_reward,
+                                                 exp_next_state,
+                                                 exp_done,
+                                                 _exp_steps,
+                                                 exp_actor) = item
+                                            self.agent.step(exp_state, exp_action, exp_reward, exp_next_state, exp_done, actor=exp_actor)
+                                        except TypeError:
+                                            pass
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
                         try:
                             if self.agent:
                                 # Hybrid agents expect (state, discrete, continuous, reward, next_state, done)
-                                self.agent.step(state['last_state'], int(da), float(ca), float(frame.reward), frame.state, bool(frame.done))
+                                self.agent.step(
+                                    state['last_state'],
+                                    int(da),
+                                    float(ca),
+                                    float(frame.reward),
+                                    frame.state,
+                                    bool(frame.done),
+                                    actor=require_actor_tag("direct push"),
+                                    horizon=1,
+                                )
                         except TypeError:
                             # Fallback for agents without continuous action in signature
                             try:
-                                self.agent.step(state['last_state'], int(da), float(frame.reward), frame.state, bool(frame.done))
+                                self.agent.step(
+                                    state['last_state'],
+                                    int(da),
+                                    float(frame.reward),
+                                    frame.state,
+                                    bool(frame.done),
+                                    actor=require_actor_tag("direct push legacy"),
+                                    horizon=1,
+                                )
                             except Exception:
                                 pass
 
@@ -369,7 +475,7 @@ class SocketServer:
                 self.metrics.increment_total_controls()
 
                 discrete_action, continuous_spinner = 0, 0.0
-                action_source = 'unknown'
+                action_source = None
 
                 if self.agent:
                     # expert vs dqn mixture with override forcing pure dqn

@@ -47,15 +47,12 @@ SERVER_CONFIG = ServerConfigData()
 class RLConfigData:
     """Reinforcement Learning Configuration"""
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
-    # Hybrid action space: 4 discrete fire/zap combinations + 1 continuous spinner
-    discrete_action_size: int = 4  # fire/zap combinations: (0,0), (1,0), (0,1), (1,1)
-    continuous_action_size: int = 1  # spinner value in [-0.3, +0.3]
     # Legacy removed: discrete 18-action size (pure hybrid model)
-    # Phase 1 Optimization: Larger batch + accumulation for better GPU utilization
-    batch_size: int = 16384               # Increased for better GPU utilization with AMP enabled
-    lr: float = 0.01                      # PLATEAU BREAKER: Double LR from 0.0025 to escape local optimum
-    gradient_accumulation_steps: int = 1  # Increased to simulate 131k effective batch for throughput
+    # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
+    batch_size: int = 4096                # Moderate batch for stability
+    lr: float = 0.0005                    # Conservative fixed learning rate
     gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
+
     epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
     epsilon_start: float = 0.25           # Start at 0.20 on next run
     # Quick Win: keep a bit more random exploration while DQN catches up
@@ -63,6 +60,7 @@ class RLConfigData:
     epsilon_end: float = 0.25            # Target floor
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
+
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.95      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
@@ -70,91 +68,48 @@ class RLConfigData:
     expert_ratio_min: float = 0.10        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
+
     memory_size: int = 2000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 6                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
-    use_noisy_nets: bool = False          # DISABLED: Use pure epsilon-greedy exploration for debugging
     
-    # Prioritized Experience Replay (PER) settings
-    use_per: bool = True                  # Enable Prioritized Experience Replay for better sample efficiency
-    per_alpha: float = 0.6                # Prioritization exponent (0=uniform, 1=fully prioritized)
-    per_beta_start: float = 0.4           # Initial importance sampling correction exponent
-    per_beta_end: float = 1.0             # Final importance sampling correction exponent
-    per_beta_decay_steps: int = 1000000   # Steps to linearly anneal beta from start to end
-    per_eps: float = 1e-6                 # Small constant to prevent zero priorities
+    # SIMPLIFIED: Disable PER - use uniform sampling only
     
-    # NOTE: gradient_accumulation_steps is defined above and should remain 2 for responsiveness
-    use_mixed_precision: bool = True      # Enable automatic mixed precision for better performance  
-    # Phase 1 Optimization: More frequent updates for faster convergence
-    training_steps_per_sample: int = 8    # Reduced from 8 to 2 to prevent queue overflow
-    training_workers: int = 4             # Increased from 8 to 16 for better queue processing
-    use_torch_compile: bool = True        # ENABLED - torch.compile for loss computation (safe in single-threaded training)
-    use_soft_target: bool = True          # Enable soft target updates for stability
+    # Single-threaded training
+    training_steps_per_sample: int = 1    # One update per sample
+    training_workers: int = 1             # SIMPLIFIED - single thread only
+    use_torch_compile: bool = False       # DISABLED - keep it simple
+    use_soft_target: bool = False         # SIMPLIFIED - hard updates only
     tau: float = 0.012                    # Slight bump for more responsive soft target tracking
-    # Optional hard refresh of target net even when using soft updates
-    hard_target_refresh_every_steps: int = 25000  # Slightly faster hard refresh cadence to re-anchor periodically
-    # Warmup hard-refresh policy (active only while total_training_steps < warmup_until_steps)
-    warmup_hard_refresh_until_steps: int = 2000
-    warmup_hard_refresh_every_steps: int = 200
-    # Watchdog: ensure a hard refresh happens at least every N seconds once training is active
-    hard_update_watchdog_seconds: float = 3600.0     # Once per hour; rely on soft targets primarily
-    # Legacy setting removed: zap_random_scale used only by legacy discrete agent
-    # Modest n-step to aid credit assignment without destabilizing
-    n_step: int = 7
-    # Enable dueling architecture for better value/advantage separation
-    use_dueling: bool = True              # ENABLED: Deeper network can benefit from dueling streams             
+    # SIMPLIFIED: No dueling architecture
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
     # Gradient clipping configuration
     max_grad_norm: float = 5.0            # Clip threshold for total grad norm (L2)
-    # Target clamp to stabilize bootstrapping near plateaus - DISABLED to observe natural Q-value range with gamma=0.95
-    clamp_targets: bool = False           # DISABLED: Let Q-values grow naturally to detect any remaining inflation
-    target_clamp_value: float = 8.0       # Value preserved for potential re-enable if needed
+    # SIMPLIFIED: Enable target clamping for stability
+    clamp_targets: bool = True            # ENABLED to prevent Q-value explosion
+    target_clamp_value: float = 200.0     # Reasonable clamp value
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    # Optimization: learning-rate schedule (frame-based)
+    # SIMPLIFIED: No LR schedule - fixed LR
     # Options: 'none', 'cosine'
-    lr_schedule: str = 'cosine'
-    lr_base: float = 0.001
-    lr_min: float = 5e-05
-    lr_warmup_frames: int = 250_000       # linear warmup from lr_min -> lr_base
-    lr_hold_until_frames: int = 1_000_000 # hold at lr_base until this frame
-    lr_decay_until_frames: int = 12_000_000 # cosine decay from hold -> this frame
 
-    # Targets: use Double DQN bootstrapping for discrete head
-    use_double_dqn: bool = True
 
-    # Replay sampling bias toward most recent data (windowed uniform)
+    # SIMPLIFIED: Pure uniform sampling
     # If bias > 0, sample this fraction from the most recent (window_frac) of the buffer
-    recent_sample_bias: float = 0.5       # 0.0 disables; 0.5 = half recent, half global
+    recent_sample_bias: float = 0.0       # DISABLED - uniform sampling only
     recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
 
-    # Exploration policy: allow adaptive epsilon floor adjustments as performance improves
-    adaptive_epsilon_floor: bool = True
-    # Expert policy: allow adaptive expert-ratio floor adjustments based on performance trend
-    adaptive_expert_floor: bool = False
 
-    # Loss weighting: balance continuous head relative to discrete head
-    continuous_loss_weight: float = 0.5
-
-    # Reward shaping/normalization controls (to stabilize targets when external reward scale changes)
-    reward_scale: float = 0.1            # Multiply incoming rewards by this factor before TD target
-    reward_clamp_abs: float = 0.0        # If > 0, clamp rewards to [-reward_clamp_abs, +reward_clamp_abs]
-    reward_tanh: bool = False            # If True, apply tanh to (scaled) rewards
+    # SIMPLIFIED: No reward transforms - use raw rewards
+    reward_scale: float = 1.0             # No scaling
 
     # Subjective reward scaling (for movement/aiming rewards)
     subj_reward_scale: float = 0.35       # Scale factor applied to subjective rewards from OOB
-
-    # Optional gradient value clamp (0.0 disables)
-    max_grad_value: float = 0.0
-
-    # Superzap gate: probability that a DQN-selected zap is actually executed (0..1)
-    # Expert-directed zaps are not gated.
-    superzap_prob: float = 0.01
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
