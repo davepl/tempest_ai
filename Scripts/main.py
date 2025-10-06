@@ -93,7 +93,8 @@ def keyboard_input_handler(agent, keyboard_handler):
                         pass
                     display_metrics_row(agent, keyboard_handler)
                 elif key.lower() == 'h':
-                    # Print the header
+                    # Do hard target update before displaying header
+                    agent.update_target_network()
                     display_metrics_header()
                 elif key == ' ':  # Handle space key
                     # Print only one row (no header)

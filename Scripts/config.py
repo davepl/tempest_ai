@@ -70,8 +70,8 @@ class RLConfigData:
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
 
     memory_size: int = 2000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 512               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 6                  
+    hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 4                  
     target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
     update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
     save_interval: int = 10000            # Model save frequency
@@ -82,8 +82,6 @@ class RLConfigData:
     training_steps_per_sample: int = 1    # One update per sample
     training_workers: int = 1             # SIMPLIFIED - single thread only
     use_torch_compile: bool = False       # DISABLED - keep it simple
-    use_soft_target: bool = False         # SIMPLIFIED - hard updates only
-    tau: float = 0.012                    # Slight bump for more responsive soft target tracking
     # SIMPLIFIED: No dueling architecture
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
@@ -522,19 +520,6 @@ class MetricsData:
             if kb_handler and IS_INTERACTIVE:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nEpsilon: {self.epsilon:.3f} (natural decay)\r")
-
-# Define hybrid action space
-# Discrete fire/zap combinations (4 total)
-FIRE_ZAP_MAPPING = {
-    0: (0, 0),  # No fire, no zap
-    1: (1, 0),  # Fire, no zap  
-    2: (0, 1),  # No fire, zap
-    3: (1, 1),  # Fire, zap
-}
-
-# Continuous spinner range - matches expert system full range
-SPINNER_MIN = -0.9
-SPINNER_MAX = 0.9
 
 # Legacy discrete action mapping removed (pure hybrid model)
 
