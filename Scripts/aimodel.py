@@ -722,7 +722,7 @@ class HybridDQNAgent:
         
         return int(discrete_action), float(continuous_action)
     
-    def step(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def step(self, state, discrete_action, continuous_action, reward, next_state, done, actor=None, horizon=1):
         """Add experience to memory and queue training"""
         self.memory.push(
             state,
@@ -808,14 +808,8 @@ class HybridDQNAgent:
 
         # Target computation
         with torch.no_grad():
-            if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
-                next_q_local, _ = self.qnetwork_local(next_states)
-                next_actions = next_q_local.argmax(dim=1, keepdim=True)
-                next_q_target, _ = self.qnetwork_target(next_states)
-                discrete_q_next_max = next_q_target.gather(1, next_actions)
-            else:
-                next_q_target, _ = self.qnetwork_target(next_states)
-                discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
+            next_q_target, _ = self.qnetwork_target(next_states)
+            discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
 
             discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
             continuous_targets = continuous_actions
@@ -848,20 +842,8 @@ class HybridDQNAgent:
         except Exception:
             pass
 
-        # Soft target update
-        if getattr(RL_CONFIG, 'use_soft_target', True):
-            tau = getattr(RL_CONFIG, 'tau', 0.005)
-            for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
-                target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
-            # Telemetry
-            try:
-                metrics.last_target_update_frame = metrics.frame_count
-                metrics.last_target_update_time = time.time()
-            except Exception:
-                pass
-        
         # Hard target update
-        elif self.training_steps % RL_CONFIG.target_update_freq == 0:
+        if self.training_steps % RL_CONFIG.target_update_freq == 0:
             self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
             # Telemetry
             try:
@@ -873,63 +855,6 @@ class HybridDQNAgent:
                 pass
         
         return float(total_loss.item())
-
-    def _apply_lr_schedule(self):
-        """Compute and apply per-frame LR based on RL_CONFIG schedule."""
-        sched = str(getattr(RL_CONFIG, 'lr_schedule', 'none') or 'none').lower()
-        if sched == 'none':
-            return
-        try:
-            if getattr(metrics, 'manual_lr_override', False):
-                lr_now = float(getattr(metrics, 'manual_learning_rate', self.learning_rate))
-                for g in self.optimizer.param_groups:
-                    g['lr'] = float(lr_now)
-                self.learning_rate = float(lr_now)
-                return
-        except Exception:
-            pass
-        # Determine current global frame
-        try:
-            fc = int(getattr(metrics, 'frame_count', 0) or 0)
-        except Exception:
-            fc = 0
-        lr_base = float(getattr(RL_CONFIG, 'lr_base', RL_CONFIG.lr) or RL_CONFIG.lr)
-        lr_min = float(getattr(RL_CONFIG, 'lr_min', lr_base * 0.1) or (lr_base * 0.1))
-        warm = int(getattr(RL_CONFIG, 'lr_warmup_frames', 0) or 0)
-        hold = int(getattr(RL_CONFIG, 'lr_hold_until_frames', 0) or 0)
-        decay_end = int(getattr(RL_CONFIG, 'lr_decay_until_frames', 0) or 0)
-
-        # Track old LR for change detection
-        old_lr = self.learning_rate
-        phase = "unknown"
-
-        # Piecewise: warmup -> hold -> cosine decay -> floor
-        if fc <= warm and warm > 0:
-            # Linear from lr_min to lr_base
-            t = fc / max(warm, 1)
-            lr_now = lr_min + (lr_base - lr_min) * t
-            phase = "warmup"
-        elif fc <= hold or decay_end <= hold:
-            lr_now = lr_base
-            phase = "hold"
-        elif fc <= decay_end:
-            # Cosine from lr_base to lr_min over [hold, decay_end]
-            import math
-            t = (fc - hold) / max(decay_end - hold, 1)
-            lr_now = lr_min + 0.5 * (lr_base - lr_min) * (1 + math.cos(math.pi * t))
-            phase = "decay"
-        else:
-            lr_now = lr_min
-            phase = "floor"
-
-        # Apply to optimizer groups
-        for g in self.optimizer.param_groups:
-            g['lr'] = float(lr_now)
-        self.learning_rate = float(lr_now)
-
-        # Print when LR changes significantly (> 0.1% relative change)
-        if abs(lr_now - old_lr) > 0.001 * max(abs(old_lr), abs(lr_now)):
-            print(f"Learning rate adjusted: {old_lr:.6f} → {lr_now:.6f} (phase={phase}, frame={fc:,})")
 
     def set_training_enabled(self, enabled: bool):
         """Enable/disable training at runtime. When disabling, drain pending work."""
@@ -1699,9 +1624,8 @@ class SafeMetrics:
             
     def update_expert_ratio(self):
         with self.lock:
-            # Respect override_expert: freeze expert_ratio at 0 while override is ON
-            # Also respect manual_expert_override: freeze expert_ratio while manual override is ON
-            if self.metrics.override_expert or getattr(self.metrics, 'manual_expert_override', False):
+            # Respect expert_mode, override_expert, and manual_expert_override: freeze expert_ratio while any are ON
+            if self.metrics.expert_mode or self.metrics.override_expert or getattr(self.metrics, 'manual_expert_override', False):
                 return self.metrics.expert_ratio
             decay_expert_ratio(self.metrics.frame_count)
             return self.metrics.expert_ratio
