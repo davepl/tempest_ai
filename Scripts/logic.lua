@@ -696,6 +696,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- 6. EXPERT POSITIONING REWARD (Follow Expert System Guidance)
             -- Reward the DQN for following expert system's strategic positioning recommendations
             -- IMPORTANT: If expert target lane is dangerous, skip positioning shaping entirely.
+            -- CRITICAL FIX: Only reward MOVEMENT toward target, never reward static alignment (prevents camping)
             do
                 local positioning_reward = 0.0
                 if expert_target_seg_cached ~= -1 then
@@ -708,18 +709,22 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local current_distance = math.abs(abs_to_rel_func(current_player_seg, expert_target_seg_cached, is_open))
                         local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
                         
-                        -- Award for being on target segment
-                        if current_distance == 0 then
-                            -- Worth ~10 points when perfectly aligned (10 / SCORE_UNIT)
-                            positioning_reward = 10.0 / SCORE_UNIT
-                        -- Award for moving toward target
-                        elseif current_distance < previous_distance then
+                        -- REMOVED: Static alignment bonus (was causing "camping" behavior)
+                        -- Award ONLY for moving toward target (improving alignment)
+                        if current_distance < previous_distance then
                             local progress = previous_distance - current_distance
-                            -- Scale small progress reward so it remains below score/death signals
+                            -- Scale progress reward so it remains below score/death signals
                             positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
-                        -- Small penalty for moving away from target or not moving when needed
-                        elseif current_distance > 0 then
-                            -- Penalties removed for moving away or not moving
+                        end
+                        -- No reward for holding position, even if aligned
+                        
+                        -- NEW: Reward firing when aligned AND shots available (edge-triggered)
+                        local fire_now = (player_state.fire_detected or 0)
+                        local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
+                        local shot_count = player_state.shot_count or 0
+                        if current_distance == 0 and fire_edge and shot_count < 8 then
+                            -- Reward successful firing action when aligned (~10 pts)
+                            positioning_reward = positioning_reward + (10.0 / SCORE_UNIT)
                         end
                         
                         -- Apply level-specific scaling

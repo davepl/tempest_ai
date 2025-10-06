@@ -52,13 +52,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# Removed StepLR and AMP imports (hybrid-only path doesn't use them)
 import select
 import threading
 import queue
 from collections import deque, namedtuple
 from datetime import datetime
-# Removed stable_baselines3 imports (no longer used after refactor)
 import socket
 import traceback
 from torch.nn import SmoothL1Loss # Import SmoothL1Loss
@@ -237,15 +235,12 @@ print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision',
 print(f"State size: {RL_CONFIG.state_size}")
 
 # For compatibility with single-device code
-device = device  # Legacy compatibility
 
 # Initialize metrics
 metrics = config_metrics
 
 # Global reference to server for metrics display
 metrics.global_server = None
-
-# Legacy discrete-only replay types removed; hybrid-only
 
 # Discrete-only QNetwork removed (hybrid-only)
 
@@ -812,6 +807,8 @@ class HybridDQNAgent:
             discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
 
             discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
+            # REVERTED: Keep behavioral cloning for continuous actions to preserve exploration
+            # The exploration noise in taken actions is essential for discovering new strategies
             continuous_targets = continuous_actions
 
         # Losses
@@ -1396,8 +1393,6 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
     spinner = -intensity if relative_dist > 0 else intensity
 
     return expert_fire, expert_zap, spinner
-
-### Legacy conversion helpers removed (pure hybrid model)
 
 def encode_action_to_game(fire, zap, spinner):
     """Convert action values to game-compatible format.
