@@ -697,6 +697,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- Reward the DQN for following expert system's strategic positioning recommendations
             -- IMPORTANT: If expert target lane is dangerous, skip positioning shaping entirely.
             -- CRITICAL FIX: Only reward MOVEMENT toward target, never reward static alignment (prevents camping)
+            -- VELOCITY-BASED: Reward higher velocity movements more than slow creeping (encourages "snappy" expert-like movements)
             do
                 local positioning_reward = 0.0
                 if expert_target_seg_cached ~= -1 then
@@ -710,11 +711,23 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local previous_distance = math.abs(abs_to_rel_func(prev_player_seg, expert_target_seg_cached, is_open))
                         
                         -- REMOVED: Static alignment bonus (was causing "camping" behavior)
-                        -- Award ONLY for moving toward target (improving alignment)
+                        -- Award ONLY for moving toward target with SUPERLINEAR velocity bonus
                         if current_distance < previous_distance then
-                            local progress = previous_distance - current_distance
-                            -- Scale progress reward so it remains below score/death signals
-                            positioning_reward = 0.5 * (progress / 8.0) * (10.0 / SCORE_UNIT)
+                            local velocity = previous_distance - current_distance  -- Movement speed in segments/frame
+                            
+                            -- SUPERLINEAR VELOCITY BONUS: Reward aggressive movement exponentially
+                            -- Moving 2 segments is worth MORE than 2x the reward of moving 1 segment
+                            -- This incentivizes the DQN to learn the expert's "quick and snappy" movement patterns
+                            -- instead of slow creeping that still technically "moves toward target"
+                            local base_scale = 0.5 / 8.0 * (10.0 / SCORE_UNIT)
+                            
+                            -- Quadratic bonus: velocity² scaling makes fast movement much more valuable
+                            -- Example: 1 segment = 1.0x, 2 segments = 2.5x, 3 segments = 4.0x reward
+                            local velocity_multiplier = 1.0 + (velocity * 0.75)  -- Quadratic term
+                            positioning_reward = base_scale * velocity * velocity_multiplier
+                            
+                            -- Alternative exponential bonus (currently commented out, can swap if quadratic insufficient):
+                            -- positioning_reward = base_scale * velocity * math.exp(velocity * 0.3)
                         end
                         -- No reward for holding position, even if aligned
                         
