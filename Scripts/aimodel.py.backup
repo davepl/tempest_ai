@@ -185,21 +185,69 @@ class FrameData:
 SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
-# Initialize device (single GPU setup)
+# Initialize devices (dual GPU setup: inference on GPU1, training on GPU0)
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
-    print(f"Using CUDA device: {device}")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    # Check if both GPUs are available for dual GPU setup
+    if torch.cuda.device_count() >= 4:
+        training_device = torch.device("cuda:0")
+        inference_device = torch.device("cuda:1")
+        print(f"Using dual GPU setup: Training on {training_device}, Inference on {inference_device}")
+        print(f"Available GPUs: {torch.cuda.device_count()}")
+        print(f"GPU 0: {torch.cuda.get_device_name(0)}")
+        print(f"GPU 1: {torch.cuda.get_device_name(1)}")
+    else:
+        # Fall back to single GPU if only one is available
+        training_device = torch.device("cuda:0")
+        inference_device = torch.device("cuda:0")
+        print(f"Only {torch.cuda.device_count()} GPU(s) available, using single GPU setup: {training_device}")
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print(f"Using MPS device: {device}")
+    training_device = torch.device("mps")
+    inference_device = torch.device("mps")
+    print(f"Using MPS for both inference and training: {training_device}")
 else:
-    device = torch.device("cpu")
-    print(f"Using CPU device: {device}")
+    training_device = torch.device("cpu")
+    inference_device = torch.device("cpu")
+    print(f"Using CPU for both inference and training: {training_device}")
+
+# Actor tagging constants
+ACTOR_UNKNOWN = 0
+ACTOR_DQN = 1
+ACTOR_EXPERT = 2
+ACTOR_OTHER = 3
+
+
+def _normalize_actor_label(actor: Optional[str]) -> str:
+    if actor is None:
+        raise ValueError("Actor label is required for replay entries")
+    label = str(actor).strip().lower()
+    if not label:
+        raise ValueError("Actor label cannot be blank")
+    return label
+
+
+def encode_actor_label(actor: Optional[str]) -> int:
+    label = _normalize_actor_label(actor)
+    if label in ('unknown', 'none', 'random'):
+        raise ValueError(f"Actor label '{label}' is not permitted in replay")
+    if 'expert' in label or 'human' in label:
+        return ACTOR_EXPERT
+    if 'dqn' in label or 'policy' in label:
+        return ACTOR_DQN
+    return ACTOR_OTHER
+
+
+def decode_actor_label(actor_id: int) -> str:
+    mapping = {
+        ACTOR_UNKNOWN: 'unknown',
+        ACTOR_DQN: 'dqn',
+        ACTOR_EXPERT: 'expert',
+        ACTOR_OTHER: 'other',
+    }
+    return mapping.get(int(actor_id), 'unknown')
 
 # Low-risk math speedups (CUDA only): allow TF32 and tune matmul/cudnn
 try:
-    if device.type == 'cuda':
+    if training_device.type == 'cuda':
         # Enable TF32 where available for faster matmuls
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -232,12 +280,13 @@ for i in range(1, len(layer_sizes)):
     print(f"  Layer {i+1}: {layer_sizes[i-1]} → {layer_sizes[i]}")
 print(f"  Head layers: {layer_sizes[-1]} → {max(64, layer_sizes[-1] // 2)}")
 
+print(f"Dueling: {'enabled' if getattr(RL_CONFIG, 'use_dueling', False) else 'disabled' } ")
 print("Replay: hybrid experience buffer (discrete + continuous)")
 print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision', False) else 'disabled'}")
 print(f"State size: {RL_CONFIG.state_size}")
 
-# For compatibility with single-device code
-device = device  # Legacy compatibility
+# For compatibility with dual-device code
+device = training_device  # Legacy compatibility
 
 # Initialize metrics
 metrics = config_metrics
@@ -248,6 +297,53 @@ metrics.global_server = None
 # Legacy discrete-only replay types removed; hybrid-only
 
 # Discrete-only QNetwork removed (hybrid-only)
+
+class NoisyLinear(nn.Module):
+    """Factorized Gaussian NoisyNet layer (adds noise only in training mode)."""
+    def __init__(self, in_features: int, out_features: int, sigma_init: float = 0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Learnable parameters
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+
+        # Buffers for noise
+        self.register_buffer('weight_eps', torch.empty(out_features, in_features))
+        self.register_buffer('bias_eps', torch.empty(out_features))
+
+        self.reset_parameters(sigma_init)
+        self.reset_noise()
+
+    def reset_parameters(self, sigma_init: float):
+        mu_range = 1 / np.sqrt(self.in_features)
+        with torch.no_grad():
+            self.weight_mu.uniform_(-mu_range, mu_range)
+            self.bias_mu.uniform_(-mu_range, mu_range)
+            self.weight_sigma.fill_(sigma_init / np.sqrt(self.in_features))
+            self.bias_sigma.fill_(sigma_init / np.sqrt(self.out_features))
+
+    def _scale_noise(self, size):
+        x = torch.randn(size, device=self.weight_mu.device)
+        return x.sign() * x.abs().sqrt()
+
+    def reset_noise(self):
+        eps_in = self._scale_noise(self.in_features)
+        eps_out = self._scale_noise(self.out_features)
+        self.weight_eps.copy_(eps_out.ger(eps_in))
+        self.bias_eps.copy_(eps_out)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            # Use current sampled noise; do not mutate buffers during forward
+            weight = self.weight_mu + self.weight_sigma * self.weight_eps
+            bias = self.bias_mu + self.bias_sigma * self.bias_eps
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(input, weight, bias)
 
 class HybridDQN(nn.Module):
     """Hybrid DQN with discrete fire/zap actions + continuous spinner.
@@ -262,15 +358,18 @@ class HybridDQN(nn.Module):
     - continuous_spinner: (batch_size, 1) spinner values in [-0.9, +0.9]
     """
     def __init__(self, state_size: int, discrete_actions: int = 4, 
-                 hidden_size: int = 512, num_layers: int = 3):
+                 hidden_size: int = 512, num_layers: int = 3, 
+                 use_dueling: bool = False, use_noisy: bool = False, noisy_std: float = 0.1):
         super(HybridDQN, self).__init__()
         
         self.state_size = state_size
         self.discrete_actions = discrete_actions
+        self.use_dueling = use_dueling
+        self.use_noisy = use_noisy
         self.num_layers = num_layers
         
         # Shared trunk for feature extraction
-        LinearOrNoisy = nn.Linear  # Noisy networks removed for simplification
+        LinearOrNoisy = NoisyLinear if use_noisy else nn.Linear
         
         # Dynamic layer sizing with pairs: A,A -> A/2,A/2 -> A/4,A/4 -> ...
         # Pattern: 512,512 -> 256,256 -> 128,128 -> ...
@@ -286,19 +385,32 @@ class HybridDQN(nn.Module):
         self.shared_layers = nn.ModuleList()
         
         # First layer: state_size -> hidden_size
-        self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
+        if use_noisy:
+            self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0], noisy_std))
+        else:
+            self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
         
         # Subsequent layers: hidden_size -> hidden_size/2 -> hidden_size/4 -> ...
         for i in range(1, num_layers):
-            self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
+            if use_noisy:
+                self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i], noisy_std))
+            else:
+                self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
         
         # Final layer size for heads
         shared_output_size = layer_sizes[-1]
         head_size = max(64, shared_output_size // 2)  # Head layer size
         
-        # Standard Q-network for discrete Q-values
-        self.discrete_fc = nn.Linear(shared_output_size, head_size)
-        self.discrete_out = nn.Linear(head_size, discrete_actions)
+        if use_dueling:
+            # Dueling architecture for discrete Q-values
+            self.discrete_val_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_adv_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_val_out = nn.Linear(head_size, 1)  # State value
+            self.discrete_adv_out = nn.Linear(head_size, discrete_actions)  # Advantages
+        else:
+            # Standard architecture for discrete Q-values
+            self.discrete_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_out = nn.Linear(head_size, discrete_actions)
         
         # Continuous head for spinner (always separate from dueling)
         self.continuous_fc1 = nn.Linear(shared_output_size, head_size)
@@ -309,6 +421,13 @@ class HybridDQN(nn.Module):
         # Initialize continuous head with smaller weights for stable training
         torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
         torch.nn.init.constant_(self.continuous_out.bias, 0.0)
+    
+    def reset_noise(self):
+        """Reset noise layers if using noisy networks"""
+        if self.use_noisy:
+            for m in self.modules():
+                if isinstance(m, NoisyLinear):
+                    m.reset_noise()
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass returning (discrete_q_values, continuous_spinner)
@@ -326,8 +445,20 @@ class HybridDQN(nn.Module):
             shared = F.relu(layer(shared))
         
         # Discrete Q-values head
-        discrete = F.relu(self.discrete_fc(shared))
-        discrete_q = self.discrete_out(discrete)  # (B, discrete_actions)
+        if self.use_dueling:
+            # Dueling network: V(s) + A(s,a) - mean(A(s,·))
+            discrete_val = F.relu(self.discrete_val_fc(shared))
+            discrete_val = self.discrete_val_out(discrete_val)  # (B, 1)
+            
+            discrete_adv = F.relu(self.discrete_adv_fc(shared))
+            discrete_adv = self.discrete_adv_out(discrete_adv)  # (B, discrete_actions)
+            
+            # Center advantages around their mean
+            discrete_q = discrete_val + (discrete_adv - discrete_adv.mean(dim=1, keepdim=True))
+        else:
+            # Standard Q-network
+            discrete = F.relu(self.discrete_fc(shared))
+            discrete_q = self.discrete_out(discrete)  # (B, discrete_actions)
         
         # Continuous spinner head
         continuous = F.relu(self.continuous_fc1(shared))
@@ -338,6 +469,273 @@ class HybridDQN(nn.Module):
         continuous_spinner = torch.tanh(continuous_raw) * 0.9
         
         return discrete_q, continuous_spinner
+
+class PrioritizedReplayMemory:
+    """Prioritized Experience Replay buffer for hybrid discrete-continuous actions.
+    
+    Implements the prioritized sampling mechanism from:
+    "Prioritized Experience Replay" (Schaul et al. 2015)
+    
+    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
+    Maintains priorities in a sum tree for efficient sampling.
+    """
+    
+    def __init__(self, capacity: int, alpha: float = 0.6, eps: float = 1e-6, state_size: int = None):
+        self.capacity = capacity
+        self.alpha = alpha  # Prioritization exponent
+        self.eps = eps      # Small constant to prevent zero priorities
+        self.position = 0
+        self.size = 0
+        self.sample_calls = 0
+        
+        # State size from config if not provided
+        if state_size is None:
+            state_size = getattr(RL_CONFIG, 'state_size', 175)
+        self.state_size = int(state_size)
+        
+        # Pre-allocated arrays for experiences
+        self.states = np.empty((capacity, self.state_size), dtype=np.float32)
+        self.discrete_actions = np.empty((capacity,), dtype=np.int32)
+        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
+        self.rewards = np.empty((capacity,), dtype=np.float32)
+        self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
+        self.dones = np.empty((capacity,), dtype=np.bool_)
+        self.actors = np.zeros((capacity,), dtype=np.uint8)
+        self.horizons = np.ones((capacity,), dtype=np.int16)
+        
+        # Priority storage (using simple array for efficiency)
+        self.priorities = np.full((capacity, 1), fill_value=self.eps, dtype=np.float32)
+        self.max_priority = 1.0  # Track maximum priority for new experiences
+        
+    def _ensure_valid_priorities(self, prios: Optional[np.ndarray] = None):
+        if prios is None:
+            prios = self.priorities[:self.size, 0]
+        if prios.size == 0:
+            return
+        if not np.all(np.isfinite(prios)):
+            raise AssertionError("PER priorities contain non-finite values")
+        if not np.all(prios > 0):
+            raise AssertionError("PER priorities must be strictly positive")
+
+    def validate_priorities(self):
+        """External hook for tests to validate priority buffer integrity."""
+        self._ensure_valid_priorities()
+
+    def push(self, state, action_or_discrete, reward_or_continuous=None, next_state_or_reward=None,
+             done_or_next_state=None, done=None, actor=None, horizon=None):
+        """Add experience to buffer with maximum priority.
+        
+        Supports both interfaces:
+        - Hybrid: push(state, discrete_action, continuous_action, reward, next_state, done)
+        - Simple: push(state, action, reward, next_state, done) 
+        """
+        # Detect interface by argument count
+        if done is not None:
+            # 6-argument hybrid interface
+            discrete_action = action_or_discrete
+            continuous_action = reward_or_continuous
+            reward = next_state_or_reward
+            next_state = done_or_next_state
+        else:
+            # 5-argument simple interface (for tests)
+            discrete_action = action_or_discrete
+            continuous_action = 0.0  # Default continuous action for test compatibility
+            reward = reward_or_continuous
+            next_state = next_state_or_reward
+            done = done_or_next_state
+
+        if actor is None:
+            raise ValueError("PrioritizedReplayMemory.push requires an explicit actor tag")
+        steps = int(horizon) if horizon and int(horizon) > 0 else 1
+        
+        # Coerce inputs to proper types
+        discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
+        continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        
+        # Clamp continuous action to valid range
+        continuous_val = max(-0.9, min(0.9, continuous_val))
+        
+        # Store experience
+        try:
+            s = np.asarray(state, dtype=np.float32)
+            if s.shape != (self.state_size,):
+                s = s.reshape(self.state_size)
+            self.states[self.position] = s
+            
+            ns = np.asarray(next_state, dtype=np.float32)
+            if ns.shape != (self.state_size,):
+                ns = ns.reshape(self.state_size)
+            self.next_states[self.position] = ns
+            
+            self.discrete_actions[self.position] = discrete_idx
+            self.continuous_actions[self.position] = continuous_val
+            self.rewards[self.position] = float(reward)
+            self.dones[self.position] = bool(done)
+            self.actors[self.position] = encode_actor_label(actor)
+            self.horizons[self.position] = max(1, min(32767, steps))
+            
+            # Set priority to maximum for new experiences
+            self.priorities[self.position, 0] = self.max_priority
+            
+            self.position = (self.position + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
+            
+        except Exception as e:
+            print(f"Error in PER push: {e}")
+            print(f"Shapes: state={state.shape if hasattr(state, 'shape') else type(state)}, "
+                  f"next_state={next_state.shape if hasattr(next_state, 'shape') else type(next_state)}")
+            raise
+    
+    def sample(self, batch_size: int, beta: float = 0.4):
+        """Sample batch of experiences with prioritized sampling.
+        
+        Returns test-compatible format: (states, actions, rewards, next_states, dones, actors, is_weights, indices)
+        """
+        if self.size < batch_size:
+            raise AssertionError(f"Cannot sample {batch_size} from buffer of size {self.size}")
+        
+        # Get priorities for available experiences
+        active_prios = self.priorities[:self.size, 0]
+        self.sample_calls += 1
+        strict_every = int(getattr(RL_CONFIG, 'per_strict_checks_every', 0) or 0)
+        if strict_every <= 0 or (self.sample_calls % max(1, strict_every)) == 0:
+            self._ensure_valid_priorities(active_prios)
+
+        prios = active_prios ** self.alpha
+        sum_prios = prios.sum()
+        if not np.isfinite(sum_prios) or sum_prios <= 0:
+            raise AssertionError("PER priorities sum is invalid")
+        probs = prios / sum_prios
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(len(probs), size=batch_size, replace=False, p=probs)
+        
+        # Calculate importance sampling weights
+        weights = (self.size * probs[indices]) ** (-beta)
+        weights = weights / weights.max()  # Normalize to [0, 1]
+        
+        # Gather experiences (vectorized)
+        states_np = self.states[indices]
+        next_states_np = self.next_states[indices]
+        batch_discrete_actions = self.discrete_actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_dones = self.dones[indices]
+        batch_actors = self.actors[indices]
+        batch_horizons = self.horizons[indices]
+        
+        # Convert to tensors (test-compatible format)
+        states = torch.from_numpy(states_np).float()
+        next_states = torch.from_numpy(next_states_np).float()
+        actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()  # Only discrete for test compatibility
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        actors = torch.from_numpy(batch_actors.reshape(-1, 1).astype(np.int16)).long()
+        horizons = torch.from_numpy(batch_horizons.reshape(-1, 1).astype(np.int16)).long()
+        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
+        
+        return states, actions, rewards, next_states, dones, horizons, actors, is_weights, indices
+    
+    def sample_hybrid(self, batch_size: int, beta: float = 0.4):
+        """Sample batch for hybrid training with device movement.
+        
+        Returns: (states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, is_weights, indices)
+        """
+        if self.size < batch_size:
+            return None
+        
+        # Get priorities for available experiences
+        active_prios = self.priorities[:self.size, 0]
+        self.sample_calls += 1
+        strict_every = int(getattr(RL_CONFIG, 'per_strict_checks_every', 0) or 0)
+        if strict_every <= 0 or (self.sample_calls % max(1, strict_every)) == 0:
+            self._ensure_valid_priorities(active_prios)
+
+        prios = active_prios ** self.alpha
+        sum_prios = prios.sum()
+        if not np.isfinite(sum_prios) or sum_prios <= 0:
+            raise AssertionError("PER priorities sum is invalid")
+        probs = prios / sum_prios
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(len(probs), size=batch_size, replace=False, p=probs)
+        
+        # Calculate importance sampling weights
+        weights = (self.size * probs[indices]) ** (-beta)
+        weights = weights / weights.max()  # Normalize to [0, 1]
+        
+        # Gather experiences (vectorized)
+        states_np = self.states[indices]
+        next_states_np = self.next_states[indices]
+        batch_discrete_actions = self.discrete_actions[indices]
+        batch_continuous_actions = self.continuous_actions[indices]
+        batch_rewards = self.rewards[indices]
+        batch_dones = self.dones[indices]
+        batch_actors = self.actors[indices]
+        batch_horizons = self.horizons[indices]
+        
+        # Convert to tensors with device movement
+        use_pinned = (training_device.type == 'cuda')
+        states = torch.from_numpy(states_np).float()
+        next_states = torch.from_numpy(next_states_np).float()
+        discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
+        continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
+        rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
+        dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        actors = torch.from_numpy(batch_actors.reshape(-1, 1).astype(np.int16)).long()
+        horizons = torch.from_numpy(batch_horizons.reshape(-1, 1).astype(np.int16)).long()
+        is_weights = torch.from_numpy(weights.reshape(-1, 1)).float()
+        
+        if use_pinned:
+            states = states.pin_memory()
+            next_states = next_states.pin_memory()
+            discrete_actions = discrete_actions.pin_memory()
+            continuous_actions = continuous_actions.pin_memory()
+            rewards = rewards.pin_memory()
+            dones = dones.pin_memory()
+            actors = actors.pin_memory()
+            horizons = horizons.pin_memory()
+            is_weights = is_weights.pin_memory()
+        
+        # Move to training device
+        states = states.to(training_device, non_blocking=True)
+        next_states = next_states.to(training_device, non_blocking=True)
+        discrete_actions = discrete_actions.to(training_device, non_blocking=True)
+        continuous_actions = continuous_actions.to(training_device, non_blocking=True)
+        rewards = rewards.to(training_device, non_blocking=True)
+        dones = dones.to(training_device, non_blocking=True)
+        actors = actors.to(training_device, non_blocking=True)
+        horizons = horizons.to(training_device, non_blocking=True)
+        is_weights = is_weights.to(training_device, non_blocking=True)
+        
+        return (states, discrete_actions, continuous_actions, rewards, next_states, dones,
+                horizons, actors, is_weights, indices)
+    
+    def update_priorities(self, indices, td_errors):
+        """Update priorities based on TD errors."""
+        if isinstance(td_errors, torch.Tensor):
+            td_errors = td_errors.detach().cpu().numpy()
+        
+        # Convert to numpy and ensure proper shape
+        td_errors = np.asarray(td_errors).flatten()
+        indices = np.asarray(indices)
+        
+        # Clamp TD errors to keep priorities in a reasonable range
+        td_errors = np.clip(td_errors, 0, 5.0)
+        
+        # Update priorities: priority = |TD error| + eps
+        new_priorities = np.abs(td_errors) + self.eps
+        
+        # Update the priority array
+        for i, idx in enumerate(indices):
+            if 0 <= idx < self.size:
+                self.priorities[idx, 0] = new_priorities[i]
+        
+        # Update maximum priority for future new experiences
+        self.max_priority = max(self.max_priority, new_priorities.max())
+    
+    def __len__(self):
+        """Return current buffer size."""
+        return self.size
 
 class HybridReplayBuffer:
     """Experience replay buffer for hybrid discrete-continuous actions.
@@ -361,15 +759,21 @@ class HybridReplayBuffer:
         self.rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
+        self.actors = np.zeros((capacity,), dtype=np.uint8)
+        self.horizons = np.ones((capacity,), dtype=np.int16)
 
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor=None, horizon=None):
         """Add experience to buffer"""
+        if actor is None:
+            raise ValueError("HybridReplayBuffer.push requires an explicit actor tag")
+
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
 
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
+        steps = int(horizon) if horizon and int(horizon) > 0 else 1
 
         # Store experience
         try:
@@ -403,6 +807,8 @@ class HybridReplayBuffer:
         except Exception:
             self.next_states[self.position, :] = 0.0
         self.dones[self.position] = done
+        self.actors[self.position] = encode_actor_label(actor)
+        self.horizons[self.position] = max(1, min(32767, steps))
 
         # Update position and size
         self.position = (self.position + 1) % self.capacity
@@ -448,15 +854,18 @@ class HybridReplayBuffer:
         batch_continuous_actions = self.continuous_actions[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
+        batch_horizons = self.horizons[indices]
 
         # Convert to tensors (pin memory for fast H2D when on CUDA)
-        use_pinned = (device.type == 'cuda')
+        use_pinned = (training_device.type == 'cuda')
         states = torch.from_numpy(states_np).float()
         next_states = torch.from_numpy(next_states_np).float()
         discrete_actions = torch.from_numpy(batch_discrete_actions.reshape(-1, 1)).long()
         continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        actors = torch.from_numpy(self.actors[indices].reshape(-1, 1).astype(np.int16)).long()
+        horizons = torch.from_numpy(batch_horizons.reshape(-1, 1).astype(np.int16)).long()
 
         if use_pinned:
             states = states.pin_memory()
@@ -465,16 +874,20 @@ class HybridReplayBuffer:
             continuous_actions = continuous_actions.pin_memory()
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
+            actors = actors.pin_memory()
+            horizons = horizons.pin_memory()
 
-        non_block = True if device.type == 'cuda' else False
-        states = states.to(device, non_blocking=non_block)
-        next_states = next_states.to(device, non_blocking=non_block)
-        discrete_actions = discrete_actions.to(device, non_blocking=non_block)
-        continuous_actions = continuous_actions.to(device, non_blocking=non_block)
-        rewards = rewards.to(device, non_blocking=non_block)
-        dones = dones.to(device, non_blocking=non_block)
+        non_block = True if training_device.type == 'cuda' else False
+        states = states.to(training_device, non_blocking=non_block)
+        next_states = next_states.to(training_device, non_blocking=non_block)
+        discrete_actions = discrete_actions.to(training_device, non_blocking=non_block)
+        continuous_actions = continuous_actions.to(training_device, non_blocking=non_block)
+        rewards = rewards.to(training_device, non_blocking=non_block)
+        dones = dones.to(training_device, non_blocking=non_block)
+        actors = actors.to(training_device, non_blocking=non_block)
+        horizons = horizons.to(training_device, non_blocking=non_block)
         
-        return states, discrete_actions, continuous_actions, rewards, next_states, dones
+        return states, discrete_actions, continuous_actions, rewards, next_states, dones, horizons, actors
     
     def __len__(self):
         return self.size
@@ -637,23 +1050,38 @@ class HybridDQNAgent:
         self.batch_size = batch_size
         self.last_save_time = 0.0
         
-        # Hybrid neural networks (single device)
+        # Hybrid neural networks
         self.qnetwork_local = HybridDQN(
             state_size=state_size,
             discrete_actions=discrete_actions,
             hidden_size=RL_CONFIG.hidden_size,
-            num_layers=RL_CONFIG.num_layers
-        ).to(device)
+            num_layers=RL_CONFIG.num_layers,
+            use_dueling=RL_CONFIG.use_dueling,
+            use_noisy=RL_CONFIG.use_noisy_nets
+        ).to(training_device)
         
         self.qnetwork_target = HybridDQN(
             state_size=state_size,
             discrete_actions=discrete_actions,
             hidden_size=RL_CONFIG.hidden_size,
-            num_layers=RL_CONFIG.num_layers
-        ).to(device)
+            num_layers=RL_CONFIG.num_layers,
+            use_dueling=RL_CONFIG.use_dueling,
+            use_noisy=RL_CONFIG.use_noisy_nets
+        ).to(training_device)
         
-        # Use same network for inference (no separate inference network)
-        self.qnetwork_inference = self.qnetwork_local
+        # Create inference copy on inference device
+        if inference_device != training_device:
+            print(f"Creating dedicated hybrid inference network on {inference_device}")
+            self.qnetwork_inference = HybridDQN(
+                state_size=state_size,
+                discrete_actions=discrete_actions,
+                hidden_size=RL_CONFIG.hidden_size,
+                num_layers=RL_CONFIG.num_layers,
+                use_dueling=RL_CONFIG.use_dueling,
+                use_noisy=RL_CONFIG.use_noisy_nets
+            ).to(inference_device)
+        else:
+            self.qnetwork_inference = self.qnetwork_local
         
         # Initialize target network
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
@@ -666,15 +1094,51 @@ class HybridDQNAgent:
         if self.qnetwork_inference is not self.qnetwork_local:
             self.qnetwork_inference.eval()
         
-        # Store device reference
-        self.device = device
+        # Store device references
+        self.inference_device = inference_device
+        self.training_device = training_device
         
         # Optimizer with separate parameter groups for discrete and continuous components
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=learning_rate)
         
-        # Experience replay (simplified to uniform sampling only)
-        self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
-        print("Using standard HybridReplayBuffer (uniform sampling)")
+        # Experience replay (choose buffer type based on config)
+        if getattr(RL_CONFIG, 'use_per', True):
+            self.memory = PrioritizedReplayMemory(
+                capacity=memory_size, 
+                state_size=self.state_size,
+                alpha=getattr(RL_CONFIG, 'per_alpha', 0.6),
+                eps=getattr(RL_CONFIG, 'per_eps', 1e-6)
+            )
+            self.use_per = True
+            print("Using Prioritized Experience Replay (PER)")
+        else:
+            self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+            self.use_per = False
+            print("Using standard HybridReplayBuffer")
+        
+        # PER beta annealing schedule
+        if self.use_per:
+            self.per_beta_start = getattr(RL_CONFIG, 'per_beta_start', 0.4)
+            self.per_beta_end = getattr(RL_CONFIG, 'per_beta_end', 1.0)
+            self.per_beta_decay_steps = getattr(RL_CONFIG, 'per_beta_decay_steps', 1000000)
+            self.training_step = 0
+
+        # AMP persistent settings
+        self.use_amp = bool(getattr(RL_CONFIG, 'use_mixed_precision', False) and self.training_device.type == 'cuda')
+        if self.use_amp:
+            try:
+                from torch.cuda.amp import autocast as _autocast, GradScaler
+                self.autocast = _autocast
+                self.scaler = GradScaler(enabled=True)
+            except Exception:
+                self.use_amp = False
+                import contextlib
+                self.autocast = contextlib.nullcontext
+                self.scaler = None
+        else:
+            import contextlib
+            self.autocast = contextlib.nullcontext
+            self.scaler = None
         
         # Training queue and metrics
         self.train_queue = queue.Queue(maxsize=100)
@@ -687,11 +1151,18 @@ class HybridDQNAgent:
         # Background training worker(s)
         self.running = True
         self.num_training_workers = int(getattr(RL_CONFIG, 'training_workers', 1) or 1)
+        # Serialize optimizer updates across threads to avoid race conditions
+        self.training_lock = threading.Lock()
         self.training_threads = []
         for i in range(self.num_training_workers):
             t = threading.Thread(target=self.background_train, daemon=True, name=f"HybridTrainWorker-{i}")
             t.start()
             self.training_threads.append(t)
+
+        # Inference sync heartbeat to ensure periodic sync even if training is sparse
+        self._sync_interval_seconds = float(getattr(RL_CONFIG, 'inference_sync_interval_sec', 10.0) or 10.0)
+        self._sync_thread = threading.Thread(target=self._inference_sync_heartbeat, daemon=True, name="HybridInferenceSyncHeartbeat")
+        self._sync_thread.start()
         
     def act(self, state, epsilon=0.0, add_noise=True):
         """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
@@ -700,7 +1171,7 @@ class HybridDQNAgent:
             discrete_action: int (0-3) for fire/zap combination
             continuous_action: float in [-0.9, +0.9] for spinner
         """
-        state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+        state = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         
         # Do not flip modes every call; rely on persistent .eval() for dedicated inference model
         with torch.no_grad():
@@ -722,8 +1193,11 @@ class HybridDQNAgent:
         
         return int(discrete_action), float(continuous_action)
     
-    def step(self, state, discrete_action, continuous_action, reward, next_state, done):
+    def step(self, state, discrete_action, continuous_action, reward, next_state, done, actor: str, horizon: int | None = None):
         """Add experience to memory and queue training"""
+        if actor is None:
+            raise ValueError("HybridDQNAgent.step requires an explicit actor tag")
+        steps = int(horizon) if horizon and int(horizon) > 0 else 1
         self.memory.push(
             state,
             discrete_action,
@@ -731,6 +1205,8 @@ class HybridDQNAgent:
             reward,
             next_state,
             done,
+            actor=actor,
+            horizon=steps,
         )
         
         # Queue multiple training steps per experience
@@ -748,10 +1224,42 @@ class HybridDQNAgent:
         except Exception:
             pass
 
+    def _make_actor_weights(self, actor_ids: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        """Create per-sample weights for the continuous loss based on actor tags."""
+        cfg = RL_CONFIG
+        unknown_w = float(getattr(cfg, 'spinner_weight_unknown', 1.0) or 1.0)
+        dqn_w = float(getattr(cfg, 'spinner_weight_dqn', unknown_w) or unknown_w)
+        expert_w = float(getattr(cfg, 'spinner_weight_expert', unknown_w) or unknown_w)
+        other_w = float(getattr(cfg, 'spinner_weight_other', unknown_w) or unknown_w)
+
+        if actor_ids.dtype != torch.long:
+            actor_ids = actor_ids.long()
+        actor_ids = actor_ids.to(reference.device, non_blocking=True)
+
+        if torch.any(actor_ids == ACTOR_UNKNOWN):
+            raise RuntimeError("Encountered ACTOR_UNKNOWN in training batch; actor tagging must be explicit")
+
+        try:
+            metrics.spinner_weight_unknown = float(unknown_w)
+            metrics.spinner_weight_dqn = float(dqn_w)
+            metrics.spinner_weight_expert = float(expert_w)
+            metrics.spinner_weight_other = float(other_w)
+        except Exception:
+            pass
+
+        weights = torch.full(actor_ids.shape, unknown_w, device=reference.device, dtype=reference.dtype)
+        if dqn_w != unknown_w:
+            weights = torch.where(actor_ids == ACTOR_DQN, weights.new_full(weights.shape, dqn_w), weights)
+        if expert_w != unknown_w:
+            weights = torch.where(actor_ids == ACTOR_EXPERT, weights.new_full(weights.shape, expert_w), weights)
+        if other_w != unknown_w:
+            weights = torch.where(actor_ids == ACTOR_OTHER, weights.new_full(weights.shape, other_w), weights)
+        return weights
+
     def background_train(self):
         """Background worker that drains the train_queue and performs train steps."""
         worker_id = threading.current_thread().name
-        print(f"Training thread {worker_id} started on {self.device}")
+        print(f"Training thread {worker_id} started on {self.training_device}")
         while self.running:
             try:
                 _ = self.train_queue.get()  # block until work arrives
@@ -778,7 +1286,13 @@ class HybridDQNAgent:
                 time.sleep(0.01)
     
     def train_step(self):
-        """Perform one optimizer update."""
+        """Perform one optimizer update with gradient accumulation over micro-batches.
+
+        Accumulates gradients over RL_CONFIG.gradient_accumulation_steps micro-batches,
+        each of size RL_CONFIG.batch_size, then applies a single optimizer.step().
+        The entire accumulation window is performed under a lock to keep weights
+        consistent across micro-batches when multiple training workers are enabled.
+        """
         # Global gate
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
             return 0.0
@@ -791,60 +1305,381 @@ class HybridDQNAgent:
         except Exception:
             pass
 
-        # Require at least one batch worth of data
+        # Require at least one micro-batch worth of data
         if len(self.memory) < self.batch_size:
             return 0.0
 
-        # Sample batch
-        batch = self.memory.sample(self.batch_size)
-        if batch is None:
-            return 0.0
-
-        states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
-
-        # Forward pass
-        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
-        discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
-
-        # Target computation
-        with torch.no_grad():
-            if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
-                next_q_local, _ = self.qnetwork_local(next_states)
-                next_actions = next_q_local.argmax(dim=1, keepdim=True)
-                next_q_target, _ = self.qnetwork_target(next_states)
-                discrete_q_next_max = next_q_target.gather(1, next_actions)
-            else:
-                next_q_target, _ = self.qnetwork_target(next_states)
-                discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
-
-            discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
-            continuous_targets = continuous_actions
-
-        # Losses
+        # Accumulation setup
+        grad_accum_steps = max(1, int(getattr(RL_CONFIG, 'gradient_accumulation_steps', 1) or 1))
+        use_amp = self.use_amp
+        scaler = self.scaler
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
-        d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
-        c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='mean')
-        total_loss = d_loss + w_cont * c_loss
 
-        # Backward pass
-        self.optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        self.optimizer.step()
+        # Keep track of loss for telemetry
+        total_loss_value = 0.0
+        priority_updates = {} if self.use_per else None
 
-        # Update training counters
+        # Perform accumulation and optimizer step atomically for thread safety
+        with self.training_lock:
+            # Zero gradients before accumulation
+            self.optimizer.zero_grad(set_to_none=True)
+
+            preclip_grad_norm = 0.0
+            postclip_grad_norm = 0.0
+
+            for acc_idx in range(grad_accum_steps):
+                actor_ids = None
+                horizons = None
+
+                # Sample micro-batch (handle both PER and standard replay)
+                if self.use_per:
+                    # Calculate current beta for importance sampling
+                    beta = self.per_beta_start + (self.per_beta_end - self.per_beta_start) * \
+                           min(1.0, self.training_step / self.per_beta_decay_steps)
+
+                    batch_data = self.memory.sample_hybrid(self.batch_size, beta=beta)
+                    if batch_data is None:
+                        if acc_idx == 0:
+                            return 0.0
+                        break
+
+                    if len(batch_data) >= 10:
+                        (states,
+                         discrete_actions,
+                         continuous_actions,
+                         rewards,
+                         next_states,
+                         dones,
+                         horizons,
+                         actor_ids,
+                         is_weights,
+                         indices) = batch_data[:10]
+                    elif len(batch_data) == 9:
+                        (states,
+                         discrete_actions,
+                         continuous_actions,
+                         rewards,
+                         next_states,
+                         dones,
+                         horizons,
+                         is_weights,
+                         indices) = batch_data
+                        actor_ids = None
+                    elif len(batch_data) == 8:
+                        (states,
+                         discrete_actions,
+                         continuous_actions,
+                         rewards,
+                         next_states,
+                         dones,
+                         is_weights,
+                         indices) = batch_data
+                        horizons = torch.ones_like(dones, dtype=torch.long)
+                        actor_ids = None
+                    else:
+                        if acc_idx == 0:
+                            return 0.0
+                        break
+                else:
+                    # Standard replay buffer
+                    batch = self.memory.sample(self.batch_size)
+                    if batch is None:
+                        if acc_idx == 0:
+                            return 0.0
+                        break
+
+                    if len(batch) >= 8:
+                        (states,
+                         discrete_actions,
+                         continuous_actions,
+                         rewards,
+                         next_states,
+                         dones,
+                         horizons,
+                         actor_ids) = batch[:8]
+                    elif len(batch) == 7:
+                        (states,
+                         discrete_actions,
+                         continuous_actions,
+                         rewards,
+                         next_states,
+                         dones,
+                         horizons) = batch
+                        actor_ids = None
+                    else:
+                        states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+                        horizons = None
+                        actor_ids = None
+                    is_weights = None
+                    indices = None
+
+                if horizons is None:
+                    horizons = torch.ones_like(dones, dtype=torch.long)
+
+                # Forward pass (local) under autocast as configured
+                if use_amp:
+                    with self.autocast():
+                        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+                        discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+                else:
+                    discrete_q_pred, continuous_pred = self.qnetwork_local(states)
+                    discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+
+                # Target computation detached
+                with torch.no_grad():
+                    if bool(getattr(RL_CONFIG, 'use_double_dqn', True)):
+                        next_q_local, _ = self.qnetwork_local(next_states)
+                        next_actions = next_q_local.argmax(dim=1, keepdim=True)
+                        next_q_target, _ = self.qnetwork_target(next_states)
+                        discrete_q_next_max = next_q_target.gather(1, next_actions)
+                    else:
+                        next_q_target, _ = self.qnetwork_target(next_states)
+                        discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
+
+                    # n-step gamma and reward transforms using per-sample horizons
+                    horizons_f = horizons.to(discrete_q_next_max.device, non_blocking=True).float()
+                    gamma_base = horizons_f.new_full(horizons_f.shape, float(self.gamma))
+                    gamma_boot = torch.pow(gamma_base, horizons_f).to(discrete_q_next_max.dtype)
+                    try:
+                        metrics.train_batch_horizon_mean = float(horizons_f.mean().item())
+                        metrics.train_batch_horizon_max = float(horizons_f.max().item())
+                    except Exception:
+                        pass
+                    r = rewards
+                    try:
+                        rs = float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
+                        if rs != 1.0:
+                            r = r * rs
+                        rc = float(getattr(RL_CONFIG, 'reward_clamp_abs', 0.0) or 0.0)
+                        if rc > 0.0:
+                            r = torch.clamp(r, -rc, rc)
+                        if bool(getattr(RL_CONFIG, 'reward_tanh', False)):
+                            r = torch.tanh(r)
+                    except Exception:
+                        pass
+                    discrete_targets = r + (gamma_boot * discrete_q_next_max * (1 - dones))
+                    continuous_targets = continuous_actions
+                    
+                    # Apply target clamping if enabled to prevent Q-value explosion
+                    if getattr(RL_CONFIG, 'clamp_targets', False):
+                        target_clamp = float(getattr(RL_CONFIG, 'target_clamp_value', 100.0))
+                        
+                        # Diagnostic: log when targets exceed clamp threshold
+                        extreme_mask = discrete_targets.abs() > target_clamp
+                        if extreme_mask.any():
+                            n_extreme = extreme_mask.sum().item()
+                            max_target = discrete_targets.abs().max().item()
+                            pct_extreme = 100.0 * n_extreme / len(discrete_targets)
+                            if pct_extreme > 1.0:  # Only log if >1% of batch is extreme
+                                print(f"WARNING: {n_extreme}/{len(discrete_targets)} ({pct_extreme:.1f}%) targets exceed clamp {target_clamp:.0f}, max={max_target:.1f}")
+                                # Log components for diagnosis
+                                extreme_idx = extreme_mask.nonzero(as_tuple=True)[0][:5]  # First 5 examples
+                                for idx in extreme_idx:
+                                    print(f"  Sample {idx}: r={rewards[idx]:.2f}, gamma^n={gamma_boot[idx]:.4f}, Q_next={discrete_q_next_max[idx]:.2f}, target={discrete_targets[idx]:.2f}")
+                        
+                        discrete_targets = torch.clamp(discrete_targets, -target_clamp, target_clamp)
+
+                # Match dtypes under AMP
+                if use_amp:
+                    try:
+                        discrete_targets = discrete_targets.to(discrete_q_selected.dtype)
+                        continuous_targets = continuous_targets.to(continuous_pred.dtype)
+                    except Exception:
+                        pass
+
+                actor_weights = None
+                if actor_ids is not None:
+                    try:
+                        actor_weights = self._make_actor_weights(actor_ids, continuous_targets)
+                    except Exception:
+                        actor_weights = None
+
+                # Losses per micro-batch (autocast already applied for forward)
+                if use_amp:
+                    with self.autocast():
+                        d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+                        c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                        if actor_weights is not None:
+                            c_loss = c_loss * actor_weights
+                        
+                        # Apply importance weights if using PER
+                        if self.use_per and is_weights is not None:
+                            d_loss = d_loss * is_weights
+                            c_loss = c_loss * is_weights
+                        
+                        # Reduce losses to scalars
+                        d_loss = d_loss.mean()
+                        c_loss = c_loss.mean()
+                        micro_total = d_loss + w_cont * c_loss
+                        # Scale loss for accumulation so effective LR remains constant
+                        micro_total = micro_total / float(grad_accum_steps)
+                else:
+                    d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+                    c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+                    if actor_weights is not None:
+                        c_loss = c_loss * actor_weights
+                    
+                    # Apply importance weights if using PER
+                    if self.use_per and is_weights is not None:
+                        d_loss = d_loss * is_weights
+                        c_loss = c_loss * is_weights
+                    
+                    # Reduce losses to scalars
+                    d_loss = d_loss.mean()
+                    c_loss = c_loss.mean()
+                    micro_total = (d_loss + w_cont * c_loss) / float(grad_accum_steps)
+
+                # Record PER priority deltas to apply after the accumulation window
+                if priority_updates is not None and indices is not None:
+                    try:
+                        with torch.no_grad():
+                            td_errors = torch.abs(discrete_q_selected - discrete_targets)
+                        td_errors_cpu = td_errors.detach().view(-1).cpu().numpy()
+                        np_indices = np.asarray(indices).reshape(-1)
+                        for idx, err in zip(np_indices, td_errors_cpu):
+                            priority_updates[int(idx)] = float(err)
+                    except Exception:
+                        pass
+
+                total_loss_value += float((d_loss + w_cont * c_loss).item()) / float(grad_accum_steps)
+
+                # Backward accumulate
+                if use_amp and scaler is not None:
+                    scaler.scale(micro_total).backward()
+                else:
+                    micro_total.backward()
+
+            # Apply accumulated PER priority updates once per train step
+            if priority_updates:
+                try:
+                    idx_list = list(priority_updates.keys())
+                    err_list = [priority_updates[idx] for idx in idx_list]
+                    self.memory.update_priorities(idx_list, err_list)
+                    try:
+                        metrics.per_priority_update_count = int(len(idx_list))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            elif priority_updates is not None:
+                try:
+                    metrics.per_priority_update_count = 0
+                except Exception:
+                    pass
+
+            # Unscale once before measuring/clipping
+            if use_amp and scaler is not None:
+                try:
+                    scaler.unscale_(self.optimizer)
+                except Exception:
+                    pass
+
+            # Replace non-finite grads and compute pre-clip norm
+            preclip_sq_sum = 0.0
+            grad_count = 0
+            zero_grad_count = 0
+            try:
+                for p in self.qnetwork_local.parameters():
+                    if p.grad is not None:
+                        grad_count += 1
+                        if not torch.isfinite(p.grad).all():
+                            p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
+                        g = p.grad.data.norm(2)
+                        if torch.isfinite(g):
+                            g_val = float(g.item())
+                            if g_val < 1e-12:
+                                zero_grad_count += 1
+                            preclip_sq_sum += g_val ** 2
+                preclip_grad_norm = (preclip_sq_sum ** 0.5)
+                
+                # Alert if all gradients are suspiciously zero
+                if grad_count > 0 and zero_grad_count == grad_count and self.training_steps % 100 == 0:
+                    print(f"WARNING: All {grad_count} gradient tensors are zero at step {self.training_steps}! Check if model is frozen or optimizer is broken.")
+            except Exception as e:
+                print(f"ERROR computing gradients: {e}")
+                preclip_grad_norm = 0.0
+
+            # Optional gradient value clamp and norm clip
+            postclip_grad_norm = preclip_grad_norm
+            if hasattr(RL_CONFIG, 'max_grad_norm') and RL_CONFIG.max_grad_norm > 0:
+                try:
+                    max_gv = float(getattr(RL_CONFIG, 'max_grad_value', 0.0) or 0.0)
+                    if max_gv > 0.0:
+                        for p in self.qnetwork_local.parameters():
+                            if p.grad is not None:
+                                p.grad.data.clamp_(-max_gv, max_gv)
+                    torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), RL_CONFIG.max_grad_norm)
+                    post_sq_sum = 0.0
+                    for p in self.qnetwork_local.parameters():
+                        if p.grad is not None:
+                            g = p.grad.data.norm(2)
+                            if torch.isfinite(g):
+                                x = float(g.item())
+                                post_sq_sum += x * x
+                    postclip_grad_norm = (post_sq_sum ** 0.5)
+                except Exception:
+                    postclip_grad_norm = preclip_grad_norm
+
+            # Optimizer step
+            if use_amp and scaler is not None:
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                self.optimizer.step()
+
+        # LR scheduling (frame-based)
+        try:
+            self._apply_lr_schedule()
+        except Exception:
+            pass
+        
+        # Update training counters and metrics
         self.training_steps += 1
+        if self.use_per:
+            self.training_step += 1  # Track PER beta annealing
         try:
             metrics.total_training_steps += 1
             metrics.training_steps_interval += 1
             metrics.memory_buffer_size = len(self.memory)
         except Exception:
             pass
-        # Track loss values
+        # Track loss values for display
         try:
-            loss_val = float(total_loss.item())
-            metrics.losses.append(loss_val)
-            metrics.loss_sum_interval += loss_val
+            metrics.losses.append(float(total_loss_value))
+            metrics.loss_sum_interval += float(total_loss_value)
             metrics.loss_count_interval += 1
+        except Exception:
+            pass
+        # Publish grad diagnostics
+        try:
+            # Only publish finite diagnostics
+            if preclip_grad_norm > 0 and np.isfinite(preclip_grad_norm) and np.isfinite(postclip_grad_norm):
+                metrics.grad_clip_delta = float(postclip_grad_norm / max(preclip_grad_norm, 1e-12))
+                metrics.grad_norm = float(preclip_grad_norm)
+            else:
+                metrics.grad_clip_delta = 1.0
+                metrics.grad_norm = 0.0
+        except Exception:
+            pass
+
+        # Periodic hard refresh during warmup or watchdog interval
+        try:
+            # Hard refresh during warmup steps
+            warm_until = int(getattr(RL_CONFIG, 'warmup_hard_refresh_until_steps', 0) or 0)
+            warm_every = int(getattr(RL_CONFIG, 'warmup_hard_refresh_every_steps', 0) or 0)
+            if warm_until > 0 and self.training_steps <= warm_until and warm_every > 0:
+                if (self.training_steps % warm_every) == 0:
+                    self.update_target_network()
+            # Time-based watchdog
+            watchdog_secs = float(getattr(RL_CONFIG, 'hard_update_watchdog_seconds', 0.0) or 0.0)
+            if watchdog_secs > 0.0:
+                last_t = float(getattr(metrics, 'last_hard_target_update_time', 0.0) or 0.0)
+                if last_t <= 0.0 or (time.time() - last_t) >= watchdog_secs:
+                    self.update_target_network()
+            # Step-based periodic refresh even when using soft target
+            step_every = int(getattr(RL_CONFIG, 'hard_target_refresh_every_steps', 0) or 0)
+            if step_every > 0 and (self.training_steps % step_every) == 0:
+                self.update_target_network()
         except Exception:
             pass
 
@@ -853,7 +1688,7 @@ class HybridDQNAgent:
             tau = getattr(RL_CONFIG, 'tau', 0.005)
             for target_param, local_param in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
                 target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
-            # Telemetry
+            # Telemetry for target updates (soft)
             try:
                 metrics.last_target_update_frame = metrics.frame_count
                 metrics.last_target_update_time = time.time()
@@ -863,7 +1698,7 @@ class HybridDQNAgent:
         # Hard target update
         elif self.training_steps % RL_CONFIG.target_update_freq == 0:
             self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-            # Telemetry
+            # Telemetry for hard target updates
             try:
                 metrics.last_target_update_frame = metrics.frame_count
                 metrics.last_target_update_time = time.time()
@@ -872,7 +1707,18 @@ class HybridDQNAgent:
             except Exception:
                 pass
         
-        return float(total_loss.item())
+        # Sync inference network
+        if inference_device != training_device and self.training_steps % 100 == 0:
+            self.sync_inference_network()
+        elif self.training_steps % 100 == 0:
+            # Even in single-device mode, update sync telemetry periodically
+            try:
+                metrics.last_inference_sync_frame = metrics.frame_count
+                metrics.last_inference_sync_time = time.time()
+            except Exception:
+                pass
+        
+        return float(total_loss_value)
 
     def _apply_lr_schedule(self):
         """Compute and apply per-frame LR based on RL_CONFIG schedule."""
@@ -983,6 +1829,37 @@ class HybridDQNAgent:
             print(message.strip())
         return float(new_lr)
 
+    def sync_inference_network(self):
+        """Synchronize inference network weights and record telemetry."""
+        did_copy = False
+        try:
+            if hasattr(self, 'qnetwork_inference') and self.qnetwork_inference is not self.qnetwork_local:
+                with torch.no_grad():
+                    state = {}
+                    for k, p in self.qnetwork_local.state_dict().items():
+                        state[k] = p.to(self.inference_device)
+                    self.qnetwork_inference.load_state_dict(state)
+                did_copy = True
+        finally:
+            try:
+                metrics.last_inference_sync_frame = metrics.frame_count
+                metrics.last_inference_sync_time = time.time()
+            except Exception:
+                pass
+        return did_copy
+
+    def _inference_sync_heartbeat(self):
+        """Periodic sync to keep inference network fresh even with low training activity."""
+        while self.running:
+            try:
+                now = time.time()
+                last = getattr(metrics, 'last_inference_sync_time', 0.0)
+                if last <= 0.0 or (now - last) >= self._sync_interval_seconds:
+                    self.sync_inference_network()
+                time.sleep(1.0)
+            except Exception:
+                time.sleep(1.0)
+
     def update_target_network(self):
         """Hard update target network from local and record telemetry."""
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
@@ -1051,7 +1928,7 @@ class HybridDQNAgent:
 
         if os.path.exists(filepath):
             try:
-                checkpoint = torch.load(filepath, map_location=device)
+                checkpoint = torch.load(filepath, map_location=training_device)
 
                 # Verify architecture compatibility
                 if checkpoint.get('architecture') != 'hybrid':
@@ -1072,12 +1949,14 @@ class HybridDQNAgent:
 
                 self.training_steps = int(checkpoint.get('training_steps', 0))
 
-                # No separate inference network to sync in single device setup
+                # Sync inference network
+                if inference_device != training_device:
+                    self.qnetwork_inference.load_state_dict(checkpoint['local_state_dict'])
 
                 # Sanity-check Q-values on load to catch corruption/explosion
                 try:
                     with torch.no_grad():
-                        dummy = torch.zeros(1, self.state_size, device=self.device)
+                        dummy = torch.zeros(1, self.state_size, device=self.training_device)
                         dq, _ = self.qnetwork_local(dummy)
                         qmax = float(dq.max().item())
                         qmin = float(dq.min().item())
@@ -1169,7 +2048,7 @@ class HybridDQNAgent:
             return False
 
     def stop(self, join: bool = True, timeout: float = 2.0):
-        """Gracefully stop background threads."""
+        """Gracefully stop background threads and heartbeat."""
         self.running = False
         # Unblock workers by enqueueing no-op tokens
         try:
@@ -1183,6 +2062,10 @@ class HybridDQNAgent:
                     t.join(timeout=timeout)
                 except Exception:
                     pass
+            try:
+                self._sync_thread.join(timeout=timeout)
+            except Exception:
+                pass
 
     def get_q_value_range(self):
         """Return min/max Q-values from the discrete head over a representative batch.
@@ -1207,13 +2090,13 @@ class HybridDQNAgent:
                     if sample is not None:
                         states = sample[0]
                         if isinstance(states, torch.Tensor):
-                            states = states.to(self.device, non_blocking=True)
+                            states = states.to(self.inference_device, non_blocking=True)
                             discrete_q, _ = self.qnetwork_inference(states)
                             min_q = discrete_q.min().item()
                             max_q = discrete_q.max().item()
 
                 if min_q is None or max_q is None:
-                    dummy = torch.zeros(1, self.state_size, device=self.device)
+                    dummy = torch.zeros(1, self.state_size, device=self.inference_device)
                     discrete_q, _ = self.qnetwork_inference(dummy)
                     min_q = discrete_q.min().item()
                     max_q = discrete_q.max().item()
@@ -1222,7 +2105,193 @@ class HybridDQNAgent:
         except Exception:
             return float('nan'), float('nan')
 
+# Thread-safe metrics storage
+class SafeMetrics:
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.lock = threading.Lock()
+    
+    def update_frame_count(self, delta: int = 1):
+        with self.lock:
+            # Update total frame count
+            if delta < 1:
+                delta = 1
+            self.metrics.frame_count += delta
+            # Track interval frames for display rate
+            try:
+                self.metrics.frames_count_interval += delta
+            except Exception:
+                pass
+            
+            # Update FPS tracking
+            current_time = time.time()
+            
+            # Initialize last_fps_time if this is the first frame
+            if self.metrics.last_fps_time == 0:
+                self.metrics.last_fps_time = current_time
+                
+            # Count frames for this second
+            self.metrics.frames_last_second += delta
+            
+            # Calculate FPS every second
+            elapsed = current_time - self.metrics.last_fps_time
+            if elapsed >= 1.0:
+                # Calculate frames per second with more accuracy
+                new_fps = self.metrics.frames_last_second / elapsed
+                
+                # Store the new FPS value
+                self.metrics.fps = new_fps
+                
+                # Reset counters
+                self.metrics.frames_last_second = 0
+                self.metrics.last_fps_time = current_time
+                
+            return self.metrics.frame_count
+            
+    def get_epsilon(self):
+        with self.lock:
+            return self.metrics.epsilon
 
+    def get_effective_epsilon(self):
+        """Thread-safe access to effective epsilon (0.0 when override_epsilon is ON)."""
+        with self.lock:
+            try:
+                return 0.0 if getattr(self.metrics, 'override_epsilon', False) else float(self.metrics.epsilon)
+            except Exception:
+                return float(self.metrics.epsilon)
+
+    def get_effective_epsilon_with_state(self, gamestate: int):
+        """Return effective epsilon possibly adjusted by game state.
+
+        Currently: if GS_ZoomingDown (0x20), return epsilon * RL_CONFIG.zoom_epsilon_scale (default 0.25).
+        Honors override_epsilon by returning 0.0 regardless of state.
+        """
+        with self.lock:
+            try:
+                if getattr(self.metrics, 'override_epsilon', False):
+                    return 0.0
+                eps = float(self.metrics.epsilon)
+                if gamestate == 0x20:
+                    try:
+                        scale = float(getattr(RL_CONFIG, 'zoom_epsilon_scale', 0.25) or 0.25)
+                    except Exception:
+                        scale = 0.25
+                    eps = eps * scale
+                # Bound within [0,1] as an effective runtime parameter
+                if eps < 0.0:
+                    eps = 0.0
+                elif eps > 1.0:
+                    eps = 1.0
+                return eps
+            except Exception:
+                return float(self.metrics.epsilon)
+            
+    def update_epsilon(self):
+        with self.lock:
+            self.metrics.epsilon = decay_epsilon(self.metrics.frame_count)
+            return self.metrics.epsilon
+            
+    def update_expert_ratio(self):
+        with self.lock:
+            # Respect override_expert: freeze expert_ratio at 0 while override is ON
+            # Also respect manual_expert_override: freeze expert_ratio while manual override is ON
+            if self.metrics.override_expert or getattr(self.metrics, 'manual_expert_override', False):
+                return self.metrics.expert_ratio
+            decay_expert_ratio(self.metrics.frame_count)
+            return self.metrics.expert_ratio
+    
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None):
+        """Record per-episode rewards in a thread-safe way.
+
+        Forward to the underlying MetricsData.add_episode_reward when available so that:
+        - All episodes (including zero/negative totals) are recorded to keep deques aligned
+        - Interval accumulators (for per-row means) are updated consistently for Rwrd/DQN/Exp/Subj/Obj
+        Fallback to direct appends if the underlying metrics object lacks the method.
+        """
+        with self.lock:
+            try:
+                add_fn = getattr(self.metrics, 'add_episode_reward', None)
+                if callable(add_fn):
+                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward), subj_reward, obj_reward)
+                    return
+            except Exception:
+                pass
+            # Fallback: append directly without filtering to preserve alignment
+            try:
+                self.metrics.episode_rewards.append(float(total_reward))
+            except Exception:
+                pass
+            try:
+                self.metrics.dqn_rewards.append(float(dqn_reward))
+            except Exception:
+                pass
+            try:
+                self.metrics.expert_rewards.append(float(expert_reward))
+            except Exception:
+                pass
+            try:
+                if subj_reward is not None:
+                    self.metrics.subj_rewards.append(float(subj_reward))
+            except Exception:
+                pass
+            try:
+                if obj_reward is not None:
+                    self.metrics.obj_rewards.append(float(obj_reward))
+            except Exception:
+                pass
+    
+    def increment_guided_count(self):
+        with self.lock:
+            self.metrics.guided_count += 1
+    
+    def increment_total_controls(self):
+        with self.lock:
+            self.metrics.total_controls += 1
+            
+    def update_action_source(self, source):
+        with self.lock:
+            self.metrics.last_action_source = source
+            
+    def update_game_state(self, enemy_seg, open_level):
+        with self.lock:
+            self.metrics.enemy_seg = enemy_seg
+            self.metrics.open_level = open_level
+    
+    def get_expert_ratio(self):
+        with self.lock:
+            return self.metrics.expert_ratio
+            
+    def is_override_active(self):
+        with self.lock:
+            return self.metrics.override_expert
+
+    def get_fps(self):
+        with self.lock:
+            return self.metrics.fps
+
+    # Thread-safe helpers for common aggregated metrics
+    def add_inference_time(self, t: float):
+        """Accumulate inference time and count in a thread-safe way."""
+        try:
+            dt = float(t)
+        except Exception:
+            dt = 0.0
+        with self.lock:
+            # Underlying MetricsData holds these fields
+            try:
+                self.metrics.total_inference_time += dt
+                self.metrics.total_inference_requests += 1
+            except Exception:
+                # If fields are missing for any reason, initialize defensively
+                try:
+                    if not hasattr(self.metrics, 'total_inference_time'):
+                        self.metrics.total_inference_time = 0.0
+                    if not hasattr(self.metrics, 'total_inference_requests'):
+                        self.metrics.total_inference_requests = 0
+                    self.metrics.total_inference_time += dt
+                    self.metrics.total_inference_requests += 1
+                except Exception:
+                    pass
 
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
@@ -1253,7 +2322,6 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         
         # Apply subjective reward scaling
         subjreward *= RL_CONFIG.subj_reward_scale
-        reward = subjreward + objreward
         
         # Combine score components
         score = (score_high * 65536) + score_low

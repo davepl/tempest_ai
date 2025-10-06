@@ -4,8 +4,20 @@ Lightweight n-step return preprocessor used by DQNAgent.
 This module is intentionally dependency-light to make unit tests fast.
 """
 from collections import deque
-from typing import Deque, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Deque, List, Optional, Tuple
 import numpy as np
+
+
+@dataclass
+class _PendingStep:
+    state: Any
+    action: int
+    reward: float
+    next_state: Any
+    done: bool
+    actor: str
+    aux_action: float = 0.0
 
 
 class NStepReplayBuffer:
@@ -16,7 +28,7 @@ class NStepReplayBuffer:
     - On terminal, we flush the remaining tail so no transitions are lost across episode boundaries.
     Contract:
       Input: (state, action, reward, next_state, done)
-      Output: List[Tuple(state, action, R_n, next_state_n, done_n)]
+    Output: List[Tuple(state, action, R_n, next_state_n, done_n, actor)]
     """
     def __init__(self, n_step: int, gamma: float, store_aux_action: bool = False):
         assert n_step >= 1
@@ -25,7 +37,7 @@ class NStepReplayBuffer:
         # When store_aux_action=True, we will store an extra per-step auxiliary action
         # (e.g., a continuous action) alongside the discrete action and return it in outputs.
         self.store_aux_action = bool(store_aux_action)
-        self._deque: Deque[Tuple] = deque()
+        self._deque: Deque[_PendingStep] = deque()
 
     def reset(self):
         self._deque.clear()
@@ -34,31 +46,53 @@ class NStepReplayBuffer:
         R = 0.0
         done_flag = False
         last_next_state = None
-        if self.store_aux_action:
-            s0, a0, aux0, _, _, _ = self._deque[0]
-        else:
-            s0, a0, _, _, _ = self._deque[0]
+        first = self._deque[0]
+        s0 = first.state
+        a0 = first.action
+        aux0 = first.aux_action
+        start_actor = first.actor
+        steps_used = 0
 
         for i in range(self.n_step):
             if i >= len(self._deque):
                 break
-            if self.store_aux_action:
-                _, _, _, r, ns, d = self._deque[i]
-            else:
-                _, _, r, ns, d = self._deque[i]
-            R += (self.gamma ** i) * float(r)
-            last_next_state = ns
-            if d:
+            step = self._deque[i]
+            if i > 0 and step.actor != start_actor:
+                break
+            R += (self.gamma ** i) * float(step.reward)
+            last_next_state = step.next_state
+            steps_used = i + 1
+            if step.done:
                 done_flag = True
                 break
 
+        # Ensure we always report at least one step consumed
+        if steps_used <= 0:
+            steps_used = 1
+
         assert last_next_state is not None
         if self.store_aux_action:
-            return (s0, a0, aux0, R, last_next_state, done_flag)
-        else:
-            return (s0, a0, R, last_next_state, done_flag)
+            return (s0, a0, aux0, R, last_next_state, done_flag, steps_used, start_actor)
+        return (s0, a0, R, last_next_state, done_flag, steps_used, start_actor)
 
-    def add(self, state, action, reward, next_state, done, aux_action=None):
+    def _should_emit(self) -> bool:
+        if not self._deque:
+            return False
+
+        if len(self._deque) >= self.n_step:
+            return True
+
+        start_actor = self._deque[0].actor
+        max_len = min(self.n_step, len(self._deque))
+        for i in range(max_len):
+            step = self._deque[i]
+            if i > 0 and step.actor != start_actor:
+                return True
+            if step.done:
+                return True
+        return False
+
+    def add(self, state, action, reward, next_state, done, aux_action=None, actor: Optional[str] = None):
         # Normalize action to int
         try:
             if isinstance(action, np.ndarray):
@@ -70,21 +104,40 @@ class NStepReplayBuffer:
         except Exception:
             a_idx = int(action)
 
-        if self.store_aux_action:
-            self._deque.append((state, a_idx, float(aux_action) if aux_action is not None else 0.0,
-                                float(reward), next_state, bool(done)))
-        else:
-            self._deque.append((state, a_idx, float(reward), next_state, bool(done)))
+        if actor is None:
+            raise ValueError("NStepReplayBuffer.add requires an explicit actor tag")
+        actor_tag = str(actor).strip().lower()
+        if not actor_tag:
+            raise ValueError("NStepReplayBuffer.add received blank actor tag")
+        if actor_tag in ('unknown', 'none', 'random'):
+            raise ValueError(f"NStepReplayBuffer.add received invalid actor tag '{actor_tag}'")
+        aux_val = float(aux_action) if (self.store_aux_action and aux_action is not None) else 0.0
+
+        if not self.store_aux_action:
+            aux_val = 0.0
+
+        self._deque.append(
+            _PendingStep(
+                state=state,
+                action=a_idx,
+                reward=float(reward),
+                next_state=next_state,
+                done=bool(done),
+                actor=actor_tag,
+                aux_action=aux_val,
+            )
+        )
 
         outputs: List[Tuple] = []
 
-        if not done:
-            if len(self._deque) >= self.n_step:
+        if done:
+            while self._deque:
                 outputs.append(self._make_experience_from_start())
                 self._deque.popleft()
-        else:
-            while len(self._deque) > 0:
-                outputs.append(self._make_experience_from_start())
-                self._deque.popleft()
+            return outputs
+
+        while self._should_emit():
+            outputs.append(self._make_experience_from_start())
+            self._deque.popleft()
 
         return outputs

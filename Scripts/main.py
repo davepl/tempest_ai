@@ -116,6 +116,12 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == '6':
                     metrics.increase_epsilon(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
+                elif key == 'L':
+                    agent.adjust_learning_rate(0.00005, keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key == 'l':
+                    agent.adjust_learning_rate(-0.00005, keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
             
             time.sleep(0.1)
         except Exception as e:
