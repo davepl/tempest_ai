@@ -305,6 +305,7 @@ class SocketServer:
                                          exp_done,
                                          exp_steps,
                                          exp_actor) = item
+                                        # Add ALL experiences to replay buffer for learning
                                         self.agent.step(
                                             exp_state,
                                             exp_action,
@@ -323,6 +324,7 @@ class SocketServer:
                                          exp_done,
                                          exp_steps,
                                          exp_actor) = item
+                                        # Add ALL experiences to replay buffer
                                         self.agent.step(
                                             exp_state,
                                             exp_action,
@@ -352,6 +354,7 @@ class SocketServer:
                                              exp_done,
                                              exp_steps,
                                              exp_actor) = item
+                                        # Add ALL experiences to replay buffer
                                         self.agent.step(
                                             exp_state,
                                             exp_action,
@@ -380,6 +383,7 @@ class SocketServer:
                                                  exp_done,
                                                  _exp_steps,
                                                  exp_actor) = item
+                                            # Add ALL experiences to replay buffer
                                             self.agent.step(exp_state, exp_action, exp_reward, exp_next_state, exp_done, actor=exp_actor)
                                         except TypeError:
                                             pass

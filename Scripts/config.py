@@ -30,15 +30,10 @@ LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
 @dataclass
 class ServerConfigData:
     """Configuration for socket server"""
-    host: str = "0.0.0.0"  # Listen on all interfaces
+    host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
     params_count: int = 171
-    reset_frame_count: bool = False   # Resume from checkpoint - don't reset frame count
-    reset_expert_ratio: bool = False  # Resume from checkpoint - don't reset expert ratio  
-    reset_epsilon: bool = True       # Resume from checkpoint - don't reset epsilon
-     
-    force_expert_ratio_recalc: bool = False  # Don't force recalculation of expert ratio
 
 # Create instance of ServerConfigData first
 SERVER_CONFIG = ServerConfigData()
@@ -49,23 +44,22 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 4096                # Moderate batch for stability
+    batch_size: int = 8192                # Moderate batch for stability
     lr: float = 0.0005                    # Conservative fixed learning rate
-    gamma: float = 0.995                   # Reverted from 0.92 - lower gamma made plateau worse
+    gamma: float = 0.995                   # Discount factor for future rewards
+    n_step: int = 3                        # N-step returns for better credit assignment
 
-    epsilon: float = 0.25                 # Next-run start: exploration rate (see decay schedule below)
-    epsilon_start: float = 0.25           # Start at 0.20 on next run
-    # Quick Win: keep a bit more random exploration while DQN catches up
-    epsilon_min: float = 0.25            # Floor for exploration
-    epsilon_end: float = 0.25            # Target floor
+    epsilon: float = 0.10                  # Current exploration rate
+    epsilon_start: float = 0.10            # Start with moderate exploration
+    epsilon_min: float = 0.01              # Floor for exploration (1% random actions)
+    epsilon_end: float = 0.01              # Target minimum epsilon
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
-    expert_ratio_start: float = 0.95      # Initial probability of expert control
+    expert_ratio_start: float = 0.30      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.25
-    expert_ratio_min: float = 0.10        # Minimum expert control probability
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
 
@@ -81,33 +75,19 @@ class RLConfigData:
     # Single-threaded training
     training_steps_per_sample: int = 1    # One update per sample
     training_workers: int = 1             # SIMPLIFIED - single thread only
-    use_torch_compile: bool = False       # DISABLED - keep it simple
-    # SIMPLIFIED: No dueling architecture
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
-    # Gradient clipping configuration
-    max_grad_norm: float = 5.0            # Clip threshold for total grad norm (L2)
-    # SIMPLIFIED: Enable target clamping for stability
-    clamp_targets: bool = True            # ENABLED to prevent Q-value explosion
-    target_clamp_value: float = 200.0     # Reasonable clamp value
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    # SIMPLIFIED: No LR schedule - fixed LR
     # Options: 'none', 'cosine'
-
-
-    # SIMPLIFIED: Pure uniform sampling
-    # If bias > 0, sample this fraction from the most recent (window_frac) of the buffer
-    recent_sample_bias: float = 0.0       # DISABLED - uniform sampling only
-    recent_window_frac: float = 0.25      # last 25% of buffer considered "recent"
 
 
     # SIMPLIFIED: No reward transforms - use raw rewards
     reward_scale: float = 1.0             # No scaling
 
     # Subjective reward scaling (for movement/aiming rewards)
-    subj_reward_scale: float = 0.35       # Scale factor applied to subjective rewards from OOB
+    subj_reward_scale: float = 0.80       # Scale factor applied to subjective rewards from OOB
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -144,10 +124,6 @@ class MetricsData:
     total_inference_time: float = 0.0
     total_inference_requests: int = 0
     average_level: float = 0  # Average level number across all clients
-    # PER-specific metrics removed
-    # Gradient clipping diagnostics
-    grad_clip_delta: float = 1.0   # post-clip L2 norm divided by pre-clip L2 norm (should be ~1.0 if not clipping)
-    grad_norm: float = 0.0         # pre-clip gradient L2 norm magnitude for monitoring learning dynamics
     # Loss averaging since last metrics print
     loss_sum_interval: float = 0.0
     loss_count_interval: int = 0
@@ -175,11 +151,6 @@ class MetricsData:
     
     # Reward component tracking (for analysis and display)
     # State summary stats (rolling)
-    state_mean: float = 0.0
-    state_std: float = 0.0
-    state_min: float = 0.0
-    state_max: float = 0.0
-    state_invalid_frac: float = 0.0  # Fraction of entries equal to -1.0 (our invalid sentinel)
     # Level averaging since last metrics print (0-based levels)
     level_sum_interval: float = 0.0
     level_count_interval: int = 0
@@ -334,17 +305,6 @@ class MetricsData:
         with self.lock:
             return self.fps
     
-    
-    def get_reward_component_averages(self) -> Dict[str, float]:
-        """Get recent averages of reward components"""
-        with self.lock:
-            averages = {}
-            for component, history in self.reward_component_history.items():
-                if history:
-                    averages[component] = sum(history) / len(history)
-                else:
-                    averages[component] = 0.0
-            return averages
     
     def toggle_override(self, kb_handler=None):
         """Toggle override mode"""
@@ -520,8 +480,6 @@ class MetricsData:
             if kb_handler and IS_INTERACTIVE:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nEpsilon: {self.epsilon:.3f} (natural decay)\r")
-
-# Legacy discrete action mapping removed (pure hybrid model)
 
 # Create instances of config classes
 metrics = MetricsData()
