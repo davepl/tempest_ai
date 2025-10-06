@@ -601,7 +601,7 @@ def print_with_terminal_restore(kb_handler, *args, **kwargs):
     if IS_INTERACTIVE and is_unix_like:
         kb_handler.restore_terminal()
         
-    # Standard print call - works on all platforms
+    # Standard print call - works on all platformse
     print(*args, **kwargs, flush=True)
     
     if IS_INTERACTIVE and is_unix_like:
