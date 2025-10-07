@@ -385,8 +385,8 @@ def display_metrics_row(agent, kb_handler):
         f"{avg_inference_time_ms:>7.2f} "
         f"{samples_per_sec:>8.0f} "
         f"{steps_per_sec:>8.1f} "
-        f"{0.0:>8.3f} "
-        f"{1.0:>6.3f} "
+        f"{metrics.last_grad_norm:>8.3f} "
+        f"{metrics.last_clip_delta:>6.3f} "
         f"{q_range:>14} {training_stats:>15}"
     )
     
