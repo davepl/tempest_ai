@@ -40,7 +40,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
 local SCORE_UNIT = 1.0           
 local LEVEL_COMPLETION_BONUS = 0.0   -- Edge-triggered bonus when level increments
-local DEATH_PENALTY = 10000            -- Edge-triggered penalty when dying (raised to better balance vs completion)
+local DEATH_PENALTY = 0            -- Edge-triggered penalty when dying (raised to better balance vs completion)
 local ZAP_COST = 100                 -- Edge-triggered Small cost per zap frame
  
 local previous_score = 0
