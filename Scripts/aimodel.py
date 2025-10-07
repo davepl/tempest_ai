@@ -1224,6 +1224,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         
         # Apply subjective reward scaling
         subjreward *= RL_CONFIG.subj_reward_scale
+        objreward *= RL_CONFIG.reward_scale
         reward = subjreward + objreward
         
         state_data = memoryview(data)[header_size:]

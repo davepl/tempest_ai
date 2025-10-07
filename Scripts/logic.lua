@@ -590,7 +590,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
-        if score_delta ~= 0 and score_delta < 1000 then                         -- Filter out large completion bonuses
+        if score_delta > 0 and score_delta < 1000 then                         -- Filter out large bonuses AND negative deltas
             local r_score = score_delta 
             obj_reward = obj_reward + r_score
         end
