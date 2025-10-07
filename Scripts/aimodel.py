@@ -711,7 +711,8 @@ class HybridDQNAgent:
         continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
         if add_noise and epsilon > 0:
             # Add Gaussian noise scaled by epsilon for exploration
-            noise_scale = epsilon * 0.9  # 90% of action range at full epsilon
+            # Use HIGHER noise for continuous (2x epsilon factor) to break local minima
+            noise_scale = epsilon * 1.8  # 180% of action range at full epsilon (was 90%)
             noise = np.random.normal(0, noise_scale)
             continuous_action = np.clip(continuous_action + noise, -0.9, 0.9)
         
@@ -807,19 +808,64 @@ class HybridDQNAgent:
             discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
 
             discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
-            # REVERTED: Keep behavioral cloning for continuous actions to preserve exploration
-            # The exploration noise in taken actions is essential for discovering new strategies
-            continuous_targets = continuous_actions
+            
+            # ADVANTAGE-WEIGHTED POLICY GRADIENT for continuous actions
+            # This allows the agent to LEARN from rewards, not just imitate
+            # Key insight: Weight the gradient by how good the outcome was
+            
+            # Compute standardized advantages (z-scores)
+            reward_mean = rewards.mean()
+            reward_std = rewards.std() + 1e-8
+            advantages = (rewards - reward_mean) / reward_std
+            advantages = advantages.clamp(-3, 3)  # Clip extreme outliers
+            
+            # Exponential weighting: good actions get MUCH stronger gradients than bad ones
+            # AGGRESSIVE SCALING: exp(1.5) ≈ 90x,  exp(0.0) = 1.0x,  exp(-1.5) ≈ 0.01x
+            # This creates EXTREME preference for successful actions to overcome bad DQN dominance
+            advantage_weights = torch.exp(advantages * 1.5).clamp(0.001, 100.0)
+            
+            continuous_targets = continuous_actions  # Still target the actions taken
 
         # Losses
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
         d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
-        c_loss = F.mse_loss(continuous_pred, continuous_targets, reduction='mean')
+        
+        # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
+        # High reward (+1.5σ) → 4.5x gradient strength → LEARN STRONGLY
+        # Average reward (0σ) → 1.0x gradient → normal learning
+        # Low reward (-1.5σ) → 0.22x gradient → nearly ignore
+        c_loss_raw = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
+        c_loss = (c_loss_raw * advantage_weights).mean()
+        
         total_loss = d_loss + w_cont * c_loss
 
         # Backward pass
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        
+        # Compute gradient norm BEFORE clipping
+        total_grad_norm = 0.0
+        for p in self.qnetwork_local.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_grad_norm += param_norm.item() ** 2
+        total_grad_norm = total_grad_norm ** 0.5
+        
+        # Gradient clipping for stability (critical with 100x advantage weights)
+        max_norm = 10.0
+        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
+        
+        # Compute gradient norm AFTER clipping to measure clip effect
+        clipped_grad_norm = 0.0
+        for p in self.qnetwork_local.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                clipped_grad_norm += param_norm.item() ** 2
+        clipped_grad_norm = clipped_grad_norm ** 0.5
+        
+        # Clip delta: ratio of clipped to original (1.0 = no clipping, <1.0 = clipped)
+        clip_delta = clipped_grad_norm / max(total_grad_norm, 1e-8)
+        
         self.optimizer.step()
 
         # Update training counters
@@ -836,6 +882,9 @@ class HybridDQNAgent:
             metrics.losses.append(loss_val)
             metrics.loss_sum_interval += loss_val
             metrics.loss_count_interval += 1
+            # Track gradient norms for monitoring
+            metrics.last_grad_norm = float(total_grad_norm)
+            metrics.last_clip_delta = float(clip_delta)
         except Exception:
             pass
 

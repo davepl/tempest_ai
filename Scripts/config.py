@@ -20,8 +20,8 @@ from collections import deque
 IS_INTERACTIVE = sys.stdin.isatty()
 
 # Flag to control metric reset on load
-RESET_METRICS = False  # Set to True to ignore saved epsilon/expert ratio - FRESH START
-FORCE_FRESH_MODEL = False # Set to True to completely ignore saved model and start fresh
+RESET_METRICS = True  # Set to True to ignore saved epsilon/expert ratio - FRESH START
+FORCE_FRESH_MODEL = True  # Set to True to completely ignore saved model and start fresh
 
 # Directory paths
 MODEL_DIR = "models"
@@ -45,14 +45,14 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 8192                # Moderate batch for stability
-    lr: float = 0.0005                    # Conservative fixed learning rate
+    lr: float = 0.00025                   # Atari DQN learning rate (was 0.0005, halved for stability)
     gamma: float = 0.995                   # Discount factor for future rewards
     n_step: int = 3                        # N-step returns for better credit assignment
 
-    epsilon: float = 0.10                  # Current exploration rate
-    epsilon_start: float = 0.10            # Start with moderate exploration
-    epsilon_min: float = 0.01              # Floor for exploration (1% random actions)
-    epsilon_end: float = 0.01              # Target minimum epsilon
+    epsilon: float = 0.25                  # Current exploration rate
+    epsilon_start: float = 0.25            # Start with HIGH exploration (needed for advantage weighting diversity)
+    epsilon_min: float = 0.05              # Floor for exploration (1% random actions)
+    epsilon_end: float = 0.05              # Target minimum epsilon
     epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
 
@@ -87,7 +87,7 @@ class RLConfigData:
     reward_scale: float = 1.0             # No scaling
 
     # Subjective reward scaling (for movement/aiming rewards)
-    subj_reward_scale: float = 0.80       # Scale factor applied to subjective rewards from OOB
+    subj_reward_scale: float = 0.70       # Scale factor applied to subjective rewards from OOB
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -169,6 +169,9 @@ class MetricsData:
     training_enabled: bool = True
     # Epsilon override: when True, force epsilon=0.0 (pure greedy) regardless of other overrides
     override_epsilon: bool = False
+    # Gradient monitoring
+    last_grad_norm: float = 0.0
+    last_clip_delta: float = 1.0
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""

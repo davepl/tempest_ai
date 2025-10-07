@@ -38,7 +38,7 @@ local M = {} -- Module table
 
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
-local SCORE_UNIT = 10000.0           -- 10k points ~= 1 life worth of reward
+local SCORE_UNIT = 500.0           -- 10k points ~= 1 life worth of reward
 local LEVEL_COMPLETION_BONUS = 2.0   -- Edge-triggered bonus when level increments
 local DEATH_PENALTY = 0.3            -- Edge-triggered penalty when dying (raised to better balance vs completion)
 local ZAP_COST = 0.2                 -- Edge-triggered Small cost per zap frame
@@ -591,7 +591,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
         if score_delta ~= 0 and score_delta < 10000 then                         -- Filter our large completion bonuses
-            local r_score = score_delta / 20                            -- Scaled: 20k points = 1.0 reward unit
+            local r_score = score_delta 
             if r_score > 1.0 then r_score = 1.0 end
             if r_score < -1.0 then r_score = -1.0 end
             obj_reward = obj_reward + r_score
@@ -804,8 +804,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
 
             -- 7. MOVEMENT INCENTIVE REWARD (Encourage active spinner control)
-            -- Add small bonus for appropriate spinner movement when not perfectly aligned
-            -- Helps prevent the AI from learning to stay completely still
+            -- Add bonus for appropriate spinner movement when not perfectly aligned
+            -- Prevents the AI from learning to stay completely still (camping)
+            -- CRITICAL: Must be large enough to overcome risk-averse behavior
             do
                 local spin_delta = math.abs(tonumber(player_state.spinner_detected or 0))
                 if spin_delta > 0 then
@@ -820,11 +821,13 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         need_move = distance_to_target > 0 -- any misalignment needs movement
                     end
                     
-                    -- Give small bonus for movement when not perfectly aligned
-                    -- Scales with movement magnitude but capped to keep it subtle
+                    -- Give SUBSTANTIAL bonus for movement when not perfectly aligned
+                    -- Scaled to be comparable to score rewards (1000 pts = 0.05 reward)
+                    -- So movement should be worth ~200-500 pts equivalent
                     if need_move and distance_to_target > 0 then
                         local units = math.min(4, spin_delta)
-                        local movement_bonus = 0.0001 * units * (distance_to_target / 8.0) -- Scale by how far off target
+                        -- INCREASED 200x: was 0.0001, now 0.02 (equivalent to ~400 pts)
+                        local movement_bonus = 1.0 * units * (distance_to_target / 8.0)
                         subj_reward = subj_reward + movement_bonus
                     end
                 end
