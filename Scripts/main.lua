@@ -380,8 +380,6 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     local is_attract_mode = (gs.game_mode & 0x80) == 0
     local is_open_level = ls.level_type == 0xFF
     local score = ps.score or 0
-    local score_high = math.floor(score / 65536)
-    local score_low = score % 65536
     local frame = gs.frame_counter % 65536
 
     -- Save signal logic
@@ -398,11 +396,11 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     -- Pack OOB data (header only, reward components removed for simplicity)
     -- NOTE: The short (h) after attract encodes the NEAREST ENEMY ABSOLUTE SEGMENT for Python expert steering.
     -- Format legend:
-    --   >HdddBBBHHHBBBhBhBBBBB
-    --   H: num_values, ddd: (reward, subj_reward, obj_reward), BBB: (gamestate, game_mode, done), HHH: (frame, score_hi, score_lo),
+    --   >HdddBBBHIBBBhBhBBBBB
+    --   H: num_values, ddd: (reward, subj_reward, obj_reward), BBB: (gamestate, game_mode, done), HI: (frame, score),
     --   BBB: (save, fire, zap), h: spinner, B: attract, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number
-    local oob_format = ">HdddBBBHHHBBBhBhBBBBB"
+    local oob_format = ">HdddBBBHIBBBhBhBBBBB"
     -- Determine nearest enemy absolute segment to transmit (or -1 if none)
     local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
     local oob_data = string.pack(oob_format,
@@ -414,12 +412,11 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         gs.game_mode,               -- B: Game Mode (uchar)
         bDone and 1 or 0,           -- B: Done flag (uchar)
         frame,                      -- H: Frame counter (ushort)
-        score_high,                 -- H: Score High (ushort)
-        score_low,                  -- H: Score Low (ushort)
+        score,                      -- I: Score (uint)
         save_signal,                -- B: Save Signal (uchar)
         ps.fire_commanded,          -- B: Commanded Fire (uchar)
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
-        ps.spinner_commanded,       -- h: Commanded Spinner (short)o
+        ps.spinner_commanded,       -- h: Commanded Spinner (short)
         is_attract_mode and 1 or 0, -- B: Is Attract Mode (uchar)
         oob_nearest_enemy_abs_seg,  -- h: Nearest Enemy ABS Segment (short)
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)

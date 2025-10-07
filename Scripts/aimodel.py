@@ -1204,12 +1204,12 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
         
         # Fixed OOB header format (must match Lua exactly). Precompute once.
-        # Format: ">HdBBBHHHBBBhBhBBBBBffffff"
+        # Format: ">HdddBBBHIBBBhBhBBBBB"
         global _FMT_OOB, _HDR_OOB
         try:
             _FMT_OOB
         except NameError:
-            _FMT_OOB = ">HdddBBBHHHBBBhBhBBBBB"
+            _FMT_OOB = ">HdddBBBHIBBBhBhBBBBB"
             _HDR_OOB = struct.calcsize(_FMT_OOB)
 
         if len(data) < _HDR_OOB:
@@ -1217,7 +1217,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
 
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
-        (num_values, reward, subjreward, objreward, gamestate, game_mode, done, frame_counter, score_high, score_low,
+        (num_values, reward, subjreward, objreward, gamestate, game_mode, done, frame_counter, score,
          save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
          expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
@@ -1225,9 +1225,6 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         # Apply subjective reward scaling
         subjreward *= RL_CONFIG.subj_reward_scale
         reward = subjreward + objreward
-        
-        # Combine score components
-        score = (score_high * 65536) + score_low
         
         state_data = memoryview(data)[header_size:]
         
