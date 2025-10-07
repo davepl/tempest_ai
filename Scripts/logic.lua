@@ -38,10 +38,10 @@ local M = {} -- Module table
 
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
-local SCORE_UNIT = 500.0           -- 10k points ~= 1 life worth of reward
-local LEVEL_COMPLETION_BONUS = 2.0   -- Edge-triggered bonus when level increments
-local DEATH_PENALTY = 0.3            -- Edge-triggered penalty when dying (raised to better balance vs completion)
-local ZAP_COST = 0.2                 -- Edge-triggered Small cost per zap frame
+local SCORE_UNIT = 1.0           
+local LEVEL_COMPLETION_BONUS = 0.0   -- Edge-triggered bonus when level increments
+local DEATH_PENALTY = 10000            -- Edge-triggered penalty when dying (raised to better balance vs completion)
+local ZAP_COST = 100                 -- Edge-triggered Small cost per zap frame
  
 local previous_score = 0
 local previous_level = 0
@@ -590,10 +590,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
-        if score_delta ~= 0 and score_delta < 10000 then                         -- Filter our large completion bonuses
+        if score_delta ~= 0 and score_delta < 1000 then                         -- Filter out large completion bonuses
             local r_score = score_delta 
-            if r_score > 1.0 then r_score = 1.0 end
-            if r_score < -1.0 then r_score = -1.0 end
             obj_reward = obj_reward + r_score
         end
 
