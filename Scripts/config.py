@@ -84,10 +84,10 @@ class RLConfigData:
 
 
     # SIMPLIFIED: No reward transforms - use raw rewards
-    reward_scale: float = 1.0             # No scaling
+    reward_scale: float = 0.01             # No scaling
 
     # Subjective reward scaling (for movement/aiming rewards)
-    subj_reward_scale: float = 0.07       # Scale factor applied to subjective rewards from OOB
+    subj_reward_scale: float = 0.007       # Scale factor applied to subjective rewards from OOB
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
