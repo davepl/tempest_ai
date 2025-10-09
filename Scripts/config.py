@@ -45,8 +45,8 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 8192                # Moderate batch for stability
-    lr: float = 0.00025                   # Atari DQN learning rate (was 0.0005, halved for stability)
-    gamma: float = 0.995                   # Discount factor for future rewards
+    lr: float = 0.0005                   # Atari DQN learning rate (was 0.0005, halved for stability)
+    gamma: float = 0.992                   # Discount factor for future rewards
     n_step: int = 3                        # N-step returns for better credit assignment
 
     epsilon: float = 0.25                  # Current exploration rate
@@ -59,13 +59,13 @@ class RLConfigData:
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.30      # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
-    zoom_epsilon_scale: float = 0.25
+    zoom_epsilon_scale: float = 0.10
     expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
     expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
 
     memory_size: int = 2000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 4                  
+    hidden_size: int = 1024               # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 7                  
     # CRITICAL FIX: Reduced from 2000 → 500 to prevent local/target divergence
     # With slow training (1 step per ~57 frames), 2000 steps = only 8 updates per 1M frames!
     # This causes local network to drift far from target between updates → oscillation
@@ -88,10 +88,10 @@ class RLConfigData:
 
 
     # SIMPLIFIED: No reward transforms - use raw rewards
-    reward_scale: float = 0.01             # No scaling
+    reward_scale: float = 0.1             # No scaling
 
     # Subjective reward scaling (for movement/aiming rewards)
-    subj_reward_scale: float = 0.007       # Scale factor applied to subjective rewards from OOB
+    subj_reward_scale: float = 0.07       # Scale factor applied to subjective rewards from OOB
 
     # Diagnostics
     grad_diag_interval: int = 200         # Every N training steps, sample per-head gradient contributions (0=off)
@@ -104,9 +104,6 @@ class RLConfigData:
     # Loss weighting (makes contributions explicit and tunable)
     continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss
     discrete_loss_weight: float = 0.1     # Weight applied to discrete (Q) loss
-
-    # Optional: restrict discrete training to expert frames (useful as a warmup when re-enabling DLoss)
-    discrete_expert_only: bool = False
 
     # Target network update strategy
     use_soft_target_update: bool = True   # If True, apply Polyak averaging every step

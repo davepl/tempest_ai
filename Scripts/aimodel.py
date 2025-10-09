@@ -710,6 +710,45 @@ class HybridReplayBuffer:
         
         # Combine all indices
         indices = np.concatenate(all_indices)
+
+        # Defensive: very rarely we have observed spurious gigantic indices (far beyond capacity) leading to IndexError.
+        # Root hypotheses: (1) memory corruption via unintended dtype upcast, (2) race during concatenation with uninitialized array,
+        # (3) numpy RNG edge case returning int64 that overflowed earlier arithmetic. Until root cause isolated, sanitize here.
+        if indices.dtype != np.int64 and indices.dtype != np.int32:
+            try:
+                indices = indices.astype(np.int64, copy=False)
+            except Exception:
+                pass
+        # Fast path: mask valid range
+        if indices.max(initial=0) >= self.size or indices.min(initial=0) < 0:
+            # Collect stats once per anomaly occurrence (avoid log spam)
+            try:
+                if not hasattr(self, '_oob_warned'):
+                    large_vals = indices[indices >= self.size]
+                    neg_vals = indices[indices < 0]
+                    print(f"[Replay][WARN] OOB indices detected: count={large_vals.size} max={large_vals.max() if large_vals.size else 'n/a'} min_bad={neg_vals.min() if neg_vals.size else 'n/a'} size={self.size}")
+                    self._oob_warned = True
+            except Exception:
+                pass
+            # Clamp then replace any that still out of range with fresh random valid indices
+            indices = np.clip(indices, 0, max(0, self.size - 1))
+            # Re-randomize duplicates / pathological concentration if many were clamped to same edge
+            # (Keep it simple: ensure uniqueness only if feasible; otherwise allow replacement sampling.)
+            try:
+                # Identify any indices that after clipping still include too many repeats at boundaries
+                # If more than 5% are identical boundary indices, re-sample those positions randomly
+                if self.size > 0:
+                    boundary_low_mask = (indices == 0)
+                    boundary_high_mask = (indices == self.size - 1)
+                    total = indices.size
+                    if boundary_low_mask.sum() > 0.05 * total:
+                        repl_ct = boundary_low_mask.sum()
+                        indices[boundary_low_mask] = self._rand.choice(self.size, size=repl_ct, replace=False)
+                    if boundary_high_mask.sum() > 0.05 * total:
+                        repl_ct = boundary_high_mask.sum()
+                        indices[boundary_high_mask] = self._rand.choice(self.size, size=repl_ct, replace=False)
+            except Exception:
+                pass
         
         # Track sampling diagnostics (store counts for metrics)
         try:
@@ -1239,7 +1278,12 @@ class HybridDQNAgent:
                 advantages = advantages.clamp(-3, 3)
                 advantage_weights = torch.exp(advantages * 0.5).clamp(0.1, 5.0)
             
-            continuous_targets = continuous_actions  # Still target the actions taken
+            continuous_targets = continuous_actions.clone()  # Start with taken actions
+            
+            # For DQN samples, use predicted continuous as target to reinforce current policy
+            # For expert samples, use taken actions to learn optimal behavior
+            if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
+                continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
 
         # Losses
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
@@ -1261,20 +1305,7 @@ class HybridDQNAgent:
         # Low reward (-1.5σ) → 0.47x gradient → slight reduction
         # This prevents overfitting to rare high-reward frames while still biasing toward quality
         c_loss_raw = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
-        # Optionally restrict continuous loss to expert frames only in spinner-only mode
-        if getattr(RL_CONFIG, 'spinner_only', False) and getattr(RL_CONFIG, 'spinner_only_expert_only', False):
-            try:
-                if 'torch_mask_exp' in locals() and torch_mask_exp.any():
-                    mask = torch_mask_exp.view(-1, 1).float()
-                    # Normalize mask to keep scale comparable when few expert frames are present
-                    denom = mask.mean().clamp(min=1e-6)
-                    c_loss = ((c_loss_raw * advantage_weights) * mask).sum() / (c_loss_raw.numel() * denom.item())
-                else:
-                    c_loss = (c_loss_raw * advantage_weights).mean()
-            except Exception:
-                c_loss = (c_loss_raw * advantage_weights).mean()
-        else:
-            c_loss = (c_loss_raw * advantage_weights).mean()
+        c_loss = (c_loss_raw * advantage_weights).mean()
         
         # In spinner-only mode, ignore discrete loss entirely
         if getattr(RL_CONFIG, 'spinner_only', False):
