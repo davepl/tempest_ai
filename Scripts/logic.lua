@@ -391,7 +391,7 @@ end
 -- Function to find the target segment and recommended action (expert policy)
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
     -- Simplified targeting logic per spec
-    local is_open = (level_state.level_type == 0xFF)
+    local is_open = (level_state.level_type == 0x00) -- Updated: 0x00 now considered open
     local player_abs_seg = math.floor(player_state.position) % 16
     local shot_count = player_state.shot_count or 0
 
@@ -565,7 +565,7 @@ end
 -- Function to calculate desired spinner direction and distance to target enemy
 function M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local player_abs_seg = math.floor(player_state.position) % 16
-    local is_open = (level_state.level_type == 0xFF)
+    local is_open = (level_state.level_type == 0x00) -- Updated heuristic
     local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
 
     if target_abs_segment == -1 then return 0, 0, 255 end -- No target
@@ -605,7 +605,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
         if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
             local player_abs_seg = player_state.position & 0x0F
-            local is_open = (level_state.level_type == 0xFF)
+            local is_open = (level_state.level_type == 0x00) -- Updated heuristic
             
             -- Level-specific scaling factors
             local level_type = (level_state.level_number - 1) % 4
@@ -810,7 +810,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 if spin_delta > 0 then
                     local player_abs_seg2 = player_state.position & 0x0F
                     local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
-                    local is_open2 = (level_state.level_type == 0xFF)
+                    local is_open2 = (level_state.level_type == 0x00) -- Updated heuristic
                     local need_move = false
                     local distance_to_target = 0
                     if nearest_abs ~= -1 then

@@ -92,6 +92,10 @@ def keyboard_input_handler(agent, keyboard_handler):
                     except Exception:
                         pass
                     display_metrics_row(agent, keyboard_handler)
+                elif key.lower() == 'c':
+                    from metrics_display import clear_screen
+                    clear_screen()
+                    display_metrics_header()
                 elif key.lower() == 'h':
                     # Do hard target update before displaying header
                     agent.update_target_network()

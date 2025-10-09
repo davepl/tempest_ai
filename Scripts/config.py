@@ -20,8 +20,8 @@ from collections import deque
 IS_INTERACTIVE = sys.stdin.isatty()
 
 # Flag to control metric reset on load
-RESET_METRICS = True  # Set to True to ignore saved epsilon/expert ratio - FRESH START
-FORCE_FRESH_MODEL = True  # Set to True to completely ignore saved model and start fresh
+RESET_METRICS = False  # Set to True to ignore saved epsilon/expert ratio - FRESH START
+FORCE_FRESH_MODEL = False  # Set to True to completely ignore saved model and start fresh
 
 # Directory paths
 MODEL_DIR = "models"
@@ -66,8 +66,12 @@ class RLConfigData:
     memory_size: int = 2000000           # Balanced buffer size (was 4000000)
     hidden_size: int = 256               # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 4                  
-    target_update_freq: int = 2000        # Reverted from 1000 - more frequent updates destabilized learning
-    update_target_every: int = 2000       # Reverted - more frequent target updates made plateau worse
+    # CRITICAL FIX: Reduced from 2000 → 500 to prevent local/target divergence
+    # With slow training (1 step per ~57 frames), 2000 steps = only 8 updates per 1M frames!
+    # This causes local network to drift far from target between updates → oscillation
+    # 500 steps = ~32 updates per 1M frames for better sync
+    target_update_freq: int = 500         # More frequent updates reduce local/target divergence  
+    update_target_every: int = 500        # Keep in sync with target_update_freq
     save_interval: int = 10000            # Model save frequency
     
     # SIMPLIFIED: Disable PER - use uniform sampling only
@@ -88,6 +92,48 @@ class RLConfigData:
 
     # Subjective reward scaling (for movement/aiming rewards)
     subj_reward_scale: float = 0.007       # Scale factor applied to subjective rewards from OOB
+
+    # Diagnostics
+    grad_diag_interval: int = 200         # Every N training steps, sample per-head gradient contributions (0=off)
+
+    # Experimental: optimize spinner only (ignore discrete loss and fix DQN discrete action to FIRE/no-zap)
+    spinner_only: bool = False
+    # When spinner_only is True, restrict spinner training to expert frames only
+    spinner_only_expert_only: bool = False
+
+    # Loss weighting (makes contributions explicit and tunable)
+    continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss
+    discrete_loss_weight: float = 0.1     # Weight applied to discrete (Q) loss
+
+    # Optional: restrict discrete training to expert frames (useful as a warmup when re-enabling DLoss)
+    discrete_expert_only: bool = False
+
+    # Target network update strategy
+    use_soft_target_update: bool = True   # If True, apply Polyak averaging every step
+    soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
+    # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
+    td_target_clip: float | None = None
+
+    # Replay sampling optimization flags
+    # --- Replay Sampling Optimization ---
+    # When True, HybridReplayBuffer avoids per-sample O(N) scans for each category by caching:
+    # 1. High-reward percentile threshold + boolean mask (updated periodically & with light EMA on push)
+    # 2. Terminal transition indices for pre-death sampling
+    # In extremely large buffers (millions of entries) this reduces CPU time per sample and GC pressure.
+    # Small synthetic tests may not show large speedups because numpy percentile is already vectorized.
+    optimized_replay_sampling: bool = True
+    # Percentile used to define "high reward" group (e.g., 70 = top 30%).
+    replay_high_reward_percentile: float = 70.0
+    # Recent window definition: max(replay_recent_window_min, frac * buffer_size)
+    replay_recent_window_min: int = 50000
+    replay_recent_window_frac: float = 0.10
+    # Full cache refresh cadence in frames (defends against slow drift of EMA threshold)
+    replay_cache_refresh_interval: int = 5000
+    # Pre-death sampling random lookback bounds (inclusive)
+    replay_terminal_lookback_min: int = 5
+    replay_terminal_lookback_max: int = 10
+    # Debug toggle prints fallback notices / warnings
+    replay_sampling_debug: bool = False
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -127,6 +173,11 @@ class MetricsData:
     # Loss averaging since last metrics print
     loss_sum_interval: float = 0.0
     loss_count_interval: int = 0
+    # Component loss averaging since last metrics print
+    d_loss_sum_interval: float = 0.0
+    d_loss_count_interval: int = 0
+    c_loss_sum_interval: float = 0.0
+    c_loss_count_interval: int = 0
     # Training steps since last metrics print and when last row printed
     training_steps_interval: int = 0
     last_metrics_row_time: float = 0.0
@@ -172,6 +223,80 @@ class MetricsData:
     # Gradient monitoring
     last_grad_norm: float = 0.0
     last_clip_delta: float = 1.0
+    # Detailed loss diagnostics
+    last_d_loss: float = 0.0            # Discrete head loss (Huber)
+    last_c_loss: float = 0.0            # Continuous head loss (after weighting)
+    # Advantage weighting diagnostics
+    adv_w_mean: float = 1.0
+    adv_w_mean_dqn: float = 1.0
+    adv_w_mean_expert: float = 1.0
+    adv_w_max: float = 1.0
+    
+    # Per-actor training diagnostics
+    batch_frac_dqn: float = 0.0       # Fraction of batch that is DQN frames
+    batch_n_dqn: int = 0              # Number of DQN frames in last batch
+    batch_n_expert: int = 0           # Number of expert frames in last batch
+    td_err_mean_dqn: float = 0.0      # Mean TD error for DQN frames
+    td_err_mean_expert: float = 0.0   # Mean TD error for expert frames
+    reward_mean_dqn: float = 0.0      # Mean reward for DQN frames in batch
+    reward_mean_expert: float = 0.0   # Mean reward for expert frames in batch
+    q_mean_dqn: float = 0.0           # Mean Q-value for DQN frames
+    q_mean_expert: float = 0.0        # Mean Q-value for expert frames
+    
+    # Backward-compat accessors (defensive): return safe defaults if fields missing
+    def get_last_d_loss(self) -> float:
+        try:
+            return float(self.last_d_loss)
+        except Exception:
+            return 0.0
+    def get_last_c_loss(self) -> float:
+        try:
+            return float(self.last_c_loss)
+        except Exception:
+            return 0.0
+    def get_adv_w_mean(self) -> float:
+        try:
+            return float(self.adv_w_mean)
+        except Exception:
+            return 1.0
+    def get_adv_w_max(self) -> float:
+        try:
+            return float(self.adv_w_max)
+        except Exception:
+            return 1.0
+    
+    # Stratified sampling diagnostics
+    sample_n_high_reward: int = 0     # Number of high-reward frames sampled
+    sample_n_pre_death: int = 0       # Number of pre-death frames sampled
+    sample_n_recent: int = 0          # Number of recent frames sampled
+    sample_n_random: int = 0          # Number of random frames sampled
+
+    # Discrete-head focused diagnostics
+    d_loss_mean_dqn: float = 0.0       # Mean per-sample Huber loss for DQN frames
+    d_loss_mean_expert: float = 0.0    # Mean per-sample Huber loss for Expert frames
+    q_sel_mean_dqn: float = 0.0        # Mean selected Q (Q(s,a)) for DQN frames
+    q_sel_mean_expert: float = 0.0     # Mean selected Q (Q(s,a)) for Expert frames
+    q_tgt_mean_dqn: float = 0.0        # Mean target for DQN frames
+    q_tgt_mean_expert: float = 0.0     # Mean target for Expert frames
+    action_frac_0: float = 0.0         # Fraction of action index 0 in last batch
+    action_frac_1: float = 0.0         # Fraction of action index 1 in last batch
+    action_frac_2: float = 0.0         # Fraction of action index 2 in last batch
+    action_frac_3: float = 0.0         # Fraction of action index 3 in last batch
+    action_agree_pct: float = 0.0      # % of batch where taken action == current policy argmax
+    batch_done_frac: float = 0.0       # Fraction of terminal transitions in last batch
+    batch_h_mean: float = 1.0          # Mean n-step horizon in last batch
+
+    # Gradient diagnostics (sampled)
+    grad_trunk_d: float = 0.0          # Trunk grad norm due to discrete loss
+    grad_trunk_c: float = 0.0          # Trunk grad norm due to continuous loss
+    grad_head_disc_d: float = 0.0      # Discrete head grad norm due to discrete loss
+    grad_head_disc_c: float = 0.0      # Discrete head grad norm due to continuous loss (should be ~0)
+    grad_head_cont_d: float = 0.0      # Continuous head grad norm due to discrete loss (should be ~0)
+    grad_head_cont_c: float = 0.0      # Continuous head grad norm due to continuous loss
+    sample_reward_mean_high: float = 0.0     # Mean reward of high-reward samples
+    sample_reward_mean_pre_death: float = 0.0  # Mean reward of pre-death samples
+    sample_reward_mean_recent: float = 0.0     # Mean reward of recent samples
+    sample_reward_mean_random: float = 0.0     # Mean reward of random samples
     
     def update_frame_count(self, delta: int = 1):
         """Update frame count and FPS tracking"""
