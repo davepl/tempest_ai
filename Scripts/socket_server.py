@@ -541,18 +541,29 @@ class SocketServer:
                             except Exception:
                                 pass
                         discrete_action, continuous_spinner = int(da), float(ca)
-                        # Probabilistic superzap gate for DQN actions: allow zap with probability superzap_prob
+                        # Spinner-only experiment: override discrete to FIRE/no-zap in DQN mode
                         try:
-                            pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))
-                        except Exception:
-                            pzap = 0.01
-                        try:
-                            # If DQN chose a zap (bit0==1), keep it only with probability pzap
-                            if (discrete_action & 1) == 1:
-                                if random.random() >= max(0.0, min(1.0, pzap)):
-                                    discrete_action = (discrete_action & 2)  # clear zap bit, preserve fire
+                            if getattr(RL_CONFIG, 'spinner_only', False):
+                                discrete_action = 2  # FIRE=1, ZAP=0
                         except Exception:
                             pass
+                        # Optional probabilistic superzap gate for DQN actions: disabled by default
+                        try:
+                            enable_zap_gate = bool(getattr(RL_CONFIG, 'enable_superzap_gate', False))
+                        except Exception:
+                            enable_zap_gate = False
+                        if enable_zap_gate:
+                            try:
+                                pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))
+                            except Exception:
+                                pzap = 0.01
+                            try:
+                                # If DQN chose a zap (bit0==1), keep it only with probability pzap
+                                if (discrete_action & 1) == 1:
+                                    if random.random() >= max(0.0, min(1.0, pzap)):
+                                        discrete_action = (discrete_action & 2)  # clear zap bit, preserve fire
+                            except Exception:
+                                pass
                         action_source = 'dqn'
                 else:
                     action_source = 'none'

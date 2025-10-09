@@ -210,6 +210,51 @@ try:
 except Exception:
     pass
 
+# ----------------------------------------------------------------------------------
+# Defensive de-compile guard:
+# If a previous run left torch.compile OptimizedModules resident in this process
+# (e.g., via hot reload or checkpoint load) we forcibly unwrap them so that the
+# current session runs in plain eager mode. This prevents lingering Inductor
+# cudagraph / TLS assertion failures after source reversion.
+# ----------------------------------------------------------------------------------
+try:
+    import types as _types
+    _DYNAMO_SEEN = False
+    def _unwrap_if_compiled(mod):
+        """Return the underlying eager module if this is a torch.compile wrapper."""
+        try:
+            # PyTorch's compiled wrapper class name can vary; check common patterns
+            if hasattr(mod, '_orig_mod'):
+                base = getattr(mod, '_orig_mod')
+                return base if isinstance(base, torch.nn.Module) else mod
+            # Fallback heuristic: class name contains 'Optimized' or resides in torch._dynamo
+            cname = mod.__class__.__name__
+            if 'Optimized' in cname or mod.__class__.__module__.startswith('torch._dynamo'):
+                return getattr(mod, '_orig_mod', mod)
+        except Exception:
+            return mod
+        return mod
+    # Expose for external use (tests / debugging)
+    unwrap_compiled_module = _unwrap_if_compiled
+except Exception:
+    def unwrap_compiled_module(mod):  # type: ignore
+        return mod
+
+def _force_dynamo_reset_once():
+    global _DYNAMO_SEEN
+    if _DYNAMO_SEEN:
+        return
+    try:
+        import torch._dynamo as _dynamo
+        _dynamo.reset()
+        # Disable further frame evaluation for absolute safety this run
+        os.environ['TORCHDYNAMO_DISABLE'] = '1'
+        print("[DecompileGuard] torch._dynamo.reset() executed; forcing eager mode.")
+    except Exception:
+        pass
+    _DYNAMO_SEEN = True
+
+
 # Display key configuration parameters
 print(f"Learning rate: {RL_CONFIG.lr}")
 print(f"Batch size: {RL_CONFIG.batch_size}")
@@ -337,9 +382,10 @@ class HybridDQN(nn.Module):
 class HybridReplayBuffer:
     """Experience replay buffer for hybrid discrete-continuous actions.
     
-    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done)
+    Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done, actor, horizon)
     - discrete_action: integer index for fire/zap combination (0-3)
     - continuous_action: float spinner value in [-0.9, +0.9]
+    - actor: string tag identifying source of experience ('expert' or 'dqn')
     """
     def __init__(self, capacity: int, state_size: Optional[int] = None):
         self.capacity = capacity
@@ -356,12 +402,129 @@ class HybridReplayBuffer:
         self.rewards = np.empty((capacity,), dtype=np.float32)
         self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
         self.dones = np.empty((capacity,), dtype=np.bool_)
+        self.actors = np.empty((capacity,), dtype='U10')  # Store actor tags (up to 10 chars)
+        self.horizons = np.ones((capacity,), dtype=np.int32)  # n-step horizon per transition (default 1)
+        # Caches (initialized lazily)
+        self._last_percentile_value = None
+        self._last_percentile_source_size = 0
+        self._high_reward_mask = None
+        self._terminal_indices = None
+        self._last_terminal_count_source_size = 0
+        self._last_cache_refresh_frame = 0
+        self._rand = np.random.default_rng()
 
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done):
-        """Add experience to buffer"""
+    # Internal helpers for optimized sampling
+    def _refresh_percentile_cache(self, rl_cfg, metrics_obj):
+        try:
+            perc = float(getattr(rl_cfg, 'replay_high_reward_percentile', 70.0))
+        except Exception:
+            perc = 70.0
+        try:
+            rewards_view = self.rewards[:self.size]
+            if rewards_view.size == 0:
+                self._last_percentile_value = 0.0
+                self._high_reward_mask = None
+            else:
+                self._last_percentile_value = float(np.percentile(rewards_view, perc))
+                self._high_reward_mask = (rewards_view >= self._last_percentile_value)
+            self._last_percentile_source_size = self.size
+        except Exception:
+            self._last_percentile_value = None
+        try:
+            metrics_obj.replay_cache_percentile = float(self._last_percentile_value if self._last_percentile_value is not None else 0.0)
+        except Exception:
+            pass
+
+    def _refresh_terminal_cache(self, metrics_obj):
+        try:
+            dones_view = self.dones[:self.size]
+            self._terminal_indices = np.flatnonzero(dones_view)
+            self._last_terminal_count_source_size = self.size
+        except Exception:
+            self._terminal_indices = None
+        try:
+            metrics_obj.replay_cache_terminals = int(0 if self._terminal_indices is None else self._terminal_indices.size)
+        except Exception:
+            pass
+
+    def _maybe_refresh_caches(self):
+        # Import inside to avoid circular import at module load
+        from config import RL_CONFIG as _RL_CFG, metrics as _METRICS
+        if not getattr(_RL_CFG, 'optimized_replay_sampling', False):
+            return
+        # Periodic full refresh based on frame count interval to combat distribution drift
+        frame_ct = getattr(_METRICS, 'frame_count', 0)
+        interval = int(getattr(_RL_CFG, 'replay_cache_refresh_interval', 5000) or 5000)
+        if frame_ct - self._last_cache_refresh_frame >= interval:
+            self._refresh_percentile_cache(_RL_CFG, _METRICS)
+            self._refresh_terminal_cache(_METRICS)
+            self._last_cache_refresh_frame = frame_ct
+
+    def _fast_high_reward_indices(self, count, rl_cfg):
+        # Ensure cache valid; refresh lazily if size grew enough
+        if self._last_percentile_value is None or self._last_percentile_source_size != self.size:
+            self._refresh_percentile_cache(rl_cfg, metrics)
+        if self._high_reward_mask is None or self._high_reward_mask.size != self.size:
+            threshold = self._last_percentile_value if self._last_percentile_value is not None else -1e9
+            cand = np.flatnonzero(self.rewards[:self.size] >= threshold)
+        else:
+            cand = np.flatnonzero(self._high_reward_mask)
+        if cand.size == 0:
+            # fallback: any random indices
+            return self._rand.choice(self.size, size=count, replace=False)
+        if cand.size >= count:
+            return self._rand.choice(cand, size=count, replace=False)
+        # Not enough, fill remainder randomly (avoid duplicates by using set difference)
+        needed = count - cand.size
+        extras = self._rand.choice(self.size, size=needed, replace=False)
+        return np.concatenate([cand, extras])
+
+    def _fast_pre_death_indices(self, count, rl_cfg):
+        # Refresh terminal cache if needed
+        if self._terminal_indices is None or self._last_terminal_count_source_size != self.size:
+            self._refresh_terminal_cache(metrics)
+        terms = self._terminal_indices
+        if terms is None or terms.size == 0:
+            return self._rand.choice(self.size, size=count, replace=False)
+        lb_min = int(getattr(rl_cfg, 'replay_terminal_lookback_min', 5) or 5)
+        lb_max = int(getattr(rl_cfg, 'replay_terminal_lookback_max', 10) or 10)
+        # Sample candidate pre-death frames by random lookback inside [lb_min, lb_max]
+        chosen = []
+        if terms.size >= count:
+            sample_terms = self._rand.choice(terms, size=count, replace=False)
+        else:
+            sample_terms = terms
+        for t in sample_terms:
+            lookback = self._rand.integers(lb_min, lb_max + 1)
+            idx = int(t) - int(lookback)
+            if idx < 0:
+                idx = 0
+            chosen.append(idx)
+        chosen = np.array(chosen, dtype=np.int64)
+        if chosen.size < count:
+            need = count - chosen.size
+            extra = self._rand.choice(self.size, size=need, replace=False)
+            chosen = np.concatenate([chosen, extra])
+        return chosen
+
+    def _fast_recent_indices(self, count, rl_cfg):
+        recent_min = int(getattr(rl_cfg, 'replay_recent_window_min', 50000) or 50000)
+        recent_frac = float(getattr(rl_cfg, 'replay_recent_window_frac', 0.10) or 0.10)
+        window = max(recent_min, int(self.size * recent_frac))
+        start = max(0, self.size - window)
+        if start >= self.size:
+            start = 0
+        return self._rand.integers(start, self.size, size=count, endpoint=False)
+
+    def _fast_random_indices(self, count):
+        return self._rand.choice(self.size, size=count, replace=False)
+
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor='dqn', horizon: int = 1):
+        """Add experience to buffer with actor tag"""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        actor_tag = str(actor).lower().strip() if actor else 'dqn'
 
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
@@ -398,43 +561,175 @@ class HybridReplayBuffer:
         except Exception:
             self.next_states[self.position, :] = 0.0
         self.dones[self.position] = done
+        self.actors[self.position] = actor_tag
+        try:
+            h = int(horizon)
+            if h < 1:
+                h = 1
+        except Exception:
+            h = 1
+        self.horizons[self.position] = h
 
         # Update position and size
         self.position = (self.position + 1) % self.capacity
         if self.size < self.capacity:
             self.size += 1
+        # Incremental cache maintenance (only when optimization enabled)
+        try:
+            from config import RL_CONFIG as _RL_CFG
+            if getattr(_RL_CFG, 'optimized_replay_sampling', False):
+                # Terminal index maintenance: append if done, else nothing. If overwriting existing slot that was terminal, force full refresh next sample.
+                if done:
+                    if self._terminal_indices is not None:
+                        # Append new absolute index (position just advanced; newly written index = (position-1) mod capacity)
+                        new_idx = (self.position - 1) % self.capacity
+                        self._terminal_indices = np.append(self._terminal_indices, new_idx)
+                else:
+                    # If overwriting a terminal slot, mark for refresh by invalidating source size reference
+                    pass
+                # Percentile maintenance: light-touch exponential moving estimate of threshold to avoid full np.percentile each push
+                if self._last_percentile_value is not None:
+                    perc = float(getattr(_RL_CFG, 'replay_high_reward_percentile', 70.0) or 70.0)
+                    # Simple heuristic: move threshold slightly toward new reward if it's above current threshold region
+                    r_new = float(reward)
+                    alpha = 0.001  # slow adaptation
+                    # If new reward higher than current threshold, raise threshold slightly; else decay slightly
+                    if r_new > self._last_percentile_value:
+                        self._last_percentile_value = (1 - alpha) * self._last_percentile_value + alpha * r_new
+                    else:
+                        # Gentle decay toward mean (assumed ~0) if threshold drifts too high
+                        self._last_percentile_value *= (1 - alpha*0.5)
+        except Exception:
+            pass
     
     def sample(self, batch_size):
-        """Sample batch of experiences with optional recent-window bias."""
+        """Sample batch with stratified quality-based sampling.
+        
+        Distribution:
+        - 40% from high-reward frames (good play to reinforce)
+        - 20% from pre-death frames (critical mistakes to avoid)
+        - 20% from recent frames (fresh policy)
+        - 20% random (coverage/exploration)
+        """
         if self.size < batch_size:
             return None
 
-        # Default: uniform over buffer
-        indices = None
+        # Calculate target counts for each category
+        n_high_reward = int(batch_size * 0.4)
+        n_pre_death = int(batch_size * 0.2)
+        n_recent = int(batch_size * 0.2)
+        n_random = batch_size - n_high_reward - n_pre_death - n_recent  # Remainder
+        
+        all_indices = []
+        
+        # Fast path if optimization enabled
+        from config import RL_CONFIG as _RL_CFG
+        optimized = getattr(_RL_CFG, 'optimized_replay_sampling', False)
+        if optimized:
+            try:
+                self._maybe_refresh_caches()
+                sampled_high = self._fast_high_reward_indices(n_high_reward, _RL_CFG)
+                sampled_pre_death = self._fast_pre_death_indices(n_pre_death, _RL_CFG)
+                sampled_recent = self._fast_recent_indices(n_recent, _RL_CFG)
+                sampled_random = self._fast_random_indices(n_random)
+                all_indices.extend([sampled_high, sampled_pre_death, sampled_recent, sampled_random])
+                # Reliability assertions (non-fatal)
+                try:
+                    if getattr(_RL_CFG, 'replay_sampling_debug', False):
+                        if any(arr.size == 0 for arr in (sampled_high, sampled_pre_death, sampled_recent, sampled_random)):
+                            print("[ReplayOpt][WARN] Empty category encountered; will rely on others.")
+                except Exception:
+                    pass
+            except Exception:
+                # Fall back to legacy slow path on any error
+                if getattr(_RL_CFG, 'replay_sampling_debug', False):
+                    print("[ReplayOpt][FALLBACK] Exception in fast path; using legacy sampling.")
+                optimized = False
+        if not optimized:
+            # 1. High-reward frames (top percentile)
+            try:
+                perc = 70
+                try:
+                    perc = int(getattr(_RL_CFG, 'replay_high_reward_percentile', 70) or 70)
+                except Exception:
+                    pass
+                reward_threshold = np.percentile(self.rewards[:self.size], perc)
+                high_reward_idx = np.where(self.rewards[:self.size] >= reward_threshold)[0]
+                if len(high_reward_idx) >= n_high_reward:
+                    sampled_high = np.random.choice(high_reward_idx, n_high_reward, replace=False)
+                else:
+                    sampled_high = high_reward_idx
+                    deficit = n_high_reward - len(high_reward_idx)
+                    if deficit > 0:
+                        extra = np.random.choice(self.size, deficit, replace=False)
+                        sampled_high = np.concatenate([sampled_high, extra])
+                all_indices.append(sampled_high)
+            except Exception:
+                all_indices.append(np.random.choice(self.size, n_high_reward, replace=False))
+            # 2. Pre-death frames
+            try:
+                terminal_idx = np.where(self.dones[:self.size] == True)[0]
+                if len(terminal_idx) > 0:
+                    pre_death_candidates = []
+                    for death_idx in terminal_idx:
+                        lookback = np.random.randint(5, 11)
+                        pre_death_idx = max(0, death_idx - lookback)
+                        pre_death_candidates.append(pre_death_idx)
+                    pre_death_candidates = np.array(pre_death_candidates, dtype=np.int64)
+                    if len(pre_death_candidates) >= n_pre_death:
+                        sampled_pre_death = np.random.choice(pre_death_candidates, n_pre_death, replace=False)
+                    else:
+                        sampled_pre_death = pre_death_candidates
+                        deficit = n_pre_death - len(pre_death_candidates)
+                        if deficit > 0:
+                            extra = np.random.choice(self.size, deficit, replace=False)
+                            sampled_pre_death = np.concatenate([sampled_pre_death, extra])
+                else:
+                    sampled_pre_death = np.random.choice(self.size, n_pre_death, replace=False)
+                all_indices.append(sampled_pre_death)
+            except Exception:
+                all_indices.append(np.random.choice(self.size, n_pre_death, replace=False))
+            # 3. Recent frames
+            try:
+                recent_window_size = max(50000, int(self.size * 0.1))
+                recent_start = max(0, self.size - recent_window_size)
+                if recent_start < self.size:
+                    sampled_recent = np.random.randint(recent_start, self.size, size=n_recent)
+                else:
+                    sampled_recent = np.random.choice(self.size, n_recent, replace=False)
+                all_indices.append(sampled_recent)
+            except Exception:
+                all_indices.append(np.random.choice(self.size, n_recent, replace=False))
+            # 4. Random frames
+            try:
+                sampled_random = np.random.choice(self.size, n_random, replace=False)
+                all_indices.append(sampled_random)
+            except Exception:
+                sampled_random = np.random.randint(0, self.size, size=n_random)
+                all_indices.append(sampled_random)
+        
+        # Combine all indices
+        indices = np.concatenate(all_indices)
+        
+        # Track sampling diagnostics (store counts for metrics)
         try:
-            bias = float(getattr(RL_CONFIG, 'recent_sample_bias', 0.0) or 0.0)
-            window_frac = float(getattr(RL_CONFIG, 'recent_window_frac', 0.0) or 0.0)
+            metrics.sample_n_high_reward = len(all_indices[0]) if len(all_indices) > 0 else 0
+            metrics.sample_n_pre_death = len(all_indices[1]) if len(all_indices) > 1 else 0
+            metrics.sample_n_recent = len(all_indices[2]) if len(all_indices) > 2 else 0
+            metrics.sample_n_random = len(all_indices[3]) if len(all_indices) > 3 else 0
+            
+            # Track mean rewards per category for diagnostics
+            if len(all_indices[0]) > 0:
+                metrics.sample_reward_mean_high = float(self.rewards[all_indices[0]].mean())
+            if len(all_indices[1]) > 0:
+                metrics.sample_reward_mean_pre_death = float(self.rewards[all_indices[1]].mean())
+            if len(all_indices[2]) > 0:
+                metrics.sample_reward_mean_recent = float(self.rewards[all_indices[2]].mean())
+            if len(all_indices[3]) > 0:
+                metrics.sample_reward_mean_random = float(self.rewards[all_indices[3]].mean())
         except Exception:
-            bias, window_frac = 0.0, 0.0
-
-        if bias <= 0.0 or window_frac <= 0.0:
-            indices = np.random.randint(0, self.size, size=batch_size)
-        else:
-            # Split batch: some from recent window, remainder from full buffer
-            recent_count = int(batch_size * min(max(bias, 0.0), 1.0))
-            global_count = batch_size - recent_count
-            # Recent window range [start, size)
-            recent_window = int(self.size * (1.0 - min(max(window_frac, 0.0), 1.0)))
-            recent_low = max(0, min(recent_window, self.size - 1))
-            if recent_count > 0 and recent_low < self.size:
-                recent_idx = np.random.randint(recent_low, self.size, size=recent_count)
-            else:
-                recent_idx = np.empty((0,), dtype=np.int64)
-            if global_count > 0:
-                global_idx = np.random.randint(0, self.size, size=global_count)
-            else:
-                global_idx = np.empty((0,), dtype=np.int64)
-            indices = np.concatenate([recent_idx, global_idx])
+            pass
+        
         
         # Vectorized gather for batch data
         states_np = self.states[indices]
@@ -443,6 +738,8 @@ class HybridReplayBuffer:
         batch_continuous_actions = self.continuous_actions[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
+        batch_actors = self.actors[indices]  # Get actor tags for batch
+        batch_horizons = self.horizons[indices]
 
         # Convert to tensors (pin memory for fast H2D when on CUDA)
         use_pinned = (device.type == 'cuda')
@@ -452,6 +749,7 @@ class HybridReplayBuffer:
         continuous_actions = torch.from_numpy(batch_continuous_actions.reshape(-1, 1)).float()
         rewards = torch.from_numpy(batch_rewards.reshape(-1, 1)).float()
         dones = torch.from_numpy(batch_dones.reshape(-1, 1).astype(np.uint8)).float()
+        horizons = torch.from_numpy(batch_horizons.reshape(-1, 1)).float()
 
         if use_pinned:
             states = states.pin_memory()
@@ -460,6 +758,7 @@ class HybridReplayBuffer:
             continuous_actions = continuous_actions.pin_memory()
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
+            horizons = horizons.pin_memory()
 
         non_block = True if device.type == 'cuda' else False
         states = states.to(device, non_blocking=non_block)
@@ -468,11 +767,30 @@ class HybridReplayBuffer:
         continuous_actions = continuous_actions.to(device, non_blocking=non_block)
         rewards = rewards.to(device, non_blocking=non_block)
         dones = dones.to(device, non_blocking=non_block)
+        horizons = horizons.to(device, non_blocking=non_block)
         
-        return states, discrete_actions, continuous_actions, rewards, next_states, dones
+        return states, discrete_actions, continuous_actions, rewards, next_states, dones, batch_actors, horizons
     
     def __len__(self):
         return self.size
+    
+    def get_actor_composition(self):
+        """Return statistics on actor composition of buffer"""
+        if self.size == 0:
+            return {'total': 0, 'dqn': 0, 'expert': 0, 'frac_dqn': 0.0, 'frac_expert': 0.0}
+        
+        # Count actors in the filled portion of the buffer
+        actors_slice = self.actors[:self.size]
+        n_dqn = np.sum(actors_slice == 'dqn')
+        n_expert = np.sum(actors_slice == 'expert')
+        
+        return {
+            'total': self.size,
+            'dqn': int(n_dqn),
+            'expert': int(n_expert),
+            'frac_dqn': float(n_dqn) / self.size,
+            'frac_expert': float(n_expert) / self.size,
+        }
 
 ## Hybrid-only path: legacy discrete-only DQNAgent removed
 ## N-step learning handled upstream (server) or via dedicated buffer; hybrid agent expects 1-step or n-step rewards provided.
@@ -660,6 +978,19 @@ class HybridDQNAgent:
         self.qnetwork_target.eval()
         if self.qnetwork_inference is not self.qnetwork_local:
             self.qnetwork_inference.eval()
+
+        # Defensive: unwrap any lingering compiled wrappers & reset dynamo once.
+        try:
+            before_types = (self.qnetwork_local.__class__.__name__, self.qnetwork_target.__class__.__name__)
+            self.qnetwork_local = unwrap_compiled_module(self.qnetwork_local)
+            self.qnetwork_target = unwrap_compiled_module(self.qnetwork_target)
+            self.qnetwork_inference = unwrap_compiled_module(self.qnetwork_inference)
+            after_types = (self.qnetwork_local.__class__.__name__, self.qnetwork_target.__class__.__name__)
+            if before_types != after_types:
+                print(f"[DecompileGuard] Unwrapped compiled modules: {before_types} -> {after_types}")
+            _force_dynamo_reset_once()
+        except Exception:
+            pass
         
         # Store device reference
         self.device = device
@@ -669,8 +1000,8 @@ class HybridDQNAgent:
         
         # Experience replay (simplified to uniform sampling only)
         self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
-        print("Using standard HybridReplayBuffer (uniform sampling)")
-        
+        print("Using standard HybridReplayBuffer (uniform sampling, eager mode)")
+
         # Training queue and metrics
         self.train_queue = queue.Queue(maxsize=100)
         self.training_steps = 0
@@ -701,11 +1032,15 @@ class HybridDQNAgent:
         with torch.no_grad():
             discrete_q, continuous_pred = self.qnetwork_inference(state)
         
-        # Discrete action selection (epsilon-greedy)
-        if random.random() < epsilon:
-            discrete_action = random.randint(0, self.discrete_actions - 1)
+        # Discrete action selection (epsilon-greedy) or fixed FIRE when spinner_only
+        if getattr(RL_CONFIG, 'spinner_only', False):
+            # FIRE=1, ZAP=0 -> discrete index 2 (binary 10)
+            discrete_action = 2
         else:
-            discrete_action = discrete_q.cpu().data.numpy().argmax()
+            if random.random() < epsilon:
+                discrete_action = random.randint(0, self.discrete_actions - 1)
+            else:
+                discrete_action = discrete_q.cpu().data.numpy().argmax()
         
         # Continuous action selection (predicted value + optional exploration noise)
         continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
@@ -720,6 +1055,9 @@ class HybridDQNAgent:
     
     def step(self, state, discrete_action, continuous_action, reward, next_state, done, actor=None, horizon=1):
         """Add experience to memory and queue training"""
+        if actor is None:
+            actor = 'dqn'  # Default to DQN if not specified
+        
         self.memory.push(
             state,
             discrete_action,
@@ -727,6 +1065,8 @@ class HybridDQNAgent:
             reward,
             next_state,
             done,
+            actor=actor,
+            horizon=horizon,
         )
         
         # Queue multiple training steps per experience
@@ -796,52 +1136,289 @@ class HybridDQNAgent:
         if batch is None:
             return 0.0
 
-        states, discrete_actions, continuous_actions, rewards, next_states, dones = batch
+        states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
+
+        # Compute batch actor composition for diagnostics
+        try:
+            actor_dqn_mask = np.array([a == 'dqn' for a in actors], dtype=bool)
+            actor_expert_mask = np.array([a == 'expert' for a in actors], dtype=bool)
+            n_dqn = actor_dqn_mask.sum()
+            n_expert = actor_expert_mask.sum()
+            frac_dqn = n_dqn / len(actors) if len(actors) > 0 else 0.0
+            
+            # Store batch composition metrics
+            metrics.batch_frac_dqn = float(frac_dqn)
+            metrics.batch_n_dqn = int(n_dqn)
+            metrics.batch_n_expert = int(n_expert)
+            
+            # Log batch composition every 10000 training steps (disabled for normal operation)
+            # if self.training_steps > 0 and self.training_steps % 10000 == 0:
+            #     print(f"[BATCH] Step {self.training_steps}: {n_dqn} DQN ({frac_dqn*100:.1f}%) / {n_expert} expert ({(1-frac_dqn)*100:.1f}%)")
+        except Exception:
+            actor_dqn_mask = None
+            actor_expert_mask = None
+            pass
 
         # Forward pass
         discrete_q_pred, continuous_pred = self.qnetwork_local(states)
         discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
 
-        # Target computation
+        # Target computation using DOUBLE DQN to prevent Q-value overestimation
+        # Vanilla DQN: target = r + γ * max_a' Q_target(s',a')  ← Maximization bias!
+        # Double DQN: target = r + γ * Q_target(s', argmax_a' Q_local(s',a'))  ← Debiased!
         with torch.no_grad():
+            # Use LOCAL network to SELECT best action (argmax)
+            next_q_local, _ = self.qnetwork_local(next_states)
+            best_actions = next_q_local.max(1)[1].unsqueeze(1)  # argmax over actions
+            
+            # Use TARGET network to EVALUATE that action
             next_q_target, _ = self.qnetwork_target(next_states)
-            discrete_q_next_max = next_q_target.max(1)[0].unsqueeze(1)
-
-            discrete_targets = rewards + (self.gamma * discrete_q_next_max * (1 - dones))
+            discrete_q_next_max = next_q_target.gather(1, best_actions)  # Q_target(s', a*) where a* = argmax Q_local
+            # If horizons>1 (n-step return), apply gamma^h to the bootstrap term
+            gamma_h = torch.pow(torch.tensor(self.gamma, device=rewards.device), horizons)
+            discrete_targets = rewards + (gamma_h * discrete_q_next_max * (1 - dones))
+            # Optional safety: clip TD targets to avoid runaway value scales
+            td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
+            if td_clip is not None:
+                try:
+                    lo, hi = (-float(td_clip), float(td_clip)) if isinstance(td_clip, (int, float)) else td_clip
+                    discrete_targets = discrete_targets.clamp(min=float(lo), max=float(hi))
+                except Exception:
+                    pass
             
             # ADVANTAGE-WEIGHTED POLICY GRADIENT for continuous actions
-            # This allows the agent to LEARN from rewards, not just imitate
-            # Key insight: Weight the gradient by how good the outcome was
+            # KEY FIX: Compute advantages SEPARATELY per actor type to avoid cross-contamination
+            # If we compute advantages across mixed expert+DQN batch, expert's high rewards
+            # make DQN's lower rewards look bad, suppressing DQN learning!
             
-            # Compute standardized advantages (z-scores)
-            reward_mean = rewards.mean()
-            reward_std = rewards.std() + 1e-8
-            advantages = (rewards - reward_mean) / reward_std
-            advantages = advantages.clamp(-3, 3)  # Clip extreme outliers
+            # CRITICAL FIX: Reduced advantage scaling from 1.5 → 0.5 to prevent extreme weights
+            # Was: exp(adv * 1.5) with 90x max weight causing loss instability
+            # Now: exp(adv * 0.5) with ~4.5x max weight for stable learning
             
-            # Exponential weighting: good actions get MUCH stronger gradients than bad ones
-            # AGGRESSIVE SCALING: exp(1.5) ≈ 90x,  exp(0.0) = 1.0x,  exp(-1.5) ≈ 0.01x
-            # This creates EXTREME preference for successful actions to overcome bad DQN dominance
-            advantage_weights = torch.exp(advantages * 1.5).clamp(0.001, 100.0)
+            advantage_weights = torch.ones_like(rewards)
+            
+            try:
+                if actor_dqn_mask is not None and actor_expert_mask is not None:
+                    # Convert numpy masks to torch boolean masks on the same device for indexing
+                    torch_mask_dqn = torch.from_numpy(actor_dqn_mask).to(device=rewards.device, dtype=torch.bool).view(-1)
+                    torch_mask_exp = torch.from_numpy(actor_expert_mask).to(device=rewards.device, dtype=torch.bool).view(-1)
+
+                    # DQN advantages: compare DQN frames to OTHER DQN frames
+                    if n_dqn > 1:
+                        dqn_rewards = rewards[torch_mask_dqn]
+                        dqn_mean = dqn_rewards.mean()
+                        dqn_std = dqn_rewards.std() + 1e-8
+                        dqn_advantages = (dqn_rewards - dqn_mean) / dqn_std
+                        dqn_advantages = dqn_advantages.clamp(-3, 3)
+                        # Reduced scaling: 0.5 instead of 1.5 (was causing 90x weights!)
+                        dqn_weights = torch.exp(dqn_advantages * 0.5).clamp(0.1, 5.0)
+                        advantage_weights[torch_mask_dqn] = dqn_weights
+                    
+                    # Expert advantages: compare expert frames to OTHER expert frames
+                    if n_expert > 1:
+                        exp_rewards = rewards[torch_mask_exp]
+                        exp_mean = exp_rewards.mean()
+                        exp_std = exp_rewards.std() + 1e-8
+                        exp_advantages = (exp_rewards - exp_mean) / exp_std
+                        exp_advantages = exp_advantages.clamp(-3, 3)
+                        # Reduced scaling: 0.5 instead of 1.5
+                        exp_weights = torch.exp(exp_advantages * 0.5).clamp(0.1, 5.0)
+                        advantage_weights[torch_mask_exp] = exp_weights
+                else:
+                    # Fallback: compute advantages across full batch (old behavior)
+                    reward_mean = rewards.mean()
+                    reward_std = rewards.std() + 1e-8
+                    advantages = (rewards - reward_mean) / reward_std
+                    advantages = advantages.clamp(-3, 3)
+                    advantage_weights = torch.exp(advantages * 0.5).clamp(0.1, 5.0)
+            except Exception:
+                # Fallback: compute advantages across full batch
+                reward_mean = rewards.mean()
+                reward_std = rewards.std() + 1e-8
+                advantages = (rewards - reward_mean) / reward_std
+                advantages = advantages.clamp(-3, 3)
+                advantage_weights = torch.exp(advantages * 0.5).clamp(0.1, 5.0)
             
             continuous_targets = continuous_actions  # Still target the actions taken
 
         # Losses
-        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 0.5) or 0.5)
-        d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
+        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
+        w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
+
+        # Optionally restrict discrete loss to expert frames only
+        if bool(getattr(RL_CONFIG, 'discrete_expert_only', False)) and 'torch_mask_exp' in locals() and torch_mask_exp.any():
+            d_loss_raw = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
+            d_mask = torch_mask_exp.view(-1, 1).float()
+            denom = d_mask.mean().clamp(min=1e-6)
+            d_loss = (d_loss_raw * d_mask).sum() / (d_loss_raw.numel() * denom.item())
+        else:
+            d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
         
-        # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
-        # High reward (+1.5σ) → 4.5x gradient strength → LEARN STRONGLY
+    # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
+        # REDUCED SCALING: exp(adv * 0.5) with 5x max weight (was 1.5 * 100x causing instability!)
+        # High reward (+1.5σ) → 2.1x gradient strength → moderate boost
         # Average reward (0σ) → 1.0x gradient → normal learning
-        # Low reward (-1.5σ) → 0.22x gradient → nearly ignore
+        # Low reward (-1.5σ) → 0.47x gradient → slight reduction
+        # This prevents overfitting to rare high-reward frames while still biasing toward quality
         c_loss_raw = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
-        c_loss = (c_loss_raw * advantage_weights).mean()
+        # Optionally restrict continuous loss to expert frames only in spinner-only mode
+        if getattr(RL_CONFIG, 'spinner_only', False) and getattr(RL_CONFIG, 'spinner_only_expert_only', False):
+            try:
+                if 'torch_mask_exp' in locals() and torch_mask_exp.any():
+                    mask = torch_mask_exp.view(-1, 1).float()
+                    # Normalize mask to keep scale comparable when few expert frames are present
+                    denom = mask.mean().clamp(min=1e-6)
+                    c_loss = ((c_loss_raw * advantage_weights) * mask).sum() / (c_loss_raw.numel() * denom.item())
+                else:
+                    c_loss = (c_loss_raw * advantage_weights).mean()
+            except Exception:
+                c_loss = (c_loss_raw * advantage_weights).mean()
+        else:
+            c_loss = (c_loss_raw * advantage_weights).mean()
         
-        total_loss = d_loss + w_cont * c_loss
+        # In spinner-only mode, ignore discrete loss entirely
+        if getattr(RL_CONFIG, 'spinner_only', False):
+            total_loss = w_cont * c_loss
+        else:
+            total_loss = (w_disc * d_loss) + (w_cont * c_loss)
+
+        # Compute per-actor metrics for diagnostics
+        try:
+            if actor_dqn_mask is not None and actor_expert_mask is not None:
+                # TD errors per actor
+                td_errors = (discrete_q_selected - discrete_targets).detach().cpu().numpy().flatten()
+                if n_dqn > 0:
+                    metrics.td_err_mean_dqn = float(np.abs(td_errors[actor_dqn_mask]).mean())
+                    metrics.reward_mean_dqn = float(rewards.cpu().numpy().flatten()[actor_dqn_mask].mean())
+                    metrics.q_mean_dqn = float(discrete_q_selected.detach().cpu().numpy().flatten()[actor_dqn_mask].mean())
+                if n_expert > 0:
+                    metrics.td_err_mean_expert = float(np.abs(td_errors[actor_expert_mask]).mean())
+                    metrics.reward_mean_expert = float(rewards.cpu().numpy().flatten()[actor_expert_mask].mean())
+                    metrics.q_mean_expert = float(discrete_q_selected.detach().cpu().numpy().flatten()[actor_expert_mask].mean())
+                # Per-actor discrete loss means (per-sample)
+                try:
+                    d_loss_per = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none').detach().cpu().numpy().flatten()
+                    if n_dqn > 0:
+                        metrics.d_loss_mean_dqn = float(d_loss_per[actor_dqn_mask].mean())
+                    if n_expert > 0:
+                        metrics.d_loss_mean_expert = float(d_loss_per[actor_expert_mask].mean())
+                except Exception:
+                    pass
+                # Selected/target Q means per actor
+                try:
+                    q_sel_np = discrete_q_selected.detach().cpu().numpy().flatten()
+                    q_tgt_np = discrete_targets.detach().cpu().numpy().flatten()
+                    if n_dqn > 0:
+                        metrics.q_sel_mean_dqn = float(q_sel_np[actor_dqn_mask].mean())
+                        metrics.q_tgt_mean_dqn = float(q_tgt_np[actor_dqn_mask].mean())
+                    if n_expert > 0:
+                        metrics.q_sel_mean_expert = float(q_sel_np[actor_expert_mask].mean())
+                        metrics.q_tgt_mean_expert = float(q_tgt_np[actor_expert_mask].mean())
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Backward pass
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        # If spinner-only, clear any stray grads in discrete head to avoid updates
+        if getattr(RL_CONFIG, 'spinner_only', False):
+            try:
+                for name, p in self.qnetwork_local.named_parameters():
+                    if name.startswith('discrete_') and p.grad is not None:
+                        p.grad.detach_()
+                        p.grad.zero_()
+            except Exception:
+                pass
+
+        # Optional gradient diagnostics: measure each head's contribution
+        try:
+            interval = int(getattr(RL_CONFIG, 'grad_diag_interval', 0) or 0)
+        except Exception:
+            interval = 0
+        if interval and (self.training_steps % interval == 0):
+            try:
+                # Compute separate grads by re-backpropagating each component on a fresh graph snapshot
+                # Snapshot current parameter grads to restore later
+                saved_grads = [p.grad.detach().clone() if p.grad is not None else None for p in self.qnetwork_local.parameters()]
+
+                def zero_grads():
+                    for p in self.qnetwork_local.parameters():
+                        if p.grad is not None:
+                            p.grad.detach_()
+                            p.grad.zero_()
+
+                # Recompute forward needed tensors under no grad accumulation
+                # Note: reuse already computed discrete_q_selected/continuous_pred where possible
+
+                # 1) Discrete-only backward
+                zero_grads()
+                d_loss.backward(retain_graph=True)
+                trunk_norm_d, disc_head_norm_d, cont_head_norm_d = 0.0, 0.0, 0.0
+                try:
+                    for name, p in self.qnetwork_local.named_parameters():
+                        if p.grad is None:
+                            continue
+                        g = p.grad.data
+                        gn = g.norm(2).item()
+                        if name.startswith('shared_layers'):
+                            trunk_norm_d += gn * gn
+                        elif name.startswith('discrete_'):
+                            disc_head_norm_d += gn * gn
+                        elif name.startswith('continuous_'):
+                            cont_head_norm_d += gn * gn
+                    trunk_norm_d = trunk_norm_d ** 0.5
+                    disc_head_norm_d = disc_head_norm_d ** 0.5
+                    cont_head_norm_d = cont_head_norm_d ** 0.5
+                except Exception:
+                    pass
+
+                # 2) Continuous-only backward
+                zero_grads()
+                (w_cont * c_loss).backward(retain_graph=False)
+                trunk_norm_c, disc_head_norm_c, cont_head_norm_c = 0.0, 0.0, 0.0
+                try:
+                    for name, p in self.qnetwork_local.named_parameters():
+                        if p.grad is None:
+                            continue
+                        g = p.grad.data
+                        gn = g.norm(2).item()
+                        if name.startswith('shared_layers'):
+                            trunk_norm_c += gn * gn
+                        elif name.startswith('discrete_'):
+                            disc_head_norm_c += gn * gn
+                        elif name.startswith('continuous_'):
+                            cont_head_norm_c += gn * gn
+                    trunk_norm_c = trunk_norm_c ** 0.5
+                    disc_head_norm_c = disc_head_norm_c ** 0.5
+                    cont_head_norm_c = cont_head_norm_c ** 0.5
+                except Exception:
+                    pass
+
+                # Restore original grads
+                for p, g in zip(self.qnetwork_local.parameters(), saved_grads):
+                    if g is None:
+                        p.grad = None
+                    else:
+                        if p.grad is None:
+                            p.grad = g.clone()
+                        else:
+                            p.grad.detach_()
+                            p.grad.copy_(g)
+
+                # Publish metrics
+                try:
+                    metrics.grad_trunk_d = float(trunk_norm_d)
+                    metrics.grad_trunk_c = float(trunk_norm_c)
+                    metrics.grad_head_disc_d = float(disc_head_norm_d)
+                    metrics.grad_head_disc_c = float(disc_head_norm_c)
+                    metrics.grad_head_cont_d = float(cont_head_norm_d)
+                    metrics.grad_head_cont_c = float(cont_head_norm_c)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         # Compute gradient norm BEFORE clipping
         total_grad_norm = 0.0
@@ -874,6 +1451,13 @@ class HybridDQNAgent:
             metrics.total_training_steps += 1
             metrics.training_steps_interval += 1
             metrics.memory_buffer_size = len(self.memory)
+            
+            # Report buffer composition every 10000 training steps (disabled for normal operation)
+            # if self.training_steps % 10000 == 0:
+            #     comp = self.memory.get_actor_composition()
+            #     print(f"[BUFFER] Step {self.training_steps}: {comp['total']} total, "
+            #           f"{comp['dqn']} DQN ({comp['frac_dqn']*100:.1f}%), "
+            #           f"{comp['expert']} expert ({comp['frac_expert']*100:.1f}%)")
         except Exception:
             pass
         # Track loss values
@@ -885,20 +1469,87 @@ class HybridDQNAgent:
             # Track gradient norms for monitoring
             metrics.last_grad_norm = float(total_grad_norm)
             metrics.last_clip_delta = float(clip_delta)
+            # Track component losses
+            last_d = float((w_disc * d_loss).item())
+            last_c = float((w_cont * c_loss).item())
+            metrics.last_d_loss = last_d
+            metrics.last_c_loss = last_c
+            # Accumulate interval-averaged component losses
+            try:
+                metrics.d_loss_sum_interval += last_d
+                metrics.d_loss_count_interval += 1
+                metrics.c_loss_sum_interval += last_c
+                metrics.c_loss_count_interval += 1
+            except Exception:
+                pass
+            # Advantage weight summaries
+            try:
+                metrics.adv_w_mean = float(advantage_weights.mean().item())
+                metrics.adv_w_max = float(advantage_weights.max().item())
+                # If masks available, compute per-actor means
+                if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
+                    metrics.adv_w_mean_dqn = float(advantage_weights[torch_mask_dqn].mean().item())
+                if 'torch_mask_exp' in locals() and torch_mask_exp.any():
+                    metrics.adv_w_mean_expert = float(advantage_weights[torch_mask_exp].mean().item())
+            except Exception:
+                pass
+            # Discrete-head global diagnostics for this batch
+            try:
+                # Action distribution (0..3)
+                acts_np = discrete_actions.detach().cpu().numpy().flatten()
+                for a in range(4):
+                    frac = float((acts_np == a).mean())
+                    if a == 0: metrics.action_frac_0 = frac
+                    elif a == 1: metrics.action_frac_1 = frac
+                    elif a == 2: metrics.action_frac_2 = frac
+                    elif a == 3: metrics.action_frac_3 = frac
+                # Agreement rate: taken action vs current policy argmax
+                with torch.no_grad():
+                    dq_now, _ = self.qnetwork_local(states)
+                    a_star = dq_now.max(1)[1].unsqueeze(1)
+                    agree = (a_star == discrete_actions).float().mean().item()
+                metrics.action_agree_pct = float(agree * 100.0)
+                # Batch done fraction and horizon mean
+                try:
+                    metrics.batch_done_frac = float(dones.detach().cpu().numpy().mean())
+                except Exception:
+                    metrics.batch_done_frac = 0.0
+                try:
+                    metrics.batch_h_mean = float(horizons.detach().cpu().numpy().mean())
+                except Exception:
+                    metrics.batch_h_mean = 1.0
+            except Exception:
+                pass
         except Exception:
             pass
 
-        # Hard target update
-        if self.training_steps % RL_CONFIG.target_update_freq == 0:
-            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-            # Telemetry
+        # Target network update: support soft updates (Polyak) or periodic hard copy
+        if getattr(RL_CONFIG, 'use_soft_target_update', False):
+            try:
+                tau = float(getattr(RL_CONFIG, 'soft_target_tau', 0.005) or 0.005)
+            except Exception:
+                tau = 0.005
+            with torch.no_grad():
+                for tgt_p, src_p in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
+                    tgt_p.data.mul_(1.0 - tau).add_(src_p.data, alpha=tau)
+            # Telemetry (treat as a target update for age tracking)
             try:
                 metrics.last_target_update_frame = metrics.frame_count
                 metrics.last_target_update_time = time.time()
-                metrics.last_hard_target_update_frame = metrics.frame_count
-                metrics.last_hard_target_update_time = time.time()
             except Exception:
                 pass
+        else:
+            # Hard target update
+            if self.training_steps % RL_CONFIG.target_update_freq == 0:
+                self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+                # Telemetry
+                try:
+                    metrics.last_target_update_frame = metrics.frame_count
+                    metrics.last_target_update_time = time.time()
+                    metrics.last_hard_target_update_frame = metrics.frame_count
+                    metrics.last_hard_target_update_time = time.time()
+                except Exception:
+                    pass
         
         return float(total_loss.item())
 

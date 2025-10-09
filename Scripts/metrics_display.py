@@ -185,6 +185,9 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
         f"{'Rwrd':>6} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
+        f"{'DLoss':>8} {'CLoss':>8} {'AdvWm':>6} {'AdvWmx':>7} {'FrDQN%':>7} {'TDdqn':>7} {'TDexp':>7} "
+        f"{'Wd':>4} {'Wc':>4} "
+        f"{'Agree%':>7} {'Done%':>6} {'HMean':>6} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
         f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
     )
@@ -262,6 +265,8 @@ def display_metrics_row(agent, kb_handler):
     # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time and Steps/s
     latest_loss = metrics.losses[-1] if metrics.losses else 0.0
     loss_avg = latest_loss
+    d_loss_avg = float(getattr(metrics, 'last_d_loss', 0.0) or 0.0)
+    c_loss_avg = float(getattr(metrics, 'last_c_loss', 0.0) or 0.0)
     avg_inference_time_ms = 0.0
     steps_per_sec = 0.0
     samples_per_sec = 0.0
@@ -276,9 +281,21 @@ def display_metrics_row(agent, kb_handler):
         # Average loss since last row and reset
         if getattr(metrics, 'loss_count_interval', 0) > 0:
             loss_avg = metrics.loss_sum_interval / max(metrics.loss_count_interval, 1)
+        # Component interval averages
+        try:
+            if getattr(metrics, 'd_loss_count_interval', 0) > 0:
+                d_loss_avg = metrics.d_loss_sum_interval / max(metrics.d_loss_count_interval, 1)
+            if getattr(metrics, 'c_loss_count_interval', 0) > 0:
+                c_loss_avg = metrics.c_loss_sum_interval / max(metrics.c_loss_count_interval, 1)
+        except Exception:
+            pass
         # Reset interval accumulators
         metrics.loss_sum_interval = 0.0
         metrics.loss_count_interval = 0
+        metrics.d_loss_sum_interval = 0.0
+        metrics.d_loss_count_interval = 0
+        metrics.c_loss_sum_interval = 0.0
+        metrics.c_loss_count_interval = 0
 
         # Steps/s: compute using time elapsed since last row
         now = time.time()
@@ -368,6 +385,18 @@ def display_metrics_row(agent, kb_handler):
     sync_col = f"{sync_df//1000}k/{(f'{sync_dt:>4.1f}s' if sync_dt is not None else 'n/a'):>6}"
     targ_col = f"{targ_df//1000}k/{(f'{targ_dt:>4.1f}s' if targ_dt is not None else 'n/a'):>6}"
 
+    # Additional diagnostics for troubleshooting
+    d_loss = d_loss_avg
+    c_loss = c_loss_avg
+    adv_w_mean = float(getattr(metrics, 'adv_w_mean', 1.0) or 0.0)
+    adv_w_max = float(getattr(metrics, 'adv_w_max', 1.0) or 0.0)
+    frac_dqn_pct = 100.0 * float(getattr(metrics, 'batch_frac_dqn', 0.0) or 0.0)
+    td_dqn = float(getattr(metrics, 'td_err_mean_dqn', 0.0) or 0.0)
+    td_exp = float(getattr(metrics, 'td_err_mean_expert', 0.0) or 0.0)
+    agree_pct = float(getattr(metrics, 'action_agree_pct', 0.0) or 0.0)
+    done_pct = 100.0 * float(getattr(metrics, 'batch_done_frac', 0.0) or 0.0)
+    h_mean = float(getattr(metrics, 'batch_h_mean', 1.0) or 1.0)
+
     # Base row text with Q-Value Range moved before Training Stats, reward components removed
     # Show effective epsilon (0.00 when epsilon override is ON)
     try:
@@ -375,9 +404,22 @@ def display_metrics_row(agent, kb_handler):
     except Exception:
         effective_eps = metrics.epsilon
 
+    # Loss weights (from RL_CONFIG)
+    try:
+        w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
+    except Exception:
+        w_disc = 1.0
+    try:
+        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
+    except Exception:
+        w_cont = 1.0
+
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
     f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
+    f"{d_loss:>8.5f} {c_loss:>8.5f} {adv_w_mean:>6.2f} {adv_w_max:>7.2f} {frac_dqn_pct:>7.1f} {td_dqn:>7.3f} {td_exp:>7.3f} "
+    f"{w_disc:>4.2f} {w_cont:>4.2f} "
+    f"{agree_pct:>7.1f} {done_pct:>6.1f} {h_mean:>6.2f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{'ON' if metrics.override_expert else 'OFF':>3} "
         f"{'ON' if metrics.expert_mode else 'OFF':>6} "

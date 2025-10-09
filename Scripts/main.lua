@@ -378,7 +378,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
 
     -- --- OOB Data Packing ---
     local is_attract_mode = (gs.game_mode & 0x80) == 0
-    local is_open_level = ls.level_type == 0xFF
+    local is_open_level = ls.level_type == 0x00 -- Updated heuristic
     local score = ps.score or 0
     local frame = gs.frame_counter % 65536
 

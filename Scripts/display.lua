@@ -142,7 +142,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     -- Level State Section
     local level_metrics = {
          ["Level Num"] = level_state.level_number,
-         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type == 0xFF) and "Open" or "Closed"),
+         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type == 0x00) and "Open" or "Closed"), -- Updated heuristic
          ["Level Shape"] = level_state.level_shape,
     }
     display_str = display_str .. format_section("Level State", level_metrics)

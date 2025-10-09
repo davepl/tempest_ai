@@ -496,7 +496,7 @@ function M.LevelState:new()
     local self = setmetatable({}, M.LevelState)
     self.level_number = 0
     self.spike_heights = {} -- Array of 16 spike heights (0-15 index)
-    self.level_type = 0     -- 00 = closed, FF = open (Read from memory, but might be unreliable)
+    self.level_type = 0     -- 00 = OPEN, FF = closed (Updated: original assumption inverted after assembly review)
     self.level_angles = {}  -- Array of 16 tube angles (0-15 index)
     self.level_shape = 0    -- Level shape (level_number % 16)
     -- Initialize tables
@@ -509,7 +509,7 @@ end
 
 function M.LevelState:update(mem)
     self.level_number = mem:read_u8(0x009F)   -- Level number
-    self.level_type = mem:read_u8(0x0111)     -- Level type (00=closed, FF=open)
+    self.level_type = mem:read_u8(0x0111)     -- Level type raw flag at $0111 (00=open, FF=closed after inversion)
     self.level_shape = self.level_number % 16 -- Calculate level shape
 
     -- Read spike heights for all 16 segments and store them indexed by absolute segment number (0-15)
@@ -582,7 +582,8 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     -- Read all 8 shot positions and segments
     -- Determine if level is open based on the level type flag (might be unreliable)
     local level_type_flag = mem:read_u8(0x0111)
-    local is_open = (level_type_flag == 0xFF)
+    -- Inverted heuristic: treat 0x00 as open now. Keep temporary check for monitoring.
+    local is_open = (level_type_flag == 0x00)
     -- Or use level number pattern if flag is known bad:
     -- local level_num_zero_based = (mem:read_u8(0x009F) - 1)
     -- local is_open = (level_num_zero_based % 4 == 2)
@@ -758,7 +759,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- Get player position and level type for relative calculations
     local player_abs_segment = player_state.position & 0x0F -- Get current player absolute segment
     -- Determine if level is open based *only* on the memory flag now
-    local is_open = (level_state.level_type == 0xFF)
+    local is_open = (level_state.level_type == 0x00)
     -- Re-enable debug print to monitor memory flag and resulting is_open
 
     -- Read active enemy counts and related state
