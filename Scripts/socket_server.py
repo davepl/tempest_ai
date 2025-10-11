@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# ==================================================================================================================
+# ||                                                                                                              ||
+# ||                                    TEMPEST AI • SOCKET BRIDGE SERVER                                        ||
+# ||                                                                                                              ||
+# ||  FILE: Scripts/socket_server.py                                                                              ||
+# ||  ROLE: TCP server bridging Lua (MAME) and Python: receives frames, returns actions, manages clients.          ||
+# ||                                                                                                              ||
+# ||  NEED TO KNOW:                                                                                               ||
+# ||   - Accepts Lua client(s), handshakes, reads OOB+state, decodes, queries agent, replies action bytes.         ||
+# ||   - Supports optional server-side n-step (if agent doesn’t own one); updates metrics thread-safely.          ||
+# ||   - Robust shutdown handling; per-client worker threads.                                                      ||
+# ||                                                                                                              ||
+# ||  CONSUMES: RL_CONFIG, SERVER_CONFIG, metrics, NStepReplayBuffer (optional)                                   ||
+# ||  PRODUCES: agent experiences, actions to Lua, metrics updates                                                ||
+# ||                                                                                                              ||
+# ==================================================================================================================
 """
 Socket server for Tempest AI (hybrid-only).
 Bridges Lua frames to a HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner).
@@ -53,6 +69,7 @@ class SocketServer:
         self.client_lock = threading.Lock()
 
         # Action distribution stats
+        #BUGBUG Is this still accurate with the hybrid model?
         self.expert_action_counts = np.zeros(16, dtype=np.int64)  # 4 discrete * 4 spinner buckets (diagnostic only)
         self.dqn_action_counts = np.zeros(16, dtype=np.int64)
 
@@ -120,11 +137,13 @@ class SocketServer:
                     with self.client_lock:
                         self.clients[client_id] = t
                     t.start()
+
         except Exception as e:
             # Suppress noisy tracebacks if we're shutting down intentionally
             if not (self.shutdown_event.is_set() or not self.running):
                 print(f"Server loop error: {e}")
                 traceback.print_exc()
+
         finally:
             self.stop()
 
@@ -282,16 +301,19 @@ class SocketServer:
 
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
+                        # Compute total reward from subj+obj for n-step accumulation
+                        total_reward = float(frame.subjreward) + float(frame.objreward)
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
                             int(da),
-                            frame.reward,
+                            total_reward,
                             frame.state,
                             frame.done,
                             aux_action=float(ca),
                             actor=require_actor_tag("n-step buffer push"),
                         )
 
+                        # BUGBUG Do we still need to handle mulltiple different numbers of args and signatures?
                         # Push all matured experiences to agent
                         if self.agent and experiences:
                             for item in experiences:
@@ -396,7 +418,7 @@ class SocketServer:
                                     state['last_state'],
                                     int(da),
                                     float(ca),
-                                    float(frame.reward),
+                                    float(frame.subjreward + frame.objreward),
                                     frame.state,
                                     bool(frame.done),
                                     actor=require_actor_tag("direct push"),
@@ -408,7 +430,7 @@ class SocketServer:
                                 self.agent.step(
                                     state['last_state'],
                                     int(da),
-                                    float(frame.reward),
+                                    float(frame.subjreward + frame.objreward),
                                     frame.state,
                                     bool(frame.done),
                                     actor=require_actor_tag("direct push legacy"),
@@ -418,14 +440,16 @@ class SocketServer:
                                 pass
 
                     # reward accounting
-                    state['total_reward'] = state.get('total_reward', 0.0) + frame.reward
+                    # Update reward accounting using subj+obj derived total
+                    total_reward = float(frame.subjreward) + float(frame.objreward)
+                    state['total_reward'] = state.get('total_reward', 0.0) + total_reward
                     state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + frame.subjreward
                     state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + frame.objreward
                     src = state.get('last_action_source')
                     if src == 'dqn':
-                        state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + frame.reward
+                        state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + total_reward
                     elif src == 'expert':
-                        state['episode_expert_reward'] = state.get('episode_expert_reward', 0.0) + frame.reward
+                        state['episode_expert_reward'] = state.get('episode_expert_reward', 0.0) + total_reward
 
                 # terminal handling
                 if frame.done:
@@ -527,7 +551,8 @@ class SocketServer:
                         except Exception:
                             pass
                         start_t = time.perf_counter()
-                        da, ca = self.agent.act(frame.state, epsilon)
+                        # add_noise: exploration noise is enabled when epsilon>0, but we pass explicit flag per agent signature
+                        da, ca = self.agent.act(frame.state, epsilon, True)
                         infer_t = time.perf_counter() - start_t
                         # Record inference timing via SafeMetrics API
                         if hasattr(self.metrics, 'add_inference_time'):

@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# ==================================================================================================================
+# ||                                                                                                              ||
+# ||                                   TEMPEST AI • APPLICATION ENTRY POINT                                       ||
+# ||                                                                                                              ||
+# ||  FILE: Scripts/main.py                                                                                       ||
+# ||  ROLE: Boots the socket server, spawns keyboard and stats threads, and coordinates graceful shutdown.         ||
+# ||                                                                                                              ||
+# ||  NEED TO KNOW:                                                                                               ||
+# ||   - Creates model dir; instantiates HybridDQNAgent; loads latest model if present.                           ||
+# ||   - Starts SocketServer (Lua <-> Python bridge) and metrics display loop.                                    ||
+# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t), LR adjust (l/L), header (c).                   ||
+# ||                                                                                                              ||
+# ||  CONSUMES: RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, SERVER_CONFIG, metrics                                   ||
+# ||  PRODUCES: running server, periodic metrics rows, on-exit model save                                         ||
+# ||                                                                                                              ||
+# ==================================================================================================================
 """
 Tempest AI Main Entry Point
 Coordinates the socket server, metrics display, and keyboard handling.
@@ -10,18 +26,19 @@ import threading
 from datetime import datetime
 import traceback
 
-from aimodel import (
-    HybridDQNAgent, KeyboardHandler
-)
-from config import (
-    RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
-)
+from aimodel import HybridDQNAgent, KeyboardHandler
+from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
+
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
 
 def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
     print("Starting stats reporter thread...")
+    
+    # Load the model if it exists
+    if os.path.exists(LATEST_MODEL_PATH):
+        agent.load(LATEST_MODEL_PATH)
     last_report = time.time()
     report_interval = 60.0  # Reduced frequency: print 1/5 as often
     
@@ -67,7 +84,7 @@ def keyboard_input_handler(agent, keyboard_handler):
                         pass
                     try:
                         if agent:
-                            agent.stop(join=True)
+                            agent.stop(join=True, timeout=2.0)
                     except Exception:
                         pass
                     break
@@ -135,28 +152,30 @@ def keyboard_input_handler(agent, keyboard_handler):
 
 def main():
     """Main function to run the Tempest AI application"""
+
     # Create model directory if it doesn't exist
     if not os.path.exists(MODEL_DIR):
         os.makedirs(MODEL_DIR)
     
     # Initialize the Agent
     # Use HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner)
-    # Fall back to legacy DQNAgent if needed by flipping this block.
-    agent = HybridDQNAgent(
-        state_size=RL_CONFIG.state_size,
-        discrete_actions=4,
-        learning_rate=RL_CONFIG.lr,
-        gamma=RL_CONFIG.gamma,
-        epsilon=RL_CONFIG.epsilon,
-        epsilon_min=RL_CONFIG.epsilon_min,
-        memory_size=RL_CONFIG.memory_size,
-        batch_size=RL_CONFIG.batch_size
-    )
     
+    agent = HybridDQNAgent(
+        state_size       = RL_CONFIG.state_size,
+        discrete_actions = 4,
+        learning_rate    = RL_CONFIG.lr,
+        gamma            = RL_CONFIG.gamma,
+        epsilon          = RL_CONFIG.epsilon,
+        epsilon_min      = RL_CONFIG.epsilon_min,
+        memory_size      = RL_CONFIG.memory_size,
+        batch_size       = RL_CONFIG.batch_size
+    )
+
     # Load the model if it exists
     if os.path.exists(LATEST_MODEL_PATH):
         agent.load(LATEST_MODEL_PATH)
     
+
     # Initialize the socket server
     server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, metrics)
     
@@ -198,8 +217,10 @@ def main():
                 agent.save(LATEST_MODEL_PATH)
                 last_save_time = current_time
             time.sleep(1)
+
     except KeyboardInterrupt:
         print("\nKeyboard interrupt received, saving and shutting down...")
+    
     finally:
         # Save the model before exiting
         agent.save(LATEST_MODEL_PATH)
@@ -217,7 +238,7 @@ def main():
             pass
         try:
             if agent:
-                agent.stop(join=True)
+                agent.stop(join=True, timeout=2.0)
         except Exception:
             pass
         
