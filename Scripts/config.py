@@ -1,7 +1,41 @@
 #!/usr/bin/env python3
-"""
-Configuration and shared types for Tempest AI.
-"""
+# ==================================================================================================================
+# ||                                                                                                              ||
+# ||                                      TEMPEST AI • CONFIGURATION MODULE                                       ||
+# ||                                                                                                              ||
+# ||  FILE: Scripts/config.py                                                                                     ||
+# ||  ROLE: Central configuration and shared data structures for the Python side (server, agent, metrics).        ||
+# ||                                                                                                              ||
+# ||  NEED TO KNOW (WHAT'S IN HERE):                                                                              ||
+# ||   - Global flags: IS_INTERACTIVE (TTY present), RESET_METRICS, FORCE_FRESH_MODEL.                            ||
+# ||   - Model paths: MODEL_DIR, LATEST_MODEL_PATH.                                                               ||
+# ||   - ServerConfigData: host/port/max_clients, params_count (state vector length expected from Lua).           ||
+# ||   - RLConfigData: RL/training hyperparameters (batch_size, lr, gamma, n_step, epsilon/expert schedules,      ||
+# ||                   replay size, network depth/width, target update cadence, loss settings, reward scaling,    ||
+# ||                   spinner-only/testing toggles, soft-target tau, replay sampling options).                   ||
+# ||   - MetricsData: Thread-safe counters/aggregates for display and diagnostics (losses, rates, queue health,   ||
+# ||                  reward means, Q-window summaries, gradient stats, training progress).                       ||
+# ||   - Global singletons: SERVER_CONFIG, RL_CONFIG, metrics.                                                    ||
+# ||                                                                                                              ||
+# ||  HOW IT'S USED:                                                                                              ||
+# ||   • Socket server reads SERVER_CONFIG to bind/listen and to size state parsing.                              ||
+# ||   • Agent/Trainer reads RL_CONFIG to build networks, buffers, and training schedule.                         ||
+# ||   • UI/metrics code reads/writes 'metrics' fields; access is guarded by metrics.lock where needed.           ||
+# ||                                                                                                              ||
+# ||  COMMON TUNABLES (SAFE TO EDIT):                                                                             ||
+# ||   • RL_CONFIG.batch_size, lr, gamma, n_step, hidden_size, num_layers, memory_size                            ||
+# ||   • Exploration & expert control: epsilon_* fields, expert_ratio_* fields                                    ||
+# ||   • Target updates: target_update_freq / update_target_every, use_soft_target_update + soft_target_tau       ||
+# ||   • Replay sampling: optimized_replay_sampling, percentile/window/terminal lookback                          ||
+# ||                                                                                                              ||
+# ||  SAFETY SWITCHES:                                                                                            ||
+# ||   • RESET_METRICS: ignore saved UI state for a clean run.                                                    ||
+# ||   • FORCE_FRESH_MODEL: skip loading and start from randomly initialized weights.                             ||
+# ||                                                                                                              ||
+# ||  NOTE: Keep this file import-light and pure-Python (no heavy GPU ops).                                       ||
+# ||        It is imported by many processes and threads early in startup.                                        ||
+# ||                                                                                                              ||
+# ==================================================================================================================
 
 # Prevent direct execution
 if __name__ == "__main__":
@@ -44,7 +78,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 8192                # Moderate batch for stability
+    batch_size: int = 1024                # Moderate batch for stability
     lr: float = 0.0005                   # Atari DQN learning rate (was 0.0005, halved for stability)
     gamma: float = 0.992                   # Discount factor for future rewards
     n_step: int = 3                        # N-step returns for better credit assignment
@@ -53,44 +87,36 @@ class RLConfigData:
     epsilon_start: float = 0.25            # Start with HIGH exploration (needed for advantage weighting diversity)
     epsilon_min: float = 0.05              # Floor for exploration (1% random actions)
     epsilon_end: float = 0.05              # Target minimum epsilon
-    epsilon_decay_steps: int = 10000     # Decay applied every 10k frames
+    epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
-    expert_ratio_start: float = 0.30      # Initial probability of expert control
+    expert_ratio_start: float = 0.30       # Initial probability of expert control
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
-    expert_ratio_decay: float = 0.996     # Multiplicative decay factor per step interval
-    expert_ratio_decay_steps: int = 10000 # Step interval for applying decay
+    expert_ratio_decay: float = 0.996      # Multiplicative decay factor per step interval
+    expert_ratio_decay_steps: int = 10000  # Step interval for applying decay
 
-    memory_size: int = 2000000           # Balanced buffer size (was 4000000)
-    hidden_size: int = 1024               # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 7                  
-    # CRITICAL FIX: Reduced from 2000 → 500 to prevent local/target divergence
-    # With slow training (1 step per ~57 frames), 2000 steps = only 8 updates per 1M frames!
-    # This causes local network to drift far from target between updates → oscillation
-    # 500 steps = ~32 updates per 1M frames for better sync
-    target_update_freq: int = 500         # More frequent updates reduce local/target divergence  
-    update_target_every: int = 500        # Keep in sync with target_update_freq
-    save_interval: int = 10000            # Model save frequency
+    memory_size: int = 2000000             # Balanced buffer size (was 4000000)
+    hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 5                  
+    target_update_freq: int = 500          # More frequent updates reduce local/target divergence  
+    update_target_every: int = 500         # Keep in sync with target_update_freq
+    save_interval: int = 10000             # Model save frequency
     
     # SIMPLIFIED: Disable PER - use uniform sampling only
     
     # Single-threaded training
-    training_steps_per_sample: int = 1    # One update per sample
-    training_workers: int = 1             # SIMPLIFIED - single thread only
+    training_steps_per_sample: int = 4     # One update per sample
+    training_workers: int = 4             # SIMPLIFIED - single thread only
+
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
+
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    # Options: 'none', 'cosine'
-
-
-    # SIMPLIFIED: No reward transforms - use raw rewards
     reward_scale: float = 0.1             # No scaling
-
-    # Subjective reward scaling (for movement/aiming rewards)
     subj_reward_scale: float = 0.07       # Scale factor applied to subjective rewards from OOB
 
     # Diagnostics
@@ -110,7 +136,7 @@ class RLConfigData:
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
     td_target_clip: float | None = None
-
+  
     # Replay sampling optimization flags
     # --- Replay Sampling Optimization ---
     # When True, HybridReplayBuffer avoids per-sample O(N) scans for each category by caching:
@@ -119,16 +145,21 @@ class RLConfigData:
     # In extremely large buffers (millions of entries) this reduces CPU time per sample and GC pressure.
     # Small synthetic tests may not show large speedups because numpy percentile is already vectorized.
     optimized_replay_sampling: bool = True
+
     # Percentile used to define "high reward" group (e.g., 70 = top 30%).
     replay_high_reward_percentile: float = 70.0
+
     # Recent window definition: max(replay_recent_window_min, frac * buffer_size)
     replay_recent_window_min: int = 50000
     replay_recent_window_frac: float = 0.10
+
     # Full cache refresh cadence in frames (defends against slow drift of EMA threshold)
     replay_cache_refresh_interval: int = 5000
+
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
     replay_terminal_lookback_max: int = 10
+
     # Debug toggle prints fallback notices / warnings
     replay_sampling_debug: bool = False
 
@@ -177,6 +208,11 @@ class MetricsData:
     c_loss_count_interval: int = 0
     # Training steps since last metrics print and when last row printed
     training_steps_interval: int = 0
+    # New: training requests vs missed (queue full) since last metrics row
+    training_steps_requested_interval: int = 0
+    training_steps_missed_interval: int = 0
+    # New: cumulative missed training steps
+    total_training_steps_missed: int = 0
     last_metrics_row_time: float = 0.0
     # Frames since last metrics print
     frames_count_interval: int = 0

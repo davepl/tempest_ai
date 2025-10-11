@@ -22,7 +22,7 @@ local SHOW_DISPLAY            = false
 local START_ADVANCED          = false
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
-local SOCKET_ADDRESS          = "socket.ubdellamd:9999"
+local SOCKET_ADDRESS          = "socket.localhost:9999"
 local SOCKET_READ_TIMEOUT_S   = 3.5  
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
@@ -377,7 +377,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     end
 
     -- --- OOB Data Packing ---
-    local is_attract_mode = (gs.game_mode & 0x80) == 0
+    -- Python expects OOB header format: >HddBBBHIBBBhhBBBBB (no total reward, no attract byte)
     local is_open_level = ls.level_type == 0x00 -- Updated heuristic
     local score = ps.score or 0
     local frame = gs.frame_counter % 65536
@@ -392,23 +392,20 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         else print("Periodic Save: Sending save signal.") end
     end
 
-    -- Fetch last reward components to transmit out-of-band (avoid recomputation in Python)
-    -- Pack OOB data (header only, reward components removed for simplicity)
-    -- NOTE: The short (h) after attract encodes the NEAREST ENEMY ABSOLUTE SEGMENT for Python expert steering.
+    -- Pack OOB data matching Python (reward total not sent; only subj,obj). Attract not sent.
     -- Format legend:
-    --   >HdddBBBHIBBBhBhBBBBB
-    --   H: num_values, ddd: (reward, subj_reward, obj_reward), BBB: (gamestate, game_mode, done), HI: (frame, score),
-    --   BBB: (save, fire, zap), h: spinner, B: attract, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
+    --   >HddBBBHIBBBhhBBBBB
+    --   H: num_values, dd: (subj_reward, obj_reward), BBB: (gamestate, game_mode, done), HI: (frame, score),
+    --   BBB: (save, fire, zap), h: spinner, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number
-    local oob_format = ">HdddBBBHIBBBhBhBBBBB"
+    local oob_format = ">HddBBBHIBBBhhBBBBB"
     -- Determine nearest enemy absolute segment to transmit (or -1 if none)
     local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
-        reward,                     -- d: Total reward (double)
         subj_reward,                -- d: Subjective reward (double)
         obj_reward,                 -- d: Objective reward (double)
-        gs.gamestate,               -- B: Gamestate (uchar) - was placeholder
+        gs.gamestate,               -- B: Gamestate (uchar)
         gs.game_mode,               -- B: Game Mode (uchar)
         bDone and 1 or 0,           -- B: Done flag (uchar)
         frame,                      -- H: Frame counter (ushort)
@@ -417,7 +414,6 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         ps.fire_commanded,          -- B: Commanded Fire (uchar)
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
         ps.spinner_commanded,       -- h: Commanded Spinner (short)
-        is_attract_mode and 1 or 0, -- B: Is Attract Mode (uchar)
         oob_nearest_enemy_abs_seg,  -- h: Nearest Enemy ABS Segment (short)
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
@@ -517,7 +513,17 @@ end
 -- Perform AI interaction (calculate reward, expert advice, send state, receive action)
 local function handle_ai_interaction()
     -- Calculate reward based on current state and detected actions
-    local reward, subj_reward, obj_reward, episode_done = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
+    local r1, r2, r3, r4 = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
+    local reward, subj_reward, obj_reward, episode_done
+    if r4 ~= nil then
+        -- Signature: reward, subj, obj, done
+        reward, subj_reward, obj_reward, episode_done = r1, r2, r3, r4
+    else
+        -- Signature: reward, done
+        reward, episode_done = r1, r2
+        subj_reward = reward
+        obj_reward = 0.0
+    end
     
     -- NOTE: Removed reward clamping [-1,1] since rewards are now properly scaled in logic.calculate_reward()    -- Calculate expert advice (target segment, fire, zap)
     local is_open_level = (level_state.level_number - 1) % 4 == 2

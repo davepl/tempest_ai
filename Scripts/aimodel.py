@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# ==================================================================================================================
+# ||                                                                                                              ||
+# ||                              TEMPEST AI • MODEL, AGENT, AND UTILITIES                                       ||
+# ||                                                                                                              ||
+# ||  FILE: Scripts/aimodel.py                                                                                    ||
+# ||  ROLE: Neural model (HybridDQN), training agent, parsing, expert helpers, keyboard, and utilities.           ||
+# ||                                                                                                              ||
+# ||  NEED TO KNOW:                                                                                               ||
+# ||   - HybridDQN: shared trunk + discrete head (4 Q-values) + continuous head (spinner in [-0.9,0.9]).          ||
+# ||   - HybridDQNAgent: replay, background training, epsilon/actor logic, loss computation, target updates.      ||
+# ||   - parse_frame_data: unpacks OOB header and float32 state from Lua.                                         ||
+# ||   - KeyboardHandler & metrics-safe print helpers.                                                             ||
+# ||                                                                                                              ||
+# ||  CONSUMES: RL_CONFIG, SERVER_CONFIG, metrics                                                                 ||
+# ||  PRODUCES: actions, trained weights, metrics updates                                                          ||
+# ||                                                                                                              ||
+# ==================================================================================================================
 """
 Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
 - Makes intelligent decisions based on enemy positions and level types
@@ -122,7 +139,7 @@ except ImportError:
 sys.modules.setdefault('aimodel', sys.modules[__name__])
 
 # Suppress warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('default')
 
 # Global flag to track if running interactively
 # Check this early before any potential tty interaction
@@ -141,14 +158,11 @@ state_size = rl_config.state_size
 class FrameData:
     """Game state data for a single frame"""
     state: np.ndarray
-    reward: float
     subjreward: float  # Subjective reward (movement/aiming)
     objreward: float   # Objective reward (scoring)
     action: Tuple[bool, bool, float]  # fire, zap, spinner
-    mode: int
     gamestate: int    # Added: Game state value from Lua
     done: bool
-    attract: bool
     save_signal: bool
     enemy_seg: int
     player_seg: int
@@ -162,21 +176,18 @@ class FrameData:
         """Create FrameData from dictionary"""
         return cls(
             state=data["state"],
-            reward=data["reward"],
-            subjreward=data.get("subjreward", 0.0),  # Default to 0.0 if not provided
-            objreward=data.get("objreward", 0.0),    # Default to 0.0 if not provided
+            subjreward=data["subjreward"],
+            objreward=data["objreward"],
             action=data["action"],
-            mode=data["mode"],
-            gamestate=data.get("gamestate", 0),  # Default to 0 if not provided
+            gamestate=data["gamestate"],
             done=data["done"],
-            attract=data["attract"],
             save_signal=data["save_signal"],
             enemy_seg=data["enemy_seg"],
             player_seg=data["player_seg"],
             open_level=data["open_level"],
             expert_fire=data["expert_fire"],
             expert_zap=data["expert_zap"],
-            level_number=data.get("level_number", 0)  # Default to 0 if not provided
+            level_number=data["level_number"],
         )
 
 # Configuration constants
@@ -287,8 +298,6 @@ metrics = config_metrics
 # Global reference to server for metrics display
 metrics.global_server = None
 
-# Discrete-only QNetwork removed (hybrid-only)
-
 class HybridDQN(nn.Module):
     """Hybrid DQN with discrete fire/zap actions + continuous spinner.
     
@@ -340,6 +349,7 @@ class HybridDQN(nn.Module):
         self.discrete_fc = nn.Linear(shared_output_size, head_size)
         self.discrete_out = nn.Linear(head_size, discrete_actions)
         
+        #BUGBUG why fc1 and fc2?  What's the difference and why are there both?
         # Continuous head for spinner (always separate from dueling)
         self.continuous_fc1 = nn.Linear(shared_output_size, head_size)
         continuous_head_size = max(32, head_size // 2)
@@ -347,6 +357,7 @@ class HybridDQN(nn.Module):
         self.continuous_out = nn.Linear(continuous_head_size, 1)
         
         # Initialize continuous head with smaller weights for stable training
+        # BUGBUG what does this do?  Do we still need or want it?
         torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
         torch.nn.init.constant_(self.continuous_out.bias, 0.0)
     
@@ -387,12 +398,10 @@ class HybridReplayBuffer:
     - continuous_action: float spinner value in [-0.9, +0.9]
     - actor: string tag identifying source of experience ('expert' or 'dqn')
     """
-    def __init__(self, capacity: int, state_size: Optional[int] = None):
+    def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
         self.position = 0
         self.size = 0
-        if state_size is None:
-            state_size = getattr(RL_CONFIG, 'state_size', SERVER_CONFIG.params_count)
         self.state_size = int(state_size)
         
         # Pre-allocated arrays for maximum speed
@@ -519,12 +528,17 @@ class HybridReplayBuffer:
     def _fast_random_indices(self, count):
         return self._rand.choice(self.size, size=count, replace=False)
 
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor='dqn', horizon: int = 1):
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon: int):
         """Add experience to buffer with actor tag"""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
-        actor_tag = str(actor).lower().strip() if actor else 'dqn'
+        # Require explicit, non-empty actor tag
+        if not actor:
+            raise ValueError("HybridReplayBuffer.push requires a non-empty actor tag")
+        actor_tag = str(actor).lower().strip()
+        if actor_tag in ('unknown', 'none', 'random', ''):
+            raise ValueError(f"HybridReplayBuffer.push received invalid actor tag '{actor_tag}'")
 
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
@@ -562,12 +576,10 @@ class HybridReplayBuffer:
             self.next_states[self.position, :] = 0.0
         self.dones[self.position] = done
         self.actors[self.position] = actor_tag
-        try:
-            h = int(horizon)
-            if h < 1:
-                h = 1
-        except Exception:
-            h = 1
+        # Require explicit positive horizon
+        h = int(horizon)
+        if h < 1:
+            raise ValueError("HybridReplayBuffer.push requires horizon >= 1")
         self.horizons[self.position] = h
 
         # Update position and size
@@ -1058,7 +1070,7 @@ class HybridDQNAgent:
             t.start()
             self.training_threads.append(t)
         
-    def act(self, state, epsilon=0.0, add_noise=True):
+    def act(self, state, epsilon: float, add_noise: bool):
         """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
         
         Returns:
@@ -1092,7 +1104,7 @@ class HybridDQNAgent:
         
         return int(discrete_action), float(continuous_action)
     
-    def step(self, state, discrete_action, continuous_action, reward, next_state, done, actor=None, horizon=1):
+    def step(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon):
         """Add experience to memory and queue training"""
         if actor is None:
             actor = 'dqn'  # Default to DQN if not specified
@@ -1114,9 +1126,19 @@ class HybridDQNAgent:
         # Apply training_steps_per_sample ONLY in the background trainer to avoid double-counting here.
         # Enqueue a single token per environment sample to minimize queue overhead.
         try:
+            # Record a requested training step token
+            try:
+                metrics.training_steps_requested_interval += 1
+            except Exception:
+                pass
             self.train_queue.put_nowait(True)
         except queue.Full:
-            pass
+            #BUGBUG we should at least track how many we discard vs process to keep that as a metric
+            try:
+                metrics.training_steps_missed_interval += 1
+                metrics.total_training_steps_missed += 1
+            except Exception:
+                pass
         # Optional telemetry
         try:
             metrics.training_queue_size = int(self.train_queue.qsize())
@@ -1137,8 +1159,14 @@ class HybridDQNAgent:
                 steps_per_req = int(getattr(RL_CONFIG, 'training_steps_per_sample', 1) or 1)
                 for _ in range(steps_per_req):
                     loss_val = self.train_step()
-                    if loss_val is None:
-                        loss_val = 0.0
+                    did_train = (loss_val is not None)
+                    # Count only real optimizer updates, not skipped/no-op passes
+                    if did_train:
+                        try:
+                            metrics.training_steps_interval += 1
+                            metrics.total_training_steps += 1
+                        except Exception:
+                            pass
                 # Optional telemetry after consuming a token
                 try:
                     metrics.training_queue_size = int(self.train_queue.qsize())
@@ -1156,24 +1184,24 @@ class HybridDQNAgent:
         """Perform one optimizer update."""
         # Global gate
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
-            return 0.0
+            return None
         # Post-load burn-in: require some fresh frames after loading before training
         try:
             loaded_fc = int(getattr(metrics, 'loaded_frame_count', 0) or 0)
             require_new = int(getattr(RL_CONFIG, 'min_new_frames_after_load_to_train', 0) or 0)
             if loaded_fc > 0 and (metrics.frame_count - loaded_fc) < require_new:
-                return 0.0
+                return None
         except Exception:
             pass
 
         # Require at least one batch worth of data
         if len(self.memory) < self.batch_size:
-            return 0.0
+            return None
 
         # Sample batch
         batch = self.memory.sample(self.batch_size)
         if batch is None:
-            return 0.0
+            return None
 
         states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
 
@@ -1298,12 +1326,13 @@ class HybridDQNAgent:
         else:
             d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
         
-    # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
+        # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
         # REDUCED SCALING: exp(adv * 0.5) with 5x max weight (was 1.5 * 100x causing instability!)
         # High reward (+1.5σ) → 2.1x gradient strength → moderate boost
         # Average reward (0σ) → 1.0x gradient → normal learning
         # Low reward (-1.5σ) → 0.47x gradient → slight reduction
         # This prevents overfitting to rare high-reward frames while still biasing toward quality
+
         c_loss_raw = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
         c_loss = (c_loss_raw * advantage_weights).mean()
         
@@ -1821,7 +1850,7 @@ class HybridDQNAgent:
             print(f"No checkpoint found at {filepath}. Starting new hybrid model.")
             return False
 
-    def stop(self, join: bool = True, timeout: float = 2.0):
+    def stop(self, join: bool, timeout: float):
         """Gracefully stop background threads."""
         self.running = False
         # Unblock workers by enqueueing no-op tokens
@@ -1884,14 +1913,14 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         if not data or len(data) < 10:  # Minimal size check
             print("ERROR: Received empty or too small data packet", flush=True)
             sys.exit(1)
-        
+
         # Fixed OOB header format (must match Lua exactly). Precompute once.
-        # Format: ">HdddBBBHIBBBhBhBBBBB"
+        # Format: ">HddBBBHIBBBhhBBBBB"  (reward and attract removed)
         global _FMT_OOB, _HDR_OOB
         try:
             _FMT_OOB
         except NameError:
-            _FMT_OOB = ">HdddBBBHIBBBhBhBBBBB"
+            _FMT_OOB = ">HddBBBHIBBBhhBBBBB"
             _HDR_OOB = struct.calcsize(_FMT_OOB)
 
         if len(data) < _HDR_OOB:
@@ -1899,18 +1928,18 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             sys.exit(1)
 
         values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
-        (num_values, reward, subjreward, objreward, gamestate, game_mode, done, frame_counter, score,
-         save_signal, fire, zap, spinner, is_attract, nearest_enemy, player_seg, is_open,
+        (num_values, subjreward, objreward, gamestate, game_mode, done, frame_counter, score,
+         save_signal, fire, zap, spinner, nearest_enemy, player_seg, is_open,
          expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
-        
-        # Apply subjective reward scaling
-        subjreward *= RL_CONFIG.subj_reward_scale
-        objreward *= RL_CONFIG.reward_scale
-        reward = subjreward + objreward
-        
+
+        # Apply subjective/objective reward scaling and compute total
+        subjreward = float(subjreward) * float(getattr(RL_CONFIG, 'subj_reward_scale', 1.0) or 1.0)
+        objreward = float(objreward) * float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
+        reward = float(subjreward + objreward)
+
         state_data = memoryview(data)[header_size:]
-        
+
         # SIMPLIFIED: Parse as float32 array directly (no complex normalization needed!)
         try:
             # Each float32 is 4 bytes, big-endian format
@@ -1918,14 +1947,14 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             if len(state_data) < expected_bytes:
                 print(f"ERROR: Expected {expected_bytes} bytes for {num_values} floats, got {len(state_data)}", flush=True)
                 sys.exit(1)
-                
+
             state = np.frombuffer(state_data, dtype='>f4', count=num_values)  # big-endian float32
             state = state.astype(np.float32)  # Ensure correct dtype
-            
+
         except ValueError as e:
             print(f"ERROR: frombuffer failed: {e}", flush=True)
             sys.exit(1)
-            
+
         if state.size != num_values:
             print(f"ERROR: Expected {num_values} state values but got {state.size}", flush=True)
             sys.exit(1)
@@ -1934,35 +1963,35 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         nan_count = np.sum(np.isnan(state))
         inf_count = np.sum(np.isinf(state))
         if nan_count > 0 or inf_count > 0:
-            print(f"[CRITICAL] Frame {frame_counter}: {nan_count} NaN values, {inf_count} Inf values detected! "
-                  f"This will cause training instability!", flush=True)
+            print(
+                f"[CRITICAL] Frame {frame_counter}: {nan_count} NaN values, {inf_count} Inf values detected! "
+                f"This will cause training instability!",
+                flush=True,
+            )
 
         # Ensure all values are in expected range [-1, 1] with warnings for issues
         out_of_range_count = np.sum((state < -1.001) | (state > 1.001))
         if out_of_range_count > 0:
             print(f"[WARNING] Frame {frame_counter}: {out_of_range_count} values outside [-1,1] range", flush=True)
             state = np.clip(state, -1.0, 1.0)
-        
+
         frame_data = FrameData(
             state=state,
-            reward=reward,
-            subjreward=subjreward,
-            objreward=objreward,
+            subjreward=float(subjreward),
+            objreward=float(objreward),
             action=(bool(fire), bool(zap), spinner),
-            mode=game_mode,
-            gamestate=gamestate,
+            gamestate=int(gamestate),
             done=bool(done),
-            attract=bool(is_attract),
             save_signal=bool(save_signal),
-            enemy_seg=nearest_enemy,
-            player_seg=player_seg,
+            enemy_seg=int(nearest_enemy),
+            player_seg=int(player_seg),
             open_level=bool(is_open),
             expert_fire=bool(expert_fire),
             expert_zap=bool(expert_zap),
-            level_number=level_number
+            level_number=int(level_number),
         )
-        
         return frame_data
+
     except Exception as e:
         print(f"ERROR parsing frame data: {e}", flush=True)
         sys.exit(1)

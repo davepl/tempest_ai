@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# ==================================================================================================================
+# ||                                                                                                              ||
+# ||                                 TEMPEST AI • METRICS DISPLAY AND REPORTING                                   ||
+# ||                                                                                                              ||
+# ||  FILE: Scripts/metrics_display.py                                                                            ||
+# ||  ROLE: Prints periodic metrics header and rows; computes rolling DQN windows and training telemetry.          ||
+# ||                                                                                                              ||
+# ||  NEED TO KNOW:                                                                                               ||
+# ||   - Header printed once; rows show FPS, epsilon, rewards, losses, Q-range, Train%, Training Stats.            ||
+# ||   - Steps/s and Samples/s computed per-interval; Train% based on queue requested vs missed.                  ||
+# ||   - DQN 1M/5M windows updated after first real training step.                                                ||
+# ||                                                                                                              ||
+# ||  CONSUMES: metrics, RL_CONFIG                                                                                ||
+# ||  PRODUCES: Console-formatted performance summary                                                             ||
+# ||                                                                                                              ||
+# ==================================================================================================================
 """
 Metrics display for Tempest AI.
 """
@@ -184,12 +200,11 @@ def display_metrics_header():
     # Header with Q-Value Range moved before Training Stats, reward components removed
     header = (
         f"{'Frame':>11} {'FPS':>6} {'Epsi':>6} {'Xprt':>6} "
-        f"{'Rwrd':>6} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
-        f"{'DLoss':>8} {'CLoss':>8} {'AdvWm':>6} {'AdvWmx':>7} {'FrDQN%':>7} {'TDdqn':>7} {'TDexp':>7} "
-        f"{'Wd':>4} {'Wc':>4} "
+        f"{'Rwrd':>6} {'Subj':>6} {'Obj':>6} {'DQN':>6} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} "
+        f"{'DLoss':>10} {'CLoss':>10} "
         f"{'Agree%':>7} {'Done%':>6} {'HMean':>6} "
         f"{'Clnt':>4} {'Levl':>5} {'OVR':>3} {'Expert':>6} {'Train':>5} "
-        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Training Stats':>15}"
+        f"{'AvgInf':>7} {'Samp/s':>8} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>14} {'Train%':>7} {'Training Stats':>15}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -263,8 +278,7 @@ def display_metrics_row(agent, kb_handler):
             pass
     
     # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time and Steps/s
-    latest_loss = metrics.losses[-1] if metrics.losses else 0.0
-    loss_avg = latest_loss
+    # Simplified loss reporting: only DLoss and CLoss; drop combined loss
     d_loss_avg = float(getattr(metrics, 'last_d_loss', 0.0) or 0.0)
     c_loss_avg = float(getattr(metrics, 'last_c_loss', 0.0) or 0.0)
     avg_inference_time_ms = 0.0
@@ -278,10 +292,7 @@ def display_metrics_row(agent, kb_handler):
         metrics.total_inference_time = 0.0
         metrics.total_inference_requests = 0
 
-        # Average loss since last row and reset
-        if getattr(metrics, 'loss_count_interval', 0) > 0:
-            loss_avg = metrics.loss_sum_interval / max(metrics.loss_count_interval, 1)
-        # Component interval averages
+        # Component interval averages only (keep dloss and closs)
         try:
             if getattr(metrics, 'd_loss_count_interval', 0) > 0:
                 d_loss_avg = metrics.d_loss_sum_interval / max(metrics.d_loss_count_interval, 1)
@@ -289,7 +300,7 @@ def display_metrics_row(agent, kb_handler):
                 c_loss_avg = metrics.c_loss_sum_interval / max(metrics.c_loss_count_interval, 1)
         except Exception:
             pass
-        # Reset interval accumulators
+        # Reset (we no longer use the combined loss columns).
         metrics.loss_sum_interval = 0.0
         metrics.loss_count_interval = 0
         metrics.d_loss_sum_interval = 0.0
@@ -315,8 +326,15 @@ def display_metrics_row(agent, kb_handler):
         # Interval Steps/1kF using the same interval counts
         denom_frames = max(1, frames_int)
         steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
+        # Compute training completion percent over the interval
+        req = int(getattr(metrics, 'training_steps_requested_interval', 0))
+        missed = int(getattr(metrics, 'training_steps_missed_interval', 0))
+        completed = max(0, req - missed)
+        train_pct = (completed / req * 100.0) if req > 0 else 100.0
         # Reset intervals and update last row time
         metrics.training_steps_interval = 0
+        metrics.training_steps_requested_interval = 0
+        metrics.training_steps_missed_interval = 0
         metrics.frames_count_interval = 0
         metrics.last_metrics_row_time = now
     
@@ -330,18 +348,28 @@ def display_metrics_row(agent, kb_handler):
         metrics.level_sum_interval = 0.0
         metrics.level_count_interval = 0
 
-    # Update 5M-frame DQN window stats now that we have this row's mean_dqn_reward
+    # Update 5M-frame DQN window stats only after training has actually started
     try:
-        _update_dqn_window(mean_dqn_reward)
-        dqn5m_avg, dqn5m_slopeM = _compute_dqn_window_stats()
+        trained_once = getattr(metrics, 'total_training_steps', 0) > 0
     except Exception:
+        trained_once = False
+    if trained_once:
+        try:
+            _update_dqn_window(mean_dqn_reward)
+            dqn5m_avg, dqn5m_slopeM = _compute_dqn_window_stats()
+        except Exception:
+            dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
+    else:
         dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
 
-    # Update 1M-frame DQN window stats
-    try:
-        _update_dqn1m_window(mean_dqn_reward)
-        dqn1m_avg = _compute_dqn1m_window_stats()
-    except Exception:
+    # Update 1M-frame DQN window stats only after training has actually started
+    if trained_once:
+        try:
+            _update_dqn1m_window(mean_dqn_reward)
+            dqn1m_avg = _compute_dqn1m_window_stats()
+        except Exception:
+            dqn1m_avg = 0.0
+    else:
         dqn1m_avg = 0.0
 
     # Publish DQN5M stats to global metrics for gating logic elsewhere
@@ -361,9 +389,9 @@ def display_metrics_row(agent, kb_handler):
     mem_k = getattr(metrics, 'memory_buffer_size', 0) // 1000
     training_stats = f"{mem_k}k/{metrics.total_training_steps}/{steps_per_1k_frames:.1f}/{frames_since_target_update//1000}k"
 
-    # Get Q-value range from the agent
+    # Get Q-value range from the agent only after training has started
     q_range = "N/A"
-    if agent:
+    if agent and trained_once:
         try:
             min_q, max_q = agent.get_q_value_range()
             if not (np.isnan(min_q) or np.isnan(max_q)):
@@ -388,11 +416,6 @@ def display_metrics_row(agent, kb_handler):
     # Additional diagnostics for troubleshooting
     d_loss = d_loss_avg
     c_loss = c_loss_avg
-    adv_w_mean = float(getattr(metrics, 'adv_w_mean', 1.0) or 0.0)
-    adv_w_max = float(getattr(metrics, 'adv_w_max', 1.0) or 0.0)
-    frac_dqn_pct = 100.0 * float(getattr(metrics, 'batch_frac_dqn', 0.0) or 0.0)
-    td_dqn = float(getattr(metrics, 'td_err_mean_dqn', 0.0) or 0.0)
-    td_exp = float(getattr(metrics, 'td_err_mean_expert', 0.0) or 0.0)
     agree_pct = float(getattr(metrics, 'action_agree_pct', 0.0) or 0.0)
     done_pct = 100.0 * float(getattr(metrics, 'batch_done_frac', 0.0) or 0.0)
     h_mean = float(getattr(metrics, 'batch_h_mean', 1.0) or 1.0)
@@ -404,21 +427,10 @@ def display_metrics_row(agent, kb_handler):
     except Exception:
         effective_eps = metrics.epsilon
 
-    # Loss weights (from RL_CONFIG)
-    try:
-        w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
-    except Exception:
-        w_disc = 1.0
-    try:
-        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
-    except Exception:
-        w_cont = 1.0
-
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {effective_eps:>6.2f} "
-    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
-    f"{d_loss:>8.5f} {c_loss:>8.5f} {adv_w_mean:>6.2f} {adv_w_max:>7.2f} {frac_dqn_pct:>7.1f} {td_dqn:>7.3f} {td_exp:>7.3f} "
-    f"{w_disc:>4.2f} {w_cont:>4.2f} "
+    f"{metrics.expert_ratio*100:>5.1f}% {mean_reward:>6.2f} {mean_subj_reward:>6.2f} {mean_obj_reward:>6.2f} {mean_dqn_reward:>6.2f} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} "
+    f"{d_loss:>10.6f} {c_loss:>10.6f} "
     f"{agree_pct:>7.1f} {done_pct:>6.1f} {h_mean:>6.2f} "
     f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{'ON' if metrics.override_expert else 'OFF':>3} "
@@ -429,7 +441,7 @@ def display_metrics_row(agent, kb_handler):
         f"{steps_per_sec:>8.1f} "
         f"{metrics.last_grad_norm:>8.3f} "
         f"{metrics.last_clip_delta:>6.3f} "
-        f"{q_range:>14} {training_stats:>15}"
+        f"{q_range:>14} {train_pct:>6.1f}% {training_stats:>15}"
     )
     
     print_metrics_line(row)
