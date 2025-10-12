@@ -391,19 +391,20 @@ class HybridDQN(nn.Module):
         return discrete_q, continuous_spinner
 
 class HybridReplayBuffer:
-    """Experience replay buffer with bucket-based PER for hybrid discrete-continuous actions.
+    """Experience replay buffer with efficient PER for hybrid discrete-continuous actions.
     
     Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done, actor, horizon)
     - discrete_action: integer index for fire/zap combination (0-3)
     - continuous_action: float spinner value in [-0.9, +0.9]
     - actor: string tag identifying source of experience ('expert' or 'dqn')
     
-    Uses three priority buckets for efficient sampling:
-    - high_reward_bucket: Experiences with rewards above 75th percentile
-    - recent_bucket: Most recent experiences (last 10% of buffer or 50K, whichever is larger)
-    - regular_bucket: All other experiences
+    Uses dynamic priority sampling for efficient experience selection:
+    - high_reward: Experiences with rewards above 75th percentile (computed on-the-fly)
+    - recent: Most recent experiences (last 10% of buffer or 50K, whichever is larger)
+    - regular: All other experiences (early samples with low rewards)
     
-    Each bucket maintains O(1) sampling via deque with random access via list conversion.
+    Sampling uses numpy boolean indexing and array slicing for O(1) performance.
+    No expensive list conversions or deque operations during sampling.
     """
     def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
