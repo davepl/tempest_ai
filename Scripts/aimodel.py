@@ -615,173 +615,16 @@ class HybridReplayBuffer:
             pass
     
     def sample(self, batch_size):
-        """Sample batch with stratified quality-based sampling.
+        """Sample batch using simple uniform sampling for speed.
         
-        Distribution:
-        - 40% from high-reward frames (good play to reinforce)
-        - 20% from pre-death frames (critical mistakes to avoid)
-        - 20% from recent frames (fresh policy)
-        - 20% random (coverage/exploration)
+        Original stratified sampling was too slow with large buffers.
         """
         if self.size < batch_size:
             return None
 
-        # Calculate target counts for each category
-        n_high_reward = int(batch_size * 0.4)
-        n_pre_death = int(batch_size * 0.2)
-        n_recent = int(batch_size * 0.2)
-        n_random = batch_size - n_high_reward - n_pre_death - n_recent  # Remainder
-        
-        all_indices = []
-        
-        # Fast path if optimization enabled
-        from config import RL_CONFIG as _RL_CFG
-        optimized = getattr(_RL_CFG, 'optimized_replay_sampling', False)
-        if optimized:
-            try:
-                self._maybe_refresh_caches()
-                sampled_high = self._fast_high_reward_indices(n_high_reward, _RL_CFG)
-                sampled_pre_death = self._fast_pre_death_indices(n_pre_death, _RL_CFG)
-                sampled_recent = self._fast_recent_indices(n_recent, _RL_CFG)
-                sampled_random = self._fast_random_indices(n_random)
-                all_indices.extend([sampled_high, sampled_pre_death, sampled_recent, sampled_random])
-                # Reliability assertions (non-fatal)
-                try:
-                    if getattr(_RL_CFG, 'replay_sampling_debug', False):
-                        if any(arr.size == 0 for arr in (sampled_high, sampled_pre_death, sampled_recent, sampled_random)):
-                            print("[ReplayOpt][WARN] Empty category encountered; will rely on others.")
-                except Exception:
-                    pass
-            except Exception:
-                # Fall back to legacy slow path on any error
-                if getattr(_RL_CFG, 'replay_sampling_debug', False):
-                    print("[ReplayOpt][FALLBACK] Exception in fast path; using legacy sampling.")
-                optimized = False
-        if not optimized:
-            # 1. High-reward frames (top percentile)
-            try:
-                perc = 70
-                try:
-                    perc = int(getattr(_RL_CFG, 'replay_high_reward_percentile', 70) or 70)
-                except Exception:
-                    pass
-                reward_threshold = np.percentile(self.rewards[:self.size], perc)
-                high_reward_idx = np.where(self.rewards[:self.size] >= reward_threshold)[0]
-                if len(high_reward_idx) >= n_high_reward:
-                    sampled_high = np.random.choice(high_reward_idx, n_high_reward, replace=False)
-                else:
-                    sampled_high = high_reward_idx
-                    deficit = n_high_reward - len(high_reward_idx)
-                    if deficit > 0:
-                        extra = np.random.choice(self.size, deficit, replace=False)
-                        sampled_high = np.concatenate([sampled_high, extra])
-                all_indices.append(sampled_high)
-            except Exception:
-                all_indices.append(np.random.choice(self.size, n_high_reward, replace=False))
-            # 2. Pre-death frames
-            try:
-                terminal_idx = np.where(self.dones[:self.size] == True)[0]
-                if len(terminal_idx) > 0:
-                    pre_death_candidates = []
-                    for death_idx in terminal_idx:
-                        lookback = np.random.randint(5, 11)
-                        pre_death_idx = max(0, death_idx - lookback)
-                        pre_death_candidates.append(pre_death_idx)
-                    pre_death_candidates = np.array(pre_death_candidates, dtype=np.int64)
-                    if len(pre_death_candidates) >= n_pre_death:
-                        sampled_pre_death = np.random.choice(pre_death_candidates, n_pre_death, replace=False)
-                    else:
-                        sampled_pre_death = pre_death_candidates
-                        deficit = n_pre_death - len(pre_death_candidates)
-                        if deficit > 0:
-                            extra = np.random.choice(self.size, deficit, replace=False)
-                            sampled_pre_death = np.concatenate([sampled_pre_death, extra])
-                else:
-                    sampled_pre_death = np.random.choice(self.size, n_pre_death, replace=False)
-                all_indices.append(sampled_pre_death)
-            except Exception:
-                all_indices.append(np.random.choice(self.size, n_pre_death, replace=False))
-            # 3. Recent frames
-            try:
-                recent_window_size = max(50000, int(self.size * 0.1))
-                recent_start = max(0, self.size - recent_window_size)
-                if recent_start < self.size:
-                    sampled_recent = np.random.randint(recent_start, self.size, size=n_recent)
-                else:
-                    sampled_recent = np.random.choice(self.size, n_recent, replace=False)
-                all_indices.append(sampled_recent)
-            except Exception:
-                all_indices.append(np.random.choice(self.size, n_recent, replace=False))
-            # 4. Random frames
-            try:
-                sampled_random = np.random.choice(self.size, n_random, replace=False)
-                all_indices.append(sampled_random)
-            except Exception:
-                sampled_random = np.random.randint(0, self.size, size=n_random)
-                all_indices.append(sampled_random)
-        
-        # Combine all indices
-        indices = np.concatenate(all_indices)
+        # Simple uniform sampling - much faster than stratified
+        indices = np.random.choice(self.size, size=batch_size, replace=False)
 
-        # Defensive: very rarely we have observed spurious gigantic indices (far beyond capacity) leading to IndexError.
-        # Root hypotheses: (1) memory corruption via unintended dtype upcast, (2) race during concatenation with uninitialized array,
-        # (3) numpy RNG edge case returning int64 that overflowed earlier arithmetic. Until root cause isolated, sanitize here.
-        if indices.dtype != np.int64 and indices.dtype != np.int32:
-            try:
-                indices = indices.astype(np.int64, copy=False)
-            except Exception:
-                pass
-        # Fast path: mask valid range
-        if indices.max(initial=0) >= self.size or indices.min(initial=0) < 0:
-            # Collect stats once per anomaly occurrence (avoid log spam)
-            try:
-                if not hasattr(self, '_oob_warned'):
-                    large_vals = indices[indices >= self.size]
-                    neg_vals = indices[indices < 0]
-                    print(f"[Replay][WARN] OOB indices detected: count={large_vals.size} max={large_vals.max() if large_vals.size else 'n/a'} min_bad={neg_vals.min() if neg_vals.size else 'n/a'} size={self.size}")
-                    self._oob_warned = True
-            except Exception:
-                pass
-            # Clamp then replace any that still out of range with fresh random valid indices
-            indices = np.clip(indices, 0, max(0, self.size - 1))
-            # Re-randomize duplicates / pathological concentration if many were clamped to same edge
-            # (Keep it simple: ensure uniqueness only if feasible; otherwise allow replacement sampling.)
-            try:
-                # Identify any indices that after clipping still include too many repeats at boundaries
-                # If more than 5% are identical boundary indices, re-sample those positions randomly
-                if self.size > 0:
-                    boundary_low_mask = (indices == 0)
-                    boundary_high_mask = (indices == self.size - 1)
-                    total = indices.size
-                    if boundary_low_mask.sum() > 0.05 * total:
-                        repl_ct = boundary_low_mask.sum()
-                        indices[boundary_low_mask] = self._rand.choice(self.size, size=repl_ct, replace=False)
-                    if boundary_high_mask.sum() > 0.05 * total:
-                        repl_ct = boundary_high_mask.sum()
-                        indices[boundary_high_mask] = self._rand.choice(self.size, size=repl_ct, replace=False)
-            except Exception:
-                pass
-        
-        # Track sampling diagnostics (store counts for metrics)
-        try:
-            metrics.sample_n_high_reward = len(all_indices[0]) if len(all_indices) > 0 else 0
-            metrics.sample_n_pre_death = len(all_indices[1]) if len(all_indices) > 1 else 0
-            metrics.sample_n_recent = len(all_indices[2]) if len(all_indices) > 2 else 0
-            metrics.sample_n_random = len(all_indices[3]) if len(all_indices) > 3 else 0
-            
-            # Track mean rewards per category for diagnostics
-            if len(all_indices[0]) > 0:
-                metrics.sample_reward_mean_high = float(self.rewards[all_indices[0]].mean())
-            if len(all_indices[1]) > 0:
-                metrics.sample_reward_mean_pre_death = float(self.rewards[all_indices[1]].mean())
-            if len(all_indices[2]) > 0:
-                metrics.sample_reward_mean_recent = float(self.rewards[all_indices[2]].mean())
-            if len(all_indices[3]) > 0:
-                metrics.sample_reward_mean_random = float(self.rewards[all_indices[3]].mean())
-        except Exception:
-            pass
-        
-        
         # Vectorized gather for batch data
         states_np = self.states[indices]
         next_states_np = self.next_states[indices]
@@ -1054,12 +897,15 @@ class HybridDQNAgent:
         print("Using standard HybridReplayBuffer (uniform sampling, eager mode)")
 
         # Training queue and metrics
-        self.train_queue = queue.Queue(maxsize=100)
+        self.train_queue = queue.Queue(maxsize=10000)
         self.training_steps = 0
         self.last_target_update = 0
         self.last_inference_sync = 0
         # Honor global training enable toggle
         self.training_enabled = True
+
+        # Thread synchronization for training
+        self.training_lock = threading.Lock()
 
         # Background training worker(s)
         self.running = True
@@ -1158,18 +1004,21 @@ class HybridDQNAgent:
                     continue
                 steps_per_req = int(getattr(RL_CONFIG, 'training_steps_per_sample', 1) or 1)
                 for _ in range(steps_per_req):
-                    loss_val = self.train_step()
-                    did_train = (loss_val is not None)
-                    # Count only real optimizer updates, not skipped/no-op passes
-                    if did_train:
-                        try:
-                            metrics.training_steps_interval += 1
-                            metrics.total_training_steps += 1
-                        except Exception:
-                            pass
+                    # Acquire training lock to prevent concurrent model/optimizer access
+                    with self.training_lock:
+                        loss_val = self.train_step()
+                        did_train = (loss_val is not None)
+                        # Count only real optimizer updates, not skipped/no-op passes
+                        if did_train:
+                            try:
+                                metrics.training_steps_interval += 1
+                                metrics.total_training_steps += 1
+                            except Exception:
+                                pass
                 # Optional telemetry after consuming a token
                 try:
-                    metrics.training_queue_size = int(self.train_queue.qsize())
+                    with self.training_lock:  # Protect metrics access
+                        metrics.training_queue_size = int(self.train_queue.qsize())
                 except Exception:
                     pass
                 self.train_queue.task_done()
@@ -1182,6 +1031,9 @@ class HybridDQNAgent:
     
     def train_step(self):
         """Perform one optimizer update."""
+        import time
+        start_time = time.time()
+        
         # Global gate
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
             return None
@@ -1199,11 +1051,13 @@ class HybridDQNAgent:
             return None
 
         # Sample batch
+        batch_start = time.time()
         batch = self.memory.sample(self.batch_size)
         if batch is None:
             return None
 
         states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
+        batch_time = time.time() - batch_start
 
         # Compute batch actor composition for diagnostics
         try:
@@ -1227,12 +1081,15 @@ class HybridDQNAgent:
             pass
 
         # Forward pass
+        forward_start = time.time()
         discrete_q_pred, continuous_pred = self.qnetwork_local(states)
         discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
+        forward_time = time.time() - forward_start
 
         # Target computation using DOUBLE DQN to prevent Q-value overestimation
         # Vanilla DQN: target = r + γ * max_a' Q_target(s',a')  ← Maximization bias!
         # Double DQN: target = r + γ * Q_target(s', argmax_a' Q_local(s',a'))  ← Debiased!
+        target_start = time.time()
         with torch.no_grad():
             # Use LOCAL network to SELECT best action (argmax)
             next_q_local, _ = self.qnetwork_local(next_states)
@@ -1312,8 +1169,10 @@ class HybridDQNAgent:
             # For expert samples, use taken actions to learn optimal behavior
             if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
                 continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
+        target_time = time.time() - target_start
 
         # Losses
+        loss_start = time.time()
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
         w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
 
@@ -1341,6 +1200,7 @@ class HybridDQNAgent:
             total_loss = w_cont * c_loss
         else:
             total_loss = (w_disc * d_loss) + (w_cont * c_loss)
+        loss_time = time.time() - loss_start
 
         # Compute per-actor metrics for diagnostics
         try:
@@ -1380,6 +1240,7 @@ class HybridDQNAgent:
             pass
 
         # Backward pass
+        backward_start = time.time()
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         # If spinner-only, clear any stray grads in discrete head to avoid updates
@@ -1391,8 +1252,10 @@ class HybridDQNAgent:
                         p.grad.zero_()
             except Exception:
                 pass
+        backward_time = time.time() - backward_start
 
         # Optional gradient diagnostics: measure each head's contribution
+        grad_diag_start = time.time()
         try:
             interval = int(getattr(RL_CONFIG, 'grad_diag_interval', 0) or 0)
         except Exception:
@@ -1479,8 +1342,10 @@ class HybridDQNAgent:
                     pass
             except Exception:
                 pass
+        grad_diag_time = time.time() - grad_diag_start
         
         # Compute gradient norm BEFORE clipping
+        grad_norm_start = time.time()
         total_grad_norm = 0.0
         for p in self.qnetwork_local.parameters():
             if p.grad is not None:
@@ -1502,10 +1367,15 @@ class HybridDQNAgent:
         
         # Clip delta: ratio of clipped to original (1.0 = no clipping, <1.0 = clipped)
         clip_delta = clipped_grad_norm / max(total_grad_norm, 1e-8)
+        grad_norm_time = time.time() - grad_norm_start
         
+        # Optimizer step
+        optimizer_start = time.time()
         self.optimizer.step()
+        optimizer_time = time.time() - optimizer_start
 
         # Update training counters
+        counter_start = time.time()
         self.training_steps += 1
         try:
             metrics.total_training_steps += 1
@@ -1582,8 +1452,10 @@ class HybridDQNAgent:
                 pass
         except Exception:
             pass
+        counter_time = time.time() - counter_start
 
         # Target network update: support soft updates (Polyak) or periodic hard copy
+        target_update_start = time.time()
         if getattr(RL_CONFIG, 'use_soft_target_update', False):
             try:
                 tau = float(getattr(RL_CONFIG, 'soft_target_tau', 0.005) or 0.005)
@@ -1610,7 +1482,17 @@ class HybridDQNAgent:
                     metrics.last_hard_target_update_time = time.time()
                 except Exception:
                     pass
-        
+        target_update_time = time.time() - target_update_start
+
+        # Print profiling info every 100 steps
+        total_time = time.time() - start_time
+        #if self.training_steps % 100 == 0:
+            #print(f"[PROFILING] Step {self.training_steps}: Total={total_time:.4f}s | "
+            #      f"Batch={batch_time:.4f}s | Forward={forward_time:.4f}s | Target={target_time:.4f}s | "
+            #      f"Loss={loss_time:.4f}s | Backward={backward_time:.4f}s | GradDiag={grad_diag_time:.4f}s | "
+            #      f"GradNorm={grad_norm_time:.4f}s | Optimizer={optimizer_time:.4f}s | "
+            #      f"Counters={counter_time:.4f}s | TargetUpdate={target_update_time:.4f}s")
+
         return float(total_loss.item())
 
     def set_training_enabled(self, enabled: bool):

@@ -78,7 +78,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 8192                # Moderate batch for stability
+    batch_size: int = 2048                # Reduced from 8192 for faster sampling
     lr: float = 0.0005                   # Atari DQN learning rate (was 0.0005, halved for stability)
     gamma: float = 0.992                   # Discount factor for future rewards
     n_step: int = 3                        # N-step returns for better credit assignment
@@ -107,8 +107,8 @@ class RLConfigData:
     # SIMPLIFIED: Disable PER - use uniform sampling only
     
     # Single-threaded training
-    training_steps_per_sample: int = 4     # One update per sample
-    training_workers: int = 1             # SIMPLIFIED - single thread only
+    training_steps_per_sample: int = 1     # Reduced for speed - was 4
+    training_workers: int = 4               # Multiple threads now thread-safe
 
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
@@ -116,11 +116,11 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    reward_scale: float = 0.1             # No scaling
-    subj_reward_scale: float = 0.07       # Scale factor applied to subjective rewards from OOB
+    reward_scale: float = 0.1             
+    subj_reward_scale: float = 0.07       
 
     # Diagnostics
-    grad_diag_interval: int = 200         # Every N training steps, sample per-head gradient contributions (0=off)
+    grad_diag_interval: int = 0           # Every N training steps, sample per-head gradient contributions (0=off)
 
     # Experimental: optimize spinner only (ignore discrete loss and fix DQN discrete action to FIRE/no-zap)
     spinner_only: bool = False
@@ -132,7 +132,7 @@ class RLConfigData:
     discrete_loss_weight: float = 0.1     # Weight applied to discrete (Q) loss
 
     # Target network update strategy
-    use_soft_target_update: bool = True   # If True, apply Polyak averaging every step
+    use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
     td_target_clip: float | None = None
