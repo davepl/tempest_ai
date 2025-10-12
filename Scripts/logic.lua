@@ -835,20 +835,13 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
         end
     end
--- Update reward threshold periodically using rolling percentile
-self.reward_window.append(reward)
-self.threshold_update_counter += 1
-if self.threshold_update_counter >= 1000 and len(self.reward_window) >= 100:
-    # Update threshold to 90th percentile of recent rewards
-    rewards_array = np.array(list(self.reward_window))
-    self.high_reward_threshold = float(np.percentile(rewards_array, 90.0))
-    self.threshold_update_counter = 0
+    
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward
 
     -- State updates
     -- Detect level increment to reset per-level trackers
-    local current_level = level_state.level_number or 0h
+    local current_level = level_state.level_number or 0
     local current_score = player_state.score or 0
     if current_level > (previous_level or 0) then
         score_at_level_start = current_score

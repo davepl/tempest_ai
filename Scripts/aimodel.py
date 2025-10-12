@@ -542,7 +542,7 @@ class HybridReplayBuffer:
         if self.threshold_update_counter >= 1000 and len(self.reward_window) >= 100:
             # Update threshold to 75th percentile of recent rewards
             rewards_array = np.array(list(self.reward_window))
-            self.high_reward_threshold = float(np.percentile(rewards_array, 75.0))
+            self.high_reward_threshold = float(np.percentile(rewards_array, 90.0))
             self.threshold_update_counter = 0
     
     def sample(self, batch_size):
