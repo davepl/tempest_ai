@@ -835,11 +835,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             end
         end
     end
-
-    if (subj_reward < 0) then
-        print(string.format("Subj reward clipped: %.3f", subj_reward))
-    end
-
+# Update reward threshold periodically using rolling percentile
+self.reward_window.append(reward)
+self.threshold_update_counter += 1
+if self.threshold_update_counter >= 1000 and len(self.reward_window) >= 100:
+    # Update threshold to 75th percentile of recent rewards
+    rewards_array = np.array(list(self.reward_window))
+    self.high_reward_threshold = float(np.percentile(rewards_array, 75.0))
+    self.threshold_update_counter = 0
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward
 

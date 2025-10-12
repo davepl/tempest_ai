@@ -163,6 +163,12 @@ class RLConfigData:
     # Debug toggle prints fallback notices / warnings
     replay_sampling_debug: bool = False
 
+    # Superzap gate: Limits zap attempts to a low success probability
+    # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob
+    # This forces strategic zap usage rather than spamming
+    enable_superzap_gate: bool = True
+    superzap_prob: float = 0.01  # 1% success rate for zap attempts
+
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
 

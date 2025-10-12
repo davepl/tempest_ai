@@ -398,13 +398,14 @@ class HybridReplayBuffer:
     - continuous_action: float spinner value in [-0.9, +0.9]
     - actor: string tag identifying source of experience ('expert' or 'dqn')
     
-    Uses partitioned buffer approach:
-    - High-reward partition (30% of buffer): Stores experiences with reward >= 75th percentile
-    - Regular partition (70% of buffer): Stores all other experiences
-    - Sampling draws 50% from each partition for balanced training
+    Uses partitioned buffer approach with three partitions:
+    - High-reward partition (25% of buffer): Stores experiences with reward >= 75th percentile
+    - Pre-death partition (25% of buffer): Virtual partition via terminal index tracking
+    - Regular partition (50% of buffer): Stores all other experiences
+    - Sampling draws 25% from high-reward, 25% from pre-death, 50% from regular
     
-    This provides PER-like benefits (oversampling high-reward) with zero performance overhead
-    (no numpy scans, just O(1) index arithmetic and range sampling).
+    This provides PER-like benefits (oversampling high-reward and critical pre-death frames)
+    with zero performance overhead (no numpy scans, just O(1) index arithmetic and range sampling).
     """
     def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
@@ -412,8 +413,8 @@ class HybridReplayBuffer:
         self.state_size = int(state_size)
         
         # Partitioned buffer configuration
-        self.high_reward_capacity = int(capacity * 0.3)  # 30% for high-reward experiences
-        self.regular_capacity = capacity - self.high_reward_capacity  # 70% for regular
+        self.high_reward_capacity = int(capacity * 0.25)  # 25% for high-reward experiences
+        self.regular_capacity = capacity - self.high_reward_capacity  # 75% for regular (includes pre-death source)
         self.high_reward_position = 0  # Write pointer for high-reward ring buffer
         self.regular_position = 0      # Write pointer for regular ring buffer
         self.high_reward_size = 0      # Current fill of high-reward partition
@@ -423,6 +424,12 @@ class HybridReplayBuffer:
         self.high_reward_threshold = 0.0
         self.reward_window = deque(maxlen=50000)  # Rolling window for percentile calculation
         self.threshold_update_counter = 0
+        
+        # Pre-death frame tracking (terminal states)
+        # Store indices of frames that have done=True so we can sample backwards from them
+        self.terminal_indices = deque(maxlen=10000)  # Track last 10K deaths for sampling
+        # Track which frames are "pre-death" (within N frames of a terminal)
+        self.pre_death_flags = np.zeros((capacity,), dtype=np.bool_)
         
         # Pre-allocated arrays for maximum speed
         self.states = np.empty((capacity, self.state_size), dtype=np.float32)
@@ -512,6 +519,23 @@ class HybridReplayBuffer:
             raise ValueError("HybridReplayBuffer.push requires horizon >= 1")
         self.horizons[idx] = h
 
+        # Track terminal indices for pre-death sampling
+        # Also mark the previous 5-10 frames as "pre-death" for easier sampling
+        if done:
+            self.terminal_indices.append(idx)
+            # Mark frames 5-10 steps back as pre-death
+            # We'll mark all frames in the lookback range
+            from config import RL_CONFIG
+            for lookback in range(RL_CONFIG.replay_terminal_lookback_min, RL_CONFIG.replay_terminal_lookback_max + 1):
+                pre_death_idx = idx - lookback
+                # Handle negative indices (before start of buffer)
+                if pre_death_idx >= 0:
+                    self.pre_death_flags[pre_death_idx] = True
+                elif self.size >= self.capacity:
+                    # Buffer has wrapped, use modulo
+                    pre_death_idx = pre_death_idx % self.capacity
+                    self.pre_death_flags[pre_death_idx] = True
+
         # Update reward threshold periodically using rolling percentile
         self.reward_window.append(reward)
         self.threshold_update_counter += 1
@@ -524,15 +548,19 @@ class HybridReplayBuffer:
     def sample(self, batch_size):
         """Sample batch using partitioned buffer for PER-like benefits without overhead.
         
-        Samples 50% from high-reward partition and 50% from regular partition.
+        Samples 25% from high-reward partition, 25% from pre-death frames, 50% from regular.
         Pure index arithmetic - no numpy scans, minimal GIL time.
         """
         if self.size < batch_size:
             return None
 
-        # Calculate how many samples from each partition
-        high_count = batch_size // 2
-        regular_count = batch_size - high_count
+        # Import config for lookback settings
+        from config import RL_CONFIG
+        
+        # Calculate how many samples from each partition (25/25/50 split)
+        high_count = batch_size // 4  # 25%
+        pre_death_count = batch_size // 4  # 25%
+        regular_count = batch_size - high_count - pre_death_count  # 50%
         
         indices = []
         
@@ -541,6 +569,23 @@ class HybridReplayBuffer:
             high_samples = min(high_count, self.high_reward_size)
             high_indices = self._rand.integers(0, self.high_reward_size, size=high_samples, dtype=np.int64)
             indices.extend(high_indices)
+        
+        # Sample from pre-death frames if we have any marked
+        if self.size > 10:
+            # Count how many pre-death frames we have
+            pre_death_mask = self.pre_death_flags[:self.size]
+            pre_death_count_available = np.sum(pre_death_mask)
+            
+            if pre_death_count_available > 0:
+                pre_death_samples = min(pre_death_count, pre_death_count_available)
+                # Get indices of all pre-death frames
+                pre_death_indices_all = np.where(pre_death_mask)[0]
+                # Randomly sample from them
+                if len(pre_death_indices_all) >= pre_death_samples:
+                    sampled_pre_death = self._rand.choice(pre_death_indices_all, size=pre_death_samples, replace=False)
+                    indices.extend(sampled_pre_death)
+                else:
+                    indices.extend(pre_death_indices_all)
         
         # Sample from regular partition if it has data
         if self.regular_size > 0:
@@ -610,10 +655,12 @@ class HybridReplayBuffer:
         """Return statistics about buffer partitions for monitoring."""
         return {
             'high_reward': self.high_reward_size,
+            'pre_death': len(self.terminal_indices),
             'regular': self.regular_size,
             'high_reward_threshold': self.high_reward_threshold,
             'high_reward_capacity': self.high_reward_capacity,
             'regular_capacity': self.regular_capacity,
+            'terminal_count': len(self.terminal_indices),
         }
     
     def get_actor_composition(self):
