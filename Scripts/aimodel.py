@@ -1970,9 +1970,15 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             )
 
         # Ensure all values are in expected range [-1, 1] with warnings for issues
-        out_of_range_count = np.sum((state < -1.001) | (state > 1.001))
+        # Allow small floating point precision errors (±0.01)
+        out_of_range_count = np.sum((state < -1.01) | (state > 1.01))
         if out_of_range_count > 0:
+            # Debug: identify which values are out of range
+            out_of_range_indices = np.where((state < -1.01) | (state > 1.01))[0]
+            out_of_range_values = state[out_of_range_indices]
             print(f"[WARNING] Frame {frame_counter}: {out_of_range_count} values outside [-1,1] range", flush=True)
+            print(f"[DEBUG] Out-of-range indices: {out_of_range_indices[:10]}...")  # Show first 10
+            print(f"[DEBUG] Out-of-range values: {out_of_range_values[:10]}...")  # Show first 10 values
             state = np.clip(state, -1.0, 1.0)
 
         frame_data = FrameData(
