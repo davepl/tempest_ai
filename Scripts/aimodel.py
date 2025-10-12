@@ -1789,18 +1789,10 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
          expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
 
-        # DIAGNOSTIC: Check for negative subjective rewards before scaling
-        if subjreward < 0:
-            print(f"[DIAGNOSTIC] Frame {frame_counter}: Negative subjective reward received from Lua: {subjreward:.6f} (objective={objreward:.6f})", flush=True)
-
         # Apply subjective/objective reward scaling and compute total
         subjreward = float(subjreward) * float(getattr(RL_CONFIG, 'subj_reward_scale', 1.0) or 1.0)
         objreward = float(objreward) * float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
         reward = float(subjreward + objreward)
-        
-        # DIAGNOSTIC: Also check after scaling
-        if subjreward < 0:
-            print(f"[DIAGNOSTIC] Frame {frame_counter}: Negative subjective reward AFTER scaling: {subjreward:.6f} (scale={getattr(RL_CONFIG, 'subj_reward_scale', 1.0)}, total reward={reward:.6f})", flush=True)
 
         state_data = memoryview(data)[header_size:]
 
