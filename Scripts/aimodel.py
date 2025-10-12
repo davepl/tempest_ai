@@ -391,18 +391,38 @@ class HybridDQN(nn.Module):
         return discrete_q, continuous_spinner
 
 class HybridReplayBuffer:
-    """Experience replay buffer for hybrid discrete-continuous actions.
+    """Experience replay buffer with partitioned storage for hybrid discrete-continuous actions.
     
     Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done, actor, horizon)
     - discrete_action: integer index for fire/zap combination (0-3)
     - continuous_action: float spinner value in [-0.9, +0.9]
     - actor: string tag identifying source of experience ('expert' or 'dqn')
+    
+    Uses partitioned buffer approach:
+    - High-reward partition (30% of buffer): Stores experiences with reward >= 75th percentile
+    - Regular partition (70% of buffer): Stores all other experiences
+    - Sampling draws 50% from each partition for balanced training
+    
+    This provides PER-like benefits (oversampling high-reward) with zero performance overhead
+    (no numpy scans, just O(1) index arithmetic and range sampling).
     """
     def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
-        self.position = 0
         self.size = 0
         self.state_size = int(state_size)
+        
+        # Partitioned buffer configuration
+        self.high_reward_capacity = int(capacity * 0.3)  # 30% for high-reward experiences
+        self.regular_capacity = capacity - self.high_reward_capacity  # 70% for regular
+        self.high_reward_position = 0  # Write pointer for high-reward ring buffer
+        self.regular_position = 0      # Write pointer for regular ring buffer
+        self.high_reward_size = 0      # Current fill of high-reward partition
+        self.regular_size = 0          # Current fill of regular partition
+        
+        # Dynamic threshold for high-reward classification
+        self.high_reward_threshold = 0.0
+        self.reward_window = deque(maxlen=50000)  # Rolling window for percentile calculation
+        self.threshold_update_counter = 0
         
         # Pre-allocated arrays for maximum speed
         self.states = np.empty((capacity, self.state_size), dtype=np.float32)
@@ -413,123 +433,12 @@ class HybridReplayBuffer:
         self.dones = np.empty((capacity,), dtype=np.bool_)
         self.actors = np.empty((capacity,), dtype='U10')  # Store actor tags (up to 10 chars)
         self.horizons = np.ones((capacity,), dtype=np.int32)  # n-step horizon per transition (default 1)
-        # Caches (initialized lazily)
-        self._last_percentile_value = None
-        self._last_percentile_source_size = 0
-        self._high_reward_mask = None
-        self._terminal_indices = None
-        self._last_terminal_count_source_size = 0
-        self._last_cache_refresh_frame = 0
+        
+        # Random number generator
         self._rand = np.random.default_rng()
 
-    # Internal helpers for optimized sampling
-    def _refresh_percentile_cache(self, rl_cfg, metrics_obj):
-        try:
-            perc = float(getattr(rl_cfg, 'replay_high_reward_percentile', 70.0))
-        except Exception:
-            perc = 70.0
-        try:
-            rewards_view = self.rewards[:self.size]
-            if rewards_view.size == 0:
-                self._last_percentile_value = 0.0
-                self._high_reward_mask = None
-            else:
-                self._last_percentile_value = float(np.percentile(rewards_view, perc))
-                self._high_reward_mask = (rewards_view >= self._last_percentile_value)
-            self._last_percentile_source_size = self.size
-        except Exception:
-            self._last_percentile_value = None
-        try:
-            metrics_obj.replay_cache_percentile = float(self._last_percentile_value if self._last_percentile_value is not None else 0.0)
-        except Exception:
-            pass
-
-    def _refresh_terminal_cache(self, metrics_obj):
-        try:
-            dones_view = self.dones[:self.size]
-            self._terminal_indices = np.flatnonzero(dones_view)
-            self._last_terminal_count_source_size = self.size
-        except Exception:
-            self._terminal_indices = None
-        try:
-            metrics_obj.replay_cache_terminals = int(0 if self._terminal_indices is None else self._terminal_indices.size)
-        except Exception:
-            pass
-
-    def _maybe_refresh_caches(self):
-        # Import inside to avoid circular import at module load
-        from config import RL_CONFIG as _RL_CFG, metrics as _METRICS
-        if not getattr(_RL_CFG, 'optimized_replay_sampling', False):
-            return
-        # Periodic full refresh based on frame count interval to combat distribution drift
-        frame_ct = getattr(_METRICS, 'frame_count', 0)
-        interval = int(getattr(_RL_CFG, 'replay_cache_refresh_interval', 5000) or 5000)
-        if frame_ct - self._last_cache_refresh_frame >= interval:
-            self._refresh_percentile_cache(_RL_CFG, _METRICS)
-            self._refresh_terminal_cache(_METRICS)
-            self._last_cache_refresh_frame = frame_ct
-
-    def _fast_high_reward_indices(self, count, rl_cfg):
-        # Ensure cache valid; refresh lazily if size grew enough
-        if self._last_percentile_value is None or self._last_percentile_source_size != self.size:
-            self._refresh_percentile_cache(rl_cfg, metrics)
-        if self._high_reward_mask is None or self._high_reward_mask.size != self.size:
-            threshold = self._last_percentile_value if self._last_percentile_value is not None else -1e9
-            cand = np.flatnonzero(self.rewards[:self.size] >= threshold)
-        else:
-            cand = np.flatnonzero(self._high_reward_mask)
-        if cand.size == 0:
-            # fallback: any random indices
-            return self._rand.choice(self.size, size=count, replace=False)
-        if cand.size >= count:
-            return self._rand.choice(cand, size=count, replace=False)
-        # Not enough, fill remainder randomly (avoid duplicates by using set difference)
-        needed = count - cand.size
-        extras = self._rand.choice(self.size, size=needed, replace=False)
-        return np.concatenate([cand, extras])
-
-    def _fast_pre_death_indices(self, count, rl_cfg):
-        # Refresh terminal cache if needed
-        if self._terminal_indices is None or self._last_terminal_count_source_size != self.size:
-            self._refresh_terminal_cache(metrics)
-        terms = self._terminal_indices
-        if terms is None or terms.size == 0:
-            return self._rand.choice(self.size, size=count, replace=False)
-        lb_min = int(getattr(rl_cfg, 'replay_terminal_lookback_min', 5) or 5)
-        lb_max = int(getattr(rl_cfg, 'replay_terminal_lookback_max', 10) or 10)
-        # Sample candidate pre-death frames by random lookback inside [lb_min, lb_max]
-        chosen = []
-        if terms.size >= count:
-            sample_terms = self._rand.choice(terms, size=count, replace=False)
-        else:
-            sample_terms = terms
-        for t in sample_terms:
-            lookback = self._rand.integers(lb_min, lb_max + 1)
-            idx = int(t) - int(lookback)
-            if idx < 0:
-                idx = 0
-            chosen.append(idx)
-        chosen = np.array(chosen, dtype=np.int64)
-        if chosen.size < count:
-            need = count - chosen.size
-            extra = self._rand.choice(self.size, size=need, replace=False)
-            chosen = np.concatenate([chosen, extra])
-        return chosen
-
-    def _fast_recent_indices(self, count, rl_cfg):
-        recent_min = int(getattr(rl_cfg, 'replay_recent_window_min', 50000) or 50000)
-        recent_frac = float(getattr(rl_cfg, 'replay_recent_window_frac', 0.10) or 0.10)
-        window = max(recent_min, int(self.size * recent_frac))
-        start = max(0, self.size - window)
-        if start >= self.size:
-            start = 0
-        return self._rand.integers(start, self.size, size=count, endpoint=False)
-
-    def _fast_random_indices(self, count):
-        return self._rand.choice(self.size, size=count, replace=False)
-
     def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon: int):
-        """Add experience to buffer with actor tag"""
+        """Add experience to buffer with partitioned storage based on reward."""
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
@@ -543,7 +452,24 @@ class HybridReplayBuffer:
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
 
-        # Store experience
+        # Determine which partition to write to based on reward
+        if reward >= self.high_reward_threshold:
+            # High-reward partition
+            idx = self.high_reward_position
+            self.high_reward_position = (self.high_reward_position + 1) % self.high_reward_capacity
+            if self.high_reward_size < self.high_reward_capacity:
+                self.high_reward_size += 1
+        else:
+            # Regular partition (offset by high_reward_capacity)
+            idx = self.high_reward_capacity + self.regular_position
+            self.regular_position = (self.regular_position + 1) % self.regular_capacity
+            if self.regular_size < self.regular_capacity:
+                self.regular_size += 1
+
+        # Update total size
+        self.size = self.high_reward_size + self.regular_size
+
+        # Store experience at determined index
         try:
             s = np.asarray(state, dtype=np.float32)
             if s.ndim > 1:
@@ -554,13 +480,15 @@ class HybridReplayBuffer:
                 s = tmp
             elif s.size > self.state_size:
                 s = s[:self.state_size]
-            self.states[self.position, :] = s
+            self.states[idx, :] = s
         except Exception:
             # Fallback to zeros if something went wrong
-            self.states[self.position, :] = 0.0
-        self.discrete_actions[self.position] = discrete_idx
-        self.continuous_actions[self.position] = continuous_val
-        self.rewards[self.position] = reward
+            self.states[idx, :] = 0.0
+        
+        self.discrete_actions[idx] = discrete_idx
+        self.continuous_actions[idx] = continuous_val
+        self.rewards[idx] = reward
+        
         try:
             ns = np.asarray(next_state, dtype=np.float32)
             if ns.ndim > 1:
@@ -571,59 +499,69 @@ class HybridReplayBuffer:
                 ns = tmp
             elif ns.size > self.state_size:
                 ns = ns[:self.state_size]
-            self.next_states[self.position, :] = ns
+            self.next_states[idx, :] = ns
         except Exception:
-            self.next_states[self.position, :] = 0.0
-        self.dones[self.position] = done
-        self.actors[self.position] = actor_tag
+            self.next_states[idx, :] = 0.0
+        
+        self.dones[idx] = done
+        self.actors[idx] = actor_tag
+        
         # Require explicit positive horizon
         h = int(horizon)
         if h < 1:
             raise ValueError("HybridReplayBuffer.push requires horizon >= 1")
-        self.horizons[self.position] = h
+        self.horizons[idx] = h
 
-        # Update position and size
-        self.position = (self.position + 1) % self.capacity
-        if self.size < self.capacity:
-            self.size += 1
-        # Incremental cache maintenance (only when optimization enabled)
-        try:
-            from config import RL_CONFIG as _RL_CFG
-            if getattr(_RL_CFG, 'optimized_replay_sampling', False):
-                # Terminal index maintenance: append if done, else nothing. If overwriting existing slot that was terminal, force full refresh next sample.
-                if done:
-                    if self._terminal_indices is not None:
-                        # Append new absolute index (position just advanced; newly written index = (position-1) mod capacity)
-                        new_idx = (self.position - 1) % self.capacity
-                        self._terminal_indices = np.append(self._terminal_indices, new_idx)
-                else:
-                    # If overwriting a terminal slot, mark for refresh by invalidating source size reference
-                    pass
-                # Percentile maintenance: light-touch exponential moving estimate of threshold to avoid full np.percentile each push
-                if self._last_percentile_value is not None:
-                    perc = float(getattr(_RL_CFG, 'replay_high_reward_percentile', 70.0) or 70.0)
-                    # Simple heuristic: move threshold slightly toward new reward if it's above current threshold region
-                    r_new = float(reward)
-                    alpha = 0.001  # slow adaptation
-                    # If new reward higher than current threshold, raise threshold slightly; else decay slightly
-                    if r_new > self._last_percentile_value:
-                        self._last_percentile_value = (1 - alpha) * self._last_percentile_value + alpha * r_new
-                    else:
-                        # Gentle decay toward mean (assumed ~0) if threshold drifts too high
-                        self._last_percentile_value *= (1 - alpha*0.5)
-        except Exception:
-            pass
+        # Update reward threshold periodically using rolling percentile
+        self.reward_window.append(reward)
+        self.threshold_update_counter += 1
+        if self.threshold_update_counter >= 1000 and len(self.reward_window) >= 100:
+            # Update threshold to 75th percentile of recent rewards
+            rewards_array = np.array(list(self.reward_window))
+            self.high_reward_threshold = float(np.percentile(rewards_array, 75.0))
+            self.threshold_update_counter = 0
     
     def sample(self, batch_size):
-        """Sample batch using simple uniform sampling for speed.
+        """Sample batch using partitioned buffer for PER-like benefits without overhead.
         
-        Original stratified sampling was too slow with large buffers.
+        Samples 50% from high-reward partition and 50% from regular partition.
+        Pure index arithmetic - no numpy scans, minimal GIL time.
         """
         if self.size < batch_size:
             return None
 
-        # Simple uniform sampling - much faster than stratified
-        indices = np.random.choice(self.size, size=batch_size, replace=False)
+        # Calculate how many samples from each partition
+        high_count = batch_size // 2
+        regular_count = batch_size - high_count
+        
+        indices = []
+        
+        # Sample from high-reward partition if it has data
+        if self.high_reward_size > 0:
+            high_samples = min(high_count, self.high_reward_size)
+            high_indices = self._rand.integers(0, self.high_reward_size, size=high_samples, dtype=np.int64)
+            indices.extend(high_indices)
+        
+        # Sample from regular partition if it has data
+        if self.regular_size > 0:
+            regular_samples = min(regular_count, self.regular_size)
+            # Offset indices by high_reward_capacity to access regular partition
+            regular_indices = self._rand.integers(
+                self.high_reward_capacity, 
+                self.high_reward_capacity + self.regular_size, 
+                size=regular_samples, 
+                dtype=np.int64
+            )
+            indices.extend(regular_indices)
+        
+        # If we don't have enough samples from partitions, sample uniformly to fill
+        if len(indices) < batch_size:
+            remaining = batch_size - len(indices)
+            uniform_indices = self._rand.integers(0, self.size, size=remaining, dtype=np.int64)
+            indices.extend(uniform_indices)
+        
+        # Convert to numpy array
+        indices = np.array(indices[:batch_size], dtype=np.int64)
 
         # Vectorized gather for batch data
         states_np = self.states[indices]
@@ -667,6 +605,16 @@ class HybridReplayBuffer:
     
     def __len__(self):
         return self.size
+    
+    def get_partition_stats(self):
+        """Return statistics about buffer partitions for monitoring."""
+        return {
+            'high_reward': self.high_reward_size,
+            'regular': self.regular_size,
+            'high_reward_threshold': self.high_reward_threshold,
+            'high_reward_capacity': self.high_reward_capacity,
+            'regular_capacity': self.regular_capacity,
+        }
     
     def get_actor_composition(self):
         """Return statistics on actor composition of buffer"""
