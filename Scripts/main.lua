@@ -208,7 +208,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
 
     -- Normalize natural 8-bit values [0,255] to [0,1]
     local function push_natural_norm(parts, v)
-        if v < 0 or val > 255 then
+        if v < 0 or v > 255 then
             error(string.format("Value %g out of range [0,255] in natural_8bit", v))
         end
         local num = tonumber(v) or 0
