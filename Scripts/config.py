@@ -108,7 +108,7 @@ class RLConfigData:
     
     # Single-threaded training
     training_steps_per_sample: int = 4     # One update per sample
-    training_workers: int = 4             # SIMPLIFIED - single thread only
+    training_workers: int = 1             # SIMPLIFIED - single thread only
 
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
