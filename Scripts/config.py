@@ -78,7 +78,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 1024                # Moderate batch for stability
+    batch_size: int = 8192                # Moderate batch for stability
     lr: float = 0.0005                   # Atari DQN learning rate (was 0.0005, halved for stability)
     gamma: float = 0.992                   # Discount factor for future rewards
     n_step: int = 3                        # N-step returns for better credit assignment
