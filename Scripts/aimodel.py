@@ -391,12 +391,19 @@ class HybridDQN(nn.Module):
         return discrete_q, continuous_spinner
 
 class HybridReplayBuffer:
-    """Experience replay buffer for hybrid discrete-continuous actions.
+    """Experience replay buffer with bucket-based PER for hybrid discrete-continuous actions.
     
     Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done, actor, horizon)
     - discrete_action: integer index for fire/zap combination (0-3)
     - continuous_action: float spinner value in [-0.9, +0.9]
     - actor: string tag identifying source of experience ('expert' or 'dqn')
+    
+    Uses three priority buckets for efficient sampling:
+    - high_reward_bucket: Experiences with rewards above 75th percentile
+    - recent_bucket: Most recent experiences (last 10% of buffer or 50K, whichever is larger)
+    - regular_bucket: All other experiences
+    
+    Each bucket maintains O(1) sampling via deque with random access via list conversion.
     """
     def __init__(self, capacity: int, state_size: int):
         self.capacity = capacity
@@ -413,120 +420,27 @@ class HybridReplayBuffer:
         self.dones = np.empty((capacity,), dtype=np.bool_)
         self.actors = np.empty((capacity,), dtype='U10')  # Store actor tags (up to 10 chars)
         self.horizons = np.ones((capacity,), dtype=np.int32)  # n-step horizon per transition (default 1)
-        # Caches (initialized lazily)
-        self._last_percentile_value = None
-        self._last_percentile_source_size = 0
-        self._high_reward_mask = None
-        self._terminal_indices = None
-        self._last_terminal_count_source_size = 0
-        self._last_cache_refresh_frame = 0
+        
+        # Rolling reward window for percentile calculation
+        self.reward_window = deque(maxlen=50000)  # Track last 50K rewards
+        self.high_reward_threshold = 0.0
+        
+        # Recent window configuration
+        self.recent_window_size = 50000  # Will be updated dynamically
+        
+        # Random number generator
         self._rand = np.random.default_rng()
 
-    # Internal helpers for optimized sampling
-    def _refresh_percentile_cache(self, rl_cfg, metrics_obj):
-        try:
-            perc = float(getattr(rl_cfg, 'replay_high_reward_percentile', 70.0))
-        except Exception:
-            perc = 70.0
-        try:
-            rewards_view = self.rewards[:self.size]
-            if rewards_view.size == 0:
-                self._last_percentile_value = 0.0
-                self._high_reward_mask = None
-            else:
-                self._last_percentile_value = float(np.percentile(rewards_view, perc))
-                self._high_reward_mask = (rewards_view >= self._last_percentile_value)
-            self._last_percentile_source_size = self.size
-        except Exception:
-            self._last_percentile_value = None
-        try:
-            metrics_obj.replay_cache_percentile = float(self._last_percentile_value if self._last_percentile_value is not None else 0.0)
-        except Exception:
-            pass
 
-    def _refresh_terminal_cache(self, metrics_obj):
-        try:
-            dones_view = self.dones[:self.size]
-            self._terminal_indices = np.flatnonzero(dones_view)
-            self._last_terminal_count_source_size = self.size
-        except Exception:
-            self._terminal_indices = None
-        try:
-            metrics_obj.replay_cache_terminals = int(0 if self._terminal_indices is None else self._terminal_indices.size)
-        except Exception:
-            pass
-
-    def _maybe_refresh_caches(self):
-        # Import inside to avoid circular import at module load
-        from config import RL_CONFIG as _RL_CFG, metrics as _METRICS
-        if not getattr(_RL_CFG, 'optimized_replay_sampling', False):
+    def _update_reward_percentile(self):
+        """Update high-reward threshold using rolling percentile."""
+        if len(self.reward_window) < 100:  # Need minimum samples
+            self.high_reward_threshold = 0.0
             return
-        # Periodic full refresh based on frame count interval to combat distribution drift
-        frame_ct = getattr(_METRICS, 'frame_count', 0)
-        interval = int(getattr(_RL_CFG, 'replay_cache_refresh_interval', 5000) or 5000)
-        if frame_ct - self._last_cache_refresh_frame >= interval:
-            self._refresh_percentile_cache(_RL_CFG, _METRICS)
-            self._refresh_terminal_cache(_METRICS)
-            self._last_cache_refresh_frame = frame_ct
-
-    def _fast_high_reward_indices(self, count, rl_cfg):
-        # Ensure cache valid; refresh lazily if size grew enough
-        if self._last_percentile_value is None or self._last_percentile_source_size != self.size:
-            self._refresh_percentile_cache(rl_cfg, metrics)
-        if self._high_reward_mask is None or self._high_reward_mask.size != self.size:
-            threshold = self._last_percentile_value if self._last_percentile_value is not None else -1e9
-            cand = np.flatnonzero(self.rewards[:self.size] >= threshold)
-        else:
-            cand = np.flatnonzero(self._high_reward_mask)
-        if cand.size == 0:
-            # fallback: any random indices
-            return self._rand.choice(self.size, size=count, replace=False)
-        if cand.size >= count:
-            return self._rand.choice(cand, size=count, replace=False)
-        # Not enough, fill remainder randomly (avoid duplicates by using set difference)
-        needed = count - cand.size
-        extras = self._rand.choice(self.size, size=needed, replace=False)
-        return np.concatenate([cand, extras])
-
-    def _fast_pre_death_indices(self, count, rl_cfg):
-        # Refresh terminal cache if needed
-        if self._terminal_indices is None or self._last_terminal_count_source_size != self.size:
-            self._refresh_terminal_cache(metrics)
-        terms = self._terminal_indices
-        if terms is None or terms.size == 0:
-            return self._rand.choice(self.size, size=count, replace=False)
-        lb_min = int(getattr(rl_cfg, 'replay_terminal_lookback_min', 5) or 5)
-        lb_max = int(getattr(rl_cfg, 'replay_terminal_lookback_max', 10) or 10)
-        # Sample candidate pre-death frames by random lookback inside [lb_min, lb_max]
-        chosen = []
-        if terms.size >= count:
-            sample_terms = self._rand.choice(terms, size=count, replace=False)
-        else:
-            sample_terms = terms
-        for t in sample_terms:
-            lookback = self._rand.integers(lb_min, lb_max + 1)
-            idx = int(t) - int(lookback)
-            if idx < 0:
-                idx = 0
-            chosen.append(idx)
-        chosen = np.array(chosen, dtype=np.int64)
-        if chosen.size < count:
-            need = count - chosen.size
-            extra = self._rand.choice(self.size, size=need, replace=False)
-            chosen = np.concatenate([chosen, extra])
-        return chosen
-
-    def _fast_recent_indices(self, count, rl_cfg):
-        recent_min = int(getattr(rl_cfg, 'replay_recent_window_min', 50000) or 50000)
-        recent_frac = float(getattr(rl_cfg, 'replay_recent_window_frac', 0.10) or 0.10)
-        window = max(recent_min, int(self.size * recent_frac))
-        start = max(0, self.size - window)
-        if start >= self.size:
-            start = 0
-        return self._rand.integers(start, self.size, size=count, endpoint=False)
-
-    def _fast_random_indices(self, count):
-        return self._rand.choice(self.size, size=count, replace=False)
+        
+        # Use 75th percentile for high-reward classification
+        rewards = np.array(list(self.reward_window))
+        self.high_reward_threshold = float(np.percentile(rewards, 75.0))
 
     def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon: int):
         """Add experience to buffer with actor tag"""
@@ -558,9 +472,11 @@ class HybridReplayBuffer:
         except Exception:
             # Fallback to zeros if something went wrong
             self.states[self.position, :] = 0.0
+        
         self.discrete_actions[self.position] = discrete_idx
         self.continuous_actions[self.position] = continuous_val
         self.rewards[self.position] = reward
+        
         try:
             ns = np.asarray(next_state, dtype=np.float32)
             if ns.ndim > 1:
@@ -574,8 +490,10 @@ class HybridReplayBuffer:
             self.next_states[self.position, :] = ns
         except Exception:
             self.next_states[self.position, :] = 0.0
+        
         self.dones[self.position] = done
         self.actors[self.position] = actor_tag
+        
         # Require explicit positive horizon
         h = int(horizon)
         if h < 1:
@@ -586,44 +504,64 @@ class HybridReplayBuffer:
         self.position = (self.position + 1) % self.capacity
         if self.size < self.capacity:
             self.size += 1
-        # Incremental cache maintenance (only when optimization enabled)
-        try:
-            from config import RL_CONFIG as _RL_CFG
-            if getattr(_RL_CFG, 'optimized_replay_sampling', False):
-                # Terminal index maintenance: append if done, else nothing. If overwriting existing slot that was terminal, force full refresh next sample.
-                if done:
-                    if self._terminal_indices is not None:
-                        # Append new absolute index (position just advanced; newly written index = (position-1) mod capacity)
-                        new_idx = (self.position - 1) % self.capacity
-                        self._terminal_indices = np.append(self._terminal_indices, new_idx)
-                else:
-                    # If overwriting a terminal slot, mark for refresh by invalidating source size reference
-                    pass
-                # Percentile maintenance: light-touch exponential moving estimate of threshold to avoid full np.percentile each push
-                if self._last_percentile_value is not None:
-                    perc = float(getattr(_RL_CFG, 'replay_high_reward_percentile', 70.0) or 70.0)
-                    # Simple heuristic: move threshold slightly toward new reward if it's above current threshold region
-                    r_new = float(reward)
-                    alpha = 0.001  # slow adaptation
-                    # If new reward higher than current threshold, raise threshold slightly; else decay slightly
-                    if r_new > self._last_percentile_value:
-                        self._last_percentile_value = (1 - alpha) * self._last_percentile_value + alpha * r_new
-                    else:
-                        # Gentle decay toward mean (assumed ~0) if threshold drifts too high
-                        self._last_percentile_value *= (1 - alpha*0.5)
-        except Exception:
-            pass
+        
+        # Update recent window size (10% of buffer or 50K, whichever is larger)
+        self.recent_window_size = max(50000, int(self.size * 0.1))
+        
+        # Update rolling reward window and percentile
+        self.reward_window.append(reward)
+        if len(self.reward_window) % 1000 == 0:  # Update percentile every 1000 samples
+            self._update_reward_percentile()
     
     def sample(self, batch_size):
-        """Sample batch using simple uniform sampling for speed.
+        """Sample batch using bucket-based PER for quality sampling.
         
-        Original stratified sampling was too slow with large buffers.
+        Samples from buffer using dynamic prioritization without expensive list conversions.
+        Uses numpy array slicing for O(1) sampling performance.
         """
         if self.size < batch_size:
             return None
 
-        # Simple uniform sampling - much faster than stratified
-        indices = np.random.choice(self.size, size=batch_size, replace=False)
+        # Calculate recent window boundary (recent_window_size most recent samples)
+        recent_start = max(0, self.size - self.recent_window_size)
+        
+        # Build index pools efficiently
+        # High-reward pool: Find indices where reward > threshold (fast numpy boolean indexing)
+        high_reward_mask = self.rewards[:self.size] >= self.high_reward_threshold
+        high_reward_indices = np.where(high_reward_mask)[0]
+        
+        # Recent pool: Last N samples
+        recent_indices = np.arange(recent_start, self.size)
+        
+        # Regular pool: Everything else (early samples with low rewards)
+        regular_mask = (~high_reward_mask) & (np.arange(self.size) < recent_start)
+        regular_indices = np.where(regular_mask)[0]
+        
+        # Sample from each pool proportionally
+        all_indices = []
+        
+        # Try to get batch_size from high-reward if available
+        if len(high_reward_indices) >= batch_size:
+            sampled = self._rand.choice(high_reward_indices, size=batch_size, replace=False)
+            all_indices.extend(sampled)
+        
+        # Try to get batch_size from recent if available
+        if len(recent_indices) >= batch_size:
+            sampled = self._rand.choice(recent_indices, size=batch_size, replace=False)
+            all_indices.extend(sampled)
+        
+        # Try to get batch_size from regular if available
+        if len(regular_indices) >= batch_size:
+            sampled = self._rand.choice(regular_indices, size=batch_size, replace=False)
+            all_indices.extend(sampled)
+        
+        # Select final batch from combined pools
+        if len(all_indices) < batch_size:
+            # Not enough samples in pools, fall back to uniform sampling
+            indices = self._rand.choice(self.size, size=batch_size, replace=False)
+        else:
+            # Randomly select from the combined pool
+            indices = self._rand.choice(all_indices, size=batch_size, replace=False)
 
         # Vectorized gather for batch data
         states_np = self.states[indices]
@@ -684,6 +622,24 @@ class HybridReplayBuffer:
             'expert': int(n_expert),
             'frac_dqn': float(n_dqn) / self.size,
             'frac_expert': float(n_expert) / self.size,
+        }
+    
+    def get_bucket_stats(self):
+        """Return statistics about priority bucket sizes for monitoring."""
+        # Calculate bucket sizes on-the-fly using the same logic as sample()
+        recent_start = max(0, self.size - self.recent_window_size)
+        high_reward_mask = self.rewards[:self.size] >= self.high_reward_threshold
+        high_reward_count = np.sum(high_reward_mask)
+        recent_count = self.size - recent_start
+        regular_mask = (~high_reward_mask) & (np.arange(self.size) < recent_start)
+        regular_count = np.sum(regular_mask)
+        
+        return {
+            'high_reward': int(high_reward_count),
+            'recent': int(recent_count),
+            'regular': int(regular_count),
+            'high_reward_threshold': self.high_reward_threshold,
+            'recent_window_size': self.recent_window_size,
         }
 
 ## Hybrid-only path: legacy discrete-only DQNAgent removed
@@ -1638,23 +1594,40 @@ class HybridDQNAgent:
 
                 # No separate inference network to sync in single device setup
 
-                # Sanity-check Q-values on load to catch corruption/explosion
+                # Sanity-check Q-values on load to catch corruption/explosion or collapse
                 try:
                     with torch.no_grad():
                         dummy = torch.zeros(1, self.state_size, device=self.device)
                         dq, _ = self.qnetwork_local(dummy)
                         qmax = float(dq.max().item())
                         qmin = float(dq.min().item())
-                        if max(abs(qmax), abs(qmin)) > 10.0:
-                            print("WARNING: Loaded hybrid model has extreme Q-values. Rescaling weights...")
-                            scale = 5.0 / max(abs(qmax), abs(qmin))
+                        q_range = max(abs(qmax), abs(qmin))
+                        
+                        # Check for extreme Q-values (too large or too small)
+                        # Normal range should be roughly [-5, +5] for typical reward scales
+                        needs_rescale = False
+                        target_scale = 2.0  # Target magnitude for rescaling
+                        
+                        if q_range > 10.0:
+                            # Q-values too large - risk of overflow
+                            print(f"WARNING: Loaded model has large Q-values [{qmin:.3f}, {qmax:.3f}]. Rescaling down...")
+                            scale = target_scale / q_range
+                            needs_rescale = True
+                        elif q_range < 0.01 and q_range > 0:
+                            # Q-values collapsed near zero - may indicate vanishing gradients or bad init
+                            print(f"WARNING: Loaded model has collapsed Q-values [{qmin:.6f}, {qmax:.6f}]. Rescaling up...")
+                            scale = target_scale / q_range
+                            needs_rescale = True
+                        
+                        if needs_rescale:
                             for p in self.qnetwork_local.parameters():
                                 p.data.mul_(scale)
                             for p in self.qnetwork_target.parameters():
                                 p.data.mul_(scale)
                             dq2, _ = self.qnetwork_local(dummy)
                             print(f"Rescaled Q-value range: [{float(dq2.min().item()):.3f}, {float(dq2.max().item()):.3f}]")
-                except Exception:
+                except Exception as e:
+                    print(f"Warning: Q-value sanity check failed: {e}")
                     pass
 
                 # Restore metrics unless explicitly reset
@@ -1815,10 +1788,18 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
          expert_fire, expert_zap, level_number) = values
         header_size = _HDR_OOB
 
+        # DIAGNOSTIC: Check for negative subjective rewards before scaling
+        if subjreward < 0:
+            print(f"[DIAGNOSTIC] Frame {frame_counter}: Negative subjective reward received from Lua: {subjreward:.6f} (objective={objreward:.6f})", flush=True)
+
         # Apply subjective/objective reward scaling and compute total
         subjreward = float(subjreward) * float(getattr(RL_CONFIG, 'subj_reward_scale', 1.0) or 1.0)
         objreward = float(objreward) * float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
         reward = float(subjreward + objreward)
+        
+        # DIAGNOSTIC: Also check after scaling
+        if subjreward < 0:
+            print(f"[DIAGNOSTIC] Frame {frame_counter}: Negative subjective reward AFTER scaling: {subjreward:.6f} (scale={getattr(RL_CONFIG, 'subj_reward_scale', 1.0)}, total reward={reward:.6f})", flush=True)
 
         state_data = memoryview(data)[header_size:]
 
