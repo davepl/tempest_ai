@@ -633,6 +633,24 @@ class HybridReplayBuffer:
             'frac_dqn': float(n_dqn) / self.size,
             'frac_expert': float(n_expert) / self.size,
         }
+    
+    def get_bucket_stats(self):
+        """Return statistics about priority bucket sizes for monitoring."""
+        # Calculate bucket sizes on-the-fly using the same logic as sample()
+        recent_start = max(0, self.size - self.recent_window_size)
+        high_reward_mask = self.rewards[:self.size] >= self.high_reward_threshold
+        high_reward_count = np.sum(high_reward_mask)
+        recent_count = self.size - recent_start
+        regular_mask = (~high_reward_mask) & (np.arange(self.size) < recent_start)
+        regular_count = np.sum(regular_mask)
+        
+        return {
+            'high_reward': int(high_reward_count),
+            'recent': int(recent_count),
+            'regular': int(regular_count),
+            'high_reward_threshold': self.high_reward_threshold,
+            'recent_window_size': self.recent_window_size,
+        }
 
 ## Hybrid-only path: legacy discrete-only DQNAgent removed
 ## N-step learning handled upstream (server) or via dedicated buffer; hybrid agent expects 1-step or n-step rewards provided.
@@ -1586,23 +1604,40 @@ class HybridDQNAgent:
 
                 # No separate inference network to sync in single device setup
 
-                # Sanity-check Q-values on load to catch corruption/explosion
+                # Sanity-check Q-values on load to catch corruption/explosion or collapse
                 try:
                     with torch.no_grad():
                         dummy = torch.zeros(1, self.state_size, device=self.device)
                         dq, _ = self.qnetwork_local(dummy)
                         qmax = float(dq.max().item())
                         qmin = float(dq.min().item())
-                        if max(abs(qmax), abs(qmin)) > 10.0:
-                            print("WARNING: Loaded hybrid model has extreme Q-values. Rescaling weights...")
-                            scale = 5.0 / max(abs(qmax), abs(qmin))
+                        q_range = max(abs(qmax), abs(qmin))
+                        
+                        # Check for extreme Q-values (too large or too small)
+                        # Normal range should be roughly [-5, +5] for typical reward scales
+                        needs_rescale = False
+                        target_scale = 2.0  # Target magnitude for rescaling
+                        
+                        if q_range > 10.0:
+                            # Q-values too large - risk of overflow
+                            print(f"WARNING: Loaded model has large Q-values [{qmin:.3f}, {qmax:.3f}]. Rescaling down...")
+                            scale = target_scale / q_range
+                            needs_rescale = True
+                        elif q_range < 0.01 and q_range > 0:
+                            # Q-values collapsed near zero - may indicate vanishing gradients or bad init
+                            print(f"WARNING: Loaded model has collapsed Q-values [{qmin:.6f}, {qmax:.6f}]. Rescaling up...")
+                            scale = target_scale / q_range
+                            needs_rescale = True
+                        
+                        if needs_rescale:
                             for p in self.qnetwork_local.parameters():
                                 p.data.mul_(scale)
                             for p in self.qnetwork_target.parameters():
                                 p.data.mul_(scale)
                             dq2, _ = self.qnetwork_local(dummy)
                             print(f"Rescaled Q-value range: [{float(dq2.min().item()):.3f}, {float(dq2.max().item()):.3f}]")
-                except Exception:
+                except Exception as e:
+                    print(f"Warning: Q-value sanity check failed: {e}")
                     pass
 
                 # Restore metrics unless explicitly reset
