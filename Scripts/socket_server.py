@@ -35,6 +35,7 @@ import threading
 import traceback
 import random
 import errno
+import queue
 from collections import deque
 
 import numpy as np
@@ -50,11 +51,104 @@ from nstep_buffer import NStepReplayBuffer
 from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
 
 
+class AsyncReplayBuffer:
+    """
+    Non-blocking async wrapper for agent.step() calls.
+    Queues experiences and inserts them in batches on a background thread.
+    This prevents client threads from blocking on buffer insertion.
+    """
+    def __init__(self, agent, batch_size=100, max_queue_size=10000):
+        self.agent = agent
+        self.batch_size = batch_size
+        self.queue = queue.Queue(maxsize=max_queue_size)
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._consume_queue, daemon=True)
+        self.worker_thread.start()
+        self.items_queued = 0
+        self.items_processed = 0
+        self.items_dropped = 0
+        
+    def step_async(self, *args, **kwargs):
+        """Non-blocking step - queues experience for later insertion."""
+        try:
+            self.queue.put_nowait((args, kwargs))
+            self.items_queued += 1
+            return True
+        except queue.Full:
+            # Queue full - drop frame (better than blocking)
+            self.items_dropped += 1
+            return False
+    
+    def _consume_queue(self):
+        """Background thread that processes queued experiences in batches."""
+        batch = []
+        while self.running:
+            try:
+                # Get item with timeout to allow checking running flag
+                item = self.queue.get(timeout=0.1)
+                batch.append(item)
+                
+                # Process batch when full or queue empty
+                if len(batch) >= self.batch_size or self.queue.empty():
+                    for args, kwargs in batch:
+                        try:
+                            self.agent.step(*args, **kwargs)
+                            self.items_processed += 1
+                        except Exception as e:
+                            print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
+                    batch.clear()
+                    
+            except queue.Empty:
+                # Process any remaining items in batch
+                if batch:
+                    for args, kwargs in batch:
+                        try:
+                            self.agent.step(*args, **kwargs)
+                            self.items_processed += 1
+                        except Exception as e:
+                            print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
+                    batch.clear()
+            except Exception as e:
+                print(f"AsyncReplayBuffer worker error: {e}")
+                
+    def stop(self):
+        """Stop the background worker and flush remaining queue."""
+        self.running = False
+        # Process any remaining items
+        remaining = []
+        try:
+            while True:
+                remaining.append(self.queue.get_nowait())
+        except queue.Empty:
+            pass
+        
+        for args, kwargs in remaining:
+            try:
+                self.agent.step(*args, **kwargs)
+                self.items_processed += 1
+            except Exception:
+                pass
+                
+        self.worker_thread.join(timeout=5.0)
+        
+    def get_stats(self):
+        """Get async buffer statistics."""
+        return {
+            'queued': self.items_queued,
+            'processed': self.items_processed,
+            'dropped': self.items_dropped,
+            'pending': self.queue.qsize(),
+            'queue_full': self.queue.full()
+        }
+
+
 class SocketServer:
     def __init__(self, host, port, agent, metrics_wrapper):
         self.host = host
         self.port = port
         self.agent = agent
+        # Create async buffer wrapper for non-blocking experience insertion
+        self.async_buffer = AsyncReplayBuffer(agent, batch_size=100, max_queue_size=10000) if agent else None
         # Always wrap with SafeMetrics for thread-safe updates
         self.metrics = SafeMetrics(metrics_wrapper)
 
@@ -150,6 +244,14 @@ class SocketServer:
     def stop(self):
         self.running = False
         self.shutdown_event.set()
+        
+        # Stop async buffer and flush remaining experiences
+        if self.async_buffer:
+            print("Flushing async replay buffer...")
+            self.async_buffer.stop()
+            stats = self.async_buffer.get_stats()
+            print(f"Async buffer stats: {stats['processed']:,} processed, {stats['pending']} remaining, {stats['dropped']} dropped")
+        
         try:
             if self.server_socket:
                 try:
@@ -327,8 +429,8 @@ class SocketServer:
                                          exp_done,
                                          exp_steps,
                                          exp_actor) = item
-                                        # Add ALL experiences to replay buffer for learning
-                                        self.agent.step(
+                                        # Add ALL experiences to replay buffer for learning (async)
+                                        self.async_buffer.step_async(
                                             exp_state,
                                             exp_action,
                                             exp_continuous,
@@ -346,8 +448,8 @@ class SocketServer:
                                          exp_done,
                                          exp_steps,
                                          exp_actor) = item
-                                        # Add ALL experiences to replay buffer
-                                        self.agent.step(
+                                        # Add ALL experiences to replay buffer (async)
+                                        self.async_buffer.step_async(
                                             exp_state,
                                             exp_action,
                                             exp_reward,
@@ -376,8 +478,8 @@ class SocketServer:
                                              exp_done,
                                              exp_steps,
                                              exp_actor) = item
-                                        # Add ALL experiences to replay buffer
-                                        self.agent.step(
+                                        # Add ALL experiences to replay buffer (async)
+                                        self.async_buffer.step_async(
                                             exp_state,
                                             exp_action,
                                             exp_reward,
@@ -405,16 +507,16 @@ class SocketServer:
                                                  exp_done,
                                                  _exp_steps,
                                                  exp_actor) = item
-                                            # Add ALL experiences to replay buffer
-                                            self.agent.step(exp_state, exp_action, exp_reward, exp_next_state, exp_done, actor=exp_actor)
+                                            # Add ALL experiences to replay buffer (async)
+                                            self.async_buffer.step_async(exp_state, exp_action, exp_reward, exp_next_state, exp_done, actor=exp_actor)
                                         except TypeError:
                                             pass
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
                         try:
                             if self.agent:
-                                # Hybrid agents expect (state, discrete, continuous, reward, next_state, done)
-                                self.agent.step(
+                                # Hybrid agents expect (state, discrete, continuous, reward, next_state, done) (async)
+                                self.async_buffer.step_async(
                                     state['last_state'],
                                     int(da),
                                     float(ca),
@@ -427,7 +529,7 @@ class SocketServer:
                         except TypeError:
                             # Fallback for agents without continuous action in signature
                             try:
-                                self.agent.step(
+                                self.async_buffer.step_async(
                                     state['last_state'],
                                     int(da),
                                     float(frame.subjreward + frame.objreward),

@@ -26,7 +26,6 @@
 # ||   • RL_CONFIG.batch_size, lr, gamma, n_step, hidden_size, num_layers, memory_size                            ||
 # ||   • Exploration & expert control: epsilon_* fields, expert_ratio_* fields                                    ||
 # ||   • Target updates: target_update_freq / update_target_every, use_soft_target_update + soft_target_tau       ||
-# ||   • Replay sampling: optimized_replay_sampling, percentile/window/terminal lookback                          ||
 # ||                                                                                                              ||
 # ||  SAFETY SWITCHES:                                                                                            ||
 # ||   • RESET_METRICS: ignore saved UI state for a clean run.                                                    ||
@@ -79,9 +78,9 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 2048                # Reduced from 8192 for faster sampling
-    lr: float = 0.0005                   # Atari DQN learning rate (was 0.0005, halved for stability)
-    gamma: float = 0.992                   # Discount factor for future rewards
-    n_step: int = 3                        # N-step returns for better credit assignment
+    lr: float = 0.00025                    # Atari DQN learning rate was 0.00025
+    gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
+    n_step: int = 3                        # CRITICAL FIX: Reduced from 7 to lower variance
 
     epsilon: float = 0.25                  # Current exploration rate
     epsilon_start: float = 0.25            # Start with HIGH exploration (needed for advantage weighting diversity)
@@ -103,9 +102,7 @@ class RLConfigData:
     target_update_freq: int = 500          # More frequent updates reduce local/target divergence  
     update_target_every: int = 500         # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
-    
-    # SIMPLIFIED: Disable PER - use uniform sampling only
-    
+        
     # Single-threaded training
     training_steps_per_sample: int = 1     # Reduced for speed - was 4
     training_workers: int = 4               # Multiple threads now thread-safe
@@ -135,7 +132,7 @@ class RLConfigData:
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = None
+    td_target_clip: float | None = 10.0   # CRITICAL FIX: Prevent Q-value explosion from unbounded targets
   
     # Replay sampling optimization flags
     # --- Replay Sampling Optimization ---
@@ -143,11 +140,9 @@ class RLConfigData:
     # 1. High-reward percentile threshold + boolean mask (updated periodically & with light EMA on push)
     # 2. Terminal transition indices for pre-death sampling
     # In extremely large buffers (millions of entries) this reduces CPU time per sample and GC pressure.
-    # Small synthetic tests may not show large speedups because numpy percentile is already vectorized.
-    optimized_replay_sampling: bool = True
 
     # Percentile used to define "high reward" group (e.g., 70 = top 30%).
-    replay_high_reward_percentile: float = 70.0
+    replay_high_reward_percentile: float = 90.0
 
     # Recent window definition: max(replay_recent_window_min, frac * buffer_size)
     replay_recent_window_min: int = 50000
