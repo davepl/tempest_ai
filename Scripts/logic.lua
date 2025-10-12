@@ -833,6 +833,10 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         end
     end
 
+    if (subj_reward < 0) then
+        print(string.format("Subj reward clipped: %.3f", subj_reward))
+    end
+
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward
 
