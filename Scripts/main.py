@@ -9,7 +9,7 @@
 # ||  NEED TO KNOW:                                                                                               ||
 # ||   - Creates model dir; instantiates HybridDQNAgent; loads latest model if present.                           ||
 # ||   - Starts SocketServer (Lua <-> Python bridge) and metrics display loop.                                    ||
-# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t), LR adjust (l/L), header (c).                   ||
+# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t,v), LR adjust (l/L), header (c).                ||
 # ||                                                                                                              ||
 # ||  CONSUMES: RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, SERVER_CONFIG, metrics                                   ||
 # ||  PRODUCES: running server, periodic metrics rows, on-exit model save                                         ||
@@ -40,7 +40,7 @@ def stats_reporter(agent, kb_handler):
     if os.path.exists(LATEST_MODEL_PATH):
         agent.load(LATEST_MODEL_PATH)
     last_report = time.time()
-    report_interval = 60.0  # Reduced frequency: print 1/5 as often
+    report_interval = 30.0  # Print every 30 seconds
     
     # Display the header once at the beginning
     display_metrics_header()
@@ -100,6 +100,9 @@ def keyboard_input_handler(agent, keyboard_handler):
                     display_metrics_row(agent, keyboard_handler)
                 elif key.lower() == 'p':
                     metrics.toggle_epsilon_override(keyboard_handler)
+                    display_metrics_row(agent, keyboard_handler)
+                elif key.lower() == 'v':
+                    metrics.toggle_verbose_mode(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
                 elif key.lower() == 't':
                     metrics.toggle_training_mode(keyboard_handler)
