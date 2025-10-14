@@ -106,8 +106,8 @@ class RLConfigData:
     memory_size: int = 2000000             # Balanced buffer size (was 4000000)
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
-    target_update_freq: int = 200                # Target network update frequency (steps)  
-    update_target_every: int = 200         # Keep in sync with target_update_freq
+    target_update_freq: int = 100                # Target network update frequency (steps) - reduced from 200 to stabilize Q-values with BC loss
+    update_target_every: int = 100         # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
         
     # Single-threaded training
