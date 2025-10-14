@@ -1150,9 +1150,24 @@ class HybridDQNAgent:
             
             continuous_targets = continuous_actions.clone()  # Start with taken actions
             
-            # For DQN samples, use predicted continuous as target to reinforce current policy
-            # For expert samples, use taken actions to learn optimal behavior
+            # SPINNER LEARNING STRATEGY:
+            # After extensive testing, self-imitation on DQN frames causes catastrophic degradation
+            # Root cause: DQN discovers different strategies than expert, self-imitation creates conflict
+            # 
+            # NEW APPROACH: Zero gradient on ALL DQN frames
+            # - Expert frames (50%): Learn expert spinner control (supervised learning)
+            # - DQN frames (50%): Zero gradient (let discrete actions optimize, spinner follows passively)
+            #
+            # Rationale:
+            # 1. DQN reward is increasing (3.2) despite agreement dropping - discovering better strategies
+            # 2. Self-imitation punishes DQN for being different from expert
+            # 3. Network torn between two strategies → catastrophic interference
+            # 4. Better to let DQN optimize discrete actions freely, expert teaches spinner basics
+            #
+            # For expert samples: always use taken actions to learn optimal behavior
+            # For DQN samples: use current prediction (zero gradient, no interference)
             if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
+                # ALL DQN frames: use prediction as target (zero gradient)
                 continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
         target_time = time.time() - target_start
 
@@ -1709,6 +1724,11 @@ class HybridDQNAgent:
                 # No separate inference network to sync in single device setup
 
                 # Sanity-check Q-values on load to catch corruption/explosion or collapse
+                # DISABLED: This rescaling was causing catastrophic Q-value resets and DLoss spikes
+                # The logic would trigger on perfectly healthy Q-values (e.g., [-10, -0.4])
+                # and scale them down to [0.03, 0.08], creating massive TD errors when
+                # fresh replay buffer data arrives with rewards of 5-7.
+                # Better to let Q-values naturally stabilize through training.
                 try:
                     with torch.no_grad():
                         dummy = torch.zeros(1, self.state_size, device=self.device)
@@ -1717,29 +1737,8 @@ class HybridDQNAgent:
                         qmin = float(dq.min().item())
                         q_range = max(abs(qmax), abs(qmin))
                         
-                        # Check for extreme Q-values (too large or too small)
-                        # Normal range should be roughly [-5, +5] for typical reward scales
-                        needs_rescale = False
-                        target_scale = 2.0  # Target magnitude for rescaling
-                        
-                        if q_range > 10.0:
-                            # Q-values too large - risk of overflow
-                            print(f"WARNING: Loaded model has large Q-values [{qmin:.3f}, {qmax:.3f}]. Rescaling down...")
-                            scale = target_scale / q_range
-                            needs_rescale = True
-                        elif q_range < 0.01 and q_range > 0:
-                            # Q-values collapsed near zero - may indicate vanishing gradients or bad init
-                            print(f"WARNING: Loaded model has collapsed Q-values [{qmin:.6f}, {qmax:.6f}]. Rescaling up...")
-                            scale = target_scale / q_range
-                            needs_rescale = True
-                        
-                        if needs_rescale:
-                            for p in self.qnetwork_local.parameters():
-                                p.data.mul_(scale)
-                            for p in self.qnetwork_target.parameters():
-                                p.data.mul_(scale)
-                            dq2, _ = self.qnetwork_local(dummy)
-                            print(f"Rescaled Q-value range: [{float(dq2.min().item()):.3f}, {float(dq2.max().item()):.3f}]")
+                        # Just log Q-values for monitoring, but don't rescale
+                        print(f"Loaded model Q-value range: [{qmin:.3f}, {qmax:.3f}]")
                 except Exception as e:
                     print(f"Warning: Q-value sanity check failed: {e}")
                     pass
