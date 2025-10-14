@@ -56,6 +56,13 @@ IS_INTERACTIVE = sys.stdin.isatty()
 RESET_METRICS = False  # Set to True to ignore saved epsilon/expert ratio - FRESH START
 FORCE_FRESH_MODEL = False  # Set to True to completely ignore saved model and start fresh
 
+# REPLAY BUFFER POLICY (RECOMMENDED: Keep True)
+# Since replay buffer is not saved/loaded, it's always empty on restart.
+# Setting this True ensures target network is synchronized to prevent Q-value explosion.
+RESET_REPLAY_BUFFER = True  # Start with empty buffer and synchronized target network
+# ⚠️ Setting to False will cause Q-value instability (exploding values, high loss, low agreement)
+# ✅ Setting to True is SAFE - does not corrupt model, prevents instability
+
 # Directory paths
 MODEL_DIR = "models"
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
@@ -78,29 +85,29 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 2048                # Reduced from 8192 for faster sampling
-    lr: float = 0.00025                    # Atari DQN learning rate was 0.00025
+    lr: float = 0.0001                    # Atari DQN learning rate was 0.00025
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
-    n_step: int = 3                        # CRITICAL FIX: Reduced from 7 to lower variance
+    n_step: int = 1                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
-    epsilon: float = 0.25                  # Current exploration rate
-    epsilon_start: float = 0.25            # Start with HIGH exploration (needed for advantage weighting diversity)
+    epsilon: float = 0.1                  # Current exploration rate
+    epsilon_start: float = 0.1            # Start with moderate exploration
     epsilon_min: float = 0.05              # Floor for exploration (1% random actions)
     epsilon_end: float = 0.05              # Target minimum epsilon
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 0.995
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
-    expert_ratio_start: float = 0.30       # Initial probability of expert control
+    expert_ratio_start: float = 0.05       # Start with minimal expert guidance to measure DQN learning
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
-    expert_ratio_decay: float = 0.996      # Multiplicative decay factor per step interval
+    expert_ratio_decay: float = 1.0      # No decay for debugging agreement
     expert_ratio_decay_steps: int = 10000  # Step interval for applying decay
 
     memory_size: int = 2000000             # Balanced buffer size (was 4000000)
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
-    target_update_freq: int = 500          # More frequent updates reduce local/target divergence  
-    update_target_every: int = 500         # Keep in sync with target_update_freq
+    target_update_freq: int = 200                # Target network update frequency (steps)  
+    update_target_every: int = 200         # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
         
     # Single-threaded training
@@ -113,8 +120,8 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    reward_scale: float = 0.1             
-    subj_reward_scale: float = 0.07       
+    obj_reward_scale: float = 0.001             # 1 reward = 1000 points
+    subj_reward_scale: float = 0.0007       # subjective are scaled to 70% of objective
 
     # Diagnostics
     grad_diag_interval: int = 0           # Every N training steps, sample per-head gradient contributions (0=off)
@@ -126,13 +133,17 @@ class RLConfigData:
 
     # Loss weighting (makes contributions explicit and tunable)
     continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss
-    discrete_loss_weight: float = 0.1     # Weight applied to discrete (Q) loss
+    discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss - increased to match continuous
+    
+    # Behavioral cloning for expert frames (imitation learning)
+    use_behavioral_cloning: bool = True   # Add BC loss for expert frames to teach action selection
+    bc_loss_weight: float = 1.0           # Weight for behavioral cloning loss (relative to Q-learning loss)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 10.0   # CRITICAL FIX: Prevent Q-value explosion from unbounded targets
+    td_target_clip: float | None = 1500.0   # CRITICAL FIX: Prevent Q-value explosion from unbounded targets
   
     # Replay sampling optimization flags
     # --- Replay Sampling Optimization ---
@@ -207,6 +218,14 @@ class MetricsData:
     d_loss_count_interval: int = 0
     c_loss_sum_interval: float = 0.0
     c_loss_count_interval: int = 0
+    bc_loss_sum_interval: float = 0.0
+    bc_loss_count_interval: int = 0
+    # Agreement averaging since last metrics print
+    agree_sum_interval: float = 0.0
+    agree_count_interval: int = 0
+    # Spinner (continuous) agreement averaging since last metrics print
+    spinner_agree_sum_interval: float = 0.0
+    spinner_agree_count_interval: int = 0
     # Training steps since last metrics print and when last row printed
     training_steps_interval: int = 0
     # New: training requests vs missed (queue full) since last metrics row
@@ -222,6 +241,7 @@ class MetricsData:
     memory_buffer_size: int = 0  # Current replay buffer size
     total_training_steps: int = 0  # Total training steps completed
     last_target_update_frame: int = 0  # Frame count when target network was last updated
+    last_target_update_step: int = 0  # Training step when target network was last updated
     last_inference_sync_frame: int = 0 # Frame count when inference net was last synced
     last_target_update_time: float = 0.0   # Wall time of last target update
     last_inference_sync_time: float = 0.0  # Wall time of last inference sync
@@ -254,12 +274,15 @@ class MetricsData:
     training_enabled: bool = True
     # Epsilon override: when True, force epsilon=0.0 (pure greedy) regardless of other overrides
     override_epsilon: bool = False
+    # Verbose mode: when True, show detailed debug output (AGREE DEBUG, etc.)
+    verbose_mode: bool = False
     # Gradient monitoring
     last_grad_norm: float = 0.0
     last_clip_delta: float = 1.0
     # Detailed loss diagnostics
-    last_d_loss: float = 0.0            # Discrete head loss (Huber)
+    last_d_loss: float = 0.0            # Discrete head loss (Huber/Q-learning)
     last_c_loss: float = 0.0            # Continuous head loss (after weighting)
+    last_bc_loss: float = 0.0           # Behavioral cloning loss (imitation learning)
     # Advantage weighting diagnostics
     adv_w_mean: float = 1.0
     adv_w_mean_dqn: float = 1.0
@@ -515,6 +538,15 @@ class MetricsData:
             if kb_handler and IS_INTERACTIVE:
                 from aimodel import print_with_terminal_restore
                 print_with_terminal_restore(kb_handler, f"\nEpsilon override: {status}\r")
+    
+    def toggle_verbose_mode(self, kb_handler=None):
+        """Toggle verbose debug output mode. When ON, shows detailed AGREE DEBUG and similar output."""
+        with self.lock:
+            self.verbose_mode = not self.verbose_mode
+            status = 'ON' if self.verbose_mode else 'OFF'
+            if kb_handler and IS_INTERACTIVE:
+                from aimodel import print_with_terminal_restore
+                print_with_terminal_restore(kb_handler, f"\nVerbose mode: {status}\r")
     
     def increase_expert_ratio(self, kb_handler=None):
         """Increase expert ratio with smart stepping: 0.01 in decimals (0.00-0.09), 0.05 in tenths (0.10+)"""

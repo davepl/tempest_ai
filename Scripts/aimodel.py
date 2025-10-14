@@ -144,7 +144,6 @@ warnings.filterwarnings('default')
 # Global flag to track if running interactively
 # Check this early before any potential tty interaction
 IS_INTERACTIVE = sys.stdin.isatty()
-print(f"Script Start: sys.stdin.isatty() = {IS_INTERACTIVE}") # DEBUG
 
 # Initialize configuration
 server_config = ServerConfigData()
@@ -197,14 +196,10 @@ RL_CONFIG = rl_config
 # Initialize device (single GPU setup)
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
-    print(f"Using CUDA device: {device}")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = torch.device("mps")
-    print(f"Using MPS device: {device}")
 else:
     device = torch.device("cpu")
-    print(f"Using CPU device: {device}")
 
 # Low-risk math speedups (CUDA only): allow TF32 and tune matmul/cudnn
 try:
@@ -260,35 +255,13 @@ def _force_dynamo_reset_once():
         _dynamo.reset()
         # Disable further frame evaluation for absolute safety this run
         os.environ['TORCHDYNAMO_DISABLE'] = '1'
-        print("[DecompileGuard] torch._dynamo.reset() executed; forcing eager mode.")
     except Exception:
         pass
     _DYNAMO_SEEN = True
 
 
 # Display key configuration parameters
-print(f"Learning rate: {RL_CONFIG.lr}")
-print(f"Batch size: {RL_CONFIG.batch_size}")
-print(f"Memory size: {RL_CONFIG.memory_size:,}")
-print(f"Hidden size: {RL_CONFIG.hidden_size}")
-print(f"Number of layers: {RL_CONFIG.num_layers}")
-
-# Calculate and display layer architecture
-layer_sizes = []
-for i in range(RL_CONFIG.num_layers):
-    pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
-    layer_size = max(32, RL_CONFIG.hidden_size // (2 ** pair_index))
-    layer_sizes.append(layer_size)
-
-print(f"Layer architecture:")
-print(f"  Layer 1: {RL_CONFIG.state_size} → {layer_sizes[0]}")
-for i in range(1, len(layer_sizes)):
-    print(f"  Layer {i+1}: {layer_sizes[i-1]} → {layer_sizes[i]}")
-print(f"  Head layers: {layer_sizes[-1]} → {max(64, layer_sizes[-1] // 2)}")
-
-print("Replay: hybrid experience buffer (discrete + continuous)")
-print(f"Mixed precision: {'enabled' if getattr(RL_CONFIG, 'use_mixed_precision', False) else 'disabled'}")
-print(f"State size: {RL_CONFIG.state_size}")
+# Configuration display removed for cleaner output
 
 # For compatibility with single-device code
 
@@ -431,14 +404,15 @@ class HybridReplayBuffer:
         # Track which frames are "pre-death" (within N frames of a terminal)
         self.pre_death_flags = np.zeros((capacity,), dtype=np.bool_)
         
-        # Pre-allocated arrays for maximum speed
-        self.states = np.empty((capacity, self.state_size), dtype=np.float32)
-        self.discrete_actions = np.empty((capacity,), dtype=np.int32)
-        self.continuous_actions = np.empty((capacity,), dtype=np.float32)
-        self.rewards = np.empty((capacity,), dtype=np.float32)
-        self.next_states = np.empty((capacity, self.state_size), dtype=np.float32)
-        self.dones = np.empty((capacity,), dtype=np.bool_)
-        self.actors = np.empty((capacity,), dtype='U10')  # Store actor tags (up to 10 chars)
+        # Pre-allocated arrays - CRITICAL: Use zeros() not empty() to avoid uninitialized memory!
+        # Using empty() causes random garbage values that lead to CUDA index out of bounds errors
+        self.states = np.zeros((capacity, self.state_size), dtype=np.float32)
+        self.discrete_actions = np.zeros((capacity,), dtype=np.int32)  # CRITICAL FIX: was empty()
+        self.continuous_actions = np.zeros((capacity,), dtype=np.float32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, self.state_size), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.bool_)
+        self.actors = np.full((capacity,), '', dtype='U10')  # Initialize to empty strings
         self.horizons = np.ones((capacity,), dtype=np.int32)  # n-step horizon per transition (default 1)
         
         # Random number generator
@@ -834,11 +808,7 @@ def print_with_terminal_restore(kb_handler, *args, **kwargs):
 
 def setup_environment():
     """Set up environment for socket server"""
-    print("\nSetting up environment...")
     os.makedirs(MODEL_DIR, exist_ok=True)
-    print(f"Model directory: {MODEL_DIR}")
-    print(f"Server will listen on {SERVER_CONFIG.host}:{SERVER_CONFIG.port}")
-    print(f"Ready to handle up to {SERVER_CONFIG.max_clients} clients")
 
 class HybridDQNAgent:
     """Hybrid DQN Agent with discrete fire/zap actions + continuous spinner"""
@@ -880,11 +850,12 @@ class HybridDQNAgent:
         # Establish persistent modes:
         # - training (local) stays in train mode
         # - target stays in eval mode
-        # - inference stays in eval mode if it's a dedicated copy
+        # - inference: MUST be in eval mode for deterministic behavior
         self.qnetwork_local.train()
         self.qnetwork_target.eval()
-        if self.qnetwork_inference is not self.qnetwork_local:
-            self.qnetwork_inference.eval()
+        # CRITICAL FIX: Even though qnetwork_inference IS qnetwork_local,
+        # we need to track that it should be in eval mode during inference.
+        # The act() method will handle mode switching.
 
         # Defensive: unwrap any lingering compiled wrappers & reset dynamo once.
         try:
@@ -894,7 +865,7 @@ class HybridDQNAgent:
             self.qnetwork_inference = unwrap_compiled_module(self.qnetwork_inference)
             after_types = (self.qnetwork_local.__class__.__name__, self.qnetwork_target.__class__.__name__)
             if before_types != after_types:
-                print(f"[DecompileGuard] Unwrapped compiled modules: {before_types} -> {after_types}")
+                pass
             _force_dynamo_reset_once()
         except Exception:
             pass
@@ -907,7 +878,6 @@ class HybridDQNAgent:
         
         # Experience replay (simplified to uniform sampling only)
         self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
-        print("Using standard HybridReplayBuffer (uniform sampling, eager mode)")
 
         # Training queue and metrics
         self.train_queue = queue.Queue(maxsize=10000)
@@ -930,7 +900,7 @@ class HybridDQNAgent:
             self.training_threads.append(t)
         
     def act(self, state, epsilon: float, add_noise: bool):
-        """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for continuous
+        """Select hybrid action using epsilon-greedy for discrete + Gaussian noise for cont7inuous
         
         Returns:
             discrete_action: int (0-3) for fire/zap combination
@@ -938,9 +908,12 @@ class HybridDQNAgent:
         """
         state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
         
-        # Do not flip modes every call; rely on persistent .eval() for dedicated inference model
+        # CRITICAL FIX: Put network in eval mode for deterministic inference
+        self.qnetwork_inference.eval()
         with torch.no_grad():
             discrete_q, continuous_pred = self.qnetwork_inference(state)
+        # Restore train mode for training
+        self.qnetwork_inference.train()
         
         # Discrete action selection (epsilon-greedy) or fixed FIRE when spinner_only
         if getattr(RL_CONFIG, 'spinner_only', False):
@@ -950,7 +923,7 @@ class HybridDQNAgent:
             if random.random() < epsilon:
                 discrete_action = random.randint(0, self.discrete_actions - 1)
             else:
-                discrete_action = discrete_q.cpu().data.numpy().argmax()
+                discrete_action = discrete_q.argmax(dim=1).item()  # Fixed: specify dimension
         
         # Continuous action selection (predicted value + optional exploration noise)
         continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
@@ -1007,7 +980,6 @@ class HybridDQNAgent:
     def background_train(self):
         """Background worker that drains the train_queue and performs train steps."""
         worker_id = threading.current_thread().name
-        print(f"Training thread {worker_id} started on {self.device}")
         while self.running:
             try:
                 _ = self.train_queue.get()  # block until work arrives
@@ -1025,7 +997,6 @@ class HybridDQNAgent:
                         if did_train:
                             try:
                                 metrics.training_steps_interval += 1
-                                metrics.total_training_steps += 1
                             except Exception:
                                 pass
                 # Optional telemetry after consuming a token
@@ -1085,9 +1056,9 @@ class HybridDQNAgent:
             metrics.batch_n_dqn = int(n_dqn)
             metrics.batch_n_expert = int(n_expert)
             
-            # Log batch composition every 10000 training steps (disabled for normal operation)
-            # if self.training_steps > 0 and self.training_steps % 10000 == 0:
-            #     print(f"[BATCH] Step {self.training_steps}: {n_dqn} DQN ({frac_dqn*100:.1f}%) / {n_expert} expert ({(1-frac_dqn)*100:.1f}%)")
+            # Log batch composition every 100 training steps (disabled for normal operation)
+            #if self.training_steps > 0 and self.training_steps % 100 == 0:
+            #    print(f"[BATCH] Step {self.training_steps}: {n_dqn} DQN ({frac_dqn*100:.1f}%) / {n_expert} expert ({(1-frac_dqn)*100:.1f}%)")
         except Exception:
             actor_dqn_mask = None
             actor_expert_mask = None
@@ -1112,7 +1083,8 @@ class HybridDQNAgent:
             next_q_target, _ = self.qnetwork_target(next_states)
             discrete_q_next_max = next_q_target.gather(1, best_actions)  # Q_target(s', a*) where a* = argmax Q_local
             # If horizons>1 (n-step return), apply gamma^h to the bootstrap term
-            gamma_h = torch.pow(torch.tensor(self.gamma, device=rewards.device), horizons)
+            # CRITICAL FIX: horizons is a tensor (batch_size, 1), need element-wise power
+            gamma_h = torch.pow(self.gamma, horizons.float())  # gamma^h for each sample
             discrete_targets = rewards + (gamma_h * discrete_q_next_max * (1 - dones))
             # Optional safety: clip TD targets to avoid runaway value scales
             td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
@@ -1188,6 +1160,7 @@ class HybridDQNAgent:
         loss_start = time.time()
         w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
         w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
+        w_bc = float(getattr(RL_CONFIG, 'bc_loss_weight', 1.0) or 1.0)
 
         # Optionally restrict discrete loss to expert frames only
         if bool(getattr(RL_CONFIG, 'discrete_expert_only', False)) and 'torch_mask_exp' in locals() and torch_mask_exp.any():
@@ -1197,6 +1170,20 @@ class HybridDQNAgent:
             d_loss = (d_loss_raw * d_mask).sum() / (d_loss_raw.numel() * denom.item())
         else:
             d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
+        
+        # BEHAVIORAL CLONING LOSS for expert frames
+        # Teaches the network to directly imitate expert action choices (not just Q-values)
+        # Uses cross-entropy on softmax(Q-values) to teach: "choose the same action as expert"
+        bc_loss = torch.tensor(0.0, device=device)
+        if bool(getattr(RL_CONFIG, 'use_behavioral_cloning', False)) and 'torch_mask_exp' in locals() and n_expert > 0:
+            # Get Q-values for expert frames only
+            expert_q_values = discrete_q_pred[torch_mask_exp]  # Shape: (n_expert, 4)
+            expert_actions = discrete_actions[torch_mask_exp]  # Shape: (n_expert, 1)
+            
+            # Cross-entropy loss: log_softmax(Q) vs one-hot(expert_action)
+            # This directly teaches: "when expert chose action A, you should choose action A"
+            log_probs = F.log_softmax(expert_q_values, dim=1)  # Convert Q-values to log-probabilities
+            bc_loss = F.nll_loss(log_probs, expert_actions.squeeze(1))  # Negative log-likelihood
         
         # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
         # REDUCED SCALING: exp(adv * 0.5) with 5x max weight (was 1.5 * 100x causing instability!)
@@ -1212,7 +1199,8 @@ class HybridDQNAgent:
         if getattr(RL_CONFIG, 'spinner_only', False):
             total_loss = w_cont * c_loss
         else:
-            total_loss = (w_disc * d_loss) + (w_cont * c_loss)
+            # Combine Q-learning loss, behavioral cloning loss, and continuous loss
+            total_loss = (w_disc * d_loss) + (w_bc * bc_loss) + (w_cont * c_loss)
         loss_time = time.time() - loss_start
 
         # Compute per-actor metrics for diagnostics
@@ -1366,7 +1354,7 @@ class HybridDQNAgent:
                 total_grad_norm += param_norm.item() ** 2
         total_grad_norm = total_grad_norm ** 0.5
         
-        # Gradient clipping for stability (critical with 100x advantage weights)
+        # Gradient clipping for stability (CRITICAL: prevents gradient explosions)
         max_norm = 10.0
         torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
         
@@ -1415,14 +1403,19 @@ class HybridDQNAgent:
             # Track component losses
             last_d = float((w_disc * d_loss).item())
             last_c = float((w_cont * c_loss).item())
+            last_bc = float((w_bc * bc_loss).item()) if bc_loss.item() > 0 else 0.0
             metrics.last_d_loss = last_d
             metrics.last_c_loss = last_c
+            metrics.last_bc_loss = last_bc
             # Accumulate interval-averaged component losses
             try:
                 metrics.d_loss_sum_interval += last_d
                 metrics.d_loss_count_interval += 1
                 metrics.c_loss_sum_interval += last_c
                 metrics.c_loss_count_interval += 1
+                if last_bc > 0:
+                    metrics.bc_loss_sum_interval += last_bc
+                    metrics.bc_loss_count_interval += 1
             except Exception:
                 pass
             # Advantage weight summaries
@@ -1446,12 +1439,68 @@ class HybridDQNAgent:
                     elif a == 1: metrics.action_frac_1 = frac
                     elif a == 2: metrics.action_frac_2 = frac
                     elif a == 3: metrics.action_frac_3 = frac
-                # Agreement rate: taken action vs current policy argmax
-                with torch.no_grad():
-                    dq_now, _ = self.qnetwork_local(states)
-                    a_star = dq_now.max(1)[1].unsqueeze(1)
-                    agree = (a_star == discrete_actions).float().mean().item()
-                metrics.action_agree_pct = float(agree * 100.0)
+                # Agreement: Does agent's current greedy policy match actions in replay buffer?
+                # This measures whether the model would choose the same actions it took in the past.
+                # Only computed for DQN frames (expert frames use different policy).
+                # Expected: ~25% random baseline, increasing to 70-90% as learning stabilizes.
+                if actor_dqn_mask is not None and n_dqn > 0:
+                    with torch.no_grad():
+                        # Get current greedy action for each state
+                        dq_current, _ = self.qnetwork_local(states)
+                        greedy_actions = dq_current.argmax(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+                        
+                        # Compare to actual actions taken (stored in replay buffer)
+                        # Both are shape (batch_size, 1), so comparison works element-wise
+                        matches = (greedy_actions == discrete_actions).float()  # 1.0 if match, 0.0 if not
+                        
+                        # Filter to DQN frames only and compute agreement percentage
+                        dqn_matches = matches.cpu().numpy().flatten()[actor_dqn_mask]
+                        agree_pct = float(dqn_matches.mean() * 100.0) if len(dqn_matches) > 0 else 0.0
+                        
+                        # DEBUG: Print agreement details every 100 steps (only in verbose mode)
+                        if metrics.verbose_mode and self.training_steps % 100 == 0:
+                            greedy_np = greedy_actions.cpu().numpy().flatten()[actor_dqn_mask]
+                            actions_np = discrete_actions.cpu().numpy().flatten()[actor_dqn_mask]
+                            print(f"\n[AGREE DEBUG] Step {self.training_steps}:")
+                            print(f"  n_dqn={n_dqn}, agree_pct={agree_pct:.1f}%")
+                            print(f"  First 10 greedy: {greedy_np[:10]}")
+                            print(f"  First 10 replay: {actions_np[:10]}")
+                            print(f"  Greedy dist: {np.bincount(greedy_np, minlength=4)}")
+                            print(f"  Replay dist: {np.bincount(actions_np, minlength=4)}")
+                        
+                        # Accumulate for interval averaging (like losses)
+                        metrics.agree_sum_interval += agree_pct * n_dqn  # Weight by number of DQN samples
+                        metrics.agree_count_interval += n_dqn
+                
+                # Spinner (Continuous) Agreement: Does predicted spinner match replay buffer?
+                # Measure "close enough" agreement using tolerance threshold (e.g., within ±0.1)
+                if actor_dqn_mask is not None and n_dqn > 0:
+                    with torch.no_grad():
+                        # Get current predicted continuous actions
+                        _, continuous_current = self.qnetwork_local(states)
+                        
+                        # Compare to actual continuous actions taken (from replay buffer)
+                        # Use tolerance: consider "match" if within ±0.1 of target
+                        tolerance = 0.1
+                        continuous_diff = torch.abs(continuous_current - continuous_actions)
+                        spinner_matches = (continuous_diff <= tolerance).float()
+                        
+                        # Filter to DQN frames only and compute agreement percentage
+                        dqn_spinner_matches = spinner_matches.cpu().numpy().flatten()[actor_dqn_mask]
+                        spinner_agree_pct = float(dqn_spinner_matches.mean() * 100.0) if len(dqn_spinner_matches) > 0 else 0.0
+                        
+                        # DEBUG: Print spinner agreement details every 100 steps (only in verbose mode)
+                        if metrics.verbose_mode and self.training_steps % 100 == 0:
+                            continuous_current_np = continuous_current.cpu().numpy().flatten()[actor_dqn_mask]
+                            continuous_replay_np = continuous_actions.cpu().numpy().flatten()[actor_dqn_mask]
+                            print(f"  Spinner agree_pct={spinner_agree_pct:.1f}%")
+                            print(f"  First 10 predicted: {continuous_current_np[:10]}")
+                            print(f"  First 10 replay:    {continuous_replay_np[:10]}")
+                            print(f"  Mean absolute error: {np.abs(continuous_current_np - continuous_replay_np).mean():.3f}")
+                        
+                        # Accumulate for interval averaging (like discrete agreement)
+                        metrics.spinner_agree_sum_interval += spinner_agree_pct * n_dqn
+                        metrics.spinner_agree_count_interval += n_dqn
                 # Batch done fraction and horizon mean
                 try:
                     metrics.batch_done_frac = float(dones.detach().cpu().numpy().mean())
@@ -1481,6 +1530,7 @@ class HybridDQNAgent:
             try:
                 metrics.last_target_update_frame = metrics.frame_count
                 metrics.last_target_update_time = time.time()
+                metrics.last_target_update_step = self.training_steps
             except Exception:
                 pass
         else:
@@ -1493,6 +1543,7 @@ class HybridDQNAgent:
                     metrics.last_target_update_time = time.time()
                     metrics.last_hard_target_update_frame = metrics.frame_count
                     metrics.last_hard_target_update_time = time.time()
+                    metrics.last_target_update_step = self.training_steps
                 except Exception:
                     pass
         target_update_time = time.time() - target_update_start
@@ -1560,28 +1611,15 @@ class HybridDQNAgent:
             print(message.strip())
         return float(new_lr)
 
-    def update_target_network(self):
-        """Hard update target network from local and record telemetry."""
-        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-        try:
-            metrics.last_target_update_frame = metrics.frame_count
-            metrics.last_target_update_time = time.time()
-            metrics.last_hard_target_update_frame = metrics.frame_count
-            metrics.last_hard_target_update_time = time.time()
-        except Exception:
-            pass
-
-    def force_hard_target_update(self):
-        """Alias for explicit hard target refresh (server compatibility)."""
+    def save(self, filepath, now=None, is_forced_save=False):
+        """Save hybrid model checkpoint with training state."""
+        if now is None:
+            import time
+            now = time.time()
+        
+        # Update target network before saving
         self.update_target_network()
-    
-    def save(self, filepath):
-        """Save hybrid model checkpoint with basic rate limiting"""
-        is_forced_save = ("exit" in str(filepath)) or ("shutdown" in str(filepath))
-        now = time.time()
-        min_interval = 30.0
-        if not is_forced_save and (now - self.last_save_time) < min_interval:
-            return
+        
         # Persist key training/metrics to avoid losing progress on restart
         # Respect saved_expert_ratio when override/expert_mode is active
         try:
@@ -1614,6 +1652,17 @@ class HybridDQNAgent:
         self.last_save_time = now
         if is_forced_save:
             print(f"Hybrid model saved to {filepath} (frame {getattr(metrics, 'frame_count', 0)})")
+
+    def update_target_network(self):
+        """Hard update target network from local and record telemetry."""
+        try:
+            self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+            metrics.last_target_update_time = time.time()
+            metrics.last_hard_target_update_frame = metrics.frame_count
+            metrics.last_hard_target_update_time = time.time()
+            metrics.last_target_update_step = self.training_steps
+        except Exception:
+            pass
     
     def load(self, filepath):
         """Load hybrid model checkpoint"""
@@ -1648,6 +1697,14 @@ class HybridDQNAgent:
                     print("Optimizer state not loaded (mismatch). Using fresh optimizer.")
 
                 self.training_steps = int(checkpoint.get('training_steps', 0))
+
+                # Sync metrics counters with loaded training_steps
+                try:
+                    metrics.total_training_steps = self.training_steps
+                    metrics.last_target_update_step = self.training_steps
+                    metrics.last_target_update_frame = metrics.frame_count
+                except Exception:
+                    pass
 
                 # No separate inference network to sync in single device setup
 
@@ -1754,6 +1811,35 @@ class HybridDQNAgent:
                 print(f"  - Resuming epsilon: {metrics.epsilon:.4f}")
                 print(f"  - Resuming expert_ratio: {metrics.expert_ratio:.4f}")
                 print(f"  - Resuming last_decay_step: {metrics.last_decay_step}")
+                
+                # CRITICAL FIX: Handle replay buffer reset
+                try:
+                    from config import RESET_REPLAY_BUFFER
+                except ImportError:
+                    from Scripts.config import RESET_REPLAY_BUFFER
+                
+                if RESET_REPLAY_BUFFER:
+                    print("\n" + "="*80)
+                    print("RESET_REPLAY_BUFFER=True: Clearing replay buffer and resetting target network")
+                    print("="*80)
+                    # Clear the replay buffer
+                    self.memory.size = 0
+                    self.memory.high_reward_size = 0
+                    self.memory.regular_size = 0
+                    self.memory.high_reward_position = 0
+                    self.memory.regular_position = 0
+                    # Clear any cached indices
+                    try:
+                        self.memory.terminal_indices.clear()
+                    except Exception:
+                        pass
+                    # Reset target network to match local network (prevent Q-explosion from stale targets)
+                    self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+                    print("✓ Replay buffer cleared")
+                    print("✓ Target network synchronized with local network")
+                    print("  This prevents Q-value explosion from bootstrapping old targets on fresh data")
+                    print("="*80 + "\n")
+                
                 return True
             except Exception as e:
                 print(f"Error loading hybrid checkpoint: {e}")
@@ -1847,7 +1933,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
 
         # Apply subjective/objective reward scaling and compute total
         subjreward = float(subjreward) * float(getattr(RL_CONFIG, 'subj_reward_scale', 1.0) or 1.0)
-        objreward = float(objreward) * float(getattr(RL_CONFIG, 'reward_scale', 1.0) or 1.0)
+        objreward = float(objreward) * float(getattr(RL_CONFIG, 'obj_reward_scale', 1.0) or 1.0)
         reward = float(subjreward + objreward)
 
         state_data = memoryview(data)[header_size:]
