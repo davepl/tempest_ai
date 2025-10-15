@@ -401,10 +401,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     -- Tube Zoom behavior unchanged
     if game_state.gamestate == 0x20 then
         local seg, _, should_fire, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
+        -- Force fire even during tube zoom
+        should_fire = true
         return seg, 0, should_fire, false
     end
     if game_state.gamestate ~= 0x04 then
-        return player_abs_seg, 0, false, false
+        return player_abs_seg, 0, true, false
     end
 
     -- Immediate fuseball avoidance: if a charging fuseball is in our lane or adjacent and near the top,
@@ -562,6 +564,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
     local should_superzap = superzapper_available and (top_rail_count >= 3)
 
+    -- Per request: Always recommend fire from the Lua expert
+    should_fire = true
     return target_seg, 0, should_fire, should_superzap
 end
 
