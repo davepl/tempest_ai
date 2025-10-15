@@ -38,7 +38,7 @@ local M = {} -- Module table
 
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
-local SCORE_UNIT = 1.0           
+         
 local LEVEL_COMPLETION_BONUS = 0.0   -- Edge-triggered bonus when level increments
 local DEATH_PENALTY = 0            -- Edge-triggered penalty when dying (raised to better balance vs completion)
 -- CRITICAL: Zap cost was 100, which dominated all other rewards and made subjective reward almost always negative
@@ -546,8 +546,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     elseif lane_has_threat or within_shooting_distance then
         should_fire = true
     else
-        -- Keep only 3 shots onscreen
-        should_fire = (shot_count < 3)
+        -- Keep only 5 shots onscreen
+        should_fire = (shot_count < 5)
     end
 
     -- Superzap heuristic retained (3+ top-rail enemies)
@@ -666,13 +666,13 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local shot_count = player_state.shot_count or 0
                 local shot_reward = 0.0
                 if shot_count <= 2 then
-                    shot_reward = 0 -- Penalty removed
-                elseif shot_count >= 4 and shot_count <= 7 then
+                    shot_reward = -1
+                elseif shot_count >= 5 and shot_count <= 7 then
                     shot_reward = 1
                 elseif shot_count >= 8 then
-                    shot_reward = 0 -- Penalty removed
+                    shot_reward = -1
                 end
-                subj_reward = subj_reward + shot_reward / SCORE_UNIT
+                subj_reward = subj_reward + shot_reward
             end
             
             -- 4. THREAT RESPONSIVENESS REWARD (Reaction to Immediate Dangers)
@@ -720,7 +720,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                             -- Moving 2 segments is worth MORE than 2x the reward of moving 1 segment
                             -- This incentivizes the DQN to learn the expert's "quick and snappy" movement patterns
                             -- instead of slow creeping that still technically "moves toward target"
-                            local base_scale = 0.5 / 8.0 * (10.0 / SCORE_UNIT)
+                            local base_scale = 0.5 / 8.0 * (10.0)
                             
                             -- Quadratic bonus: velocity² scaling makes fast movement much more valuable
                             -- Example: 1 segment = 1.0x, 2 segments = 2.5x, 3 segments = 4.0x reward
@@ -738,7 +738,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local shot_count = player_state.shot_count or 0
                         if current_distance == 0 and fire_edge and shot_count < 8 then
                             -- Reward successful firing action when aligned (~10 pts)
-                            positioning_reward = positioning_reward + (10.0 / SCORE_UNIT)
+                            positioning_reward = positioning_reward + (10.0)
                         end
                         
                         -- Apply level-specific scaling
@@ -778,7 +778,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local delta = previous_toprail_min_abs_rel - min_abs_rel_float
                         if delta > 0 then
                             -- Small reward proportional to progress, capped and scaled under 10 pts
-                            local progress_bonus = math.min(1.0, delta) * (3.0 / SCORE_UNIT)
+                            local progress_bonus = math.min(1.0, delta) * (3.0)
                             subj_reward = subj_reward + progress_bonus
                         end
                     end
@@ -787,7 +787,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local fire_now = (player_state.fire_detected or 0)
                     local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                     if min_abs_rel_float <= 0.30 and fire_edge then
-                        subj_reward = subj_reward + (4.0 / SCORE_UNIT) -- small bonus (~4 pts) for well-timed shot
+                        subj_reward = subj_reward + (4.0) -- small bonus (~4 pts) for well-timed shot
                     end
 
                     -- Penalty for not firing while very close removed per spec
@@ -800,7 +800,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                 local shot_count = player_state.shot_count or 0
                 if fire_edge and shot_count < 8 then
-                    subj_reward = subj_reward + (4.0 / SCORE_UNIT) -- reward for successfully firing a shot (~20 pts)
+                    subj_reward = subj_reward + (4.0) -- reward for successfully firing a shot 
                 end
             end
 

@@ -85,22 +85,22 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 2048                # Reduced from 8192 for faster sampling
-    lr: float = 0.0001                    # Atari DQN learning rate was 0.00025
+    lr: float = 0.00025                    # Atari DQN learning rate was 0.00025
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 1                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
-    epsilon: float = 0.1                  # Current exploration rate
-    epsilon_start: float = 0.1            # Start with moderate exploration
+    epsilon: float = 0.05                  # Current exploration rate
+    epsilon_start: float = 0.05            # Start with moderate exploration
     epsilon_min: float = 0.05              # Floor for exploration (1% random actions)
     epsilon_end: float = 0.05              # Target minimum epsilon
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
-    epsilon_decay_factor: float = 0.995
+    epsilon_decay_factor: float = 1
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
-    expert_ratio_start: float = 0.05       # Start with minimal expert guidance to measure DQN learning
+    expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
-    expert_ratio_decay: float = 1.0      # No decay for debugging agreement
+    expert_ratio_decay: float = 1.0      # Apply mild decay each step interval
     expert_ratio_decay_steps: int = 10000  # Step interval for applying decay
 
     memory_size: int = 2000000             # Balanced buffer size (was 4000000)
@@ -132,12 +132,26 @@ class RLConfigData:
     spinner_only_expert_only: bool = False
 
     # Loss weighting (makes contributions explicit and tunable)
-    continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss
+    continuous_loss_weight: float = 10.0   # Weight applied to continuous (spinner) loss
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss - increased to match continuous
+    # High-leverage continuous/expert tuning additions
+    continuous_expert_weight_start: float = 1.0   # Initial per-sample weight multiplier for expert spinner supervision
+    continuous_expert_weight_final: float = 0.08  # Final annealed expert spinner supervision weight
+    continuous_expert_weight_frames: int = 2_000_000  # Frames over which to anneal expert spinner weight
+    continuous_gate_sigma: float = 0.20    # Advantage (standardized reward) threshold for allowing DQN spinner self-imitation
+    continuous_self_imitation: bool = True  # Enable selective self-imitation for spinner on high-advantage DQN frames
+    bc_q_filter_margin: float = 0.40        # Q-filter margin for behavioral cloning (0 disables filtering)
+    adaptive_continuous_loss: bool = False # Enable adaptive scaling of continuous_loss_weight based on gradient norms
+    adaptive_cont_grad_low: float = 0.05   # If continuous head grad norm below this, scale weight up
+    adaptive_cont_grad_high: float = 0.50  # If above this, optionally scale weight down
+    adaptive_cont_scale_up: float = 1.15   # Multiplicative up-scaling factor
+    adaptive_cont_scale_dn: float = 0.90   # Multiplicative down-scaling factor
+    continuous_loss_weight_min: float = 0.25  # Clamp bounds for adaptive scaling
+    continuous_loss_weight_max: float = 3.0   # Clamp bounds for adaptive scaling
     
     # Behavioral cloning for expert frames (imitation learning)
     use_behavioral_cloning: bool = True   # Add BC loss for expert frames to teach action selection
-    bc_loss_weight: float = 1.0           # Weight for behavioral cloning loss (relative to Q-learning loss)
+    bc_loss_weight: float = 0.2           # Weight for behavioral cloning loss (relative to Q-learning loss)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
@@ -288,6 +302,10 @@ class MetricsData:
     adv_w_mean_dqn: float = 1.0
     adv_w_mean_expert: float = 1.0
     adv_w_max: float = 1.0
+    # High-leverage enhancement diagnostics
+    dynamic_expert_weight: float = 1.0     # Current annealed expert spinner supervision weight
+    spinner_gate_frac: float = 0.0         # Fraction of DQN spinner samples gated (allowed imitation)
+    bc_filtered_frac: float = 0.0          # Fraction of expert samples filtered out by Q-filter (BC)
     
     # Per-actor training diagnostics
     batch_frac_dqn: float = 0.0       # Fraction of batch that is DQN frames

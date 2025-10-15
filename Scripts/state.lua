@@ -445,10 +445,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
         end
     end
 
-    -- Apply shot count override (happens last, but never fire if out of ammo)
-    if player_state.shot_count < 8 then
-        should_fire = should_fire or player_state.shot_count < 3
-    end
+    should_fire = should_fire or player_state.shot_count < 5
 
     return final_target_seg_abs, target_depth, should_fire, should_zap
 end
