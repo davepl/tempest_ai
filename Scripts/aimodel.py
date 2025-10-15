@@ -2206,12 +2206,16 @@ def display_metrics_row(agent, kb=None):
     print_with_terminal_restore(kb, row)
 
 def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
-    """Expert policy to move toward nearest enemy with neutral tie-breaker.
+    """Expert policy: ALWAYS fire; move toward nearest enemy with neutral tie-breaker.
     Returns (fire, zap, spinner)
     """
+    # Always command fire for simplicity
+    fire = True
+    zap = bool(expert_zap)
+
     # Check for INVALID_SEGMENT (-32768) or no target (-1) which indicates no valid target (like during tube transitions)
     if enemy_seg == -32768 or enemy_seg == -1:  # INVALID_SEGMENT or no target
-        return expert_fire, expert_zap, 0  # Use Lua's recommendations with no movement
+        return fire, zap, 0  # Always fire, no movement when no target
 
     # Normalize to ring indices
     enemy_seg = int(enemy_seg) % 16
@@ -2235,7 +2239,7 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
             relative_dist = 8 if random.random() < 0.5 else -8
 
     if relative_dist == 0:
-        return expert_fire, expert_zap, 0  # No movement needed
+        return fire, zap, 0  # No movement needed; still fire
 
     # Calculate intensity based on distance
     distance = abs(relative_dist)
@@ -2244,7 +2248,7 @@ def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, e
     # For positive relative_dist (need to move clockwise), use negative spinner
     spinner = -intensity if relative_dist > 0 else intensity
 
-    return expert_fire, expert_zap, spinner
+    return fire, zap, spinner
 
 def encode_action_to_game(fire, zap, spinner):
     """Convert action values to game-compatible format.
