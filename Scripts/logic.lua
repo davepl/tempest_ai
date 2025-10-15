@@ -12,6 +12,10 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
+-- Simplified top-rail behavior threshold (in segments). When the nearest
+-- top-rail flipper/pulsar is within or equal to this distance, we will fire
+-- and move one full segment step away from it.
+local TOP_RAIL_CRITICAL_DISTANCE = 1
 local SAFE_DISTANCE = 1
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
@@ -469,100 +473,58 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
 
-    -- Scan top-rail threats (flippers and pulsars are equivalent once on top rail)
-    local nr_seg, nl_seg = nil, nil
-    local nr_dist, nl_dist = 999, 999
-    local nr_dist_float, nl_dist_float = 999, 999
-    local right_exists, left_exists = false, false
-    local min_abs_rel_float = 999 -- nearest top-rail flipper/pulsar fractional distance
-    for i = 1, 7 do
-        local depth = enemies_state.enemy_depths[i]
-        if depth > 0 and depth <= TOP_RAIL_DEPTH then
+    -- SIMPLIFIED TOP-RAIL LOGIC (per request):
+    -- If one or more top-rail flipper or pulsar exists, find the nearest.
+    -- If it's within TOP_RAIL_CRITICAL_DISTANCE (in segments), then:
+    --   - Fire
+    --   - Move one full segment away from it (by returning the adjacent target segment).
+    do
+        local nearest_rel = nil
+        local nearest_abs_seg = -1
+        local nearest_abs_dist = 999
+        for i = 1, 7 do
+            local depth = enemies_state.enemy_depths[i]
             local t = enemies_state.enemy_core_type[i]
-            if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
-                local seg = enemies_state.enemy_abs_segments[i]
-                if seg ~= INVALID_SEGMENT then
-                    local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
-                    local rel_float = enemies_state.active_top_rail_enemies[i]
-                    if rel_float == 0 and enemies_state.enemy_between_segments[i] == 0 then
-                        rel_float = rel_int
-                    end
-                    local abs_int = math.abs(rel_int)
-                    local abs_float = math.abs(rel_float)
-                    if rel_int > 0 and abs_int < nr_dist then nr_dist, nr_dist_float, nr_seg, right_exists = abs_int, abs_float, seg, true end
-                    if rel_int < 0 and abs_int < nl_dist then nl_dist, nl_dist_float, nl_seg, left_exists = abs_int, abs_float, seg, true end
-                    if abs_float < min_abs_rel_float then min_abs_rel_float = abs_float end
+            local seg = enemies_state.enemy_abs_segments[i]
+            if depth > 0 and depth <= TOP_RAIL_DEPTH and seg ~= INVALID_SEGMENT and (t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR) then
+                local rel = abs_to_rel_func(player_abs_seg, seg, is_open)
+                local d = math.abs(rel)
+                if d < nearest_abs_dist then
+                    nearest_abs_dist = d
+                    nearest_abs_seg = seg
+                    nearest_rel = rel
                 end
             end
         end
-    end
 
-    -- Open-level fixed retreats (right-only -> 1, left-only -> 13). Both sides falls through to closed-level logic
-    local target_seg = player_abs_seg
-    if is_open then
-        if right_exists and not left_exists then
-            target_seg = RIGHT_RETREAT_SEGMENT -- 1
-        elseif left_exists and not right_exists then
-            target_seg = LEFT_RETREAT_SEGMENT -- 13
-        end
-    end
-
-    -- Closed-level (and open with both sides) movement policy
-    if (not is_open) or (is_open and right_exists and left_exists) then
-        if right_exists and not left_exists then
-            -- Right-only: move left if within safe distance
-            if nr_dist <= SAFE_DISTANCE then
-                target_seg = (nr_seg - 1 + 16) % 16
-            else
-                target_seg = player_abs_seg
+        if nearest_abs_seg ~= -1 then
+            local should_fire = (nearest_abs_dist <= TOP_RAIL_CRITICAL_DISTANCE)
+            local target_seg = player_abs_seg
+            if nearest_abs_dist <= TOP_RAIL_CRITICAL_DISTANCE then
+                if nearest_rel ~= nil then
+                    if nearest_rel >= 0 then
+                        -- Enemy to the right or aligned: move left by one segment
+                        if is_open then
+                            if player_abs_seg > 0 then target_seg = player_abs_seg - 1 end
+                        else
+                            target_seg = (player_abs_seg - 1 + 16) % 16
+                        end
+                    else
+                        -- Enemy to the left: move right by one segment
+                        if is_open then
+                            if player_abs_seg < 15 then target_seg = player_abs_seg + 1 end
+                        else
+                            target_seg = (player_abs_seg + 1) % 16
+                        end
+                    end
+                end
             end
-        elseif left_exists and not right_exists then
-            -- Left-only: move right if within safe distance
-            if nl_dist <= SAFE_DISTANCE then
-                target_seg = (nl_seg + 1) % 16
-            else
-                target_seg = player_abs_seg
-            end
-        elseif right_exists and left_exists then
-            -- Both sides: freeze (hold position)
-            target_seg = player_abs_seg
-        else
-            -- No top-rail flippers/pulsars: hold
-            target_seg = player_abs_seg
+            return target_seg, 0, should_fire, false
         end
     end
 
-    -- Firing policy
-    -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within shooting distance (~0.8)
-    -- AND we have ammo available (shot_count < 8)
-    local SHOOT_DIST = 0.80
-    local lane_has_threat = M.check_segment_threat(player_abs_seg, enemies_state)
-    local within_shooting_distance = (min_abs_rel_float <= SHOOT_DIST)
-
-    local should_fire
-    if shot_count >= 8 then
-        -- No ammo available, never fire
-        should_fire = false
-    elseif lane_has_threat or within_shooting_distance then
-        should_fire = true
-    else
-        -- Keep only 5 shots onscreen
-        should_fire = (shot_count < 5)
-    end
-
-    -- Superzap heuristic retained (3+ top-rail enemies)
-    local top_rail_count = 0
-    for i = 1, 7 do
-        local depth = enemies_state.enemy_depths[i]
-        local seg = enemies_state.enemy_abs_segments[i]
-        if depth > 0 and depth <= TOP_RAIL_DEPTH and seg ~= INVALID_SEGMENT then
-            top_rail_count = top_rail_count + 1
-        end
-    end
-    local superzapper_available = (player_state.superzapper_uses or 0) < 2
-    local should_superzap = superzapper_available and (top_rail_count >= 3)
-
-    return target_seg, 0, should_fire, should_superzap
+    -- No top-rail flippers/pulsars detected: hold position, no fire.
+    return player_abs_seg, 0, false, false
 end
 
 -- Function to calculate desired spinner direction and distance to target enemy

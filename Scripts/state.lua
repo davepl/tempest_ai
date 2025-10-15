@@ -266,13 +266,13 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
-                local rel_dist = abs_to_rel_func(player_abs_segment, initial_target_seg_abs, is_open)
+                local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
                 should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
@@ -287,8 +287,55 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
         should_zap = false
     end
 
-    -- Apply panic braking
+    -- Initialize final target to initial before applying overrides below
     local final_target_seg_abs = initial_target_seg_abs
+
+    -- Simplified top-rail behavior: if a top-rail flipper or pulsar is within
+    -- one segment (critical distance), fire and move one segment away from it.
+    do
+        local TOP_RAIL_DEPTH = 0x15
+        local CRITICAL_DISTANCE = 1
+        local nearest_rel = nil
+        local nearest_abs_seg = -1
+        local nearest_abs_dist = 999
+        for i = 1, 7 do
+            local depth = enemies_state.enemy_depths[i]
+            local t = enemies_state.enemy_core_type[i]
+            local seg = enemies_state.enemy_abs_segments[i]
+            if depth > 0 and depth <= TOP_RAIL_DEPTH and seg ~= INVALID_SEGMENT and (t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR) then
+                local rel = abs_to_rel_func(player_abs_seg, seg, is_open)
+                local d = math.abs(rel)
+                if d < nearest_abs_dist then
+                    nearest_abs_dist = d
+                    nearest_abs_seg = seg
+                    nearest_rel = rel
+                end
+            end
+        end
+
+        if nearest_abs_seg ~= -1 and nearest_abs_dist <= CRITICAL_DISTANCE then
+            should_fire = true
+            if nearest_rel ~= nil then
+                if nearest_rel >= 0 then
+                    -- Enemy to the right or aligned: move left by one segment
+                    if is_open then
+                        if player_abs_seg > 0 then final_target_seg_abs = player_abs_seg - 1 end
+                    else
+                        final_target_seg_abs = (player_abs_seg - 1 + 16) % 16
+                    end
+                else
+                    -- Enemy to the left: move right by one segment
+                    if is_open then
+                        if player_abs_seg < 15 then final_target_seg_abs = player_abs_seg + 1 end
+                    else
+                        final_target_seg_abs = (player_abs_seg + 1) % 16
+                    end
+                end
+            end
+        end
+    end
+
+    -- Apply panic braking
     local did_brake = false
     if final_target_seg_abs ~= player_abs_seg and game_state.gamestate == 0x04 then
         local initial_relative_dist = abs_to_rel_func(player_abs_seg, final_target_seg_abs, is_open)
@@ -433,10 +480,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                 if threat_abs_seg ~= INVALID_SEGMENT then
                     local threat_rel_seg = abs_to_rel_func(player_abs_seg, threat_abs_seg, is_open)
                     if math.abs(threat_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
-                        -- Always recommend firing at close threats (unless out of ammo)
-                        if player_state.shot_count < 8 then
-                            should_fire = true
-                        end
+                        should_fire = true
 
                         break -- Found a dangerous close threat, no need to check others
                     end
