@@ -498,7 +498,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
 
         if nearest_abs_seg ~= -1 then
-            local should_fire = (nearest_abs_dist <= TOP_RAIL_CRITICAL_DISTANCE)
+            -- Always fire during normal play for simplicity
+            local should_fire = true
             local target_seg = player_abs_seg
             if nearest_abs_dist <= TOP_RAIL_CRITICAL_DISTANCE then
                 if nearest_rel ~= nil then
@@ -523,8 +524,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
 
-    -- No top-rail flippers/pulsars detected: hold position, no fire.
-    return player_abs_seg, 0, false, false
+    -- No top-rail flippers/pulsars detected: hold position, but still fire for simplicity
+    return player_abs_seg, 0, true, false
 end
 
 -- Function to calculate desired spinner direction and distance to target enemy
