@@ -185,7 +185,9 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'FAFO':>6} {'Xprt':>7} "
         f"{'Rwrd':>7} {'Subj':>7} {'Obj':>7} {'DQN':>7} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
-        f"{'DLoss':>8} {'CLoss':>8} {'BCLoss':>8} {'Agree%':>7} {'SpinAgr%':>8} {'Done%':>6} {'Train%':>6} "
+        f"{'DLoss':>8} {'CLoss':>8} {'BCLoss':>8} {'Agree%':>7} {'SpinAgr%':>8} "
+        f"{'DynX%':>6} {'Gate%':>7} {'BCFilt%':>8} "
+        f"{'Done%':>6} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
         f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>15} {'TgtAge':>7} {'Training Stats':>15}"
     )
@@ -396,6 +398,20 @@ def display_metrics_row(agent, kb_handler):
     agree_pct = agree_avg  # Use interval-averaged agreement instead of snapshot
     done_pct = 100.0 * float(getattr(metrics, 'batch_done_frac', 0.0) or 0.0)
 
+    # High-leverage enhancement diagnostics (format as percentages)
+    try:
+        with metrics.lock:
+            dyn_w = float(getattr(metrics, 'dynamic_expert_weight', 0.0) or 0.0)
+            gate_frac = float(getattr(metrics, 'spinner_gate_frac', 0.0) or 0.0)
+            bc_filt_frac = float(getattr(metrics, 'bc_filtered_frac', 0.0) or 0.0)
+        dyn_w_pct = dyn_w * 100.0
+        gate_pct = gate_frac * 100.0
+        bc_filt_pct = bc_filt_frac * 100.0
+    except Exception:
+        dyn_w_pct = 0.0
+        gate_pct = 0.0
+        bc_filt_pct = 0.0
+
     # Show effective epsilon with OVR marker
     try:
         effective_eps = metrics.get_effective_epsilon()
@@ -426,7 +442,9 @@ def display_metrics_row(agent, kb_handler):
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {eps_display} "
         f"{xprt_display:>7} {rwrd_display:>7} {subj_display:>7} {obj_display:>7} {dqn_display:>7} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
-        f"{d_loss:>8.5f} {c_loss:>8.5f} {bc_loss_avg:>8.5f} {agree_pct:>7.1f} {spinner_agree_avg:>8.1f} {done_pct:>6.1f} {train_pct:>6.1f} "
+        f"{d_loss:>8.5f} {c_loss:>8.5f} {bc_loss_avg:>8.5f} {agree_pct:>7.1f} {spinner_agree_avg:>8.1f} "
+        f"{dyn_w_pct:>6.1f} {gate_pct:>7.1f} {bc_filt_pct:>8.1f} "
+        f"{done_pct:>6.1f} {train_pct:>6.1f} "
         f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{avg_inference_time_ms:>7.2f} "
         f"{samples_per_sec:>9.0f} "

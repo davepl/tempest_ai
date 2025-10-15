@@ -1148,27 +1148,73 @@ class HybridDQNAgent:
                 advantages = advantages.clamp(-3, 3)
                 advantage_weights = torch.exp(advantages * 0.5).clamp(0.1, 5.0)
             
-            continuous_targets = continuous_actions.clone()  # Start with taken actions
-            
-            # SPINNER LEARNING STRATEGY:
-            # After extensive testing, self-imitation on DQN frames causes catastrophic degradation
-            # Root cause: DQN discovers different strategies than expert, self-imitation creates conflict
-            # 
-            # NEW APPROACH: Zero gradient on ALL DQN frames
-            # - Expert frames (50%): Learn expert spinner control (supervised learning)
-            # - DQN frames (50%): Zero gradient (let discrete actions optimize, spinner follows passively)
-            #
-            # Rationale:
-            # 1. DQN reward is increasing (3.2) despite agreement dropping - discovering better strategies
-            # 2. Self-imitation punishes DQN for being different from expert
-            # 3. Network torn between two strategies → catastrophic interference
-            # 4. Better to let DQN optimize discrete actions freely, expert teaches spinner basics
-            #
-            # For expert samples: always use taken actions to learn optimal behavior
-            # For DQN samples: use current prediction (zero gradient, no interference)
-            if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
-                # ALL DQN frames: use prediction as target (zero gradient)
-                continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
+            continuous_targets = continuous_actions.clone()  # Base targets default to taken actions
+
+            # ------------------------------
+            # Expert spinner supervision anneal
+            # ------------------------------
+            try:
+                anneal_frames = float(getattr(RL_CONFIG, 'continuous_expert_weight_frames', 1_000_000) or 1_000_000)
+                w_start = float(getattr(RL_CONFIG, 'continuous_expert_weight_start', 1.0) or 1.0)
+                w_final = float(getattr(RL_CONFIG, 'continuous_expert_weight_final', 0.5) or 0.5)
+                fc = float(getattr(metrics, 'frame_count', 0))
+                if anneal_frames > 0:
+                    prog = min(1.0, fc / anneal_frames)
+                    expert_w = w_start + (w_final - w_start) * prog
+                else:
+                    expert_w = w_final
+                metrics.dynamic_expert_weight = float(expert_w)
+            except Exception:
+                expert_w = 1.0
+
+            # Apply annealed scaling to expert spinner targets (moves them toward network prediction if annealed down)
+            if 'torch_mask_exp' in locals() and torch_mask_exp.any():
+                try:
+                    # Blend expert action toward current prediction as expert weight anneals down
+                    exp_idx = torch_mask_exp
+                    blended = (expert_w * continuous_actions[exp_idx]) + ((1.0 - expert_w) * continuous_pred[exp_idx])
+                    continuous_targets[exp_idx] = blended
+                except Exception:
+                    pass
+
+            # ------------------------------
+            # Selective DQN spinner self-imitation via advantage gating
+            # ------------------------------
+            try:
+                gate_sigma = float(getattr(RL_CONFIG, 'continuous_gate_sigma', 0.5) or 0.5)
+                enable_self = bool(getattr(RL_CONFIG, 'continuous_self_imitation', True))
+            except Exception:
+                gate_sigma = 0.5
+                enable_self = True
+            gated_frac = 0.0
+            if enable_self and 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
+                try:
+                    # Recompute DQN rewards subset stats (already done above but reuse)
+                    dqn_rewards = rewards[torch_mask_dqn]            # shape: (n_dqn, 1)
+                    dqn_mean = dqn_rewards.mean()
+                    dqn_std = dqn_rewards.std() + 1e-8
+                    # Standardized advantage; flatten to 1D for boolean indexing
+                    dqn_adv = ((dqn_rewards - dqn_mean) / dqn_std).view(-1)  # shape: (n_dqn,)
+                    good_mask = (dqn_adv >= gate_sigma)                      # shape: (n_dqn,)
+                    # Map back to original batch indices
+                    idx_dqn = torch_mask_dqn.nonzero(as_tuple=False).view(-1) # shape: (n_dqn,)
+                    if good_mask.any():
+                        idx_good = idx_dqn[good_mask]
+                        continuous_targets[idx_good] = continuous_actions[idx_good]  # keep imitation on good samples
+                    # For non-good DQN frames: zero gradient by using prediction as target
+                    idx_bad = idx_dqn[~good_mask]
+                    if idx_bad.numel() > 0:
+                        continuous_targets[idx_bad] = continuous_pred[idx_bad]
+                    # Fraction of DQN samples that passed the gate
+                    gated_frac = float(good_mask.float().mean().item()) if good_mask.numel() > 0 else 0.0
+                except Exception:
+                    # Fallback: zero gradient all DQN frames when any error occurs
+                    continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
+            else:
+                if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
+                    # Self-imitation disabled: zero gradient
+                    continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
+            metrics.spinner_gate_frac = float(gated_frac)
         target_time = time.time() - target_start
 
         # Losses
@@ -1191,14 +1237,32 @@ class HybridDQNAgent:
         # Uses cross-entropy on softmax(Q-values) to teach: "choose the same action as expert"
         bc_loss = torch.tensor(0.0, device=device)
         if bool(getattr(RL_CONFIG, 'use_behavioral_cloning', False)) and 'torch_mask_exp' in locals() and n_expert > 0:
-            # Get Q-values for expert frames only
-            expert_q_values = discrete_q_pred[torch_mask_exp]  # Shape: (n_expert, 4)
-            expert_actions = discrete_actions[torch_mask_exp]  # Shape: (n_expert, 1)
-            
-            # Cross-entropy loss: log_softmax(Q) vs one-hot(expert_action)
-            # This directly teaches: "when expert chose action A, you should choose action A"
-            log_probs = F.log_softmax(expert_q_values, dim=1)  # Convert Q-values to log-probabilities
-            bc_loss = F.nll_loss(log_probs, expert_actions.squeeze(1))  # Negative log-likelihood
+            expert_q_values = discrete_q_pred[torch_mask_exp]
+            expert_actions = discrete_actions[torch_mask_exp]
+            log_probs = F.log_softmax(expert_q_values, dim=1)
+            # Optional Q-filter: skip BC on samples where Q(expert_action) is not better than greedy Q by margin
+            try:
+                margin = float(getattr(RL_CONFIG, 'bc_q_filter_margin', 0.0) or 0.0)
+            except Exception:
+                margin = 0.0
+            if margin > 0:
+                with torch.no_grad():
+                    # Selected expert action Q
+                    q_sel = expert_q_values.gather(1, expert_actions)
+                    # Greedy action Q
+                    q_greedy, greedy_idx = expert_q_values.max(dim=1, keepdim=True)
+                    # Keep BC only if expert action within margin of greedy (for positive margin, require q_sel >= q_greedy - margin)
+                    keep_mask = (q_sel >= (q_greedy - margin)).view(-1)
+                metrics.bc_filtered_frac = 1.0 - float(keep_mask.float().mean().item()) if keep_mask.numel() > 0 else 0.0
+                if keep_mask.any():
+                    log_probs_kept = log_probs[keep_mask]
+                    actions_kept = expert_actions[keep_mask]
+                    bc_loss = F.nll_loss(log_probs_kept, actions_kept.squeeze(1))
+                else:
+                    bc_loss = torch.tensor(0.0, device=device)
+            else:
+                metrics.bc_filtered_frac = 0.0
+                bc_loss = F.nll_loss(log_probs, expert_actions.squeeze(1))
         
         # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
         # REDUCED SCALING: exp(adv * 0.5) with 5x max weight (was 1.5 * 100x causing instability!)
@@ -1372,6 +1436,33 @@ class HybridDQNAgent:
         # Gradient clipping for stability (CRITICAL: prevents gradient explosions)
         max_norm = 10.0
         torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
+
+        # Adaptive continuous loss weight scaling (post-backward, prior to optimizer step)
+        try:
+            if bool(getattr(RL_CONFIG, 'adaptive_continuous_loss', False)):
+                # Estimate continuous head gradient norm
+                cont_head_norm = 0.0
+                for name, p in self.qnetwork_local.named_parameters():
+                    if name.startswith('continuous_') and p.grad is not None:
+                        gn = p.grad.data.norm(2).item()
+                        cont_head_norm += gn * gn
+                cont_head_norm = cont_head_norm ** 0.5
+                low = float(getattr(RL_CONFIG, 'adaptive_cont_grad_low', 0.05) or 0.05)
+                high = float(getattr(RL_CONFIG, 'adaptive_cont_grad_high', 0.50) or 0.50)
+                w_up = float(getattr(RL_CONFIG, 'adaptive_cont_scale_up', 1.10) or 1.10)
+                w_dn = float(getattr(RL_CONFIG, 'adaptive_cont_scale_dn', 0.95) or 0.95)
+                w_min = float(getattr(RL_CONFIG, 'continuous_loss_weight_min', 0.25) or 0.25)
+                w_max = float(getattr(RL_CONFIG, 'continuous_loss_weight_max', 3.0) or 3.0)
+                current_w = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
+                new_w = current_w
+                if cont_head_norm < low:
+                    new_w = min(w_max, current_w * w_up)
+                elif cont_head_norm > high:
+                    new_w = max(w_min, current_w * w_dn)
+                if new_w != current_w:
+                    RL_CONFIG.continuous_loss_weight = float(new_w)
+        except Exception:
+            pass
         
         # Compute gradient norm AFTER clipping to measure clip effect
         clipped_grad_norm = 0.0
