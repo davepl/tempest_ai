@@ -185,11 +185,10 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>6} {'FAFO':>6} {'Xprt':>7} "
         f"{'Rwrd':>7} {'Subj':>7} {'Obj':>7} {'DQN':>7} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
-        f"{'DLoss':>8} {'CLoss':>8} {'BCLoss':>8} {'Agree%':>7} {'SpinAgr%':>8} "
-        f"{'DynX%':>6} {'Gate%':>7} {'BCFilt%':>8} "
-        f"{'Done%':>6} {'Train%':>6} "
+        f"{'DLoss':>8} {'CLoss':>8} {'Agree%':>7} {'SpinAgr%':>9} "
+        f"{'AvgEpLen':>8} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
-        f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Value Range':>15} {'TgtAge':>7} {'Training Stats':>15}"
+        f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Range':>12} {'Stats':>18}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -267,7 +266,6 @@ def display_metrics_row(agent, kb_handler):
     loss_avg = latest_loss
     d_loss_avg = float(getattr(metrics, 'last_d_loss', 0.0) or 0.0)
     c_loss_avg = float(getattr(metrics, 'last_c_loss', 0.0) or 0.0)
-    bc_loss_avg = float(getattr(metrics, 'last_bc_loss', 0.0) or 0.0)
     avg_inference_time_ms = 0.0
     steps_per_sec = 0.0
     samples_per_sec = 0.0
@@ -288,8 +286,6 @@ def display_metrics_row(agent, kb_handler):
                 d_loss_avg = metrics.d_loss_sum_interval / max(metrics.d_loss_count_interval, 1)
             if getattr(metrics, 'c_loss_count_interval', 0) > 0:
                 c_loss_avg = metrics.c_loss_sum_interval / max(metrics.c_loss_count_interval, 1)
-            if getattr(metrics, 'bc_loss_count_interval', 0) > 0:
-                bc_loss_avg = metrics.bc_loss_sum_interval / max(metrics.bc_loss_count_interval, 1)
         except Exception:
             pass
         # Average agreement since last row and reset
@@ -307,8 +303,6 @@ def display_metrics_row(agent, kb_handler):
         metrics.d_loss_count_interval = 0
         metrics.c_loss_sum_interval = 0.0
         metrics.c_loss_count_interval = 0
-        metrics.bc_loss_sum_interval = 0.0
-        metrics.bc_loss_count_interval = 0
         metrics.agree_sum_interval = 0.0
         metrics.agree_count_interval = 0
         metrics.spinner_agree_sum_interval = 0.0
@@ -378,9 +372,22 @@ def display_metrics_row(agent, kb_handler):
     # Calculate training steps since last target update
     steps_since_target_update = metrics.total_training_steps - getattr(metrics, 'last_target_update_step', 0)
     
-    # Format training stats: MemK/Steps/StepsPer1kF/TargetAge
+    # Format training stats: MemK/Steps/High%/Regular%
     mem_k = getattr(metrics, 'memory_buffer_size', 0) // 1000
-    training_stats = f"{mem_k}k/{metrics.total_training_steps}/{steps_per_1k_frames:.1f}/{steps_since_target_update}"
+    
+    # Get partition stats if agent is available
+    high_reward_fill_pct = 0.0
+    regular_fill_pct = 0.0
+    if agent and hasattr(agent, 'memory') and hasattr(agent.memory, 'get_partition_stats'):
+        try:
+            pstats = agent.memory.get_partition_stats()
+            high_reward_fill_pct = (pstats['high_reward'] / max(pstats['high_reward_capacity'], 1)) * 100
+            regular_fill_pct = (pstats['regular'] / max(pstats['regular_capacity'], 1)) * 100
+        except Exception:
+            high_reward_fill_pct = 0.0
+            regular_fill_pct = 0.0
+    
+    training_stats = f"{mem_k}k/{metrics.total_training_steps}/{high_reward_fill_pct:.0f}%/{regular_fill_pct:.0f}%"
 
     # Get Q-value range from the agent
     q_range = "N/A"
@@ -388,7 +395,7 @@ def display_metrics_row(agent, kb_handler):
         try:
             min_q, max_q = agent.get_q_value_range()
             if not (np.isnan(min_q) or np.isnan(max_q)):
-                q_range = f"[{min_q:.2f}, {max_q:.2f}]"
+                q_range = f"[{min_q:.1f},{max_q:.1f}]"
         except Exception:
             q_range = "Error"
 
@@ -396,21 +403,15 @@ def display_metrics_row(agent, kb_handler):
     d_loss = d_loss_avg
     c_loss = c_loss_avg
     agree_pct = agree_avg  # Use interval-averaged agreement instead of snapshot
-    done_pct = 100.0 * float(getattr(metrics, 'batch_done_frac', 0.0) or 0.0)
-
-    # High-leverage enhancement diagnostics (format as percentages)
-    try:
-        with metrics.lock:
-            dyn_w = float(getattr(metrics, 'dynamic_expert_weight', 0.0) or 0.0)
-            gate_frac = float(getattr(metrics, 'spinner_gate_frac', 0.0) or 0.0)
-            bc_filt_frac = float(getattr(metrics, 'bc_filtered_frac', 0.0) or 0.0)
-        dyn_w_pct = dyn_w * 100.0
-        gate_pct = gate_frac * 100.0
-        bc_filt_pct = bc_filt_frac * 100.0
-    except Exception:
-        dyn_w_pct = 0.0
-        gate_pct = 0.0
-        bc_filt_pct = 0.0
+    
+    # Calculate average episode length since last metrics print
+    avg_episode_length = 0.0
+    with metrics.lock:
+        if getattr(metrics, 'episode_length_count_interval', 0) > 0:
+            avg_episode_length = metrics.episode_length_sum_interval / max(metrics.episode_length_count_interval, 1)
+        # Reset interval counters
+        metrics.episode_length_sum_interval = 0
+        metrics.episode_length_count_interval = 0
 
     # Show effective epsilon with OVR marker
     try:
@@ -442,16 +443,15 @@ def display_metrics_row(agent, kb_handler):
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {eps_display} "
         f"{xprt_display:>7} {rwrd_display:>7} {subj_display:>7} {obj_display:>7} {dqn_display:>7} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
-        f"{d_loss:>8.5f} {c_loss:>8.5f} {bc_loss_avg:>8.5f} {agree_pct:>7.1f} {spinner_agree_avg:>8.1f} "
-        f"{dyn_w_pct:>6.1f} {gate_pct:>7.1f} {bc_filt_pct:>8.1f} "
-        f"{done_pct:>6.1f} {train_pct:>6.1f} "
+        f"{d_loss:>8.5f} {c_loss:>8.5f} {agree_pct*100:>6.1f}% {spinner_agree_avg*100:>7.1f}% "
+        f"{avg_episode_length:>8.1f} {train_pct:>6.1f} "
         f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{avg_inference_time_ms:>7.2f} "
         f"{samples_per_sec:>9.0f} "
         f"{steps_per_sec:>8.1f} "
         f"{metrics.last_grad_norm:>8.3f} "
         f"{metrics.last_clip_delta:>6.3f} "
-        f"{q_range:>15} {steps_since_target_update:>7} {training_stats:>15}"
+        f"{q_range:>12} {training_stats:>18}"
     )
     
     print_metrics_line(row)

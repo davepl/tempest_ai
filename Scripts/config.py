@@ -85,9 +85,9 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 2048                # Reduced from 8192 for faster sampling
-    lr: float = 0.00025                    # Atari DQN learning rate was 0.00025
+    lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
-    n_step: int = 1                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
+    n_step: int = 3                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
     epsilon: float = 0.05                  # Current exploration rate
     epsilon_start: float = 0.05            # Start with moderate exploration
@@ -106,8 +106,8 @@ class RLConfigData:
     memory_size: int = 2000000             # Balanced buffer size (was 4000000)
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
-    target_update_freq: int = 100                # Target network update frequency (steps) - reduced from 200 to stabilize Q-values with BC loss
-    update_target_every: int = 100         # Keep in sync with target_update_freq
+    target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
+    update_target_every: int = 1000        # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
         
     # Single-threaded training
@@ -122,6 +122,7 @@ class RLConfigData:
 
     obj_reward_scale: float = 0.001             # 1 reward = 1000 points
     subj_reward_scale: float = 0.0007       # subjective are scaled to 70% of objective
+    ignore_subjective_rewards: bool = True
 
     # Diagnostics
     grad_diag_interval: int = 0           # Every N training steps, sample per-head gradient contributions (0=off)
@@ -132,15 +133,16 @@ class RLConfigData:
     spinner_only_expert_only: bool = False
 
     # Loss weighting (makes contributions explicit and tunable)
-    continuous_loss_weight: float = 10.0   # Weight applied to continuous (spinner) loss
-    discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss - increased to match continuous
+    continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
+    discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss - BALANCED with continuous
+    discrete_bc_weight: float = 0.5       # Weight for discrete behavioral cloning loss - REDUCED to allow Q-learning to dominate at low expert ratios
     # High-leverage continuous/expert tuning additions
     continuous_expert_weight_start: float = 1.0   # Initial per-sample weight multiplier for expert spinner supervision
     continuous_expert_weight_final: float = 0.08  # Final annealed expert spinner supervision weight
-    continuous_expert_weight_frames: int = 2_000_000  # Frames over which to anneal expert spinner weight
+    continuous_expert_weight_frames: int = 0  # DISABLED: Complex annealing removed in simplified training.py
     continuous_gate_sigma: float = 0.20    # Advantage (standardized reward) threshold for allowing DQN spinner self-imitation
     continuous_self_imitation: bool = True  # Enable selective self-imitation for spinner on high-advantage DQN frames
-    bc_q_filter_margin: float = 0.40        # Q-filter margin for behavioral cloning (0 disables filtering)
+    bc_q_filter_margin: float = 0.0        # Q-filter margin for behavioral cloning (0 disables filtering)
     adaptive_continuous_loss: bool = False # Enable adaptive scaling of continuous_loss_weight based on gradient norms
     adaptive_cont_grad_low: float = 0.05   # If continuous head grad norm below this, scale weight up
     adaptive_cont_grad_high: float = 0.50  # If above this, optionally scale weight down
@@ -150,14 +152,15 @@ class RLConfigData:
     continuous_loss_weight_max: float = 3.0   # Clamp bounds for adaptive scaling
     
     # Behavioral cloning for expert frames (imitation learning)
-    use_behavioral_cloning: bool = True   # Add BC loss for expert frames to teach action selection
-    bc_loss_weight: float = 0.2           # Weight for behavioral cloning loss (relative to Q-learning loss)
+    use_behavioral_cloning: bool = False   # DISABLED: BC loss removed in simplified training.py
+    bc_loss_weight: float = 0.0           # Weight for behavioral cloning loss (relative to Q-learning loss)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 1500.0   # CRITICAL FIX: Prevent Q-value explosion from unbounded targets
+    td_target_clip: float | None = 100.0    # EMERGENCY FIX: Drastically reduced from 1500 to prevent Q-explosion
+    max_q_value: float = 10.0               # EMERGENCY FIX: Drastically reduced from 50 to prevent overestimation spiral
   
     # Replay sampling optimization flags
     # --- Replay Sampling Optimization ---
@@ -186,7 +189,9 @@ class RLConfigData:
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob
     # This forces strategic zap usage rather than spamming
-    enable_superzap_gate: bool = True
+    # DISABLED FOR TRAINING: Causes 67% action mismatch (model predicts zaps, gate blocks them)
+    # Re-enable for evaluation/competition once model is trained
+    enable_superzap_gate: bool = False  # Was True - disabled to fix agreement < 25% issue
     superzap_prob: float = 0.01  # 1% success rate for zap attempts
 
 # Create instance of RLConfigData after its definition
@@ -234,10 +239,10 @@ class MetricsData:
     c_loss_count_interval: int = 0
     bc_loss_sum_interval: float = 0.0
     bc_loss_count_interval: int = 0
-    # Agreement averaging since last metrics print
+    # Agreement averaging since last metrics print (DQN actions only)
     agree_sum_interval: float = 0.0
     agree_count_interval: int = 0
-    # Spinner (continuous) agreement averaging since last metrics print
+    # Spinner (continuous) agreement averaging since last metrics print (DQN actions only)
     spinner_agree_sum_interval: float = 0.0
     spinner_agree_count_interval: int = 0
     # Training steps since last metrics print and when last row printed
@@ -250,6 +255,10 @@ class MetricsData:
     last_metrics_row_time: float = 0.0
     # Frames since last metrics print
     frames_count_interval: int = 0
+    
+    # Episode length tracking (for AvgEpLen column instead of Done%)
+    episode_length_sum_interval: int = 0   # Sum of episode lengths since last metrics print
+    episode_length_count_interval: int = 0 # Number of episodes completed since last metrics print
     
     # Training-specific metrics
     memory_buffer_size: int = 0  # Current replay buffer size
@@ -444,7 +453,7 @@ class MetricsData:
             decay_expert_ratio(self.frame_count)
             return self.expert_ratio
     
-    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None):
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None, episode_length=0):
         """Add episode rewards to tracking (include negatives/zeros for accurate means)"""
         with self.lock:
             self.episode_rewards.append(float(total_reward))
@@ -469,6 +478,10 @@ class MetricsData:
                 if obj_reward is not None:
                     self.reward_sum_interval_obj += float(obj_reward)
                     self.reward_count_interval_obj += 1
+                # Track episode length
+                if episode_length > 0:
+                    self.episode_length_sum_interval += episode_length
+                    self.episode_length_count_interval += 1
             except Exception:
                 pass
     

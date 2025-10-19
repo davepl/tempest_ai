@@ -123,6 +123,7 @@ try:
         RLConfigData,
         RESET_METRICS,
     )
+    from training import train_step
 except ImportError:
     from Scripts.config import (
         SERVER_CONFIG,
@@ -134,6 +135,7 @@ except ImportError:
         RLConfigData,
         RESET_METRICS,
     )
+    from Scripts.training import train_step
 
 # Expose module under short name for compatibility with legacy imports/tests
 sys.modules.setdefault('aimodel', sys.modules[__name__])
@@ -314,6 +316,12 @@ class HybridDQN(nn.Module):
         for i in range(1, num_layers):
             self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
         
+        # Initialize shared trunk with xavier to ensure good gradient flow
+        for layer in self.shared_layers:
+            if isinstance(layer, nn.Linear):
+                torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
+                torch.nn.init.constant_(layer.bias, 0.0)
+        
         # Final layer size for heads
         shared_output_size = layer_sizes[-1]
         head_size = max(64, shared_output_size // 2)  # Head layer size
@@ -329,8 +337,16 @@ class HybridDQN(nn.Module):
         self.continuous_fc2 = nn.Linear(head_size, continuous_head_size)
         self.continuous_out = nn.Linear(continuous_head_size, 1)
         
+        # Initialize discrete head with balanced initialization to prevent action bias
+        # CRITICAL: Without this, default initialization creates strong bias (e.g., 93% action 3)
+        # Strategy: Use small random weights to allow gradient flow while maintaining initial balance
+        torch.nn.init.xavier_uniform_(self.discrete_fc.weight, gain=1.0)
+        torch.nn.init.constant_(self.discrete_fc.bias, 0.0)
+        # Output layer: Small random initialization for gradient flow with minimal bias
+        torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
+        torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
+        
         # Initialize continuous head with smaller weights for stable training
-        # BUGBUG what does this do?  Do we still need or want it?
         torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
         torch.nn.init.constant_(self.continuous_out.bias, 0.0)
     
@@ -991,7 +1007,7 @@ class HybridDQNAgent:
                 for _ in range(steps_per_req):
                     # Acquire training lock to prevent concurrent model/optimizer access
                     with self.training_lock:
-                        loss_val = self.train_step()
+                        loss_val = train_step(self)
                         did_train = (loss_val is not None)
                         # Count only real optimizer updates, not skipped/no-op passes
                         if did_train:
@@ -1013,658 +1029,6 @@ class HybridDQNAgent:
                 import traceback; traceback.print_exc()
                 time.sleep(0.01)
     
-    def train_step(self):
-        """Perform one optimizer update."""
-        import time
-        start_time = time.time()
-        
-        # Global gate
-        if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
-            return None
-        # Post-load burn-in: require some fresh frames after loading before training
-        try:
-            loaded_fc = int(getattr(metrics, 'loaded_frame_count', 0) or 0)
-            require_new = int(getattr(RL_CONFIG, 'min_new_frames_after_load_to_train', 0) or 0)
-            if loaded_fc > 0 and (metrics.frame_count - loaded_fc) < require_new:
-                return None
-        except Exception:
-            pass
-
-        # Require at least one batch worth of data
-        if len(self.memory) < self.batch_size:
-            return None
-
-        # Sample batch
-        batch_start = time.time()
-        batch = self.memory.sample(self.batch_size)
-        if batch is None:
-            return None
-
-        states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
-        batch_time = time.time() - batch_start
-
-        # Compute batch actor composition for diagnostics
-        try:
-            actor_dqn_mask = np.array([a == 'dqn' for a in actors], dtype=bool)
-            actor_expert_mask = np.array([a == 'expert' for a in actors], dtype=bool)
-            n_dqn = actor_dqn_mask.sum()
-            n_expert = actor_expert_mask.sum()
-            frac_dqn = n_dqn / len(actors) if len(actors) > 0 else 0.0
-            
-            # Store batch composition metrics
-            metrics.batch_frac_dqn = float(frac_dqn)
-            metrics.batch_n_dqn = int(n_dqn)
-            metrics.batch_n_expert = int(n_expert)
-            
-            # Log batch composition every 100 training steps (disabled for normal operation)
-            #if self.training_steps > 0 and self.training_steps % 100 == 0:
-            #    print(f"[BATCH] Step {self.training_steps}: {n_dqn} DQN ({frac_dqn*100:.1f}%) / {n_expert} expert ({(1-frac_dqn)*100:.1f}%)")
-        except Exception:
-            actor_dqn_mask = None
-            actor_expert_mask = None
-            pass
-
-        # Forward pass
-        forward_start = time.time()
-        discrete_q_pred, continuous_pred = self.qnetwork_local(states)
-        discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
-        forward_time = time.time() - forward_start
-
-        # Target computation using DOUBLE DQN to prevent Q-value overestimation
-        # Vanilla DQN: target = r + γ * max_a' Q_target(s',a')  ← Maximization bias!
-        # Double DQN: target = r + γ * Q_target(s', argmax_a' Q_local(s',a'))  ← Debiased!
-        target_start = time.time()
-        with torch.no_grad():
-            # Use LOCAL network to SELECT best action (argmax)
-            next_q_local, _ = self.qnetwork_local(next_states)
-            best_actions = next_q_local.max(1)[1].unsqueeze(1)  # argmax over actions
-            
-            # Use TARGET network to EVALUATE that action
-            next_q_target, _ = self.qnetwork_target(next_states)
-            discrete_q_next_max = next_q_target.gather(1, best_actions)  # Q_target(s', a*) where a* = argmax Q_local
-            # If horizons>1 (n-step return), apply gamma^h to the bootstrap term
-            # CRITICAL FIX: horizons is a tensor (batch_size, 1), need element-wise power
-            gamma_h = torch.pow(self.gamma, horizons.float())  # gamma^h for each sample
-            discrete_targets = rewards + (gamma_h * discrete_q_next_max * (1 - dones))
-            # Optional safety: clip TD targets to avoid runaway value scales
-            td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
-            if td_clip is not None:
-                try:
-                    lo, hi = (-float(td_clip), float(td_clip)) if isinstance(td_clip, (int, float)) else td_clip
-                    discrete_targets = discrete_targets.clamp(min=float(lo), max=float(hi))
-                except Exception:
-                    pass
-            
-            # ADVANTAGE-WEIGHTED POLICY GRADIENT for continuous actions
-            # KEY FIX: Compute advantages SEPARATELY per actor type to avoid cross-contamination
-            # If we compute advantages across mixed expert+DQN batch, expert's high rewards
-            # make DQN's lower rewards look bad, suppressing DQN learning!
-            
-            # CRITICAL FIX: Reduced advantage scaling from 1.5 → 0.5 to prevent extreme weights
-            # Was: exp(adv * 1.5) with 90x max weight causing loss instability
-            # Now: exp(adv * 0.5) with ~4.5x max weight for stable learning
-            
-            advantage_weights = torch.ones_like(rewards)
-            
-            try:
-                if actor_dqn_mask is not None and actor_expert_mask is not None:
-                    # Convert numpy masks to torch boolean masks on the same device for indexing
-                    torch_mask_dqn = torch.from_numpy(actor_dqn_mask).to(device=rewards.device, dtype=torch.bool).view(-1)
-                    torch_mask_exp = torch.from_numpy(actor_expert_mask).to(device=rewards.device, dtype=torch.bool).view(-1)
-
-                    # DQN advantages: compare DQN frames to OTHER DQN frames
-                    if n_dqn > 1:
-                        dqn_rewards = rewards[torch_mask_dqn]
-                        dqn_mean = dqn_rewards.mean()
-                        dqn_std = dqn_rewards.std() + 1e-8
-                        dqn_advantages = (dqn_rewards - dqn_mean) / dqn_std
-                        dqn_advantages = dqn_advantages.clamp(-3, 3)
-                        # Reduced scaling: 0.5 instead of 1.5 (was causing 90x weights!)
-                        dqn_weights = torch.exp(dqn_advantages * 0.5).clamp(0.1, 5.0)
-                        advantage_weights[torch_mask_dqn] = dqn_weights
-                    
-                    # Expert advantages: compare expert frames to OTHER expert frames
-                    if n_expert > 1:
-                        exp_rewards = rewards[torch_mask_exp]
-                        exp_mean = exp_rewards.mean()
-                        exp_std = exp_rewards.std() + 1e-8
-                        exp_advantages = (exp_rewards - exp_mean) / exp_std
-                        exp_advantages = exp_advantages.clamp(-3, 3)
-                        # Reduced scaling: 0.5 instead of 1.5
-                        exp_weights = torch.exp(exp_advantages * 0.5).clamp(0.1, 5.0)
-                        advantage_weights[torch_mask_exp] = exp_weights
-                else:
-                    # Fallback: compute advantages across full batch (old behavior)
-                    reward_mean = rewards.mean()
-                    reward_std = rewards.std() + 1e-8
-                    advantages = (rewards - reward_mean) / reward_std
-                    advantages = advantages.clamp(-3, 3)
-                    advantage_weights = torch.exp(advantages * 0.5).clamp(0.1, 5.0)
-            except Exception:
-                # Fallback: compute advantages across full batch
-                reward_mean = rewards.mean()
-                reward_std = rewards.std() + 1e-8
-                advantages = (rewards - reward_mean) / reward_std
-                advantages = advantages.clamp(-3, 3)
-                advantage_weights = torch.exp(advantages * 0.5).clamp(0.1, 5.0)
-            
-            continuous_targets = continuous_actions.clone()  # Base targets default to taken actions
-
-            # ------------------------------
-            # Expert spinner supervision anneal
-            # ------------------------------
-            try:
-                anneal_frames = float(getattr(RL_CONFIG, 'continuous_expert_weight_frames', 1_000_000) or 1_000_000)
-                w_start = float(getattr(RL_CONFIG, 'continuous_expert_weight_start', 1.0) or 1.0)
-                w_final = float(getattr(RL_CONFIG, 'continuous_expert_weight_final', 0.5) or 0.5)
-                fc = float(getattr(metrics, 'frame_count', 0))
-                if anneal_frames > 0:
-                    prog = min(1.0, fc / anneal_frames)
-                    expert_w = w_start + (w_final - w_start) * prog
-                else:
-                    expert_w = w_final
-                metrics.dynamic_expert_weight = float(expert_w)
-            except Exception:
-                expert_w = 1.0
-
-            # Apply annealed scaling to expert spinner targets (moves them toward network prediction if annealed down)
-            if 'torch_mask_exp' in locals() and torch_mask_exp.any():
-                try:
-                    # Blend expert action toward current prediction as expert weight anneals down
-                    exp_idx = torch_mask_exp
-                    blended = (expert_w * continuous_actions[exp_idx]) + ((1.0 - expert_w) * continuous_pred[exp_idx])
-                    continuous_targets[exp_idx] = blended
-                except Exception:
-                    pass
-
-            # ------------------------------
-            # Selective DQN spinner self-imitation via advantage gating
-            # ------------------------------
-            try:
-                gate_sigma = float(getattr(RL_CONFIG, 'continuous_gate_sigma', 0.5) or 0.5)
-                enable_self = bool(getattr(RL_CONFIG, 'continuous_self_imitation', True))
-            except Exception:
-                gate_sigma = 0.5
-                enable_self = True
-            gated_frac = 0.0
-            if enable_self and 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
-                try:
-                    # Recompute DQN rewards subset stats (already done above but reuse)
-                    dqn_rewards = rewards[torch_mask_dqn]            # shape: (n_dqn, 1)
-                    dqn_mean = dqn_rewards.mean()
-                    dqn_std = dqn_rewards.std() + 1e-8
-                    # Standardized advantage; flatten to 1D for boolean indexing
-                    dqn_adv = ((dqn_rewards - dqn_mean) / dqn_std).view(-1)  # shape: (n_dqn,)
-                    good_mask = (dqn_adv >= gate_sigma)                      # shape: (n_dqn,)
-                    # Map back to original batch indices
-                    idx_dqn = torch_mask_dqn.nonzero(as_tuple=False).view(-1) # shape: (n_dqn,)
-                    if good_mask.any():
-                        idx_good = idx_dqn[good_mask]
-                        continuous_targets[idx_good] = continuous_actions[idx_good]  # keep imitation on good samples
-                    # For non-good DQN frames: zero gradient by using prediction as target
-                    idx_bad = idx_dqn[~good_mask]
-                    if idx_bad.numel() > 0:
-                        continuous_targets[idx_bad] = continuous_pred[idx_bad]
-                    # Fraction of DQN samples that passed the gate
-                    gated_frac = float(good_mask.float().mean().item()) if good_mask.numel() > 0 else 0.0
-                except Exception:
-                    # Fallback: zero gradient all DQN frames when any error occurs
-                    continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
-            else:
-                if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
-                    # Self-imitation disabled: zero gradient
-                    continuous_targets[torch_mask_dqn] = continuous_pred[torch_mask_dqn]
-            metrics.spinner_gate_frac = float(gated_frac)
-        target_time = time.time() - target_start
-
-        # Losses
-        loss_start = time.time()
-        w_cont = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
-        w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
-        w_bc = float(getattr(RL_CONFIG, 'bc_loss_weight', 1.0) or 1.0)
-
-        # Optionally restrict discrete loss to expert frames only
-        if bool(getattr(RL_CONFIG, 'discrete_expert_only', False)) and 'torch_mask_exp' in locals() and torch_mask_exp.any():
-            d_loss_raw = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none')
-            d_mask = torch_mask_exp.view(-1, 1).float()
-            denom = d_mask.mean().clamp(min=1e-6)
-            d_loss = (d_loss_raw * d_mask).sum() / (d_loss_raw.numel() * denom.item())
-        else:
-            d_loss = F.huber_loss(discrete_q_selected, discrete_targets, reduction='mean')
-        
-        # BEHAVIORAL CLONING LOSS for expert frames
-        # Teaches the network to directly imitate expert action choices (not just Q-values)
-        # Uses cross-entropy on softmax(Q-values) to teach: "choose the same action as expert"
-        bc_loss = torch.tensor(0.0, device=device)
-        if bool(getattr(RL_CONFIG, 'use_behavioral_cloning', False)) and 'torch_mask_exp' in locals() and n_expert > 0:
-            expert_q_values = discrete_q_pred[torch_mask_exp]
-            expert_actions = discrete_actions[torch_mask_exp]
-            log_probs = F.log_softmax(expert_q_values, dim=1)
-            # Optional Q-filter: skip BC on samples where Q(expert_action) is not better than greedy Q by margin
-            try:
-                margin = float(getattr(RL_CONFIG, 'bc_q_filter_margin', 0.0) or 0.0)
-            except Exception:
-                margin = 0.0
-            if margin > 0:
-                with torch.no_grad():
-                    # Selected expert action Q
-                    q_sel = expert_q_values.gather(1, expert_actions)
-                    # Greedy action Q
-                    q_greedy, greedy_idx = expert_q_values.max(dim=1, keepdim=True)
-                    # Keep BC only if expert action within margin of greedy (for positive margin, require q_sel >= q_greedy - margin)
-                    keep_mask = (q_sel >= (q_greedy - margin)).view(-1)
-                metrics.bc_filtered_frac = 1.0 - float(keep_mask.float().mean().item()) if keep_mask.numel() > 0 else 0.0
-                if keep_mask.any():
-                    log_probs_kept = log_probs[keep_mask]
-                    actions_kept = expert_actions[keep_mask]
-                    bc_loss = F.nll_loss(log_probs_kept, actions_kept.squeeze(1))
-                else:
-                    bc_loss = torch.tensor(0.0, device=device)
-            else:
-                metrics.bc_filtered_frac = 0.0
-                bc_loss = F.nll_loss(log_probs, expert_actions.squeeze(1))
-        
-        # Continuous loss: ADVANTAGE-WEIGHTED to amplify learning from good experiences
-        # REDUCED SCALING: exp(adv * 0.5) with 5x max weight (was 1.5 * 100x causing instability!)
-        # High reward (+1.5σ) → 2.1x gradient strength → moderate boost
-        # Average reward (0σ) → 1.0x gradient → normal learning
-        # Low reward (-1.5σ) → 0.47x gradient → slight reduction
-        # This prevents overfitting to rare high-reward frames while still biasing toward quality
-
-        c_loss_raw = F.mse_loss(continuous_pred, continuous_targets, reduction='none')
-        c_loss = (c_loss_raw * advantage_weights).mean()
-        
-        # In spinner-only mode, ignore discrete loss entirely
-        if getattr(RL_CONFIG, 'spinner_only', False):
-            total_loss = w_cont * c_loss
-        else:
-            # Combine Q-learning loss, behavioral cloning loss, and continuous loss
-            total_loss = (w_disc * d_loss) + (w_bc * bc_loss) + (w_cont * c_loss)
-        loss_time = time.time() - loss_start
-
-        # Compute per-actor metrics for diagnostics
-        try:
-            if actor_dqn_mask is not None and actor_expert_mask is not None:
-                # TD errors per actor
-                td_errors = (discrete_q_selected - discrete_targets).detach().cpu().numpy().flatten()
-                if n_dqn > 0:
-                    metrics.td_err_mean_dqn = float(np.abs(td_errors[actor_dqn_mask]).mean())
-                    metrics.reward_mean_dqn = float(rewards.cpu().numpy().flatten()[actor_dqn_mask].mean())
-                    metrics.q_mean_dqn = float(discrete_q_selected.detach().cpu().numpy().flatten()[actor_dqn_mask].mean())
-                if n_expert > 0:
-                    metrics.td_err_mean_expert = float(np.abs(td_errors[actor_expert_mask]).mean())
-                    metrics.reward_mean_expert = float(rewards.cpu().numpy().flatten()[actor_expert_mask].mean())
-                    metrics.q_mean_expert = float(discrete_q_selected.detach().cpu().numpy().flatten()[actor_expert_mask].mean())
-                # Per-actor discrete loss means (per-sample)
-                try:
-                    d_loss_per = F.huber_loss(discrete_q_selected, discrete_targets, reduction='none').detach().cpu().numpy().flatten()
-                    if n_dqn > 0:
-                        metrics.d_loss_mean_dqn = float(d_loss_per[actor_dqn_mask].mean())
-                    if n_expert > 0:
-                        metrics.d_loss_mean_expert = float(d_loss_per[actor_expert_mask].mean())
-                except Exception:
-                    pass
-                # Selected/target Q means per actor
-                try:
-                    q_sel_np = discrete_q_selected.detach().cpu().numpy().flatten()
-                    q_tgt_np = discrete_targets.detach().cpu().numpy().flatten()
-                    if n_dqn > 0:
-                        metrics.q_sel_mean_dqn = float(q_sel_np[actor_dqn_mask].mean())
-                        metrics.q_tgt_mean_dqn = float(q_tgt_np[actor_dqn_mask].mean())
-                    if n_expert > 0:
-                        metrics.q_sel_mean_expert = float(q_sel_np[actor_expert_mask].mean())
-                        metrics.q_tgt_mean_expert = float(q_tgt_np[actor_expert_mask].mean())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Backward pass
-        backward_start = time.time()
-        self.optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        # If spinner-only, clear any stray grads in discrete head to avoid updates
-        if getattr(RL_CONFIG, 'spinner_only', False):
-            try:
-                for name, p in self.qnetwork_local.named_parameters():
-                    if name.startswith('discrete_') and p.grad is not None:
-                        p.grad.detach_()
-                        p.grad.zero_()
-            except Exception:
-                pass
-        backward_time = time.time() - backward_start
-
-        # Optional gradient diagnostics: measure each head's contribution
-        grad_diag_start = time.time()
-        try:
-            interval = int(getattr(RL_CONFIG, 'grad_diag_interval', 0) or 0)
-        except Exception:
-            interval = 0
-        if interval and (self.training_steps % interval == 0):
-            try:
-                # Compute separate grads by re-backpropagating each component on a fresh graph snapshot
-                # Snapshot current parameter grads to restore later
-                saved_grads = [p.grad.detach().clone() if p.grad is not None else None for p in self.qnetwork_local.parameters()]
-
-                def zero_grads():
-                    for p in self.qnetwork_local.parameters():
-                        if p.grad is not None:
-                            p.grad.detach_()
-                            p.grad.zero_()
-
-                # Recompute forward needed tensors under no grad accumulation
-                # Note: reuse already computed discrete_q_selected/continuous_pred where possible
-
-                # 1) Discrete-only backward
-                zero_grads()
-                d_loss.backward(retain_graph=True)
-                trunk_norm_d, disc_head_norm_d, cont_head_norm_d = 0.0, 0.0, 0.0
-                try:
-                    for name, p in self.qnetwork_local.named_parameters():
-                        if p.grad is None:
-                            continue
-                        g = p.grad.data
-                        gn = g.norm(2).item()
-                        if name.startswith('shared_layers'):
-                            trunk_norm_d += gn * gn
-                        elif name.startswith('discrete_'):
-                            disc_head_norm_d += gn * gn
-                        elif name.startswith('continuous_'):
-                            cont_head_norm_d += gn * gn
-                    trunk_norm_d = trunk_norm_d ** 0.5
-                    disc_head_norm_d = disc_head_norm_d ** 0.5
-                    cont_head_norm_d = cont_head_norm_d ** 0.5
-                except Exception:
-                    pass
-
-                # 2) Continuous-only backward
-                zero_grads()
-                (w_cont * c_loss).backward(retain_graph=False)
-                trunk_norm_c, disc_head_norm_c, cont_head_norm_c = 0.0, 0.0, 0.0
-                try:
-                    for name, p in self.qnetwork_local.named_parameters():
-                        if p.grad is None:
-                            continue
-                        g = p.grad.data
-                        gn = g.norm(2).item()
-                        if name.startswith('shared_layers'):
-                            trunk_norm_c += gn * gn
-                        elif name.startswith('discrete_'):
-                            disc_head_norm_c += gn * gn
-                        elif name.startswith('continuous_'):
-                            cont_head_norm_c += gn * gn
-                    trunk_norm_c = trunk_norm_c ** 0.5
-                    disc_head_norm_c = disc_head_norm_c ** 0.5
-                    cont_head_norm_c = cont_head_norm_c ** 0.5
-                except Exception:
-                    pass
-
-                # Restore original grads
-                for p, g in zip(self.qnetwork_local.parameters(), saved_grads):
-                    if g is None:
-                        p.grad = None
-                    else:
-                        if p.grad is None:
-                            p.grad = g.clone()
-                        else:
-                            p.grad.detach_()
-                            p.grad.copy_(g)
-
-                # Publish metrics
-                try:
-                    metrics.grad_trunk_d = float(trunk_norm_d)
-                    metrics.grad_trunk_c = float(trunk_norm_c)
-                    metrics.grad_head_disc_d = float(disc_head_norm_d)
-                    metrics.grad_head_disc_c = float(disc_head_norm_c)
-                    metrics.grad_head_cont_d = float(cont_head_norm_d)
-                    metrics.grad_head_cont_c = float(cont_head_norm_c)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        grad_diag_time = time.time() - grad_diag_start
-        
-        # Compute gradient norm BEFORE clipping
-        grad_norm_start = time.time()
-        total_grad_norm = 0.0
-        for p in self.qnetwork_local.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_grad_norm += param_norm.item() ** 2
-        total_grad_norm = total_grad_norm ** 0.5
-        
-        # Gradient clipping for stability (CRITICAL: prevents gradient explosions)
-        max_norm = 10.0
-        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=max_norm)
-
-        # Adaptive continuous loss weight scaling (post-backward, prior to optimizer step)
-        try:
-            if bool(getattr(RL_CONFIG, 'adaptive_continuous_loss', False)):
-                # Estimate continuous head gradient norm
-                cont_head_norm = 0.0
-                for name, p in self.qnetwork_local.named_parameters():
-                    if name.startswith('continuous_') and p.grad is not None:
-                        gn = p.grad.data.norm(2).item()
-                        cont_head_norm += gn * gn
-                cont_head_norm = cont_head_norm ** 0.5
-                low = float(getattr(RL_CONFIG, 'adaptive_cont_grad_low', 0.05) or 0.05)
-                high = float(getattr(RL_CONFIG, 'adaptive_cont_grad_high', 0.50) or 0.50)
-                w_up = float(getattr(RL_CONFIG, 'adaptive_cont_scale_up', 1.10) or 1.10)
-                w_dn = float(getattr(RL_CONFIG, 'adaptive_cont_scale_dn', 0.95) or 0.95)
-                w_min = float(getattr(RL_CONFIG, 'continuous_loss_weight_min', 0.25) or 0.25)
-                w_max = float(getattr(RL_CONFIG, 'continuous_loss_weight_max', 3.0) or 3.0)
-                current_w = float(getattr(RL_CONFIG, 'continuous_loss_weight', 1.0) or 1.0)
-                new_w = current_w
-                if cont_head_norm < low:
-                    new_w = min(w_max, current_w * w_up)
-                elif cont_head_norm > high:
-                    new_w = max(w_min, current_w * w_dn)
-                if new_w != current_w:
-                    RL_CONFIG.continuous_loss_weight = float(new_w)
-        except Exception:
-            pass
-        
-        # Compute gradient norm AFTER clipping to measure clip effect
-        clipped_grad_norm = 0.0
-        for p in self.qnetwork_local.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                clipped_grad_norm += param_norm.item() ** 2
-        clipped_grad_norm = clipped_grad_norm ** 0.5
-        
-        # Clip delta: ratio of clipped to original (1.0 = no clipping, <1.0 = clipped)
-        clip_delta = clipped_grad_norm / max(total_grad_norm, 1e-8)
-        grad_norm_time = time.time() - grad_norm_start
-        
-        # Optimizer step
-        optimizer_start = time.time()
-        self.optimizer.step()
-        optimizer_time = time.time() - optimizer_start
-
-        # Update training counters
-        counter_start = time.time()
-        self.training_steps += 1
-        try:
-            metrics.total_training_steps += 1
-            metrics.training_steps_interval += 1
-            metrics.memory_buffer_size = len(self.memory)
-            
-            # Report buffer composition every 10000 training steps (disabled for normal operation)
-            # if self.training_steps % 10000 == 0:
-            #     comp = self.memory.get_actor_composition()
-            #     print(f"[BUFFER] Step {self.training_steps}: {comp['total']} total, "
-            #           f"{comp['dqn']} DQN ({comp['frac_dqn']*100:.1f}%), "
-            #           f"{comp['expert']} expert ({comp['frac_expert']*100:.1f}%)")
-        except Exception:
-            pass
-        # Track loss values
-        try:
-            loss_val = float(total_loss.item())
-            metrics.losses.append(loss_val)
-            metrics.loss_sum_interval += loss_val
-            metrics.loss_count_interval += 1
-            # Track gradient norms for monitoring
-            metrics.last_grad_norm = float(total_grad_norm)
-            metrics.last_clip_delta = float(clip_delta)
-            # Track component losses
-            last_d = float((w_disc * d_loss).item())
-            last_c = float((w_cont * c_loss).item())
-            last_bc = float((w_bc * bc_loss).item()) if bc_loss.item() > 0 else 0.0
-            metrics.last_d_loss = last_d
-            metrics.last_c_loss = last_c
-            metrics.last_bc_loss = last_bc
-            # Accumulate interval-averaged component losses
-            try:
-                metrics.d_loss_sum_interval += last_d
-                metrics.d_loss_count_interval += 1
-                metrics.c_loss_sum_interval += last_c
-                metrics.c_loss_count_interval += 1
-                if last_bc > 0:
-                    metrics.bc_loss_sum_interval += last_bc
-                    metrics.bc_loss_count_interval += 1
-            except Exception:
-                pass
-            # Advantage weight summaries
-            try:
-                metrics.adv_w_mean = float(advantage_weights.mean().item())
-                metrics.adv_w_max = float(advantage_weights.max().item())
-                # If masks available, compute per-actor means
-                if 'torch_mask_dqn' in locals() and torch_mask_dqn.any():
-                    metrics.adv_w_mean_dqn = float(advantage_weights[torch_mask_dqn].mean().item())
-                if 'torch_mask_exp' in locals() and torch_mask_exp.any():
-                    metrics.adv_w_mean_expert = float(advantage_weights[torch_mask_exp].mean().item())
-            except Exception:
-                pass
-            # Discrete-head global diagnostics for this batch
-            try:
-                # Action distribution (0..3)
-                acts_np = discrete_actions.detach().cpu().numpy().flatten()
-                for a in range(4):
-                    frac = float((acts_np == a).mean())
-                    if a == 0: metrics.action_frac_0 = frac
-                    elif a == 1: metrics.action_frac_1 = frac
-                    elif a == 2: metrics.action_frac_2 = frac
-                    elif a == 3: metrics.action_frac_3 = frac
-                # Agreement: Does agent's current greedy policy match actions in replay buffer?
-                # This measures whether the model would choose the same actions it took in the past.
-                # Only computed for DQN frames (expert frames use different policy).
-                # Expected: ~25% random baseline, increasing to 70-90% as learning stabilizes.
-                if actor_dqn_mask is not None and n_dqn > 0:
-                    with torch.no_grad():
-                        # Get current greedy action for each state
-                        dq_current, _ = self.qnetwork_local(states)
-                        greedy_actions = dq_current.argmax(dim=1, keepdim=True)  # Shape: (batch_size, 1)
-                        
-                        # Compare to actual actions taken (stored in replay buffer)
-                        # Both are shape (batch_size, 1), so comparison works element-wise
-                        matches = (greedy_actions == discrete_actions).float()  # 1.0 if match, 0.0 if not
-                        
-                        # Filter to DQN frames only and compute agreement percentage
-                        dqn_matches = matches.cpu().numpy().flatten()[actor_dqn_mask]
-                        agree_pct = float(dqn_matches.mean() * 100.0) if len(dqn_matches) > 0 else 0.0
-                        
-                        # DEBUG: Print agreement details every 100 steps (only in verbose mode)
-                        if metrics.verbose_mode and self.training_steps % 100 == 0:
-                            greedy_np = greedy_actions.cpu().numpy().flatten()[actor_dqn_mask]
-                            actions_np = discrete_actions.cpu().numpy().flatten()[actor_dqn_mask]
-                            print(f"\n[AGREE DEBUG] Step {self.training_steps}:")
-                            print(f"  n_dqn={n_dqn}, agree_pct={agree_pct:.1f}%")
-                            print(f"  First 10 greedy: {greedy_np[:10]}")
-                            print(f"  First 10 replay: {actions_np[:10]}")
-                            print(f"  Greedy dist: {np.bincount(greedy_np, minlength=4)}")
-                            print(f"  Replay dist: {np.bincount(actions_np, minlength=4)}")
-                        
-                        # Accumulate for interval averaging (like losses)
-                        metrics.agree_sum_interval += agree_pct * n_dqn  # Weight by number of DQN samples
-                        metrics.agree_count_interval += n_dqn
-                
-                # Spinner (Continuous) Agreement: Does predicted spinner match replay buffer?
-                # Measure "close enough" agreement using tolerance threshold (e.g., within ±0.1)
-                if actor_dqn_mask is not None and n_dqn > 0:
-                    with torch.no_grad():
-                        # Get current predicted continuous actions
-                        _, continuous_current = self.qnetwork_local(states)
-                        
-                        # Compare to actual continuous actions taken (from replay buffer)
-                        # Use tolerance: consider "match" if within ±0.1 of target
-                        tolerance = 0.1
-                        continuous_diff = torch.abs(continuous_current - continuous_actions)
-                        spinner_matches = (continuous_diff <= tolerance).float()
-                        
-                        # Filter to DQN frames only and compute agreement percentage
-                        dqn_spinner_matches = spinner_matches.cpu().numpy().flatten()[actor_dqn_mask]
-                        spinner_agree_pct = float(dqn_spinner_matches.mean() * 100.0) if len(dqn_spinner_matches) > 0 else 0.0
-                        
-                        # DEBUG: Print spinner agreement details every 100 steps (only in verbose mode)
-                        if metrics.verbose_mode and self.training_steps % 100 == 0:
-                            continuous_current_np = continuous_current.cpu().numpy().flatten()[actor_dqn_mask]
-                            continuous_replay_np = continuous_actions.cpu().numpy().flatten()[actor_dqn_mask]
-                            print(f"  Spinner agree_pct={spinner_agree_pct:.1f}%")
-                            print(f"  First 10 predicted: {continuous_current_np[:10]}")
-                            print(f"  First 10 replay:    {continuous_replay_np[:10]}")
-                            print(f"  Mean absolute error: {np.abs(continuous_current_np - continuous_replay_np).mean():.3f}")
-                        
-                        # Accumulate for interval averaging (like discrete agreement)
-                        metrics.spinner_agree_sum_interval += spinner_agree_pct * n_dqn
-                        metrics.spinner_agree_count_interval += n_dqn
-                # Batch done fraction and horizon mean
-                try:
-                    metrics.batch_done_frac = float(dones.detach().cpu().numpy().mean())
-                except Exception:
-                    metrics.batch_done_frac = 0.0
-                try:
-                    metrics.batch_h_mean = float(horizons.detach().cpu().numpy().mean())
-                except Exception:
-                    metrics.batch_h_mean = 1.0
-            except Exception:
-                pass
-        except Exception:
-            pass
-        counter_time = time.time() - counter_start
-
-        # Target network update: support soft updates (Polyak) or periodic hard copy
-        target_update_start = time.time()
-        if getattr(RL_CONFIG, 'use_soft_target_update', False):
-            try:
-                tau = float(getattr(RL_CONFIG, 'soft_target_tau', 0.005) or 0.005)
-            except Exception:
-                tau = 0.005
-            with torch.no_grad():
-                for tgt_p, src_p in zip(self.qnetwork_target.parameters(), self.qnetwork_local.parameters()):
-                    tgt_p.data.mul_(1.0 - tau).add_(src_p.data, alpha=tau)
-            # Telemetry (treat as a target update for age tracking)
-            try:
-                metrics.last_target_update_frame = metrics.frame_count
-                metrics.last_target_update_time = time.time()
-                metrics.last_target_update_step = self.training_steps
-            except Exception:
-                pass
-        else:
-            # Hard target update
-            if self.training_steps % RL_CONFIG.target_update_freq == 0:
-                self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-                # Telemetry
-                try:
-                    metrics.last_target_update_frame = metrics.frame_count
-                    metrics.last_target_update_time = time.time()
-                    metrics.last_hard_target_update_frame = metrics.frame_count
-                    metrics.last_hard_target_update_time = time.time()
-                    metrics.last_target_update_step = self.training_steps
-                except Exception:
-                    pass
-        target_update_time = time.time() - target_update_start
-
-        # Print profiling info every 100 steps
-        total_time = time.time() - start_time
-        #if self.training_steps % 100 == 0:
-            #print(f"[PROFILING] Step {self.training_steps}: Total={total_time:.4f}s | "
-            #      f"Batch={batch_time:.4f}s | Forward={forward_time:.4f}s | Target={target_time:.4f}s | "
-            #      f"Loss={loss_time:.4f}s | Backward={backward_time:.4f}s | GradDiag={grad_diag_time:.4f}s | "
-            #      f"GradNorm={grad_norm_time:.4f}s | Optimizer={optimizer_time:.4f}s | "
-            #      f"Counters={counter_time:.4f}s | TargetUpdate={target_update_time:.4f}s")
-
-        return float(total_loss.item())
-
     def set_training_enabled(self, enabled: bool):
         """Enable/disable training at runtime. When disabling, drain pending work."""
         self.training_enabled = bool(enabled)
@@ -1909,10 +1273,7 @@ class HybridDQNAgent:
                     from Scripts.config import RESET_REPLAY_BUFFER
                 
                 if RESET_REPLAY_BUFFER:
-                    print("\n" + "="*80)
-                    print("RESET_REPLAY_BUFFER=True: Clearing replay buffer and resetting target network")
-                    print("="*80)
-                    # Clear the replay buffer
+                    # Clear the replay buffer (silent operation)
                     self.memory.size = 0
                     self.memory.high_reward_size = 0
                     self.memory.regular_size = 0
@@ -1925,10 +1286,6 @@ class HybridDQNAgent:
                         pass
                     # Reset target network to match local network (prevent Q-explosion from stale targets)
                     self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-                    print("✓ Replay buffer cleared")
-                    print("✓ Target network synchronized with local network")
-                    print("  This prevents Q-value explosion from bootstrapping old targets on fresh data")
-                    print("="*80 + "\n")
                 
                 return True
             except Exception as e:
@@ -2024,7 +1381,11 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         # Apply subjective/objective reward scaling and compute total
         subjreward = float(subjreward) * float(getattr(RL_CONFIG, 'subj_reward_scale', 1.0) or 1.0)
         objreward = float(objreward) * float(getattr(RL_CONFIG, 'obj_reward_scale', 1.0) or 1.0)
-        reward = float(subjreward + objreward)
+        
+        if (ignore_subj_reward := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+            reward = objreward
+        else:
+            reward = float(subjreward + objreward)
 
         state_data = memoryview(data)[header_size:]
 
@@ -2477,7 +1838,7 @@ class SafeMetrics:
             decay_expert_ratio(self.metrics.frame_count)
             return self.metrics.expert_ratio
     
-    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None):
+    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None, episode_length=0):
         """Record per-episode rewards in a thread-safe way.
 
         Forward to the underlying MetricsData.add_episode_reward when available so that:
@@ -2489,7 +1850,7 @@ class SafeMetrics:
             try:
                 add_fn = getattr(self.metrics, 'add_episode_reward', None)
                 if callable(add_fn):
-                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward), subj_reward, obj_reward)
+                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward), subj_reward, obj_reward, episode_length)
                     return
             except Exception:
                 pass

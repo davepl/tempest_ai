@@ -1,0 +1,68 @@
+
+====================================================================================================
+                                 TEMPEST AI - NETWORK CONFIGURATION
+====================================================================================================
+
+📐 NETWORK ARCHITECTURE:
+   State Size:        171
+   Discrete Actions:  4 (FIRE/ZAP combinations)
+   Continuous Output: 1 (Spinner: -0.9 to +0.9)
+
+   Shared Trunk:      5 layers
+      Layer 1:        171 → 512
+      Layer 2:        512 → 512
+      Layer 3:        512 → 256
+      Layer 4:        256 → 256
+      Layer 5:        256 → 128
+
+   Discrete Head:     128 → 64 → 4
+   Continuous Head:   128 → 64 → 32 → 1
+
+   Total Parameters:  599,621
+   Trainable:         599,621
+
+⚙️  TRAINING HYPERPARAMETERS:
+   Learning Rate:     0.000150
+   Batch Size:        2,048
+   Gamma (γ):         0.99
+   Epsilon (ε):       0.05 → 0.05 (exploration)
+   Memory Size:       2,000,000 transitions
+   Target Update:     Every 1000 steps
+
+⚖️  LOSS CONFIGURATION:
+   Discrete Loss:     TD (Huber) + BC (Cross-Entropy)
+   Continuous Loss:   MSE with advantage weighting
+   Loss Weights:      Discrete=1.0, Continuous=1.0
+   BC Weight:         0.5 (behavioral cloning)
+   Max Q-Value Clip:  10.0
+   TD Target Clip:    100.0
+
+🎓 EXPERT GUIDANCE:
+   Expert Ratio:      50%
+   Superzap Gate:     Disabled
+
+🚀 OPTIMIZATION:
+   Gradient Clip:     10.0 (max norm)
+   N-Step Returns:    3-step
+   Training Workers:  4
+
+====================================================================================================
+⚠ No existing model found, starting fresh
+KeyboardHandler: Using termios/tty for linux.
+SocketServer listening on 0.0.0.0:9999
+Starting keyboard input handler thread...
+Starting stats reporter thread...
+      Frame    FPS   FAFO    Xprt    Rwrd    Subj     Obj     DQN  DQN1M  DQN5M  DQNSlope       Loss    DLoss    CLoss  Agree%  SpinAgr% AvgEpLen Train% Clnt  Levl  AvgInf    Samp/s  Steps/s GradNorm  ClipΔ      Q-Range              Stats
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     39,096 1404.4   0.05   50.0%    5.77    1.09    5.77    2.96   0.00   0.00     0.000   0.024392  0.00133  0.02306   41.9%    60.1%    826.4   15.6 0005   4.6    0.80    414171    202.2    0.904  1.000    [0.0,0.4]     39k/3038/2%/2%
+     81,184 1407.9   0.05   50.0%    5.51    1.01    5.51    2.60   2.60   2.60     0.000   0.022049  0.00183  0.02022   43.8%    61.7%    848.6   15.7 0005   4.7    0.79    450956    220.2    1.234  1.000    [0.1,1.2]     81k/6345/3%/4%
+Quit command received, shutting down...
+Flushing async replay buffer...
+Async buffer stats: 89,911 processed, 0 remaining, 0 dropped
+Flushing async replay buffer...
+Async buffer stats: 89,911 processed, 0 remaining, 0 dropped
+Server stopped running, exiting stats reporter
+Final model state saved
+Flushing async replay buffer...
+Async buffer stats: 89,911 processed, 0 remaining, 0 dropped
+Application shutdown complete

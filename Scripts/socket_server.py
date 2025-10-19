@@ -362,6 +362,7 @@ class SocketServer:
                         break
                     state = self.client_states[client_id]
                     state['frames_processed'] += 1
+                    state['episode_frame_count'] = state.get('episode_frame_count', 0) + 1  # Track episode length
                     state['level_number'] = frame.level_number
                     state['prev_frame'] = state.get('current_frame')
                     state['current_frame'] = frame
@@ -404,7 +405,12 @@ class SocketServer:
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
                         # Compute total reward from subj+obj for n-step accumulation
-                        total_reward = float(frame.subjreward) + float(frame.objreward)
+                        
+                        if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+                            total_reward = float(frame.objreward)
+                        else:
+                            total_reward = float(frame.subjreward) + float(frame.objreward)
+
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
                             int(da),
@@ -513,6 +519,12 @@ class SocketServer:
                                             pass
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
+                        # Compute total reward respecting ignore_subjective_rewards flag
+                        if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+                            direct_reward = float(frame.objreward)
+                        else:
+                            direct_reward = float(frame.subjreward) + float(frame.objreward)
+                        
                         try:
                             if self.agent:
                                 # Hybrid agents expect (state, discrete, continuous, reward, next_state, done) (async)
@@ -520,7 +532,7 @@ class SocketServer:
                                     state['last_state'],
                                     int(da),
                                     float(ca),
-                                    float(frame.subjreward + frame.objreward),
+                                    direct_reward,
                                     frame.state,
                                     bool(frame.done),
                                     actor=require_actor_tag("direct push"),
@@ -532,7 +544,7 @@ class SocketServer:
                                 self.async_buffer.step_async(
                                     state['last_state'],
                                     int(da),
-                                    float(frame.subjreward + frame.objreward),
+                                    direct_reward,
                                     frame.state,
                                     bool(frame.done),
                                     actor=require_actor_tag("direct push legacy"),
@@ -542,8 +554,13 @@ class SocketServer:
                                 pass
 
                     # reward accounting
-                    # Update reward accounting using subj+obj derived total
-                    total_reward = float(frame.subjreward) + float(frame.objreward)
+                    # Update reward accounting using subj+obj derived total, respecting ignore_subjective_rewards
+                    
+                    if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+                        total_reward = float(frame.objreward)
+                    else:
+                        total_reward = float(frame.subjreward) + float(frame.objreward)
+
                     state['total_reward'] = state.get('total_reward', 0.0) + total_reward
                     state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + frame.subjreward
                     state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + frame.objreward
@@ -556,12 +573,15 @@ class SocketServer:
                 # terminal handling
                 if frame.done:
                     if not state.get('was_done', False):
+                        # Calculate episode length (frames in this episode)
+                        episode_length = state.get('episode_frame_count', 0)
                         self.metrics.add_episode_reward(
                             state.get('total_reward', 0.0),
                             state.get('episode_dqn_reward', 0.0),
                             state.get('episode_expert_reward', 0.0),
                             state.get('episode_subj_reward', 0.0),
-                            state.get('episode_obj_reward', 0.0)
+                            state.get('episode_obj_reward', 0.0),
+                            episode_length=episode_length
                         )
                     state['was_done'] = True
 
@@ -590,6 +610,7 @@ class SocketServer:
                     state['episode_expert_reward'] = 0.0
                     state['episode_subj_reward'] = 0.0
                     state['episode_obj_reward'] = 0.0
+                    state['episode_frame_count'] = 0  # Reset episode length counter
                     continue
 
                 elif state.get('was_done', False):
@@ -599,6 +620,7 @@ class SocketServer:
                     state['episode_expert_reward'] = 0.0
                     state['episode_subj_reward'] = 0.0
                     state['episode_obj_reward'] = 0.0
+                    state['episode_frame_count'] = 0  # Reset episode length counter
                     # No per-level frame tracking
 
                 # choose action (hybrid-only)

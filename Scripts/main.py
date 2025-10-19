@@ -25,6 +25,7 @@ import time
 import threading
 from datetime import datetime
 import traceback
+import torch
 
 from aimodel import HybridDQNAgent, KeyboardHandler
 from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
@@ -153,6 +154,72 @@ def keyboard_input_handler(agent, keyboard_handler):
             print(f"Error in keyboard input handler: {e}")
             break
 
+def print_network_config(agent):
+    """Display network architecture and key hyperparameters at startup"""
+    print("\n" + "="*100)
+    print("TEMPEST AI - NETWORK CONFIGURATION".center(100))
+    print("="*100)
+    
+    # Network Architecture
+    print("\n📐 NETWORK ARCHITECTURE:")
+    print(f"   State Size:        {agent.state_size}")
+    print(f"   Discrete Actions:  {agent.discrete_actions} (FIRE/ZAP combinations)")
+    print(f"   Continuous Output: 1 (Spinner: -0.9 to +0.9)")
+    
+    # Get layer sizes from the network
+    print(f"\n   Shared Trunk:      {len(agent.qnetwork_local.shared_layers)} layers")
+    for i, layer in enumerate(agent.qnetwork_local.shared_layers):
+        if isinstance(layer, torch.nn.Linear):
+            print(f"      Layer {i+1}:        {layer.in_features} → {layer.out_features}")
+    
+    # Head architectures
+    shared_out = agent.qnetwork_local.shared_layers[-1].out_features if agent.qnetwork_local.shared_layers else 0
+    discrete_hidden = agent.qnetwork_local.discrete_fc.out_features
+    continuous_hidden = agent.qnetwork_local.continuous_fc1.out_features
+    
+    print(f"\n   Discrete Head:     {shared_out} → {discrete_hidden} → {agent.discrete_actions}")
+    print(f"   Continuous Head:   {shared_out} → {continuous_hidden} → {agent.qnetwork_local.continuous_fc2.out_features} → 1")
+    
+    # Count total parameters
+    total_params = sum(p.numel() for p in agent.qnetwork_local.parameters())
+    trainable_params = sum(p.numel() for p in agent.qnetwork_local.parameters() if p.requires_grad)
+    print(f"\n   Total Parameters:  {total_params:,}")
+    print(f"   Trainable:         {trainable_params:,}")
+    
+    # Training Hyperparameters
+    print("\n⚙️  TRAINING HYPERPARAMETERS:")
+    print(f"   Learning Rate:     {agent.learning_rate:.6f}")
+    print(f"   Batch Size:        {agent.batch_size:,}")
+    print(f"   Gamma (γ):         {agent.gamma}")
+    print(f"   Epsilon (ε):       {agent.epsilon} → {agent.epsilon_min} (exploration)")
+    print(f"   Memory Size:       {agent.memory.capacity:,} transitions")
+    print(f"   Target Update:     Every {RL_CONFIG.target_update_freq} steps")
+    
+    # Loss Configuration
+    print("\n⚖️  LOSS CONFIGURATION:")
+    print(f"   Discrete Loss:     TD (Huber) + BC (Cross-Entropy)")
+    print(f"   Continuous Loss:   MSE with advantage weighting")
+    print(f"   Loss Weights:      Discrete={RL_CONFIG.discrete_loss_weight:.1f}, Continuous={RL_CONFIG.continuous_loss_weight:.1f}")
+    bc_weight = getattr(RL_CONFIG, 'discrete_bc_weight', 1.0)
+    print(f"   BC Weight:         {bc_weight:.1f} (behavioral cloning)")
+    max_q = getattr(RL_CONFIG, 'max_q_value', None)
+    print(f"   Max Q-Value Clip:  {max_q:.1f}" if max_q else "   Max Q-Value Clip:  None")
+    td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
+    print(f"   TD Target Clip:    {td_clip:.1f}" if td_clip else "   TD Target Clip:    None")
+    
+    # Expert Configuration
+    print("\n🎓 EXPERT GUIDANCE:")
+    print(f"   Expert Ratio:      {RL_CONFIG.expert_ratio_start*100:.0f}%")
+    print(f"   Superzap Gate:     {'Enabled' if RL_CONFIG.enable_superzap_gate else 'Disabled'}")
+    
+    # Optimization
+    print("\n🚀 OPTIMIZATION:")
+    print(f"   Gradient Clip:     10.0 (max norm)")
+    print(f"   N-Step Returns:    {RL_CONFIG.n_step}-step")
+    print(f"   Training Workers:  {RL_CONFIG.training_workers}")
+    
+    print("\n" + "="*100 + "\n")
+
 def main():
     """Main function to run the Tempest AI application"""
 
@@ -174,10 +241,15 @@ def main():
         batch_size       = RL_CONFIG.batch_size
     )
 
+    # Display network configuration and hyperparameters
+    print_network_config(agent)
+
     # Load the model if it exists
     if os.path.exists(LATEST_MODEL_PATH):
         agent.load(LATEST_MODEL_PATH)
-    
+        print(f"✓ Loaded model from: {LATEST_MODEL_PATH}\n")
+    else:
+        print(f"⚠ No existing model found, starting fresh\n")
 
     # Initialize the socket server
     server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, metrics)
