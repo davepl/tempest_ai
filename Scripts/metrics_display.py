@@ -181,9 +181,9 @@ def display_metrics_header():
     row_counter = 0
     # clear_screen()
     
-    # Full header with all desired columns
+    # Full header with all desired columns (aligned to match data column widths)
     header = (
-        f"{'Frame':>11} {'FPS':>6} {'FAFO':>6} {'Xprt':>7} "
+        f"{'Frame':>11} {'FPS':>7} {'FAFO':>6} {'Xprt':>7} "
         f"{'Rwrd':>7} {'Subj':>7} {'Obj':>7} {'DQN':>7} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
         f"{'DLoss':>8} {'CLoss':>8} {'Agree%':>7} {'SpinAgr%':>9} "
         f"{'AvgEpLen':>8} {'Train%':>6} "
@@ -441,7 +441,7 @@ def display_metrics_row(agent, kb_handler):
         dqn_display = f"{dqn_display}!"
 
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>6.1f} {eps_display} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_display} "
         f"{xprt_display:>7} {rwrd_display:>7} {subj_display:>7} {obj_display:>7} {dqn_display:>7} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
         f"{d_loss:>8.5f} {c_loss:>8.5f} {agree_pct*100:>6.1f}% {spinner_agree_avg*100:>7.1f}% "
         f"{avg_episode_length:>8.1f} {train_pct:>6.1f} "
