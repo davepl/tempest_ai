@@ -565,16 +565,61 @@ class SocketServer:
                     state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + frame.subjreward
                     state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + frame.objreward
                     src = state.get('last_action_source')
+                    # Persist last-step attribution details for debugging/terminal reporting
+                    try:
+                        state['last_step_total_reward'] = float(total_reward)
+                        state['last_step_obj_reward'] = float(frame.objreward)
+                        state['last_step_subj_reward'] = float(frame.subjreward)
+                        state['last_step_actor'] = str(src) if src is not None else 'unknown'
+                    except Exception:
+                        pass
                     if src == 'dqn':
                         state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + total_reward
                     elif src == 'expert':
                         state['episode_expert_reward'] = state.get('episode_expert_reward', 0.0) + total_reward
+                    else:
+                        # In verbose mode, surface unexpected/missing actor tags
+                        try:
+                            verbose = False
+                            if hasattr(self.metrics, 'get'):
+                                # SafeMetrics may not expose direct fields; attempt safe get
+                                verbose = bool(self.metrics.get('verbose_mode', False))
+                            elif hasattr(self.metrics, 'metrics') and hasattr(self.metrics, 'lock'):
+                                with self.metrics.lock:
+                                    verbose = bool(getattr(self.metrics.metrics, 'verbose_mode', False))
+                            if verbose:
+                                print(f"[ATTR] Client {client_id}: unexpected actor tag '{src}' on reward attribution; reward={total_reward:.4f}")
+                        except Exception:
+                            pass
 
                 # terminal handling
                 if frame.done:
                     if not state.get('was_done', False):
                         # Calculate episode length (frames in this episode)
                         episode_length = state.get('episode_frame_count', 0)
+                        # Optional verbose attribution snapshot at episode end to validate who received terminal penalty
+                        try:
+                            verbose = False
+                            if hasattr(self.metrics, 'get'):
+                                verbose = bool(self.metrics.get('verbose_mode', False))
+                            elif hasattr(self.metrics, 'metrics') and hasattr(self.metrics, 'lock'):
+                                with self.metrics.lock:
+                                    verbose = bool(getattr(self.metrics.metrics, 'verbose_mode', False))
+                            if verbose:
+                                last_actor = state.get('last_step_actor', state.get('last_action_source'))
+                                last_tot = state.get('last_step_total_reward', 0.0)
+                                last_obj = state.get('last_step_obj_reward', 0.0)
+                                last_subj = state.get('last_step_subj_reward', 0.0)
+                                ep_dqn = state.get('episode_dqn_reward', 0.0)
+                                ep_exp = state.get('episode_expert_reward', 0.0)
+                                ep_total = state.get('total_reward', 0.0)
+                                print(
+                                    f"[ATTR] Episode end (client {client_id}, frames={episode_length}): "
+                                    f"last_step_actor={last_actor}, last_step_obj={last_obj:.4f}, last_step_subj={last_subj:.4f}, "
+                                    f"attrib_last_step_total={last_tot:.4f} | ep_dqn={ep_dqn:.4f}, ep_expert={ep_exp:.4f}, ep_total={ep_total:.4f}"
+                                )
+                        except Exception:
+                            pass
                         self.metrics.add_episode_reward(
                             state.get('total_reward', 0.0),
                             state.get('episode_dqn_reward', 0.0),
