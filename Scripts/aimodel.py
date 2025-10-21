@@ -629,36 +629,53 @@ class HybridReplayBuffer:
         self.percentile_thresholds = [np.percentile(errors, p) for p in percentiles]
     
     def sample(self, batch_size):
-        """Sample batch uniformly from all buckets.
+        """Sample batch uniformly from all buckets using stratified sampling.
         
-        Each bucket has its own offset in the storage arrays. We need to:
-        1. Collect valid index ranges from each bucket
-        2. Sample uniformly from the union of valid indices
+        Instead of building a list of all valid indices (slow for large buffers),
+        we sample proportionally from each bucket based on its fill ratio.
+        This is O(n_buckets) instead of O(buffer_size).
         """
         if self.size < batch_size:
             return None
         
-        # Build list of all valid indices across all buckets
-        valid_indices = []
-        for bucket in self.buckets:
-            if bucket['size'] > 0:
-                start = bucket['offset']
-                # If bucket wrapped around, we need to handle it carefully
-                if bucket['size'] < bucket['capacity']:
-                    # Bucket not full: valid indices are contiguous from offset
-                    end = start + bucket['size']
-                    valid_indices.extend(range(start, end))
-                else:
-                    # Bucket full: all indices in this bucket's range are valid
-                    end = start + bucket['capacity']
-                    valid_indices.extend(range(start, end))
+        # Calculate how many samples to draw from each bucket (proportional to bucket size)
+        samples_per_bucket = []
+        total_allocated = 0
         
-        # Sample uniformly from valid indices
-        if len(valid_indices) < batch_size:
+        for i, bucket in enumerate(self.buckets):
+            if bucket['size'] == 0:
+                samples_per_bucket.append(0)
+            else:
+                # Allocate samples proportionally to bucket's contribution to total size
+                proportion = bucket['size'] / self.size
+                n_samples = int(batch_size * proportion)
+                
+                # Last bucket gets remainder to ensure we hit batch_size exactly
+                if i == len(self.buckets) - 1:
+                    n_samples = batch_size - total_allocated
+                
+                samples_per_bucket.append(n_samples)
+                total_allocated += n_samples
+        
+        # Sample from each bucket
+        all_indices = []
+        for bucket, n_samples in zip(self.buckets, samples_per_bucket):
+            if n_samples > 0 and bucket['size'] > 0:
+                # Sample uniformly from this bucket's valid range
+                # Valid indices are [offset, offset + size)
+                bucket_indices = self._rand.integers(
+                    bucket['offset'], 
+                    bucket['offset'] + bucket['size'],
+                    size=n_samples,
+                    dtype=np.int64
+                )
+                all_indices.append(bucket_indices)
+        
+        # Concatenate all sampled indices
+        if not all_indices:
             return None
-            
-        sampled_positions = self._rand.choice(valid_indices, size=batch_size, replace=False)
-        indices = np.array(sampled_positions, dtype=np.int64)
+        
+        indices = np.concatenate(all_indices)
 
         # Vectorized gather for batch data
         states_np = self.states[indices]
