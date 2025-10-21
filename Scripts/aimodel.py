@@ -739,18 +739,39 @@ class HybridReplayBuffer:
         """Return statistics on actor composition of buffer"""
         if self.size == 0:
             return {'total': 0, 'dqn': 0, 'expert': 0, 'frac_dqn': 0.0, 'frac_expert': 0.0}
-        
-        # Count actors in the filled portion of the buffer
-        actors_slice = self.actors[:self.size]
-        n_dqn = np.sum(actors_slice == 'dqn')
-        n_expert = np.sum(actors_slice == 'expert')
-        
+
+        total = 0
+        n_dqn = 0
+        n_expert = 0
+
+        for bucket in self.buckets:
+            bucket_size = bucket['size']
+            if bucket_size <= 0:
+                continue
+
+            start = bucket['offset']
+            if bucket_size < bucket['capacity']:
+                end = start + bucket_size
+            else:
+                end = start + bucket['capacity']
+
+            actors_slice = self.actors[start:end]
+            n_dqn += int(np.count_nonzero(actors_slice == 'dqn'))
+            n_expert += int(np.count_nonzero(actors_slice == 'expert'))
+            total += bucket_size
+
+        if total <= 0:
+            return {'total': 0, 'dqn': 0, 'expert': 0, 'frac_dqn': 0.0, 'frac_expert': 0.0}
+
+        frac_dqn = float(n_dqn) / float(total)
+        frac_expert = float(n_expert) / float(total)
+
         return {
-            'total': self.size,
+            'total': int(total),
             'dqn': int(n_dqn),
             'expert': int(n_expert),
-            'frac_dqn': float(n_dqn) / self.size,
-            'frac_expert': float(n_expert) / self.size,
+            'frac_dqn': frac_dqn,
+            'frac_expert': frac_expert,
         }
     
     def get_bucket_stats(self):
