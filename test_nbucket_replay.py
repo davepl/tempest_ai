@@ -400,6 +400,36 @@ class TestNBucketReplayBuffer(unittest.TestCase):
         self.assertAlmostEqual(comp['frac_dqn'], 0.7, places=2)
         self.assertAlmostEqual(comp['frac_expert'], 0.3, places=2)
     
+    def test_actor_composition_sparse_priority_buckets(self):
+        """Actor composition should include entries stored past self.size slice."""
+        buffer = HybridReplayBuffer(self.capacity, self.state_size)
+
+        top_bucket_capacity = RL_CONFIG.replay_bucket_size
+        main_capacity = RL_CONFIG.replay_main_bucket_size
+
+        # Stage 1: Fill the highest-priority bucket with expert transitions to prime thresholds.
+        for _ in range(top_bucket_capacity):
+            exp = self._make_experience(actor='expert', td_error=10.0)
+            buffer.push(**exp)
+
+        # Stage 2: Fill the main bucket with low TD-error DQN transitions.
+        for _ in range(main_capacity):
+            exp = self._make_experience(actor='dqn', td_error=0.0)
+            buffer.push(**exp)
+
+        comp = buffer.get_actor_composition()
+
+        expected_expert = buffer.buckets[0]['size']
+        expected_dqn = buffer.buckets[-1]['size']
+        expected_total = expected_expert + expected_dqn
+
+        self.assertEqual(comp['total'], expected_total)
+        self.assertEqual(comp['expert'], expected_expert)
+        self.assertEqual(comp['dqn'], expected_dqn)
+        self.assertAlmostEqual(comp['frac_expert'], expected_expert / expected_total)
+        self.assertAlmostEqual(comp['frac_dqn'], expected_dqn / expected_total)
+
+
     def test_partition_stats(self):
         """Test partition statistics reporting."""
         buffer = HybridReplayBuffer(self.capacity, self.state_size)
