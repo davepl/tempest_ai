@@ -329,8 +329,15 @@ def train_step(agent):
         # Track agreement metrics (how often taken actions match current policy)
         try:
             with torch.no_grad():
-                # Get current policy predictions (discrete only)
-                curr_discrete_q = agent.qnetwork_local(states)
+                # Get current policy predictions
+                network_output = agent.qnetwork_local(states)
+                
+                # Handle both hybrid (tuple) and discrete-only (tensor) architectures
+                if isinstance(network_output, tuple):
+                    curr_discrete_q, curr_continuous_pred = network_output
+                else:
+                    curr_discrete_q = network_output
+                    curr_continuous_pred = None
                 
                 # Filter to only DQN-generated actions for agreement calculation
                 dqn_indices = [i for i, actor in enumerate(actors) if actor == 'dqn']
@@ -347,13 +354,25 @@ def train_step(agent):
                     
                     dqn_discrete_matches = (curr_dqn == actions_dqn).float()
                     discrete_agree_frac = dqn_discrete_matches.mean().item()
+                    
+                    # Continuous agreement (if hybrid network)
+                    if curr_continuous_pred is not None:
+                        continuous_diff = torch.abs(curr_continuous_pred[dqn_tensor] - continuous_actions[dqn_tensor])
+                        dqn_continuous_matches = (continuous_diff < 0.1).float()
+                        continuous_agree_frac = dqn_continuous_matches.mean().item()
+                    else:
+                        continuous_agree_frac = 0.0
                 else:
                     # Fallback if no DQN actions in batch
                     discrete_agree_frac = 0.0
+                    continuous_agree_frac = 0.0
                 
-                # Update interval accumulators (discrete only)
+                # Update interval accumulators
                 metrics.agree_sum_interval += discrete_agree_frac
                 metrics.agree_count_interval += 1
+                if curr_continuous_pred is not None:
+                    metrics.spinner_agree_sum_interval += continuous_agree_frac
+                    metrics.spinner_agree_count_interval += 1
         except Exception as e:
             # Debug: print if agreement calculation fails
             print(f"Warning: Agreement calculation failed: {e}")
