@@ -629,18 +629,36 @@ class HybridReplayBuffer:
         self.percentile_thresholds = [np.percentile(errors, p) for p in percentiles]
     
     def sample(self, batch_size):
-        """Sample batch uniformly from all buckets (contiguous storage allows simple uniform sampling).
+        """Sample batch uniformly from all buckets.
         
-        Since storage is contiguous, we can simply sample uniformly from [0, size).
-        The TD-error stratification happens at insertion time, distributing experiences
-        across buckets. Uniform sampling naturally oversamples priority buckets since
-        they have more "slots" for high-error experiences.
+        Each bucket has its own offset in the storage arrays. We need to:
+        1. Collect valid index ranges from each bucket
+        2. Sample uniformly from the union of valid indices
         """
         if self.size < batch_size:
             return None
         
-        # Simple uniform sampling from filled portion of buffer
-        indices = self._rand.integers(0, self.size, size=batch_size, dtype=np.int64)
+        # Build list of all valid indices across all buckets
+        valid_indices = []
+        for bucket in self.buckets:
+            if bucket['size'] > 0:
+                start = bucket['offset']
+                # If bucket wrapped around, we need to handle it carefully
+                if bucket['size'] < bucket['capacity']:
+                    # Bucket not full: valid indices are contiguous from offset
+                    end = start + bucket['size']
+                    valid_indices.extend(range(start, end))
+                else:
+                    # Bucket full: all indices in this bucket's range are valid
+                    end = start + bucket['capacity']
+                    valid_indices.extend(range(start, end))
+        
+        # Sample uniformly from valid indices
+        if len(valid_indices) < batch_size:
+            return None
+            
+        sampled_positions = self._rand.choice(valid_indices, size=batch_size, replace=False)
+        indices = np.array(sampled_positions, dtype=np.int64)
 
         # Vectorized gather for batch data
         states_np = self.states[indices]
