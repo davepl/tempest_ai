@@ -57,7 +57,7 @@ class AsyncReplayBuffer:
     Queues experiences and inserts them in batches on a background thread.
     This prevents client threads from blocking on buffer insertion.
     """
-    def __init__(self, agent, batch_size=100, max_queue_size=10000):
+    def __init__(self, agent, batch_size=1000, max_queue_size=10000):
         self.agent = agent
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
@@ -84,22 +84,16 @@ class AsyncReplayBuffer:
         batch = []
         while self.running:
             try:
-                # Get item with timeout to allow checking running flag
-                item = self.queue.get(timeout=0.1)
-                batch.append(item)
+                # Try to get item without blocking (aggressive draining)
+                try:
+                    # Drain multiple items quickly
+                    while len(batch) < self.batch_size:
+                        item = self.queue.get_nowait()
+                        batch.append(item)
+                except queue.Empty:
+                    pass
                 
-                # Process batch when full or queue empty
-                if len(batch) >= self.batch_size or self.queue.empty():
-                    for args, kwargs in batch:
-                        try:
-                            self.agent.step(*args, **kwargs)
-                            self.items_processed += 1
-                        except Exception as e:
-                            print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
-                    batch.clear()
-                    
-            except queue.Empty:
-                # Process any remaining items in batch
+                # If we have a batch or any items and queue is empty, process immediately
                 if batch:
                     for args, kwargs in batch:
                         try:
@@ -108,6 +102,10 @@ class AsyncReplayBuffer:
                         except Exception as e:
                             print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
                     batch.clear()
+                else:
+                    # Only sleep briefly if queue is truly empty
+                    time.sleep(0.001)  # 1ms sleep to avoid busy-wait
+                    
             except Exception as e:
                 print(f"AsyncReplayBuffer worker error: {e}")
                 

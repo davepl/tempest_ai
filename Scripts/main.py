@@ -108,8 +108,8 @@ def print_bucket_stats(agent, kb_handler):
         print(f"  {'main':<15} {main_label:<15} {main_size:>9,} / {main_capacity:<10,} "
               f"{main_fill_pct:>6.1f}%  [{bar}]")
         
-        # TD-Error thresholds
-        print(f"\n{'TD-ERROR PERCENTILE THRESHOLDS':<40}")
+        # Priority metric thresholds (currently using reward magnitude as proxy)
+        print(f"\n{'PRIORITY METRIC PERCENTILE THRESHOLDS (REWARD MAGNITUDE)':<75}")
         print("-" * 90)
         
         # Dynamically get threshold keys
