@@ -9,7 +9,7 @@
 # ||  NEED TO KNOW:                                                                                               ||
 # ||   - Creates model dir; instantiates HybridDQNAgent; loads latest model if present.                           ||
 # ||   - Starts SocketServer (Lua <-> Python bridge) and metrics display loop.                                    ||
-# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t,v), LR adjust (l/L), header (c).                ||
+# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t,v), LR adjust (l/L), bucket stats (b).          ||
 # ||                                                                                                              ||
 # ||  CONSUMES: RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, SERVER_CONFIG, metrics                                   ||
 # ||  PRODUCES: running server, periodic metrics rows, on-exit model save                                         ||
@@ -32,6 +32,119 @@ from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metr
 
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
+
+def print_bucket_stats(agent, kb_handler):
+    """Print detailed N-bucket replay buffer statistics table."""
+    try:
+        # Get stats from replay buffer
+        if not hasattr(agent, 'memory') or agent.memory is None:
+            print("\nNo replay buffer available")
+            return
+        
+        stats = agent.memory.get_partition_stats()
+        actor_comp = agent.memory.get_actor_composition()
+        
+        # Print header
+        print("\n" + "=" * 90)
+        print(" " * 30 + "N-BUCKET REPLAY BUFFER STATISTICS")
+        print("=" * 90)
+        
+        # Overall stats
+        print(f"\n{'OVERALL STATISTICS':<40}")
+        print("-" * 90)
+        print(f"  Total Size:          {stats['total_size']:>12,} / {stats['total_capacity']:>12,} "
+              f"({stats['total_size']/stats['total_capacity']*100:>5.1f}%)")
+        print(f"  DQN Experiences:     {actor_comp['dqn']:>12,}   "
+              f"({actor_comp['frac_dqn']*100:>5.1f}%)")
+        print(f"  Expert Experiences:  {actor_comp['expert']:>12,}   "
+              f"({actor_comp['frac_expert']*100:>5.1f}%)")
+        
+        # Bucket-by-bucket breakdown
+        print(f"\n{'PRIORITY BUCKET BREAKDOWN':<40}")
+        print("-" * 90)
+        print(f"  {'Bucket':<15} {'Percentile':<15} {'Size':<20} {'Capacity':<20} {'Fill %':<10}")
+        print("-" * 90)
+        
+        # Dynamically get priority buckets from stats
+        priority_buckets = []
+        for key in stats.keys():
+            if key.startswith('p') and key.endswith('_size') and key != 'main_size':
+                bucket_name = key.replace('_size', '')
+                priority_buckets.append(bucket_name)
+        
+        # Sort by percentile (highest first)
+        priority_buckets.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
+        
+        for name in priority_buckets:
+            # Extract percentile range from name (e.g., 'p98_100' -> '98-100%')
+            parts = name[1:].split('_')  # Remove 'p' prefix and split
+            label = f"{parts[0]}-{parts[1]}%"
+            
+            size = stats.get(f'{name}_size', 0)
+            capacity = stats.get(f'{name}_capacity', 0)
+            fill_pct = stats.get(f'{name}_fill_pct', 0.0)
+            
+            # Visual fill bar (moved right for better alignment)
+            bar_width = 30
+            filled = int(fill_pct / 100 * bar_width)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            
+            print(f"  {name:<15} {label:<15} {size:>9,} / {capacity:<10,} {fill_pct:>6.1f}%  [{bar}]")
+        
+        # Main bucket
+        main_size = stats.get('main_size', 0)
+        main_capacity = stats.get('main_capacity', 0)
+        main_fill_pct = stats.get('main_fill_pct', 0.0)
+        filled = int(main_fill_pct / 100 * 30)
+        bar = '█' * filled + '░' * (30 - filled)
+        
+        # Determine main bucket label from lowest priority bucket
+        if priority_buckets:
+            lowest_percentile = int(priority_buckets[-1].split('_')[0][1:])
+            main_label = f"<{lowest_percentile}%"
+        else:
+            main_label = "<90%"  # Default for N=3
+        
+        print(f"  {'main':<15} {main_label:<15} {main_size:>9,} / {main_capacity:<10,} "
+              f"{main_fill_pct:>6.1f}%  [{bar}]")
+        
+        # TD-Error thresholds
+        print(f"\n{'TD-ERROR PERCENTILE THRESHOLDS':<40}")
+        print("-" * 90)
+        
+        # Dynamically get threshold keys
+        threshold_keys = []
+        for key in stats.keys():
+            if key.startswith('threshold_p'):
+                threshold_keys.append(key)
+        
+        # Sort by percentile (highest first)
+        threshold_keys.sort(key=lambda x: int(x.split('_p')[1]), reverse=True)
+        
+        for key in threshold_keys:
+            percentile = key.split('_p')[1]
+            threshold = stats.get(key, 0.0)
+            label = f"{percentile}th percentile:"
+            print(f"  {label:<25} {threshold:>8.4f}")
+        
+        # Additional metrics
+        print(f"\n{'SAMPLING METRICS':<40}")
+        print("-" * 90)
+        print(f"  {'Recent batch size:':<25} {getattr(agent, 'batch_size', 'N/A')}")
+        print(f"  {'Training steps:':<25} {getattr(metrics, 'total_training_steps', 0):>12,}")
+        print(f"  {'Experiences added:':<25} {stats['total_size']:>12,}")
+        
+        print("\n" + "=" * 90 + "\n")
+        
+        # Restore terminal and display current row
+        if kb_handler and IS_INTERACTIVE:
+            kb_handler.set_raw_mode()
+        
+    except Exception as e:
+        print(f"\nError printing bucket stats: {e}")
+        traceback.print_exc()
+        if kb_handler and IS_INTERACTIVE:
+            kb_handler.set_raw_mode()
 
 def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
@@ -148,6 +261,9 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == 'l':
                     agent.adjust_learning_rate(-0.00005, keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
+                elif key == 'b':
+                    # Print N-bucket replay buffer statistics
+                    print_bucket_stats(agent, keyboard_handler)
             
             time.sleep(0.1)
         except Exception as e:
@@ -217,6 +333,16 @@ def print_network_config(agent):
     print(f"   Gradient Clip:     10.0 (max norm)")
     print(f"   N-Step Returns:    {RL_CONFIG.n_step}-step")
     print(f"   Training Workers:  {RL_CONFIG.training_workers}")
+    
+    # Keyboard Controls
+    print("\n⌨️  KEYBOARD CONTROLS:")
+    print(f"   [q] Quit           [s] Save Model       [c] Clear Screen")
+    print(f"   [o] Override       [e] Expert Mode      [p] Force Epsilon")
+    print(f"   [t] Training       [v] Verbose          [h] Hard Target Update")
+    print(f"   [7] Dec Expert     [8] Reset Expert     [9] Inc Expert")
+    print(f"   [4] Dec Epsilon    [5] Reset Epsilon    [6] Inc Epsilon")
+    print(f"   [l] Dec LR         [L] Inc LR           [space] Print Row")
+    print(f"   [b] Bucket Stats   - Display N-bucket replay buffer statistics")
     
     print("\n" + "="*100 + "\n")
 

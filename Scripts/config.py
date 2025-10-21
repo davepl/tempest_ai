@@ -103,7 +103,14 @@ class RLConfigData:
     expert_ratio_decay: float = 1.0      # Apply mild decay each step interval
     expert_ratio_decay_steps: int = 10000  # Step interval for applying decay
 
-    memory_size: int = 2000000             # Balanced buffer size (was 4000000)
+    memory_size: int = 2000000             # Total buffer size across all buckets
+    
+    # N-Bucket stratified replay buffer configuration (PER-like without performance overhead)
+    # Ultra-focused on 90-100th percentile: top 2%, 95-98%, 90-95%, and main <90%
+    replay_n_buckets: int = 3              # Number of priority buckets (3 buckets focusing on 90-100th percentile)
+    replay_bucket_size: int = 250000       # Size of each priority bucket (250K each = 750K total)
+    replay_main_bucket_size: int = 1500000 # Size of main bucket for <90th percentile experiences (1.5M)
+    
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
@@ -152,8 +159,8 @@ class RLConfigData:
     continuous_loss_weight_max: float = 3.0   # Clamp bounds for adaptive scaling
     
     # Behavioral cloning for expert frames (imitation learning)
-    use_behavioral_cloning: bool = False   # DISABLED: BC loss removed in simplified training.py
-    bc_loss_weight: float = 0.0           # Weight for behavioral cloning loss (relative to Q-learning loss)
+    use_behavioral_cloning: bool = True   # DISABLED: BC loss removed in simplified training.py
+    bc_loss_weight: float = 1.0           # Weight for behavioral cloning loss (relative to Q-learning loss)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True

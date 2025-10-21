@@ -380,65 +380,121 @@ class HybridDQN(nn.Module):
         return discrete_q, continuous_spinner
 
 class HybridReplayBuffer:
-    """Experience replay buffer with partitioned storage for hybrid discrete-continuous actions.
+    """Experience replay buffer with N-bucket stratified storage for hybrid discrete-continuous actions.
     
     Stores experiences as: (state, discrete_action, continuous_action, reward, next_state, done, actor, horizon)
     - discrete_action: integer index for fire/zap combination (0-3)
     - continuous_action: float spinner value in [-0.9, +0.9]
     - actor: string tag identifying source of experience ('expert' or 'dqn')
     
-    Uses partitioned buffer approach with three partitions:
-    - High-reward partition (25% of buffer): Stores experiences with reward >= 75th percentile
-    - Pre-death partition (25% of buffer): Virtual partition via terminal index tracking
-    - Regular partition (50% of buffer): Stores all other experiences
-    - Sampling draws 25% from high-reward, 25% from pre-death, 50% from regular
+    Uses N-bucket stratified sampling based on TD-error percentiles:
+    - N priority buckets (default 5): Split top 50% of TD errors into deciles
+      (e.g., 90-99%, 80-89%, 70-79%, 60-69%, 50-59%)
+    - Each priority bucket: 250K capacity (configurable)
+    - Main bucket: 1M capacity for bottom 50% of TD errors
     
-    This provides PER-like benefits (oversampling high-reward and critical pre-death frames)
-    with zero performance overhead (no numpy scans, just O(1) index arithmetic and range sampling).
+    This provides PER-like benefits (oversampling high TD-error experiences)
+    with O(1) performance (no tree structures, just percentile thresholds and ring buffers).
     """
     def __init__(self, capacity: int, state_size: int):
-        self.capacity = capacity
-        self.size = 0
+        from config import RL_CONFIG
+        
         self.state_size = int(state_size)
         
-        # Partitioned buffer configuration
-        self.high_reward_capacity = int(capacity * 0.25)  # 25% for high-reward experiences
-        self.regular_capacity = capacity - self.high_reward_capacity  # 75% for regular (includes pre-death source)
-        self.high_reward_position = 0  # Write pointer for high-reward ring buffer
-        self.regular_position = 0      # Write pointer for regular ring buffer
-        self.high_reward_size = 0      # Current fill of high-reward partition
-        self.regular_size = 0          # Current fill of regular partition
+        # N-bucket configuration
+        self.n_buckets = getattr(RL_CONFIG, 'replay_n_buckets', 3)
+        bucket_size = getattr(RL_CONFIG, 'replay_bucket_size', 250000)
+        main_bucket_size = getattr(RL_CONFIG, 'replay_main_bucket_size', 1500000)
         
-        # Dynamic threshold for high-reward classification
-        self.high_reward_threshold = 0.0
-        self.reward_window = deque(maxlen=50000)  # Rolling window for percentile calculation
+        # Initialize buckets: N priority buckets + 1 main bucket
+        # Ultra-focused strategy: Priority buckets cover 90-100th percentile (top 10%)
+        # Using power-law spacing: 98-100%, 95-98%, 90-95%
+        # Main bucket holds everything below 90th percentile
+        self.buckets = []
+        
+        # Define percentile ranges for priority buckets (focused on 90-100th percentile)
+        # For N=3: [98-100, 95-98, 90-95]
+        # This dedicates 33% of capacity to top 10% of TD-errors
+        if self.n_buckets == 3:
+            # Ultra-focused: 90-100th percentile split into 3 buckets
+            percentile_ranges = [(98, 100), (95, 98), (90, 95)]
+            main_percentile_high = 90
+        elif self.n_buckets == 4:
+            # Alternative: 85-100th percentile split into 4 buckets
+            percentile_ranges = [(96, 100), (91, 96), (86, 91), (85, 86)]
+            main_percentile_high = 85
+        elif self.n_buckets == 5:
+            # Conservative: 80-100th percentile split into 5 buckets
+            percentile_ranges = [(96, 100), (92, 96), (88, 92), (84, 88), (80, 84)]
+            main_percentile_high = 80
+        else:
+            # Fallback to old linear spacing for other values
+            percentile_ranges = [(100 - (i+1)*10, 100 - i*10) for i in range(self.n_buckets)]
+            main_percentile_high = 100 - self.n_buckets * 10
+        
+        # Create priority buckets with defined ranges
+        for percentile_low, percentile_high in percentile_ranges:
+            self.buckets.append({
+                'name': f'p{percentile_low}-{percentile_high}',
+                'percentile_low': percentile_low,
+                'percentile_high': percentile_high,
+                'capacity': bucket_size,
+                'position': 0,
+                'size': 0
+            })
+        
+        # Add main bucket for experiences below main_percentile_high
+        self.buckets.append({
+            'name': 'main',
+            'percentile_low': 0,
+            'percentile_high': main_percentile_high,
+            'capacity': main_bucket_size,
+            'position': 0,
+            'size': 0
+        })
+        
+        # Calculate total capacity
+        self.capacity = sum(b['capacity'] for b in self.buckets)
+        self.size = 0
+        
+        # Allocate storage arrays across all buckets (contiguous for uniform sampling)
+        self.states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
+        self.discrete_actions = np.zeros((self.capacity,), dtype=np.int32)
+        self.continuous_actions = np.zeros((self.capacity,), dtype=np.float32)
+        self.rewards = np.zeros((self.capacity,), dtype=np.float32)
+        self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
+        self.dones = np.zeros((self.capacity,), dtype=np.bool_)
+        self.actors = np.full((self.capacity,), '', dtype='U10')
+        self.horizons = np.ones((self.capacity,), dtype=np.int32)
+        
+        # Assign storage offset for each bucket (contiguous layout)
+        offset = 0
+        for bucket in self.buckets:
+            bucket['offset'] = offset
+            offset += bucket['capacity']
+        
+        # Rolling TD-error window for percentile threshold calculation
+        self.td_error_window = deque(maxlen=50000)
+        self.percentile_thresholds = [0.0] * self.n_buckets  # Thresholds for 50th, 60th, 70th, 80th, 90th
         self.threshold_update_counter = 0
         
         # Pre-death frame tracking (terminal states)
-        # Store indices of frames that have done=True so we can sample backwards from them
-        self.terminal_indices = deque(maxlen=10000)  # Track last 10K deaths for sampling
-        # Track which frames are "pre-death" (within N frames of a terminal)
-        self.pre_death_flags = np.zeros((capacity,), dtype=np.bool_)
-        
-        # Pre-allocated arrays - CRITICAL: Use zeros() not empty() to avoid uninitialized memory!
-        # Using empty() causes random garbage values that lead to CUDA index out of bounds errors
-        self.states = np.zeros((capacity, self.state_size), dtype=np.float32)
-        self.discrete_actions = np.zeros((capacity,), dtype=np.int32)  # CRITICAL FIX: was empty()
-        self.continuous_actions = np.zeros((capacity,), dtype=np.float32)
-        self.rewards = np.zeros((capacity,), dtype=np.float32)
-        self.next_states = np.zeros((capacity, self.state_size), dtype=np.float32)
-        self.dones = np.zeros((capacity,), dtype=np.bool_)
-        self.actors = np.full((capacity,), '', dtype='U10')  # Initialize to empty strings
-        self.horizons = np.ones((capacity,), dtype=np.int32)  # n-step horizon per transition (default 1)
+        self.terminal_indices = deque(maxlen=10000)
+        self.pre_death_flags = np.zeros((self.capacity,), dtype=np.bool_)
         
         # Random number generator
         self._rand = np.random.default_rng()
 
-    def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon: int):
-        """Add experience to buffer with partitioned storage based on reward."""
+    def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon: int, td_error: float = 0.0):
+        """Add experience to buffer with N-bucket stratified storage based on TD error.
+        
+        Args:
+            td_error: Absolute TD error for this experience (used for bucket classification)
+        """
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
         continuous_val = float(continuous_action) if not isinstance(continuous_action, float) else continuous_action
+        
         # Require explicit, non-empty actor tag
         if not actor:
             raise ValueError("HybridReplayBuffer.push requires a non-empty actor tag")
@@ -448,23 +504,31 @@ class HybridReplayBuffer:
 
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
-
-        # Determine which partition to write to based on reward
-        if reward >= self.high_reward_threshold:
-            # High-reward partition
-            idx = self.high_reward_position
-            self.high_reward_position = (self.high_reward_position + 1) % self.high_reward_capacity
-            if self.high_reward_size < self.high_reward_capacity:
-                self.high_reward_size += 1
-        else:
-            # Regular partition (offset by high_reward_capacity)
-            idx = self.high_reward_capacity + self.regular_position
-            self.regular_position = (self.regular_position + 1) % self.regular_capacity
-            if self.regular_size < self.regular_capacity:
-                self.regular_size += 1
-
+        
+        # Update TD error window for threshold calculation
+        abs_td_error = abs(float(td_error))
+        self.td_error_window.append(abs_td_error)
+        self.threshold_update_counter += 1
+        
+        # Update percentile thresholds periodically
+        if self.threshold_update_counter >= 1000 and len(self.td_error_window) >= 1000:
+            self._update_percentile_thresholds()
+            self.threshold_update_counter = 0
+        
+        # Determine which bucket to write to based on TD error
+        bucket_idx = self._get_bucket_index(abs_td_error)
+        bucket = self.buckets[bucket_idx]
+        
+        # Calculate absolute index in storage arrays
+        idx = bucket['offset'] + bucket['position']
+        
+        # Update bucket ring buffer position
+        bucket['position'] = (bucket['position'] + 1) % bucket['capacity']
+        if bucket['size'] < bucket['capacity']:
+            bucket['size'] += 1
+        
         # Update total size
-        self.size = self.high_reward_size + self.regular_size
+        self.size = sum(b['size'] for b in self.buckets)
 
         # Store experience at determined index
         try:
@@ -479,7 +543,6 @@ class HybridReplayBuffer:
                 s = s[:self.state_size]
             self.states[idx, :] = s
         except Exception:
-            # Fallback to zeros if something went wrong
             self.states[idx, :] = 0.0
         
         self.discrete_actions[idx] = discrete_idx
@@ -510,93 +573,74 @@ class HybridReplayBuffer:
         self.horizons[idx] = h
 
         # Track terminal indices for pre-death sampling
-        # Also mark the previous 5-10 frames as "pre-death" for easier sampling
         if done:
             self.terminal_indices.append(idx)
             # Mark frames 5-10 steps back as pre-death
-            # We'll mark all frames in the lookback range
             from config import RL_CONFIG
             for lookback in range(RL_CONFIG.replay_terminal_lookback_min, RL_CONFIG.replay_terminal_lookback_max + 1):
                 pre_death_idx = idx - lookback
-                # Handle negative indices (before start of buffer)
                 if pre_death_idx >= 0:
                     self.pre_death_flags[pre_death_idx] = True
                 elif self.size >= self.capacity:
-                    # Buffer has wrapped, use modulo
                     pre_death_idx = pre_death_idx % self.capacity
                     self.pre_death_flags[pre_death_idx] = True
-
-        # Update reward threshold periodically using rolling percentile
-        self.reward_window.append(reward)
-        self.threshold_update_counter += 1
-        if self.threshold_update_counter >= 1000 and len(self.reward_window) >= 100:
-            # Update threshold to 75th percentile of recent rewards
-            rewards_array = np.array(list(self.reward_window))
-            self.high_reward_threshold = float(np.percentile(rewards_array, 90.0))
-            self.threshold_update_counter = 0
+    
+    def _get_bucket_index(self, td_error: float) -> int:
+        """Classify TD error into appropriate bucket.
+        
+        Priority buckets cover high percentiles (90-100th for N=3).
+        Main bucket holds everything below the main threshold (e.g., <90th percentile).
+        """
+        # Check against thresholds from highest to lowest
+        for i, threshold in enumerate(self.percentile_thresholds):
+            if td_error >= threshold:
+                return i
+        
+        # If below all thresholds, goes to main bucket (last bucket)
+        return len(self.buckets) - 1
+    
+    def _update_percentile_thresholds(self):
+        """Update percentile thresholds from rolling TD-error window.
+        
+        Calculates thresholds based on configured bucket ranges.
+        For N=3 (ultra-focused): 98th, 95th, 90th percentiles
+        For N=4: 96th, 91st, 86th, 85th percentiles
+        For N=5: 96th, 92nd, 88th, 84th, 80th percentiles
+        """
+        if len(self.td_error_window) < 100:
+            return
+        
+        errors = np.array(self.td_error_window)
+        
+        # Calculate percentiles based on bucket configuration
+        if self.n_buckets == 3:
+            # Ultra-focused on 90-100th: thresholds at 98th, 95th, 90th
+            percentiles = [98, 95, 90]
+        elif self.n_buckets == 4:
+            # 85-100th range: thresholds at 96th, 91st, 86th, 85th
+            percentiles = [96, 91, 86, 85]
+        elif self.n_buckets == 5:
+            # 80-100th range: thresholds at 96th, 92nd, 88th, 84th, 80th
+            percentiles = [96, 92, 88, 84, 80]
+        else:
+            # Fallback to old evenly-spaced logic
+            percentiles = [100 - ((i + 1) * 10) for i in range(self.n_buckets)]
+        
+        self.percentile_thresholds = [np.percentile(errors, p) for p in percentiles]
     
     def sample(self, batch_size):
-        """Sample batch using partitioned buffer for PER-like benefits without overhead.
+        """Sample batch uniformly from all buckets (contiguous storage allows simple uniform sampling).
         
-        Samples 25% from high-reward partition, 25% from pre-death frames, 50% from regular.
-        Pure index arithmetic - no numpy scans, minimal GIL time.
+        Since storage is contiguous, we can simply sample uniformly from [0, size).
+        The TD-error stratification happens at insertion time, distributing experiences
+        across buckets. Uniform sampling naturally oversamples priority buckets since
+        they have more "slots" for high-error experiences.
         """
         if self.size < batch_size:
             return None
-
-        # Import config for lookback settings
-        from config import RL_CONFIG
         
-        # Calculate how many samples from each partition (25/25/50 split)
-        high_count = batch_size // 4  # 25%
-        pre_death_count = batch_size // 4  # 25%
-        regular_count = batch_size - high_count - pre_death_count  # 50%
-        
-        indices = []
-        
-        # Sample from high-reward partition if it has data
-        if self.high_reward_size > 0:
-            high_samples = min(high_count, self.high_reward_size)
-            high_indices = self._rand.integers(0, self.high_reward_size, size=high_samples, dtype=np.int64)
-            indices.extend(high_indices)
-        
-        # Sample from pre-death frames if we have any marked
-        if self.size > 10:
-            # Count how many pre-death frames we have
-            pre_death_mask = self.pre_death_flags[:self.size]
-            pre_death_count_available = np.sum(pre_death_mask)
-            
-            if pre_death_count_available > 0:
-                pre_death_samples = min(pre_death_count, pre_death_count_available)
-                # Get indices of all pre-death frames
-                pre_death_indices_all = np.where(pre_death_mask)[0]
-                # Randomly sample from them
-                if len(pre_death_indices_all) >= pre_death_samples:
-                    sampled_pre_death = self._rand.choice(pre_death_indices_all, size=pre_death_samples, replace=False)
-                    indices.extend(sampled_pre_death)
-                else:
-                    indices.extend(pre_death_indices_all)
-        
-        # Sample from regular partition if it has data
-        if self.regular_size > 0:
-            regular_samples = min(regular_count, self.regular_size)
-            # Offset indices by high_reward_capacity to access regular partition
-            regular_indices = self._rand.integers(
-                self.high_reward_capacity, 
-                self.high_reward_capacity + self.regular_size, 
-                size=regular_samples, 
-                dtype=np.int64
-            )
-            indices.extend(regular_indices)
-        
-        # If we don't have enough samples from partitions, sample uniformly to fill
-        if len(indices) < batch_size:
-            remaining = batch_size - len(indices)
-            uniform_indices = self._rand.integers(0, self.size, size=remaining, dtype=np.int64)
-            indices.extend(uniform_indices)
-        
-        # Convert to numpy array
-        indices = np.array(indices[:batch_size], dtype=np.int64)
+        # Simple uniform sampling from filled portion of buffer
+        indices = self._rand.integers(0, self.size, size=batch_size, dtype=np.int64)
 
         # Vectorized gather for batch data
         states_np = self.states[indices]
@@ -605,7 +649,7 @@ class HybridReplayBuffer:
         batch_continuous_actions = self.continuous_actions[indices]
         batch_rewards = self.rewards[indices]
         batch_dones = self.dones[indices]
-        batch_actors = self.actors[indices]  # Get actor tags for batch
+        batch_actors = self.actors[indices]
         batch_horizons = self.horizons[indices]
 
         # Convert to tensors (pin memory for fast H2D when on CUDA)
@@ -642,16 +686,36 @@ class HybridReplayBuffer:
         return self.size
     
     def get_partition_stats(self):
-        """Return statistics about buffer partitions for monitoring."""
-        return {
-            'high_reward': self.high_reward_size,
-            'pre_death': len(self.terminal_indices),
-            'regular': self.regular_size,
-            'high_reward_threshold': self.high_reward_threshold,
-            'high_reward_capacity': self.high_reward_capacity,
-            'regular_capacity': self.regular_capacity,
-            'terminal_count': len(self.terminal_indices),
+        """Return statistics about N-bucket stratified buffer for monitoring."""
+        stats = {
+            'total_size': self.size,
+            'total_capacity': self.capacity,
         }
+        
+        # Add stats for each bucket
+        for bucket in self.buckets:
+            prefix = bucket['name'].replace('-', '_')
+            stats[f'{prefix}_size'] = bucket['size']
+            stats[f'{prefix}_capacity'] = bucket['capacity']
+            stats[f'{prefix}_fill_pct'] = (bucket['size'] / bucket['capacity'] * 100) if bucket['capacity'] > 0 else 0.0
+        
+        # Add TD-error threshold information
+        # Map threshold indices to actual percentiles based on configuration
+        if self.n_buckets == 3:
+            percentile_labels = [98, 95, 90]
+        elif self.n_buckets == 4:
+            percentile_labels = [96, 91, 86, 85]
+        elif self.n_buckets == 5:
+            percentile_labels = [96, 92, 88, 84, 80]
+        else:
+            # Fallback to old evenly-spaced logic
+            percentile_labels = [100 - ((i + 1) * 10) for i in range(self.n_buckets)]
+        
+        for i, threshold in enumerate(self.percentile_thresholds):
+            if i < len(percentile_labels):
+                stats[f'threshold_p{percentile_labels[i]}'] = threshold
+        
+        return stats
     
     def get_actor_composition(self):
         """Return statistics on actor composition of buffer"""
@@ -957,6 +1021,31 @@ class HybridDQNAgent:
         if actor is None:
             actor = 'dqn'  # Default to DQN if not specified
         
+        # Compute TD-error for bucket classification (approximation using local network)
+        td_error = 0.0
+        try:
+            with torch.no_grad():
+                # Convert to tensors
+                state_t = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+                next_state_t = torch.from_numpy(next_state).float().unsqueeze(0).to(self.device)
+                
+                # Forward pass
+                q_pred, _ = self.qnetwork_local(state_t)
+                q_next, _ = self.qnetwork_local(next_state_t)
+                
+                # Get Q-value for taken action
+                q_current = q_pred[0, discrete_action].item()
+                
+                # Estimate TD target (simplified, no Double DQN)
+                q_next_max = q_next.max().item()
+                td_target = reward + (self.gamma ** horizon) * q_next_max * (1.0 - float(done))
+                
+                # TD error
+                td_error = abs(q_current - td_target)
+        except Exception:
+            # If TD-error computation fails, default to 0.0 (will go to main bucket)
+            td_error = 0.0
+        
         self.memory.push(
             state,
             discrete_action,
@@ -966,6 +1055,7 @@ class HybridDQNAgent:
             done,
             actor=actor,
             horizon=horizon,
+            td_error=td_error,
         )
         
         # Queue multiple training steps per experience

@@ -282,6 +282,8 @@ def train_step(agent):
             metrics.d_loss_count_interval += 1
             metrics.c_loss_sum_interval += metrics.last_c_loss
             metrics.c_loss_count_interval += 1
+            metrics.bc_loss_sum_interval += metrics.last_bc_loss
+            metrics.bc_loss_count_interval += 1
         except Exception:
             pass
         
@@ -327,34 +329,34 @@ def train_step(agent):
         # Track agreement metrics (how often taken actions match current policy)
         try:
             with torch.no_grad():
-                # Get current policy predictions
-                curr_discrete_q, curr_continuous_pred = agent.qnetwork_local(states)
+                # Get current policy predictions (discrete only)
+                curr_discrete_q = agent.qnetwork_local(states)
                 
                 # Filter to only DQN-generated actions for agreement calculation
                 dqn_indices = [i for i, actor in enumerate(actors) if actor == 'dqn']
                 dqn_count = len(dqn_indices)
                 
                 if dqn_count > 0:
+                    # Convert dqn_indices list to tensor for proper indexing
+                    dqn_tensor = torch.tensor(dqn_indices, dtype=torch.long, device=curr_discrete_q.device)
+                    
                     # Discrete agreement: check if argmax matches taken action (DQN only)
                     curr_discrete_actions = curr_discrete_q.argmax(dim=1, keepdim=True)
-                    dqn_discrete_matches = (curr_discrete_actions[dqn_indices] == discrete_actions[dqn_indices]).float()
-                    discrete_agree_frac = dqn_discrete_matches.mean().item()
+                    curr_dqn = curr_discrete_actions[dqn_tensor]
+                    actions_dqn = discrete_actions[dqn_tensor]
                     
-                    # Continuous agreement: check if predictions are close to taken actions (DQN only)
-                    continuous_diff = torch.abs(curr_continuous_pred[dqn_indices] - continuous_actions[dqn_indices])
-                    dqn_continuous_matches = (continuous_diff < 0.1).float()
-                    continuous_agree_frac = dqn_continuous_matches.mean().item()
+                    dqn_discrete_matches = (curr_dqn == actions_dqn).float()
+                    discrete_agree_frac = dqn_discrete_matches.mean().item()
                 else:
                     # Fallback if no DQN actions in batch
                     discrete_agree_frac = 0.0
-                    continuous_agree_frac = 0.0
                 
-                # Update interval accumulators
+                # Update interval accumulators (discrete only)
                 metrics.agree_sum_interval += discrete_agree_frac
                 metrics.agree_count_interval += 1
-                metrics.spinner_agree_sum_interval += continuous_agree_frac
-                metrics.spinner_agree_count_interval += 1
-        except Exception:
+        except Exception as e:
+            # Debug: print if agreement calculation fails
+            print(f"Warning: Agreement calculation failed: {e}")
             pass
     except Exception:
         pass
