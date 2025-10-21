@@ -60,7 +60,6 @@ import time
 import struct
 import random
 import sys
-import subprocess
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Deque
@@ -72,7 +71,7 @@ import torch.optim as optim
 import select
 import threading
 import queue
-from collections import deque, namedtuple
+from collections import deque
 from datetime import datetime
 import socket
 import traceback
@@ -1051,15 +1050,11 @@ class HybridDQNAgent:
         # Restore train mode for training
         self.qnetwork_inference.train()
         
-        # Discrete action selection (epsilon-greedy) or fixed FIRE when spinner_only
-        if getattr(RL_CONFIG, 'spinner_only', False):
-            # FIRE=1, ZAP=0 -> discrete index 2 (binary 10)
-            discrete_action = 2
+        # Discrete action selection via epsilon-greedy
+        if random.random() < epsilon:
+            discrete_action = random.randint(0, self.discrete_actions - 1)
         else:
-            if random.random() < epsilon:
-                discrete_action = random.randint(0, self.discrete_actions - 1)
-            else:
-                discrete_action = discrete_q.argmax(dim=1).item()  # Fixed: specify dimension
+            discrete_action = discrete_q.argmax(dim=1).item()  # Fixed: specify dimension
         
         # Continuous action selection (predicted value + optional exploration noise)
         continuous_action = continuous_pred.cpu().data.numpy()[0, 0]
@@ -1596,121 +1591,6 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
     except Exception as e:
         print(f"ERROR parsing frame data: {e}", flush=True)
         sys.exit(1)
-
-# Rolling window for DQN reward over last 1M frames
-DQN1M_WINDOW_FRAMES = 1_000_000
-_dqn1m_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: float, frame_end: int)
-_dqn1m_window_frames = 0
-_last_frame_count_seen_1m = None
-
-def _update_dqn1m_window(mean_dqn_reward: float):
-    """Update the 1M-frames rolling window with the latest interval.
-
-    Uses the number of frames progressed since the last row as the weight.
-    """
-    global _dqn1m_window_frames, _last_frame_count_seen_1m
-    current_frame = metrics.frame_count
-    # Determine frames elapsed since last sample
-    if _last_frame_count_seen_1m is None:
-        delta_frames = 0
-    else:
-        delta_frames = max(0, current_frame - _last_frame_count_seen_1m)
-    _last_frame_count_seen_1m = current_frame
-
-    # If no frame progress (e.g., first row), just return without adding
-    if delta_frames <= 0:
-        return
-
-    # Append new interval
-    _dqn1m_window.append((delta_frames, float(mean_dqn_reward), int(current_frame)))
-    _dqn1m_window_frames += delta_frames
-
-    # Trim window to last 1M frames (may need partial trim of the oldest bucket)
-    while _dqn1m_window and _dqn1m_window_frames > DQN1M_WINDOW_FRAMES:
-        overflow = _dqn1m_window_frames - DQN1M_WINDOW_FRAMES
-        oldest_frames, oldest_val, oldest_end = _dqn1m_window[0]
-        if oldest_frames <= overflow:
-            _dqn1m_window.popleft()
-            _dqn1m_window_frames -= oldest_frames
-        else:
-            # Partially trim the oldest bucket
-            kept_frames = oldest_frames - overflow
-            _dqn1m_window[0] = (kept_frames, oldest_val, oldest_end)
-            _dqn1m_window_frames = DQN1M_WINDOW_FRAMES
-            break
-
-def _compute_dqn1m_window_stats():
-    """Compute weighted average for the 1M-frame window.
-
-    Returns avg.
-    """
-    if not _dqn1m_window or _dqn1m_window_frames <= 0:
-        return 0.0
-
-    # Weighted average
-    w_sum = float(_dqn1m_window_frames)
-    wy_sum = sum(fr * val for fr, val, _ in _dqn1m_window)
-    avg = wy_sum / w_sum if w_sum > 0 else 0.0
-    return avg
-
-def display_metrics_header(kb=None):
-    """Display header for metrics table"""
-    if not IS_INTERACTIVE: return
-    header = (
-        f"{'Frame':>8} | {'FPS':>5} | {'Clients':>7} | {'Rwrd':>6} | {'Subj':>6} | {'Obj':>6} | {'DQN':>6} | {'DQN1M':>6} | {'Loss':>8} | "
-        f"{'Epsilon':>7} | {'Xprt':>6} | {'Mem Size':>8} | {'Avg Level':>9} | {'Level Type':>10} | {'OVR':>3} | {'Expert':>6} | "
-        f"{'Q-Value Range':>14}"
-    )
-    print_with_terminal_restore(kb, f"\n{'-' * len(header)}")
-    print_with_terminal_restore(kb, header)
-    print_with_terminal_restore(kb, f"{'-' * len(header)}")
-
-def display_metrics_row(agent, kb=None):
-    """Display current metrics in tabular format"""
-    if not IS_INTERACTIVE: return
-    mean_reward = np.mean(list(metrics.episode_rewards)) if metrics.episode_rewards else float('nan')
-    mean_subj_reward = np.mean(list(metrics.subj_rewards)) if metrics.subj_rewards else float('nan')
-    mean_obj_reward = np.mean(list(metrics.obj_rewards)) if metrics.obj_rewards else float('nan')
-    dqn_reward = np.mean(list(metrics.dqn_rewards)) if metrics.dqn_rewards else float('nan')
-    mean_loss = np.mean(list(metrics.losses)) if metrics.losses else float('nan')
-    guided_ratio = metrics.expert_ratio
-    mem_size = len(agent.memory) if agent else 0
-    
-    # Update DQN1M window and compute stats
-    _update_dqn1m_window(dqn_reward)
-    dqn1m_avg = _compute_dqn1m_window_stats()
-    
-    # Get client count from server if available
-    client_count = 0
-    if hasattr(metrics, 'global_server') and metrics.global_server:
-        with metrics.global_server.client_lock:
-            client_count = len(metrics.global_server.clients)
-            # Update the metrics.client_count value
-            metrics.client_count = client_count
-    
-    # Determine override status
-    # Display simple ON/OFF for override in its own column; Expert has its own ON/OFF column
-    override_status = "ON" if metrics.override_expert else "OFF"
-    
-    # Display average level as 1-based instead of 0-based
-    display_level = metrics.average_level + 1.0
-    
-    # Get Q-value range from the agent
-    q_range = "N/A"
-    if agent:
-        try:
-            min_q, max_q = agent.get_q_value_range()
-            if not (np.isnan(min_q) or np.isnan(max_q)):
-                q_range = f"[{min_q:.2f}, {max_q:.2f}]"
-        except Exception:
-            q_range = "Error"
-    
-    row = (
-        f"{metrics.frame_count:8d} | {metrics.fps:5.1f} | {client_count:>7} | {mean_reward:6.2f} | {mean_subj_reward:6.2f} | {mean_obj_reward:6.2f} | {dqn_reward:6.2f} | {dqn1m_avg:6.2f} | {mean_loss:8.2f} | "
-        f"{metrics.epsilon:7.3f} | {guided_ratio*100:6.1f} | {mem_size:8d} | {display_level:9.2f} | {'Open' if metrics.open_level else 'Closed':10} | {override_status:>3} | {'ON' if metrics.expert_mode else 'OFF':>6} | "
-        f"{q_range:>14}"
-    )
-    print_with_terminal_restore(kb, row)
 
 def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
     """Expert policy to move toward nearest enemy with neutral tie-breaker.

@@ -223,23 +223,11 @@ def train_step(agent):
     c_loss = (c_loss_raw * advantage_weights).mean()
 
     # Combine losses
-    if getattr(RL_CONFIG, 'spinner_only', False):
-        total_loss = w_cont * c_loss
-    else:
-        total_loss = (w_disc * d_loss) + (w_cont * c_loss)
+    total_loss = (w_disc * d_loss) + (w_cont * c_loss)
 
     # Backward pass
     agent.optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
-
-    # Clear discrete gradients in spinner-only mode
-    if getattr(RL_CONFIG, 'spinner_only', False):
-        try:
-            for name, p in agent.qnetwork_local.named_parameters():
-                if name.startswith('discrete_') and p.grad is not None:
-                    p.grad.zero_()
-        except Exception:
-            pass
 
     # Gradient clipping and tracking
     grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), 10.0)
