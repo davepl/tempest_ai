@@ -735,12 +735,6 @@ class SocketServer:
                             except Exception:
                                 pass
                         discrete_action, continuous_spinner = int(da), float(ca)
-                        # Spinner-only experiment: override discrete to FIRE/no-zap in DQN mode
-                        try:
-                            if getattr(RL_CONFIG, 'spinner_only', False):
-                                discrete_action = 2  # FIRE=1, ZAP=0
-                        except Exception:
-                            pass
                         # Optional probabilistic superzap gate for DQN actions: disabled by default
                         try:
                             enable_zap_gate = bool(getattr(RL_CONFIG, 'enable_superzap_gate', False))
