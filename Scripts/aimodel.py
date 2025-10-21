@@ -411,21 +411,21 @@ class HybridReplayBuffer:
         # Main bucket holds everything below 90th percentile
         self.buckets = []
         
-        # Define percentile ranges for priority buckets (focused on 90-100th percentile)
-        # For N=3: [98-100, 95-98, 90-95]
-        # This dedicates 33% of capacity to top 10% of TD-errors
+        # Define percentile ranges for priority buckets
+        # Top 35% of experiences distributed across priority buckets
+        # This dedicates 33% of capacity (3x250k) to top 35% of TD-errors
         if self.n_buckets == 3:
-            # Ultra-focused: 90-100th percentile split into 3 buckets
-            percentile_ranges = [(98, 100), (95, 98), (90, 95)]
-            main_percentile_high = 90
+            # Top 35% split into 3 buckets: [95-100%, 85-95%, 75-85%], remaining 65% in main
+            percentile_ranges = [(95, 100), (85, 95), (75, 85)]
+            main_percentile_high = 75
         elif self.n_buckets == 4:
-            # Alternative: 85-100th percentile split into 4 buckets
-            percentile_ranges = [(96, 100), (91, 96), (86, 91), (85, 86)]
-            main_percentile_high = 85
+            # Top 35% split into 4 buckets
+            percentile_ranges = [(95, 100), (85, 95), (75, 85), (65, 75)]
+            main_percentile_high = 65
         elif self.n_buckets == 5:
-            # Conservative: 80-100th percentile split into 5 buckets
-            percentile_ranges = [(96, 100), (92, 96), (88, 92), (84, 88), (80, 84)]
-            main_percentile_high = 80
+            # Top 35% split into 5 buckets
+            percentile_ranges = [(95, 100), (88, 95), (81, 88), (74, 81), (67, 74)]
+            main_percentile_high = 67
         else:
             # Fallback to old linear spacing for other values
             percentile_ranges = [(100 - (i+1)*10, 100 - i*10) for i in range(self.n_buckets)]
@@ -472,9 +472,27 @@ class HybridReplayBuffer:
             bucket['offset'] = offset
             offset += bucket['capacity']
         
-        # Rolling TD-error window for percentile threshold calculation
-        self.td_error_window = deque(maxlen=50000)
-        self.percentile_thresholds = [0.0] * self.n_buckets  # Thresholds for 50th, 60th, 70th, 80th, 90th
+        # Rolling priority metric window for percentile threshold calculation
+        # Currently using reward magnitude as a fast proxy for experience importance
+        self.priority_metric_window = deque(maxlen=50000)
+        
+        # Initialize thresholds with reasonable defaults based on expected reward range
+        # Use conservative initial values that will be updated as data arrives
+        # Assume rewards typically range from 0 to ~10 for Tempest gameplay
+        if self.n_buckets == 3:
+            # Target percentiles: 95th, 85th, 75th for top 35% distribution
+            # Initial guesses: higher values for more selective priority buckets
+            self.percentile_thresholds = [7.0, 5.0, 3.0]
+        elif self.n_buckets == 4:
+            # Target percentiles: 95th, 85th, 75th, 65th
+            self.percentile_thresholds = [7.0, 5.0, 3.5, 2.0]
+        elif self.n_buckets == 5:
+            # Target percentiles: 95th, 88th, 81st, 74th, 67th
+            self.percentile_thresholds = [7.0, 5.5, 4.0, 3.0, 2.0]
+        else:
+            # Fallback: evenly spaced from 1.0 to n_buckets
+            self.percentile_thresholds = [float(self.n_buckets - i) for i in range(self.n_buckets)]
+        
         self.threshold_update_counter = 0
         
         # Pre-death frame tracking (terminal states)
@@ -485,10 +503,10 @@ class HybridReplayBuffer:
         self._rand = np.random.default_rng()
 
     def push(self, state, discrete_action, continuous_action, reward, next_state, done, actor, horizon: int, td_error: float = 0.0):
-        """Add experience to buffer with N-bucket stratified storage based on TD error.
+        """Add experience to buffer with N-bucket stratified storage based on priority metric.
         
         Args:
-            td_error: Absolute TD error for this experience (used for bucket classification)
+            td_error: Priority metric for this experience (currently reward magnitude, used for bucket classification)
         """
         # Coerce inputs to proper types
         discrete_idx = int(discrete_action) if not isinstance(discrete_action, int) else discrete_action
@@ -504,18 +522,21 @@ class HybridReplayBuffer:
         # Clamp continuous action to valid range
         continuous_val = max(-0.9, min(0.9, continuous_val))
         
-        # Update TD error window for threshold calculation
-        abs_td_error = abs(float(td_error))
-        self.td_error_window.append(abs_td_error)
+        # Update priority metric window for threshold calculation
+        abs_priority_metric = abs(float(td_error))
+        self.priority_metric_window.append(abs_priority_metric)
         self.threshold_update_counter += 1
         
         # Update percentile thresholds periodically
-        if self.threshold_update_counter >= 1000 and len(self.td_error_window) >= 1000:
+        # Start with frequent updates (every 100 samples) to quickly adapt from initial defaults
+        # After 10k samples, reduce frequency to every 1000 samples for efficiency
+        update_interval = 100 if len(self.priority_metric_window) < 10000 else 1000
+        if self.threshold_update_counter >= update_interval and len(self.priority_metric_window) >= update_interval:
             self._update_percentile_thresholds()
             self.threshold_update_counter = 0
         
-        # Determine which bucket to write to based on TD error
-        bucket_idx = self._get_bucket_index(abs_td_error)
+        # Determine which bucket to write to based on priority metric
+        bucket_idx = self._get_bucket_index(abs_priority_metric)
         bucket = self.buckets[bucket_idx]
         
         # Calculate absolute index in storage arrays
@@ -584,45 +605,47 @@ class HybridReplayBuffer:
                     pre_death_idx = pre_death_idx % self.capacity
                     self.pre_death_flags[pre_death_idx] = True
     
-    def _get_bucket_index(self, td_error: float) -> int:
-        """Classify TD error into appropriate bucket.
+    def _get_bucket_index(self, priority_metric: float) -> int:
+        """Classify priority metric (reward magnitude) into appropriate bucket.
         
-        Priority buckets cover high percentiles (90-100th for N=3).
-        Main bucket holds everything below the main threshold (e.g., <90th percentile).
+        Priority buckets cover high percentiles (e.g., 95-100th, 85-95th, 75-85th for N=3).
+        Main bucket holds everything below the main threshold (e.g., <75th percentile).
         """
         # Check against thresholds from highest to lowest
         for i, threshold in enumerate(self.percentile_thresholds):
-            if td_error >= threshold:
+            if priority_metric >= threshold:
                 return i
         
         # If below all thresholds, goes to main bucket (last bucket)
         return len(self.buckets) - 1
     
     def _update_percentile_thresholds(self):
-        """Update percentile thresholds from rolling TD-error window.
+        """Update percentile thresholds from rolling priority metric window.
         
         Calculates thresholds based on configured bucket ranges.
-        For N=3 (ultra-focused): 98th, 95th, 90th percentiles
-        For N=4: 96th, 91st, 86th, 85th percentiles
-        For N=5: 96th, 92nd, 88th, 84th, 80th percentiles
+        Currently using reward magnitude as priority metric proxy.
+        For N=3: 95th, 85th, 75th percentiles (top 35% split into 3 buckets, bottom 65% in main)
         """
-        if len(self.td_error_window) < 100:
+        if len(self.priority_metric_window) < 100:
             return
         
-        errors = np.array(self.td_error_window)
+        errors = np.array(self.priority_metric_window)
         
         # Calculate percentiles based on bucket configuration
+        # Goal: Distribute top 35% of priority metrics (rewards) across N priority buckets
+        # Main bucket gets bottom 65% (for N=3) or 35% (for N=4)
         if self.n_buckets == 3:
-            # Ultra-focused on 90-100th: thresholds at 98th, 95th, 90th
-            percentiles = [98, 95, 90]
+            # Top 35% split into 3 buckets: 95-100%, 85-95%, 75-85%
+            # Thresholds at 95th, 85th, 75th percentiles
+            percentiles = [95, 85, 75]
         elif self.n_buckets == 4:
-            # 85-100th range: thresholds at 96th, 91st, 86th, 85th
-            percentiles = [96, 91, 86, 85]
+            # Top 35% split into 4 buckets: 95-100%, 85-95%, 75-85%, 65-75%
+            percentiles = [95, 85, 75, 65]
         elif self.n_buckets == 5:
-            # 80-100th range: thresholds at 96th, 92nd, 88th, 84th, 80th
-            percentiles = [96, 92, 88, 84, 80]
+            # Top 35% split into 5 buckets
+            percentiles = [95, 88, 81, 74, 67]
         else:
-            # Fallback to old evenly-spaced logic
+            # Fallback to evenly-spaced logic
             percentiles = [100 - ((i + 1) * 10) for i in range(self.n_buckets)]
         
         self.percentile_thresholds = [np.percentile(errors, p) for p in percentiles]
@@ -736,11 +759,11 @@ class HybridReplayBuffer:
         # Add TD-error threshold information
         # Map threshold indices to actual percentiles based on configuration
         if self.n_buckets == 3:
-            percentile_labels = [98, 95, 90]
+            percentile_labels = [95, 85, 75]
         elif self.n_buckets == 4:
-            percentile_labels = [96, 91, 86, 85]
+            percentile_labels = [95, 85, 75, 65]
         elif self.n_buckets == 5:
-            percentile_labels = [96, 92, 88, 84, 80]
+            percentile_labels = [95, 88, 81, 74, 67]
         else:
             # Fallback to old evenly-spaced logic
             percentile_labels = [100 - ((i + 1) * 10) for i in range(self.n_buckets)]
@@ -1072,30 +1095,11 @@ class HybridDQNAgent:
         if actor is None:
             actor = 'dqn'  # Default to DQN if not specified
         
-        # Compute TD-error for bucket classification (approximation using local network)
-        td_error = 0.0
-        try:
-            with torch.no_grad():
-                # Convert to tensors
-                state_t = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
-                next_state_t = torch.from_numpy(next_state).float().unsqueeze(0).to(self.device)
-                
-                # Forward pass
-                q_pred, _ = self.qnetwork_local(state_t)
-                q_next, _ = self.qnetwork_local(next_state_t)
-                
-                # Get Q-value for taken action
-                q_current = q_pred[0, discrete_action].item()
-                
-                # Estimate TD target (simplified, no Double DQN)
-                q_next_max = q_next.max().item()
-                td_target = reward + (self.gamma ** horizon) * q_next_max * (1.0 - float(done))
-                
-                # TD error
-                td_error = abs(q_current - td_target)
-        except Exception:
-            # If TD-error computation fails, default to 0.0 (will go to main bucket)
-            td_error = 0.0
+        # Use reward magnitude as a fast priority metric proxy instead of expensive forward passes
+        # This is orders of magnitude faster than computing actual TD-error
+        # High rewards indicate important transitions (enemy kills, level completion)
+        # Actual TD-errors can be computed during sampling/training if needed
+        td_error = abs(float(reward))
         
         self.memory.push(
             state,
@@ -1109,9 +1113,10 @@ class HybridDQNAgent:
             td_error=td_error,
         )
         
-        # Queue multiple training steps per experience
+        # Queue training steps only if training is enabled
+        # NOTE: Experiences are ALWAYS collected in the replay buffer regardless of training state
         if not getattr(metrics, 'training_enabled', True) or not self.training_enabled:
-            return
+            return  # Skip queueing training, but buffer is already updated above
         # Apply training_steps_per_sample ONLY in the background trainer to avoid double-counting here.
         # Enqueue a single token per environment sample to minimize queue overhead.
         try:
