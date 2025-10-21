@@ -12,7 +12,7 @@
 # ||   - ServerConfigData: host/port/max_clients, params_count (state vector length expected from Lua).           ||
 # ||   - RLConfigData: RL/training hyperparameters (batch_size, lr, gamma, n_step, epsilon/expert schedules,      ||
 # ||                   replay size, network depth/width, target update cadence, loss settings, reward scaling,    ||
-# ||                   spinner-only/testing toggles, soft-target tau, replay sampling options).                   ||
+# ||                   evaluation toggles, soft-target tau, replay sampling options).                             ||
 # ||   - MetricsData: Thread-safe counters/aggregates for display and diagnostics (losses, rates, queue health,   ||
 # ||                  reward means, Q-window summaries, gradient stats, training progress).                       ||
 # ||   - Global singletons: SERVER_CONFIG, RL_CONFIG, metrics.                                                    ||
@@ -131,36 +131,16 @@ class RLConfigData:
     subj_reward_scale: float = 0.0007       # subjective are scaled to 70% of objective
     ignore_subjective_rewards: bool = True
 
-    # Diagnostics
-    grad_diag_interval: int = 0           # Every N training steps, sample per-head gradient contributions (0=off)
-
-    # Experimental: optimize spinner only (ignore discrete loss and fix DQN discrete action to FIRE/no-zap)
-    spinner_only: bool = False
-    # When spinner_only is True, restrict spinner training to expert frames only
-    spinner_only_expert_only: bool = False
-
     # Loss weighting (makes contributions explicit and tunable)
     continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss - BALANCED with continuous
     discrete_bc_weight: float = 0.5       # Weight for discrete behavioral cloning loss - REDUCED to allow Q-learning to dominate at low expert ratios
     # High-leverage continuous/expert tuning additions
-    continuous_expert_weight_start: float = 1.0   # Initial per-sample weight multiplier for expert spinner supervision
-    continuous_expert_weight_final: float = 0.08  # Final annealed expert spinner supervision weight
     continuous_expert_weight_frames: int = 0  # DISABLED: Complex annealing removed in simplified training.py
-    continuous_gate_sigma: float = 0.20    # Advantage (standardized reward) threshold for allowing DQN spinner self-imitation
-    continuous_self_imitation: bool = True  # Enable selective self-imitation for spinner on high-advantage DQN frames
     bc_q_filter_margin: float = 0.0        # Q-filter margin for behavioral cloning (0 disables filtering)
-    adaptive_continuous_loss: bool = False # Enable adaptive scaling of continuous_loss_weight based on gradient norms
-    adaptive_cont_grad_low: float = 0.05   # If continuous head grad norm below this, scale weight up
-    adaptive_cont_grad_high: float = 0.50  # If above this, optionally scale weight down
-    adaptive_cont_scale_up: float = 1.15   # Multiplicative up-scaling factor
-    adaptive_cont_scale_dn: float = 0.90   # Multiplicative down-scaling factor
-    continuous_loss_weight_min: float = 0.25  # Clamp bounds for adaptive scaling
-    continuous_loss_weight_max: float = 3.0   # Clamp bounds for adaptive scaling
     
     # Behavioral cloning for expert frames (imitation learning)
     use_behavioral_cloning: bool = True   # DISABLED: BC loss removed in simplified training.py
-    bc_loss_weight: float = 1.0           # Weight for behavioral cloning loss (relative to Q-learning loss)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
@@ -169,29 +149,9 @@ class RLConfigData:
     td_target_clip: float | None = 100.0    # EMERGENCY FIX: Drastically reduced from 1500 to prevent Q-explosion
     max_q_value: float = 10.0               # EMERGENCY FIX: Drastically reduced from 50 to prevent overestimation spiral
   
-    # Replay sampling optimization flags
-    # --- Replay Sampling Optimization ---
-    # When True, HybridReplayBuffer avoids per-sample O(N) scans for each category by caching:
-    # 1. High-reward percentile threshold + boolean mask (updated periodically & with light EMA on push)
-    # 2. Terminal transition indices for pre-death sampling
-    # In extremely large buffers (millions of entries) this reduces CPU time per sample and GC pressure.
-
-    # Percentile used to define "high reward" group (e.g., 70 = top 30%).
-    replay_high_reward_percentile: float = 90.0
-
-    # Recent window definition: max(replay_recent_window_min, frac * buffer_size)
-    replay_recent_window_min: int = 50000
-    replay_recent_window_frac: float = 0.10
-
-    # Full cache refresh cadence in frames (defends against slow drift of EMA threshold)
-    replay_cache_refresh_interval: int = 5000
-
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
     replay_terminal_lookback_max: int = 10
-
-    # Debug toggle prints fallback notices / warnings
-    replay_sampling_debug: bool = False
 
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob
