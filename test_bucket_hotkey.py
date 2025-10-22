@@ -15,8 +15,8 @@ class MockKeyboardHandler:
         pass
 
 def test_bucket_stats_display():
-    """Test the bucket stats display function."""
-    print("Testing N-bucket replay buffer statistics display...\n")
+    """Test the buffer stats hotkey against the simplified uniform buffer."""
+    print("Testing replay buffer statistics display...\n")
     
     # Create agent with replay buffer
     agent = HybridDQNAgent(
@@ -34,25 +34,15 @@ def test_bucket_stats_display():
     print("Filling buffer with test experiences...")
     state_size = 128
     
-    # Add varied TD-error experiences to see bucket distribution
-    for i in range(5000):
+    for i in range(4000):
         state = np.random.randn(state_size).astype(np.float32)
         next_state = np.random.randn(state_size).astype(np.float32)
         discrete_action = np.random.randint(0, 4)
         continuous_action = np.random.uniform(-0.9, 0.9)
         reward = np.random.randn()
         done = (i % 100 == 0)  # Terminal every 100 steps
-        
-        # Vary TD-errors: some low, some medium, some high
-        if i < 2000:
-            td_error = np.random.exponential(0.5)  # Low TD-errors
-            actor = 'expert'
-        elif i < 4000:
-            td_error = np.random.uniform(0, 3)  # Medium TD-errors
-            actor = 'dqn'
-        else:
-            td_error = np.random.gamma(2, 2)  # Higher TD-errors
-            actor = 'dqn'
+
+        actor = 'expert' if i % 3 == 0 else 'dqn'
         
         agent.memory.push(
             state=state,
@@ -63,7 +53,6 @@ def test_bucket_stats_display():
             done=done,
             actor=actor,
             horizon=1,
-            td_error=td_error
         )
     
     print(f"Added {len(agent.memory)} experiences to buffer\n")
@@ -74,7 +63,7 @@ def test_bucket_stats_display():
     kb_handler = MockKeyboardHandler()
     print_bucket_stats(agent, kb_handler)
     
-    print("\n✓ Bucket stats display test completed successfully!")
+    print("\n✓ Buffer stats display test completed successfully!")
 
 if __name__ == '__main__':
     test_bucket_stats_display()

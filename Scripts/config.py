@@ -87,7 +87,7 @@ class RLConfigData:
     batch_size: int = 2048                # Reduced from 8192 for faster sampling
     lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
-    n_step: int = 3                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
+    n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
     epsilon: float = 0.05                  # Current exploration rate
     epsilon_start: float = 0.05            # Start with moderate exploration
@@ -95,6 +95,7 @@ class RLConfigData:
     epsilon_end: float = 0.05              # Target minimum epsilon
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 1
+    epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
@@ -146,8 +147,8 @@ class RLConfigData:
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 100.0    # EMERGENCY FIX: Drastically reduced from 1500 to prevent Q-explosion
-    max_q_value: float = 10.0               # EMERGENCY FIX: Drastically reduced from 50 to prevent overestimation spiral
+    td_target_clip: float | None = 50.0    # Clamp TD targets to match network output clamping (±50)
+    max_q_value: float = 50.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
@@ -158,7 +159,7 @@ class RLConfigData:
     # This forces strategic zap usage rather than spamming
     # DISABLED FOR TRAINING: Causes 67% action mismatch (model predicts zaps, gate blocks them)
     # Re-enable for evaluation/competition once model is trained
-    enable_superzap_gate: bool = False  # Was True - disabled to fix agreement < 25% issue
+    enable_superzap_gate: bool = True  # Was True - disabled to fix agreement < 25% issue
     superzap_prob: float = 0.01  # 1% success rate for zap attempts
 
 # Create instance of RLConfigData after its definition
