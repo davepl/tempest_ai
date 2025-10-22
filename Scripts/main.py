@@ -33,119 +33,96 @@ from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metr
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
 
+
 def print_bucket_stats(agent, kb_handler):
-    """Print detailed N-bucket replay buffer statistics table."""
+    """Print replay buffer statistics in the simplified uniform layout."""
     try:
-        # Get stats from replay buffer
         if not hasattr(agent, 'memory') or agent.memory is None:
             print("\nNo replay buffer available")
             return
-        
+
         stats = agent.memory.get_partition_stats()
         actor_comp = agent.memory.get_actor_composition()
-        
-        # Print header
+
         print("\n" + "=" * 90)
-        print(" " * 30 + "N-BUCKET REPLAY BUFFER STATISTICS")
+        print(" " * 30 + "REPLAY BUFFER STATISTICS")
         print("=" * 90)
-        
-        # Overall stats
+
         print(f"\n{'OVERALL STATISTICS':<40}")
         print("-" * 90)
-        print(f"  Total Size:          {stats['total_size']:>12,} / {stats['total_capacity']:>12,} "
-              f"({stats['total_size']/stats['total_capacity']*100:>5.1f}%)")
-        print(f"  DQN Experiences:     {actor_comp['dqn']:>12,}   "
-              f"({actor_comp['frac_dqn']*100:>5.1f}%)")
-        print(f"  Expert Experiences:  {actor_comp['expert']:>12,}   "
-              f"({actor_comp['frac_expert']*100:>5.1f}%)")
-        
-        # Bucket-by-bucket breakdown
-        print(f"\n{'PRIORITY BUCKET BREAKDOWN':<40}")
-        print("-" * 90)
-        print(f"  {'Bucket':<15} {'Percentile':<15} {'Size':<20} {'Capacity':<20} {'Fill %':<10}")
-        print("-" * 90)
-        
-        # Dynamically get priority buckets from stats
-        priority_buckets = []
-        for key in stats.keys():
-            if key.startswith('p') and key.endswith('_size') and key != 'main_size':
-                bucket_name = key.replace('_size', '')
-                priority_buckets.append(bucket_name)
-        
-        # Sort by percentile (highest first)
-        priority_buckets.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
-        
-        for name in priority_buckets:
-            # Extract percentile range from name (e.g., 'p98_100' -> '98-100%')
-            parts = name[1:].split('_')  # Remove 'p' prefix and split
-            label = f"{parts[0]}-{parts[1]}%"
-            
-            size = stats.get(f'{name}_size', 0)
-            capacity = stats.get(f'{name}_capacity', 0)
-            fill_pct = stats.get(f'{name}_fill_pct', 0.0)
-            
-            # Visual fill bar (moved right for better alignment)
-            bar_width = 30
-            filled = int(fill_pct / 100 * bar_width)
+        total_size = stats.get('total_size', 0)
+        total_capacity = stats.get('total_capacity', max(1, total_size))
+        fill_pct = (total_size / total_capacity) * 100.0 if total_capacity else 0.0
+        print(f"  Total Size:          {total_size:>12,} / {total_capacity:>12,} ({fill_pct:>5.1f}%)")
+        print(f"  DQN Experiences:     {actor_comp.get('dqn', 0):>12,}   "
+              f"({actor_comp.get('frac_dqn', 0.0)*100:>5.1f}%)")
+        print(f"  Expert Experiences:  {actor_comp.get('expert', 0):>12,}   "
+              f"({actor_comp.get('frac_expert', 0.0)*100:>5.1f}%)")
+
+        if not stats.get('priority_buckets_enabled', False):
+            print(f"\n{'UNIFORM BUFFER OVERVIEW':<40}")
+            print("-" * 90)
+            main_capacity = stats.get('main_capacity', total_capacity)
+            main_size = stats.get('main_size', total_size)
+            main_fill_pct = stats.get('main_fill_pct', fill_pct)
+            bar_width = 40
+            filled = int(main_fill_pct / 100.0 * bar_width)
             bar = '█' * filled + '░' * (bar_width - filled)
-            
-            print(f"  {name:<15} {label:<15} {size:>9,} / {capacity:<10,} {fill_pct:>6.1f}%  [{bar}]")
-        
-        # Main bucket
-        main_size = stats.get('main_size', 0)
-        main_capacity = stats.get('main_capacity', 0)
-        main_fill_pct = stats.get('main_fill_pct', 0.0)
-        filled = int(main_fill_pct / 100 * 30)
-        bar = '█' * filled + '░' * (30 - filled)
-        
-        # Determine main bucket label from lowest priority bucket
-        if priority_buckets:
-            lowest_percentile = int(priority_buckets[-1].split('_')[0][1:])
-            main_label = f"<{lowest_percentile}%"
+            print(f"  {'Capacity':<20} {main_capacity:>12,}")
+            print(f"  {'Stored':<20} {main_size:>12,}")
+            print(f"  {'Fill':<20} {main_fill_pct:>6.1f}%  [{bar}]")
+            print("\n  Priority buckets disabled — sampling is uniform across the buffer.")
         else:
-            main_label = "<90%"  # Default for N=3
-        
-        print(f"  {'main':<15} {main_label:<15} {main_size:>9,} / {main_capacity:<10,} "
-              f"{main_fill_pct:>6.1f}%  [{bar}]")
-        
-        # Priority metric thresholds (currently using reward magnitude as proxy)
-        print(f"\n{'PRIORITY METRIC PERCENTILE THRESHOLDS (REWARD MAGNITUDE)':<75}")
-        print("-" * 90)
-        
-        # Dynamically get threshold keys
-        threshold_keys = []
-        for key in stats.keys():
-            if key.startswith('threshold_p'):
-                threshold_keys.append(key)
-        
-        # Sort by percentile (highest first)
-        threshold_keys.sort(key=lambda x: int(x.split('_p')[1]), reverse=True)
-        
-        for key in threshold_keys:
-            percentile = key.split('_p')[1]
-            threshold = stats.get(key, 0.0)
-            label = f"{percentile}th percentile:"
-            print(f"  {label:<25} {threshold:>8.4f}")
-        
-        # Additional metrics
+            print(f"\n{'PRIORITY BUCKET BREAKDOWN':<40}")
+            print("-" * 90)
+            print(f"  {'Bucket':<15} {'Percentile':<15} {'Physical':<12} {'Actual':<12} "
+                  f"{'Capacity':<12} {'Fill %':<10}")
+            print("-" * 90)
+
+            bucket_names = []
+            for key in stats.keys():
+                if key.startswith('p') and key.endswith('_size') and key != 'main_size' and 'actual_size' not in key:
+                    bucket_names.append(key.replace('_size', ''))
+            bucket_names.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
+
+            for name in bucket_names:
+                parts = name[1:].split('_')
+                label = f"{parts[0]}-{parts[1]}%"
+                physical = stats.get(f'{name}_size', 0)
+                actual = stats.get(f'{name}_actual_size', physical)
+                capacity = stats.get(f'{name}_capacity', 0)
+                fill = stats.get(f'{name}_fill_pct', 0.0)
+                bar_width = 30
+                filled = int(fill / 100.0 * bar_width)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                print(f"  {name:<15} {label:<15} {physical:>10,} {actual:>10,} {capacity:>10,} {fill:>6.1f}%  [{bar}]")
+
+            main_physical = stats.get('main_size', 0)
+            main_actual = stats.get('main_actual_size', main_physical)
+            main_capacity = stats.get('main_capacity', 0)
+            main_fill = stats.get('main_fill_pct', 0.0)
+            filled = int(main_fill / 100.0 * 30)
+            bar = '█' * filled + '░' * (30 - filled)
+            lowest = int(bucket_names[-1].split('_')[0][1:]) if bucket_names else 90
+            print(f"  {'main':<15} <{lowest}% {main_physical:>10,} {main_actual:>10,} {main_capacity:>10,} "
+                  f"{main_fill:>6.1f}%  [{bar}]")
+
         print(f"\n{'SAMPLING METRICS':<40}")
         print("-" * 90)
         print(f"  {'Recent batch size:':<25} {getattr(agent, 'batch_size', 'N/A')}")
         print(f"  {'Training steps:':<25} {getattr(metrics, 'total_training_steps', 0):>12,}")
-        print(f"  {'Experiences added:':<25} {stats['total_size']:>12,}")
-        
+        print(f"  {'Experiences added:':<25} {stats.get('total_size', 0):>12,}")
+
         print("\n" + "=" * 90 + "\n")
-        
-        # Restore terminal and display current row
-        if kb_handler and IS_INTERACTIVE:
-            kb_handler.set_raw_mode()
-        
-    except Exception as e:
-        print(f"\nError printing bucket stats: {e}")
-        traceback.print_exc()
+
         if kb_handler and IS_INTERACTIVE:
             kb_handler.set_raw_mode()
 
+    except Exception as exc:
+        print(f"\nError printing buffer stats: {exc}")
+        traceback.print_exc()
+        if kb_handler and IS_INTERACTIVE:
+            kb_handler.set_raw_mode()
 def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
     print("Starting stats reporter thread...")

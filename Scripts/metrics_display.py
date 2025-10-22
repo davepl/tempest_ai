@@ -319,7 +319,7 @@ def display_metrics_row(agent, kb_handler):
         elapsed = now - last_t if last_t > 0.0 else None
         steps_int = int(getattr(metrics, 'training_steps_interval', 0))
         frames_int = int(getattr(metrics, 'frames_count_interval', 0))
-        steps_requested_int = int(getattr(metrics, 'training_steps_requested_interval', 0))
+        steps_missed_int = int(getattr(metrics, 'training_steps_missed_interval', 0))
         if elapsed and elapsed > 0:
             steps_per_sec = steps_int / elapsed
         else:
@@ -332,11 +332,13 @@ def display_metrics_row(agent, kb_handler):
         # Interval Steps/1kF using the same interval counts
         denom_frames = max(1, frames_int)
         steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
-        # Calculate training completion percentage
-        train_pct = (100.0 * steps_int / steps_requested_int) if steps_requested_int > 0 else 100.0
+        # Calculate training completion percentage against served + missed requests
+        denom_steps = max(1.0, float(steps_int + steps_missed_int))
+        train_pct = (100.0 * steps_int / denom_steps)
         # Reset intervals and update last row time
         metrics.training_steps_interval = 0
         metrics.training_steps_requested_interval = 0
+        metrics.training_steps_missed_interval = 0
         metrics.frames_count_interval = 0
         metrics.last_metrics_row_time = now
     
@@ -386,29 +388,26 @@ def display_metrics_row(agent, kb_handler):
     if agent and hasattr(agent, 'memory') and hasattr(agent.memory, 'get_partition_stats'):
         try:
             pstats = agent.memory.get_partition_stats()
-            # Dynamically get bucket names from stats (handles N=3, 4, or 5)
-            # For N=3: p98_100, p95_98, p90_95, main
-            bucket_names = []
-            for key in pstats.keys():
-                if key.startswith('p') and key.endswith('_fill_pct') and key != 'main_fill_pct':
-                    # Extract base name (e.g., 'p98_100' from 'p98_100_fill_pct')
-                    bucket_names.append(key.replace('_fill_pct', ''))
-            
-            # Sort bucket names by percentile (highest first)
-            bucket_names.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
-            
-            # Get fill percentages for each bucket
-            for name in bucket_names:
-                fill_pct = pstats.get(f'{name}_fill_pct', 0.0)
-                bucket_fill_pcts.append(f"{fill_pct:.0f}%")
-            # Add main bucket
-            main_fill_pct = pstats.get('main_fill_pct', 0.0)
-            bucket_fill_pcts.append(f"{main_fill_pct:.0f}%")
+            if not pstats.get('priority_buckets_enabled', False):
+                bucket_fill_pcts.append(f"{pstats.get('main_fill_pct', 0.0):.0f}%")
+            else:
+                bucket_names = []
+                for key in pstats.keys():
+                    if key.startswith('p') and key.endswith('_fill_pct') and key != 'main_fill_pct':
+                        bucket_names.append(key.replace('_fill_pct', ''))
+
+                bucket_names.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
+
+                for name in bucket_names:
+                    fill_pct = pstats.get(f'{name}_fill_pct', 0.0)
+                    bucket_fill_pcts.append(f"{fill_pct:.0f}%")
+
+                main_fill_pct = pstats.get('main_fill_pct', 0.0)
+                bucket_fill_pcts.append(f"{main_fill_pct:.0f}%")
         except Exception:
-            # Fallback for N=3 buckets
-            bucket_fill_pcts = ['0%'] * 4  # 3 priority + 1 main
+            bucket_fill_pcts = ['--']
     else:
-        bucket_fill_pcts = ['0%'] * 4
+        bucket_fill_pcts = ['--']
     
     # Format: MemK/Steps/P98/P95/P90/Main (for N=3)
     training_stats = f"{mem_k}k/{metrics.total_training_steps}/{'/'.join(bucket_fill_pcts)}"
