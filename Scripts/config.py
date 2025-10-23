@@ -108,10 +108,12 @@ class RLConfigData:
     
     # N-Bucket stratified replay buffer configuration (PER-like without performance overhead)
     # Ultra-focused on 90-100th percentile: top 2%, 95-98%, 90-95%, and main <90%
-    replay_n_buckets: int = 3              # Number of priority buckets (3 buckets focusing on 90-100th percentile)
+    replay_n_buckets: int = 2              # Number of priority buckets
     replay_bucket_size: int = 250000       # Size of each priority bucket (250K each = 750K total)
     replay_main_bucket_size: int = 1500000 # Size of main bucket for <90th percentile experiences (1.5M)
-    
+    priority_sample_fraction: float = 0.20 # Fraction of each batch drawn from priority buckets
+    priority_terminal_bonus: float = 0.5   # Extra score for terminal transitions when computing priority
+
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
@@ -129,12 +131,12 @@ class RLConfigData:
     min_new_frames_after_load_to_train: int = 50000
 
     obj_reward_scale: float = 0.001             # 1 reward = 1000 points
-    subj_reward_scale: float = 0.0007       # subjective are scaled to 70% of objective
+    subj_reward_scale: float = 0.007       # subjective are scaled to 70% of objective
     ignore_subjective_rewards: bool = True
 
     # Loss weighting (makes contributions explicit and tunable)
-    continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
-    discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss - BALANCED with continuous
+    continuous_loss_weight: float = 2.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
+    discrete_loss_weight: float = 0.5    # Weight applied to discrete (Q) loss - BALANCED with continuous
     discrete_bc_weight: float = 0.5       # Weight for discrete behavioral cloning loss - REDUCED to allow Q-learning to dominate at low expert ratios
     # High-leverage continuous/expert tuning additions
     continuous_expert_weight_frames: int = 0  # DISABLED: Complex annealing removed in simplified training.py

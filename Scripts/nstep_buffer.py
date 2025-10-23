@@ -14,6 +14,7 @@ class _PendingStep:
     state: Any
     action: int
     reward: float
+    priority_reward: float
     next_state: Any
     done: bool
     actor: str
@@ -44,6 +45,7 @@ class NStepReplayBuffer:
 
     def _make_experience_from_start(self):
         R = 0.0
+        priority_R = 0.0
         done_flag = False
         last_next_state = None
         first = self._deque[0]
@@ -60,6 +62,7 @@ class NStepReplayBuffer:
             if i > 0 and step.actor != start_actor:
                 break
             R += (self.gamma ** i) * float(step.reward)
+            priority_R += (self.gamma ** i) * float(step.priority_reward)
             last_next_state = step.next_state
             steps_used = i + 1
             if step.done:
@@ -72,8 +75,8 @@ class NStepReplayBuffer:
 
         assert last_next_state is not None
         if self.store_aux_action:
-            return (s0, a0, aux0, R, last_next_state, done_flag, steps_used, start_actor)
-        return (s0, a0, R, last_next_state, done_flag, steps_used, start_actor)
+            return (s0, a0, aux0, R, priority_R, last_next_state, done_flag, steps_used, start_actor)
+        return (s0, a0, R, priority_R, last_next_state, done_flag, steps_used, start_actor)
 
     def _should_emit(self) -> bool:
         if not self._deque:
@@ -92,7 +95,17 @@ class NStepReplayBuffer:
                 return True
         return False
 
-    def add(self, state, action, reward, next_state, done, aux_action=None, actor: Optional[str] = None):
+    def add(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        done,
+        aux_action=None,
+        actor: Optional[str] = None,
+        priority_reward: Optional[float] = None,
+    ):
         # Normalize action to int
         try:
             if isinstance(action, np.ndarray):
@@ -116,11 +129,14 @@ class NStepReplayBuffer:
         if not self.store_aux_action:
             aux_val = 0.0
 
+        priority_val = float(priority_reward) if priority_reward is not None else float(reward)
+
         self._deque.append(
             _PendingStep(
                 state=state,
                 action=a_idx,
                 reward=float(reward),
+                priority_reward=priority_val,
                 next_state=next_state,
                 done=bool(done),
                 actor=actor_tag,

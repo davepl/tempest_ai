@@ -63,6 +63,7 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Deque
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -374,30 +375,199 @@ class HybridDQN(nn.Module):
 
 
 class HybridReplayBuffer:
-    """Uniform replay buffer for hybrid discrete-continuous experiences."""
+    """Segmented replay buffer with optional priority buckets (PER-lite)."""
+
+    _DEFAULT_BUCKET_LABELS = [
+        ("p99_100", 0.995),
+        ("p75_99", 0.75),
+        ("p90_95", 0.90),
+        ("p85_90", 0.85),
+    ]
+    _PRIORITY_SAMPLE_FRACTION = 0.20
+    _THRESHOLD_WINDOW = 5000
+    _THRESHOLD_MIN_SAMPLES = 64
+    _THRESHOLD_UPDATE_INTERVAL = 128
+
+    class _Segment:
+        __slots__ = (
+            "capacity",
+            "state_size",
+            "states",
+            "next_states",
+            "discrete_actions",
+            "continuous_actions",
+            "rewards",
+            "dones",
+            "horizons",
+            "actors",
+            "position",
+            "size",
+        )
+
+        def __init__(self, capacity: int, state_size: int):
+            self.capacity = int(max(0, capacity))
+            self.state_size = int(max(1, state_size))
+            self.position = 0
+            self.size = 0
+
+            if self.capacity > 0:
+                self.states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
+                self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
+                self.discrete_actions = np.zeros((self.capacity,), dtype=np.int64)
+                self.continuous_actions = np.zeros((self.capacity,), dtype=np.float32)
+                self.rewards = np.zeros((self.capacity,), dtype=np.float32)
+                self.dones = np.zeros((self.capacity,), dtype=np.bool_)
+                self.horizons = np.ones((self.capacity,), dtype=np.int32)
+                self.actors = np.full((self.capacity,), 'dqn', dtype='U10')
+            else:
+                self.states = np.zeros((0, self.state_size), dtype=np.float32)
+                self.next_states = np.zeros((0, self.state_size), dtype=np.float32)
+                self.discrete_actions = np.zeros((0,), dtype=np.int64)
+                self.continuous_actions = np.zeros((0,), dtype=np.float32)
+                self.rewards = np.zeros((0,), dtype=np.float32)
+                self.dones = np.zeros((0,), dtype=np.bool_)
+                self.horizons = np.zeros((0,), dtype=np.int32)
+                self.actors = np.zeros((0,), dtype='U10')
+
+        def add(
+            self,
+            state: np.ndarray,
+            discrete_action: int,
+            continuous_action: float,
+            reward: float,
+            next_state: np.ndarray,
+            done: bool,
+            actor: str,
+            horizon: int,
+        ):
+            if self.capacity <= 0:
+                return
+
+            idx = self.position
+            self.states[idx] = state
+            self.next_states[idx] = next_state
+            self.discrete_actions[idx] = discrete_action
+            self.continuous_actions[idx] = continuous_action
+            self.rewards[idx] = reward
+            self.dones[idx] = done
+            self.actors[idx] = actor
+            self.horizons[idx] = horizon
+
+            self.position = (idx + 1) % self.capacity
+            if self.size < self.capacity:
+                self.size += 1
+
+        def gather(self, indices: np.ndarray):
+            if indices.size == 0:
+                zero_states = np.zeros((0, self.state_size), dtype=np.float32)
+                zero_scalar = np.zeros((0, 1), dtype=np.float32)
+                zero_int = np.zeros((0, 1), dtype=np.int64)
+                return (
+                    zero_states,
+                    zero_int,
+                    zero_scalar,
+                    zero_scalar,
+                    zero_states,
+                    zero_scalar,
+                    [],
+                    zero_int.astype(np.int32),
+                )
+
+            states_np = self.states[indices].copy()
+            next_states_np = self.next_states[indices].copy()
+            discrete_np = self.discrete_actions[indices].copy().reshape(-1, 1)
+            continuous_np = self.continuous_actions[indices].copy().reshape(-1, 1)
+            rewards_np = self.rewards[indices].copy().reshape(-1, 1)
+            dones_np = self.dones[indices].astype(np.float32).reshape(-1, 1)
+            horizons_np = self.horizons[indices].copy().reshape(-1, 1)
+            actors_list = [str(a) for a in self.actors[indices]]
+            return (
+                states_np,
+                discrete_np,
+                continuous_np,
+                rewards_np,
+                next_states_np,
+                dones_np,
+                actors_list,
+                horizons_np,
+            )
+
+        def clear(self):
+            self.position = 0
+            self.size = 0
 
     def __init__(self, capacity: int, state_size: int):
-        self.capacity = int(max(1, capacity))
+        self.total_capacity = int(max(1, capacity))
         self.state_size = int(max(1, state_size))
-
-        self.states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
-        self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
-        self.discrete_actions = np.zeros((self.capacity,), dtype=np.int64)
-        self.continuous_actions = np.zeros((self.capacity,), dtype=np.float32)
-        self.rewards = np.zeros((self.capacity,), dtype=np.float32)
-        self.dones = np.zeros((self.capacity,), dtype=np.bool_)
-        self.horizons = np.ones((self.capacity,), dtype=np.int32)
-        self.actors = np.full((self.capacity,), 'dqn', dtype='U10')
-
-        self.position = 0
-        self.size = 0
 
         self._lock = threading.Lock()
         self._rng = np.random.default_rng()
 
-        # Compatibility flags for existing tooling
+        configured_n = int(getattr(RL_CONFIG, 'replay_n_buckets', 0) or 0)
+        configured_bucket_size = int(getattr(RL_CONFIG, 'replay_bucket_size', 0) or 0)
+        configured_fraction = float(getattr(RL_CONFIG, 'priority_sample_fraction', self._PRIORITY_SAMPLE_FRACTION) or 0.0)
+        configured_fraction = float(np.clip(configured_fraction, 0.0, 0.9))
+
         self.priority_buckets_enabled = False
-        self.n_buckets = 0
+        self.priority_segments: List[HybridReplayBuffer._Segment] = []
+        self.bucket_labels: List[str] = []
+        self.bucket_percentiles: List[float] = []
+        self._priority_thresholds: List[float] = []
+        self._priority_sample_fraction = configured_fraction if configured_fraction > 0 else self._PRIORITY_SAMPLE_FRACTION
+
+        bucket_capacity = 0
+        main_capacity = self.total_capacity
+        active_bucket_count = 0
+
+        if configured_n > 0 and configured_bucket_size > 0:
+            tentative_bucket_cap = min(configured_bucket_size, max(1, self.total_capacity // (configured_n + 1)))
+            tentative_main = self.total_capacity - (tentative_bucket_cap * configured_n)
+            if tentative_bucket_cap > 0 and tentative_main > 0:
+                bucket_capacity = tentative_bucket_cap
+                main_capacity = tentative_main
+                active_bucket_count = configured_n
+
+        if active_bucket_count > 0:
+            label_pairs = list(self._DEFAULT_BUCKET_LABELS)
+            while len(label_pairs) < active_bucket_count:
+                start = max(0, 100 - (len(label_pairs) + 1) * 5)
+                end = min(100, start + 5)
+                percentile = max(0.5, end / 100.0)
+                label_pairs.append((f"p{start}_{end}", percentile))
+
+            selected = label_pairs[:active_bucket_count]
+            self.bucket_labels = [lbl for lbl, _ in selected]
+            self.bucket_percentiles = [perc for _, perc in selected]
+            self._priority_thresholds = [float('inf')] * active_bucket_count
+            self.priority_segments = [
+                self._Segment(bucket_capacity, self.state_size) for _ in range(active_bucket_count)
+            ]
+            self.priority_buckets_enabled = True
+        else:
+            self.bucket_labels = []
+            self.bucket_percentiles = []
+            self._priority_thresholds = []
+            self.priority_segments = []
+            self.priority_buckets_enabled = False
+
+        self._main = self._Segment(main_capacity, self.state_size)
+        self.capacity = self._main.capacity
+        self.size = self._main.size
+        self.position = self._main.position
+        self.n_buckets = len(self.priority_segments)
+
+        # Maintain direct references for compatibility with existing code paths
+        self.states = self._main.states
+        self.next_states = self._main.next_states
+        self.discrete_actions = self._main.discrete_actions
+        self.continuous_actions = self._main.continuous_actions
+        self.rewards = self._main.rewards
+        self.dones = self._main.dones
+        self.horizons = self._main.horizons
+        self.actors = self._main.actors
+
+        self._recent_scores: Deque[float] = deque(maxlen=self._THRESHOLD_WINDOW)
+        self._total_additions = 0
 
     def _to_state_array(self, value):
         try:
@@ -435,9 +605,10 @@ class HybridReplayBuffer:
         actor: str = 'dqn',
         horizon: int = 1,
         td_error: Optional[float] = None,
+        priority_reward: Optional[float] = None,
     ):
         """Store a transition; td_error is accepted for backward compatibility."""
-        _ = td_error  # Prioritization disabled in simplified buffer
+        _ = td_error  # Compatibility shim for previous PER variants
 
         state_arr = self._to_state_array(state)
         next_state_arr = self._to_state_array(next_state)
@@ -458,6 +629,14 @@ class HybridReplayBuffer:
         except Exception:
             reward_val = 0.0
 
+        if priority_reward is None:
+            priority_val = reward_val
+        else:
+            try:
+                priority_val = float(priority_reward)
+            except Exception:
+                priority_val = reward_val
+
         done_flag = bool(done)
         actor_tag = self._normalize_actor(actor)
 
@@ -469,38 +648,102 @@ class HybridReplayBuffer:
             horizon_val = 1
 
         with self._lock:
-            idx = self.position
-            self.states[idx] = state_arr
-            self.next_states[idx] = next_state_arr
-            self.discrete_actions[idx] = action_idx
-            self.continuous_actions[idx] = cont_val
-            self.rewards[idx] = reward_val
-            self.dones[idx] = done_flag
-            self.actors[idx] = actor_tag
-            self.horizons[idx] = horizon_val
+            self._main.add(
+                state_arr,
+                action_idx,
+                cont_val,
+                reward_val,
+                next_state_arr,
+                done_flag,
+                actor_tag,
+                horizon_val,
+            )
+            self.size = self._main.size
+            self.position = self._main.position
 
-            self.position = (self.position + 1) % self.capacity
-            if self.size < self.capacity:
-                self.size += 1
+            if self.priority_buckets_enabled and self.priority_segments:
+                score = max(priority_val, 0.0)
+                self._recent_scores.append(score)
+                self._total_additions += 1
+
+                if (
+                    self._total_additions % self._THRESHOLD_UPDATE_INTERVAL == 0
+                    and len(self._recent_scores) >= self._THRESHOLD_MIN_SAMPLES
+                ):
+                    self._update_priority_thresholds()
+                elif any(math.isinf(t) for t in self._priority_thresholds) and len(self._recent_scores) >= self._THRESHOLD_MIN_SAMPLES:
+                    self._update_priority_thresholds()
+
+                bucket_idx = self._select_priority_bucket(score, actor_tag)
+                if bucket_idx is not None and 0 <= bucket_idx < len(self.priority_segments):
+                    self.priority_segments[bucket_idx].add(
+                        state_arr,
+                        action_idx,
+                        cont_val,
+                        reward_val,
+                        next_state_arr,
+                        done_flag,
+                        actor_tag,
+                        horizon_val,
+                    )
 
     def sample(self, batch_size: int, return_indices: bool = False):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
         with self._lock:
-            if self.size < batch_size:
+            if self._main.size < batch_size:
                 return None
 
-            indices = self._rng.choice(self.size, size=batch_size, replace=False)
+            priority_chunks = []
+            remaining = batch_size
 
-            states_np = self.states[indices].copy()
-            next_states_np = self.next_states[indices].copy()
-            discrete_np = self.discrete_actions[indices].copy().reshape(-1, 1)
-            continuous_np = self.continuous_actions[indices].copy().reshape(-1, 1)
-            rewards_np = self.rewards[indices].copy().reshape(-1, 1)
-            dones_np = self.dones[indices].astype(np.float32).reshape(-1, 1)
-            horizons_np = self.horizons[indices].copy().reshape(-1, 1)
-            actors_list = self.actors[indices].tolist()
+            for segment in self.priority_segments:
+                if remaining <= 0:
+                    priority_chunks.append(None)
+                    continue
+
+                desired = int(batch_size * self._priority_sample_fraction)
+                desired = min(desired, remaining)
+                desired = min(desired, segment.size)
+
+                if desired <= 0:
+                    priority_chunks.append(None)
+                    continue
+
+                idx = self._rng.choice(segment.size, size=desired, replace=False)
+                priority_chunks.append(segment.gather(idx))
+                remaining -= desired
+
+            main_count = min(self._main.size, remaining)
+            main_indices = self._rng.choice(self._main.size, size=main_count, replace=False)
+            main_chunk = self._main.gather(main_indices)
+
+        sample_chunks = [chunk for chunk in priority_chunks if chunk is not None]
+        sample_chunks.append(main_chunk)
+
+        states_list, discrete_list, continuous_list = [], [], []
+        rewards_list, next_states_list, dones_list = [], [], []
+        actors_list: List[str] = []
+        horizons_list = []
+
+        for chunk in sample_chunks:
+            states_list.append(chunk[0])
+            discrete_list.append(chunk[1])
+            continuous_list.append(chunk[2])
+            rewards_list.append(chunk[3])
+            next_states_list.append(chunk[4])
+            dones_list.append(chunk[5])
+            actors_list.extend(chunk[6])
+            horizons_list.append(chunk[7])
+
+        states_np = np.concatenate(states_list, axis=0) if states_list else np.zeros((0, self.state_size), dtype=np.float32)
+        discrete_np = np.concatenate(discrete_list, axis=0) if discrete_list else np.zeros((0, 1), dtype=np.int64)
+        continuous_np = np.concatenate(continuous_list, axis=0) if continuous_list else np.zeros((0, 1), dtype=np.float32)
+        rewards_np = np.concatenate(rewards_list, axis=0) if rewards_list else np.zeros((0, 1), dtype=np.float32)
+        next_states_np = np.concatenate(next_states_list, axis=0) if next_states_list else np.zeros((0, self.state_size), dtype=np.float32)
+        dones_np = np.concatenate(dones_list, axis=0) if dones_list else np.zeros((0, 1), dtype=np.float32)
+        horizons_np = np.concatenate(horizons_list, axis=0) if horizons_list else np.zeros((0, 1), dtype=np.int32)
 
         states = torch.from_numpy(states_np).float().to(device)
         next_states = torch.from_numpy(next_states_np).float().to(device)
@@ -508,9 +751,10 @@ class HybridReplayBuffer:
         continuous_actions = torch.from_numpy(continuous_np).float().to(device)
         rewards = torch.from_numpy(rewards_np).float().to(device)
         dones = torch.from_numpy(dones_np).float().to(device)
-        horizons = torch.from_numpy(horizons_np).float().to(device)
+        horizons = torch.from_numpy(horizons_np.astype(np.float32)).float().to(device)
 
         if return_indices:
+            dummy_indices = np.full(states_np.shape[0], -1, dtype=np.int64)
             return (
                 states,
                 discrete_actions,
@@ -520,7 +764,7 @@ class HybridReplayBuffer:
                 dones,
                 actors_list,
                 horizons,
-                np.asarray(indices, dtype=np.int64),
+                dummy_indices,
             )
 
         return (
@@ -536,35 +780,60 @@ class HybridReplayBuffer:
 
     def __len__(self):
         with self._lock:
-            return self.size
+            return self._main.size
 
     def clear(self):
         with self._lock:
-            self.position = 0
-            self.size = 0
+            self._main.clear()
+            for segment in self.priority_segments:
+                segment.clear()
+            self.size = self._main.size
+            self.position = self._main.position
+            self._recent_scores.clear()
+            self._priority_thresholds = [float('inf')] * len(self.priority_segments)
+            self._total_additions = 0
 
     def get_partition_stats(self):
         with self._lock:
-            fill_pct = (self.size / self.capacity * 100.0) if self.capacity > 0 else 0.0
-            return {
-                'total_size': self.size,
-                'total_capacity': self.capacity,
-                'priority_buckets_enabled': False,
-                'priority_bucket_count': 0,
-                'main_size': self.size,
-                'main_capacity': self.capacity,
-                'main_fill_pct': fill_pct,
-                'main_actual_size': self.size,
+            main_fill_pct = (self._main.size / self._main.capacity * 100.0) if self._main.capacity > 0 else 0.0
+            stats = {
+                'total_size': self._main.size,
+                'total_capacity': self._main.capacity,
+                'priority_buckets_enabled': self.priority_buckets_enabled,
+                'priority_bucket_count': self.n_buckets,
+                'main_size': self._main.size,
+                'main_actual_size': self._main.size,
+                'main_capacity': self._main.capacity,
+                'main_fill_pct': main_fill_pct,
             }
+
+            if self.priority_buckets_enabled:
+                total_priority = 0
+                for idx, (label, segment) in enumerate(zip(self.bucket_labels, self.priority_segments)):
+                    fill_pct = (segment.size / segment.capacity * 100.0) if segment.capacity > 0 else 0.0
+                    stats[f'{label}_size'] = segment.size
+                    stats[f'{label}_actual_size'] = segment.size
+                    stats[f'{label}_capacity'] = segment.capacity
+                    stats[f'{label}_fill_pct'] = fill_pct
+                    threshold_val = self._priority_thresholds[idx] if idx < len(self._priority_thresholds) else float('inf')
+                    stats[f'{label}_threshold'] = threshold_val
+                    total_priority += segment.size
+                stats['total_priority_size'] = total_priority
+                stats['bucket_labels'] = list(self.bucket_labels)
+            else:
+                stats['total_priority_size'] = 0
+                stats['bucket_labels'] = []
+
+            return stats
 
     def get_actor_composition(self):
         with self._lock:
-            if self.size == 0:
+            if self._main.size == 0:
                 return {'total': 0, 'dqn': 0, 'expert': 0, 'frac_dqn': 0.0, 'frac_expert': 0.0}
-            actors = self.actors[:self.size]
+            actors = self._main.actors[: self._main.size]
             n_dqn = int(np.count_nonzero(actors == 'dqn'))
             n_expert = int(np.count_nonzero(actors == 'expert'))
-            total = self.size
+            total = self._main.size
         frac_dqn = float(n_dqn) / float(total) if total else 0.0
         frac_expert = float(n_expert) / float(total) if total else 0.0
         return {
@@ -574,6 +843,49 @@ class HybridReplayBuffer:
             'frac_dqn': frac_dqn,
             'frac_expert': frac_expert,
         }
+
+    def _update_priority_thresholds(self):
+        if not self.bucket_percentiles or not self._recent_scores:
+            return
+
+        scores = np.asarray(self._recent_scores, dtype=np.float32)
+        percentiles = np.asarray(self.bucket_percentiles, dtype=np.float32)
+        sorted_idx = np.argsort(percentiles)
+        sorted_percentiles = np.clip(percentiles[sorted_idx], 0.0, 0.999)
+
+        if scores.size == 1:
+            quantiles = np.full_like(sorted_percentiles, scores[0], dtype=np.float32)
+        else:
+            quantiles = np.quantile(scores, sorted_percentiles, method='nearest')
+
+        thresholds = np.zeros_like(percentiles, dtype=np.float32)
+        thresholds[sorted_idx] = quantiles
+        self._priority_thresholds = thresholds.tolist()
+
+    def _select_priority_bucket(self, score: float, actor_tag: str) -> Optional[int]:
+        if not self.priority_buckets_enabled or not self.priority_segments:
+            return None
+
+        if actor_tag == 'expert':
+            return 0
+
+        if score <= 0.0:
+            return None
+
+        fallback_idx = None
+        for idx, threshold in enumerate(self._priority_thresholds):
+            if math.isinf(threshold):
+                fallback_idx = idx
+                continue
+            if score >= threshold:
+                return idx
+
+        if fallback_idx is not None:
+            return fallback_idx
+
+        if self._priority_thresholds:
+            return len(self._priority_thresholds) - 1
+        return None
 
 
 class KeyboardHandler:
@@ -864,6 +1176,7 @@ class HybridDQNAgent:
         done,
         actor,
         horizon,
+        priority_reward: Optional[float] = None,
     ):
         self.memory.push(
             state,
@@ -874,6 +1187,7 @@ class HybridDQNAgent:
             done,
             actor=actor,
             horizon=horizon,
+            priority_reward=priority_reward,
         )
 
         try:
