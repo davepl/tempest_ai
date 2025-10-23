@@ -847,7 +847,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     if level_changed then
         bDone = true
     end
-    if level_changed or previous_level == 0 then
+    if previous_level == 0 then
         score_at_level_start = current_score
     end
     previous_score = current_score
