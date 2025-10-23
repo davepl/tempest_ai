@@ -188,7 +188,7 @@ def display_metrics_header():
         f"{'DLoss':>8} {'CLoss':>8} {'BCLoss':>8} {'Agree%':>7} {'SpinAgr%':>9} "
         f"{'AvgEpLen':>8} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
-        f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Range':>12} {'Stats':>18}"
+        f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Range':>12} {'Stats':>26}"
     )
     
     print_metrics_line(header, is_header=True)
@@ -391,12 +391,18 @@ def display_metrics_row(agent, kb_handler):
             if not pstats.get('priority_buckets_enabled', False):
                 bucket_fill_pcts.append(f"{pstats.get('main_fill_pct', 0.0):.0f}%")
             else:
-                bucket_names = []
-                for key in pstats.keys():
-                    if key.startswith('p') and key.endswith('_fill_pct') and key != 'main_fill_pct':
-                        bucket_names.append(key.replace('_fill_pct', ''))
+                bucket_names = list(pstats.get('bucket_labels', []))
+                if not bucket_names:
+                    for key in pstats.keys():
+                        if key.startswith('p') and key.endswith('_fill_pct') and key != 'main_fill_pct':
+                            bucket_names.append(key.replace('_fill_pct', ''))
 
-                bucket_names.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
+                if bucket_names:
+                    bucket_names = sorted(
+                        bucket_names,
+                        key=lambda x: int(x.split('_')[0][1:]) if x.startswith('p') else 0,
+                        reverse=True,
+                    )
 
                 for name in bucket_names:
                     fill_pct = pstats.get(f'{name}_fill_pct', 0.0)

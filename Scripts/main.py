@@ -22,6 +22,7 @@ Coordinates the socket server, metrics display, and keyboard handling.
 
 import os
 import time
+import math
 import threading
 from datetime import datetime
 import traceback
@@ -74,17 +75,21 @@ def print_bucket_stats(agent, kb_handler):
             print("\n  Priority buckets disabled — sampling is uniform across the buffer.")
         else:
             print(f"\n{'PRIORITY BUCKET BREAKDOWN':<40}")
-            print("-" * 90)
-            print(f"  {'Bucket':<15} {'Percentile':<15} {'Physical':<12} {'Actual':<12} "
-                  f"{'Capacity':<12} {'Fill %':<10}")
-            print("-" * 90)
+            print("-" * 104)
+            print(f"  {'Bucket':<15} {'Percentile':<15} {'Cutoff':>12} {'Physical':>12} {'Actual':>12} "
+                  f"{'Capacity':>12} {'Fill %':>8}  {'Fill':<32}")
+            print("-" * 104)
 
-            bucket_names = []
-            for key in stats.keys():
-                if key.startswith('p') and key.endswith('_size') and key != 'main_size' and 'actual_size' not in key:
-                    bucket_names.append(key.replace('_size', ''))
-            bucket_names.sort(key=lambda x: int(x.split('_')[0][1:]), reverse=True)
-
+            bucket_names = list(stats.get('bucket_labels', []))
+            if not bucket_names:
+                for key in stats.keys():
+                    if key.startswith('p') and key.endswith('_size') and key != 'main_size' and 'actual_size' not in key:
+                        bucket_names.append(key.replace('_size', ''))
+            bucket_names = sorted(
+                bucket_names,
+                key=lambda x: int(x.split('_')[0][1:]) if x.startswith('p') else 0,
+                reverse=True,
+            )
             for name in bucket_names:
                 parts = name[1:].split('_')
                 label = f"{parts[0]}-{parts[1]}%"
@@ -92,10 +97,15 @@ def print_bucket_stats(agent, kb_handler):
                 actual = stats.get(f'{name}_actual_size', physical)
                 capacity = stats.get(f'{name}_capacity', 0)
                 fill = stats.get(f'{name}_fill_pct', 0.0)
+                cutoff_val = stats.get(f'{name}_threshold', float('inf'))
+                if math.isinf(cutoff_val):
+                    cutoff_str = "   inf"
+                else:
+                    cutoff_str = f"{cutoff_val:12.3f}"
                 bar_width = 30
                 filled = int(fill / 100.0 * bar_width)
                 bar = '█' * filled + '░' * (bar_width - filled)
-                print(f"  {name:<15} {label:<15} {physical:>10,} {actual:>10,} {capacity:>10,} {fill:>6.1f}%  [{bar}]")
+                print(f"  {name:<15} {label:<15} {cutoff_str} {physical:>12,} {actual:>12,} {capacity:>12,} {fill:>7.1f}%  [{bar:<30}]")
 
             main_physical = stats.get('main_size', 0)
             main_actual = stats.get('main_actual_size', main_physical)
@@ -104,8 +114,9 @@ def print_bucket_stats(agent, kb_handler):
             filled = int(main_fill / 100.0 * 30)
             bar = '█' * filled + '░' * (30 - filled)
             lowest = int(bucket_names[-1].split('_')[0][1:]) if bucket_names else 90
-            print(f"  {'main':<15} <{lowest}% {main_physical:>10,} {main_actual:>10,} {main_capacity:>10,} "
-                  f"{main_fill:>6.1f}%  [{bar}]")
+            label = f"<{lowest}%"
+            print(f"  {'main':<15} {label:<15} {'   --':>12} {main_physical:>12,} {main_actual:>12,} {main_capacity:>12,} "
+                  f"{main_fill:>7.1f}%  [{bar:<30}]")
 
         print(f"\n{'SAMPLING METRICS':<40}")
         print("-" * 90)

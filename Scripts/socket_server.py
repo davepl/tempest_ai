@@ -402,12 +402,17 @@ class SocketServer:
 
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
-                        # Compute total reward from subj+obj for n-step accumulation
-                        
+                        # Compute rewards separately for training and for bucket priority
+                        obj_reward = float(frame.objreward)
+                        subj_reward = float(frame.subjreward)
+                        priority_reward_step = obj_reward + subj_reward
+                        terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
+                        if frame.done and terminal_bonus != 0.0:
+                            priority_reward_step += terminal_bonus
                         if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
-                            total_reward = float(frame.objreward)
+                            total_reward = obj_reward
                         else:
-                            total_reward = float(frame.subjreward) + float(frame.objreward)
+                            total_reward = priority_reward_step
 
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
@@ -417,23 +422,66 @@ class SocketServer:
                             frame.done,
                             aux_action=float(ca),
                             actor=require_actor_tag("n-step buffer push"),
+                            priority_reward=priority_reward_step,
                         )
 
                         # BUGBUG Do we still need to handle mulltiple different numbers of args and signatures?
                         # Push all matured experiences to agent
                         if self.agent and experiences:
                             for item in experiences:
+                                exp_continuous = None
+                                exp_priority_reward = None
+
                                 try:
-                                    if len(item) == 8:
+                                    if len(item) == 9:
                                         (exp_state,
                                          exp_action,
                                          exp_continuous,
+                                         exp_reward,
+                                         exp_priority_reward,
+                                         exp_next_state,
+                                         exp_done,
+                                         exp_steps,
+                                         exp_actor) = item
+                                    elif len(item) == 8:
+                                        if state['nstep_buffer'].store_aux_action:
+                                            (exp_state,
+                                             exp_action,
+                                             exp_continuous,
+                                             exp_reward,
+                                             exp_next_state,
+                                             exp_done,
+                                             exp_steps,
+                                             exp_actor) = item
+                                            exp_priority_reward = exp_reward
+                                        else:
+                                            (exp_state,
+                                             exp_action,
+                                             exp_reward,
+                                             exp_priority_reward,
+                                             exp_next_state,
+                                             exp_done,
+                                             exp_steps,
+                                             exp_actor) = item
+                                    elif len(item) == 7:
+                                        (exp_state,
+                                         exp_action,
                                          exp_reward,
                                          exp_next_state,
                                          exp_done,
                                          exp_steps,
                                          exp_actor) = item
-                                        # Add ALL experiences to replay buffer for learning (async)
+                                        exp_priority_reward = exp_reward
+                                    else:
+                                        raise TypeError("Unexpected n-step experience format")
+                                except Exception:
+                                    continue
+
+                                if exp_priority_reward is None:
+                                    exp_priority_reward = exp_reward
+
+                                try:
+                                    if exp_continuous is not None:
                                         self.async_buffer.step_async(
                                             exp_state,
                                             exp_action,
@@ -443,16 +491,9 @@ class SocketServer:
                                             exp_done,
                                             actor=exp_actor,
                                             horizon=exp_steps,
+                                            priority_reward=exp_priority_reward,
                                         )
-                                    elif len(item) == 7:
-                                        (exp_state,
-                                         exp_action,
-                                         exp_reward,
-                                         exp_next_state,
-                                         exp_done,
-                                         exp_steps,
-                                         exp_actor) = item
-                                        # Add ALL experiences to replay buffer (async)
+                                    else:
                                         self.async_buffer.step_async(
                                             exp_state,
                                             exp_action,
@@ -461,28 +502,10 @@ class SocketServer:
                                             exp_done,
                                             actor=exp_actor,
                                             horizon=exp_steps,
+                                            priority_reward=exp_priority_reward,
                                         )
                                 except TypeError:
-                                    # Legacy agents without continuous head or actor support
                                     try:
-                                        if len(item) == 8:
-                                            (exp_state,
-                                             exp_action,
-                                             _exp_continuous,
-                                             exp_reward,
-                                             exp_next_state,
-                                             exp_done,
-                                             exp_steps,
-                                             exp_actor) = item
-                                        else:
-                                            (exp_state,
-                                             exp_action,
-                                             exp_reward,
-                                             exp_next_state,
-                                             exp_done,
-                                             exp_steps,
-                                             exp_actor) = item
-                                        # Add ALL experiences to replay buffer (async)
                                         self.async_buffer.step_async(
                                             exp_state,
                                             exp_action,
@@ -490,39 +513,25 @@ class SocketServer:
                                             exp_next_state,
                                             exp_done,
                                             actor=exp_actor,
-                                            horizon=exp_steps,
+                                            priority_reward=exp_priority_reward,
                                         )
-                                    except TypeError:
-                                        try:
-                                            if len(item) == 8:
-                                                (exp_state,
-                                                 exp_action,
-                                                 _exp_continuous,
-                                                 exp_reward,
-                                                 exp_next_state,
-                                                 exp_done,
-                                                 _exp_steps,
-                                                 exp_actor) = item
-                                            else:
-                                                (exp_state,
-                                                 exp_action,
-                                                 exp_reward,
-                                                 exp_next_state,
-                                                 exp_done,
-                                                 _exp_steps,
-                                                 exp_actor) = item
-                                            # Add ALL experiences to replay buffer (async)
-                                            self.async_buffer.step_async(exp_state, exp_action, exp_reward, exp_next_state, exp_done, actor=exp_actor)
-                                        except TypeError:
-                                            pass
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
-                        # Compute total reward respecting ignore_subjective_rewards flag
+                        obj_reward = float(frame.objreward)
+                        subj_reward = float(frame.subjreward)
+                        priority_reward_step = obj_reward + subj_reward
+                        terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
+                        if frame.done and terminal_bonus != 0.0:
+                            priority_reward_step += terminal_bonus
                         if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
-                            direct_reward = float(frame.objreward)
+                            direct_reward = obj_reward
                         else:
-                            direct_reward = float(frame.subjreward) + float(frame.objreward)
-                        
+                            direct_reward = priority_reward_step
+
                         try:
                             if self.agent:
                                 # Hybrid agents expect (state, discrete, continuous, reward, next_state, done) (async)
@@ -535,6 +544,7 @@ class SocketServer:
                                     bool(frame.done),
                                     actor=require_actor_tag("direct push"),
                                     horizon=1,
+                                    priority_reward=priority_reward_step,
                                 )
                         except TypeError:
                             # Fallback for agents without continuous action in signature
@@ -547,6 +557,7 @@ class SocketServer:
                                     bool(frame.done),
                                     actor=require_actor_tag("direct push legacy"),
                                     horizon=1,
+                                    priority_reward=priority_reward_step,
                                 )
                             except Exception:
                                 pass
