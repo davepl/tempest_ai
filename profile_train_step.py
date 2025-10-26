@@ -29,14 +29,13 @@ def create_test_batch(batch_size=64, state_size=100):
     # Create single experience, not a batch
     state = np.random.randn(state_size).astype(np.float32)
     discrete_action = np.random.randint(0, 4)
-    continuous_action = np.random.randn()
     reward = np.random.randn()
     next_state = np.random.randn(state_size).astype(np.float32)
     done = np.random.randint(0, 2)
     actor = 'dqn' if np.random.random() < 0.5 else 'expert'
     horizon = 1
 
-    return (state, discrete_action, continuous_action, reward, next_state, done, actor, horizon)
+    return (state, discrete_action, reward, next_state, done, actor, horizon)
 
 def profile_train_step(agent, num_steps=100):
     """Profile the train_step method."""

@@ -17,7 +17,7 @@
 # ==================================================================================================================
 """
 Socket server for Tempest AI (hybrid-only).
-Bridges Lua frames to a HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner).
+Bridges Lua frames to a HybridDQNAgent with a joint fire/zap/spinner action space.
 """
 
 # Prevent direct execution
@@ -43,6 +43,9 @@ import numpy as np
 from aimodel import (
     parse_frame_data,
     get_expert_action,
+    get_expert_hybrid_action,
+    compose_action_index,
+    action_index_to_components,
     hybrid_to_game_action,
     fire_zap_to_discrete,
     SafeMetrics,
@@ -280,7 +283,7 @@ class SocketServer:
                 'prev_frame': None,
                 'current_frame': None,
                 'last_state': None,
-                'last_action_hybrid': None,  # (discrete, continuous)
+                'last_action_index': None,
                 'last_action_source': None,
                 'total_reward': 0.0,
                 'episode_dqn_reward': 0.0,
@@ -288,7 +291,7 @@ class SocketServer:
                 'was_done': False,
                 # Only create an n-step buffer if the server is responsible for n-step preprocessing
                 'nstep_buffer': (
-                    NStepReplayBuffer(RL_CONFIG.n_step, RL_CONFIG.gamma, store_aux_action=True)
+                    NStepReplayBuffer(RL_CONFIG.n_step, RL_CONFIG.gamma)
                     if self._server_nstep_enabled() else None
                 )
             }
@@ -397,9 +400,8 @@ class SocketServer:
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
 
                 # N-step experience processing (server-side only when enabled) or direct 1-step fallback
-                if state.get('last_state') is not None and state.get('last_action_hybrid') is not None:
-                    da, ca = state['last_action_hybrid']
-
+                if state.get('last_state') is not None and state.get('last_action_index') is not None:
+                    action_index = state['last_action_index']
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
                         # Compute rewards separately for training and for bucket priority
@@ -416,109 +418,40 @@ class SocketServer:
 
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
-                            int(da),
+                            int(action_index),
                             total_reward,
                             frame.state,
                             frame.done,
-                            aux_action=float(ca),
                             actor=require_actor_tag("n-step buffer push"),
                             priority_reward=priority_reward_step,
                         )
 
-                        # BUGBUG Do we still need to handle mulltiple different numbers of args and signatures?
                         # Push all matured experiences to agent
                         if self.agent and experiences:
                             for item in experiences:
-                                exp_continuous = None
-                                exp_priority_reward = None
-
-                                try:
-                                    if len(item) == 9:
-                                        (exp_state,
-                                         exp_action,
-                                         exp_continuous,
-                                         exp_reward,
-                                         exp_priority_reward,
-                                         exp_next_state,
-                                         exp_done,
-                                         exp_steps,
-                                         exp_actor) = item
-                                    elif len(item) == 8:
-                                        if state['nstep_buffer'].store_aux_action:
-                                            (exp_state,
-                                             exp_action,
-                                             exp_continuous,
-                                             exp_reward,
-                                             exp_next_state,
-                                             exp_done,
-                                             exp_steps,
-                                             exp_actor) = item
-                                            exp_priority_reward = exp_reward
-                                        else:
-                                            (exp_state,
-                                             exp_action,
-                                             exp_reward,
-                                             exp_priority_reward,
-                                             exp_next_state,
-                                             exp_done,
-                                             exp_steps,
-                                             exp_actor) = item
-                                    elif len(item) == 7:
-                                        (exp_state,
-                                         exp_action,
-                                         exp_reward,
-                                         exp_next_state,
-                                         exp_done,
-                                         exp_steps,
-                                         exp_actor) = item
-                                        exp_priority_reward = exp_reward
-                                    else:
-                                        raise TypeError("Unexpected n-step experience format")
-                                except Exception:
+                                if len(item) != 8:
                                     continue
+                                (
+                                    exp_state,
+                                    exp_action,
+                                    exp_reward,
+                                    exp_priority_reward,
+                                    exp_next_state,
+                                    exp_done,
+                                    exp_steps,
+                                    exp_actor,
+                                ) = item
 
-                                if exp_priority_reward is None:
-                                    exp_priority_reward = exp_reward
-
-                                try:
-                                    if exp_continuous is not None:
-                                        self.async_buffer.step_async(
-                                            exp_state,
-                                            exp_action,
-                                            exp_continuous,
-                                            exp_reward,
-                                            exp_next_state,
-                                            exp_done,
-                                            actor=exp_actor,
-                                            horizon=exp_steps,
-                                            priority_reward=exp_priority_reward,
-                                        )
-                                    else:
-                                        self.async_buffer.step_async(
-                                            exp_state,
-                                            exp_action,
-                                            exp_reward,
-                                            exp_next_state,
-                                            exp_done,
-                                            actor=exp_actor,
-                                            horizon=exp_steps,
-                                            priority_reward=exp_priority_reward,
-                                        )
-                                except TypeError:
-                                    try:
-                                        self.async_buffer.step_async(
-                                            exp_state,
-                                            exp_action,
-                                            exp_reward,
-                                            exp_next_state,
-                                            exp_done,
-                                            actor=exp_actor,
-                                            priority_reward=exp_priority_reward,
-                                        )
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    pass
+                                self.async_buffer.step_async(
+                                    exp_state,
+                                    exp_action,
+                                    exp_reward,
+                                    exp_next_state,
+                                    exp_done,
+                                    actor=exp_actor,
+                                    horizon=exp_steps,
+                                    priority_reward=exp_priority_reward,
+                                )
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
                         obj_reward = float(frame.objreward)
@@ -532,35 +465,17 @@ class SocketServer:
                         else:
                             direct_reward = priority_reward_step
 
-                        try:
-                            if self.agent:
-                                # Hybrid agents expect (state, discrete, continuous, reward, next_state, done) (async)
-                                self.async_buffer.step_async(
-                                    state['last_state'],
-                                    int(da),
-                                    float(ca),
-                                    direct_reward,
-                                    frame.state,
-                                    bool(frame.done),
-                                    actor=require_actor_tag("direct push"),
-                                    horizon=1,
-                                    priority_reward=priority_reward_step,
-                                )
-                        except TypeError:
-                            # Fallback for agents without continuous action in signature
-                            try:
-                                self.async_buffer.step_async(
-                                    state['last_state'],
-                                    int(da),
-                                    direct_reward,
-                                    frame.state,
-                                    bool(frame.done),
-                                    actor=require_actor_tag("direct push legacy"),
-                                    horizon=1,
-                                    priority_reward=priority_reward_step,
-                                )
-                            except Exception:
-                                pass
+                        if self.agent:
+                            self.async_buffer.step_async(
+                                state['last_state'],
+                                int(action_index),
+                                direct_reward,
+                                frame.state,
+                                bool(frame.done),
+                                actor=require_actor_tag("direct push"),
+                                horizon=1,
+                                priority_reward=priority_reward_step,
+                            )
 
                     # reward accounting
                     # Update reward accounting using subj+obj derived total, respecting ignore_subjective_rewards
@@ -654,11 +569,7 @@ class SocketServer:
 
                     # reset for next episode
                     state['last_state'] = None
-                    state['last_action_hybrid'] = None
-                    try:
-                        state['nstep_buf'].clear()
-                    except Exception:
-                        pass
+                    state['last_action_index'] = None
                     state['total_reward'] = 0.0
                     state['episode_dqn_reward'] = 0.0
                     state['episode_expert_reward'] = 0.0
@@ -680,7 +591,8 @@ class SocketServer:
                 # choose action (hybrid-only)
                 self.metrics.increment_total_controls()
 
-                discrete_action, continuous_spinner = 0, 0.0
+                action_index = 0
+                spinner_value = 0.0
                 action_source = None
 
                 if self.agent:
@@ -691,21 +603,18 @@ class SocketServer:
                     use_expert = (random.random() < expert_ratio) and (not self.metrics.is_override_active())
 
                     if use_expert:
-                        fire, zap, spin = get_expert_action(
+                        action_index, spinner_value = get_expert_hybrid_action(
                             frame.enemy_seg,
                             frame.player_seg,
                             frame.open_level,
                             frame.expert_fire,
                             frame.expert_zap,
                         )
-                        discrete_action = fire_zap_to_discrete(fire, zap)
-                        continuous_spinner = float(spin)
                         action_source = 'expert'
                     else:
                         # Epsilon policy: when override_epsilon is ON, force 0.0 (pure greedy).
                         # Otherwise, always use the current decayed epsilon even during expert/inference overrides.
                         try:
-                            # SafeMetrics may or may not expose get_effective_epsilon; fall back to metrics method
                             if hasattr(self.metrics, 'get_effective_epsilon'):
                                 epsilon = float(self.metrics.get_effective_epsilon())
                             elif hasattr(self.metrics, 'metrics') and hasattr(self.metrics.metrics, 'get_effective_epsilon'):
@@ -721,57 +630,52 @@ class SocketServer:
                             if frame.gamestate == 0x20:  # GS_ZoomingDown
                                 scale = float(getattr(RL_CONFIG, 'zoom_epsilon_scale', 0.25) or 0.25)
                                 epsilon = epsilon * scale
-                                # Clamp to sane [0,1] bounds; intentionally allow below epsilon_min as this is an effective runtime scale
                                 if epsilon < 0.0:
                                     epsilon = 0.0
                                 elif epsilon > 1.0:
                                     epsilon = 1.0
                         except Exception:
                             pass
+
                         start_t = time.perf_counter()
-                        # add_noise: exploration noise is enabled when epsilon>0, but we pass explicit flag per agent signature
-                        da, ca = self.agent.act(frame.state, epsilon, True)
+                        action_index = int(self.agent.act(frame.state, epsilon, True))
                         infer_t = time.perf_counter() - start_t
-                        # Record inference timing via SafeMetrics API
+
                         if hasattr(self.metrics, 'add_inference_time'):
                             self.metrics.add_inference_time(infer_t)
                         else:
-                            # Fallback: best-effort direct update with lock if exposed
                             try:
                                 with self.metrics.lock:
                                     self.metrics.total_inference_time += infer_t
                                     self.metrics.total_inference_requests += 1
                             except Exception:
                                 pass
-                        discrete_action, continuous_spinner = int(da), float(ca)
-                        # Optional probabilistic superzap gate for DQN actions: disabled by default
+
+                        fire, zap, spinner_bucket, spinner_value = action_index_to_components(action_index)
                         try:
                             enable_zap_gate = bool(getattr(RL_CONFIG, 'enable_superzap_gate', False))
                         except Exception:
                             enable_zap_gate = False
-                        if enable_zap_gate:
+                        if enable_zap_gate and zap:
                             try:
                                 pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))
                             except Exception:
                                 pzap = 0.01
-                            try:
-                                # If DQN chose a zap (bit0==1), keep it only with probability pzap
-                                if (discrete_action & 1) == 1:
-                                    if random.random() >= max(0.0, min(1.0, pzap)):
-                                        discrete_action = (discrete_action & 2)  # clear zap bit, preserve fire
-                            except Exception:
-                                pass
+                            if random.random() >= max(0.0, min(1.0, pzap)):
+                                zap = False
+                                fire_zap_idx = fire_zap_to_discrete(fire, zap)
+                                action_index = compose_action_index(fire_zap_idx, spinner_bucket)
                         action_source = 'dqn'
                 else:
                     action_source = 'none'
 
                 # store for next step
                 state['last_state'] = frame.state
-                state['last_action_hybrid'] = (discrete_action, continuous_spinner)
+                state['last_action_index'] = action_index
                 state['last_action_source'] = action_source
 
                 # send to game
-                game_fire, game_zap, game_spinner = hybrid_to_game_action(discrete_action, continuous_spinner)
+                game_fire, game_zap, game_spinner = hybrid_to_game_action(action_index)
                 try:
                     client_socket.sendall(struct.pack('bbb', game_fire, game_zap, game_spinner))
                 except Exception:

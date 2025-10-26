@@ -267,8 +267,7 @@ def print_network_config(agent):
     # Network Architecture
     print("\n📐 NETWORK ARCHITECTURE:")
     print(f"   State Size:        {agent.state_size}")
-    print(f"   Discrete Actions:  {agent.discrete_actions} (FIRE/ZAP combinations)")
-    print(f"   Continuous Output: 1 (Spinner: -0.9 to +0.9)")
+    print(f"   Discrete Actions:  {agent.discrete_actions} (joint FIRE/ZAP/SPINNER)")
     
     # Get layer sizes from the network
     print(f"\n   Shared Trunk:      {len(agent.qnetwork_local.shared_layers)} layers")
@@ -279,10 +278,8 @@ def print_network_config(agent):
     # Head architectures
     shared_out = agent.qnetwork_local.shared_layers[-1].out_features if agent.qnetwork_local.shared_layers else 0
     discrete_hidden = agent.qnetwork_local.discrete_fc.out_features
-    continuous_hidden = agent.qnetwork_local.continuous_fc1.out_features
     
-    print(f"\n   Discrete Head:     {shared_out} → {discrete_hidden} → {agent.discrete_actions}")
-    print(f"   Continuous Head:   {shared_out} → {continuous_hidden} → {agent.qnetwork_local.continuous_fc2.out_features} → 1")
+    print(f"\n   Action Head:       {shared_out} → {discrete_hidden} → {agent.discrete_actions}")
     
     # Count total parameters
     total_params = sum(p.numel() for p in agent.qnetwork_local.parameters())
@@ -301,11 +298,8 @@ def print_network_config(agent):
     
     # Loss Configuration
     print("\n⚖️  LOSS CONFIGURATION:")
-    print(f"   Discrete Loss:     TD (Huber) + BC (Cross-Entropy)")
-    print(f"   Continuous Loss:   MSE with advantage weighting")
-    print(f"   Loss Weights:      Discrete={RL_CONFIG.discrete_loss_weight:.1f}, Continuous={RL_CONFIG.continuous_loss_weight:.1f}")
-    bc_weight = getattr(RL_CONFIG, 'discrete_bc_weight', 1.0)
-    print(f"   BC Weight:         {bc_weight:.1f} (behavioral cloning)")
+    print(f"   Discrete Loss:     TD (Huber)")
+    print(f"   Loss Weight:       {RL_CONFIG.discrete_loss_weight:.1f}")
     max_q = getattr(RL_CONFIG, 'max_q_value', None)
     print(f"   Max Q-Value Clip:  {max_q:.1f}" if max_q else "   Max Q-Value Clip:  None")
     td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
@@ -342,7 +336,7 @@ def main():
         os.makedirs(MODEL_DIR)
     
     # Initialize the Agent
-    # Use HybridDQNAgent (4 discrete fire/zap + 1 continuous spinner)
+    # Use HybridDQNAgent (joint fire/zap/spinner action space)
     
     agent = HybridDQNAgent(
         state_size       = RL_CONFIG.state_size,
@@ -354,6 +348,9 @@ def main():
         memory_size      = RL_CONFIG.memory_size,
         batch_size       = RL_CONFIG.batch_size
     )
+    # Surface which accelerator PyTorch selected so slowdowns are obvious
+    device_label = getattr(getattr(agent, "device", None), "type", "unknown")
+    print(f"🧮 Device:          {device_label.upper()}")
 
     # Display network configuration and hyperparameters
     print_network_config(agent)

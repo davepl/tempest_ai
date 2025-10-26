@@ -183,9 +183,9 @@ def display_metrics_header():
     
     # Full header with all desired columns (aligned to match data column widths)
     header = (
-        f"{'Frame':>11} {'FPS':>7} {'FAFO':>6} {'Xprt':>7} "
+        f"{'Frame':>11} {'FPS':>7} {'Epsi':>6} {'Xprt':>7} "
         f"{'Rwrd':>7} {'Subj':>7} {'Obj':>7} {'DQN':>7} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
-        f"{'DLoss':>8} {'CLoss':>8} {'BCLoss':>8} {'Agree%':>7} {'SpinAgr%':>9} "
+        f"{'DLoss':>8} {'Agree%':>7} "
         f"{'AvgEpLen':>8} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
         f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Range':>12} {'Stats':>26}"
@@ -265,8 +265,6 @@ def display_metrics_row(agent, kb_handler):
     latest_loss = metrics.losses[-1] if metrics.losses else 0.0
     loss_avg = latest_loss
     d_loss_avg = float(getattr(metrics, 'last_d_loss', 0.0) or 0.0)
-    c_loss_avg = float(getattr(metrics, 'last_c_loss', 0.0) or 0.0)
-    bc_loss_avg = float(getattr(metrics, 'last_bc_loss', 0.0) or 0.0)
     avg_inference_time_ms = 0.0
     steps_per_sec = 0.0
     samples_per_sec = 0.0
@@ -285,33 +283,19 @@ def display_metrics_row(agent, kb_handler):
         try:
             if getattr(metrics, 'd_loss_count_interval', 0) > 0:
                 d_loss_avg = metrics.d_loss_sum_interval / max(metrics.d_loss_count_interval, 1)
-            if getattr(metrics, 'c_loss_count_interval', 0) > 0:
-                c_loss_avg = metrics.c_loss_sum_interval / max(metrics.c_loss_count_interval, 1)
-            if getattr(metrics, 'bc_loss_count_interval', 0) > 0:
-                bc_loss_avg = metrics.bc_loss_sum_interval / max(metrics.bc_loss_count_interval, 1)
         except Exception:
             pass
         # Average agreement since last row and reset
         agree_avg = 0.0
         if getattr(metrics, 'agree_count_interval', 0) > 0:
             agree_avg = metrics.agree_sum_interval / max(metrics.agree_count_interval, 1)
-        # Average spinner agreement since last row and reset
-        spinner_agree_avg = 0.0
-        if getattr(metrics, 'spinner_agree_count_interval', 0) > 0:
-            spinner_agree_avg = metrics.spinner_agree_sum_interval / max(metrics.spinner_agree_count_interval, 1)
         # Reset interval accumulators
         metrics.loss_sum_interval = 0.0
         metrics.loss_count_interval = 0
         metrics.d_loss_sum_interval = 0.0
         metrics.d_loss_count_interval = 0
-        metrics.c_loss_sum_interval = 0.0
-        metrics.c_loss_count_interval = 0
-        metrics.bc_loss_sum_interval = 0.0
-        metrics.bc_loss_count_interval = 0
         metrics.agree_sum_interval = 0.0
         metrics.agree_count_interval = 0
-        metrics.spinner_agree_sum_interval = 0.0
-        metrics.spinner_agree_count_interval = 0
 
         # Steps/s: compute using time elapsed since last row
         now = time.time()
@@ -430,8 +414,6 @@ def display_metrics_row(agent, kb_handler):
 
     # Additional diagnostics for troubleshooting
     d_loss = d_loss_avg
-    c_loss = c_loss_avg
-    bc_loss = bc_loss_avg
     agree_pct = agree_avg  # Use interval-averaged agreement instead of snapshot
     
     # Calculate average episode length since last metrics print
@@ -473,7 +455,7 @@ def display_metrics_row(agent, kb_handler):
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_display} "
         f"{xprt_display:>7} {rwrd_display:>7} {subj_display:>7} {obj_display:>7} {dqn_display:>7} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
-        f"{d_loss:>8.5f} {c_loss:>8.5f} {bc_loss:>8.5f} {agree_pct*100:>6.1f}% {spinner_agree_avg*100:>7.1f}% "
+        f"{d_loss:>8.5f} {agree_pct*100:>6.1f}% "
         f"{avg_episode_length:>8.1f} {train_pct:>6.1f} "
         f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{avg_inference_time_ms:>7.2f} "

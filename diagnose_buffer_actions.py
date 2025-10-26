@@ -5,18 +5,13 @@ sys.path.insert(0, './Scripts')
 import torch
 import numpy as np
 from config import RL_CONFIG
-from aimodel import Agent
+from aimodel import Agent, action_index_to_components, fire_zap_to_discrete
 
 def main():
     print("=== REPLAY BUFFER ACTION ANALYSIS ===\n")
     
     # Create agent
-    agent = Agent(
-        state_size=RL_CONFIG.state_size,
-        action_size=RL_CONFIG.action_size,
-        discrete_action_size=RL_CONFIG.discrete_action_size,
-        config=RL_CONFIG
-    )
+    agent = Agent(state_size=RL_CONFIG.state_size)
     
     # Load model if exists
     try:
@@ -50,10 +45,13 @@ def main():
         print("✗ Failed to sample batch")
         return
     
-    states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
-    
+    states, discrete_actions, rewards, next_states, dones, actors, horizons = batch
+
     # Convert discrete actions to numpy for analysis
     discrete_np = discrete_actions.cpu().numpy().flatten()
+    fire_zap_only = np.array([
+        fire_zap_to_discrete(*action_index_to_components(int(a))[:2]) for a in discrete_np
+    ])
     
     print("\n=== DISCRETE ACTION DISTRIBUTION ===")
     print(f"Shape: {discrete_actions.shape}")
@@ -61,7 +59,7 @@ def main():
     
     print("\nAction frequency:")
     for action_id in range(4):
-        count = (discrete_np == action_id).sum()
+        count = (fire_zap_only == action_id).sum()
         pct = 100.0 * count / len(discrete_np)
         print(f"  Action {action_id}: {count:6d} ({pct:5.2f}%)")
     
@@ -77,7 +75,7 @@ def main():
     
     print(f"\nDQN actions: {n_dqn} ({100.0 * n_dqn / len(actors_np):.1f}%)")
     if n_dqn > 0:
-        dqn_actions = discrete_np[dqn_mask]
+        dqn_actions = fire_zap_only[dqn_mask]
         for action_id in range(4):
             count = (dqn_actions == action_id).sum()
             pct = 100.0 * count / len(dqn_actions)
@@ -85,7 +83,7 @@ def main():
     
     print(f"\nExpert actions: {n_expert} ({100.0 * n_expert / len(actors_np):.1f}%)")
     if n_expert > 0:
-        expert_actions = discrete_np[expert_mask]
+        expert_actions = fire_zap_only[expert_mask]
         for action_id in range(4):
             count = (expert_actions == action_id).sum()
             pct = 100.0 * count / len(expert_actions)
@@ -111,7 +109,7 @@ def main():
     print("\n=== DIAGNOSIS ===")
     
     # Check if action 2 (FIRE) is present
-    fire_count = (discrete_np == 2).sum()
+    fire_count = (fire_zap_only == 2).sum()
     fire_pct = 100.0 * fire_count / len(discrete_np)
     
     print(f"\n1. Action 2 (FIRE) frequency: {fire_count} ({fire_pct:.2f}%)")
@@ -133,7 +131,7 @@ def main():
     
     # Check if expert actions match expected pattern
     if n_expert > 0:
-        expert_fire = (discrete_np[expert_mask] == 2).sum()
+        expert_fire = (fire_zap_only[expert_mask] == 2).sum()
         expert_fire_pct = 100.0 * expert_fire / n_expert
         print(f"\n3. Expert FIRE action: {expert_fire_pct:.1f}%")
         if expert_fire_pct < 80:

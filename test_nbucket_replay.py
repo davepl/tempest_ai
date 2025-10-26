@@ -39,19 +39,17 @@ class TestSegmentedReplayBuffer(unittest.TestCase):
         state = np.random.randn(self.state_size).astype(np.float32)
         next_state = np.random.randn(self.state_size).astype(np.float32)
         discrete_action = np.random.randint(0, 4)
-        continuous_action = float(np.random.uniform(-0.9, 0.9))
         reward_val = float(np.random.randn()) if reward is None else float(reward)
         done = bool(np.random.rand() < 0.05)
         horizon = np.random.randint(1, 4)
-        return state, discrete_action, continuous_action, reward_val, next_state, done, actor, horizon
+        return state, discrete_action, reward_val, next_state, done, actor, horizon
 
     def _push_transition(self, actor="dqn", reward=None):
-        state, discrete_action, continuous_action, reward_val, next_state, done, act_tag, horizon = self._make_transition(actor=actor, reward=reward)
+        state, discrete_action, reward_val, next_state, done, act_tag, horizon = self._make_transition(actor=actor, reward=reward)
         priority_val = abs(reward_val)
         self.buffer.push(
             state,
             discrete_action,
-            continuous_action,
             reward_val,
             next_state,
             done,
@@ -84,10 +82,9 @@ class TestSegmentedReplayBuffer(unittest.TestCase):
 
         batch = self.buffer.sample(64)
         self.assertIsNotNone(batch)
-        states, discrete, continuous, rewards, next_states, dones, actors, horizons = batch
+        states, discrete, rewards, next_states, dones, actors, horizons = batch
         self.assertEqual(states.shape, (64, self.state_size))
         self.assertEqual(discrete.shape, (64, 1))
-        self.assertEqual(continuous.shape, (64, 1))
         self.assertEqual(rewards.shape, (64, 1))
         self.assertEqual(next_states.shape, (64, self.state_size))
         self.assertEqual(dones.shape, (64, 1))

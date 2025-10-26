@@ -84,13 +84,13 @@ def test_pre_death_flags():
     
     # Add 100 frames, then a death
     for i in range(100):
-        test_buffer.push(state, 0, 0.0, 1.0, state, False, 'dqn', 1)
-    test_buffer.push(state, 0, 0.0, -10.0, state, True, 'dqn', 1)  # Death at index 100
-    
+        test_buffer.push(state, 0, 1.0, state, False, 'dqn', 1)
+    test_buffer.push(state, 0, -10.0, state, True, 'dqn', 1)  # Death at index 100
+
     # Add 100 more frames, then another death
     for i in range(100):
-        test_buffer.push(state, 0, 0.0, 1.0, state, False, 'dqn', 1)
-    test_buffer.push(state, 0, 0.0, -10.0, state, True, 'dqn', 1)  # Death at index 201
+        test_buffer.push(state, 0, 1.0, state, False, 'dqn', 1)
+    test_buffer.push(state, 0, -10.0, state, True, 'dqn', 1)  # Death at index 201
     
     # Check pre-death flags
     pd_count = np.sum(test_buffer.pre_death_flags[:test_buffer.size])
@@ -101,7 +101,7 @@ def test_pre_death_flags():
     # Sample and check rewards
     batch = test_buffer.sample(100)
     if batch:
-        states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
+        states, discrete_actions, rewards, next_states, dones, actors, horizons = batch
         death_rewards = (rewards == -10.0).sum().item()
         normal_rewards = (rewards == 1.0).sum().item()
         print(f"\n   Sample of 100 frames:")

@@ -21,12 +21,11 @@ def test_discrete_action_storage():
     for i, action in enumerate(test_actions):
         state = np.random.randn(10).astype(np.float32)
         next_state = np.random.randn(10).astype(np.float32)
-        continuous_action = 0.0
         reward = float(i)
         done = False
         
         print(f"Pushing action {action} (type: {type(action)})")
-        buffer.push(state, action, continuous_action, reward, next_state, done, 'dqn', 1)
+        buffer.push(state, action, reward, next_state, done, 'dqn', 1)
     
     # Check what was stored
     print("\nStored discrete_actions:")
@@ -36,11 +35,12 @@ def test_discrete_action_storage():
     print(f"Max value: {buffer.discrete_actions[:len(test_actions)].max()}")
     
     # Check for any invalid values
-    invalid = (buffer.discrete_actions[:len(test_actions)] < 0) | (buffer.discrete_actions[:len(test_actions)] >= 4)
-    if np.any(invalid):
-        print(f"\n❌ FOUND INVALID ACTIONS: {buffer.discrete_actions[:len(test_actions)][invalid]}")
+    if not np.array_equal(buffer.discrete_actions[:len(test_actions)], test_actions):
+        print("\n❌ Stored actions do not match expected values!")
+        print("   Expected:", test_actions)
+        print("   Actual:  ", buffer.discrete_actions[:len(test_actions)])
     else:
-        print("\n✓ All actions are valid (0-3)")
+        print("\n✓ Stored actions match input values")
 
 if __name__ == "__main__":
     test_discrete_action_storage()

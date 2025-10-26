@@ -36,7 +36,7 @@ def final_validation():
                 reward = np.random.rand() * 2.0  # Positive rewards
                 done = False
             
-            buffer.push(state, 0, 0.0, reward, state, done, 'dqn', 1)
+            buffer.push(state, 0, reward, state, done, 'dqn', 1)
             total_frames += 1
     
     print(f"   Total frames: {total_frames}")
@@ -65,7 +65,7 @@ def final_validation():
     for i in range(20):
         batch = buffer.sample(batch_size)
         if batch:
-            states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
+            states, discrete_actions, rewards, next_states, dones, actors, horizons = batch
             
             # We can't directly tell which partition a sample came from without tracking
             # But we can infer based on rewards

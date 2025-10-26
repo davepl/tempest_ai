@@ -23,7 +23,6 @@ def create_test_network():
     layers.append(nn.Linear(128, 64))
     layers.append(nn.ReLU())
     layers.append(nn.Linear(64, 4))  # discrete actions
-    layers.append(nn.Linear(64, 1))  # continuous action
     
     return nn.ModuleList(layers)
 
