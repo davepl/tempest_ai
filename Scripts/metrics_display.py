@@ -185,7 +185,7 @@ def display_metrics_header():
     header = (
         f"{'Frame':>11} {'FPS':>7} {'Epsi':>6} {'Xprt':>7} "
         f"{'Rwrd':>7} {'Subj':>7} {'Obj':>7} {'DQN':>7} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
-        f"{'DLoss':>8} {'Agree%':>7} "
+        f"{'Agree%':>7} "
         f"{'AvgEpLen':>8} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
         f"{'AvgInf':>7} {'Samp/s':>9} {'Steps/s':>8} {'GradNorm':>8} {'ClipΔ':>6} {'Q-Range':>12} {'Stats':>26}"
@@ -264,7 +264,6 @@ def display_metrics_row(agent, kb_handler):
     # Get the latest loss value (fallback) and compute avg since last print; also compute Avg Inference time and Steps/s
     latest_loss = metrics.losses[-1] if metrics.losses else 0.0
     loss_avg = latest_loss
-    d_loss_avg = float(getattr(metrics, 'last_d_loss', 0.0) or 0.0)
     avg_inference_time_ms = 0.0
     steps_per_sec = 0.0
     samples_per_sec = 0.0
@@ -279,12 +278,6 @@ def display_metrics_row(agent, kb_handler):
         # Average loss since last row and reset
         if getattr(metrics, 'loss_count_interval', 0) > 0:
             loss_avg = metrics.loss_sum_interval / max(metrics.loss_count_interval, 1)
-        # Component interval averages
-        try:
-            if getattr(metrics, 'd_loss_count_interval', 0) > 0:
-                d_loss_avg = metrics.d_loss_sum_interval / max(metrics.d_loss_count_interval, 1)
-        except Exception:
-            pass
         # Average agreement since last row and reset
         agree_avg = 0.0
         if getattr(metrics, 'agree_count_interval', 0) > 0:
@@ -413,7 +406,6 @@ def display_metrics_row(agent, kb_handler):
             q_range = "Error"
 
     # Additional diagnostics for troubleshooting
-    d_loss = d_loss_avg
     agree_pct = agree_avg  # Use interval-averaged agreement instead of snapshot
     
     # Calculate average episode length since last metrics print
@@ -455,7 +447,7 @@ def display_metrics_row(agent, kb_handler):
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_display} "
         f"{xprt_display:>7} {rwrd_display:>7} {subj_display:>7} {obj_display:>7} {dqn_display:>7} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
-        f"{d_loss:>8.5f} {agree_pct*100:>6.1f}% "
+        f"{agree_pct*100:>6.1f}% "
         f"{avg_episode_length:>8.1f} {train_pct:>6.1f} "
         f"{metrics.client_count:04d} {display_level:>5.1f} "
         f"{avg_inference_time_ms:>7.2f} "
