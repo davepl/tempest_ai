@@ -37,8 +37,7 @@ def test_bucket_stats_display():
     for i in range(4000):
         state = np.random.randn(state_size).astype(np.float32)
         next_state = np.random.randn(state_size).astype(np.float32)
-        discrete_action = np.random.randint(0, 4)
-        continuous_action = np.random.uniform(-0.9, 0.9)
+        discrete_action = np.random.randint(0, agent.discrete_actions)
         reward = np.random.randn()
         done = (i % 100 == 0)  # Terminal every 100 steps
 
@@ -47,7 +46,6 @@ def test_bucket_stats_display():
         agent.memory.push(
             state=state,
             discrete_action=discrete_action,
-            continuous_action=continuous_action,
             reward=reward,
             next_state=next_state,
             done=done,

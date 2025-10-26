@@ -67,12 +67,12 @@ def test_discrete_gradients(agent):
     dones = torch.zeros(batch_size, 1).to(agent.device)
     
     # Forward pass
-    discrete_q_pred, continuous_pred = agent.qnetwork_local(states)
+    discrete_q_pred = agent.qnetwork_local(states)
     discrete_q_selected = discrete_q_pred.gather(1, discrete_actions)
     
     # Compute simple target
     with torch.no_grad():
-        next_q, _ = agent.qnetwork_target(next_states)
+        next_q = agent.qnetwork_target(next_states)
         discrete_targets = rewards + 0.99 * next_q.max(1, keepdim=True)[0] * (1 - dones)
     
     # Compute loss for discrete head only
@@ -116,12 +116,12 @@ def test_action_consistency(agent):
     state = np.random.randn(agent.state_size).astype(np.float32)
     
     # Get action via act() method (inference path)
-    discrete_action_inference, _ = agent.act(state, epsilon=0.0, add_noise=False)
+    discrete_action_inference = agent.act(state, epsilon=0.0, add_noise=False)
     
     # Get action via direct network forward (training path)
     state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(agent.device)
     with torch.no_grad():
-        discrete_q, _ = agent.qnetwork_local(state_tensor)
+        discrete_q = agent.qnetwork_local(state_tensor)
         discrete_action_training = discrete_q.argmax(dim=1).item()
     
     print(f"Inference path action: {discrete_action_inference}")
@@ -148,12 +148,11 @@ def test_network_updates(agent):
     for i in range(100):
         state = np.random.randn(agent.state_size).astype(np.float32)
         next_state = np.random.randn(agent.state_size).astype(np.float32)
-        discrete_action = i % 4
-        continuous_action = 0.0
+        discrete_action = i % agent.discrete_actions
         reward = float(np.random.randn())
         done = False
         
-        agent.memory.push(state, discrete_action, continuous_action, reward, next_state, done, 'dqn', 1)
+        agent.memory.push(state, discrete_action, reward, next_state, done, 'dqn', 1)
     
     # Run multiple training steps
     print(f"Initial discrete_out.weight mean: {initial_weights.mean().item():.6f}")
@@ -205,13 +204,12 @@ def test_q_value_prediction():
         state = np.random.randn(agent.state_size).astype(np.float32)
         next_state = np.random.randn(agent.state_size).astype(np.float32)
         
-        discrete_action = i % 4
+        discrete_action = i % agent.discrete_actions
         # Action 2 always gets high reward
         reward = 5.0 if discrete_action == 2 else 0.0
-        continuous_action = 0.0
         done = False
         
-        agent.memory.push(state, discrete_action, continuous_action, reward, next_state, done, 'dqn', 1)
+        agent.memory.push(state, discrete_action, reward, next_state, done, 'dqn', 1)
     
     # Train for several steps
     print("Training network to learn that action 2 gives reward +5...")
@@ -225,7 +223,7 @@ def test_q_value_prediction():
     for state in test_states:
         state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(agent.device)
         with torch.no_grad():
-            discrete_q, _ = agent.qnetwork_local(state_tensor)
+            discrete_q = agent.qnetwork_local(state_tensor)
             best_action = discrete_q.argmax().item()
             if best_action == 2:
                 action_2_preferred += 1

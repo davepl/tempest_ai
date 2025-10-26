@@ -10,12 +10,7 @@ def main():
     print("=== Q-VALUE EXPLOSION DIAGNOSIS ===\n")
     
     # Load model
-    agent = Agent(
-        state_size=RL_CONFIG.state_size,
-        action_size=RL_CONFIG.action_size,
-        discrete_action_size=RL_CONFIG.discrete_action_size,
-        config=RL_CONFIG
-    )
+    agent = Agent(state_size=RL_CONFIG.state_size)
     
     try:
         checkpoint = torch.load('models/tempest_model_latest.pt', map_location=agent.device)
@@ -33,7 +28,7 @@ def main():
     
     print("=== LOCAL NETWORK Q-VALUES ===")
     with torch.no_grad():
-        discrete_q, continuous = agent.qnetwork_local(dummy_states)
+        discrete_q = agent.qnetwork_local(dummy_states)
         
         print(f"Discrete Q-values shape: {discrete_q.shape}")
         print(f"Min Q-value: {discrete_q.min().item():.4f}")
@@ -55,7 +50,7 @@ def main():
     
     print("\n=== TARGET NETWORK Q-VALUES ===")
     with torch.no_grad():
-        target_q, _ = agent.qnetwork_target(dummy_states)
+        target_q = agent.qnetwork_target(dummy_states)
         
         print(f"Min Q-value: {target_q.min().item():.4f}")
         print(f"Max Q-value: {target_q.max().item():.4f}")
@@ -79,7 +74,7 @@ def main():
     print("\n=== GRADIENT STATISTICS (if available) ===")
     # Forward pass with gradients
     agent.qnetwork_local.train()
-    discrete_q, continuous = agent.qnetwork_local(dummy_states)
+    discrete_q = agent.qnetwork_local(dummy_states)
     
     # Simulate loss
     fake_targets = torch.zeros_like(discrete_q[:, 0:1])
@@ -99,7 +94,7 @@ def main():
     
     print("\n=== DIAGNOSIS ===")
     with torch.no_grad():
-        discrete_q, _ = agent.qnetwork_local(dummy_states)
+        discrete_q = agent.qnetwork_local(dummy_states)
         max_q = discrete_q.max().item()
         min_q = discrete_q.min().item()
         mean_q = discrete_q.mean().item()

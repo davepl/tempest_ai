@@ -18,7 +18,6 @@ class _PendingStep:
     next_state: Any
     done: bool
     actor: str
-    aux_action: float = 0.0
 
 
 class NStepReplayBuffer:
@@ -31,13 +30,10 @@ class NStepReplayBuffer:
       Input: (state, action, reward, next_state, done)
     Output: List[Tuple(state, action, R_n, next_state_n, done_n, actor)]
     """
-    def __init__(self, n_step: int, gamma: float, store_aux_action: bool = False):
+    def __init__(self, n_step: int, gamma: float):
         assert n_step >= 1
         self.n_step = int(n_step)
         self.gamma = float(gamma)
-        # When store_aux_action=True, we will store an extra per-step auxiliary action
-        # (e.g., a continuous action) alongside the discrete action and return it in outputs.
-        self.store_aux_action = bool(store_aux_action)
         self._deque: Deque[_PendingStep] = deque()
 
     def reset(self):
@@ -51,7 +47,6 @@ class NStepReplayBuffer:
         first = self._deque[0]
         s0 = first.state
         a0 = first.action
-        aux0 = first.aux_action
         start_actor = first.actor
         steps_used = 0
 
@@ -74,8 +69,6 @@ class NStepReplayBuffer:
             steps_used = 1
 
         assert last_next_state is not None
-        if self.store_aux_action:
-            return (s0, a0, aux0, R, priority_R, last_next_state, done_flag, steps_used, start_actor)
         return (s0, a0, R, priority_R, last_next_state, done_flag, steps_used, start_actor)
 
     def _should_emit(self) -> bool:
@@ -102,7 +95,6 @@ class NStepReplayBuffer:
         reward,
         next_state,
         done,
-        aux_action=None,
         actor: Optional[str] = None,
         priority_reward: Optional[float] = None,
     ):
@@ -124,11 +116,6 @@ class NStepReplayBuffer:
             raise ValueError("NStepReplayBuffer.add received blank actor tag")
         if actor_tag in ('unknown', 'none', 'random'):
             raise ValueError(f"NStepReplayBuffer.add received invalid actor tag '{actor_tag}'")
-        aux_val = float(aux_action) if (self.store_aux_action and aux_action is not None) else 0.0
-
-        if not self.store_aux_action:
-            aux_val = 0.0
-
         priority_val = float(priority_reward) if priority_reward is not None else float(reward)
 
         self._deque.append(
@@ -140,7 +127,6 @@ class NStepReplayBuffer:
                 next_state=next_state,
                 done=bool(done),
                 actor=actor_tag,
-                aux_action=aux_val,
             )
         )
 

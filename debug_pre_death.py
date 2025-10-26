@@ -55,7 +55,7 @@ def debug_pre_death_sampling():
     # We'll do this by sampling and checking
     batch = buffer.sample(batch_size)
     if batch:
-        states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
+        states, discrete_actions, rewards, next_states, dones, actors, horizons = batch
         print(f"   Batch size: {len(states)}")
         print(f"   Rewards in batch: min={rewards.min():.2f}, max={rewards.max():.2f}, mean={rewards.mean():.2f}")
         print(f"   Death rewards (=-10): {(rewards == -10.0).sum().item()}")

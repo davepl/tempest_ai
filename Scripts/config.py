@@ -96,6 +96,7 @@ class RLConfigData:
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 1
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
+    spinner_command_levels: tuple[int, ...] = (0, 1, 2, 3, 5, 7, 9, -9, -7, -5, -3, -2, -1)
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
@@ -135,15 +136,7 @@ class RLConfigData:
     ignore_subjective_rewards: bool = True
 
     # Loss weighting (makes contributions explicit and tunable)
-    continuous_loss_weight: float = 2.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
-    discrete_loss_weight: float = 0.5    # Weight applied to discrete (Q) loss - BALANCED with continuous
-    discrete_bc_weight: float = 0.5       # Weight for discrete behavioral cloning loss - REDUCED to allow Q-learning to dominate at low expert ratios
-    # High-leverage continuous/expert tuning additions
-    continuous_expert_weight_frames: int = 0  # DISABLED: Complex annealing removed in simplified training.py
-    bc_q_filter_margin: float = 0.0        # Q-filter margin for behavioral cloning (0 disables filtering)
-    
-    # Behavioral cloning for expert frames (imitation learning)
-    use_behavioral_cloning: bool = True   # DISABLED: BC loss removed in simplified training.py
+    discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
@@ -205,16 +198,9 @@ class MetricsData:
     # Component loss averaging since last metrics print
     d_loss_sum_interval: float = 0.0
     d_loss_count_interval: int = 0
-    c_loss_sum_interval: float = 0.0
-    c_loss_count_interval: int = 0
-    bc_loss_sum_interval: float = 0.0
-    bc_loss_count_interval: int = 0
     # Agreement averaging since last metrics print (DQN actions only)
     agree_sum_interval: float = 0.0
     agree_count_interval: int = 0
-    # Spinner (continuous) agreement averaging since last metrics print (DQN actions only)
-    spinner_agree_sum_interval: float = 0.0
-    spinner_agree_count_interval: int = 0
     # Training steps since last metrics print and when last row printed
     training_steps_interval: int = 0
     # New: training requests vs missed (queue full) since last metrics row
@@ -274,8 +260,6 @@ class MetricsData:
     last_clip_delta: float = 1.0
     # Detailed loss diagnostics
     last_d_loss: float = 0.0            # Discrete head loss (Huber/Q-learning)
-    last_c_loss: float = 0.0            # Continuous head loss (after weighting)
-    last_bc_loss: float = 0.0           # Behavioral cloning loss (imitation learning)
     # Advantage weighting diagnostics
     adv_w_mean: float = 1.0
     adv_w_mean_dqn: float = 1.0
@@ -283,8 +267,6 @@ class MetricsData:
     adv_w_max: float = 1.0
     # High-leverage enhancement diagnostics
     dynamic_expert_weight: float = 1.0     # Current annealed expert spinner supervision weight
-    spinner_gate_frac: float = 0.0         # Fraction of DQN spinner samples gated (allowed imitation)
-    bc_filtered_frac: float = 0.0          # Fraction of expert samples filtered out by Q-filter (BC)
     
     # Per-actor training diagnostics
     batch_frac_dqn: float = 0.0       # Fraction of batch that is DQN frames
@@ -301,11 +283,6 @@ class MetricsData:
     def get_last_d_loss(self) -> float:
         try:
             return float(self.last_d_loss)
-        except Exception:
-            return 0.0
-    def get_last_c_loss(self) -> float:
-        try:
-            return float(self.last_c_loss)
         except Exception:
             return 0.0
     def get_adv_w_mean(self) -> float:
@@ -332,21 +309,13 @@ class MetricsData:
     q_sel_mean_expert: float = 0.0     # Mean selected Q (Q(s,a)) for Expert frames
     q_tgt_mean_dqn: float = 0.0        # Mean target for DQN frames
     q_tgt_mean_expert: float = 0.0     # Mean target for Expert frames
-    action_frac_0: float = 0.0         # Fraction of action index 0 in last batch
-    action_frac_1: float = 0.0         # Fraction of action index 1 in last batch
-    action_frac_2: float = 0.0         # Fraction of action index 2 in last batch
-    action_frac_3: float = 0.0         # Fraction of action index 3 in last batch
     action_agree_pct: float = 0.0      # % of batch where taken action == current policy argmax
     batch_done_frac: float = 0.0       # Fraction of terminal transitions in last batch
     batch_h_mean: float = 1.0          # Mean n-step horizon in last batch
 
     # Gradient diagnostics (sampled)
     grad_trunk_d: float = 0.0          # Trunk grad norm due to discrete loss
-    grad_trunk_c: float = 0.0          # Trunk grad norm due to continuous loss
     grad_head_disc_d: float = 0.0      # Discrete head grad norm due to discrete loss
-    grad_head_disc_c: float = 0.0      # Discrete head grad norm due to continuous loss (should be ~0)
-    grad_head_cont_d: float = 0.0      # Continuous head grad norm due to discrete loss (should be ~0)
-    grad_head_cont_c: float = 0.0      # Continuous head grad norm due to continuous loss
     sample_reward_mean_high: float = 0.0     # Mean reward of high-reward samples
     sample_reward_mean_pre_death: float = 0.0  # Mean reward of pre-death samples
     sample_reward_mean_recent: float = 0.0     # Mean reward of recent samples

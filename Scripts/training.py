@@ -43,7 +43,6 @@ def train_step(agent):
     (
         states,
         discrete_actions,
-        continuous_actions,
         rewards,
         next_states,
         dones,
@@ -52,7 +51,6 @@ def train_step(agent):
     ) = batch
 
     discrete_actions = discrete_actions.long()
-    continuous_actions = continuous_actions.float()
     rewards = rewards.float()
     dones = dones.float()
     horizons = horizons.float()
@@ -60,36 +58,27 @@ def train_step(agent):
     agent.qnetwork_local.train()
 
     # Forward pass for current states
-    discrete_q, spinner_pred = agent.qnetwork_local(states)
-    selected_q = discrete_q.gather(1, discrete_actions)
+    q_values = agent.qnetwork_local(states)
+    selected_q = q_values.gather(1, discrete_actions)
 
     # Build Double DQN targets
     with torch.no_grad():
-        next_q_local, _ = agent.qnetwork_local(next_states)
+        next_q_local = agent.qnetwork_local(next_states)
         best_next_actions = next_q_local.argmax(dim=1, keepdim=True)
 
-        next_q_target, _ = agent.qnetwork_target(next_states)
+        next_q_target = agent.qnetwork_target(next_states)
         next_values = next_q_target.gather(1, best_next_actions)
 
         gamma_h = torch.pow(torch.full_like(horizons, agent.gamma), horizons)
         targets = rewards + (1.0 - dones) * gamma_h * next_values
 
     td_loss = F.smooth_l1_loss(selected_q, targets)
-    spinner_loss = F.mse_loss(spinner_pred, continuous_actions)
 
     expert_mask_np = [actor == "expert" for actor in actors]
     expert_mask = _to_tensor_bool(expert_mask_np, len(actors), device=states.device)
 
-    if expert_mask.any():
-        bc_loss_raw = F.cross_entropy(discrete_q[expert_mask], discrete_actions[expert_mask].squeeze(1))
-    else:
-        bc_loss_raw = torch.tensor(0.0, device=states.device)
-
     w_disc = float(getattr(RL_CONFIG, "discrete_loss_weight", 1.0))
-    w_cont = float(getattr(RL_CONFIG, "continuous_loss_weight", 1.0))
-    bc_weight = float(getattr(RL_CONFIG, "discrete_bc_weight", 0.0))
-
-    total_loss = (w_disc * td_loss) + (w_cont * spinner_loss) + (bc_weight * bc_loss_raw)
+    total_loss = w_disc * td_loss
 
     agent.optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
@@ -115,15 +104,9 @@ def train_step(agent):
         metrics.loss_count_interval += 1
 
         metrics.last_d_loss = float((w_disc * td_loss).item())
-        metrics.last_c_loss = float((w_cont * spinner_loss).item())
-        metrics.last_bc_loss = float((bc_weight * bc_loss_raw).item())
 
         metrics.d_loss_sum_interval += metrics.last_d_loss
         metrics.d_loss_count_interval += 1
-        metrics.c_loss_sum_interval += metrics.last_c_loss
-        metrics.c_loss_count_interval += 1
-        metrics.bc_loss_sum_interval += metrics.last_bc_loss
-        metrics.bc_loss_count_interval += 1
 
         grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
         metrics.last_grad_norm = grad_norm_val
@@ -149,7 +132,7 @@ def train_step(agent):
             metrics.reward_mean_expert = float(rewards_np[expert_mask_np].mean())
 
         with torch.no_grad():
-            policy_q, policy_spinner = agent.qnetwork_local(states)
+            policy_q = agent.qnetwork_local(states)
             greedy_actions = policy_q.argmax(dim=1, keepdim=True)
             action_matches = (greedy_actions == discrete_actions).float().squeeze(1)
 
@@ -157,15 +140,10 @@ def train_step(agent):
                 dqn_indices = torch.tensor(np.nonzero(dqn_mask_np)[0], dtype=torch.long, device=states.device)
                 agree_mean = float(action_matches[dqn_indices].mean().item())
 
-                spinner_diff = torch.abs(policy_spinner[dqn_indices] - continuous_actions[dqn_indices])
-                spinner_agree_mean = float((spinner_diff < 0.1).float().mean().item())
-
                 # Update agreement metrics atomically to avoid race-induced >100% readings
                 with metrics.lock:
                     metrics.agree_sum_interval += agree_mean
                     metrics.agree_count_interval += 1
-                    metrics.spinner_agree_sum_interval += spinner_agree_mean
-                    metrics.spinner_agree_count_interval += 1
 
         metrics.last_optimizer_step_time = time.time()
     except Exception:

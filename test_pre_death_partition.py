@@ -30,7 +30,7 @@ def test_pre_death_partition():
     for i in range(1000):
         reward = np.random.randn() * 2.0  # Random rewards
         done = False
-        buffer.push(state, 0, 0.0, reward, state, done, 'dqn', 1)
+        buffer.push(state, 0, reward, state, done, 'dqn', 1)
     
     stats = buffer.get_partition_stats()
     print(f"   Buffer size: {buffer.size}")
@@ -44,7 +44,7 @@ def test_pre_death_partition():
         for frame in range(20):
             reward = np.random.randn()
             done = (frame == 19)  # Death on last frame
-            buffer.push(state, 0, 0.0, reward, state, done, 'dqn', 1)
+            buffer.push(state, 0, reward, state, done, 'dqn', 1)
             if done:
                 death_count += 1
     
@@ -58,7 +58,7 @@ def test_pre_death_partition():
     for i in range(2000):
         reward = np.random.randn() * 2.0
         done = False
-        buffer.push(state, 0, 0.0, reward, state, done, 'dqn', 1)
+        buffer.push(state, 0, reward, state, done, 'dqn', 1)
     
     stats = buffer.get_partition_stats()
     print(f"   Buffer size: {buffer.size}")
@@ -76,7 +76,7 @@ def test_pre_death_partition():
         print("   ERROR: Failed to sample batch!")
         return False
     
-    states, discrete_actions, continuous_actions, rewards, next_states, dones, actors, horizons = batch
+    states, discrete_actions, rewards, next_states, dones, actors, horizons = batch
     
     print(f"   Batch size: {len(states)}")
     print(f"   Terminal states in batch: {dones.sum().item()}")

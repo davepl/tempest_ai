@@ -7,7 +7,7 @@
 # ||  ROLE: Neural model (HybridDQN), training agent, parsing, expert helpers, keyboard, and utilities.           ||
 # ||                                                                                                              ||
 # ||  NEED TO KNOW:                                                                                               ||
-# ||   - HybridDQN: shared trunk + discrete head (4 Q-values) + continuous head (spinner in [-0.9,0.9]).          ||
+# ||   - HybridDQN: shared trunk + discrete head over fire/zap/spinner combinations.                              ||
 # ||   - HybridDQNAgent: replay, background training, epsilon/actor logic, loss computation, target updates.      ||
 # ||   - parse_frame_data: unpacks OOB header and float32 state from Lua.                                         ||
 # ||   - KeyboardHandler & metrics-safe print helpers.                                                             ||
@@ -146,6 +146,70 @@ rl_config = RLConfigData()
 params_count = server_config.params_count
 state_size = rl_config.state_size
 
+SPINNER_SCALE = 32.0
+_RAW_SPINNER_LEVELS = tuple(int(v) for v in getattr(RL_CONFIG, "spinner_command_levels", (0,)))
+if not _RAW_SPINNER_LEVELS:
+    _RAW_SPINNER_LEVELS = (0,)
+SPINNER_BUCKET_VALUES = tuple(level / SPINNER_SCALE for level in _RAW_SPINNER_LEVELS)
+NUM_SPINNER_BUCKETS = len(SPINNER_BUCKET_VALUES)
+FIRE_ZAP_ACTIONS = 4
+TOTAL_DISCRETE_ACTIONS = FIRE_ZAP_ACTIONS * NUM_SPINNER_BUCKETS
+
+
+def _clamp_spinner_index(index: int) -> int:
+    if NUM_SPINNER_BUCKETS <= 0:
+        return 0
+    return int(max(0, min(NUM_SPINNER_BUCKETS - 1, index)))
+
+
+def spinner_index_to_value(index: int) -> float:
+    if not SPINNER_BUCKET_VALUES:
+        return 0.0
+    return SPINNER_BUCKET_VALUES[_clamp_spinner_index(index)]
+
+
+def quantize_spinner_value(spinner_value: float) -> int:
+    if not SPINNER_BUCKET_VALUES:
+        return 0
+    target = float(spinner_value)
+    best_idx = 0
+    best_dist = float("inf")
+    for idx, bucket_value in enumerate(SPINNER_BUCKET_VALUES):
+        dist = abs(bucket_value - target)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+    return best_idx
+
+
+def compose_action_index(fire_zap_index: int, spinner_index: int) -> int:
+    return int(max(0, fire_zap_index)) * NUM_SPINNER_BUCKETS + _clamp_spinner_index(spinner_index)
+
+
+def decompose_action_index(action_index: int) -> tuple[int, int]:
+    if NUM_SPINNER_BUCKETS <= 0:
+        return int(action_index), 0
+    spinner_index = action_index % NUM_SPINNER_BUCKETS
+    fire_zap_index = action_index // NUM_SPINNER_BUCKETS
+    fire_zap_index = int(max(0, min(FIRE_ZAP_ACTIONS - 1, fire_zap_index)))
+    return fire_zap_index, _clamp_spinner_index(spinner_index)
+
+
+def action_index_to_components(action_index: int) -> tuple[bool, bool, int, float]:
+    fire_zap_index, spinner_index = decompose_action_index(int(action_index))
+    fire, zap = discrete_to_fire_zap(fire_zap_index)
+    spinner_value = spinner_index_to_value(spinner_index)
+    return fire, zap, spinner_index, spinner_value
+
+
+def encode_action_from_components(fire: bool, zap: bool, spinner_value: float) -> tuple[int, int, float]:
+    fire_zap_index = fire_zap_to_discrete(fire, zap)
+    spinner_index = quantize_spinner_value(spinner_value)
+    action_index = compose_action_index(fire_zap_index, spinner_index)
+    quantized_spinner = spinner_index_to_value(spinner_index)
+    return action_index, spinner_index, quantized_spinner
+
+
 @dataclass
 class FrameData:
     """Game state data for a single frame"""
@@ -265,18 +329,9 @@ metrics = config_metrics
 metrics.global_server = None
 
 class HybridDQN(nn.Module):
-    """Hybrid DQN with discrete fire/zap actions + continuous spinner.
-    
-    Architecture:
-    - Shared trunk: processes state features
-    - Discrete head: outputs Q-values for 4 fire/zap combinations
-    - Continuous head: outputs single continuous spinner value in [-0.9, +0.9]
-    
-    Forward pass returns: (discrete_q_values, continuous_spinner)
-    - discrete_q_values: (batch_size, 4) Q-values for fire/zap combinations
-    - continuous_spinner: (batch_size, 1) spinner values in [-0.9, +0.9]
-    """
-    def __init__(self, state_size: int, discrete_actions: int = 4, 
+    """DQN with shared trunk feeding a single discrete head over joint fire/zap/spinner actions."""
+
+    def __init__(self, state_size: int, discrete_actions: int = TOTAL_DISCRETE_ACTIONS,
                  hidden_size: int = 512, num_layers: int = 3):
         super(HybridDQN, self).__init__()
         
@@ -321,13 +376,6 @@ class HybridDQN(nn.Module):
         self.discrete_fc = nn.Linear(shared_output_size, head_size)
         self.discrete_out = nn.Linear(head_size, discrete_actions)
         
-        #BUGBUG why fc1 and fc2?  What's the difference and why are there both?
-        # Continuous head for spinner (always separate from dueling)
-        self.continuous_fc1 = nn.Linear(shared_output_size, head_size)
-        continuous_head_size = max(32, head_size // 2)
-        self.continuous_fc2 = nn.Linear(head_size, continuous_head_size)
-        self.continuous_out = nn.Linear(continuous_head_size, 1)
-        
         # Initialize discrete head with balanced initialization to prevent action bias
         # CRITICAL: Without this, default initialization creates strong bias (e.g., 93% action 3)
         # Strategy: Use small random weights to allow gradient flow while maintaining initial balance
@@ -337,20 +385,8 @@ class HybridDQN(nn.Module):
         torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
         torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
         
-        # Initialize continuous head with smaller weights for stable training
-        torch.nn.init.xavier_normal_(self.continuous_out.weight, gain=0.1)
-        torch.nn.init.constant_(self.continuous_out.bias, 0.0)
-    
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning (discrete_q_values, continuous_spinner)
-        
-        Args:
-            x: Input state tensor (batch_size, state_size)
-            
-        Returns:
-            discrete_q_values: Q-values for fire/zap combinations (batch_size, 4)
-            continuous_spinner: Spinner values in [-0.9, +0.9] (batch_size, 1)
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning Q-values for every joint action combination."""
         # Shared feature extraction through dynamic layers
         shared = x
         for layer in self.shared_layers:
@@ -358,20 +394,11 @@ class HybridDQN(nn.Module):
         
         # Discrete Q-values head
         discrete = F.relu(self.discrete_fc(shared))
-        discrete_q = self.discrete_out(discrete)  # (B, discrete_actions)
+        discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
         
         # Clamp Q-values to [-50, +50] to prevent divergence
         discrete_q = torch.clamp(discrete_q, -50.0, 50.0)
-        
-        # Continuous spinner head
-        continuous = F.relu(self.continuous_fc1(shared))
-        continuous = F.relu(self.continuous_fc2(continuous))
-        continuous_raw = self.continuous_out(continuous)  # (B, 1)
-        
-        # Apply tanh to bound spinner to [-1, +1] then scale to [-0.9, +0.9]
-        continuous_spinner = torch.tanh(continuous_raw) * 0.9
-        
-        return discrete_q, continuous_spinner
+        return discrete_q
 
 
 class HybridReplayBuffer:
@@ -395,7 +422,6 @@ class HybridReplayBuffer:
             "states",
             "next_states",
             "discrete_actions",
-            "continuous_actions",
             "rewards",
             "dones",
             "horizons",
@@ -414,7 +440,6 @@ class HybridReplayBuffer:
                 self.states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
                 self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
                 self.discrete_actions = np.zeros((self.capacity,), dtype=np.int64)
-                self.continuous_actions = np.zeros((self.capacity,), dtype=np.float32)
                 self.rewards = np.zeros((self.capacity,), dtype=np.float32)
                 self.dones = np.zeros((self.capacity,), dtype=np.bool_)
                 self.horizons = np.ones((self.capacity,), dtype=np.int32)
@@ -423,7 +448,6 @@ class HybridReplayBuffer:
                 self.states = np.zeros((0, self.state_size), dtype=np.float32)
                 self.next_states = np.zeros((0, self.state_size), dtype=np.float32)
                 self.discrete_actions = np.zeros((0,), dtype=np.int64)
-                self.continuous_actions = np.zeros((0,), dtype=np.float32)
                 self.rewards = np.zeros((0,), dtype=np.float32)
                 self.dones = np.zeros((0,), dtype=np.bool_)
                 self.horizons = np.zeros((0,), dtype=np.int32)
@@ -433,7 +457,6 @@ class HybridReplayBuffer:
             self,
             state: np.ndarray,
             discrete_action: int,
-            continuous_action: float,
             reward: float,
             next_state: np.ndarray,
             done: bool,
@@ -447,7 +470,6 @@ class HybridReplayBuffer:
             self.states[idx] = state
             self.next_states[idx] = next_state
             self.discrete_actions[idx] = discrete_action
-            self.continuous_actions[idx] = continuous_action
             self.rewards[idx] = reward
             self.dones[idx] = done
             self.actors[idx] = actor
@@ -466,7 +488,6 @@ class HybridReplayBuffer:
                     zero_states,
                     zero_int,
                     zero_scalar,
-                    zero_scalar,
                     zero_states,
                     zero_scalar,
                     [],
@@ -476,7 +497,6 @@ class HybridReplayBuffer:
             states_np = self.states[indices].copy()
             next_states_np = self.next_states[indices].copy()
             discrete_np = self.discrete_actions[indices].copy().reshape(-1, 1)
-            continuous_np = self.continuous_actions[indices].copy().reshape(-1, 1)
             rewards_np = self.rewards[indices].copy().reshape(-1, 1)
             dones_np = self.dones[indices].astype(np.float32).reshape(-1, 1)
             horizons_np = self.horizons[indices].copy().reshape(-1, 1)
@@ -484,7 +504,6 @@ class HybridReplayBuffer:
             return (
                 states_np,
                 discrete_np,
-                continuous_np,
                 rewards_np,
                 next_states_np,
                 dones_np,
@@ -560,7 +579,6 @@ class HybridReplayBuffer:
         self.states = self._main.states
         self.next_states = self._main.next_states
         self.discrete_actions = self._main.discrete_actions
-        self.continuous_actions = self._main.continuous_actions
         self.rewards = self._main.rewards
         self.dones = self._main.dones
         self.horizons = self._main.horizons
@@ -598,7 +616,6 @@ class HybridReplayBuffer:
         self,
         state,
         discrete_action,
-        continuous_action,
         reward,
         next_state,
         done,
@@ -617,12 +634,6 @@ class HybridReplayBuffer:
             action_idx = int(discrete_action)
         except Exception:
             action_idx = 0
-
-        try:
-            cont_val = float(continuous_action)
-        except Exception:
-            cont_val = 0.0
-        cont_val = max(-0.9, min(0.9, cont_val))
 
         try:
             reward_val = float(reward)
@@ -651,7 +662,6 @@ class HybridReplayBuffer:
             self._main.add(
                 state_arr,
                 action_idx,
-                cont_val,
                 reward_val,
                 next_state_arr,
                 done_flag,
@@ -679,7 +689,6 @@ class HybridReplayBuffer:
                     self.priority_segments[bucket_idx].add(
                         state_arr,
                         action_idx,
-                        cont_val,
                         reward_val,
                         next_state_arr,
                         done_flag,
@@ -722,7 +731,7 @@ class HybridReplayBuffer:
         sample_chunks = [chunk for chunk in priority_chunks if chunk is not None]
         sample_chunks.append(main_chunk)
 
-        states_list, discrete_list, continuous_list = [], [], []
+        states_list, discrete_list = [], []
         rewards_list, next_states_list, dones_list = [], [], []
         actors_list: List[str] = []
         horizons_list = []
@@ -730,16 +739,14 @@ class HybridReplayBuffer:
         for chunk in sample_chunks:
             states_list.append(chunk[0])
             discrete_list.append(chunk[1])
-            continuous_list.append(chunk[2])
-            rewards_list.append(chunk[3])
-            next_states_list.append(chunk[4])
-            dones_list.append(chunk[5])
-            actors_list.extend(chunk[6])
-            horizons_list.append(chunk[7])
+            rewards_list.append(chunk[2])
+            next_states_list.append(chunk[3])
+            dones_list.append(chunk[4])
+            actors_list.extend(chunk[5])
+            horizons_list.append(chunk[6])
 
         states_np = np.concatenate(states_list, axis=0) if states_list else np.zeros((0, self.state_size), dtype=np.float32)
         discrete_np = np.concatenate(discrete_list, axis=0) if discrete_list else np.zeros((0, 1), dtype=np.int64)
-        continuous_np = np.concatenate(continuous_list, axis=0) if continuous_list else np.zeros((0, 1), dtype=np.float32)
         rewards_np = np.concatenate(rewards_list, axis=0) if rewards_list else np.zeros((0, 1), dtype=np.float32)
         next_states_np = np.concatenate(next_states_list, axis=0) if next_states_list else np.zeros((0, self.state_size), dtype=np.float32)
         dones_np = np.concatenate(dones_list, axis=0) if dones_list else np.zeros((0, 1), dtype=np.float32)
@@ -748,7 +755,6 @@ class HybridReplayBuffer:
         states = torch.from_numpy(states_np).float().to(device)
         next_states = torch.from_numpy(next_states_np).float().to(device)
         discrete_actions = torch.from_numpy(discrete_np).long().to(device)
-        continuous_actions = torch.from_numpy(continuous_np).float().to(device)
         rewards = torch.from_numpy(rewards_np).float().to(device)
         dones = torch.from_numpy(dones_np).float().to(device)
         horizons = torch.from_numpy(horizons_np.astype(np.float32)).float().to(device)
@@ -758,7 +764,6 @@ class HybridReplayBuffer:
             return (
                 states,
                 discrete_actions,
-                continuous_actions,
                 rewards,
                 next_states,
                 dones,
@@ -770,7 +775,6 @@ class HybridReplayBuffer:
         return (
             states,
             discrete_actions,
-            continuous_actions,
             rewards,
             next_states,
             dones,
@@ -1038,7 +1042,9 @@ class HybridDQNAgent:
         batch_size: int = RL_CONFIG.batch_size,
     ):
         self.state_size = int(state_size)
-        self.discrete_actions = int(discrete_actions)
+        self.fire_zap_actions = int(discrete_actions)
+        self.spinner_actions = max(1, NUM_SPINNER_BUCKETS)
+        self.discrete_actions = max(1, self.fire_zap_actions * self.spinner_actions)
         self.learning_rate = float(learning_rate)
         self.gamma = float(gamma)
         self.epsilon = float(epsilon)
@@ -1089,30 +1095,27 @@ class HybridDQNAgent:
             worker.start()
             self.training_threads.append(worker)
 
-    def _sample_epsilon_discrete_action(self) -> int:
-        """Sample a discrete action for epsilon exploration with a reduced superzap chance."""
-        if self.discrete_actions <= 1:
-            return 0
-
+    def _sample_fire_zap_action(self) -> int:
+        """Sample a fire/zap combination with optional zap discount."""
+        base_actions = max(1, self.fire_zap_actions)
         zap_discount = float(getattr(RL_CONFIG, 'epsilon_random_zap_discount', 0.0) or 0.0)
-        if zap_discount <= 0.0:
-            return random.randrange(self.discrete_actions)
+        if zap_discount <= 0.0 or base_actions <= 1:
+            return random.randrange(base_actions)
 
-        # Actions containing zap (superzap) are indices 1 and 3 in the FIRE/ZAP mapping.
-        zap_indices = [idx for idx in (1, 3) if idx < self.discrete_actions]
-        non_zap_indices = [idx for idx in range(self.discrete_actions) if idx not in zap_indices]
+        zap_indices = [idx for idx in (1, 3) if idx < base_actions]
+        non_zap_indices = [idx for idx in range(base_actions) if idx not in zap_indices]
 
         if not zap_indices or not non_zap_indices:
-            return random.randrange(self.discrete_actions)
+            return random.randrange(base_actions)
 
-        base_prob = 1.0 / float(self.discrete_actions)
+        base_prob = 1.0 / float(base_actions)
         max_discount = max(0.0, (base_prob * len(zap_indices)) - 1e-6)
         total_discount = min(zap_discount, max_discount)
 
         per_zap = total_discount / len(zap_indices)
         per_non = total_discount / len(non_zap_indices)
 
-        probs = [base_prob for _ in range(self.discrete_actions)]
+        probs = [base_prob for _ in range(base_actions)]
         for idx in zap_indices:
             probs[idx] = max(0.0, probs[idx] - per_zap)
         for idx in non_zap_indices:
@@ -1124,7 +1127,12 @@ class HybridDQNAgent:
             cumulative += prob
             if r < cumulative:
                 return idx
-        return self.discrete_actions - 1
+        return base_actions - 1
+
+    def _sample_random_action_index(self) -> int:
+        fire_zap_idx = self._sample_fire_zap_action()
+        spinner_idx = random.randrange(self.spinner_actions)
+        return compose_action_index(fire_zap_idx, spinner_idx)
 
     def _queue_training_steps(self, n_steps: int):
         for _ in range(max(0, n_steps)):
@@ -1152,25 +1160,18 @@ class HybridDQNAgent:
 
         self.qnetwork_local.eval()
         with torch.no_grad():
-            discrete_q, spinner = self.qnetwork_local(state_tensor)
+            q_values = self.qnetwork_local(state_tensor)
         self.qnetwork_local.train()
 
         if random.random() < epsilon:
-            discrete_action = self._sample_epsilon_discrete_action()
-        else:
-            discrete_action = int(discrete_q.argmax(dim=1).item())
+            return self._sample_random_action_index()
 
-        spinner_val = float(torch.tanh(spinner).item() * 0.9)
-        if add_noise and epsilon > 0.0:
-            spinner_val = float(np.clip(spinner_val + np.random.normal(scale=0.05), -0.9, 0.9))
-
-        return discrete_action, spinner_val
+        return int(q_values.argmax(dim=1).item())
 
     def step(
         self,
         state,
         discrete_action,
-        continuous_action,
         reward,
         next_state,
         done,
@@ -1181,7 +1182,6 @@ class HybridDQNAgent:
         self.memory.push(
             state,
             discrete_action,
-            continuous_action,
             reward,
             next_state,
             done,
@@ -1393,11 +1393,11 @@ class HybridDQNAgent:
                     sample = self.memory.sample(min(len(self.memory), 256))
                     if sample is not None:
                         states = sample[0]
-                        discrete_q, _ = self.qnetwork_local(states)
-                        return float(discrete_q.min().item()), float(discrete_q.max().item())
+                        q_values = self.qnetwork_local(states)
+                        return float(q_values.min().item()), float(q_values.max().item())
                 dummy = torch.zeros(1, self.state_size, device=self.device)
-                discrete_q, _ = self.qnetwork_local(dummy)
-                return float(discrete_q.min().item()), float(discrete_q.max().item())
+                q_values = self.qnetwork_local(dummy)
+                return float(q_values.min().item()), float(q_values.max().item())
         except Exception:
             return float('nan'), float('nan')
 
@@ -1577,35 +1577,15 @@ def discrete_to_fire_zap(discrete_action):
     return bool(fire), bool(zap)
 
 def get_expert_hybrid_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
-    """Get expert action in hybrid format (discrete_action, continuous_spinner)
-    
-    Returns:
-        discrete_action: int (0-3) for fire/zap combination
-        continuous_spinner: float in [-0.9, +0.9] for movement (full expert range)
-    """
-    # Get continuous expert action
+    """Return (action_index, quantized_spinner) for the expert policy."""
     fire, zap, spinner = get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire, expert_zap)
-    
-    # Convert to hybrid format - preserve full expert system range!
-    discrete_action = fire_zap_to_discrete(fire, zap)
-    continuous_spinner = float(spinner)  # No clamping - use expert's full range
-    
-    return discrete_action, continuous_spinner
+    action_index, _, quantized_spinner = encode_action_from_components(fire, zap, spinner)
+    return action_index, quantized_spinner
 
-def hybrid_to_game_action(discrete_action, continuous_spinner):
-    """Convert hybrid action to game format
-    
-    Args:
-        discrete_action: int (0-3) for fire/zap combination
-        continuous_spinner: float in [-0.3, +0.3] for movement
-        
-    Returns:
-        fire_cmd: int (0 or 1)
-        zap_cmd: int (0 or 1) 
-        spinner_cmd: int (-9 to +9, scaled from spinner * 31)
-    """
-    fire, zap = discrete_to_fire_zap(discrete_action)
-    return encode_action_to_game(fire, zap, continuous_spinner)
+def hybrid_to_game_action(action_index: int):
+    """Convert a joint action index to game-compatible fire/zap/spinner commands."""
+    fire, zap, _, spinner_value = action_index_to_components(action_index)
+    return encode_action_to_game(fire, zap, spinner_value)
 
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate using step-based decay with adaptive floor.
