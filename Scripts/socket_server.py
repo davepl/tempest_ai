@@ -656,6 +656,18 @@ class SocketServer:
                             enable_zap_gate = bool(getattr(RL_CONFIG, 'enable_superzap_gate', False))
                         except Exception:
                             enable_zap_gate = False
+
+                        # Never run the zap gate during training. If the config accidentally
+                        # leaves it enabled, force it off whenever the agent is updating so
+                        # we don't overwrite the DQN's chosen actions (which torpedoes Agree%).
+                        if enable_zap_gate:
+                            try:
+                                training_active = bool(getattr(self.agent, 'training_enabled', True))
+                            except Exception:
+                                training_active = True
+                            if training_active:
+                                enable_zap_gate = False
+
                         if enable_zap_gate and zap:
                             try:
                                 pzap = float(getattr(RL_CONFIG, 'superzap_prob', 0.01))

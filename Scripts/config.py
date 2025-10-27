@@ -84,7 +84,7 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 2048                # Reduced from 8192 for faster sampling
+    batch_size: int = 1024                # Reduced from 8192 for faster sampling
     lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
@@ -131,9 +131,13 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    obj_reward_scale: float = 0.001             # 1 reward = 1000 points
-    subj_reward_scale: float = 0.007       # subjective are scaled to 70% of objective
-    ignore_subjective_rewards: bool = True
+    obj_reward_scale: float = 0.00001            # Convert game score points to RL reward (1 point => 1e-5)
+    subj_reward_scale: float = 0.000007     # Subjective shaping scaled another 10x down to prevent exploitation
+    ignore_subjective_rewards: bool = False
+    obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
+    use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
+    reward_centering_beta: float = 0.0005   # EMA rate for reward centering (lower = slower adaptation)
+    reward_centering_init: float = 0.05     # Initial guess for mean objective reward (pre-scale)
 
     # Loss weighting (makes contributions explicit and tunable)
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
@@ -152,9 +156,11 @@ class RLConfigData:
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob
     # This forces strategic zap usage rather than spamming
-    # DISABLED FOR TRAINING: Causes 67% action mismatch (model predicts zaps, gate blocks them)
-    # Re-enable for evaluation/competition once model is trained
-    enable_superzap_gate: bool = True  # Was True - disabled to fix agreement < 25% issue
+    # IMPORTANT: Keep DISABLED during training. Enabling this during training
+    # causes a large action mismatch (the policy selects zap, but the gate
+    # suppresses it), which tanks the Agree% metric and destabilizes learning.
+    # Re-enable for evaluation once the model is trained if desired.
+    enable_superzap_gate: bool = False
     superzap_prob: float = 0.01  # 1% success rate for zap attempts
 
 # Create instance of RLConfigData after its definition
@@ -211,6 +217,8 @@ class MetricsData:
     last_metrics_row_time: float = 0.0
     # Frames since last metrics print
     frames_count_interval: int = 0
+    # Reward centering telemetry
+    reward_center_value: float = 0.0
     
     # Episode length tracking (for AvgEpLen column instead of Done%)
     episode_length_sum_interval: int = 0   # Sum of episode lengths since last metrics print
