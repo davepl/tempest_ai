@@ -84,8 +84,8 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 2048                # Reduced from 8192 for faster sampling
-    lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
+    batch_size: int = 512                # Reduced from 8192 for faster sampling
+    lr: float = 0.00025                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
@@ -120,9 +120,9 @@ class RLConfigData:
     update_target_every: int = 1000        # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
         
-    # Single-threaded training
-    training_steps_per_sample: int = 1     # Reduced for speed - was 4
-    training_workers: int = 4               # Multiple threads now thread-safe
+    # Training scheduling (supports fractional updates per sample; queue drains asynchronously)
+    training_steps_per_sample: float = 1  # Average training updates enqueued per experience (use <1.0 to throttle)
+    training_workers: int = 2               # Background trainer threads (updates still serialize on optimizer)
 
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
@@ -135,9 +135,9 @@ class RLConfigData:
     ignore_subjective_rewards: bool = True
 
     # Loss weighting (makes contributions explicit and tunable)
-    continuous_loss_weight: float = 2.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
+    continuous_loss_weight: float = 1.0   # Weight applied to continuous (spinner) loss - REDUCED to restore stability
     discrete_loss_weight: float = 0.5    # Weight applied to discrete (Q) loss - BALANCED with continuous
-    discrete_bc_weight: float = 0.5       # Weight for discrete behavioral cloning loss - REDUCED to allow Q-learning to dominate at low expert ratios
+    discrete_bc_weight: float = 0.1       # Weight for discrete behavioral cloning loss - REDUCED to allow Q-learning to dominate at low expert ratios
     # High-leverage continuous/expert tuning additions
     continuous_expert_weight_frames: int = 0  # DISABLED: Complex annealing removed in simplified training.py
     bc_q_filter_margin: float = 0.0        # Q-filter margin for behavioral cloning (0 disables filtering)

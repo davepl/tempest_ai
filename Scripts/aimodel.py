@@ -1079,6 +1079,7 @@ class HybridDQNAgent:
         self.training_threads: list[threading.Thread] = []
         self.num_training_workers = int(getattr(RL_CONFIG, 'training_workers', 1) or 1)
         self.training_lock = threading.Lock()
+        self._train_step_reservoir = 0.0
 
         for idx in range(self.num_training_workers):
             worker = threading.Thread(
@@ -1126,8 +1127,14 @@ class HybridDQNAgent:
                 return idx
         return self.discrete_actions - 1
 
-    def _queue_training_steps(self, n_steps: int):
-        for _ in range(max(0, n_steps)):
+    def _queue_training_steps(self, n_steps: float):
+        self._train_step_reservoir += max(0.0, float(n_steps))
+        whole_steps = int(self._train_step_reservoir)
+        if whole_steps <= 0:
+            return
+        self._train_step_reservoir -= whole_steps
+
+        for _ in range(whole_steps):
             try:
                 self.train_queue.put_nowait(1)
                 metrics.training_steps_requested_interval += 1
@@ -1202,7 +1209,7 @@ class HybridDQNAgent:
         if not global_training_enabled:
             return
 
-        steps_per_sample = int(getattr(RL_CONFIG, 'training_steps_per_sample', 1) or 1)
+        steps_per_sample = float(getattr(RL_CONFIG, 'training_steps_per_sample', 1.0) or 0.0)
         self._queue_training_steps(steps_per_sample)
 
     def background_train(self):

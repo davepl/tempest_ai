@@ -319,6 +319,7 @@ def display_metrics_row(agent, kb_handler):
         elapsed = now - last_t if last_t > 0.0 else None
         steps_int = int(getattr(metrics, 'training_steps_interval', 0))
         frames_int = int(getattr(metrics, 'frames_count_interval', 0))
+        steps_requested_int = int(getattr(metrics, 'training_steps_requested_interval', 0))
         steps_missed_int = int(getattr(metrics, 'training_steps_missed_interval', 0))
         if elapsed and elapsed > 0:
             steps_per_sec = steps_int / elapsed
@@ -332,9 +333,12 @@ def display_metrics_row(agent, kb_handler):
         # Interval Steps/1kF using the same interval counts
         denom_frames = max(1, frames_int)
         steps_per_1k_frames = (steps_int * 1000.0) / float(denom_frames)
-        # Calculate training completion percentage against served + missed requests
-        denom_steps = max(1.0, float(steps_int + steps_missed_int))
-        train_pct = (100.0 * steps_int / denom_steps)
+        # Calculate training completion percentage against requested + missed steps
+        desired_steps = steps_requested_int + steps_missed_int
+        if desired_steps <= 0:
+            train_pct = 100.0 if steps_int > 0 else 0.0
+        else:
+            train_pct = min(100.0, (100.0 * steps_int) / float(desired_steps))
         # Reset intervals and update last row time
         metrics.training_steps_interval = 0
         metrics.training_steps_requested_interval = 0
