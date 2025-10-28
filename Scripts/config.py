@@ -132,7 +132,7 @@ class RLConfigData:
     min_new_frames_after_load_to_train: int = 50000
 
     obj_reward_scale: float = 0.0001            # Convert game score points to RL reward (1 point => 1e-5)
-    subj_reward_scale: float = 0.00007     # Subjective shaping scaled another 10x down to prevent exploitation
+    subj_reward_scale: float = 0.00001     # Subjective shaping scaled down further to prevent exploitation
     ignore_subjective_rewards: bool = False
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
     use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
