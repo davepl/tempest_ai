@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import threading
+import math
 import numpy as np
 from typing import Optional, List, Dict, Any
 from collections import deque
@@ -183,8 +184,8 @@ def display_metrics_header():
     
     # Full header with all desired columns (aligned to match data column widths)
     header = (
-        f"{'Frame':>11} {'FPS':>7} {'Epsi':>6} {'Xprt':>7} "
-        f"{'Rwrd':>7} {'Subj':>7} {'Obj':>7} {'DQN':>7} {'DQN1M':>6} {'DQN5M':>6} {'DQNSlope':>9} {'Loss':>10} "
+        f"{'Frame':>11} {'FPS':>7} {'Epsi':>9} {'Xprt':>9} "
+        f"{'Rwrd':>9} {'Subj':>9} {'Obj':>9} {'DQN':>9} {'DQN1M':>9} {'DQN5M':>9} {'DQNSlope':>9} {'Loss':>10} "
         f"{'Agree%':>7} "
         f"{'AvgEpLen':>8} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
@@ -417,36 +418,77 @@ def display_metrics_row(agent, kb_handler):
         metrics.episode_length_sum_interval = 0
         metrics.episode_length_count_interval = 0
 
-    # Show effective epsilon with OVR marker
+    def _safe_inverse(scale_value):
+        try:
+            scale_float = float(scale_value)
+            if scale_float == 0.0:
+                return 1.0
+            return 1.0 / scale_float
+        except Exception:
+            return 1.0
+
+    inv_obj = _safe_inverse(getattr(RL_CONFIG, 'obj_reward_scale', 1.0))
+    inv_subj = _safe_inverse(getattr(RL_CONFIG, 'subj_reward_scale', 1.0))
+
+    obj_raw = mean_obj_reward * inv_obj
+    subj_raw = mean_subj_reward * inv_subj
+    total_raw = obj_raw + subj_raw
+
+    reward_multiplier = None
+    if mean_reward not in (0.0, None):
+        try:
+            reward_multiplier = total_raw / mean_reward if mean_reward != 0 else None
+        except Exception:
+            reward_multiplier = None
+    if reward_multiplier is None or not math.isfinite(reward_multiplier) or reward_multiplier == 0.0:
+        reward_multiplier = inv_obj if inv_obj != 1.0 else (inv_subj if inv_subj != 1.0 else 1.0)
+
+    dqn_raw = mean_dqn_reward * reward_multiplier
+    dqn1m_raw = dqn1m_avg * reward_multiplier
+    dqn5m_raw = dqn5m_avg * reward_multiplier
+
+    def _format_reward(value, width=9, marker=""):
+        try:
+            val = float(value)
+            if not math.isfinite(val):
+                val = 0.0
+        except Exception:
+            val = 0.0
+        base = f"{val:.0f}"
+        if marker:
+            base = f"{base}{marker}"
+        return base.rjust(width)
+
+    # Show effective epsilon with OVR marker (percentage with no decimals)
     try:
         effective_eps = metrics.get_effective_epsilon()
-        eps_display = f"{effective_eps:>6.2f}"
-        if metrics.override_epsilon:
-            eps_display = f"{eps_display}*"
+        eps_percent = float(effective_eps) * 100.0
     except Exception:
-        eps_display = f"{metrics.epsilon:>6.2f}"
+        eps_percent = float(metrics.epsilon) * 100.0
+    eps_display = f"{eps_percent:.0f}%".rjust(9)
+    if metrics.override_epsilon:
+        eps_display = (eps_display.rstrip() + "*").rjust(9)
 
-    # Expert ratio with OVR marker
-    xprt_display = f"{metrics.expert_ratio*100:>6.1f}%"
+    # Expert ratio with OVR marker (percentage with no decimals)
+    xprt_percent = metrics.expert_ratio * 100.0
+    xprt_display = f"{xprt_percent:.0f}%".rjust(9)
     if metrics.override_expert:
-        xprt_display = f"{xprt_display}*"
+        xprt_display = (xprt_display.rstrip() + "*").rjust(9)
     elif metrics.expert_mode:
-        xprt_display = f"{xprt_display}!"
+        xprt_display = (xprt_display.rstrip() + "!").rjust(9)
 
-    # Rewards with 2 decimal places, with OVR marker for expert mode
-    rwrd_display = f"{mean_reward:>6.2f}"
-    subj_display = f"{mean_subj_reward:>6.2f}"
-    obj_display = f"{mean_obj_reward:>6.2f}"
-    dqn_display = f"{mean_dqn_reward:>6.2f}"
-    if metrics.expert_mode:
-        rwrd_display = f"{rwrd_display}!"
-        subj_display = f"{subj_display}!"
-        obj_display = f"{obj_display}!"
-        dqn_display = f"{dqn_display}!"
+    # Rewards shown in raw points (no decimals)
+    expert_marker = "!" if metrics.expert_mode else ""
+    rwrd_display = _format_reward(total_raw, marker=expert_marker)
+    subj_display = _format_reward(subj_raw, marker=expert_marker)
+    obj_display = _format_reward(obj_raw, marker=expert_marker)
+    dqn_display = _format_reward(dqn_raw, marker=expert_marker)
+    dqn1m_display = _format_reward(dqn1m_raw)
+    dqn5m_display = _format_reward(dqn5m_raw)
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_display} "
-        f"{xprt_display:>7} {rwrd_display:>7} {subj_display:>7} {obj_display:>7} {dqn_display:>7} {dqn1m_avg:>6.2f} {dqn5m_avg:>6.2f} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
+        f"{xprt_display} {rwrd_display} {subj_display} {obj_display} {dqn_display} {dqn1m_display} {dqn5m_display} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
         f"{agree_pct*100:>6.1f}% "
         f"{avg_episode_length:>8.1f} {train_pct:>6.1f} "
         f"{metrics.client_count:04d} {display_level:>5.1f} "

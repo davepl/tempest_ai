@@ -96,7 +96,7 @@ class RLConfigData:
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 1
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
-    spinner_command_levels: tuple[int, ...] = (0, 1, 2, 3, 5, 7, 9, -9, -7, -5, -3, -2, -1)
+    spinner_command_levels: tuple[int, ...] = (0, 9, -9)
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
@@ -115,8 +115,8 @@ class RLConfigData:
     priority_sample_fraction: float = 0.20 # Fraction of each batch drawn from priority buckets
     priority_terminal_bonus: float = 0.5   # Extra score for terminal transitions when computing priority
 
-    hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 5                  
+    hidden_size: int = 384                 # More moderate size - 2048 too slow for rapid experimentation
+    num_layers: int = 4                  
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
     update_target_every: int = 1000        # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
@@ -131,16 +131,22 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    obj_reward_scale: float = 0.00001            # Convert game score points to RL reward (1 point => 1e-5)
-    subj_reward_scale: float = 0.000007     # Subjective shaping scaled another 10x down to prevent exploitation
+    obj_reward_scale: float = 0.0001            # Convert game score points to RL reward (1 point => 1e-5)
+    subj_reward_scale: float = 0.00007     # Subjective shaping scaled another 10x down to prevent exploitation
     ignore_subjective_rewards: bool = False
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
     use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
     reward_centering_beta: float = 0.0005   # EMA rate for reward centering (lower = slower adaptation)
     reward_centering_init: float = 0.05     # Initial guess for mean objective reward (pre-scale)
+    superzap_penalty: float = 0.01          # Subjective reward penalty for using superzap (fire+zap). 0 = disabled
+
+    # Epsilon exploration bias: reduce probability of selecting zap actions during random exploration
+    # This helps prevent the DQN from learning to spam zap through exploration
+    epsilon_random_zap_discount: float = 0.49  # Reduce zap action probability to ~1/100th of fire probability
 
     # Loss weighting (makes contributions explicit and tunable)
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
+    expert_supervision_weight: float = 0.05  # Weight for imitation loss on expert fire/zap targets (0 disables)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True

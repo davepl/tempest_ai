@@ -1565,15 +1565,21 @@ def encode_action_to_game(fire, zap, spinner):
         spinner_val = -32
     return int(fire), int(zap), int(spinner_val)
 
-def fire_zap_to_discrete(fire, zap):
-    """Convert fire/zap booleans to discrete action index (0-3)"""
+def fire_zap_to_discrete(fire: bool, zap: bool) -> int:
+    """Convert fire/zap booleans to discrete action index (0-3).
+
+    Historical encoding warning:
+    - Bit 0 represents ZAP.
+    - Bit 1 represents FIRE.
+    This ordering is preserved to remain compatible with existing models and replay buffers.
+    """
     return int(fire) * 2 + int(zap)
 
-def discrete_to_fire_zap(discrete_action):
-    """Convert discrete action index (0-3) to fire/zap booleans"""
+def discrete_to_fire_zap(discrete_action: int) -> tuple[bool, bool]:
+    """Convert discrete action index (0-3) back to (fire, zap) booleans using the historical bit layout."""
     discrete_action = int(discrete_action)
-    fire = (discrete_action >> 1) & 1  # Extract fire bit
-    zap = discrete_action & 1         # Extract zap bit
+    fire = (discrete_action >> 1) & 1  # fire stored in bit 1
+    zap = discrete_action & 1          # zap stored in bit 0
     return bool(fire), bool(zap)
 
 def get_expert_hybrid_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
