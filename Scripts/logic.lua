@@ -719,7 +719,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local distance_delta = previous_distance - current_distance
                         if distance_delta > 0 then
                             local velocity = distance_delta  -- Movement speed toward target in segments/frame
-                            local base_scale = 0.5 / 8.0 * (10.0)
+                            local base_scale = 0.2 / 8.0 * (10.0)  -- reduced from 0.5
                             local velocity_multiplier = 1.0 + (velocity * 0.75)
                             positioning_reward = base_scale * velocity * velocity_multiplier
                         elseif distance_delta < 0 then
@@ -740,7 +740,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local shot_count = player_state.shot_count or 0
                         local shots_remaining = math.max(0, 8 - shot_count)
                         if current_distance <= 0.15 and fire_edge and shots_remaining > 1 then
-                            positioning_reward = positioning_reward + (10.0)
+                            positioning_reward = positioning_reward + (25.0)  -- increased from 10.0
                         end
                         
                         -- Apply level-specific scaling
@@ -791,7 +791,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local shot_count = player_state.shot_count or 0
                     local shots_remaining = math.max(0, 8 - shot_count)
                     if min_abs_rel_float <= 0.30 and fire_edge and shots_remaining > 1 then
-                        subj_reward = subj_reward + (4.0) -- small bonus (~4 pts) for well-timed shot
+                        subj_reward = subj_reward + (12.0) -- increased from 4.0 for well-timed shot
                     end
 
                     -- Penalty for not firing while very close removed per spec
@@ -805,7 +805,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local shot_count = player_state.shot_count or 0
                 local shots_remaining = math.max(0, 8 - shot_count)
                 if fire_edge and shots_remaining > 1 then
-                    subj_reward = subj_reward + (4.0) -- reward for successfully firing a shot 
+                    subj_reward = subj_reward + (15.0) -- reward for successfully firing a shot (increased from 4.0)
                 end
             end
 
@@ -830,7 +830,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         if delta > 0 then
                             local progress = math.min(2.0, delta)
                             local distance_weight = math.min(1.0, prev_distance / 8.0)
-                            subj_reward = subj_reward + (0.6 * spin_units * progress * distance_weight)
+                            subj_reward = subj_reward + (0.15 * spin_units * progress * distance_weight)  -- reduced from 0.6
                         elseif delta < 0 then
                             local regress = math.min(2.0, -delta)
                             subj_reward = subj_reward - (0.8 * spin_units * regress)
@@ -839,7 +839,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                             subj_reward = subj_reward - (0.4 * spin_units)
                         end
                     else
-                        subj_reward = subj_reward + (0.1 * spin_units)
+                        subj_reward = subj_reward + (0.02 * spin_units)  -- reduced from 0.1 to discourage pointless spinning
                     end
                 end
             end
