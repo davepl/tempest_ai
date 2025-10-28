@@ -716,31 +716,30 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         
                         -- REMOVED: Static alignment bonus (was causing "camping" behavior)
                         -- Award ONLY for moving toward target with SUPERLINEAR velocity bonus
-                        if current_distance < previous_distance then
-                            local velocity = previous_distance - current_distance  -- Movement speed in segments/frame
-                            
-                            -- SUPERLINEAR VELOCITY BONUS: Reward aggressive movement exponentially
-                            -- Moving 2 segments is worth MORE than 2x the reward of moving 1 segment
-                            -- This incentivizes the DQN to learn the expert's "quick and snappy" movement patterns
-                            -- instead of slow creeping that still technically "moves toward target"
+                        local distance_delta = previous_distance - current_distance
+                        if distance_delta > 0 then
+                            local velocity = distance_delta  -- Movement speed toward target in segments/frame
                             local base_scale = 0.5 / 8.0 * (10.0)
-                            
-                            -- Quadratic bonus: velocity² scaling makes fast movement much more valuable
-                            -- Example: 1 segment = 1.0x, 2 segments = 2.5x, 3 segments = 4.0x reward
-                            local velocity_multiplier = 1.0 + (velocity * 0.75)  -- Quadratic term
+                            local velocity_multiplier = 1.0 + (velocity * 0.75)
                             positioning_reward = base_scale * velocity * velocity_multiplier
-                            
-                            -- Alternative exponential bonus (currently commented out, can swap if quadratic insufficient):
-                            -- positioning_reward = base_scale * velocity * math.exp(velocity * 0.3)
+                        elseif distance_delta < 0 then
+                            local regress = math.min(1.5, -distance_delta)
+                            positioning_reward = positioning_reward - (regress * 1.0)
                         end
-                        -- No reward for holding position, even if aligned
+                        -- Discourage jitter once tightly aligned with the target
+                        if current_distance <= 0.25 then
+                            local spin_mag = math.min(4, math.abs(tonumber(player_state.spinner_detected or 0) or 0))
+                            if spin_mag > 0 then
+                                positioning_reward = positioning_reward - (spin_mag * 0.35)
+                            end
+                        end
                         
-                        -- NEW: Reward firing when aligned AND shots available (edge-triggered)
+                        -- Reward firing when aligned AND shots available (edge-triggered)
                         local fire_now = (player_state.fire_detected or 0)
                         local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                         local shot_count = player_state.shot_count or 0
-                        if current_distance == 0 and fire_edge and shot_count < 8 then
-                            -- Reward successful firing action when aligned (~10 pts)
+                        local shots_remaining = math.max(0, 8 - shot_count)
+                        if current_distance <= 0.15 and fire_edge and shots_remaining > 1 then
                             positioning_reward = positioning_reward + (10.0)
                         end
                         
@@ -789,7 +788,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     -- Reward firing when well aligned (tight aim window)
                     local fire_now = (player_state.fire_detected or 0)
                     local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
-                    if min_abs_rel_float <= 0.30 and fire_edge then
+                    local shot_count = player_state.shot_count or 0
+                    local shots_remaining = math.max(0, 8 - shot_count)
+                    if min_abs_rel_float <= 0.30 and fire_edge and shots_remaining > 1 then
                         subj_reward = subj_reward + (4.0) -- small bonus (~4 pts) for well-timed shot
                     end
 
@@ -802,37 +803,43 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local fire_now = (player_state.fire_detected or 0)
                 local fire_edge = (fire_now == 1 and previous_fire_detected == 0)
                 local shot_count = player_state.shot_count or 0
-                if fire_edge and shot_count < 8 then
+                local shots_remaining = math.max(0, 8 - shot_count)
+                if fire_edge and shots_remaining > 1 then
                     subj_reward = subj_reward + (4.0) -- reward for successfully firing a shot 
                 end
             end
 
-            -- 7. MOVEMENT INCENTIVE REWARD (Encourage active spinner control)
-            -- Add bonus for appropriate spinner movement when not perfectly aligned
-            -- Prevents the AI from learning to stay completely still (camping)
-            -- CRITICAL: Must be large enough to overcome risk-averse behavior
+            -- 7. MOVEMENT INCENTIVE REWARD (Encourage purposeful spinner control)
+            -- Reward directional progress toward the target and penalize backing away or jitter around alignment.
+            -- Keeps the policy snappy without encouraging endless oscillation once lined up.
             do
-                local spin_delta = math.abs(tonumber(player_state.spinner_detected or 0))
-                if spin_delta > 0 then
+                local raw_spin = tonumber(player_state.spinner_detected or 0) or 0
+                local spin_units = math.min(4, math.abs(raw_spin))
+                if spin_units > 0 then
                     local player_abs_seg2 = player_state.position & 0x0F
-                    local nearest_abs = enemies_state.nearest_enemy_abs_seg_internal or -1
-                    local is_open2 = (level_state.level_type == 0x00) -- Updated heuristic
-                    local need_move = false
-                    local distance_to_target = 0
-                    if nearest_abs ~= -1 then
-                        local rel = abs_to_rel_func(player_abs_seg2, nearest_abs, is_open2)
-                        distance_to_target = math.abs(rel)
-                        need_move = distance_to_target > 0 -- any misalignment needs movement
+                    local is_open2 = (level_state.level_type == 0x00)
+                    local target_seg = expert_target_seg_cached
+                    if target_seg == -1 then
+                        target_seg = enemies_state.nearest_enemy_abs_seg_internal or -1
                     end
-                    
-                    -- Give SUBSTANTIAL bonus for movement when not perfectly aligned
-                    -- Scaled to be comparable to score rewards (1000 pts = 0.05 reward)
-                    -- So movement should be worth ~200-500 pts equivalent
-                    if need_move and distance_to_target > 0 then
-                        local units = math.min(4, spin_delta)
-                        -- INCREASED 200x: was 0.0001, now 0.02 (equivalent to ~400 pts)
-                        local movement_bonus = 1.0 * units * (distance_to_target / 8.0)
-                        subj_reward = subj_reward + movement_bonus
+                    if target_seg ~= -1 then
+                        local prev_seg = previous_player_position & 0x0F
+                        local prev_distance = math.abs(abs_to_rel_func(prev_seg, target_seg, is_open2))
+                        local curr_distance = math.abs(abs_to_rel_func(player_abs_seg2, target_seg, is_open2))
+                        local delta = prev_distance - curr_distance
+                        if delta > 0 then
+                            local progress = math.min(2.0, delta)
+                            local distance_weight = math.min(1.0, prev_distance / 8.0)
+                            subj_reward = subj_reward + (0.6 * spin_units * progress * distance_weight)
+                        elseif delta < 0 then
+                            local regress = math.min(2.0, -delta)
+                            subj_reward = subj_reward - (0.8 * spin_units * regress)
+                        end
+                        if curr_distance <= 0.25 then
+                            subj_reward = subj_reward - (0.4 * spin_units)
+                        end
+                    else
+                        subj_reward = subj_reward + (0.1 * spin_units)
                     end
                 end
             end

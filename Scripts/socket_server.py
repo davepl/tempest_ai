@@ -54,6 +54,15 @@ from nstep_buffer import NStepReplayBuffer
 from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
 
 
+def _spinner_sign(value: float) -> int:
+    """Classify spinner magnitude by sign for agreement comparison."""
+    if value > 0.0:
+        return 1
+    if value < 0.0:
+        return -1
+    return 0
+
+
 class AsyncReplayBuffer:
     """
     Non-blocking async wrapper for agent.step() calls.
@@ -167,6 +176,15 @@ class SocketServer:
         #BUGBUG Is this still accurate with the hybrid model?
         self.expert_action_counts = np.zeros(16, dtype=np.int64)  # 4 discrete * 4 spinner buckets (diagnostic only)
         self.dqn_action_counts = np.zeros(16, dtype=np.int64)
+
+    def _verbose_enabled(self) -> bool:
+        """Return True when verbose debug logging is enabled."""
+        try:
+            if hasattr(self.metrics, 'metrics') and self.metrics.metrics is not None:
+                return bool(getattr(self.metrics.metrics, 'verbose_mode', False))
+            return bool(getattr(self.metrics, 'verbose_mode', False))
+        except Exception:
+            return False
 
     def _server_nstep_enabled(self) -> bool:
         """Decide whether this server should perform n-step preprocessing.
@@ -402,11 +420,20 @@ class SocketServer:
                 # N-step experience processing (server-side only when enabled) or direct 1-step fallback
                 if state.get('last_state') is not None and state.get('last_action_index') is not None:
                     action_index = state['last_action_index']
+                    
+                    # Apply superzap penalty to subjective reward if configured
+                    subj_reward = float(frame.subjreward)
+                    superzap_penalty = float(getattr(RL_CONFIG, 'superzap_penalty', 0.0) or 0.0)
+                    if superzap_penalty > 0.0:
+                        # Check if last action was superzap (fire + zap)
+                        last_fire, last_zap, _, _ = action_index_to_components(int(action_index))
+                        if last_fire and last_zap:
+                            subj_reward -= superzap_penalty
+                    
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
                         # Compute rewards separately for training and for bucket priority
                         obj_reward = float(frame.objreward)
-                        subj_reward = float(frame.subjreward)
                         priority_reward_step = obj_reward + subj_reward
                         terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
                         if frame.done and terminal_bonus != 0.0:
@@ -455,7 +482,6 @@ class SocketServer:
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
                         obj_reward = float(frame.objreward)
-                        subj_reward = float(frame.subjreward)
                         priority_reward_step = obj_reward + subj_reward
                         terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
                         if frame.done and terminal_bonus != 0.0:
@@ -483,17 +509,17 @@ class SocketServer:
                     if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
                         total_reward = float(frame.objreward)
                     else:
-                        total_reward = float(frame.subjreward) + float(frame.objreward)
+                        total_reward = subj_reward + float(frame.objreward)
 
                     state['total_reward'] = state.get('total_reward', 0.0) + total_reward
-                    state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + frame.subjreward
+                    state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + subj_reward
                     state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + frame.objreward
                     src = state.get('last_action_source')
                     # Persist last-step attribution details for debugging/terminal reporting
                     try:
                         state['last_step_total_reward'] = float(total_reward)
                         state['last_step_obj_reward'] = float(frame.objreward)
-                        state['last_step_subj_reward'] = float(frame.subjreward)
+                        state['last_step_subj_reward'] = float(subj_reward)
                         state['last_step_actor'] = str(src) if src is not None else 'unknown'
                     except Exception:
                         pass
@@ -678,6 +704,41 @@ class SocketServer:
                                 fire_zap_idx = fire_zap_to_discrete(fire, zap)
                                 action_index = compose_action_index(fire_zap_idx, spinner_bucket)
                         action_source = 'dqn'
+                        if self._verbose_enabled():
+                            try:
+                                expert_idx, exp_spinner_val = get_expert_hybrid_action(
+                                    frame.enemy_seg,
+                                    frame.player_seg,
+                                    frame.open_level,
+                                    frame.expert_fire,
+                                    frame.expert_zap,
+                                )
+                                exp_fire, exp_zap, exp_spin_bucket, exp_spin_quant = action_index_to_components(int(expert_idx))
+                                dqn_agree = (int(action_index) == int(expert_idx))
+                                if not dqn_agree:
+                                    same_fire = bool(fire) == bool(exp_fire)
+                                    same_zap = bool(zap) == bool(exp_zap)
+                                    if same_fire and same_zap:
+                                        dqn_sign = _spinner_sign(float(spinner_value))
+                                        exp_sign = _spinner_sign(float(exp_spin_quant))
+                                        dqn_agree = dqn_sign == exp_sign
+                                # Fetch latest global frame count safely
+                                try:
+                                    with self.metrics.lock:
+                                        frame_counter_dbg = getattr(self.metrics.metrics, 'frame_count', 0)
+                                except Exception:
+                                    frame_counter_dbg = getattr(metrics, 'frame_count', 0)
+                                verbose_line = (
+                                    f"[VERBOSE DQN] frame={frame_counter_dbg:,} client={client_id} lvl={frame.level_number} open={frame.open_level} "
+                                    f"eps={epsilon:.4f} exp_ratio={expert_ratio:.4f} "
+                                    f"dqn(fire={int(fire)},zap={int(zap)},bucket={spinner_bucket},spin={spinner_value:.3f}) "
+                                    f"expert(fire={int(exp_fire)},zap={int(exp_zap)},bucket={exp_spin_bucket},spin={exp_spin_quant:.3f}) "
+                                    f"agree={'Y' if dqn_agree else 'N'} "
+                                    f"obj={frame.objreward:.5f} subj={frame.subjreward:.5f}"
+                                )
+                                print(verbose_line)
+                            except Exception as dbg_exc:
+                                print(f"[VERBOSE DQN] error while dumping frame info: {dbg_exc}")
                 else:
                     action_source = 'none'
 

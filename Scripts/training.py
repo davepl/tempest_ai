@@ -28,6 +28,59 @@ def _to_tensor_bool(mask: Sequence[bool], length: int, *, device: torch.device) 
     return torch.tensor(mask, dtype=torch.bool, device=device)
 
 
+_SPINNER_SIGN_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+
+
+def _get_spinner_signs(device: torch.device, spinner_actions: int) -> torch.Tensor:
+    """Return a tensor of spinner signs (-1, 0, 1) for each bucket on the requested device."""
+    key = (device.type, int(getattr(device, "index", -1) or -1))
+    cached = _SPINNER_SIGN_CACHE.get(key)
+    if cached is None or cached.numel() < spinner_actions:
+        levels = tuple(getattr(RL_CONFIG, "spinner_command_levels", (0,)))
+        if not levels:
+            levels = (0,)
+        sign_tensor = torch.sign(torch.tensor(levels, dtype=torch.float32, device=device))
+        if sign_tensor.numel() < spinner_actions:
+            pad = torch.zeros(spinner_actions - sign_tensor.numel(), dtype=torch.float32, device=device)
+            sign_tensor = torch.cat([sign_tensor, pad], dim=0)
+        _SPINNER_SIGN_CACHE[key] = sign_tensor
+        cached = sign_tensor
+    return cached[:spinner_actions]
+
+
+def compute_action_agreement(
+    greedy_actions: torch.Tensor,
+    taken_actions: torch.Tensor,
+    spinner_actions: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return boolean tensor where True means actions agree under sign-aware spinner matching."""
+    if greedy_actions.ndim > 1:
+        greedy_flat = greedy_actions.reshape(-1)
+    else:
+        greedy_flat = greedy_actions
+    if taken_actions.ndim > 1:
+        taken_flat = taken_actions.reshape(-1)
+    else:
+        taken_flat = taken_actions
+
+    exact_match = greedy_flat == taken_flat
+    spinner_actions = max(1, int(spinner_actions))
+
+    greedy_fire_zap = torch.div(greedy_flat, spinner_actions, rounding_mode="floor")
+    taken_fire_zap = torch.div(taken_flat, spinner_actions, rounding_mode="floor")
+    fire_zap_match = greedy_fire_zap == taken_fire_zap
+
+    sign_tensor = _get_spinner_signs(device, spinner_actions)
+    greedy_spinner_idx = torch.remainder(greedy_flat, spinner_actions).long()
+    taken_spinner_idx = torch.remainder(taken_flat, spinner_actions).long()
+    greedy_sign = sign_tensor[greedy_spinner_idx]
+    taken_sign = sign_tensor[taken_spinner_idx]
+
+    sign_match = greedy_sign == taken_sign
+    return exact_match | (fire_zap_match & sign_match)
+
+
 def train_step(agent):
     """Run a single optimizer step for the simplified hybrid agent."""
     if not getattr(metrics, "training_enabled", True) or not agent.training_enabled:
@@ -80,6 +133,40 @@ def train_step(agent):
     w_disc = float(getattr(RL_CONFIG, "discrete_loss_weight", 1.0))
     total_loss = w_disc * td_loss
 
+    supervised_loss = None
+    supervised_loss_item = 0.0
+    w_sup = float(getattr(RL_CONFIG, "expert_supervision_weight", 0.0) or 0.0)
+    if w_sup > 0.0 and bool(expert_mask.any().item()):
+        log_probs = F.log_softmax(q_values, dim=1)
+        spinner_actions = max(1, int(getattr(agent, "spinner_actions", 1) or 1))
+        total_actions = log_probs.size(1)
+        action_indices = torch.arange(total_actions, device=log_probs.device)
+        fire_zap_indices = torch.div(action_indices, spinner_actions, rounding_mode="floor")
+        fire_mask = ((fire_zap_indices >> 1) & 1).bool()
+        zap_mask = (fire_zap_indices & 1).bool()
+
+        log_prob_fire1 = torch.logsumexp(log_probs[:, fire_mask], dim=1)
+        log_prob_fire0 = torch.logsumexp(log_probs[:, ~fire_mask], dim=1)
+        log_prob_zap1 = torch.logsumexp(log_probs[:, zap_mask], dim=1)
+        log_prob_zap0 = torch.logsumexp(log_probs[:, ~zap_mask], dim=1)
+
+        taken_flat = discrete_actions.squeeze(1)
+        fire_zap_taken = torch.div(taken_flat, spinner_actions, rounding_mode="floor")
+        fire_targets = ((fire_zap_taken >> 1) & 1).float()
+        zap_targets = (fire_zap_taken & 1).float()
+
+        fire_log_prob = torch.where(fire_targets > 0.5, log_prob_fire1, log_prob_fire0)
+        zap_log_prob = torch.where(zap_targets > 0.5, log_prob_zap1, log_prob_zap0)
+
+        expert_indices = torch.nonzero(expert_mask, as_tuple=False).squeeze(1)
+        if expert_indices.numel() > 0:
+            fire_loss = -fire_log_prob[expert_indices]
+            zap_loss = -zap_log_prob[expert_indices]
+            imitation_loss = (fire_loss.mean() + zap_loss.mean()) * 0.5
+            supervised_loss = imitation_loss * w_sup
+            total_loss = total_loss + supervised_loss
+            supervised_loss_item = float(supervised_loss.item())
+
     agent.optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
 
@@ -104,6 +191,7 @@ def train_step(agent):
         metrics.loss_count_interval += 1
 
         metrics.last_d_loss = float((w_disc * td_loss).item())
+        metrics.last_supervised_loss = float(supervised_loss_item)
 
         metrics.d_loss_sum_interval += metrics.last_d_loss
         metrics.d_loss_count_interval += 1
@@ -132,9 +220,16 @@ def train_step(agent):
             metrics.reward_mean_expert = float(rewards_np[expert_mask_np].mean())
 
         with torch.no_grad():
-            policy_q = agent.qnetwork_local(states)
+            policy_q = q_values.detach()
             greedy_actions = policy_q.argmax(dim=1, keepdim=True)
-            action_matches = (greedy_actions == discrete_actions).float().squeeze(1)
+            spinner_actions = getattr(agent, "spinner_actions", 1)
+            combined_match = compute_action_agreement(
+                greedy_actions,
+                discrete_actions,
+                spinner_actions,
+                states.device,
+            )
+            action_matches = combined_match.float()
 
             if n_dqn > 0:
                 dqn_indices = torch.tensor(np.nonzero(dqn_mask_np)[0], dtype=torch.long, device=states.device)

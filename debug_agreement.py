@@ -6,7 +6,7 @@ Debug low agreement issue - check if network is learning backwards
 import torch
 import numpy as np
 import sys
-sys.path.append('Scripts')
+sys.path.append('Scripts') 
 
 from config import metrics, RL_CONFIG
 from aimodel import HybridDQNAgent
