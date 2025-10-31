@@ -143,7 +143,6 @@ class RLConfigData:
     use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
     reward_centering_beta: float = 0.0005   # EMA rate for reward centering (lower = slower adaptation)
     reward_centering_init: float = 0.05     # Initial guess for mean objective reward (pre-scale)
-    superzap_penalty: float = 0.01          # Subjective reward penalty for using superzap (fire+zap). 0 = disabled
 
     # Epsilon exploration bias: reduce probability of selecting zap actions during random exploration
     # This helps prevent the DQN from learning to spam zap through exploration
