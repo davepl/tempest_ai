@@ -397,7 +397,7 @@ class HybridDQN(nn.Module):
         discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
         
         # Clamp Q-values to [-50, +50] to prevent divergence
-        discrete_q = torch.clamp(discrete_q, -50.0, 50.0)
+        discrete_q = torch.clamp(discrete_q, -1000.0, 1000.0)
         return discrete_q
 
 
@@ -1593,6 +1593,31 @@ def hybrid_to_game_action(action_index: int):
     fire, zap, _, spinner_value = action_index_to_components(action_index)
     return encode_action_to_game(fire, zap, spinner_value)
 
+def _curriculum_target(frame_count: int, value_index: int):
+    """Return scheduled value for the given index (1=epsilon, 2=expert ratio) if curriculum defined."""
+    try:
+        curriculum = getattr(RL_CONFIG, 'exploration_curriculum', ())
+    except Exception:
+        curriculum = ()
+    if not curriculum:
+        return None
+
+    target = None
+    for stage in curriculum:
+        try:
+            start_frame = int(stage[0])
+        except Exception:
+            continue
+        if frame_count >= start_frame:
+            try:
+                target = float(stage[value_index])
+            except (IndexError, TypeError, ValueError):
+                continue
+        else:
+            break
+    return target
+
+
 def decay_epsilon(frame_count):
     """Calculate decayed exploration rate using step-based decay with adaptive floor.
 
@@ -1603,6 +1628,17 @@ def decay_epsilon(frame_count):
     if metrics.override_epsilon or getattr(metrics, 'manual_epsilon_override', False):
         return metrics.epsilon
     
+    # Curriculum override
+    curriculum_eps = _curriculum_target(frame_count, 1)
+    if curriculum_eps is not None:
+        metrics.epsilon = max(0.0, min(1.0, curriculum_eps))
+        # Keep decay bookkeeping roughly aligned so downstream logic stays bounded
+        try:
+            metrics.last_epsilon_decay_step = frame_count // RL_CONFIG.epsilon_decay_steps
+        except Exception:
+            pass
+        return metrics.epsilon
+
     step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
 
     # Only decay if a new step interval is reached
@@ -1639,6 +1675,16 @@ def decay_expert_ratio(current_step):
     if metrics.expert_mode or metrics.override_expert or getattr(metrics, 'manual_expert_override', False):
         return metrics.expert_ratio
     
+    curriculum_expert = _curriculum_target(current_step, 2)
+    if curriculum_expert is not None:
+        # Clamp between 0 and 1 for safety
+        metrics.expert_ratio = max(0.0, min(1.0, curriculum_expert))
+        try:
+            metrics.last_decay_step = current_step // RL_CONFIG.expert_ratio_decay_steps
+        except Exception:
+            pass
+        return metrics.expert_ratio
+
     # DON'T auto-initialize to start value at frame 0 - respect loaded checkpoint values
     # Only initialize if expert_ratio is somehow invalid (negative or > 1)
     if current_step == 0 and (metrics.expert_ratio < 0 or metrics.expert_ratio > 1):

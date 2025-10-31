@@ -432,7 +432,11 @@ def display_metrics_row(agent, kb_handler):
 
     obj_raw = mean_obj_reward * inv_obj
     subj_raw = mean_subj_reward * inv_subj
-    total_raw = obj_raw + subj_raw
+    ignore_subj = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', False))
+    if ignore_subj:
+        total_raw = obj_raw
+    else:
+        total_raw = obj_raw + subj_raw
 
     reward_multiplier = None
     if mean_reward not in (0.0, None):

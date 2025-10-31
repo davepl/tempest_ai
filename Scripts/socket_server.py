@@ -434,11 +434,15 @@ class SocketServer:
                         # Add experience to n-step buffer and get matured experiences
                         # Compute rewards separately for training and for bucket priority
                         obj_reward = float(frame.objreward)
-                        priority_reward_step = obj_reward + subj_reward
+                        ignore_subjective_rewards = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', True))
+                        if ignore_subjective_rewards:
+                            priority_reward_step = obj_reward
+                        else:
+                            priority_reward_step = obj_reward + subj_reward
                         terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
                         if frame.done and terminal_bonus != 0.0:
                             priority_reward_step += terminal_bonus
-                        if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+                        if ignore_subjective_rewards:
                             total_reward = obj_reward
                         else:
                             total_reward = priority_reward_step
@@ -482,11 +486,15 @@ class SocketServer:
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
                         obj_reward = float(frame.objreward)
-                        priority_reward_step = obj_reward + subj_reward
+                        ignore_subjective_rewards = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', True))
+                        if ignore_subjective_rewards:
+                            priority_reward_step = obj_reward
+                        else:
+                            priority_reward_step = obj_reward + subj_reward
                         terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
                         if frame.done and terminal_bonus != 0.0:
                             priority_reward_step += terminal_bonus
-                        if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+                        if ignore_subjective_rewards:
                             direct_reward = obj_reward
                         else:
                             direct_reward = priority_reward_step
@@ -506,7 +514,8 @@ class SocketServer:
                     # reward accounting
                     # Update reward accounting using subj+obj derived total, respecting ignore_subjective_rewards
                     
-                    if (ignore_subjective_rewards := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
+                    ignore_subjective_rewards = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', True))
+                    if ignore_subjective_rewards:
                         total_reward = float(frame.objreward)
                     else:
                         total_reward = subj_reward + float(frame.objreward)
