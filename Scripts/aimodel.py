@@ -338,6 +338,12 @@ class HybridDQN(nn.Module):
         self.state_size = state_size
         self.discrete_actions = discrete_actions
         self.num_layers = num_layers
+        cfg_max_q = getattr(RL_CONFIG, 'max_q_value', None)
+        try:
+            cfg_max_q = float(cfg_max_q)
+        except (TypeError, ValueError):
+            cfg_max_q = None
+        self.max_q_value = float(cfg_max_q) if cfg_max_q and cfg_max_q > 0 else 1000.0
         
         # Shared trunk for feature extraction
         LinearOrNoisy = nn.Linear  # Noisy networks removed for simplification
@@ -397,7 +403,7 @@ class HybridDQN(nn.Module):
         discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
         
         # Clamp Q-values to [-50, +50] to prevent divergence
-        discrete_q = torch.clamp(discrete_q, -1000.0, 1000.0)
+        discrete_q = torch.clamp(discrete_q, -self.max_q_value, self.max_q_value)
         return discrete_q
 
 
@@ -1710,6 +1716,24 @@ class SafeMetrics:
     def __init__(self, metrics):
         self.metrics = metrics
         self.lock = threading.Lock()
+        try:
+            self._default_reward_center = float(getattr(RL_CONFIG, 'reward_centering_init', 0.0) or 0.0)
+        except Exception:
+            self._default_reward_center = 0.0
+        try:
+            current_center = getattr(self.metrics, 'reward_center_value', None)
+        except Exception:
+            current_center = None
+        if current_center is None or not isinstance(current_center, (int, float)) or not math.isfinite(current_center):
+            try:
+                self.metrics.reward_center_value = self._default_reward_center
+            except Exception:
+                pass
+        elif current_center == 0.0 and self._default_reward_center != 0.0:
+            try:
+                self.metrics.reward_center_value = self._default_reward_center
+            except Exception:
+                pass
     
     def update_frame_count(self, delta: int = 1):
         with self.lock:
@@ -1747,6 +1771,43 @@ class SafeMetrics:
                 self.metrics.last_fps_time = current_time
                 
             return self.metrics.frame_count
+    
+    def get_reward_center_value(self) -> float:
+        with self.lock:
+            try:
+                value = float(getattr(self.metrics, 'reward_center_value', self._default_reward_center))
+                if math.isfinite(value):
+                    return value
+            except Exception:
+                pass
+            return self._default_reward_center
+
+    def center_objective_reward(self, obj_reward: float) -> tuple[float, float]:
+        """Return centered reward and updated center value."""
+        try:
+            reward_val = float(obj_reward)
+        except Exception:
+            reward_val = 0.0
+        if not math.isfinite(reward_val):
+            reward_val = 0.0
+        use_centering = bool(getattr(RL_CONFIG, 'use_reward_centering', False))
+        beta = float(getattr(RL_CONFIG, 'reward_centering_beta', 0.0) or 0.0)
+        if beta < 0.0:
+            beta = 0.0
+        with self.lock:
+            current_center = getattr(self.metrics, 'reward_center_value', self._default_reward_center)
+            if not isinstance(current_center, (int, float)) or not math.isfinite(current_center):
+                current_center = self._default_reward_center
+            if not use_centering:
+                self.metrics.reward_center_value = current_center
+                return reward_val, current_center
+            centered = reward_val - current_center
+            if beta > 0.0:
+                new_center = current_center + beta * centered
+            else:
+                new_center = current_center
+            self.metrics.reward_center_value = new_center
+            return centered, new_center
             
     def get_epsilon(self):
         with self.lock:

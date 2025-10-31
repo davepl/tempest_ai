@@ -421,31 +421,30 @@ class SocketServer:
                 if state.get('last_state') is not None and state.get('last_action_index') is not None:
                     action_index = state['last_action_index']
                     
-                    # Apply superzap penalty to subjective reward if configured
                     subj_reward = float(frame.subjreward)
-                    superzap_penalty = float(getattr(RL_CONFIG, 'superzap_penalty', 0.0) or 0.0)
-                    if superzap_penalty > 0.0:
-                        # Check if last action was superzap (fire + zap)
-                        last_fire, last_zap, _, _ = action_index_to_components(int(action_index))
-                        if last_fire and last_zap:
-                            subj_reward -= superzap_penalty
-                    
+                    obj_reward_raw = float(frame.objreward)
+                    centered_obj_reward, reward_center_value = self.metrics.center_objective_reward(obj_reward_raw)
+                    ignore_subjective_rewards = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', True))
+                    if ignore_subjective_rewards:
+                        training_reward = centered_obj_reward
+                        priority_reward_step = obj_reward_raw
+                    else:
+                        training_reward = centered_obj_reward + subj_reward
+                        priority_reward_step = obj_reward_raw + subj_reward
+                    terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
+                    if frame.done and terminal_bonus != 0.0:
+                        priority_reward_step += terminal_bonus
+                        if not ignore_subjective_rewards:
+                            training_reward += terminal_bonus
+                    try:
+                        state['last_reward_center'] = reward_center_value
+                    except Exception:
+                        pass
+
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences
                         # Compute rewards separately for training and for bucket priority
-                        obj_reward = float(frame.objreward)
-                        ignore_subjective_rewards = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', True))
-                        if ignore_subjective_rewards:
-                            priority_reward_step = obj_reward
-                        else:
-                            priority_reward_step = obj_reward + subj_reward
-                        terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
-                        if frame.done and terminal_bonus != 0.0:
-                            priority_reward_step += terminal_bonus
-                        if ignore_subjective_rewards:
-                            total_reward = obj_reward
-                        else:
-                            total_reward = priority_reward_step
+                        total_reward = training_reward
 
                         experiences = state['nstep_buffer'].add(
                             state['last_state'],
@@ -485,19 +484,7 @@ class SocketServer:
                                 )
                     else:
                         # Server is not handling n-step: push single-step transition directly to the agent
-                        obj_reward = float(frame.objreward)
-                        ignore_subjective_rewards = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', True))
-                        if ignore_subjective_rewards:
-                            priority_reward_step = obj_reward
-                        else:
-                            priority_reward_step = obj_reward + subj_reward
-                        terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
-                        if frame.done and terminal_bonus != 0.0:
-                            priority_reward_step += terminal_bonus
-                        if ignore_subjective_rewards:
-                            direct_reward = obj_reward
-                        else:
-                            direct_reward = priority_reward_step
+                        direct_reward = training_reward
 
                         if self.agent:
                             self.async_buffer.step_async(
