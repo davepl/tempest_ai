@@ -89,14 +89,19 @@ class RLConfigData:
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
-    epsilon: float = 0.05                  # Current exploration rate
-    epsilon_start: float = 0.05            # Start with moderate exploration
-    epsilon_min: float = 0.05              # Floor for exploration (1% random actions)
+    epsilon: float = 0.50                  # Current exploration rate (stage 0 of curriculum)
+    epsilon_start: float = 0.50            # Curriculum stage 0 exploration rate
+    epsilon_min: float = 0.05              # Floor for exploration (5% random actions)
     epsilon_end: float = 0.05              # Target minimum epsilon
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 1
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
-    spinner_command_levels: tuple[int, ...] = (0, 9, -9)
+    spinner_command_levels: tuple[int, ...] = (0, 9, 3, 1, -1, -3, -9)
+    exploration_curriculum: tuple[tuple[int, float, float], ...] = (
+        (0, 0.50, 0.50),         # Frames   0 - 499,999
+        (500_000, 0.25, 0.25),   # Frames 500k - 999,999
+        (1_000_000, 0.05, 0.10)  # Frames 1M+
+    )
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
@@ -131,9 +136,9 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    obj_reward_scale: float = 0.0001            # Convert game score points to RL reward (1 point => 1e-5)
-    subj_reward_scale: float = 0.00001     # Subjective shaping scaled down further to prevent exploitation
-    ignore_subjective_rewards: bool = False
+    obj_reward_scale: float = 0.00001            # Convert game score points to RL reward (1 point => 1e-5)
+    subj_reward_scale: float = 0.0000025    # Subjective shaping scaled to average ~25% of objective reward magnitude
+    ignore_subjective_rewards: bool = True
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
     use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
     reward_centering_beta: float = 0.0005   # EMA rate for reward centering (lower = slower adaptation)
@@ -147,13 +152,14 @@ class RLConfigData:
     # Loss weighting (makes contributions explicit and tunable)
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
     expert_supervision_weight: float = 0.05  # Weight for imitation loss on expert fire/zap targets (0 disables)
+    spinner_supervision_weight: float = 0.05  # Weight for imitation loss on expert spinner buckets (0 disables)
 
     # Target network update strategy
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 50.0    # Clamp TD targets to match network output clamping (±50)
-    max_q_value: float = 50.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
+    td_target_clip: float | None = 150.0    # Clamp TD targets to match network output clamping (±150)
+    max_q_value: float = 150.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
@@ -274,6 +280,8 @@ class MetricsData:
     last_clip_delta: float = 1.0
     # Detailed loss diagnostics
     last_d_loss: float = 0.0            # Discrete head loss (Huber/Q-learning)
+    last_supervised_loss: float = 0.0   # Total imitation loss (fire/zap + spinner)
+    last_spinner_loss: float = 0.0      # Spinner-only imitation loss component
     # Advantage weighting diagnostics
     adv_w_mean: float = 1.0
     adv_w_mean_dqn: float = 1.0
