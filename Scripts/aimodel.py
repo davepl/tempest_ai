@@ -338,12 +338,20 @@ class HybridDQN(nn.Module):
         self.state_size = state_size
         self.discrete_actions = discrete_actions
         self.num_layers = num_layers
-        cfg_max_q = getattr(RL_CONFIG, 'max_q_value', None)
-        try:
-            cfg_max_q = float(cfg_max_q)
-        except (TypeError, ValueError):
-            cfg_max_q = None
-        self.max_q_value = float(cfg_max_q) if cfg_max_q and cfg_max_q > 0 else 1000.0
+        max_q_config = getattr(RL_CONFIG, 'max_q_value', None)
+        td_clip_config = getattr(RL_CONFIG, 'td_target_clip', None)
+        clamp_candidates: list[float] = []
+        for candidate in (max_q_config, td_clip_config):
+            try:
+                candidate_val = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if candidate_val > 0.0 and math.isfinite(candidate_val):
+                clamp_candidates.append(candidate_val)
+        if clamp_candidates:
+            self.max_q_value = min(clamp_candidates)
+        else:
+            self.max_q_value = 1000.0
         
         # Shared trunk for feature extraction
         LinearOrNoisy = nn.Linear  # Noisy networks removed for simplification
@@ -1605,22 +1613,63 @@ def _curriculum_target(frame_count: int, value_index: int):
         curriculum = getattr(RL_CONFIG, 'exploration_curriculum', ())
     except Exception:
         curriculum = ()
-    if not curriculum:
-        return None
 
     target = None
-    for stage in curriculum:
-        try:
-            start_frame = int(stage[0])
-        except Exception:
-            continue
-        if frame_count >= start_frame:
+    if curriculum:
+        for stage in curriculum:
             try:
-                target = float(stage[value_index])
-            except (IndexError, TypeError, ValueError):
+                start_frame = int(stage[0])
+            except Exception:
                 continue
-        else:
-            break
+            if frame_count >= start_frame:
+                try:
+                    target = float(stage[value_index])
+                except (IndexError, TypeError, ValueError):
+                    continue
+            else:
+                break
+
+    # Optional repeating curriculum cycle with arbitrary segment lengths
+    try:
+        cycle_start = int(getattr(RL_CONFIG, 'exploration_curriculum_cycle_start', 0))
+        raw_cycle = getattr(RL_CONFIG, 'exploration_curriculum_cycle', ())
+    except Exception:
+        cycle_start, raw_cycle = 0, ()
+
+    if raw_cycle and frame_count >= cycle_start:
+        processed_segments: list[tuple[int, Optional[float], Optional[float]]] = []
+        total_length = 0
+        for segment in raw_cycle:
+            try:
+                seg_length = int(segment[0])
+            except Exception:
+                continue
+            if seg_length <= 0:
+                continue
+            seg_eps = None
+            seg_expert = None
+            try:
+                seg_eps = float(segment[1])
+            except (IndexError, TypeError, ValueError):
+                pass
+            try:
+                seg_expert = float(segment[2])
+            except (IndexError, TypeError, ValueError):
+                pass
+            processed_segments.append((seg_length, seg_eps, seg_expert))
+            total_length += seg_length
+
+        if processed_segments and total_length > 0:
+            offset = (frame_count - cycle_start) % total_length
+            cumulative = 0
+            for seg_length, seg_eps, seg_expert in processed_segments:
+                cumulative += seg_length
+                if offset < cumulative:
+                    alt_target = seg_eps if value_index == 1 else seg_expert
+                    if alt_target is not None:
+                        target = alt_target
+                    break
+
     return target
 
 
