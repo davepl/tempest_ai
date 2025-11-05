@@ -87,7 +87,7 @@ class RLConfigData:
     batch_size: int = 1024                # Reduced from 8192 for faster sampling
     lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
-    n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
+    n_step: int = 7                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
     epsilon: float = 0.50                  # Current exploration rate (stage 0 of curriculum)
     epsilon_start: float = 0.50            # Curriculum stage 0 exploration rate
@@ -100,7 +100,11 @@ class RLConfigData:
     exploration_curriculum: tuple[tuple[int, float, float], ...] = (
         (0, 0.50, 0.50),         # Frames   0 - 499,999
         (500_000, 0.25, 0.25),   # Frames 500k - 999,999
-        (1_000_000, 0.05, 0.10)  # Frames 1M+
+    )
+    exploration_curriculum_cycle_start: int = 1_000_000  # Begin repeating schedule at 1M frames
+    exploration_curriculum_cycle: tuple[tuple[int, float, float], ...] = (
+        (250_000, 0.10, 0.10),   # First 250k frames: light exploration/guidance
+        (750_000, 0.00, 0.20),   # Next 750k frames: pure greedy with stronger expert mix
     )
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
@@ -120,7 +124,7 @@ class RLConfigData:
     priority_sample_fraction: float = 0.20 # Fraction of each batch drawn from priority buckets
     priority_terminal_bonus: float = 0.5   # Extra score for terminal transitions when computing priority
 
-    hidden_size: int = 384                 # More moderate size - 2048 too slow for rapid experimentation
+    hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 4                  
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
     update_target_every: int = 1000        # Keep in sync with target_update_freq
@@ -136,8 +140,8 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    obj_reward_scale: float = 0.00001            # Convert game score points to RL reward (1 point => 1e-5)
-    subj_reward_scale: float = 0.0000025    # Subjective shaping scaled to average ~25% of objective reward magnitude
+    obj_reward_scale: float = 0.00000001            # Convert game score points to RL reward (1 point => 1e-5)
+    subj_reward_scale: float = 0.0000000025    # Subjective shaping scaled to average ~25% of objective reward magnitude
     ignore_subjective_rewards: bool = True
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
     use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
@@ -157,8 +161,8 @@ class RLConfigData:
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 150.0    # Clamp TD targets to match network output clamping (±150)
-    max_q_value: float = 150.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
+    td_target_clip: float | None = 500.0    # Clamp TD targets to match network output clamping (±150)
+    max_q_value: float = 500.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
@@ -167,11 +171,8 @@ class RLConfigData:
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob
     # This forces strategic zap usage rather than spamming
-    # IMPORTANT: Keep DISABLED during training. Enabling this during training
-    # causes a large action mismatch (the policy selects zap, but the gate
-    # suppresses it), which tanks the Agree% metric and destabilizes learning.
-    # Re-enable for evaluation once the model is trained if desired.
-    enable_superzap_gate: bool = False
+
+    enable_superzap_gate: bool = True
     superzap_prob: float = 0.01  # 1% success rate for zap attempts
 
 # Create instance of RLConfigData after its definition

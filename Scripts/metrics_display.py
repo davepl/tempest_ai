@@ -35,6 +35,10 @@ _dqn1m_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: f
 _dqn1m_window_frames = 0
 _last_frame_count_seen_1m = None
 
+# Short-term DQN trend based on recent raw values
+DQN_TREND_POINTS = 8
+_dqn_trend_points = deque(maxlen=DQN_TREND_POINTS)
+
 def _update_dqn_window(mean_dqn_reward: float):
     """Update the 5M-frames rolling window with the latest interval.
 
@@ -150,6 +154,39 @@ def _compute_dqn1m_window_stats():
     avg = wy_sum / w_sum if w_sum > 0 else 0.0
     return avg
 
+def _update_dqn_trend(frame_count: int, dqn_raw: float):
+    """Maintain a small buffer of recent (frame, raw_dqn_reward) points."""
+    try:
+        frame = int(frame_count)
+        value = float(dqn_raw)
+        if not math.isfinite(value):
+            return
+    except Exception:
+        return
+    _dqn_trend_points.append((frame, value))
+
+def _compute_dqn_trend_slope():
+    """Compute linear trend (per million frames) over the recent raw DQN values."""
+    if len(_dqn_trend_points) < 2:
+        return 0.0
+
+    base_frame = _dqn_trend_points[0][0]
+    xs = [frame - base_frame for frame, _ in _dqn_trend_points]
+    ys = [value for _, value in _dqn_trend_points]
+
+    sum_x = sum(xs)
+    sum_y = sum(ys)
+    sum_xx = sum(x * x for x in xs)
+    sum_xy = sum(x * y for x, y in zip(xs, ys))
+    n = float(len(xs))
+
+    denom = n * sum_xx - (sum_x * sum_x)
+    if denom == 0.0:
+        return 0.0
+
+    slope_per_frame = (n * sum_xy - sum_x * sum_y) / denom
+    return slope_per_frame * 1_000_000.0
+
 def clear_screen():
     """Clear the screen and move cursor to home position"""
     if IS_INTERACTIVE:
@@ -185,7 +222,7 @@ def display_metrics_header():
     # Full header with all desired columns (aligned to match data column widths)
     header = (
         f"{'Frame':>11} {'FPS':>7} {'Epsi':>9} {'Xprt':>9} "
-        f"{'Rwrd':>9} {'Subj':>9} {'Obj':>9} {'DQN':>9} {'DQN1M':>9} {'DQN5M':>9} {'DQNSlope':>9} {'Loss':>10} "
+        f"{'Rwrd':>9} {'Subj':>9} {'Obj':>9} {'DQN':>9} {'DQN1M':>9} {'DQN5M':>9} {'DQNTrend':>9} {'Loss':>10} "
         f"{'Agree%':>7} "
         f"{'AvgEpLen':>8} {'Train%':>6} "
         f"{'Clnt':>4} {'Levl':>5} "
@@ -451,6 +488,19 @@ def display_metrics_row(agent, kb_handler):
     dqn1m_raw = dqn1m_avg * reward_multiplier
     dqn5m_raw = dqn5m_avg * reward_multiplier
 
+    dqn_trend_perM = 0.0
+    try:
+        _update_dqn_trend(metrics.frame_count, dqn_raw)
+        dqn_trend_perM = _compute_dqn_trend_slope()
+    except Exception:
+        dqn_trend_perM = 0.0
+
+    try:
+        with metrics.lock:
+            metrics.dqn_trend_perM = float(dqn_trend_perM)
+    except Exception:
+        pass
+
     def _format_reward(value, width=9, marker=""):
         try:
             val = float(value)
@@ -492,7 +542,7 @@ def display_metrics_row(agent, kb_handler):
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_display} "
-        f"{xprt_display} {rwrd_display} {subj_display} {obj_display} {dqn_display} {dqn1m_display} {dqn5m_display} {dqn5m_slopeM:>9.3f} {loss_avg:>10.6f} "
+        f"{xprt_display} {rwrd_display} {subj_display} {obj_display} {dqn_display} {dqn1m_display} {dqn5m_display} {dqn_trend_perM:>9.3f} {loss_avg:>10.6f} "
         f"{agree_pct*100:>6.1f}% "
         f"{avg_episode_length:>8.1f} {train_pct:>6.1f} "
         f"{metrics.client_count:04d} {display_level:>5.1f} "

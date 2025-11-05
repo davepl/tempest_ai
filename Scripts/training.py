@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Simplified training loop for the Tempest hybrid DQN agent."""
 
+import math
 import time
 from typing import Sequence
 
@@ -124,6 +125,13 @@ def train_step(agent):
 
         gamma_h = torch.pow(torch.full_like(horizons, agent.gamma), horizons)
         targets = rewards + (1.0 - dones) * gamma_h * next_values
+        td_clip = getattr(RL_CONFIG, "td_target_clip", None)
+        try:
+            td_clip_val = float(td_clip)
+        except (TypeError, ValueError):
+            td_clip_val = None
+        if td_clip_val is not None and td_clip_val > 0.0 and math.isfinite(td_clip_val):
+            targets = torch.clamp(targets, -td_clip_val, td_clip_val)
 
     td_loss = F.smooth_l1_loss(selected_q, targets)
 
