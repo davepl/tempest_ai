@@ -73,7 +73,8 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 171
+    # 256 zero-page bytes + 245 high-signal addresses (see Scripts/main.lua)
+    params_count: int = 501
 
 # Create instance of ServerConfigData first
 SERVER_CONFIG = ServerConfigData()
@@ -148,7 +149,7 @@ class RLConfigData:
     reward_centering_beta: float = 0.0005   # EMA rate for reward centering (lower = slower adaptation)
     reward_centering_init: float = 0.05     # Initial guess for mean objective reward (pre-scale)
 
-    # Epsilon exploration bias: reduce probability of selecting zap actions during random exploration
+    # Epsilon exploration bias: reduce probability of selecting zap actions during random exploraLtion
     # This helps prevent the DQN from learning to spam zap through exploration
     epsilon_random_zap_discount: float = 0.49  # Reduce zap action probability to ~1/100th of fire probability
 
@@ -161,8 +162,8 @@ class RLConfigData:
     use_soft_target_update: bool = False   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 500.0    # Clamp TD targets to match network output clamping (±150)
-    max_q_value: float = 500.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
+    td_target_clip: float | None = 150.0    # Clamp TD targets to match network output clamping (±150)
+    max_q_value: float = 150.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5

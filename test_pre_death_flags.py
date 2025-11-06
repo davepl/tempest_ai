@@ -6,6 +6,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Scripts'))
 
 import numpy as np
+from config import RL_CONFIG
 from aimodel import HybridReplayBuffer
 
 def test_pre_death_flags():
@@ -15,7 +16,7 @@ def test_pre_death_flags():
     
     # Create buffer
     capacity = 10000
-    state_size = 171
+    state_size = RL_CONFIG.state_size
     buffer = HybridReplayBuffer(capacity, state_size)
     
     # Add episodes with deaths

@@ -13,7 +13,7 @@ from aimodel import HybridDQNAgent
 
 # Load the current model
 agent = HybridDQNAgent(
-    state_size=171,  # From SERVER_CONFIG.params_count
+    state_size=RL_CONFIG.state_size,
     discrete_actions=4
 )
 

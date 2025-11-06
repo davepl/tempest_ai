@@ -133,7 +133,7 @@ The implementation is a drop-in replacement for the original `HybridReplayBuffer
 
 ```python
 # Create buffer
-buffer = HybridReplayBuffer(capacity=2000000, state_size=171)
+buffer = HybridReplayBuffer(capacity=2000000, state_size=501)
 
 # Add experiences (automatically classified into buckets)
 buffer.push(state, action, continuous_action, reward, next_state, done, 'dqn', 1)
