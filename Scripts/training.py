@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Simplified training loop for the Tempest hybrid DQN agent."""
 
+import contextlib
 import math
 import time
 from typing import Sequence
@@ -30,6 +31,14 @@ def _to_tensor_bool(mask: Sequence[bool], length: int, *, device: torch.device) 
 
 
 _SPINNER_SIGN_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+
+
+def _is_supervision_active(frame_count: int) -> bool:
+    """Return True if expert supervision losses should be applied."""
+    warmup = int(getattr(RL_CONFIG, "supervision_warmup_frames", 0) or 0)
+    if warmup > 0 and frame_count >= warmup:
+        return False
+    return True
 
 
 def _get_spinner_signs(device: torch.device, spinner_actions: int) -> torch.Tensor:
@@ -111,29 +120,39 @@ def train_step(agent):
 
     agent.qnetwork_local.train()
 
-    # Forward pass for current states
-    q_values = agent.qnetwork_local(states)
-    selected_q = q_values.gather(1, discrete_actions)
+    use_amp = bool(getattr(agent, "amp_enabled", False) and getattr(agent, "amp_scaler", None))
+    if use_amp:
+        autocast_ctx = torch.cuda.amp.autocast()
+    else:
+        autocast_ctx = contextlib.nullcontext()
 
-    # Build Double DQN targets
-    with torch.no_grad():
-        next_q_local = agent.qnetwork_local(next_states)
-        best_next_actions = next_q_local.argmax(dim=1, keepdim=True)
+    frame_count = int(getattr(metrics, "frame_count", 0))
+    supervision_active = _is_supervision_active(frame_count) or getattr(metrics, "expert_mode", False)
 
-        next_q_target = agent.qnetwork_target(next_states)
-        next_values = next_q_target.gather(1, best_next_actions)
+    with autocast_ctx:
+        # Forward pass for current states
+        q_values = agent.qnetwork_local(states)
+        selected_q = q_values.gather(1, discrete_actions)
 
-        gamma_h = torch.pow(torch.full_like(horizons, agent.gamma), horizons)
-        targets = rewards + (1.0 - dones) * gamma_h * next_values
-        td_clip = getattr(RL_CONFIG, "td_target_clip", None)
-        try:
-            td_clip_val = float(td_clip)
-        except (TypeError, ValueError):
-            td_clip_val = None
-        if td_clip_val is not None and td_clip_val > 0.0 and math.isfinite(td_clip_val):
-            targets = torch.clamp(targets, -td_clip_val, td_clip_val)
+        # Build Double DQN targets
+        with torch.no_grad():
+            next_q_local = agent.qnetwork_local(next_states)
+            best_next_actions = next_q_local.argmax(dim=1, keepdim=True)
 
-    td_loss = F.smooth_l1_loss(selected_q, targets)
+            next_q_target = agent.qnetwork_target(next_states)
+            next_values = next_q_target.gather(1, best_next_actions)
+
+            gamma_h = torch.pow(torch.full_like(horizons, agent.gamma), horizons)
+            targets = rewards + (1.0 - dones) * gamma_h * next_values
+            td_clip = getattr(RL_CONFIG, "td_target_clip", None)
+            try:
+                td_clip_val = float(td_clip)
+            except (TypeError, ValueError):
+                td_clip_val = None
+            if td_clip_val is not None and td_clip_val > 0.0 and math.isfinite(td_clip_val):
+                targets = torch.clamp(targets, -td_clip_val, td_clip_val)
+
+        td_loss = F.smooth_l1_loss(selected_q, targets)
 
     expert_mask_np = [actor == "expert" for actor in actors]
     expert_mask = _to_tensor_bool(expert_mask_np, len(actors), device=states.device)
@@ -145,6 +164,9 @@ def train_step(agent):
     spinner_loss_item = 0.0
     w_sup = float(getattr(RL_CONFIG, "expert_supervision_weight", 0.0) or 0.0)
     w_spin = float(getattr(RL_CONFIG, "spinner_supervision_weight", w_sup) or 0.0)
+    if not supervision_active:
+        w_sup = 0.0
+        w_spin = 0.0
     expert_any = bool(expert_mask.any().item())
 
     if expert_any and (w_sup > 0.0 or w_spin > 0.0):
@@ -191,12 +213,19 @@ def train_step(agent):
             supervised_loss_item += spinner_loss_item
 
     agent.optimizer.zero_grad(set_to_none=True)
-    total_loss.backward()
-
+    grad_norm = None
     clip_norm = float(getattr(RL_CONFIG, "grad_clip_norm", 10.0) or 10.0)
-    grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), clip_norm)
 
-    agent.optimizer.step()
+    if use_amp and getattr(agent, "amp_scaler", None) is not None:
+        agent.amp_scaler.scale(total_loss).backward()
+        agent.amp_scaler.unscale_(agent.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), clip_norm)
+        agent.amp_scaler.step(agent.optimizer)
+        agent.amp_scaler.update()
+    else:
+        total_loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), clip_norm)
+        agent.optimizer.step()
 
     agent.training_steps += 1
     agent._apply_target_update()

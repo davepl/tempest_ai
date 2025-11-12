@@ -686,7 +686,9 @@ class HybridReplayBuffer:
             self.position = self._main.position
 
             if self.priority_buckets_enabled and self.priority_segments:
-                score = max(priority_val, 0.0)
+                score = float(abs(priority_val))
+                if not math.isfinite(score):
+                    score = 0.0
                 self._recent_scores.append(score)
                 self._total_additions += 1
 
@@ -1088,6 +1090,23 @@ class HybridDQNAgent:
 
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=self.learning_rate)
         self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+
+        self.amp_enabled = (
+            self.device.type == "cuda"
+            and torch.cuda.is_available()
+            and bool(getattr(RL_CONFIG, 'enable_amp', True))
+        )
+        if self.amp_enabled:
+            try:
+                if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+                    self.amp_scaler = torch.amp.GradScaler(device="cuda")
+                else:
+                    self.amp_scaler = torch.cuda.amp.GradScaler()
+            except AttributeError:
+                self.amp_scaler = None
+                self.amp_enabled = False
+        else:
+            self.amp_scaler = None
 
         self.training_enabled = True
         self.training_steps = 0
@@ -1726,9 +1745,10 @@ def decay_expert_ratio(current_step):
     - Then allow >=45% expert while 2.55 < DQN5M <= 2.70 and slope >= 0.00
     - Above that, revert to configured min (e.g., 0.40)
     """
+    min_ratio = max(0.0, min(1.0, getattr(RL_CONFIG, 'expert_ratio_min', 0.0)))
     # Skip decay if expert mode, override, or manual override is active
     if metrics.expert_mode or metrics.override_expert or getattr(metrics, 'manual_expert_override', False):
-        return metrics.expert_ratio
+        return max(min_ratio, min(1.0, metrics.expert_ratio))
     
     curriculum_expert = _curriculum_target(current_step, 2)
     if curriculum_expert is not None:
@@ -1756,6 +1776,10 @@ def decay_expert_ratio(current_step):
             metrics.expert_ratio *= RL_CONFIG.expert_ratio_decay
         metrics.last_decay_step = step_interval
 
+    try:
+        metrics.expert_ratio = max(min_ratio, min(1.0, metrics.expert_ratio))
+    except Exception:
+        metrics.expert_ratio = max(min_ratio, min(1.0, float(RL_CONFIG.expert_ratio_start)))
     return metrics.expert_ratio
 
 # Discrete-only SimpleReplayBuffer removed (hybrid-only)

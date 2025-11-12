@@ -40,7 +40,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
          
 local LEVEL_COMPLETION_BONUS = 0.0   -- Edge-triggered bonus when level increments
-local DEATH_PENALTY = 2500          -- Edge-triggered penalty when dying (applied to objective reward only)
+local DEATH_PENALTY = 1000          -- Edge-triggered penalty when dying (applied to objective reward only)
 -- CRITICAL: Zap cost was 100, which dominated all other rewards and made subjective reward almost always negative
 -- Reduced to 0.5 to make it a meaningful but not overwhelming penalty (equivalent to ~500 pts, or missing 1 enemy kill)
 -- This allows the positive subjective rewards (0.1-10 range) to actually accumulate and guide learning
