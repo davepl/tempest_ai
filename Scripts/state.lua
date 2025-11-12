@@ -139,12 +139,12 @@ find_nearest_enemy_of_type = function(enemies_state, player_abs_segment, is_open
         end
         --]]
 
-        -- Check if this is the enemy type we're looking for, if it's active,
-        -- if its depth is > 0x30, AND if the segment is NOT forbidden
-        if core_type == type_id and
-           enemy_abs_seg ~= INVALID_SEGMENT and
-           enemy_depth > 0x30 and
-           not is_forbidden then
+            -- Check if this is the enemy type we're looking for, if it's active,
+            -- if its depth is above zero (valid), AND if the segment is NOT forbidden
+            if core_type == type_id and
+               enemy_abs_seg ~= INVALID_SEGMENT and
+               enemy_depth > 0 and
+               not is_forbidden then
 
             -- Calculate distance using the provided function
             local rel_dist = abs_to_rel_func(player_abs_segment, enemy_abs_seg, is_open)

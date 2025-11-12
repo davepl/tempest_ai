@@ -87,7 +87,7 @@ class RLConfigData:
     batch_size: int = 1024                # Reduced from 8192 for faster sampling
     lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
-    n_step: int = 7                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
+    n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
     epsilon: float = 0.50                  # Current exploration rate (stage 0 of curriculum)
     epsilon_start: float = 0.50            # Curriculum stage 0 exploration rate
@@ -96,7 +96,7 @@ class RLConfigData:
     epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
     epsilon_decay_factor: float = 1
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
-    spinner_command_levels: tuple[int, ...] = (0, 9, 3, 1, -1, -3, -9)
+    spinner_command_levels: tuple[int, ...] = (0, 12, 9, 6, 3, 1, -1, -3, -6, -9, -12)
     exploration_curriculum: tuple[tuple[int, float, float], ...] = (
         (0, 0.50, 0.50),         # Frames   0 - 499,999
         (500_000, 0.25, 0.25),   # Frames 500k - 999,999
@@ -104,14 +104,15 @@ class RLConfigData:
     exploration_curriculum_cycle_start: int = 1_000_000  # Begin repeating schedule at 1M frames
     exploration_curriculum_cycle: tuple[tuple[int, float, float], ...] = (
         (250_000, 0.10, 0.10),   # First 250k frames: light exploration/guidance
-        (750_000, 0.00, 0.20),   # Next 750k frames: pure greedy with stronger expert mix
+        (750_000, 0.05, 0.25),   # Next 750k frames: minimal exploration with stronger expert mix (was 0.00 - NEVER use 0!)
     )
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
+    expert_ratio_min: float = 0.05        # Lowest allowable expert mix after decay
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
-    expert_ratio_decay: float = 1.0      # Apply mild decay each step interval
+    expert_ratio_decay: float = 0.9995   # Apply gradual decay each step interval
     expert_ratio_decay_steps: int = 10000  # Step interval for applying decay
 
     memory_size: int = 2000000             # Total buffer size across all buckets
@@ -119,13 +120,13 @@ class RLConfigData:
     # N-Bucket stratified replay buffer configuration (PER-like without performance overhead)
     # Ultra-focused on 90-100th percentile: top 2%, 95-98%, 90-95%, and main <90%
     replay_n_buckets: int = 2              # Number of priority buckets
-    replay_bucket_size: int = 250000       # Size of each priority bucket (250K each = 750K total)
-    replay_main_bucket_size: int = 1500000 # Size of main bucket for <90th percentile experiences (1.5M)
+    replay_bucket_size: int = 350000       # Size of each priority bucket (250K each = 750K total)
+    replay_main_bucket_size: int = 2500000 # Size of main bucket for <90th percentile experiences (1.5M)
     priority_sample_fraction: float = 0.20 # Fraction of each batch drawn from priority buckets
     priority_terminal_bonus: float = 0.5   # Extra score for terminal transitions when computing priority
 
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
-    num_layers: int = 4                  
+    num_layers: int = 5                  
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
     update_target_every: int = 1000        # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
@@ -140,29 +141,34 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    obj_reward_scale: float = 0.00000001            # Convert game score points to RL reward (1 point => 1e-5)
-    subj_reward_scale: float = 0.0000000025    # Subjective shaping scaled to average ~25% of objective reward magnitude
+    obj_reward_scale: float  = 0.000001            # Convert game score points to RL reward (1 point => 1e-4)
+    subj_reward_scale: float = 0.00000025          # Subjective shaping scaled to average ~25% of objective reward magnitude
     ignore_subjective_rewards: bool = True
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
-    use_reward_centering: bool = True       # Subtract a running mean of the objective reward before scaling
-    reward_centering_beta: float = 0.0005   # EMA rate for reward centering (lower = slower adaptation)
-    reward_centering_init: float = 0.05     # Initial guess for mean objective reward (pre-scale)
+    use_reward_centering: bool = False       # Subtract a running mean of the objective reward before scaling
+    reward_centering_beta: float = 0.005    # EMA rate for reward centering (lower = slower adaptation)
+    reward_centering_init: float = 0.0      # Initial guess for mean objective reward (post-scale units)
 
     # Epsilon exploration bias: reduce probability of selecting zap actions during random exploration
     # This helps prevent the DQN from learning to spam zap through exploration
-    epsilon_random_zap_discount: float = 0.49  # Reduce zap action probability to ~1/100th of fire probability
+    epsilon_random_zap_discount: float = 0.01  # Reduce zap action probability to ~1/100th of fire probability
 
     # Loss weighting (makes contributions explicit and tunable)
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
-    expert_supervision_weight: float = 0.05  # Weight for imitation loss on expert fire/zap targets (0 disables)
-    spinner_supervision_weight: float = 0.05  # Weight for imitation loss on expert spinner buckets (0 disables)
+    expert_supervision_weight: float = 1.0  # Weight for imitation loss on expert fire/zap targets (was 0.05 - too weak!)
+    spinner_supervision_weight: float = 1.0  # Weight for imitation loss on expert spinner buckets (was 0.05 - too weak!)
+    supervision_warmup_frames: int = 400_000  # After this many frames, disable imitation losses automatically
 
     # Target network update strategy
-    use_soft_target_update: bool = False   # DISABLED: Too slow - was True
+    use_soft_target_update: bool = True   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 500.0    # Clamp TD targets to match network output clamping (±150)
-    max_q_value: float = 500.0              # Clamp bootstrap Q-values (network outputs are hard-clamped to ±50 in forward pass)
+    td_target_clip: float | None = None        # Disable clipping - let Q-values find their natural range
+    max_q_value: float = 500.0                 # Reasonable headroom above observed natural range (~250)
+    
+    # Gradient clipping: Prevent massive gradient spikes that cause Q-value collapse
+    # ClipΔ values were showing 276.565, 232.841, 144.429 - gradients 15-28x too large!
+    grad_clip_norm: float = 1.0               # CRITICAL: Clip gradients to max norm of 1.0 (was defaulting to 10.0)
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
@@ -174,6 +180,9 @@ class RLConfigData:
 
     enable_superzap_gate: bool = True
     superzap_prob: float = 0.01  # 1% success rate for zap attempts
+
+    # Mixed precision / performance
+    enable_amp: bool = True      # Enable torch.cuda.amp when running on CUDA devices
 
 # Create instance of RLConfigData after its definition
 RL_CONFIG = RLConfigData()
@@ -443,6 +452,15 @@ class MetricsData:
                 if episode_length > 0:
                     self.episode_length_sum_interval += episode_length
                     self.episode_length_count_interval += 1
+            except Exception:
+                pass
+        
+        # Update DQN windows (outside lock to avoid circular dependency with metrics_display)
+        if episode_length > 0:
+            try:
+                from metrics_display import add_episode_to_dqn1m_window, add_episode_to_dqn5m_window
+                add_episode_to_dqn1m_window(float(dqn_reward), int(episode_length))
+                add_episode_to_dqn5m_window(float(dqn_reward), int(episode_length))
             except Exception:
                 pass
     

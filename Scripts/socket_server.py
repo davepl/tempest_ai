@@ -74,6 +74,7 @@ class AsyncReplayBuffer:
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
+        self.put_timeout = 0.05
         self.worker_thread = threading.Thread(target=self._consume_queue, daemon=True)
         self.worker_thread.start()
         self.items_queued = 0
@@ -83,7 +84,7 @@ class AsyncReplayBuffer:
     def step_async(self, *args, **kwargs):
         """Non-blocking step - queues experience for later insertion."""
         try:
-            self.queue.put_nowait((args, kwargs))
+            self.queue.put((args, kwargs), timeout=self.put_timeout)
             self.items_queued += 1
             return True
         except queue.Full:
@@ -96,30 +97,27 @@ class AsyncReplayBuffer:
         batch = []
         while self.running:
             try:
-                # Try to get item without blocking (aggressive draining)
-                try:
-                    # Drain multiple items quickly
-                    while len(batch) < self.batch_size:
-                        item = self.queue.get_nowait()
-                        batch.append(item)
-                except queue.Empty:
-                    pass
-                
-                # If we have a batch or any items and queue is empty, process immediately
-                if batch:
-                    for args, kwargs in batch:
-                        try:
-                            self.agent.step(*args, **kwargs)
-                            self.items_processed += 1
-                        except Exception as e:
-                            print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
-                    batch.clear()
-                else:
-                    # Only sleep briefly if queue is truly empty
-                    time.sleep(0.001)  # 1ms sleep to avoid busy-wait
-                    
+                if not batch:
+                    item = self.queue.get(timeout=0.01)
+                    batch.append(item)
+                while len(batch) < self.batch_size:
+                    try:
+                        batch.append(self.queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                for args, kwargs in batch:
+                    try:
+                        self.agent.step(*args, **kwargs)
+                        self.items_processed += 1
+                    except Exception as e:
+                        print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
+                batch.clear()
+            except queue.Empty:
+                continue
             except Exception as e:
                 print(f"AsyncReplayBuffer worker error: {e}")
+                time.sleep(0.01)
                 
     def stop(self):
         """Stop the background worker and flush remaining queue."""
@@ -303,6 +301,7 @@ class SocketServer:
                 'last_state': None,
                 'last_action_index': None,
                 'last_action_source': None,
+                'prev_action_source': None,  # Track previous frame's actor for reward attribution
                 'total_reward': 0.0,
                 'episode_dqn_reward': 0.0,
                 'episode_expert_reward': 0.0,
@@ -510,18 +509,24 @@ class SocketServer:
                     state['total_reward'] = state.get('total_reward', 0.0) + total_reward
                     state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + subj_reward
                     state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + frame.objreward
-                    src = state.get('last_action_source')
+                    
+                    # CRITICAL FIX: Use prev_action_source (who took the action that caused this reward)
+                    # not last_action_source (who is taking the action for next frame)
+                    prev_src = state.get('prev_action_source')  # Actor who took action that led to this reward
+                    
                     # Persist last-step attribution details for debugging/terminal reporting
                     try:
                         state['last_step_total_reward'] = float(total_reward)
                         state['last_step_obj_reward'] = float(frame.objreward)
                         state['last_step_subj_reward'] = float(subj_reward)
-                        state['last_step_actor'] = str(src) if src is not None else 'unknown'
+                        state['last_step_actor'] = str(prev_src) if prev_src is not None else 'unknown'
                     except Exception:
                         pass
-                    if src == 'dqn':
+                        
+                    # Attribute rewards to the actor who took the action that caused this reward
+                    if prev_src == 'dqn':
                         state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + total_reward
-                    elif src == 'expert':
+                    elif prev_src == 'expert':
                         state['episode_expert_reward'] = state.get('episode_expert_reward', 0.0) + total_reward
                     else:
                         # In verbose mode, surface unexpected/missing actor tags
@@ -534,7 +539,7 @@ class SocketServer:
                                 with self.metrics.lock:
                                     verbose = bool(getattr(self.metrics.metrics, 'verbose_mode', False))
                             if verbose:
-                                print(f"[ATTR] Client {client_id}: unexpected actor tag '{src}' on reward attribution; reward={total_reward:.4f}")
+                                print(f"[ATTR] Client {client_id}: unexpected actor tag '{prev_src}' on reward attribution; reward={total_reward:.4f}")
                         except Exception:
                             pass
 
@@ -592,6 +597,8 @@ class SocketServer:
                     # reset for next episode
                     state['last_state'] = None
                     state['last_action_index'] = None
+                    state['last_action_source'] = None  # Reset current actor
+                    state['prev_action_source'] = None  # Reset previous actor tracking
                     state['total_reward'] = 0.0
                     state['episode_dqn_reward'] = 0.0
                     state['episode_expert_reward'] = 0.0
@@ -607,6 +614,7 @@ class SocketServer:
                     state['episode_expert_reward'] = 0.0
                     state['episode_subj_reward'] = 0.0
                     state['episode_obj_reward'] = 0.0
+                    state['episode_frame_count'] = 0
                     state['episode_frame_count'] = 0  # Reset episode length counter
                     # No per-level frame tracking
 
@@ -621,7 +629,7 @@ class SocketServer:
                     # expert vs dqn mixture with override forcing pure dqn
                     expert_ratio = self.metrics.get_expert_ratio()
                     if frame.gamestate == 0x20:  # GS_ZoomingDown
-                        expert_ratio *= 2
+                        expert_ratio = min(1.0, expert_ratio * 4.0)  # 4x expert ratio during zoom (40% → 100%), clamped to 100%
                     use_expert = (random.random() < expert_ratio) and (not self.metrics.is_override_active())
 
                     if use_expert:
@@ -741,7 +749,10 @@ class SocketServer:
                 # store for next step
                 state['last_state'] = frame.state
                 state['last_action_index'] = action_index
-                state['last_action_source'] = action_source
+                
+                # CRITICAL: Store current action source so next frame's reward attribution is correct
+                state['prev_action_source'] = action_source   # Actor responsible for current action
+                state['last_action_source'] = action_source  # Maintain legacy field for compatibility
 
                 # send to game
                 game_fire, game_zap, game_spinner = hybrid_to_game_action(action_index)

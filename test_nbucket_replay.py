@@ -132,6 +132,26 @@ class TestSegmentedReplayBuffer(unittest.TestCase):
         priority_sizes = [stats.get(f"{label}_size", 0) for label in bucket_labels]
         self.assertTrue(any(size > 0 for size in priority_sizes))
 
+    def test_negative_priority_is_preserved(self):
+        """Ensure negative rewards are still treated as high-priority samples."""
+        for _ in range(20):
+            state, action, reward_val, next_state, done, actor, horizon = self._make_transition(reward=-10.0)
+            self.buffer.push(
+                state,
+                action,
+                reward_val,
+                next_state,
+                done,
+                actor=actor,
+                horizon=horizon,
+                priority_reward=reward_val,
+            )
+
+        stats = self.buffer.get_partition_stats()
+        bucket_labels = stats.get("bucket_labels", [])
+        priority_sizes = [stats.get(f"{label}_size", 0) for label in bucket_labels]
+        self.assertTrue(any(size > 0 for size in priority_sizes), "Negative rewards never reached priority buckets")
+
 
 if __name__ == "__main__":
     unittest.main()

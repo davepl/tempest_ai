@@ -25,134 +25,145 @@ row_counter = 0
 
 # Rolling window for DQN reward over last 5M frames
 DQN_WINDOW_FRAMES = 5_000_000
-_dqn_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: float, frame_end: int)
+_dqn_window = deque()  # entries: (episode_dqn_reward: float, episode_length: int)
 _dqn_window_frames = 0
-_last_frame_count_seen = None
 
 # Rolling window for DQN reward over last 1M frames
 DQN1M_WINDOW_FRAMES = 1_000_000
-_dqn1m_window = deque()  # entries: (frames_in_interval: int, dqn_reward_mean: float, frame_end: int)
+_dqn1m_window = deque()  # entries: (episode_dqn_reward: float, episode_length: int)
 _dqn1m_window_frames = 0
-_last_frame_count_seen_1m = None
 
 # Short-term DQN trend based on recent raw values
 DQN_TREND_POINTS = 8
 _dqn_trend_points = deque(maxlen=DQN_TREND_POINTS)
 
-def _update_dqn_window(mean_dqn_reward: float):
-    """Update the 5M-frames rolling window with the latest interval.
-
-    Uses the number of frames progressed since the last row as the weight.
+def _update_dqn_window(dqn_reward: float, episode_length: int):
+    """Add a completed episode to the 5M-frames rolling window.
+    
+    Args:
+        dqn_reward: Total DQN reward for the episode
+        episode_length: Number of frames in the episode
     """
-    global _dqn_window_frames, _last_frame_count_seen
-    current_frame = metrics.frame_count
-    # Determine frames elapsed since last sample
-    if _last_frame_count_seen is None:
-        delta_frames = 0
-    else:
-        delta_frames = max(0, current_frame - _last_frame_count_seen)
-    _last_frame_count_seen = current_frame
-
-    # If no frame progress (e.g., first row), just return without adding
-    if delta_frames <= 0:
+    global _dqn_window_frames
+    
+    # Skip if episode length is invalid
+    if episode_length <= 0:
         return
+    
+    # Append new episode
+    _dqn_window.append((float(dqn_reward), int(episode_length)))
+    _dqn_window_frames += episode_length
 
-    # Append new interval
-    _dqn_window.append((delta_frames, float(mean_dqn_reward), int(current_frame)))
-    _dqn_window_frames += delta_frames
-
-    # Trim window to last 5M frames (may need partial trim of the oldest bucket)
+    # Trim window to last 5M frames
     while _dqn_window and _dqn_window_frames > DQN_WINDOW_FRAMES:
         overflow = _dqn_window_frames - DQN_WINDOW_FRAMES
-        oldest_frames, oldest_val, oldest_end = _dqn_window[0]
-        if oldest_frames <= overflow:
+        oldest_reward, oldest_length = _dqn_window[0]
+        
+        if oldest_length <= overflow:
+            # Remove entire oldest episode
             _dqn_window.popleft()
-            _dqn_window_frames -= oldest_frames
+            _dqn_window_frames -= oldest_length
         else:
-            # Partially trim the oldest bucket
-            kept_frames = oldest_frames - overflow
-            _dqn_window[0] = (kept_frames, oldest_val, oldest_end)
+            # Partially count the oldest episode (proportional reward)
+            kept_frames = oldest_length - overflow
+            kept_reward = oldest_reward * (kept_frames / oldest_length)
+            _dqn_window[0] = (kept_reward, kept_frames)
             _dqn_window_frames = DQN_WINDOW_FRAMES
             break
 
-def _update_dqn1m_window(mean_dqn_reward: float):
-    """Update the 1M-frames rolling window with the latest interval.
-
-    Uses the number of frames progressed since the last row as the weight.
+def _update_dqn1m_window(dqn_reward: float, episode_length: int):
+    """Add a completed episode to the 1M-frames rolling window.
+    
+    Args:
+        dqn_reward: Total DQN reward for the episode
+        episode_length: Number of frames in the episode
     """
-    global _dqn1m_window_frames, _last_frame_count_seen_1m
-    current_frame = metrics.frame_count
-    # Determine frames elapsed since last sample
-    if _last_frame_count_seen_1m is None:
-        delta_frames = 0
-    else:
-        delta_frames = max(0, current_frame - _last_frame_count_seen_1m)
-    _last_frame_count_seen_1m = current_frame
-
-    # If no frame progress (e.g., first row), just return without adding
-    if delta_frames <= 0:
+    global _dqn1m_window_frames
+    
+    # Skip if episode length is invalid
+    if episode_length <= 0:
         return
+    
+    # Append new episode
+    _dqn1m_window.append((float(dqn_reward), int(episode_length)))
+    _dqn1m_window_frames += episode_length
 
-    # Append new interval
-    _dqn1m_window.append((delta_frames, float(mean_dqn_reward), int(current_frame)))
-    _dqn1m_window_frames += delta_frames
-
-    # Trim window to last 1M frames (may need partial trim of the oldest bucket)
+    # Trim window to last 1M frames
     while _dqn1m_window and _dqn1m_window_frames > DQN1M_WINDOW_FRAMES:
         overflow = _dqn1m_window_frames - DQN1M_WINDOW_FRAMES
-        oldest_frames, oldest_val, oldest_end = _dqn1m_window[0]
-        if oldest_frames <= overflow:
+        oldest_reward, oldest_length = _dqn1m_window[0]
+        
+        if oldest_length <= overflow:
+            # Remove entire oldest episode
             _dqn1m_window.popleft()
-            _dqn1m_window_frames -= oldest_frames
+            _dqn1m_window_frames -= oldest_length
         else:
-            # Partially trim the oldest bucket
-            kept_frames = oldest_frames - overflow
-            _dqn1m_window[0] = (kept_frames, oldest_val, oldest_end)
+            # Partially count the oldest episode (proportional reward)
+            kept_frames = oldest_length - overflow
+            kept_reward = oldest_reward * (kept_frames / oldest_length)
+            _dqn1m_window[0] = (kept_reward, kept_frames)
             _dqn1m_window_frames = DQN1M_WINDOW_FRAMES
             break
 
 def _compute_dqn_window_stats():
-    """Compute weighted average and weighted regression slope (per million frames) for the 5M-frame window.
-
-    Returns (avg, slope_per_million).
+    """Compute average DQN reward for the 5M-frame window.
+    
+    Returns average DQN reward per episode, weighted by episode length.
     """
     if not _dqn_window or _dqn_window_frames <= 0:
-        return 0.0, 0.0
+        return 0.0
 
-    # Weighted average
-    w_sum = float(_dqn_window_frames)
-    wy_sum = sum(fr * val for fr, val, _ in _dqn_window)
-    avg = wy_sum / w_sum if w_sum > 0 else 0.0
-
-    # Weighted linear regression slope of y vs x, with weights = frames
-    # Use frame_end as x for each bucket
-    wx_sum = sum(fr * x for fr, _, x in _dqn_window)
-    wxx_sum = sum(fr * (x * x) for fr, _, x in _dqn_window)
-    wy_sum = sum(fr * y for fr, y, _ in _dqn_window)
-    wxy_sum = sum(fr * x * y for fr, y, x in _dqn_window)
-
-    denom = (wxx_sum - (wx_sum * wx_sum) / w_sum) if w_sum > 0 else 0.0
-    if denom <= 0:
-        slope = 0.0
-    else:
-        slope = (wxy_sum - (wx_sum * wy_sum) / w_sum) / denom
-
-    slope_per_million = slope * 1_000_000.0
-    return avg, slope_per_million
+    # Sum total DQN rewards and compute average per episode
+    total_dqn_reward = sum(reward for reward, _ in _dqn_window)
+    num_episodes = len(_dqn_window)
+    avg = total_dqn_reward / num_episodes if num_episodes > 0 else 0.0
+    return avg
 
 def _compute_dqn1m_window_stats():
     """Compute weighted average for the 1M-frame window.
-
-    Returns avg.
+    
+    Returns average DQN reward per episode, weighted by episode length.
     """
     if not _dqn1m_window or _dqn1m_window_frames <= 0:
         return 0.0
 
-    # Weighted average
-    w_sum = float(_dqn1m_window_frames)
-    wy_sum = sum(fr * val for fr, val, _ in _dqn1m_window)
-    avg = wy_sum / w_sum if w_sum > 0 else 0.0
+    # Sum total DQN rewards and total frames
+    total_dqn_reward = sum(reward for reward, _ in _dqn1m_window)
+    total_frames = _dqn1m_window_frames
+    
+    # Average reward per frame, then scale to per-episode basis
+    # Actually, we want average episode reward, so just compute that directly
+    num_episodes = len(_dqn1m_window)
+    avg = total_dqn_reward / num_episodes if num_episodes > 0 else 0.0
     return avg
+
+def add_episode_to_dqn1m_window(dqn_reward: float, episode_length: int):
+    """Public function to add completed episodes to the 1M-frame DQN window.
+    
+    Call this when an episode completes to track DQN performance over the last 1M frames.
+    
+    Args:
+        dqn_reward: Total DQN reward for the completed episode
+        episode_length: Number of frames in the completed episode
+    """
+    try:
+        _update_dqn1m_window(dqn_reward, episode_length)
+    except Exception:
+        pass
+
+def add_episode_to_dqn5m_window(dqn_reward: float, episode_length: int):
+    """Public function to add completed episodes to the 5M-frame DQN window.
+    
+    Call this when an episode completes to track DQN performance over the last 5M frames.
+    
+    Args:
+        dqn_reward: Total DQN reward for the completed episode
+        episode_length: Number of frames in the completed episode
+    """
+    try:
+        _update_dqn_window(dqn_reward, episode_length)
+    except Exception:
+        pass
 
 def _update_dqn_trend(frame_count: int, dqn_raw: float):
     """Maintain a small buffer of recent (frame, raw_dqn_reward) points."""
@@ -367,25 +378,21 @@ def display_metrics_row(agent, kb_handler):
         metrics.level_sum_interval = 0.0
         metrics.level_count_interval = 0
 
-    # Update 5M-frame DQN window stats now that we have this row's mean_dqn_reward
+    # Compute DQN window stats (episodes are added via add_episode_to_dqn*m_window)
     try:
-        _update_dqn_window(mean_dqn_reward)
-        dqn5m_avg, dqn5m_slopeM = _compute_dqn_window_stats()
-    except Exception:
-        dqn5m_avg, dqn5m_slopeM = 0.0, 0.0
-
-    # Update 1M-frame DQN window stats
-    try:
-        _update_dqn1m_window(mean_dqn_reward)
         dqn1m_avg = _compute_dqn1m_window_stats()
     except Exception:
         dqn1m_avg = 0.0
+    
+    try:
+        dqn5m_avg = _compute_dqn_window_stats()
+    except Exception:
+        dqn5m_avg = 0.0
 
     # Publish DQN5M stats to global metrics for gating logic elsewhere
     try:
         with metrics.lock:
             metrics.dqn5m_avg = float(dqn5m_avg)
-            metrics.dqn5m_slopeM = float(dqn5m_slopeM)
     except Exception:
         pass
 
