@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Scripts'))
 
 import numpy as np
 from aimodel import HybridReplayBuffer
+from config import SERVER_CONFIG
 
 def debug_pre_death_sampling():
     """Debug the pre-death sampling to see what's happening."""
@@ -15,7 +16,7 @@ def debug_pre_death_sampling():
     
     # Create small buffer for easier debugging
     capacity = 1000
-    state_size = 171
+    state_size = SERVER_CONFIG.params_count
     buffer = HybridReplayBuffer(capacity, state_size)
     
     # Add exactly 20 frames per episode, with death on frame 20

@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Scripts'))
 
 import numpy as np
 from aimodel import HybridReplayBuffer
+from config import SERVER_CONFIG
 
 def final_validation():
     """Comprehensive validation of pre-death sampling."""
@@ -15,7 +16,7 @@ def final_validation():
     
     # Create large buffer to test at scale
     capacity = 100000
-    state_size = 171
+    state_size = SERVER_CONFIG.params_count
     buffer = HybridReplayBuffer(capacity, state_size)
     
     print(f"\n1. Creating realistic buffer with 1000 episodes...")

@@ -6,11 +6,15 @@ Simple test to measure target network update performance.
 import time
 import torch
 import torch.nn as nn
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Scripts'))
+from config import SERVER_CONFIG
 
 def create_test_network():
     """Create a simple network similar to the DQN architecture"""
     layers = []
-    layers.append(nn.Linear(171, 512))
+    layers.append(nn.Linear(SERVER_CONFIG.params_count, 512))
     layers.append(nn.ReLU())
     layers.append(nn.Linear(512, 512))
     layers.append(nn.ReLU())

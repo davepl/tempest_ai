@@ -316,6 +316,18 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsar_fliprate)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulse_beat)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsing)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.flipper_move or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.fuse_move_prb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_flipper_lsb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_pulsar_lsb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_tanker_lsb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_lsb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_lsb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_flipper_msb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_pulsar_msb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_tanker_msb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_msb or 0)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_msb or 0)
 
     -- Decoded Enemy Info (7 * 6 = 42) - all natural values
     for i = 1, 7 do
@@ -738,6 +750,5 @@ emu.add_machine_stop_notifier(on_mame_exit)
 
 print("Tempest AI script initialized and callbacks registered.")
 --[[ End of main.lua ]]--
-
 
 

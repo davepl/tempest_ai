@@ -12,7 +12,8 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local SAFE_DISTANCE = 1
+local TOP_RAIL_AVOID_DEPTH = 0x30
+local SAFE_DISTANCE = 2
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
 local FLIPPER_REACT_DISTANCE_L = 2.0 -- distance at which we move one segment and fire (left-side, float)
@@ -220,7 +221,7 @@ function M.check_segment_threat(segment, enemies_state)
         if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then return true end
     end
     for i = 1, 7 do -- Check enemies
-        if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then return true end
+        if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then return true end
     end
     for i = 1, 7 do -- Check pulsars (regardless of pulsing state for general threat)
         if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then return true end
@@ -471,67 +472,61 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
 
-    -- Scan top-rail threats (flippers and pulsars are equivalent once on top rail)
-    local nr_seg, nl_seg = nil, nil
-    local nr_dist, nl_dist = 999, 999
-    local nr_dist_float, nl_dist_float = 999, 999
-    local right_exists, left_exists = false, false
-    local min_abs_rel_float = 999 -- nearest top-rail flipper/pulsar fractional distance
+    -- Default to hunting the next enemy
+    local target_seg = player_abs_seg
+    do
+        local hunt_target_seg, _, _ = M.hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, {})
+        if hunt_target_seg ~= -1 then
+            target_seg = hunt_target_seg
+        end
+    end
+
+    -- After picking a hunt target, check for nearby top-rail enemies and flee if necessary
+    local min_abs_rel_float = nil
+    local nearest_top_rel = nil
     for i = 1, 7 do
         local depth = enemies_state.enemy_depths[i]
-        if depth > 0 and depth <= TOP_RAIL_DEPTH then
+        if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH then
             local t = enemies_state.enemy_core_type[i]
             if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
                 local seg = enemies_state.enemy_abs_segments[i]
                 if seg ~= INVALID_SEGMENT then
-                    local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
                     local rel_float = enemies_state.active_top_rail_enemies[i]
                     if rel_float == 0 and enemies_state.enemy_between_segments[i] == 0 then
-                        rel_float = rel_int
+                        rel_float = abs_to_rel_func(player_abs_seg, seg, is_open)
                     end
-                    local abs_int = math.abs(rel_int)
                     local abs_float = math.abs(rel_float)
-                    if rel_int > 0 and abs_int < nr_dist then nr_dist, nr_dist_float, nr_seg, right_exists = abs_int, abs_float, seg, true end
-                    if rel_int < 0 and abs_int < nl_dist then nl_dist, nl_dist_float, nl_seg, left_exists = abs_int, abs_float, seg, true end
-                    if abs_float < min_abs_rel_float then min_abs_rel_float = abs_float end
+                    if not min_abs_rel_float or abs_float < min_abs_rel_float then
+                        min_abs_rel_float = abs_float
+                    end
+                    if abs_float <= SAFE_DISTANCE then
+                        if (nearest_top_rel == nil) or (abs_float < math.abs(nearest_top_rel)) then
+                            nearest_top_rel = rel_float
+                        end
+                    end
                 end
             end
         end
     end
 
-    -- Open-level fixed retreats (right-only -> 1, left-only -> 13). Both sides falls through to closed-level logic
-    local target_seg = player_abs_seg
-    if is_open then
-        if right_exists and not left_exists then
-            target_seg = RIGHT_RETREAT_SEGMENT -- 1
-        elseif left_exists and not right_exists then
-            target_seg = LEFT_RETREAT_SEGMENT -- 13
-        end
-    end
-
-    -- Closed-level (and open with both sides) movement policy
-    if (not is_open) or (is_open and right_exists and left_exists) then
-        if right_exists and not left_exists then
-            -- Right-only: move left if within safe distance
-            if nr_dist <= SAFE_DISTANCE then
-                target_seg = (nr_seg - 1 + 16) % 16
+    if nearest_top_rel ~= nil then
+        local flee_dir = (nearest_top_rel >= 0) and -1 or 1
+        local function try_offset(base_seg, delta)
+            if is_open then
+                local candidate = base_seg + delta
+                if candidate >= 0 and candidate <= 15 then
+                    return candidate
+                end
+                return nil
             else
-                target_seg = player_abs_seg
+                return (base_seg + delta + 16) % 16
             end
-        elseif left_exists and not right_exists then
-            -- Left-only: move right if within safe distance
-            if nl_dist <= SAFE_DISTANCE then
-                target_seg = (nl_seg + 1) % 16
-            else
-                target_seg = player_abs_seg
-            end
-        elseif right_exists and left_exists then
-            -- Both sides: freeze (hold position)
-            target_seg = player_abs_seg
-        else
-            -- No top-rail flippers/pulsars: hold
-            target_seg = player_abs_seg
         end
+        local flee_target = try_offset(player_abs_seg, flee_dir)
+        if flee_target == nil then
+            flee_target = try_offset(player_abs_seg, -flee_dir) or player_abs_seg
+        end
+        target_seg = flee_target
     end
 
     -- Firing policy
@@ -539,7 +534,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     -- AND we have ammo available (shot_count < 8)
     local SHOOT_DIST = 0.80
     local lane_has_threat = M.check_segment_threat(player_abs_seg, enemies_state)
-    local within_shooting_distance = (min_abs_rel_float <= SHOOT_DIST)
+    local within_shooting_distance = (min_abs_rel_float ~= nil and min_abs_rel_float <= SHOOT_DIST)
 
     local should_fire
     if shot_count >= 8 then
@@ -557,7 +552,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     for i = 1, 7 do
         local depth = enemies_state.enemy_depths[i]
         local seg = enemies_state.enemy_abs_segments[i]
-        if depth > 0 and depth <= TOP_RAIL_DEPTH and seg ~= INVALID_SEGMENT then
+        if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH and seg ~= INVALID_SEGMENT then
             top_rail_count = top_rail_count + 1
         end
     end
@@ -686,7 +681,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 local depth = enemies_state.enemy_depths[i]
                 local enemy_type = enemies_state.enemy_core_type[i]
                 
-                if abs_seg == player_abs_seg and depth > 0 and depth <= 0x30 then
+                if abs_seg == player_abs_seg and depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH then
                     critical_threats = critical_threats + 1
                 end
             end
@@ -763,7 +758,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                 -- Find nearest top-rail flipper using authoritative fractional relative pos
                 for i = 1, 7 do
                     if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
-                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+                       enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then
                         local relf = enemies_state.active_top_rail_enemies[i]
                         if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
                             local d = math.abs(relf)
@@ -868,7 +863,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         local min_abs_rel_float = nil
         for i = 1, 7 do
             if enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER and
-               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then
+               enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then
                 local relf = enemies_state.active_top_rail_enemies[i]
                 if relf ~= 0 or enemies_state.enemy_between_segments[i] == 1 then
                     local d = math.abs(relf)

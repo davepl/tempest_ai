@@ -73,7 +73,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 171
+    params_count: int = 183
 
 # Create instance of ServerConfigData first
 SERVER_CONFIG = ServerConfigData()
