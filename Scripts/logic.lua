@@ -12,7 +12,7 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
-local TOP_RAIL_AVOID_DEPTH = 0x30
+local TOP_RAIL_AVOID_DEPTH = 0x60
 local SAFE_DISTANCE = 2
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
