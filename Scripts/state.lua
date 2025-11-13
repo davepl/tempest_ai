@@ -17,6 +17,7 @@ local ENEMY_TYPE_TANKER   = 2
 local ENEMY_TYPE_SPIKER   = 3
 local ENEMY_TYPE_FUSEBALL = 4
 local ENEMY_TYPE_MASK = 0x07 -- <<< ADDED THIS DEFINITION (%00000111)
+local TOP_RAIL_AVOID_DEPTH = 0x60
 
 -- Helper function for BCD conversion (local to this module)
 local function bcd_to_decimal(bcd)
@@ -71,7 +72,7 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
         local shot_abs_seg = enemies_state.enemy_shot_abs_segments[i]
         local shot_depth = enemies_state.shot_positions[i]
         -- Mark forbidden if shot is close AND player cannot shoot back
-        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= 0x30 and not has_ammo then
+        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= TOP_RAIL_AVOID_DEPTH and not has_ammo then
             -- print(string.format("  -> FORBIDDEN (Enemy Shot): Shot %d, Seg %d, Depth %02X", i, shot_abs_seg, shot_depth)) -- DEBUG
             forbidden[shot_abs_seg] = true
         end
@@ -315,7 +316,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             for i = 1, 4 do
                 if enemies_state.enemy_shot_abs_segments[i] == next_segment_abs and
                    enemies_state.shot_positions[i] > 0 and
-                   enemies_state.shot_positions[i] <= 0x30 then
+                   enemies_state.shot_positions[i] <= TOP_RAIL_AVOID_DEPTH then
                     brake_condition_met = true; break
                 end
             end
@@ -326,7 +327,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                     if (enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER or enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR) and -- <<< CORRECTED TYPE
                        enemies_state.enemy_abs_segments[i] == next_segment_abs and
                        enemies_state.enemy_depths[i] > 0 and
-                       enemies_state.enemy_depths[i] <= 0x30 then
+                       enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then
                         brake_condition_met = true; break
                     end
                 end
@@ -428,7 +429,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     local initial_should_fire = should_fire -- Store initial recommendation before override
     if not initial_should_fire then -- Only override if not already firing
         for i = 1, 7 do
-            if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
+            if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then -- Is it close vertically?
                 local threat_abs_seg = enemies_state.enemy_abs_segments[i]
                 if threat_abs_seg ~= INVALID_SEGMENT then
                     local threat_rel_seg = abs_to_rel_func(player_abs_seg, threat_abs_seg, is_open)
@@ -871,7 +872,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         end
 
         -- Check if it's a top rail Pulsar or Flipper (close to top)
-        if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] <= 0x30) then
+        if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH) then
             -- Build absolute floating segment using between-segment progress (from more_enemy_info low nibble)
             local abs_int = self.enemy_abs_segments[i]
             local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15

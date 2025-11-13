@@ -218,7 +218,7 @@ end
 -- Function to check for immediate threats in a segment
 function M.check_segment_threat(segment, enemies_state)
     for i = 1, 4 do -- Check shots
-        if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then return true end
+        if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= TOP_RAIL_AVOID_DEPTH then return true end
     end
     for i = 1, 7 do -- Check enemies
         if enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then return true end
@@ -246,8 +246,8 @@ function M.is_danger_lane(segment, enemies_state)
             if depth <= 0x20 then return true end
         end
     end
-    for i = 1, 4 do -- Check close enemy shots (depth <= 0x30)
-        if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= 0x30 then return true end
+    for i = 1, 4 do -- Check close enemy shots (depth <= TOP_RAIL_AVOID_DEPTH)
+        if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= TOP_RAIL_AVOID_DEPTH then return true end
     end
     return false
 end
@@ -398,6 +398,86 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local is_open = (level_state.level_type == 0x00) -- Updated: 0x00 now considered open
     local player_abs_seg = math.floor(player_state.position) % 16
     local shot_count = player_state.shot_count or 0
+    local min_abs_rel_float = nil
+
+    local function try_offset(base_seg, delta)
+        if is_open then
+            local candidate = base_seg + delta
+            if candidate >= 0 and candidate <= 15 then
+                return candidate
+            end
+            return nil
+        else
+            return (base_seg + delta + 16) % 16
+        end
+    end
+
+    local function scan_top_threats()
+        local flee_rel = nil
+        local flee_abs = nil
+
+        local function consider_top(rel_value)
+            if rel_value == nil then
+                return
+            end
+            local abs_rel = math.abs(rel_value)
+            if min_abs_rel_float == nil or abs_rel < min_abs_rel_float then
+                min_abs_rel_float = abs_rel
+            end
+            if abs_rel <= SAFE_DISTANCE and (flee_abs == nil or abs_rel < flee_abs) then
+                flee_abs = abs_rel
+                flee_rel = rel_value
+            end
+        end
+
+        local function consider_shot(rel_value)
+            if rel_value == nil or rel_value == INVALID_SEGMENT then
+                return
+            end
+            local abs_rel = math.abs(rel_value)
+            if abs_rel <= SAFE_DISTANCE and (flee_abs == nil or abs_rel < flee_abs) then
+                flee_abs = abs_rel
+                flee_rel = rel_value
+            end
+        end
+
+        for i = 1, 7 do
+            local depth = enemies_state.enemy_depths[i]
+            if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH then
+                local t = enemies_state.enemy_core_type[i]
+                if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
+                    local seg = enemies_state.enemy_abs_segments[i]
+                    if seg ~= INVALID_SEGMENT then
+                        local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
+                        local rel_float = enemies_state.active_top_rail_enemies[i]
+                        if not rel_float or rel_float == 0 then
+                            rel_float = rel_int
+                        end
+                        consider_top(rel_float)
+                    end
+                end
+            end
+        end
+
+        for i = 1, 4 do
+            local shot_depth = enemies_state.shot_positions[i]
+            if shot_depth and shot_depth > 0 and shot_depth <= TOP_RAIL_AVOID_DEPTH then
+                consider_shot(enemies_state.enemy_shot_segments[i])
+            end
+        end
+
+        return flee_rel
+    end
+
+    local flee_rel = scan_top_threats()
+    if flee_rel ~= nil then
+        local flee_dir = (flee_rel >= 0) and -1 or 1
+        local flee_target = try_offset(player_abs_seg, flee_dir)
+        if flee_target == nil then
+            flee_target = try_offset(player_abs_seg, -flee_dir) or player_abs_seg
+        end
+        return flee_target, 0, true, false
+    end
 
     -- Tube Zoom behavior unchanged
     if game_state.gamestate == 0x20 then
@@ -472,61 +552,13 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
 
-    -- Default to hunting the next enemy
+    -- Default to hunting the next enemy when no imminent top threat is present
     local target_seg = player_abs_seg
     do
         local hunt_target_seg, _, _ = M.hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, {})
         if hunt_target_seg ~= -1 then
             target_seg = hunt_target_seg
         end
-    end
-
-    -- After picking a hunt target, check for nearby top-rail enemies and flee if necessary
-    local min_abs_rel_float = nil
-    local nearest_top_rel = nil
-    for i = 1, 7 do
-        local depth = enemies_state.enemy_depths[i]
-        if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH then
-            local t = enemies_state.enemy_core_type[i]
-            if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
-                local seg = enemies_state.enemy_abs_segments[i]
-                if seg ~= INVALID_SEGMENT then
-                    local rel_float = enemies_state.active_top_rail_enemies[i]
-                    if rel_float == 0 and enemies_state.enemy_between_segments[i] == 0 then
-                        rel_float = abs_to_rel_func(player_abs_seg, seg, is_open)
-                    end
-                    local abs_float = math.abs(rel_float)
-                    if not min_abs_rel_float or abs_float < min_abs_rel_float then
-                        min_abs_rel_float = abs_float
-                    end
-                    if abs_float <= SAFE_DISTANCE then
-                        if (nearest_top_rel == nil) or (abs_float < math.abs(nearest_top_rel)) then
-                            nearest_top_rel = rel_float
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    if nearest_top_rel ~= nil then
-        local flee_dir = (nearest_top_rel >= 0) and -1 or 1
-        local function try_offset(base_seg, delta)
-            if is_open then
-                local candidate = base_seg + delta
-                if candidate >= 0 and candidate <= 15 then
-                    return candidate
-                end
-                return nil
-            else
-                return (base_seg + delta + 16) % 16
-            end
-        end
-        local flee_target = try_offset(player_abs_seg, flee_dir)
-        if flee_target == nil then
-            flee_target = try_offset(player_abs_seg, -flee_dir) or player_abs_seg
-        end
-        target_seg = flee_target
     end
 
     -- Firing policy
