@@ -157,14 +157,13 @@ class RLConfigData:
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
     expert_supervision_weight: float = 1.0  # Weight for imitation loss on expert fire/zap targets (was 0.05 - too weak!)
     spinner_supervision_weight: float = 1.0  # Weight for imitation loss on expert spinner buckets (was 0.05 - too weak!)
-    supervision_warmup_frames: int = 400_000  # After this many frames, disable imitation losses automatically
 
     # Target network update strategy
     use_soft_target_update: bool = True   # DISABLED: Too slow - was True
     soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = None        # Disable clipping - let Q-values find their natural range
-    max_q_value: float = 500.0                 # Reasonable headroom above observed natural range (~250)
+    td_target_clip: float | None = 150.0       # Keep TD targets bounded to avoid runaway targets
+    max_q_value: float | None = None           # Disable forward clamp; rely on td_target_clip to set range
     
     # Gradient clipping: Prevent massive gradient spikes that cause Q-value collapse
     # ClipΔ values were showing 276.565, 232.841, 144.429 - gradients 15-28x too large!

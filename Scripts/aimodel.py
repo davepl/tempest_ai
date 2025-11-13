@@ -339,19 +339,14 @@ class HybridDQN(nn.Module):
         self.discrete_actions = discrete_actions
         self.num_layers = num_layers
         max_q_config = getattr(RL_CONFIG, 'max_q_value', None)
-        td_clip_config = getattr(RL_CONFIG, 'td_target_clip', None)
-        clamp_candidates: list[float] = []
-        for candidate in (max_q_config, td_clip_config):
-            try:
-                candidate_val = float(candidate)
-            except (TypeError, ValueError):
-                continue
-            if candidate_val > 0.0 and math.isfinite(candidate_val):
-                clamp_candidates.append(candidate_val)
-        if clamp_candidates:
-            self.max_q_value = min(clamp_candidates)
-        else:
-            self.max_q_value = 1000.0
+        max_q_value = None
+        try:
+            candidate_val = float(max_q_config)
+        except (TypeError, ValueError):
+            candidate_val = None
+        if candidate_val is not None and candidate_val > 0.0 and math.isfinite(candidate_val):
+            max_q_value = candidate_val
+        self.max_q_value = max_q_value
         
         # Shared trunk for feature extraction
         LinearOrNoisy = nn.Linear  # Noisy networks removed for simplification
@@ -410,8 +405,8 @@ class HybridDQN(nn.Module):
         discrete = F.relu(self.discrete_fc(shared))
         discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
         
-        # Clamp Q-values to [-50, +50] to prevent divergence
-        discrete_q = torch.clamp(discrete_q, -self.max_q_value, self.max_q_value)
+        if self.max_q_value is not None:
+            discrete_q = torch.clamp(discrete_q, -self.max_q_value, self.max_q_value)
         return discrete_q
 
 
