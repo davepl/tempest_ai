@@ -132,8 +132,10 @@ Potential improvements:
 The implementation is a drop-in replacement for the original `HybridReplayBuffer`:
 
 ```python
+from config import SERVER_CONFIG
+
 # Create buffer
-buffer = HybridReplayBuffer(capacity=2000000, state_size=171)
+buffer = HybridReplayBuffer(capacity=2000000, state_size=SERVER_CONFIG.params_count)
 
 # Add experiences (automatically classified into buckets)
 buffer.push(state, action, continuous_action, reward, next_state, done, 'dqn', 1)

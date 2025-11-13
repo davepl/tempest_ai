@@ -8,12 +8,12 @@ import numpy as np
 import sys
 sys.path.append('Scripts') 
 
-from config import metrics, RL_CONFIG
+from config import metrics, RL_CONFIG, SERVER_CONFIG
 from aimodel import HybridDQNAgent
 
 # Load the current model
 agent = HybridDQNAgent(
-    state_size=171,  # From SERVER_CONFIG.params_count
+    state_size=SERVER_CONFIG.params_count,
     discrete_actions=4
 )
 

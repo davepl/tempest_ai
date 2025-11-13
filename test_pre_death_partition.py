@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Scripts'))
 
 import numpy as np
 from aimodel import HybridReplayBuffer
+from config import SERVER_CONFIG
 
 def test_pre_death_partition():
     """Test that pre-death frames are tracked and sampled correctly."""
@@ -15,7 +16,7 @@ def test_pre_death_partition():
     
     # Create buffer
     capacity = 10000
-    state_size = 171
+    state_size = SERVER_CONFIG.params_count
     buffer = HybridReplayBuffer(capacity, state_size)
     
     print(f"\n1. Buffer Configuration:")

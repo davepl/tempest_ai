@@ -661,6 +661,18 @@ function M.EnemiesState:new()
     self.num_enemies_in_tube = 0 -- ($0108)
     self.num_enemies_on_top = 0  -- ($0109)
     self.enemies_pending = 0 -- ($03AB)
+    self.flipper_move = 0       -- ($015D)
+    self.fuse_move_prb = 0      -- ($015F)
+    self.spd_flipper_lsb = 0    -- ($0160)
+    self.spd_pulsar_lsb = 0     -- ($0161)
+    self.spd_tanker_lsb = 0     -- ($0162)
+    self.spd_spiker_lsb = 0     -- ($0163)
+    self.spd_fuseball_lsb = 0   -- ($0164)
+    self.spd_flipper_msb = 0    -- ($0165)
+    self.spd_pulsar_msb = 0     -- ($0166)
+    self.spd_tanker_msb = 0     -- ($0167)
+    self.spd_spiker_msb = 0     -- ($0168)
+    self.spd_fuseball_msb = 0   -- ($0169)
 
     -- Enemy info arrays (Size 7, for enemy slots 1-7)
     self.enemy_type_info = {} -- Raw type byte ($0283 + i - 1)
@@ -778,6 +790,20 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     self.spawn_slots_tankers = mem:read_u8(0x013F)   -- avl_tankers
     self.spawn_slots_spikers = mem:read_u8(0x0140)   -- avl_spikers
     self.spawn_slots_fuseballs = mem:read_u8(0x0141) -- avl_fuseballs
+
+    -- Global movement / velocity registers
+    self.flipper_move = mem:read_u8(0x015D)
+    self.fuse_move_prb = mem:read_u8(0x015F)
+    self.spd_flipper_lsb = mem:read_u8(0x0160)
+    self.spd_pulsar_lsb = mem:read_u8(0x0161)
+    self.spd_tanker_lsb = mem:read_u8(0x0162)
+    self.spd_spiker_lsb = mem:read_u8(0x0163)
+    self.spd_fuseball_lsb = mem:read_u8(0x0164)
+    self.spd_flipper_msb = mem:read_u8(0x0165)
+    self.spd_pulsar_msb = mem:read_u8(0x0166)
+    self.spd_tanker_msb = mem:read_u8(0x0167)
+    self.spd_spiker_msb = mem:read_u8(0x0168)
+    self.spd_fuseball_msb = mem:read_u8(0x0169)
 
     -- Read and process enemy slots (1-7)
     for i = 1, 7 do
