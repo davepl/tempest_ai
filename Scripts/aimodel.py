@@ -473,7 +473,7 @@ class HybridReplayBuffer:
             horizon: int,
         ):
             if self.capacity <= 0:
-                return
+                return -1
 
             idx = self.position
             self.states[idx] = state
@@ -487,6 +487,7 @@ class HybridReplayBuffer:
             self.position = (idx + 1) % self.capacity
             if self.size < self.capacity:
                 self.size += 1
+            return idx
 
         def gather(self, indices: np.ndarray):
             if indices.size == 0:
@@ -595,6 +596,15 @@ class HybridReplayBuffer:
 
         self._recent_scores: Deque[float] = deque(maxlen=self._THRESHOLD_WINDOW)
         self._total_additions = 0
+        self.pre_death_flags = np.zeros((self._main.capacity,), dtype=np.bool_)
+        self.pre_death_sample_fraction = float(
+            np.clip(getattr(RL_CONFIG, 'pre_death_sample_fraction', 0.25) or 0.25, 0.0, 0.9)
+        )
+        self._pre_death_lookback_min = int(max(1, getattr(RL_CONFIG, 'replay_terminal_lookback_min', 5) or 5))
+        self._pre_death_lookback_max = int(
+            max(self._pre_death_lookback_min, getattr(RL_CONFIG, 'replay_terminal_lookback_max', 10) or 10)
+        )
+        self.terminal_indices: Deque[int] = deque(maxlen=self._main.capacity)
 
     def _to_state_array(self, value):
         try:
@@ -668,7 +678,7 @@ class HybridReplayBuffer:
             horizon_val = 1
 
         with self._lock:
-            self._main.add(
+            write_idx = self._main.add(
                 state_arr,
                 action_idx,
                 reward_val,
@@ -677,6 +687,11 @@ class HybridReplayBuffer:
                 actor_tag,
                 horizon_val,
             )
+            if write_idx >= 0:
+                self.pre_death_flags[write_idx] = False
+                if done_flag:
+                    self.terminal_indices.append(write_idx)
+                    self._mark_pre_death(write_idx)
             self.size = self._main.size
             self.position = self._main.position
 
@@ -696,16 +711,37 @@ class HybridReplayBuffer:
                     self._update_priority_thresholds()
 
                 bucket_idx = self._select_priority_bucket(score, actor_tag)
-                if bucket_idx is not None and 0 <= bucket_idx < len(self.priority_segments):
-                    self.priority_segments[bucket_idx].add(
-                        state_arr,
-                        action_idx,
-                        reward_val,
-                        next_state_arr,
-                        done_flag,
-                        actor_tag,
-                        horizon_val,
-                    )
+        if bucket_idx is not None and 0 <= bucket_idx < len(self.priority_segments):
+            self.priority_segments[bucket_idx].add(
+                state_arr,
+                action_idx,
+                reward_val,
+                next_state_arr,
+                done_flag,
+                actor_tag,
+                horizon_val,
+            )
+
+    def _mark_pre_death(self, terminal_idx: int) -> None:
+        if self._main.size <= 1:
+            return
+        lookback_span = self._pre_death_lookback_max
+        if self._pre_death_lookback_max > self._pre_death_lookback_min:
+            lookback_span = int(self._rng.integers(self._pre_death_lookback_min, self._pre_death_lookback_max + 1))
+        else:
+            lookback_span = self._pre_death_lookback_min
+
+        max_available = min(self._main.size - 1, lookback_span)
+        if max_available <= 0:
+            return
+
+        for offset in range(1, max_available + 1):
+            idx = terminal_idx - offset
+            if idx < 0:
+                if self._main.size < self._main.capacity:
+                    break
+                idx = (idx + self._main.capacity) % self._main.capacity
+            self.pre_death_flags[idx] = True
 
     def sample(self, batch_size: int, return_indices: bool = False):
         if batch_size <= 0:
@@ -715,39 +751,81 @@ class HybridReplayBuffer:
             if self._main.size < batch_size:
                 return None
 
-            priority_chunks = []
-            remaining = batch_size
+        priority_chunks = []
+        priority_indices = []
+        remaining = batch_size
 
-            for segment in self.priority_segments:
-                if remaining <= 0:
-                    priority_chunks.append(None)
-                    continue
+        for segment in self.priority_segments:
+            if remaining <= 0:
+                priority_chunks.append(None)
+                priority_indices.append(None)
+                continue
 
-                desired = int(batch_size * self._priority_sample_fraction)
-                desired = min(desired, remaining)
-                desired = min(desired, segment.size)
+            desired = int(batch_size * self._priority_sample_fraction)
+            desired = min(desired, remaining)
+            desired = min(desired, segment.size)
 
-                if desired <= 0:
-                    priority_chunks.append(None)
-                    continue
+            if desired <= 0:
+                priority_chunks.append(None)
+                priority_indices.append(None)
+                continue
 
-                idx = self._rng.choice(segment.size, size=desired, replace=False)
-                priority_chunks.append(segment.gather(idx))
-                remaining -= desired
+            idx = self._rng.choice(segment.size, size=desired, replace=False)
+            priority_chunks.append(segment.gather(idx))
+            priority_indices.append(np.full((desired, 1), -1, dtype=np.int64))
+            remaining -= desired
 
-            main_count = min(self._main.size, remaining)
-            main_indices = self._rng.choice(self._main.size, size=main_count, replace=False)
-            main_chunk = self._main.gather(main_indices)
+        predeath_chunk = None
+        predeath_indices = None
+        exclude_mask = None
+        desired_predeath = int(batch_size * self.pre_death_sample_fraction)
+        available_predeath = np.flatnonzero(self.pre_death_flags[: self._main.size])
+        if desired_predeath > 0 and available_predeath.size > 0 and remaining > 0:
+            take = min(desired_predeath, available_predeath.size, remaining)
+            if take > 0:
+                selected_predeath = self._rng.choice(available_predeath, size=take, replace=False)
+                predeath_chunk = self._main.gather(selected_predeath)
+                predeath_indices = selected_predeath.reshape(-1, 1)
+                remaining -= take
+                exclude_mask = np.zeros(self._main.size, dtype=bool)
+                exclude_mask[selected_predeath] = True
 
-        sample_chunks = [chunk for chunk in priority_chunks if chunk is not None]
-        sample_chunks.append(main_chunk)
+        main_chunk = None
+        main_indices = None
+        main_count = min(self._main.size, remaining)
+        if main_count > 0:
+            if exclude_mask is not None and exclude_mask.any():
+                available_pool = np.nonzero(~exclude_mask)[0]
+                if available_pool.size < main_count:
+                    main_count = available_pool.size
+                if main_count > 0:
+                    main_indices = self._rng.choice(available_pool, size=main_count, replace=False)
+            else:
+                main_indices = self._rng.choice(self._main.size, size=main_count, replace=False)
+            if main_indices is not None and main_indices.size > 0:
+                main_chunk = self._main.gather(main_indices)
+                main_indices = main_indices.reshape(-1, 1)
+
+        sample_chunks = []
+        chunk_indices = []
+        for chunk, idx_chunk in zip(priority_chunks, priority_indices):
+            if chunk is not None:
+                sample_chunks.append(chunk)
+                chunk_indices.append(idx_chunk if idx_chunk is not None else np.full((chunk[0].shape[0], 1), -1, dtype=np.int64))
+        if predeath_chunk is not None:
+            sample_chunks.append(predeath_chunk)
+            chunk_indices.append(predeath_indices if predeath_indices is not None else np.full((predeath_chunk[0].shape[0], 1), -1, dtype=np.int64))
+        if main_chunk is not None:
+            sample_chunks.append(main_chunk)
+            chunk_indices.append(main_indices if main_indices is not None else np.full((main_chunk[0].shape[0], 1), -1, dtype=np.int64))
 
         states_list, discrete_list = [], []
         rewards_list, next_states_list, dones_list = [], [], []
         actors_list: List[str] = []
         horizons_list = []
+        index_list = []
 
-        for chunk in sample_chunks:
+        for chunk, idx_chunk in zip(sample_chunks, chunk_indices):
             states_list.append(chunk[0])
             discrete_list.append(chunk[1])
             rewards_list.append(chunk[2])
@@ -755,6 +833,8 @@ class HybridReplayBuffer:
             dones_list.append(chunk[4])
             actors_list.extend(chunk[5])
             horizons_list.append(chunk[6])
+            if idx_chunk is not None:
+                index_list.append(idx_chunk)
 
         states_np = np.concatenate(states_list, axis=0) if states_list else np.zeros((0, self.state_size), dtype=np.float32)
         discrete_np = np.concatenate(discrete_list, axis=0) if discrete_list else np.zeros((0, 1), dtype=np.int64)
@@ -771,7 +851,10 @@ class HybridReplayBuffer:
         horizons = torch.from_numpy(horizons_np.astype(np.float32)).float().to(device)
 
         if return_indices:
-            dummy_indices = np.full(states_np.shape[0], -1, dtype=np.int64)
+            if index_list:
+                index_array = np.concatenate(index_list, axis=0)
+            else:
+                index_array = np.full((0, 1), -1, dtype=np.int64)
             return (
                 states,
                 discrete_actions,
@@ -780,7 +863,7 @@ class HybridReplayBuffer:
                 dones,
                 actors_list,
                 horizons,
-                dummy_indices,
+                index_array.reshape(-1),
             )
 
         return (
@@ -820,6 +903,7 @@ class HybridReplayBuffer:
                 'main_actual_size': self._main.size,
                 'main_capacity': self._main.capacity,
                 'main_fill_pct': main_fill_pct,
+                'pre_death': int(self.pre_death_flags[: self._main.size].sum()),
             }
 
             if self.priority_buckets_enabled:
