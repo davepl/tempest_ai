@@ -33,14 +33,6 @@ def _to_tensor_bool(mask: Sequence[bool], length: int, *, device: torch.device) 
 _SPINNER_SIGN_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
 
-def _is_supervision_active(frame_count: int) -> bool:
-    """Return True if expert supervision losses should be applied."""
-    warmup = int(getattr(RL_CONFIG, "supervision_warmup_frames", 0) or 0)
-    if warmup > 0 and frame_count >= warmup:
-        return False
-    return True
-
-
 def _get_spinner_signs(device: torch.device, spinner_actions: int) -> torch.Tensor:
     """Return a tensor of spinner signs (-1, 0, 1) for each bucket on the requested device."""
     key = (device.type, int(getattr(device, "index", -1) or -1))
@@ -122,12 +114,21 @@ def train_step(agent):
 
     use_amp = bool(getattr(agent, "amp_enabled", False) and getattr(agent, "amp_scaler", None))
     if use_amp:
-        autocast_ctx = torch.cuda.amp.autocast()
+        device_type = None
+        try:
+            device_attr = getattr(agent, "device", None)
+            if device_attr is not None:
+                device_type = getattr(device_attr, "type", None)
+        except Exception:
+            device_type = None
+        if not device_type:
+            device_type = states.device.type if hasattr(states, "device") else "cuda"
+        try:
+            autocast_ctx = torch.amp.autocast(device_type=device_type)
+        except AttributeError:
+            autocast_ctx = torch.cuda.amp.autocast()
     else:
         autocast_ctx = contextlib.nullcontext()
-
-    frame_count = int(getattr(metrics, "frame_count", 0))
-    supervision_active = _is_supervision_active(frame_count) or getattr(metrics, "expert_mode", False)
 
     with autocast_ctx:
         # Forward pass for current states
@@ -164,9 +165,6 @@ def train_step(agent):
     spinner_loss_item = 0.0
     w_sup = float(getattr(RL_CONFIG, "expert_supervision_weight", 0.0) or 0.0)
     w_spin = float(getattr(RL_CONFIG, "spinner_supervision_weight", w_sup) or 0.0)
-    if not supervision_active:
-        w_sup = 0.0
-        w_spin = 0.0
     expert_any = bool(expert_mask.any().item())
 
     if expert_any and (w_sup > 0.0 or w_spin > 0.0):
