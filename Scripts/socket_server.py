@@ -175,6 +175,23 @@ class SocketServer:
         self.expert_action_counts = np.zeros(16, dtype=np.int64)  # 4 discrete * 4 spinner buckets (diagnostic only)
         self.dqn_action_counts = np.zeros(16, dtype=np.int64)
 
+    @staticmethod
+    def _record_zap_block_penalty(state):
+        penalty_value = float(getattr(RL_CONFIG, 'superzap_block_penalty', 0.0) or 0.0)
+        if penalty_value == 0.0:
+            return 0.0
+        pending = float(state.get('pending_zap_penalty', 0.0) or 0.0)
+        pending += penalty_value
+        state['pending_zap_penalty'] = pending
+        return penalty_value
+
+    @staticmethod
+    def _drain_zap_block_penalty(state):
+        pending = float(state.get('pending_zap_penalty', 0.0) or 0.0)
+        if pending != 0.0:
+            state['pending_zap_penalty'] = 0.0
+        return pending
+
     def _verbose_enabled(self) -> bool:
         """Return True when verbose debug logging is enabled."""
         try:
@@ -306,6 +323,7 @@ class SocketServer:
                 'episode_dqn_reward': 0.0,
                 'episode_expert_reward': 0.0,
                 'was_done': False,
+                'pending_zap_penalty': 0.0,
                 # Only create an n-step buffer if the server is responsible for n-step preprocessing
                 'nstep_buffer': (
                     NStepReplayBuffer(RL_CONFIG.n_step, RL_CONFIG.gamma)
@@ -430,6 +448,11 @@ class SocketServer:
                     else:
                         training_reward = centered_obj_reward + subj_reward
                         priority_reward_step = obj_reward_raw + subj_reward
+
+                    penalty_shaping = self._drain_zap_block_penalty(state)
+                    if penalty_shaping != 0.0:
+                        training_reward += penalty_shaping
+                        priority_reward_step += penalty_shaping
                     terminal_bonus = float(getattr(RL_CONFIG, 'priority_terminal_bonus', 0.0) or 0.0)
                     if frame.done and terminal_bonus != 0.0:
                         priority_reward_step += terminal_bonus
@@ -696,6 +719,7 @@ class SocketServer:
                                 zap = False
                                 fire_zap_idx = fire_zap_to_discrete(fire, zap)
                                 action_index = compose_action_index(fire_zap_idx, spinner_bucket)
+                                self._record_zap_block_penalty(state)
                         action_source = 'dqn'
                         if self._verbose_enabled():
                             try:

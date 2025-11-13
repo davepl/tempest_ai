@@ -415,6 +415,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local function scan_top_threats()
         local flee_rel = nil
         local flee_abs = nil
+        local shot_threat = false
 
         local function consider_top(rel_value)
             if rel_value == nil then
@@ -435,9 +436,15 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 return
             end
             local abs_rel = math.abs(rel_value)
-            if abs_rel <= SAFE_DISTANCE and (flee_abs == nil or abs_rel < flee_abs) then
-                flee_abs = abs_rel
-                flee_rel = rel_value
+            if min_abs_rel_float == nil or abs_rel < min_abs_rel_float then
+                min_abs_rel_float = abs_rel
+            end
+            if abs_rel <= SAFE_DISTANCE then
+                shot_threat = true
+                if flee_abs == nil or abs_rel < flee_abs then
+                    flee_abs = abs_rel
+                    flee_rel = rel_value
+                end
             end
         end
 
@@ -466,10 +473,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             end
         end
 
-        return flee_rel
+        return flee_rel, shot_threat
     end
 
-    local flee_rel = scan_top_threats()
+    local flee_rel, shot_threat_near = scan_top_threats()
     if flee_rel ~= nil then
         local flee_dir = (flee_rel >= 0) and -1 or 1
         local flee_target = try_offset(player_abs_seg, flee_dir)
@@ -561,6 +568,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
 
+    local shots_remaining = math.max(0, 8 - shot_count)
+    if shots_remaining <= 2 or shot_threat_near then
+        target_seg = player_abs_seg
+    end
+
     -- Firing policy
     -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within shooting distance (~0.8)
     -- AND we have ammo available (shot_count < 8)
@@ -569,14 +581,14 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local within_shooting_distance = (min_abs_rel_float ~= nil and min_abs_rel_float <= SHOOT_DIST)
 
     local should_fire
-    if shot_count >= 8 then
+    if shots_remaining <= 0 then
         -- No ammo available, never fire
         should_fire = false
     elseif lane_has_threat or within_shooting_distance then
         should_fire = true
     else
         -- Keep only 5 shots onscreen
-        should_fire = (shot_count < 5)
+        should_fire = (shots_remaining > 3)
     end
 
     -- Superzap heuristic retained (3+ top-rail enemies)

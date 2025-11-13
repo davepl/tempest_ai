@@ -172,6 +172,7 @@ class RLConfigData:
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
     replay_terminal_lookback_max: int = 10
+    pre_death_sample_fraction: float = 0.25  # Fraction of each batch drawn from pre-death transitions
 
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob
@@ -179,6 +180,7 @@ class RLConfigData:
 
     enable_superzap_gate: bool = True
     superzap_prob: float = 0.01  # 1% success rate for zap attempts
+    superzap_block_penalty: float = -0.05  # Applied when superzap gate blocks a zap attempt
 
     # Mixed precision / performance
     enable_amp: bool = True      # Enable torch.cuda.amp when running on CUDA devices
