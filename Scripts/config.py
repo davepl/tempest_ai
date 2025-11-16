@@ -98,13 +98,13 @@ class RLConfigData:
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
     spinner_command_levels: tuple[int, ...] = (0, 12, 9, 6, 3, 1, -1, -3, -6, -9, -12)
     exploration_curriculum: tuple[tuple[int, float, float], ...] = (
-        (0, 0.50, 0.50),         # Frames   0 - 499,999
+        (0, 0.25, 0.95),         # Frames   0 - 499,999
         (500_000, 0.25, 0.25),   # Frames 500k - 999,999
     )
     exploration_curriculum_cycle_start: int = 1_000_000  # Begin repeating schedule at 1M frames
     exploration_curriculum_cycle: tuple[tuple[int, float, float], ...] = (
-        (250_000, 0.10, 0.10),   # First 250k frames: light exploration/guidance
-        (750_000, 0.05, 0.25),   # Next 750k frames: minimal exploration with stronger expert mix (was 0.00 - NEVER use 0!)
+        (500_000, 0.10, 0.50),   # First 250k frames: light exploration/guidance
+        (500_000, 0.02, 0.10),   # Next 750k frames: minimal exploration with stronger expert mix (was 0.00 - NEVER use 0!)
     )
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
