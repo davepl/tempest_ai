@@ -275,11 +275,14 @@ def print_network_config(agent):
         if isinstance(layer, torch.nn.Linear):
             print(f"      Layer {i+1}:        {layer.in_features} → {layer.out_features}")
     
-    # Head architectures
+    # Head architectures (support dueling/non-dueling)
     shared_out = agent.qnetwork_local.shared_layers[-1].out_features if agent.qnetwork_local.shared_layers else 0
-    discrete_hidden = agent.qnetwork_local.discrete_fc.out_features
-    
-    print(f"\n   Action Head:       {shared_out} → {discrete_hidden} → {agent.discrete_actions}")
+    if getattr(agent.qnetwork_local, "use_dueling", False):
+        head_hidden = agent.qnetwork_local.advantage_fc.out_features
+        print(f"\n   Action Head:       {shared_out} → {head_hidden} (value/advantage, dueling) → {agent.discrete_actions}")
+    else:
+        head_hidden = agent.qnetwork_local.discrete_fc.out_features if hasattr(agent.qnetwork_local, "discrete_fc") else 0
+        print(f"\n   Action Head:       {shared_out} → {head_hidden} → {agent.discrete_actions}")
     
     # Count total parameters
     total_params = sum(p.numel() for p in agent.qnetwork_local.parameters())
@@ -312,7 +315,7 @@ def print_network_config(agent):
     
     # Optimization
     print("\n🚀 OPTIMIZATION:")
-    print(f"   Gradient Clip:     10.0 (max norm)")
+    print(f"   Gradient Clip:     {getattr(RL_CONFIG, 'grad_clip_norm', 10.0):.1f} (max norm)")
     print(f"   N-Step Returns:    {RL_CONFIG.n_step}-step")
     print(f"   Training Workers:  {RL_CONFIG.training_workers}")
     
