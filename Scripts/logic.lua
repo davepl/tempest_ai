@@ -41,7 +41,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
          
 local LEVEL_COMPLETION_BONUS = 0.0   -- Edge-triggered bonus when level increments
-local DEATH_PENALTY = 10000          -- Edge-triggered penalty when dying (applied to objective reward only)
+local DEATH_PENALTY = 500            -- Edge-triggered penalty when dying (applied to objective reward only)
 -- CRITICAL: Zap cost was 100, which dominated all other rewards and made subjective reward almost always negative
 -- Reduced to 0.5 to make it a meaningful but not overwhelming penalty (equivalent to ~500 pts, or missing 1 enemy kill)
 -- This allows the positive subjective rewards (0.1-10 range) to actually accumulate and guide learning
@@ -632,6 +632,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     -- Terminal: death (edge-triggered) - Penalty applied to objective reward
     if player_state.alive == 0 and previous_alive_state == 1 then
         obj_reward = obj_reward - DEATH_PENALTY
+        bDone = true
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
@@ -890,9 +891,6 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     local current_level = level_state.level_number or 0
     local current_score = player_state.score or 0
     local level_changed = (previous_level ~= 0) and (current_level ~= previous_level)
-    if level_changed then
-        bDone = true
-    end
     if previous_level == 0 then
         score_at_level_start = current_score
     end

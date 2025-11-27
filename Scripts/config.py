@@ -85,7 +85,7 @@ class RLConfigData:
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
     batch_size: int = 1024                # Reduced from 8192 for faster sampling
-    lr: float = 0.00015                     # EMERGENCY FIX: Reduced from 0.00025 to stabilize training
+    lr: float = 0.00005                     # Lower LR for stability
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
@@ -109,7 +109,7 @@ class RLConfigData:
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
     expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
-    expert_ratio_min: float = 0.05        # Lowest allowable expert mix after decay
+    expert_ratio_min: float = 0.10        # Keep some expert presence but let DQN dominate sooner
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
     expert_ratio_decay: float = 0.9995   # Apply gradual decay each step interval
@@ -119,14 +119,20 @@ class RLConfigData:
     
     # N-Bucket stratified replay buffer configuration (PER-like without performance overhead)
     # Ultra-focused on 90-100th percentile: top 2%, 95-98%, 90-95%, and main <90%
-    replay_n_buckets: int = 2              # Number of priority buckets
-    replay_bucket_size: int = 350000       # Size of each priority bucket (250K each = 750K total)
-    replay_main_bucket_size: int = 2500000 # Size of main bucket for <90th percentile experiences (1.5M)
-    priority_sample_fraction: float = 0.20 # Fraction of each batch drawn from priority buckets
-    priority_terminal_bonus: float = 0.5   # Extra score for terminal transitions when computing priority
+    replay_n_buckets: int = 0              # Disable priority buckets (uniform replay for speed/stability)
+    replay_bucket_size: int = 0
+    replay_main_bucket_size: int = 2000000
+    priority_sample_fraction: float = 0.0  # No priority sampling
+    priority_terminal_bonus: float = 0.0
+    priority_alpha: float = 0.0            # Uniform sampling
+    priority_eps: float = 1e-3
+    priority_max_weight_elems: int = 200000
+    min_dqn_fraction: float = 0.0          # No forced actor rebalance in sampler
 
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
+    use_dueling: bool = True               # Dueling heads stabilize value estimation
+    use_layer_norm: bool = True            # LayerNorm between shared layers for smoother gradients
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
     update_target_every: int = 1000        # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
@@ -167,12 +173,23 @@ class RLConfigData:
     
     # Gradient clipping: Prevent massive gradient spikes that cause Q-value collapse
     # ClipΔ values were showing 276.565, 232.841, 144.429 - gradients 15-28x too large!
-    grad_clip_norm: float = 1.0               # CRITICAL: Clip gradients to max norm of 1.0 (was defaulting to 10.0)
+    grad_clip_norm: float = 0.5               # Tighter clipping to curb spikes
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
     replay_terminal_lookback_max: int = 10
     pre_death_sample_fraction: float = 0.25  # Fraction of each batch drawn from pre-death transitions
+
+    # Supervision (expert imitation) annealing
+    supervision_decay_start: int = 300_000   # Frames before we start reducing expert imitation loss
+    supervision_decay_frames: int = 700_000  # Anneal over this many frames
+    min_supervision_weight: float = 0.1      # Keep a small imitation signal but let TD dominate
+
+    # Reward safety
+    reward_clip_value: float | None = 1.0    # Stronger reward clipping to bound TD targets
+
+    # Death shaping
+    death_penalty: float = -1.0              # Extra penalty applied on death
 
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob

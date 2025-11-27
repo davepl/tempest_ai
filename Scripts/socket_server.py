@@ -36,6 +36,7 @@ import traceback
 import random
 import errno
 import queue
+import math
 from collections import deque
 
 import numpy as np
@@ -459,9 +460,23 @@ class SocketServer:
                         if not ignore_subjective_rewards:
                             training_reward += terminal_bonus
                     try:
+                        clip_val = getattr(RL_CONFIG, "reward_clip_value", None)
+                        if clip_val is not None:
+                            cval = float(clip_val)
+                            if cval > 0.0 and math.isfinite(cval):
+                                training_reward = float(np.clip(training_reward, -cval, cval))
+                                priority_reward_step = float(np.clip(priority_reward_step, -cval, cval))
+                    except Exception:
+                        pass
+                    try:
                         state['last_reward_center'] = reward_center_value
                     except Exception:
                         pass
+
+                    death_penalty = float(getattr(RL_CONFIG, "death_penalty", 0.0) or 0.0) if frame.done else 0.0
+                    if death_penalty != 0.0:
+                        training_reward += death_penalty
+                        priority_reward_step += death_penalty
 
                     if self._server_nstep_enabled() and state.get('nstep_buffer') is not None:
                         # Add experience to n-step buffer and get matured experiences

@@ -338,6 +338,8 @@ class HybridDQN(nn.Module):
         self.state_size = state_size
         self.discrete_actions = discrete_actions
         self.num_layers = num_layers
+        self.use_dueling = bool(getattr(RL_CONFIG, "use_dueling", False))
+        self.use_layer_norm = bool(getattr(RL_CONFIG, "use_layer_norm", False))
         max_q_config = getattr(RL_CONFIG, 'max_q_value', None)
         max_q_value = None
         try:
@@ -363,13 +365,18 @@ class HybridDQN(nn.Module):
         
         # Create shared layers dynamically
         self.shared_layers = nn.ModuleList()
+        self.shared_norms = nn.ModuleList() if self.use_layer_norm else None
         
         # First layer: state_size -> hidden_size
         self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
+        if self.use_layer_norm:
+            self.shared_norms.append(nn.LayerNorm(layer_sizes[0]))
         
         # Subsequent layers: hidden_size -> hidden_size/2 -> hidden_size/4 -> ...
         for i in range(1, num_layers):
             self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
+            if self.use_layer_norm:
+                self.shared_norms.append(nn.LayerNorm(layer_sizes[i]))
         
         # Initialize shared trunk with xavier to ensure good gradient flow
         for layer in self.shared_layers:
@@ -380,30 +387,58 @@ class HybridDQN(nn.Module):
         # Final layer size for heads
         shared_output_size = layer_sizes[-1]
         head_size = max(64, shared_output_size // 2)  # Head layer size
-        
-        # Standard Q-network for discrete Q-values
-        self.discrete_fc = nn.Linear(shared_output_size, head_size)
-        self.discrete_out = nn.Linear(head_size, discrete_actions)
-        
-        # Initialize discrete head with balanced initialization to prevent action bias
-        # CRITICAL: Without this, default initialization creates strong bias (e.g., 93% action 3)
-        # Strategy: Use small random weights to allow gradient flow while maintaining initial balance
-        torch.nn.init.xavier_uniform_(self.discrete_fc.weight, gain=1.0)
-        torch.nn.init.constant_(self.discrete_fc.bias, 0.0)
-        # Output layer: Small random initialization for gradient flow with minimal bias
-        torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
-        torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
+
+        if self.use_dueling:
+            # Dueling streams: value and advantage
+            self.value_fc = nn.Linear(shared_output_size, head_size)
+            self.value_out = nn.Linear(head_size, 1)
+            self.advantage_fc = nn.Linear(shared_output_size, head_size)
+            self.advantage_out = nn.Linear(head_size, discrete_actions)
+
+            torch.nn.init.xavier_uniform_(self.value_fc.weight, gain=1.0)
+            torch.nn.init.constant_(self.value_fc.bias, 0.0)
+            torch.nn.init.xavier_uniform_(self.advantage_fc.weight, gain=1.0)
+            torch.nn.init.constant_(self.advantage_fc.bias, 0.0)
+            torch.nn.init.uniform_(self.advantage_out.weight, -0.003, 0.003)
+            torch.nn.init.uniform_(self.value_out.weight, -0.003, 0.003)
+            torch.nn.init.constant_(self.value_out.bias, 0.0)
+            torch.nn.init.constant_(self.advantage_out.bias, 0.0)
+        else:
+            # Standard Q-network for discrete Q-values
+            self.discrete_fc = nn.Linear(shared_output_size, head_size)
+            self.discrete_out = nn.Linear(head_size, discrete_actions)
+            
+            # Initialize discrete head with balanced initialization to prevent action bias
+            # CRITICAL: Without this, default initialization creates strong bias (e.g., 93% action 3)
+            # Strategy: Use small random weights to allow gradient flow while maintaining initial balance
+            torch.nn.init.xavier_uniform_(self.discrete_fc.weight, gain=1.0)
+            torch.nn.init.constant_(self.discrete_fc.bias, 0.0)
+            # Output layer: Small random initialization for gradient flow with minimal bias
+            torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
+            torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning Q-values for every joint action combination."""
         # Shared feature extraction through dynamic layers
         shared = x
-        for layer in self.shared_layers:
-            shared = F.relu(layer(shared))
+        for idx, layer in enumerate(self.shared_layers):
+            shared = layer(shared)
+            if self.use_layer_norm and self.shared_norms is not None:
+                shared = self.shared_norms[idx](shared)
+            shared = F.relu(shared)
         
-        # Discrete Q-values head
-        discrete = F.relu(self.discrete_fc(shared))
-        discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
+        if self.use_dueling:
+            value = F.relu(self.value_fc(shared))
+            value = self.value_out(value)  # (B,1)
+
+            advantage = F.relu(self.advantage_fc(shared))
+            advantage = self.advantage_out(advantage)  # (B, A)
+            advantage_mean = advantage.mean(dim=1, keepdim=True)
+            discrete_q = value + (advantage - advantage_mean)
+        else:
+            # Discrete Q-values head
+            discrete = F.relu(self.discrete_fc(shared))
+            discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
         
         if self.max_q_value is not None:
             discrete_q = torch.clamp(discrete_q, -self.max_q_value, self.max_q_value)
@@ -435,6 +470,7 @@ class HybridReplayBuffer:
             "dones",
             "horizons",
             "actors",
+            "priorities",
             "position",
             "size",
         )
@@ -453,6 +489,7 @@ class HybridReplayBuffer:
                 self.dones = np.zeros((self.capacity,), dtype=np.bool_)
                 self.horizons = np.ones((self.capacity,), dtype=np.int32)
                 self.actors = np.full((self.capacity,), 'dqn', dtype='U10')
+                self.priorities = np.ones((self.capacity,), dtype=np.float32)
             else:
                 self.states = np.zeros((0, self.state_size), dtype=np.float32)
                 self.next_states = np.zeros((0, self.state_size), dtype=np.float32)
@@ -461,6 +498,7 @@ class HybridReplayBuffer:
                 self.dones = np.zeros((0,), dtype=np.bool_)
                 self.horizons = np.zeros((0,), dtype=np.int32)
                 self.actors = np.zeros((0,), dtype='U10')
+                self.priorities = np.ones((0,), dtype=np.float32)
 
         def add(
             self,
@@ -471,6 +509,7 @@ class HybridReplayBuffer:
             done: bool,
             actor: str,
             horizon: int,
+            priority: float,
         ):
             if self.capacity <= 0:
                 return -1
@@ -483,6 +522,7 @@ class HybridReplayBuffer:
             self.dones[idx] = done
             self.actors[idx] = actor
             self.horizons[idx] = horizon
+            self.priorities[idx] = priority
 
             self.position = (idx + 1) % self.capacity
             if self.size < self.capacity:
@@ -524,6 +564,10 @@ class HybridReplayBuffer:
         def clear(self):
             self.position = 0
             self.size = 0
+            try:
+                self.priorities.fill(1.0)
+            except Exception:
+                pass
 
     def __init__(self, capacity: int, state_size: int):
         self.total_capacity = int(max(1, capacity))
@@ -531,6 +575,15 @@ class HybridReplayBuffer:
 
         self._lock = threading.Lock()
         self._rng = np.random.default_rng()
+        self._priority_alpha = float(np.clip(getattr(RL_CONFIG, "priority_alpha", 0.0) or 0.0, 0.0, 1.0))
+        self._priority_eps = float(getattr(RL_CONFIG, "priority_eps", 1e-3) or 1e-3)
+        self._max_priority = 1.0
+        self._priority_weight_cap = int(max(1, getattr(RL_CONFIG, "priority_max_weight_elems", 200000) or 200000))
+        self._priority_enabled = (
+            self._priority_alpha > 0.0
+            and int(getattr(RL_CONFIG, "replay_n_buckets", 0) or 0) > 0
+            and float(getattr(RL_CONFIG, "priority_sample_fraction", 0.0) or 0.0) > 0.0
+        )
 
         configured_n = int(getattr(RL_CONFIG, 'replay_n_buckets', 0) or 0)
         configured_bucket_size = int(getattr(RL_CONFIG, 'replay_bucket_size', 0) or 0)
@@ -548,7 +601,7 @@ class HybridReplayBuffer:
         main_capacity = self.total_capacity
         active_bucket_count = 0
 
-        if configured_n > 0 and configured_bucket_size > 0:
+        if self._priority_enabled and configured_n > 0 and configured_bucket_size > 0:
             tentative_bucket_cap = min(configured_bucket_size, max(1, self.total_capacity // (configured_n + 1)))
             tentative_main = self.total_capacity - (tentative_bucket_cap * configured_n)
             if tentative_bucket_cap > 0 and tentative_main > 0:
@@ -605,6 +658,7 @@ class HybridReplayBuffer:
             max(self._pre_death_lookback_min, getattr(RL_CONFIG, 'replay_terminal_lookback_max', 10) or 10)
         )
         self.terminal_indices: Deque[int] = deque(maxlen=self._main.capacity)
+        self._min_dqn_fraction = float(np.clip(getattr(RL_CONFIG, "min_dqn_fraction", 0.0) or 0.0, 0.0, 0.9))
 
     def _to_state_array(self, value):
         try:
@@ -666,6 +720,8 @@ class HybridReplayBuffer:
                 priority_val = float(priority_reward)
             except Exception:
                 priority_val = reward_val
+        if not math.isfinite(priority_val):
+            priority_val = reward_val
 
         done_flag = bool(done)
         actor_tag = self._normalize_actor(actor)
@@ -677,6 +733,15 @@ class HybridReplayBuffer:
         if horizon_val < 1:
             horizon_val = 1
 
+        try:
+            priority_score = abs(priority_val) + self._priority_eps
+            if not math.isfinite(priority_score):
+                priority_score = self._priority_eps
+            # Fresh samples should be visible quickly; boost to current max
+            priority_score = max(priority_score, self._max_priority)
+        except Exception:
+            priority_score = self._max_priority
+
         with self._lock:
             write_idx = self._main.add(
                 state_arr,
@@ -686,15 +751,20 @@ class HybridReplayBuffer:
                 done_flag,
                 actor_tag,
                 horizon_val,
+                priority_score,
             )
             if write_idx >= 0:
                 self.pre_death_flags[write_idx] = False
                 if done_flag:
                     self.terminal_indices.append(write_idx)
                     self._mark_pre_death(write_idx)
+                # Track max priority to seed fresh samples
+                if priority_score > self._max_priority:
+                    self._max_priority = priority_score
             self.size = self._main.size
             self.position = self._main.position
 
+            bucket_idx = None
             if self.priority_buckets_enabled and self.priority_segments:
                 score = float(abs(priority_val))
                 if not math.isfinite(score):
@@ -720,6 +790,7 @@ class HybridReplayBuffer:
                 done_flag,
                 actor_tag,
                 horizon_val,
+                priority_score,
             )
 
     def _mark_pre_death(self, terminal_idx: int) -> None:
@@ -743,6 +814,94 @@ class HybridReplayBuffer:
                 idx = (idx + self._main.capacity) % self._main.capacity
             self.pre_death_flags[idx] = True
 
+    def _weighted_choice(self, candidates, priorities: np.ndarray, count: int) -> np.ndarray:
+        """Sample indices with optional priority weighting. Falls back to uniform for very large pools."""
+        if isinstance(candidates, (int, np.integer)):
+            cand_size = int(candidates)
+            as_array = False
+        else:
+            cand_size = candidates.size
+            as_array = True
+
+        if count <= 0 or cand_size == 0:
+            return np.zeros((0,), dtype=np.int64)
+        count = min(count, cand_size)
+
+        use_uniform = self._priority_alpha <= 0.0 or priorities is None or priorities.size == 0 or cand_size > self._priority_weight_cap
+        if use_uniform:
+            if as_array:
+                return self._rng.choice(candidates, size=count, replace=False)
+            return self._rng.choice(cand_size, size=count, replace=False)
+
+        safe_priorities = np.clip(priorities[: cand_size], self._priority_eps, None)
+        weights = np.power(safe_priorities, self._priority_alpha)
+        total = float(weights.sum())
+        if total <= 0.0 or not math.isfinite(total):
+            if as_array:
+                return self._rng.choice(candidates, size=count, replace=False)
+            return self._rng.choice(cand_size, size=count, replace=False)
+
+        probs = weights / total
+        if as_array:
+            idx = self._rng.choice(cand_size, size=count, replace=False, p=probs)
+            return candidates[idx]
+        return self._rng.choice(cand_size, size=count, replace=False, p=probs)
+
+    def _actor_balanced_fallback(self, batch_size: int):
+        """Ensure batches include enough DQN samples when actor mix is skewed."""
+        with self._lock:
+            if self._main.size < batch_size:
+                return None
+            actors = self._main.actors[: self._main.size]
+            dqn_indices = np.nonzero(actors == 'dqn')[0]
+            expert_indices = np.nonzero(actors == 'expert')[0]
+            priorities = self._main.priorities[: self._main.size]
+
+        if dqn_indices.size == 0:
+            return None
+
+        desired_dqn = max(int(math.ceil(batch_size * self._min_dqn_fraction)), 1)
+        desired_dqn = min(desired_dqn, dqn_indices.size, batch_size)
+        remaining = batch_size - desired_dqn
+        desired_expert = min(remaining, expert_indices.size)
+        remaining -= desired_expert
+
+        dqn_take = self._weighted_choice(dqn_indices, priorities[dqn_indices], desired_dqn)
+        expert_take = (
+            self._weighted_choice(expert_indices, priorities[expert_indices], desired_expert)
+            if desired_expert > 0
+            else np.zeros((0,), dtype=np.int64)
+        )
+
+        selected = np.concatenate([dqn_take, expert_take])
+        if remaining > 0:
+            pool = np.setdiff1d(np.arange(self._main.size), selected, assume_unique=False)
+            if pool.size > 0:
+                extra = self._weighted_choice(pool, priorities[pool], min(remaining, pool.size))
+                selected = np.concatenate([selected, extra])
+
+        if selected.size < batch_size:
+            return None
+
+        self._rng.shuffle(selected)
+        chunk = self._main.gather(selected)
+        states = torch.from_numpy(chunk[0]).float().to(device)
+        next_states = torch.from_numpy(chunk[3]).float().to(device)
+        discrete_actions = torch.from_numpy(chunk[1]).long().to(device)
+        rewards = torch.from_numpy(chunk[2]).float().to(device)
+        dones = torch.from_numpy(chunk[4]).float().to(device)
+        horizons = torch.from_numpy(chunk[6].astype(np.float32)).float().to(device)
+        return (
+            states,
+            discrete_actions,
+            rewards,
+            next_states,
+            dones,
+            chunk[5],
+            horizons,
+            selected.reshape(-1),
+        )
+
     def sample(self, batch_size: int, return_indices: bool = False):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -755,40 +914,51 @@ class HybridReplayBuffer:
         priority_indices = []
         remaining = batch_size
 
-        for segment in self.priority_segments:
-            if remaining <= 0:
-                priority_chunks.append(None)
-                priority_indices.append(None)
-                continue
+        if self._priority_enabled:
+            for segment in self.priority_segments:
+                if remaining <= 0:
+                    priority_chunks.append(None)
+                    priority_indices.append(None)
+                    continue
 
-            desired = int(batch_size * self._priority_sample_fraction)
-            desired = min(desired, remaining)
-            desired = min(desired, segment.size)
+                desired = int(batch_size * self._priority_sample_fraction)
+                desired = min(desired, remaining)
+                desired = min(desired, segment.size)
 
-            if desired <= 0:
-                priority_chunks.append(None)
-                priority_indices.append(None)
-                continue
+                if desired <= 0:
+                    priority_chunks.append(None)
+                    priority_indices.append(None)
+                    continue
 
-            idx = self._rng.choice(segment.size, size=desired, replace=False)
-            priority_chunks.append(segment.gather(idx))
-            priority_indices.append(np.full((desired, 1), -1, dtype=np.int64))
-            remaining -= desired
+                idx = self._weighted_choice(segment.size, segment.priorities[: segment.size], desired)
+                priority_chunks.append(segment.gather(idx))
+                priority_indices.append(np.full((idx.shape[0], 1), -1, dtype=np.int64))
+                remaining -= idx.shape[0]
 
         predeath_chunk = None
         predeath_indices = None
         exclude_mask = None
         desired_predeath = int(batch_size * self.pre_death_sample_fraction)
-        available_predeath = np.flatnonzero(self.pre_death_flags[: self._main.size])
+        available_predeath = np.flatnonzero(self.pre_death_flags[: self._main.size]).astype(np.int64, copy=False)
+        if available_predeath.size > 0:
+            valid_mask = (available_predeath >= 0) & (available_predeath < self._main.size)
+            if not valid_mask.all():
+                available_predeath = available_predeath[valid_mask]
         if desired_predeath > 0 and available_predeath.size > 0 and remaining > 0:
             take = min(desired_predeath, available_predeath.size, remaining)
             if take > 0:
-                selected_predeath = self._rng.choice(available_predeath, size=take, replace=False)
-                predeath_chunk = self._main.gather(selected_predeath)
-                predeath_indices = selected_predeath.reshape(-1, 1)
-                remaining -= take
-                exclude_mask = np.zeros(self._main.size, dtype=bool)
-                exclude_mask[selected_predeath] = True
+                selected_predeath = self._weighted_choice(
+                    available_predeath, self._main.priorities[available_predeath], take
+                )
+                if selected_predeath.size > 0:
+                    valid_mask = (selected_predeath >= 0) & (selected_predeath < self._main.size)
+                    selected_predeath = selected_predeath[valid_mask]
+                if selected_predeath.size > 0:
+                    predeath_chunk = self._main.gather(selected_predeath)
+                    predeath_indices = selected_predeath.reshape(-1, 1)
+                    remaining -= selected_predeath.size
+                    exclude_mask = np.zeros(self._main.size, dtype=bool)
+                    exclude_mask[selected_predeath] = True
 
         main_chunk = None
         main_indices = None
@@ -799,9 +969,13 @@ class HybridReplayBuffer:
                 if available_pool.size < main_count:
                     main_count = available_pool.size
                 if main_count > 0:
-                    main_indices = self._rng.choice(available_pool, size=main_count, replace=False)
+                    main_indices = self._weighted_choice(
+                        available_pool, self._main.priorities[available_pool], main_count
+                    )
             else:
-                main_indices = self._rng.choice(self._main.size, size=main_count, replace=False)
+                main_indices = self._weighted_choice(
+                    self._main.size, self._main.priorities[: self._main.size], main_count
+                )
             if main_indices is not None and main_indices.size > 0:
                 main_chunk = self._main.gather(main_indices)
                 main_indices = main_indices.reshape(-1, 1)
@@ -843,6 +1017,18 @@ class HybridReplayBuffer:
         dones_np = np.concatenate(dones_list, axis=0) if dones_list else np.zeros((0, 1), dtype=np.float32)
         horizons_np = np.concatenate(horizons_list, axis=0) if horizons_list else np.zeros((0, 1), dtype=np.int32)
 
+        # If actor mix is too expert-heavy, resample a balanced batch from main buffer
+        if self._min_dqn_fraction > 0.0 and len(actors_list) > 0:
+            n_dqn = sum(1 for a in actors_list if a == "dqn")
+            frac_dqn = n_dqn / len(actors_list) if actors_list else 0.0
+            if frac_dqn < self._min_dqn_fraction:
+                balanced = self._actor_balanced_fallback(batch_size)
+                if balanced is not None:
+                    if return_indices:
+                        return balanced
+                    else:
+                        return balanced[:7]
+
         states = torch.from_numpy(states_np).float().to(device)
         next_states = torch.from_numpy(next_states_np).float().to(device)
         discrete_actions = torch.from_numpy(discrete_np).long().to(device)
@@ -851,7 +1037,9 @@ class HybridReplayBuffer:
         horizons = torch.from_numpy(horizons_np.astype(np.float32)).float().to(device)
 
         if return_indices:
-            if index_list:
+            if not self._priority_enabled and self._min_dqn_fraction <= 0.0:
+                index_array = None
+            elif index_list:
                 index_array = np.concatenate(index_list, axis=0)
             else:
                 index_array = np.full((0, 1), -1, dtype=np.int64)
@@ -863,7 +1051,7 @@ class HybridReplayBuffer:
                 dones,
                 actors_list,
                 horizons,
-                index_array.reshape(-1),
+                None if index_array is None else index_array.reshape(-1),
             )
 
         return (
@@ -875,6 +1063,33 @@ class HybridReplayBuffer:
             actors_list,
             horizons,
         )
+
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        """Update stored priorities using fresh TD-errors."""
+        if not self._priority_enabled:
+            return
+        try:
+            idx_array = np.asarray(indices, dtype=np.int64).reshape(-1)
+            pri_array = np.asarray(priorities, dtype=np.float32).reshape(-1)
+        except Exception:
+            return
+        if idx_array.size == 0 or pri_array.size == 0:
+            return
+        count = min(idx_array.size, pri_array.size)
+        idx_array = idx_array[:count]
+        pri_array = pri_array[:count]
+        with self._lock:
+            mask = (idx_array >= 0) & (idx_array < self._main.capacity)
+            if not mask.any():
+                return
+            idx_valid = idx_array[mask]
+            pri_valid = pri_array[mask]
+            safe_pri = np.abs(pri_valid) + self._priority_eps
+            safe_pri = np.where(np.isfinite(safe_pri), safe_pri, self._priority_eps)
+            self._main.priorities[idx_valid] = safe_pri
+            max_new = float(np.max(safe_pri)) if safe_pri.size > 0 else self._max_priority
+            if max_new > self._max_priority:
+                self._max_priority = max_new
 
     def __len__(self):
         with self._lock:
@@ -890,6 +1105,7 @@ class HybridReplayBuffer:
             self._recent_scores.clear()
             self._priority_thresholds = [float('inf')] * len(self.priority_segments)
             self._total_additions = 0
+            self._max_priority = 1.0
 
     def get_partition_stats(self):
         with self._lock:

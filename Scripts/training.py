@@ -91,7 +91,7 @@ def train_step(agent):
     if len(agent.memory) < agent.batch_size:
         return None
 
-    batch = agent.memory.sample(agent.batch_size)
+    batch = agent.memory.sample(agent.batch_size, return_indices=True)
     if batch is None:
         return None
 
@@ -103,6 +103,7 @@ def train_step(agent):
         dones,
         actors,
         horizons,
+        sample_indices,
     ) = batch
 
     discrete_actions = discrete_actions.long()
@@ -153,7 +154,8 @@ def train_step(agent):
             if td_clip_val is not None and td_clip_val > 0.0 and math.isfinite(td_clip_val):
                 targets = torch.clamp(targets, -td_clip_val, td_clip_val)
 
-        td_loss = F.smooth_l1_loss(selected_q, targets)
+        td_losses = F.smooth_l1_loss(selected_q, targets, reduction="none")
+        td_loss = td_losses.mean()
 
     expert_mask_np = [actor == "expert" for actor in actors]
     expert_mask = _to_tensor_bool(expert_mask_np, len(actors), device=states.device)
@@ -165,16 +167,30 @@ def train_step(agent):
     spinner_loss_item = 0.0
     w_sup = float(getattr(RL_CONFIG, "expert_supervision_weight", 0.0) or 0.0)
     w_spin = float(getattr(RL_CONFIG, "spinner_supervision_weight", w_sup) or 0.0)
+    sup_scale = 1.0
+    try:
+        decay_start = int(getattr(RL_CONFIG, "supervision_decay_start", 0) or 0)
+        decay_frames = int(getattr(RL_CONFIG, "supervision_decay_frames", 1) or 1)
+        decay_frames = max(1, decay_frames)
+        min_sup = float(getattr(RL_CONFIG, "min_supervision_weight", 0.0) or 0.0)
+        frame_now = int(getattr(metrics, "frame_count", 0))
+        if frame_now > decay_start:
+            progress = min(1.0, (frame_now - decay_start) / float(decay_frames))
+            sup_scale = 1.0 - progress * (1.0 - min_sup)
+    except Exception:
+        sup_scale = 1.0
+    w_sup_eff = w_sup * sup_scale
+    w_spin_eff = w_spin * sup_scale
     expert_any = bool(expert_mask.any().item())
 
-    if expert_any and (w_sup > 0.0 or w_spin > 0.0):
+    if expert_any and (w_sup_eff > 0.0 or w_spin_eff > 0.0):
         log_probs = F.log_softmax(q_values, dim=1)
         spinner_actions = max(1, int(getattr(agent, "spinner_actions", 1) or 1))
         fire_zap_actions = max(1, int(getattr(agent, "fire_zap_actions", 1) or 1))
         taken_flat = discrete_actions.squeeze(1)
         expert_indices = torch.nonzero(expert_mask, as_tuple=False).squeeze(1)
 
-        if expert_indices.numel() > 0 and w_sup > 0.0:
+        if expert_indices.numel() > 0 and w_sup_eff > 0.0:
             total_actions = log_probs.size(1)
             action_indices = torch.arange(total_actions, device=log_probs.device)
             fire_zap_indices = torch.div(action_indices, spinner_actions, rounding_mode="floor")
@@ -196,16 +212,16 @@ def train_step(agent):
             fire_loss = -fire_log_prob[expert_indices]
             zap_loss = -zap_log_prob[expert_indices]
             imitation_loss = (fire_loss.mean() + zap_loss.mean()) * 0.5
-            supervised_term = imitation_loss * w_sup
+            supervised_term = imitation_loss * w_sup_eff
             total_loss = total_loss + supervised_term
             supervised_loss_item += float(supervised_term.item())
 
-        if expert_indices.numel() > 0 and w_spin > 0.0:
+        if expert_indices.numel() > 0 and w_spin_eff > 0.0:
             log_probs_reshaped = log_probs.reshape(-1, fire_zap_actions, spinner_actions)
             spinner_log_probs = torch.logsumexp(log_probs_reshaped, dim=1)
             spinner_taken = torch.remainder(taken_flat, spinner_actions).long()
             spinner_log_prob = spinner_log_probs.gather(1, spinner_taken.unsqueeze(1)).squeeze(1)
-            spinner_loss = -spinner_log_prob[expert_indices].mean() * w_spin
+            spinner_loss = -spinner_log_prob[expert_indices].mean() * w_spin_eff
             total_loss = total_loss + spinner_loss
             spinner_loss_item = float(spinner_loss.item())
             supervised_loss_item += spinner_loss_item
@@ -229,6 +245,13 @@ def train_step(agent):
     agent._apply_target_update()
 
     loss_value = float(total_loss.item())
+
+    try:
+        if sample_indices is not None:
+            td_errors = torch.abs(targets.detach() - selected_q).reshape(-1)
+            agent.memory.update_priorities(sample_indices, td_errors.detach().cpu().numpy())
+    except Exception:
+        pass
 
     # Metric updates ---------------------------------------------------------
     try:
