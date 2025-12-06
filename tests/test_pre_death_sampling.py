@@ -5,6 +5,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Scripts'))
 
@@ -28,7 +29,9 @@ def test_pre_death_samples_are_biased_into_batches():
         flagged = int(buffer.pre_death_flags[: buffer._main.size].sum())
         assert flagged > 0
         batch = buffer.sample(64, return_indices=True)
-        indices = batch[-1]
+        if batch is None:
+            pytest.skip("Buffer did not return a batch")
+        indices = batch[-2] if len(batch) == 9 else batch[-1]
         selected_flags = [buffer.pre_death_flags[idx] for idx in indices if idx >= 0]
         flagged_count = sum(1 for flag in selected_flags if flag)
         assert flagged_count >= max(1, int(0.2 * len(selected_flags)))

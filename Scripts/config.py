@@ -84,36 +84,41 @@ class RLConfigData:
     state_size: int = SERVER_CONFIG.params_count  # Use value from ServerConfigData
     # Legacy removed: discrete 18-action size (pure hybrid model)
     # SIMPLIFIED: Moderate batch size, conservative LR, no accumulation
-    batch_size: int = 1024                # Reduced from 8192 for faster sampling
-    lr: float = 0.00005                     # Lower LR for stability
+    batch_size: int = 512                 # Smaller batch to reduce per-step compute and increase steps/s
+    lr: float = 0.0001                    # Slightly higher LR to push learning faster
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
-    epsilon: float = 0.50                  # Current exploration rate (stage 0 of curriculum)
-    epsilon_start: float = 0.50            # Curriculum stage 0 exploration rate
-    epsilon_min: float = 0.05              # Floor for exploration (5% random actions)
-    epsilon_end: float = 0.05              # Target minimum epsilon
-    epsilon_decay_steps: int = 10000       # Decay applied every 10k frames
+    epsilon: float = 0.35                  # Current exploration rate (stage 0 of curriculum)
+    epsilon_start: float = 0.35            # Curriculum stage 0 exploration rate
+    epsilon_min: float = 0.02              # Lower floor for exploration to let exploitation kick in
+    epsilon_end: float = 0.02              # Target minimum epsilon
+    epsilon_decay_steps: int = 5000        # Faster decay so the floor is reached quickly
     epsilon_decay_factor: float = 1
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
     spinner_command_levels: tuple[int, ...] = (0, 12, 9, 6, 3, 1, -1, -3, -6, -9, -12)
     exploration_curriculum: tuple[tuple[int, float, float], ...] = (
-        (0, 0.25, 0.95),         # Frames   0 - 499,999
-        (500_000, 0.25, 0.25),   # Frames 500k - 999,999
+        (0, 0.35, 0.35),         # Warm start with modest expert support
+        (250_000, 0.25, 0.20),   # Let DQN act more while still guided
+        (500_000, 0.15, 0.10),   # Shift majority control to DQN
+        (750_000, 0.08, 0.05),   # Light guidance only
+        (1_000_000, 0.05, 0.02), # Mostly self-play
     )
-    exploration_curriculum_cycle_start: int = 1_000_000  # Begin repeating schedule at 1M frames
+    exploration_curriculum_cycle_start: int = 1_250_000  # Begin repeating schedule after initial anneal
     exploration_curriculum_cycle: tuple[tuple[int, float, float], ...] = (
-        (500_000, 0.10, 0.50),   # First 250k frames: light exploration/guidance
-        (500_000, 0.02, 0.10),   # Next 750k frames: minimal exploration with stronger expert mix (was 0.00 - NEVER use 0!)
+        (250_000, 0.08, 0.02),   # Short exploration bump with minimal expert
+        (250_000, 0.05, 0.01),   # Mostly DQN, tiny guidance
+        (250_000, 0.04, 0.00),   # Pure self-play exploitation
+        (250_000, 0.06, 0.01),   # Brief refresh of exploration/guidance before repeating
     )
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
-    expert_ratio_start: float = 0.5       # Start with minimal expert guidance to measure DQN learning
-    expert_ratio_min: float = 0.10        # Keep some expert presence but let DQN dominate sooner
+    expert_ratio_start: float = 0.35      # Start lower to hand control to DQN sooner
+    expert_ratio_min: float = 0.02        # Allow the expert to fade almost entirely
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
-    expert_ratio_decay: float = 0.9995   # Apply gradual decay each step interval
-    expert_ratio_decay_steps: int = 10000  # Step interval for applying decay
+    expert_ratio_decay: float = 0.9975   # Faster decay between curriculum steps
+    expert_ratio_decay_steps: int = 2000  # Apply decay more frequently to keep ratcheting down
 
     memory_size: int = 2000000             # Total buffer size across all buckets
     
@@ -124,22 +129,27 @@ class RLConfigData:
     replay_main_bucket_size: int = 2000000
     priority_sample_fraction: float = 0.0  # No priority sampling
     priority_terminal_bonus: float = 0.0
-    priority_alpha: float = 0.0            # Uniform sampling
+    priority_alpha: float = 0.0            # Disable PER to speed insert/sample
+    priority_beta: float = 0.0             # No IS weighting when PER is off
+    priority_beta_final: float = 0.0       # Keep beta at 0
+    priority_beta_frames: int = 1_000_000  # Unused with PER off
     priority_eps: float = 1e-3
     priority_max_weight_elems: int = 200000
-    min_dqn_fraction: float = 0.0          # No forced actor rebalance in sampler
+    min_dqn_fraction: float = 0.6          # Ensure batches are majority DQN to prevent expert dominance
 
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
     use_dueling: bool = True               # Dueling heads stabilize value estimation
     use_layer_norm: bool = True            # LayerNorm between shared layers for smoother gradients
+    use_noisy_nets: bool = False           # Disable NoisyLinear to restore fast inference
+    noisy_std_init: float = 0.5            # Initial sigma for NoisyLinear layers
     target_update_freq: int = 1000               # Target network update frequency (steps) - INCREASED to provide more stable Q-targets
     update_target_every: int = 1000        # Keep in sync with target_update_freq
     save_interval: int = 10000             # Model save frequency
         
     # Single-threaded training
-    training_steps_per_sample: int = 1     # Reduced for speed - was 4
-    training_workers: int = 4               # Multiple threads now thread-safe
+    training_steps_per_sample: int = 1     # Keep 1:1 to limit contention/latency
+    training_workers: int = 2               # Multiple threads now thread-safe
 
     # Loss function type: 'mse' for vanilla DQN, 'huber' for more robust training
     loss_type: str = 'huber'              # Use Huber for robustness to outliers
@@ -165,15 +175,15 @@ class RLConfigData:
     spinner_supervision_weight: float = 1.0  # Weight for imitation loss on expert spinner buckets (was 0.05 - too weak!)
 
     # Target network update strategy
-    use_soft_target_update: bool = True   # DISABLED: Too slow - was True
-    soft_target_tau: float = 0.005        # Polyak coefficient (0<tau<=1). Smaller = slower target drift
+    use_soft_target_update: bool = True   # Keep soft updates for stability
+    soft_target_tau: float = 0.02         # Faster Polyak blending to react to policy changes
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
-    td_target_clip: float | None = 150.0       # Keep TD targets bounded to avoid runaway targets
+    td_target_clip: float | None = 300.0       # Keep TD targets bounded to avoid runaway targets
     max_q_value: float | None = None           # Disable forward clamp; rely on td_target_clip to set range
     
     # Gradient clipping: Prevent massive gradient spikes that cause Q-value collapse
     # ClipΔ values were showing 276.565, 232.841, 144.429 - gradients 15-28x too large!
-    grad_clip_norm: float = 0.5               # Tighter clipping to curb spikes
+    grad_clip_norm: float = 5.0               # Allow larger updates while preventing spikes
   
     # Pre-death sampling random lookback bounds (inclusive)
     replay_terminal_lookback_min: int = 5
@@ -186,7 +196,7 @@ class RLConfigData:
     min_supervision_weight: float = 0.1      # Keep a small imitation signal but let TD dominate
 
     # Reward safety
-    reward_clip_value: float | None = 1.0    # Stronger reward clipping to bound TD targets
+    reward_clip_value: float | None = 2.5    # Keep reward scale informative but bounded
 
     # Death shaping
     death_penalty: float = -1.0              # Extra penalty applied on death
