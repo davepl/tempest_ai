@@ -78,6 +78,57 @@ import socket
 import traceback
 # Robust import for running as script (Scripts on sys.path) and as package (repo root on sys.path)
 
+class NoisyLinear(nn.Module):
+    """Factorized NoisyNet layer for exploration without epsilon."""
+    def __init__(self, in_features: int, out_features: int, std_init: float = 0.5):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.std_init = float(std_init)
+
+        # Learnable parameters
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+
+        # Buffers for factorized noise
+        self.register_buffer("weight_epsilon", torch.zeros(out_features, in_features))
+        self.register_buffer("bias_epsilon", torch.zeros(out_features))
+
+        self.reset_parameters()
+        self.reset_noise()
+
+    @staticmethod
+    def _scaled_noise(size: int, device: torch.device) -> torch.Tensor:
+        noise = torch.randn(size, device=device)
+        return noise.sign().mul_(noise.abs().sqrt_())
+
+    def reset_parameters(self):
+        mu_range = 1.0 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+
+        sigma_init = self.std_init / math.sqrt(self.in_features)
+        self.weight_sigma.data.fill_(sigma_init)
+        self.bias_sigma.data.fill_(sigma_init)
+
+    def reset_noise(self):
+        device = self.weight_mu.device
+        eps_in = self._scaled_noise(self.in_features, device)
+        eps_out = self._scaled_noise(self.out_features, device)
+        self.weight_epsilon.copy_(eps_out.ger(eps_in))
+        self.bias_epsilon.copy_(eps_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(x, weight, bias)
+
 # Platform-specific imports for KeyboardHandler
 import sys
 # Initialize all potential module variables to None first
@@ -115,6 +166,7 @@ try:
         RESET_METRICS,
     )
     from training import train_step
+    from nstep_buffer import NStepReplayBuffer
 except ImportError:
     from Scripts.config import (
         SERVER_CONFIG,
@@ -127,6 +179,7 @@ except ImportError:
         RESET_METRICS,
     )
     from Scripts.training import train_step
+    from Scripts.nstep_buffer import NStepReplayBuffer
 
 # Expose module under short name for compatibility with legacy imports/tests
 sys.modules.setdefault('aimodel', sys.modules[__name__])
@@ -340,6 +393,8 @@ class HybridDQN(nn.Module):
         self.num_layers = num_layers
         self.use_dueling = bool(getattr(RL_CONFIG, "use_dueling", False))
         self.use_layer_norm = bool(getattr(RL_CONFIG, "use_layer_norm", False))
+        self.use_noisy = bool(getattr(RL_CONFIG, "use_noisy_nets", False))
+        self.noisy_std_init = float(getattr(RL_CONFIG, "noisy_std_init", 0.5) or 0.5)
         max_q_config = getattr(RL_CONFIG, 'max_q_value', None)
         max_q_value = None
         try:
@@ -351,7 +406,9 @@ class HybridDQN(nn.Module):
         self.max_q_value = max_q_value
         
         # Shared trunk for feature extraction
-        LinearOrNoisy = nn.Linear  # Noisy networks removed for simplification
+        LinearOrNoisy = nn.Linear  # Keep shared trunk standard for speed
+        HeadLinear = NoisyLinear if self.use_noisy else nn.Linear
+        head_kwargs = {"std_init": self.noisy_std_init} if self.use_noisy else {}
         
         # Dynamic layer sizing with pairs: A,A -> A/2,A/2 -> A/4,A/4 -> ...
         # Pattern: 512,512 -> 256,256 -> 128,128 -> ...
@@ -390,32 +447,36 @@ class HybridDQN(nn.Module):
 
         if self.use_dueling:
             # Dueling streams: value and advantage
-            self.value_fc = nn.Linear(shared_output_size, head_size)
-            self.value_out = nn.Linear(head_size, 1)
-            self.advantage_fc = nn.Linear(shared_output_size, head_size)
-            self.advantage_out = nn.Linear(head_size, discrete_actions)
+            self.value_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
+            self.value_out = HeadLinear(head_size, 1, **head_kwargs)
+            self.advantage_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
+            self.advantage_out = HeadLinear(head_size, discrete_actions, **head_kwargs)
 
-            torch.nn.init.xavier_uniform_(self.value_fc.weight, gain=1.0)
-            torch.nn.init.constant_(self.value_fc.bias, 0.0)
-            torch.nn.init.xavier_uniform_(self.advantage_fc.weight, gain=1.0)
-            torch.nn.init.constant_(self.advantage_fc.bias, 0.0)
-            torch.nn.init.uniform_(self.advantage_out.weight, -0.003, 0.003)
-            torch.nn.init.uniform_(self.value_out.weight, -0.003, 0.003)
-            torch.nn.init.constant_(self.value_out.bias, 0.0)
-            torch.nn.init.constant_(self.advantage_out.bias, 0.0)
+            for layer in (self.value_fc, self.value_out, self.advantage_fc, self.advantage_out):
+                if isinstance(layer, nn.Linear):
+                    torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
+                    torch.nn.init.constant_(layer.bias, 0.0)
+            if isinstance(self.advantage_out, nn.Linear):
+                torch.nn.init.uniform_(self.advantage_out.weight, -0.003, 0.003)
+                torch.nn.init.constant_(self.advantage_out.bias, 0.0)
+            if isinstance(self.value_out, nn.Linear):
+                torch.nn.init.uniform_(self.value_out.weight, -0.003, 0.003)
+                torch.nn.init.constant_(self.value_out.bias, 0.0)
         else:
             # Standard Q-network for discrete Q-values
-            self.discrete_fc = nn.Linear(shared_output_size, head_size)
-            self.discrete_out = nn.Linear(head_size, discrete_actions)
+            self.discrete_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
+            self.discrete_out = HeadLinear(head_size, discrete_actions, **head_kwargs)
             
             # Initialize discrete head with balanced initialization to prevent action bias
             # CRITICAL: Without this, default initialization creates strong bias (e.g., 93% action 3)
             # Strategy: Use small random weights to allow gradient flow while maintaining initial balance
-            torch.nn.init.xavier_uniform_(self.discrete_fc.weight, gain=1.0)
-            torch.nn.init.constant_(self.discrete_fc.bias, 0.0)
+            if isinstance(self.discrete_fc, nn.Linear):
+                torch.nn.init.xavier_uniform_(self.discrete_fc.weight, gain=1.0)
+                torch.nn.init.constant_(self.discrete_fc.bias, 0.0)
             # Output layer: Small random initialization for gradient flow with minimal bias
-            torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
-            torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
+            if isinstance(self.discrete_out, nn.Linear):
+                torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
+                torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning Q-values for every joint action combination."""
@@ -443,6 +504,66 @@ class HybridDQN(nn.Module):
         if self.max_q_value is not None:
             discrete_q = torch.clamp(discrete_q, -self.max_q_value, self.max_q_value)
         return discrete_q
+
+    def reset_noise(self):
+        """Resample noise for all NoisyLinear layers (heads only for performance)."""
+        if not self.use_noisy:
+            return
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
+
+
+class _SumTree:
+    """Array-based sum tree for fast O(log N) priority sampling."""
+
+    __slots__ = ("capacity", "size", "_tree_size", "_tree")
+
+    def __init__(self, capacity: int):
+        self.capacity = int(max(1, capacity))
+        self.size = 0
+
+        # Use a power-of-two backing array for simple traversal.
+        tree_size = 1
+        while tree_size < self.capacity:
+            tree_size <<= 1
+        self._tree_size = tree_size
+        self._tree = np.zeros((2 * tree_size,), dtype=np.float32)
+
+    def total(self) -> float:
+        return float(self._tree[1])
+
+    def update(self, idx: int, priority: float) -> None:
+        if idx < 0 or idx >= self.capacity:
+            return
+        tree_idx = idx + self._tree_size
+        self._tree[tree_idx] = float(priority)
+        tree_idx //= 2
+        while tree_idx >= 1:
+            self._tree[tree_idx] = self._tree[tree_idx * 2] + self._tree[tree_idx * 2 + 1]
+            tree_idx //= 2
+
+    def batch_update(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        for idx, pri in zip(indices, priorities):
+            self.update(int(idx), float(pri))
+
+    def sample(self, mass: float) -> int:
+        """Return index whose prefix-sum covers `mass`."""
+        idx = 1
+        while idx < self._tree_size:
+            left = idx * 2
+            left_sum = self._tree[left]
+            if left_sum > 0.0 and mass <= left_sum:
+                idx = left
+            else:
+                mass -= left_sum
+                idx = left + 1
+        leaf = idx - self._tree_size
+        return leaf if leaf < self.capacity else self.capacity - 1
+
+    def clear(self) -> None:
+        self._tree.fill(0.0)
+        self.size = 0
 
 
 class HybridReplayBuffer:
@@ -576,10 +697,12 @@ class HybridReplayBuffer:
         self._lock = threading.Lock()
         self._rng = np.random.default_rng()
         self._priority_alpha = float(np.clip(getattr(RL_CONFIG, "priority_alpha", 0.0) or 0.0, 0.0, 1.0))
+        self._priority_beta = float(np.clip(getattr(RL_CONFIG, "priority_beta", 0.4) or 0.4, 0.0, 1.0))
         self._priority_eps = float(getattr(RL_CONFIG, "priority_eps", 1e-3) or 1e-3)
         self._max_priority = 1.0
         self._priority_weight_cap = int(max(1, getattr(RL_CONFIG, "priority_max_weight_elems", 200000) or 200000))
-        self._priority_enabled = (
+        self._per_tree_enabled = self._priority_alpha > 0.0
+        self._priority_buckets_enabled = (
             self._priority_alpha > 0.0
             and int(getattr(RL_CONFIG, "replay_n_buckets", 0) or 0) > 0
             and float(getattr(RL_CONFIG, "priority_sample_fraction", 0.0) or 0.0) > 0.0
@@ -601,7 +724,7 @@ class HybridReplayBuffer:
         main_capacity = self.total_capacity
         active_bucket_count = 0
 
-        if self._priority_enabled and configured_n > 0 and configured_bucket_size > 0:
+        if self._priority_buckets_enabled and configured_n > 0 and configured_bucket_size > 0:
             tentative_bucket_cap = min(configured_bucket_size, max(1, self.total_capacity // (configured_n + 1)))
             tentative_main = self.total_capacity - (tentative_bucket_cap * configured_n)
             if tentative_bucket_cap > 0 and tentative_main > 0:
@@ -659,6 +782,20 @@ class HybridReplayBuffer:
         )
         self.terminal_indices: Deque[int] = deque(maxlen=self._main.capacity)
         self._min_dqn_fraction = float(np.clip(getattr(RL_CONFIG, "min_dqn_fraction", 0.0) or 0.0, 0.0, 0.9))
+        self._priority_tree = _SumTree(self._main.capacity) if self._per_tree_enabled else None
+
+    def _current_priority_beta(self) -> float:
+        """Anneal beta toward full IS correction over a configured frame window."""
+        base_beta = self._priority_beta
+        final_beta = float(np.clip(getattr(RL_CONFIG, "priority_beta_final", 1.0) or 1.0, 0.0, 2.0))
+        frames = int(getattr(RL_CONFIG, "priority_beta_frames", 5_000_000) or 1)
+        frames = max(frames, 1)
+        try:
+            frame_now = int(getattr(metrics, "frame_count", 0))
+        except Exception:
+            frame_now = 0
+        progress = min(1.0, max(0.0, frame_now / float(frames)))
+        return float(base_beta + (final_beta - base_beta) * progress)
 
     def _to_state_array(self, value):
         try:
@@ -761,6 +898,10 @@ class HybridReplayBuffer:
                 # Track max priority to seed fresh samples
                 if priority_score > self._max_priority:
                     self._max_priority = priority_score
+                if self._priority_tree is not None and self._priority_alpha > 0.0:
+                    encoded_priority = float(math.pow(priority_score, self._priority_alpha))
+                    self._priority_tree.update(write_idx, encoded_priority)
+                    self._priority_tree.size = self._main.size
             self.size = self._main.size
             self.position = self._main.position
 
@@ -906,6 +1047,9 @@ class HybridReplayBuffer:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
+        if self._per_tree_enabled:
+            return self._sample_per(batch_size, return_indices)
+
         with self._lock:
             if self._main.size < batch_size:
                 return None
@@ -914,7 +1058,7 @@ class HybridReplayBuffer:
         priority_indices = []
         remaining = batch_size
 
-        if self._priority_enabled:
+        if self._priority_buckets_enabled:
             for segment in self.priority_segments:
                 if remaining <= 0:
                     priority_chunks.append(None)
@@ -1037,7 +1181,7 @@ class HybridReplayBuffer:
         horizons = torch.from_numpy(horizons_np.astype(np.float32)).float().to(device)
 
         if return_indices:
-            if not self._priority_enabled and self._min_dqn_fraction <= 0.0:
+            if not self._priority_buckets_enabled and self._min_dqn_fraction <= 0.0:
                 index_array = None
             elif index_list:
                 index_array = np.concatenate(index_list, axis=0)
@@ -1064,9 +1208,135 @@ class HybridReplayBuffer:
             horizons,
         )
 
+    def _sample_tree_indices(self, count: int, total_alpha_sum: float | None = None) -> np.ndarray:
+        if count <= 0 or self._priority_tree is None:
+            return np.zeros((0,), dtype=np.int64)
+        total = float(total_alpha_sum) if total_alpha_sum is not None else self._priority_tree.total()
+        if total <= 0.0:
+            return self._rng.choice(self._main.size, size=count, replace=False)
+        masses = self._rng.random(count) * total
+        indices = np.empty((count,), dtype=np.int64)
+        for i, mass in enumerate(masses):
+            indices[i] = self._priority_tree.sample(float(mass))
+        return indices
+
+    def _sample_per(self, batch_size: int, return_indices: bool):
+        with self._lock:
+            if self._main.size < batch_size:
+                return None
+
+            total_alpha_sum = self._priority_tree.total() if self._priority_tree is not None else 0.0
+            if total_alpha_sum <= 0.0:
+                return None
+
+            beta = self._current_priority_beta()
+            current_size = self._main.size
+            predeath_indices = np.zeros((0,), dtype=np.int64)
+            predeath_alpha = np.zeros((0,), dtype=np.float32)
+            desired_predeath = int(batch_size * self.pre_death_sample_fraction)
+
+            if desired_predeath > 0:
+                available_predeath = np.flatnonzero(self.pre_death_flags[: self._main.size]).astype(np.int64, copy=False)
+                if available_predeath.size > 0:
+                    take = min(desired_predeath, available_predeath.size, batch_size)
+                    if take > 0:
+                        predeath_indices = self._weighted_choice(
+                            available_predeath,
+                            self._main.priorities[available_predeath],
+                            take,
+                        ).astype(np.int64, copy=False)
+                        if predeath_indices.size > 0:
+                            predeath_alpha = np.power(self._main.priorities[predeath_indices], self._priority_alpha)
+
+            remaining = batch_size - predeath_indices.size
+            tree_indices = self._sample_tree_indices(remaining, total_alpha_sum)
+            indices = tree_indices if predeath_indices.size == 0 else np.concatenate([predeath_indices, tree_indices])
+
+            if indices.size == 0:
+                return None
+
+            origin_is_predeath = (
+                np.concatenate(
+                    [np.ones((predeath_indices.size,), dtype=bool), np.zeros((tree_indices.size,), dtype=bool)]
+                )
+                if predeath_indices.size > 0
+                else np.zeros((indices.size,), dtype=bool)
+            )
+
+            shuffle_idx = self._rng.permutation(indices.size)
+            indices = indices[shuffle_idx]
+            origin_is_predeath = origin_is_predeath[shuffle_idx]
+
+            chunk = self._main.gather(indices)
+            actors_list = chunk[5]
+            priority_vals = self._main.priorities[indices].copy()
+
+        states = torch.from_numpy(chunk[0]).float().to(device)
+        discrete_actions = torch.from_numpy(chunk[1]).long().to(device)
+        rewards = torch.from_numpy(chunk[2]).float().to(device)
+        next_states = torch.from_numpy(chunk[3]).float().to(device)
+        dones = torch.from_numpy(chunk[4]).float().to(device)
+        horizons = torch.from_numpy(chunk[6].astype(np.float32)).float().to(device)
+
+        if self._min_dqn_fraction > 0.0 and len(actors_list) > 0:
+            n_dqn = sum(1 for a in actors_list if a == "dqn")
+            frac_dqn = n_dqn / len(actors_list)
+            if frac_dqn < self._min_dqn_fraction:
+                balanced = self._actor_balanced_fallback(batch_size)
+                if balanced is not None:
+                    if return_indices:
+                        return balanced
+                    return balanced[:7]
+
+        if not return_indices:
+            return (
+                states,
+                discrete_actions,
+                rewards,
+                next_states,
+                dones,
+                actors_list,
+                horizons,
+            )
+
+        # Importance sampling weights (batch-normalized)
+        priority_alpha = np.power(priority_vals, self._priority_alpha)
+        predeath_share = predeath_indices.size / float(batch_size) if batch_size > 0 else 0.0
+        predeath_alpha_sum = float(predeath_alpha.sum()) if predeath_alpha.size > 0 else 0.0
+
+        base_probs = priority_alpha / max(total_alpha_sum, self._priority_eps)
+        if predeath_share > 0.0 and predeath_alpha_sum > 0.0:
+            pre_probs = priority_alpha / max(predeath_alpha_sum, self._priority_eps)
+            sample_probs = np.where(
+                origin_is_predeath,
+                (predeath_share * pre_probs) + ((1.0 - predeath_share) * base_probs),
+                (1.0 - predeath_share) * base_probs,
+            )
+        else:
+            sample_probs = base_probs
+
+        sample_probs = np.clip(sample_probs, self._priority_eps, None)
+        weights = np.power(sample_probs * current_size, -beta)
+        max_w = weights.max() if weights.size > 0 else 1.0
+        if max_w > 0:
+            weights = weights / max_w
+
+        weight_tensor = torch.from_numpy(weights.astype(np.float32)).to(device)
+        return (
+            states,
+            discrete_actions,
+            rewards,
+            next_states,
+            dones,
+            actors_list,
+            horizons,
+            indices.reshape(-1),
+            weight_tensor,
+        )
+
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
         """Update stored priorities using fresh TD-errors."""
-        if not self._priority_enabled:
+        if not (self._priority_buckets_enabled or self._per_tree_enabled):
             return
         try:
             idx_array = np.asarray(indices, dtype=np.int64).reshape(-1)
@@ -1087,6 +1357,10 @@ class HybridReplayBuffer:
             safe_pri = np.abs(pri_valid) + self._priority_eps
             safe_pri = np.where(np.isfinite(safe_pri), safe_pri, self._priority_eps)
             self._main.priorities[idx_valid] = safe_pri
+            if self._priority_tree is not None and self._priority_alpha > 0.0:
+                encoded = np.power(safe_pri, self._priority_alpha)
+                self._priority_tree.batch_update(idx_valid, encoded)
+                self._priority_tree.size = self._main.size
             max_new = float(np.max(safe_pri)) if safe_pri.size > 0 else self._max_priority
             if max_new > self._max_priority:
                 self._max_priority = max_new
@@ -1106,6 +1380,8 @@ class HybridReplayBuffer:
             self._priority_thresholds = [float('inf')] * len(self.priority_segments)
             self._total_additions = 0
             self._max_priority = 1.0
+            if self._priority_tree is not None:
+                self._priority_tree.clear()
 
     def get_partition_stats(self):
         with self._lock:
@@ -1114,6 +1390,7 @@ class HybridReplayBuffer:
                 'total_size': self._main.size,
                 'total_capacity': self._main.capacity,
                 'priority_buckets_enabled': self.priority_buckets_enabled,
+                'per_enabled': self._per_tree_enabled,
                 'priority_bucket_count': self.n_buckets,
                 'main_size': self._main.size,
                 'main_actual_size': self._main.size,
@@ -1362,6 +1639,7 @@ class HybridDQNAgent:
         self.epsilon_min = float(epsilon_min)
         self.batch_size = int(batch_size)
         self.device = device
+        self.n_step = int(getattr(RL_CONFIG, "n_step", 1) or 1)
 
         self.qnetwork_local = HybridDQN(
             state_size=self.state_size,
@@ -1385,6 +1663,7 @@ class HybridDQNAgent:
 
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=self.learning_rate)
         self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
+        self.n_step_buffer = NStepReplayBuffer(self.n_step, self.gamma) if self.n_step > 1 else None
 
         self.amp_enabled = (
             self.device.type == "cuda"
@@ -1486,6 +1765,7 @@ class HybridDQNAgent:
 
         state_tensor = torch.from_numpy(state_arr).float().unsqueeze(0).to(self.device)
 
+        use_noisy = bool(getattr(self.qnetwork_local, "use_noisy", False))
         self.qnetwork_local.eval()
         with torch.no_grad():
             q_values = self.qnetwork_local(state_tensor)
@@ -1507,16 +1787,48 @@ class HybridDQNAgent:
         horizon,
         priority_reward: Optional[float] = None,
     ):
-        self.memory.push(
-            state,
-            discrete_action,
-            reward,
-            next_state,
-            done,
-            actor=actor,
-            horizon=horizon,
-            priority_reward=priority_reward,
-        )
+        if self.n_step_buffer is not None:
+            experiences = self.n_step_buffer.add(
+                state,
+                discrete_action,
+                reward,
+                next_state,
+                done,
+                actor=actor,
+                priority_reward=priority_reward,
+            )
+            if experiences:
+                for (
+                    exp_state,
+                    exp_action,
+                    exp_reward,
+                    exp_priority_reward,
+                    exp_next_state,
+                    exp_done,
+                    exp_steps,
+                    exp_actor,
+                ) in experiences:
+                    self.memory.push(
+                        exp_state,
+                        exp_action,
+                        exp_reward,
+                        exp_next_state,
+                        exp_done,
+                        actor=exp_actor,
+                        horizon=exp_steps,
+                        priority_reward=exp_priority_reward,
+                    )
+        else:
+            self.memory.push(
+                state,
+                discrete_action,
+                reward,
+                next_state,
+                done,
+                actor=actor,
+                horizon=horizon,
+                priority_reward=priority_reward,
+            )
 
         try:
             metrics.memory_buffer_size = len(self.memory)
@@ -1692,9 +2004,25 @@ class HybridDQNAgent:
 
         try:
             checkpoint = torch.load(filepath, map_location=self.device)
-            self.qnetwork_local.load_state_dict(checkpoint['local_state_dict'])
-            self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            local_sd = checkpoint.get('local_state_dict', {})
+            target_sd = checkpoint.get('target_state_dict', {})
+
+            try:
+                self.qnetwork_local.load_state_dict(local_sd)
+            except Exception as e:
+                print(f"Warning: strict load failed for local network ({e}); retrying non-strict.")
+                self.qnetwork_local.load_state_dict(local_sd, strict=False)
+
+            try:
+                self.qnetwork_target.load_state_dict(target_sd)
+            except Exception as e:
+                print(f"Warning: strict load failed for target network ({e}); retrying non-strict.")
+                self.qnetwork_target.load_state_dict(target_sd, strict=False)
+
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                print(f"Warning: could not load optimizer state ({e}); continuing with fresh optimizer.")
             self.training_steps = int(checkpoint.get('training_steps', 0))
 
             try:

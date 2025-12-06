@@ -95,25 +95,50 @@ def train_step(agent):
     if batch is None:
         return None
 
-    (
-        states,
-        discrete_actions,
-        rewards,
-        next_states,
-        dones,
-        actors,
-        horizons,
-        sample_indices,
-    ) = batch
+    # Replay buffers may optionally provide importance-sampling weights.
+    if len(batch) == 9:
+        (
+            states,
+            discrete_actions,
+            rewards,
+            next_states,
+            dones,
+            actors,
+            horizons,
+            sample_indices,
+            weights,
+        ) = batch
+    elif len(batch) == 8:
+        (
+            states,
+            discrete_actions,
+            rewards,
+            next_states,
+            dones,
+            actors,
+            horizons,
+            sample_indices,
+        ) = batch
+        weights = None
+    else:
+        raise ValueError(f"Unexpected batch format from replay buffer (len={len(batch)})")
+
 
     discrete_actions = discrete_actions.long()
     rewards = rewards.float()
-    dones = dones.float()
+    # Guard against any non-binary values leaking into the terminal mask
+    dones = dones.float().clamp_(0.0, 1.0)
     horizons = horizons.float()
 
     agent.qnetwork_local.train()
+    noisy_enabled = bool(getattr(agent.qnetwork_local, "use_noisy", False))
 
     use_amp = bool(getattr(agent, "amp_enabled", False) and getattr(agent, "amp_scaler", None))
+    try:
+        if hasattr(agent.qnetwork_local, "reset_noise"):
+            agent.qnetwork_local.reset_noise()
+    except Exception:
+        pass
     if use_amp:
         device_type = None
         try:
@@ -145,7 +170,8 @@ def train_step(agent):
             next_values = next_q_target.gather(1, best_next_actions)
 
             gamma_h = torch.pow(torch.full_like(horizons, agent.gamma), horizons)
-            targets = rewards + (1.0 - dones) * gamma_h * next_values
+            done_mask = 1.0 - dones  # Zero out bootstrap at terminal transitions
+            targets = rewards + done_mask * gamma_h * next_values
             td_clip = getattr(RL_CONFIG, "td_target_clip", None)
             try:
                 td_clip_val = float(td_clip)
@@ -155,7 +181,11 @@ def train_step(agent):
                 targets = torch.clamp(targets, -td_clip_val, td_clip_val)
 
         td_losses = F.smooth_l1_loss(selected_q, targets, reduction="none")
-        td_loss = td_losses.mean()
+        if weights is not None:
+            td_loss = (td_losses * weights.unsqueeze(1)).mean()
+        else:
+            td_loss = td_losses.mean()
+
 
     expert_mask_np = [actor == "expert" for actor in actors]
     expert_mask = _to_tensor_bool(expert_mask_np, len(actors), device=states.device)

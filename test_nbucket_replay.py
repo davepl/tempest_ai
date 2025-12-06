@@ -23,10 +23,14 @@ class TestSegmentedReplayBuffer(unittest.TestCase):
         self._old_n = RL_CONFIG.replay_n_buckets
         self._old_bucket = RL_CONFIG.replay_bucket_size
         self._old_main = RL_CONFIG.replay_main_bucket_size
+        self._old_priority_fraction = RL_CONFIG.priority_sample_fraction
+        self._old_priority_alpha = RL_CONFIG.priority_alpha
 
         RL_CONFIG.replay_n_buckets = 2
         RL_CONFIG.replay_bucket_size = 32
         RL_CONFIG.replay_main_bucket_size = 192
+        RL_CONFIG.priority_sample_fraction = 0.2
+        RL_CONFIG.priority_alpha = 0.6
 
         self.buffer = HybridReplayBuffer(self.capacity, self.state_size)
 
@@ -34,6 +38,8 @@ class TestSegmentedReplayBuffer(unittest.TestCase):
         RL_CONFIG.replay_n_buckets = self._old_n
         RL_CONFIG.replay_bucket_size = self._old_bucket
         RL_CONFIG.replay_main_bucket_size = self._old_main
+        RL_CONFIG.priority_sample_fraction = self._old_priority_fraction
+        RL_CONFIG.priority_alpha = self._old_priority_alpha
 
     def _make_transition(self, actor="dqn", reward=None):
         state = np.random.randn(self.state_size).astype(np.float32)
