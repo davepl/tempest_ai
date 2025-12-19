@@ -4,11 +4,12 @@
 # ||                              TEMPEST AI • MODEL, AGENT, AND UTILITIES                                       ||
 # ||                                                                                                              ||
 # ||  FILE: Scripts/aimodel.py                                                                                    ||
-# ||  ROLE: Neural model (HybridDQN), training agent, parsing, expert helpers, keyboard, and utilities.           ||
+# ||  ROLE: Neural model (DiscreteDQN), training agent, parsing, expert helpers, keyboard, and utilities.         ||
 # ||                                                                                                              ||
 # ||  NEED TO KNOW:                                                                                               ||
-# ||   - HybridDQN: shared trunk + discrete head over fire/zap/spinner combinations.                              ||
-# ||   - HybridDQNAgent: replay, background training, epsilon/actor logic, loss computation, target updates.      ||
+# ||   - DiscreteDQN: shared trunk + two discrete heads (fire/zap and spinner).                                   ||
+# ||   - DiscreteDQNAgent: replay, background training, epsilon/actor logic, loss computation, target updates.    ||
+# ||   - StratifiedReplayBuffer: Separate buffers for Agent and Expert to enforce sampling ratios.                ||
 # ||   - parse_frame_data: unpacks OOB header and float32 state from Lua.                                         ||
 # ||   - KeyboardHandler & metrics-safe print helpers.                                                             ||
 # ||                                                                                                              ||
@@ -17,9 +18,9 @@
 # ||                                                                                                              ||
 # ==================================================================================================================
 """
-Tempest AI Model: Hybrid expert-guided and DQN-based gameplay system.
+Tempest AI Model: Discrete expert-guided and DQN-based gameplay system.
 - Makes intelligent decisions based on enemy positions and level types
-- Uses a Deep Q-Network (DQN) for reinforcement learning
+- Uses a Deep Q-Network (DQN) with two discrete heads (FireZap + Spinner)
 - Expert system provides guidance and training examples
 - Communicates with Tempest via socket connection
 """
@@ -33,22 +34,17 @@ if __name__ == "__main__":
 DEBUG_MODE = False
 
 # Override the built-in print function to always flush output
-# This ensures proper line breaks in output when running in background
 import builtins
 _original_print = builtins.print
 
 def _flushing_print(*args, **kwargs):
-    # Use CR+LF line endings consistently
     new_args = []
     for arg in args:
         if isinstance(arg, str):
-            # Strip trailing whitespace and line endings
             arg = arg.rstrip()
             new_args.append(arg)
         else:
             new_args.append(arg)
-    
-    # Set end parameter to use CR+LF
     kwargs["end"] = "\r\n"
     kwargs['flush'] = True
     return _original_print(*new_args, **kwargs)
@@ -76,7 +72,6 @@ from collections import deque
 from datetime import datetime
 import socket
 import traceback
-# Robust import for running as script (Scripts on sys.path) and as package (repo root on sys.path)
 
 class NoisyLinear(nn.Module):
     """Factorized NoisyNet layer for exploration without epsilon."""
@@ -86,13 +81,11 @@ class NoisyLinear(nn.Module):
         self.out_features = int(out_features)
         self.std_init = float(std_init)
 
-        # Learnable parameters
         self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
         self.bias_mu = nn.Parameter(torch.empty(out_features))
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
 
-        # Buffers for factorized noise
         self.register_buffer("weight_epsilon", torch.zeros(out_features, in_features))
         self.register_buffer("bias_epsilon", torch.zeros(out_features))
 
@@ -131,14 +124,12 @@ class NoisyLinear(nn.Module):
 
 # Platform-specific imports for KeyboardHandler
 import sys
-# Initialize all potential module variables to None first
 msvcrt = termios = tty = fcntl = None
 
 if sys.platform == 'win32':
     try:
         import msvcrt
     except ImportError:
-        # msvcrt remains None
         print("Warning: msvcrt module not found on Windows. Keyboard input will be disabled.")
 elif sys.platform in ('linux', 'darwin'):
     try:
@@ -147,10 +138,8 @@ elif sys.platform in ('linux', 'darwin'):
         import fcntl
         import select
     except ImportError:
-        # termios, tty, fcntl remain None
         print("Warning: termios, tty, or fcntl module not found. Keyboard input will be disabled.")
 else:
-    # All remain None
     print(f"Warning: Unsupported platform '{sys.platform}' for keyboard input.")
 
 # Import from config.py
@@ -166,7 +155,6 @@ try:
         RESET_METRICS,
     )
     from training import train_step
-    from nstep_buffer import NStepReplayBuffer
 except ImportError:
     from Scripts.config import (
         SERVER_CONFIG,
@@ -179,47 +167,35 @@ except ImportError:
         RESET_METRICS,
     )
     from Scripts.training import train_step
-    from Scripts.nstep_buffer import NStepReplayBuffer
 
-# Expose module under short name for compatibility with legacy imports/tests
+# Expose module under short name
 sys.modules.setdefault('aimodel', sys.modules[__name__])
 
-# Suppress warnings
 warnings.filterwarnings('default')
 
-# Global flag to track if running interactively
-# Check this early before any potential tty interaction
 IS_INTERACTIVE = sys.stdin.isatty()
 
-# Initialize configuration
 server_config = ServerConfigData()
 rl_config = RLConfigData()
 
-# Use values from config
 params_count = server_config.params_count
 state_size = rl_config.state_size
 
 SPINNER_SCALE = 32.0
-_RAW_SPINNER_LEVELS = tuple(int(v) for v in getattr(RL_CONFIG, "spinner_command_levels", (0,)))
-if not _RAW_SPINNER_LEVELS:
-    _RAW_SPINNER_LEVELS = (0,)
-SPINNER_BUCKET_VALUES = tuple(level / SPINNER_SCALE for level in _RAW_SPINNER_LEVELS)
-NUM_SPINNER_BUCKETS = len(SPINNER_BUCKET_VALUES)
+# Force 64 buckets as per new architecture spec (-32 to +31)
+NUM_SPINNER_BUCKETS = 64
+SPINNER_BUCKET_VALUES = tuple((i - 32) / SPINNER_SCALE for i in range(64))
 FIRE_ZAP_ACTIONS = 4
-TOTAL_DISCRETE_ACTIONS = FIRE_ZAP_ACTIONS * NUM_SPINNER_BUCKETS
-
 
 def _clamp_spinner_index(index: int) -> int:
     if NUM_SPINNER_BUCKETS <= 0:
         return 0
     return int(max(0, min(NUM_SPINNER_BUCKETS - 1, index)))
 
-
 def spinner_index_to_value(index: int) -> float:
     if not SPINNER_BUCKET_VALUES:
         return 0.0
     return SPINNER_BUCKET_VALUES[_clamp_spinner_index(index)]
-
 
 def quantize_spinner_value(spinner_value: float) -> int:
     if not SPINNER_BUCKET_VALUES:
@@ -234,55 +210,49 @@ def quantize_spinner_value(spinner_value: float) -> int:
             best_idx = idx
     return best_idx
 
+def fire_zap_to_discrete(fire: bool, zap: bool) -> int:
+    """Convert fire/zap booleans to discrete action index (0-3)."""
+    return int(fire) * 2 + int(zap)
 
-def compose_action_index(fire_zap_index: int, spinner_index: int) -> int:
-    return int(max(0, fire_zap_index)) * NUM_SPINNER_BUCKETS + _clamp_spinner_index(spinner_index)
+def discrete_to_fire_zap(discrete_action: int) -> tuple[bool, bool]:
+    """Convert discrete action index (0-3) back to (fire, zap) booleans."""
+    discrete_action = int(discrete_action)
+    fire = (discrete_action >> 1) & 1
+    zap = discrete_action & 1
+    return bool(fire), bool(zap)
 
-
-def decompose_action_index(action_index: int) -> tuple[int, int]:
-    if NUM_SPINNER_BUCKETS <= 0:
-        return int(action_index), 0
-    spinner_index = action_index % NUM_SPINNER_BUCKETS
-    fire_zap_index = action_index // NUM_SPINNER_BUCKETS
-    fire_zap_index = int(max(0, min(FIRE_ZAP_ACTIONS - 1, fire_zap_index)))
-    return fire_zap_index, _clamp_spinner_index(spinner_index)
-
-
-def action_index_to_components(action_index: int) -> tuple[bool, bool, int, float]:
-    fire_zap_index, spinner_index = decompose_action_index(int(action_index))
-    fire, zap = discrete_to_fire_zap(fire_zap_index)
-    spinner_value = spinner_index_to_value(spinner_index)
-    return fire, zap, spinner_index, spinner_value
-
-
-def encode_action_from_components(fire: bool, zap: bool, spinner_value: float) -> tuple[int, int, float]:
-    fire_zap_index = fire_zap_to_discrete(fire, zap)
-    spinner_index = quantize_spinner_value(spinner_value)
-    action_index = compose_action_index(fire_zap_index, spinner_index)
-    quantized_spinner = spinner_index_to_value(spinner_index)
-    return action_index, spinner_index, quantized_spinner
-
+def encode_action_to_game(fire, zap, spinner):
+    """Convert action values to game-compatible format."""
+    try:
+        sval = float(spinner)
+    except Exception:
+        sval = 0.0
+    spinner_val = int(round(sval * 32.0))
+    if spinner_val > 31:
+        spinner_val = 31
+    elif spinner_val < -32:
+        spinner_val = -32
+    return int(fire), int(zap), int(spinner_val)
 
 @dataclass
 class FrameData:
     """Game state data for a single frame"""
     state: np.ndarray
-    subjreward: float  # Subjective reward (movement/aiming)
-    objreward: float   # Objective reward (scoring)
-    action: Tuple[bool, bool, float]  # fire, zap, spinner
-    gamestate: int    # Added: Game state value from Lua
+    subjreward: float
+    objreward: float
+    action: Tuple[bool, bool, float]
+    gamestate: int
     done: bool
     save_signal: bool
     enemy_seg: int
     player_seg: int
     open_level: bool
-    expert_fire: bool  # Added: Expert system fire recommendation
-    expert_zap: bool   # Added: Expert system zap recommendation
-    level_number: int  # Added: Current level number from Lua
+    expert_fire: bool
+    expert_zap: bool
+    level_number: int
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
-        """Create FrameData from dictionary"""
         return cls(
             state=data["state"],
             subjreward=data["subjreward"],
@@ -299,11 +269,9 @@ class FrameData:
             level_number=data["level_number"],
         )
 
-# Configuration constants
 SERVER_CONFIG = server_config
 RL_CONFIG = rl_config
 
-# Initialize device (single GPU setup)
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -311,14 +279,11 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")
 
-# Low-risk math speedups (CUDA only): allow TF32 and tune matmul/cudnn
 try:
     if device.type == 'cuda':
-        # Enable TF32 where available for faster matmuls
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        # Prefer faster algorithms for float32 matmul in PyTorch 2+
         try:
             torch.set_float32_matmul_precision('high')
         except Exception:
@@ -326,1208 +291,204 @@ try:
 except Exception:
     pass
 
-# ----------------------------------------------------------------------------------
-# Defensive de-compile guard:
-# If a previous run left torch.compile OptimizedModules resident in this process
-# (e.g., via hot reload or checkpoint load) we forcibly unwrap them so that the
-# current session runs in plain eager mode. This prevents lingering Inductor
-# cudagraph / TLS assertion failures after source reversion.
-# ----------------------------------------------------------------------------------
-try:
-    import types as _types
-    _DYNAMO_SEEN = False
-    def _unwrap_if_compiled(mod):
-        """Return the underlying eager module if this is a torch.compile wrapper."""
-        try:
-            # PyTorch's compiled wrapper class name can vary; check common patterns
-            if hasattr(mod, '_orig_mod'):
-                base = getattr(mod, '_orig_mod')
-                return base if isinstance(base, torch.nn.Module) else mod
-            # Fallback heuristic: class name contains 'Optimized' or resides in torch._dynamo
-            cname = mod.__class__.__name__
-            if 'Optimized' in cname or mod.__class__.__module__.startswith('torch._dynamo'):
-                return getattr(mod, '_orig_mod', mod)
-        except Exception:
-            return mod
-        return mod
-    # Expose for external use (tests / debugging)
-    unwrap_compiled_module = _unwrap_if_compiled
-except Exception:
-    def unwrap_compiled_module(mod):  # type: ignore
-        return mod
-
-def _force_dynamo_reset_once():
-    global _DYNAMO_SEEN
-    if _DYNAMO_SEEN:
-        return
-    try:
-        import torch._dynamo as _dynamo
-        _dynamo.reset()
-        # Disable further frame evaluation for absolute safety this run
-        os.environ['TORCHDYNAMO_DISABLE'] = '1'
-    except Exception:
-        pass
-    _DYNAMO_SEEN = True
-
-
-# Display key configuration parameters
-# Configuration display removed for cleaner output
-
-# For compatibility with single-device code
-
-# Initialize metrics
 metrics = config_metrics
-
-# Global reference to server for metrics display
 metrics.global_server = None
 
-class HybridDQN(nn.Module):
-    """DQN with shared trunk feeding a single discrete head over joint fire/zap/spinner actions."""
+class DiscreteDQN(nn.Module):
+    """DQN with shared trunk and two discrete heads: FireZap (4) and Spinner (64)."""
 
-    def __init__(self, state_size: int, discrete_actions: int = TOTAL_DISCRETE_ACTIONS,
-                 hidden_size: int = 512, num_layers: int = 3):
-        super(HybridDQN, self).__init__()
+    def __init__(self, state_size: int, hidden_size: int = 512, num_layers: int = 3):
+        super(DiscreteDQN, self).__init__()
         
         self.state_size = state_size
-        self.discrete_actions = discrete_actions
         self.num_layers = num_layers
-        self.use_dueling = bool(getattr(RL_CONFIG, "use_dueling", False))
-        self.use_layer_norm = bool(getattr(RL_CONFIG, "use_layer_norm", False))
         self.use_noisy = bool(getattr(RL_CONFIG, "use_noisy_nets", False))
         self.noisy_std_init = float(getattr(RL_CONFIG, "noisy_std_init", 0.5) or 0.5)
-        max_q_config = getattr(RL_CONFIG, 'max_q_value', None)
-        max_q_value = None
-        try:
-            candidate_val = float(max_q_config)
-        except (TypeError, ValueError):
-            candidate_val = None
-        if candidate_val is not None and candidate_val > 0.0 and math.isfinite(candidate_val):
-            max_q_value = candidate_val
-        self.max_q_value = max_q_value
         
-        # Shared trunk for feature extraction
-        LinearOrNoisy = nn.Linear  # Keep shared trunk standard for speed
+        LinearOrNoisy = nn.Linear
         HeadLinear = NoisyLinear if self.use_noisy else nn.Linear
         head_kwargs = {"std_init": self.noisy_std_init} if self.use_noisy else {}
         
-        # Dynamic layer sizing with pairs: A,A -> A/2,A/2 -> A/4,A/4 -> ...
-        # Pattern: 512,512 -> 256,256 -> 128,128 -> ...
+        # Shared trunk
         layer_sizes = []
-        current_size = hidden_size
         for i in range(num_layers):
-            # Determine size for this layer pair
-            pair_index = i // 2  # 0,0 -> 1,1 -> 2,2 -> ...
+            pair_index = i // 2
             layer_size = max(32, hidden_size // (2 ** pair_index))
             layer_sizes.append(layer_size)
         
-        # Create shared layers dynamically
         self.shared_layers = nn.ModuleList()
-        self.shared_norms = nn.ModuleList() if self.use_layer_norm else None
-        
-        # First layer: state_size -> hidden_size
         self.shared_layers.append(LinearOrNoisy(state_size, layer_sizes[0]))
-        if self.use_layer_norm:
-            self.shared_norms.append(nn.LayerNorm(layer_sizes[0]))
-        
-        # Subsequent layers: hidden_size -> hidden_size/2 -> hidden_size/4 -> ...
         for i in range(1, num_layers):
             self.shared_layers.append(LinearOrNoisy(layer_sizes[i-1], layer_sizes[i]))
-            if self.use_layer_norm:
-                self.shared_norms.append(nn.LayerNorm(layer_sizes[i]))
         
-        # Initialize shared trunk with xavier to ensure good gradient flow
         for layer in self.shared_layers:
             if isinstance(layer, nn.Linear):
                 torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
                 torch.nn.init.constant_(layer.bias, 0.0)
         
-        # Final layer size for heads
         shared_output_size = layer_sizes[-1]
-        head_size = max(64, shared_output_size // 2)  # Head layer size
+        head_size = max(64, shared_output_size // 2)
 
-        if self.use_dueling:
-            # Dueling streams: value and advantage
-            self.value_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
-            self.value_out = HeadLinear(head_size, 1, **head_kwargs)
-            self.advantage_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
-            self.advantage_out = HeadLinear(head_size, discrete_actions, **head_kwargs)
+        # FireZap Head (4 actions)
+        self.firezap_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
+        self.firezap_out = HeadLinear(head_size, FIRE_ZAP_ACTIONS, **head_kwargs)
 
-            for layer in (self.value_fc, self.value_out, self.advantage_fc, self.advantage_out):
-                if isinstance(layer, nn.Linear):
-                    torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
-                    torch.nn.init.constant_(layer.bias, 0.0)
-            if isinstance(self.advantage_out, nn.Linear):
-                torch.nn.init.uniform_(self.advantage_out.weight, -0.003, 0.003)
-                torch.nn.init.constant_(self.advantage_out.bias, 0.0)
-            if isinstance(self.value_out, nn.Linear):
-                torch.nn.init.uniform_(self.value_out.weight, -0.003, 0.003)
-                torch.nn.init.constant_(self.value_out.bias, 0.0)
-        else:
-            # Standard Q-network for discrete Q-values
-            self.discrete_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
-            self.discrete_out = HeadLinear(head_size, discrete_actions, **head_kwargs)
-            
-            # Initialize discrete head with balanced initialization to prevent action bias
-            # CRITICAL: Without this, default initialization creates strong bias (e.g., 93% action 3)
-            # Strategy: Use small random weights to allow gradient flow while maintaining initial balance
-            if isinstance(self.discrete_fc, nn.Linear):
-                torch.nn.init.xavier_uniform_(self.discrete_fc.weight, gain=1.0)
-                torch.nn.init.constant_(self.discrete_fc.bias, 0.0)
-            # Output layer: Small random initialization for gradient flow with minimal bias
-            if isinstance(self.discrete_out, nn.Linear):
-                torch.nn.init.uniform_(self.discrete_out.weight, -0.003, 0.003)  # Small random weights for gradient flow
-                torch.nn.init.constant_(self.discrete_out.bias, 0.0)              # Zero bias for balance
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass returning Q-values for every joint action combination."""
-        # Shared feature extraction through dynamic layers
+        # Spinner Head (64 actions)
+        self.spinner_fc = HeadLinear(shared_output_size, head_size, **head_kwargs)
+        self.spinner_out = HeadLinear(head_size, NUM_SPINNER_BUCKETS, **head_kwargs)
+
+        # Init heads
+        for fc, out in [(self.firezap_fc, self.firezap_out), (self.spinner_fc, self.spinner_out)]:
+            if isinstance(fc, nn.Linear):
+                torch.nn.init.xavier_uniform_(fc.weight, gain=1.0)
+                torch.nn.init.constant_(fc.bias, 0.0)
+            if isinstance(out, nn.Linear):
+                torch.nn.init.uniform_(out.weight, -0.003, 0.003)
+                torch.nn.init.constant_(out.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         shared = x
-        for idx, layer in enumerate(self.shared_layers):
-            shared = layer(shared)
-            if self.use_layer_norm and self.shared_norms is not None:
-                shared = self.shared_norms[idx](shared)
-            shared = F.relu(shared)
+        for layer in self.shared_layers:
+            shared = F.relu(layer(shared))
         
-        if self.use_dueling:
-            value = F.relu(self.value_fc(shared))
-            value = self.value_out(value)  # (B,1)
+        # FireZap
+        fz = F.relu(self.firezap_fc(shared))
+        q_fz = self.firezap_out(fz)
 
-            advantage = F.relu(self.advantage_fc(shared))
-            advantage = self.advantage_out(advantage)  # (B, A)
-            advantage_mean = advantage.mean(dim=1, keepdim=True)
-            discrete_q = value + (advantage - advantage_mean)
-        else:
-            # Discrete Q-values head
-            discrete = F.relu(self.discrete_fc(shared))
-            discrete_q = self.discrete_out(discrete)  # (B, total_discrete_actions)
-        
-        if self.max_q_value is not None:
-            discrete_q = torch.clamp(discrete_q, -self.max_q_value, self.max_q_value)
-        return discrete_q
+        # Spinner
+        sp = F.relu(self.spinner_fc(shared))
+        q_sp = self.spinner_out(sp)
+
+        return q_fz, q_sp
 
     def reset_noise(self):
-        """Resample noise for all NoisyLinear layers (heads only for performance)."""
         if not self.use_noisy:
             return
         for module in self.modules():
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
 
-
-class _SumTree:
-    """Array-based sum tree for fast O(log N) priority sampling."""
-
-    __slots__ = ("capacity", "size", "_tree_size", "_tree")
-
-    def __init__(self, capacity: int):
-        self.capacity = int(max(1, capacity))
-        self.size = 0
-
-        # Use a power-of-two backing array for simple traversal.
-        tree_size = 1
-        while tree_size < self.capacity:
-            tree_size <<= 1
-        self._tree_size = tree_size
-        self._tree = np.zeros((2 * tree_size,), dtype=np.float32)
-
-    def total(self) -> float:
-        return float(self._tree[1])
-
-    def update(self, idx: int, priority: float) -> None:
-        if idx < 0 or idx >= self.capacity:
-            return
-        tree_idx = idx + self._tree_size
-        self._tree[tree_idx] = float(priority)
-        tree_idx //= 2
-        while tree_idx >= 1:
-            self._tree[tree_idx] = self._tree[tree_idx * 2] + self._tree[tree_idx * 2 + 1]
-            tree_idx //= 2
-
-    def batch_update(self, indices: np.ndarray, priorities: np.ndarray) -> None:
-        for idx, pri in zip(indices, priorities):
-            self.update(int(idx), float(pri))
-
-    def sample(self, mass: float) -> int:
-        """Return index whose prefix-sum covers `mass`."""
-        idx = 1
-        while idx < self._tree_size:
-            left = idx * 2
-            left_sum = self._tree[left]
-            if left_sum > 0.0 and mass <= left_sum:
-                idx = left
-            else:
-                mass -= left_sum
-                idx = left + 1
-        leaf = idx - self._tree_size
-        return leaf if leaf < self.capacity else self.capacity - 1
-
-    def clear(self) -> None:
-        self._tree.fill(0.0)
-        self.size = 0
-
-
-class HybridReplayBuffer:
-    """Segmented replay buffer with optional priority buckets (PER-lite)."""
-
-    _DEFAULT_BUCKET_LABELS = [
-        ("p99_100", 0.995),
-        ("p75_99", 0.75),
-        ("p90_95", 0.90),
-        ("p85_90", 0.85),
-    ]
-    _PRIORITY_SAMPLE_FRACTION = 0.20
-    _THRESHOLD_WINDOW = 5000
-    _THRESHOLD_MIN_SAMPLES = 64
-    _THRESHOLD_UPDATE_INTERVAL = 128
-
-    class _Segment:
-        __slots__ = (
-            "capacity",
-            "state_size",
-            "states",
-            "next_states",
-            "discrete_actions",
-            "rewards",
-            "dones",
-            "horizons",
-            "actors",
-            "priorities",
-            "position",
-            "size",
-        )
-
-        def __init__(self, capacity: int, state_size: int):
-            self.capacity = int(max(0, capacity))
-            self.state_size = int(max(1, state_size))
-            self.position = 0
-            self.size = 0
-
-            if self.capacity > 0:
-                self.states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
-                self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
-                self.discrete_actions = np.zeros((self.capacity,), dtype=np.int64)
-                self.rewards = np.zeros((self.capacity,), dtype=np.float32)
-                self.dones = np.zeros((self.capacity,), dtype=np.bool_)
-                self.horizons = np.ones((self.capacity,), dtype=np.int32)
-                self.actors = np.full((self.capacity,), 'dqn', dtype='U10')
-                self.priorities = np.ones((self.capacity,), dtype=np.float32)
-            else:
-                self.states = np.zeros((0, self.state_size), dtype=np.float32)
-                self.next_states = np.zeros((0, self.state_size), dtype=np.float32)
-                self.discrete_actions = np.zeros((0,), dtype=np.int64)
-                self.rewards = np.zeros((0,), dtype=np.float32)
-                self.dones = np.zeros((0,), dtype=np.bool_)
-                self.horizons = np.zeros((0,), dtype=np.int32)
-                self.actors = np.zeros((0,), dtype='U10')
-                self.priorities = np.ones((0,), dtype=np.float32)
-
-        def add(
-            self,
-            state: np.ndarray,
-            discrete_action: int,
-            reward: float,
-            next_state: np.ndarray,
-            done: bool,
-            actor: str,
-            horizon: int,
-            priority: float,
-        ):
-            if self.capacity <= 0:
-                return -1
-
-            idx = self.position
-            self.states[idx] = state
-            self.next_states[idx] = next_state
-            self.discrete_actions[idx] = discrete_action
-            self.rewards[idx] = reward
-            self.dones[idx] = done
-            self.actors[idx] = actor
-            self.horizons[idx] = horizon
-            self.priorities[idx] = priority
-
-            self.position = (idx + 1) % self.capacity
-            if self.size < self.capacity:
-                self.size += 1
-            return idx
-
-        def gather(self, indices: np.ndarray):
-            if indices.size == 0:
-                zero_states = np.zeros((0, self.state_size), dtype=np.float32)
-                zero_scalar = np.zeros((0, 1), dtype=np.float32)
-                zero_int = np.zeros((0, 1), dtype=np.int64)
-                return (
-                    zero_states,
-                    zero_int,
-                    zero_scalar,
-                    zero_states,
-                    zero_scalar,
-                    [],
-                    zero_int.astype(np.int32),
-                )
-
-            states_np = self.states[indices].copy()
-            next_states_np = self.next_states[indices].copy()
-            discrete_np = self.discrete_actions[indices].copy().reshape(-1, 1)
-            rewards_np = self.rewards[indices].copy().reshape(-1, 1)
-            dones_np = self.dones[indices].astype(np.float32).reshape(-1, 1)
-            horizons_np = self.horizons[indices].copy().reshape(-1, 1)
-            actors_list = [str(a) for a in self.actors[indices]]
-            return (
-                states_np,
-                discrete_np,
-                rewards_np,
-                next_states_np,
-                dones_np,
-                actors_list,
-                horizons_np,
-            )
-
-        def clear(self):
-            self.position = 0
-            self.size = 0
-            try:
-                self.priorities.fill(1.0)
-            except Exception:
-                pass
+class StratifiedReplayBuffer:
+    """Replay buffer with separate deques for Agent and Expert to enforce sampling ratios."""
 
     def __init__(self, capacity: int, state_size: int):
-        self.total_capacity = int(max(1, capacity))
+        self.capacity = int(max(1, capacity))
         self.state_size = int(max(1, state_size))
+        self.lock = threading.Lock()
+        
+        # Separate buffers
+        self.buffer_agent = deque(maxlen=self.capacity)
+        self.buffer_expert = deque(maxlen=self.capacity)
+        
+        # Stats
+        self.total_added = 0
 
-        self._lock = threading.Lock()
-        self._rng = np.random.default_rng()
-        self._priority_alpha = float(np.clip(getattr(RL_CONFIG, "priority_alpha", 0.0) or 0.0, 0.0, 1.0))
-        self._priority_beta = float(np.clip(getattr(RL_CONFIG, "priority_beta", 0.4) or 0.4, 0.0, 1.0))
-        self._priority_eps = float(getattr(RL_CONFIG, "priority_eps", 1e-3) or 1e-3)
-        self._max_priority = 1.0
-        self._priority_weight_cap = int(max(1, getattr(RL_CONFIG, "priority_max_weight_elems", 200000) or 200000))
-        self._per_tree_enabled = self._priority_alpha > 0.0
-        self._priority_buckets_enabled = (
-            self._priority_alpha > 0.0
-            and int(getattr(RL_CONFIG, "replay_n_buckets", 0) or 0) > 0
-            and float(getattr(RL_CONFIG, "priority_sample_fraction", 0.0) or 0.0) > 0.0
-        )
-
-        configured_n = int(getattr(RL_CONFIG, 'replay_n_buckets', 0) or 0)
-        configured_bucket_size = int(getattr(RL_CONFIG, 'replay_bucket_size', 0) or 0)
-        configured_fraction = float(getattr(RL_CONFIG, 'priority_sample_fraction', self._PRIORITY_SAMPLE_FRACTION) or 0.0)
-        configured_fraction = float(np.clip(configured_fraction, 0.0, 0.9))
-
-        self.priority_buckets_enabled = False
-        self.priority_segments: List[HybridReplayBuffer._Segment] = []
-        self.bucket_labels: List[str] = []
-        self.bucket_percentiles: List[float] = []
-        self._priority_thresholds: List[float] = []
-        self._priority_sample_fraction = configured_fraction if configured_fraction > 0 else self._PRIORITY_SAMPLE_FRACTION
-
-        bucket_capacity = 0
-        main_capacity = self.total_capacity
-        active_bucket_count = 0
-
-        if self._priority_buckets_enabled and configured_n > 0 and configured_bucket_size > 0:
-            tentative_bucket_cap = min(configured_bucket_size, max(1, self.total_capacity // (configured_n + 1)))
-            tentative_main = self.total_capacity - (tentative_bucket_cap * configured_n)
-            if tentative_bucket_cap > 0 and tentative_main > 0:
-                bucket_capacity = tentative_bucket_cap
-                main_capacity = tentative_main
-                active_bucket_count = configured_n
-
-        if active_bucket_count > 0:
-            label_pairs = list(self._DEFAULT_BUCKET_LABELS)
-            while len(label_pairs) < active_bucket_count:
-                start = max(0, 100 - (len(label_pairs) + 1) * 5)
-                end = min(100, start + 5)
-                percentile = max(0.5, end / 100.0)
-                label_pairs.append((f"p{start}_{end}", percentile))
-
-            selected = label_pairs[:active_bucket_count]
-            self.bucket_labels = [lbl for lbl, _ in selected]
-            self.bucket_percentiles = [perc for _, perc in selected]
-            self._priority_thresholds = [float('inf')] * active_bucket_count
-            self.priority_segments = [
-                self._Segment(bucket_capacity, self.state_size) for _ in range(active_bucket_count)
-            ]
-            self.priority_buckets_enabled = True
-        else:
-            self.bucket_labels = []
-            self.bucket_percentiles = []
-            self._priority_thresholds = []
-            self.priority_segments = []
-            self.priority_buckets_enabled = False
-
-        self._main = self._Segment(main_capacity, self.state_size)
-        self.capacity = self._main.capacity
-        self.size = self._main.size
-        self.position = self._main.position
-        self.n_buckets = len(self.priority_segments)
-
-        # Maintain direct references for compatibility with existing code paths
-        self.states = self._main.states
-        self.next_states = self._main.next_states
-        self.discrete_actions = self._main.discrete_actions
-        self.rewards = self._main.rewards
-        self.dones = self._main.dones
-        self.horizons = self._main.horizons
-        self.actors = self._main.actors
-
-        self._recent_scores: Deque[float] = deque(maxlen=self._THRESHOLD_WINDOW)
-        self._total_additions = 0
-        self.pre_death_flags = np.zeros((self._main.capacity,), dtype=np.bool_)
-        self.pre_death_sample_fraction = float(
-            np.clip(getattr(RL_CONFIG, 'pre_death_sample_fraction', 0.25) or 0.25, 0.0, 0.9)
-        )
-        self._pre_death_lookback_min = int(max(1, getattr(RL_CONFIG, 'replay_terminal_lookback_min', 5) or 5))
-        self._pre_death_lookback_max = int(
-            max(self._pre_death_lookback_min, getattr(RL_CONFIG, 'replay_terminal_lookback_max', 10) or 10)
-        )
-        self.terminal_indices: Deque[int] = deque(maxlen=self._main.capacity)
-        self._min_dqn_fraction = float(np.clip(getattr(RL_CONFIG, "min_dqn_fraction", 0.0) or 0.0, 0.0, 0.9))
-        self._priority_tree = _SumTree(self._main.capacity) if self._per_tree_enabled else None
-
-    def _current_priority_beta(self) -> float:
-        """Anneal beta toward full IS correction over a configured frame window."""
-        base_beta = self._priority_beta
-        final_beta = float(np.clip(getattr(RL_CONFIG, "priority_beta_final", 1.0) or 1.0, 0.0, 2.0))
-        frames = int(getattr(RL_CONFIG, "priority_beta_frames", 5_000_000) or 1)
-        frames = max(frames, 1)
-        try:
-            frame_now = int(getattr(metrics, "frame_count", 0))
-        except Exception:
-            frame_now = 0
-        progress = min(1.0, max(0.0, frame_now / float(frames)))
-        return float(base_beta + (final_beta - base_beta) * progress)
-
-    def _to_state_array(self, value):
-        try:
-            arr = np.asarray(value, dtype=np.float32)
-            if arr.ndim > 1:
-                arr = arr.reshape(-1)
-        except Exception:
-            arr = np.zeros((self.state_size,), dtype=np.float32)
-        if arr.size < self.state_size:
-            padded = np.zeros((self.state_size,), dtype=np.float32)
-            padded[:arr.size] = arr
-            return padded
-        if arr.size > self.state_size:
-            return arr[:self.state_size]
-        return arr
-
-    def _normalize_actor(self, actor: Optional[str]) -> str:
-        if not actor:
-            return 'dqn'
-        actor_str = str(actor).strip().lower()
-        if actor_str in ('dqn', 'expert'):
-            return actor_str
-        if actor_str in ('player', 'human'):
-            return 'expert'
-        return 'dqn'
-
-    def push(
-        self,
-        state,
-        discrete_action,
-        reward,
-        next_state,
-        done,
-        actor: str = 'dqn',
-        horizon: int = 1,
-        td_error: Optional[float] = None,
-        priority_reward: Optional[float] = None,
-    ):
-        """Store a transition; td_error is accepted for backward compatibility."""
-        _ = td_error  # Compatibility shim for previous PER variants
-
-        state_arr = self._to_state_array(state)
-        next_state_arr = self._to_state_array(next_state)
-
-        try:
-            action_idx = int(discrete_action)
-        except Exception:
-            action_idx = 0
-
-        try:
-            reward_val = float(reward)
-        except Exception:
-            reward_val = 0.0
-
-        if priority_reward is None:
-            priority_val = reward_val
-        else:
-            try:
-                priority_val = float(priority_reward)
-            except Exception:
-                priority_val = reward_val
-        if not math.isfinite(priority_val):
-            priority_val = reward_val
-
-        done_flag = bool(done)
-        actor_tag = self._normalize_actor(actor)
-
-        try:
-            horizon_val = int(horizon)
-        except Exception:
-            horizon_val = 1
-        if horizon_val < 1:
-            horizon_val = 1
-
-        try:
-            priority_score = abs(priority_val) + self._priority_eps
-            if not math.isfinite(priority_score):
-                priority_score = self._priority_eps
-            # Fresh samples should be visible quickly; boost to current max
-            priority_score = max(priority_score, self._max_priority)
-        except Exception:
-            priority_score = self._max_priority
-
-        with self._lock:
-            write_idx = self._main.add(
-                state_arr,
-                action_idx,
-                reward_val,
-                next_state_arr,
-                done_flag,
-                actor_tag,
-                horizon_val,
-                priority_score,
-            )
-            if write_idx >= 0:
-                self.pre_death_flags[write_idx] = False
-                if done_flag:
-                    self.terminal_indices.append(write_idx)
-                    self._mark_pre_death(write_idx)
-                # Track max priority to seed fresh samples
-                if priority_score > self._max_priority:
-                    self._max_priority = priority_score
-                if self._priority_tree is not None and self._priority_alpha > 0.0:
-                    encoded_priority = float(math.pow(priority_score, self._priority_alpha))
-                    self._priority_tree.update(write_idx, encoded_priority)
-                    self._priority_tree.size = self._main.size
-            self.size = self._main.size
-            self.position = self._main.position
-
-            bucket_idx = None
-            if self.priority_buckets_enabled and self.priority_segments:
-                score = float(abs(priority_val))
-                if not math.isfinite(score):
-                    score = 0.0
-                self._recent_scores.append(score)
-                self._total_additions += 1
-
-                if (
-                    self._total_additions % self._THRESHOLD_UPDATE_INTERVAL == 0
-                    and len(self._recent_scores) >= self._THRESHOLD_MIN_SAMPLES
-                ):
-                    self._update_priority_thresholds()
-                elif any(math.isinf(t) for t in self._priority_thresholds) and len(self._recent_scores) >= self._THRESHOLD_MIN_SAMPLES:
-                    self._update_priority_thresholds()
-
-                bucket_idx = self._select_priority_bucket(score, actor_tag)
-        if bucket_idx is not None and 0 <= bucket_idx < len(self.priority_segments):
-            self.priority_segments[bucket_idx].add(
-                state_arr,
-                action_idx,
-                reward_val,
-                next_state_arr,
-                done_flag,
-                actor_tag,
-                horizon_val,
-                priority_score,
-            )
-
-    def _mark_pre_death(self, terminal_idx: int) -> None:
-        if self._main.size <= 1:
-            return
-        lookback_span = self._pre_death_lookback_max
-        if self._pre_death_lookback_max > self._pre_death_lookback_min:
-            lookback_span = int(self._rng.integers(self._pre_death_lookback_min, self._pre_death_lookback_max + 1))
-        else:
-            lookback_span = self._pre_death_lookback_min
-
-        max_available = min(self._main.size - 1, lookback_span)
-        if max_available <= 0:
-            return
-
-        for offset in range(1, max_available + 1):
-            idx = terminal_idx - offset
-            if idx < 0:
-                if self._main.size < self._main.capacity:
-                    break
-                idx = (idx + self._main.capacity) % self._main.capacity
-            self.pre_death_flags[idx] = True
-
-    def _weighted_choice(self, candidates, priorities: np.ndarray, count: int) -> np.ndarray:
-        """Sample indices with optional priority weighting. Falls back to uniform for very large pools."""
-        if isinstance(candidates, (int, np.integer)):
-            cand_size = int(candidates)
-            as_array = False
-        else:
-            cand_size = candidates.size
-            as_array = True
-
-        if count <= 0 or cand_size == 0:
-            return np.zeros((0,), dtype=np.int64)
-        count = min(count, cand_size)
-
-        use_uniform = self._priority_alpha <= 0.0 or priorities is None or priorities.size == 0 or cand_size > self._priority_weight_cap
-        if use_uniform:
-            if as_array:
-                return self._rng.choice(candidates, size=count, replace=False)
-            return self._rng.choice(cand_size, size=count, replace=False)
-
-        safe_priorities = np.clip(priorities[: cand_size], self._priority_eps, None)
-        weights = np.power(safe_priorities, self._priority_alpha)
-        total = float(weights.sum())
-        if total <= 0.0 or not math.isfinite(total):
-            if as_array:
-                return self._rng.choice(candidates, size=count, replace=False)
-            return self._rng.choice(cand_size, size=count, replace=False)
-
-        probs = weights / total
-        if as_array:
-            idx = self._rng.choice(cand_size, size=count, replace=False, p=probs)
-            return candidates[idx]
-        return self._rng.choice(cand_size, size=count, replace=False, p=probs)
-
-    def _actor_balanced_fallback(self, batch_size: int):
-        """Ensure batches include enough DQN samples when actor mix is skewed."""
-        with self._lock:
-            if self._main.size < batch_size:
-                return None
-            actors = self._main.actors[: self._main.size]
-            dqn_indices = np.nonzero(actors == 'dqn')[0]
-            expert_indices = np.nonzero(actors == 'expert')[0]
-            priorities = self._main.priorities[: self._main.size]
-
-        if dqn_indices.size == 0:
-            return None
-
-        desired_dqn = max(int(math.ceil(batch_size * self._min_dqn_fraction)), 1)
-        desired_dqn = min(desired_dqn, dqn_indices.size, batch_size)
-        remaining = batch_size - desired_dqn
-        desired_expert = min(remaining, expert_indices.size)
-        remaining -= desired_expert
-
-        dqn_take = self._weighted_choice(dqn_indices, priorities[dqn_indices], desired_dqn)
-        expert_take = (
-            self._weighted_choice(expert_indices, priorities[expert_indices], desired_expert)
-            if desired_expert > 0
-            else np.zeros((0,), dtype=np.int64)
-        )
-
-        selected = np.concatenate([dqn_take, expert_take])
-        if remaining > 0:
-            pool = np.setdiff1d(np.arange(self._main.size), selected, assume_unique=False)
-            if pool.size > 0:
-                extra = self._weighted_choice(pool, priorities[pool], min(remaining, pool.size))
-                selected = np.concatenate([selected, extra])
-
-        if selected.size < batch_size:
-            return None
-
-        self._rng.shuffle(selected)
-        chunk = self._main.gather(selected)
-        states = torch.from_numpy(chunk[0]).float().to(device)
-        next_states = torch.from_numpy(chunk[3]).float().to(device)
-        discrete_actions = torch.from_numpy(chunk[1]).long().to(device)
-        rewards = torch.from_numpy(chunk[2]).float().to(device)
-        dones = torch.from_numpy(chunk[4]).float().to(device)
-        horizons = torch.from_numpy(chunk[6].astype(np.float32)).float().to(device)
-        return (
-            states,
-            discrete_actions,
-            rewards,
-            next_states,
-            dones,
-            chunk[5],
-            horizons,
-            selected.reshape(-1),
-        )
-
-    def sample(self, batch_size: int, return_indices: bool = False):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-
-        if self._per_tree_enabled:
-            return self._sample_per(batch_size, return_indices)
-
-        with self._lock:
-            if self._main.size < batch_size:
-                return None
-
-        priority_chunks = []
-        priority_indices = []
-        remaining = batch_size
-
-        if self._priority_buckets_enabled:
-            for segment in self.priority_segments:
-                if remaining <= 0:
-                    priority_chunks.append(None)
-                    priority_indices.append(None)
-                    continue
-
-                desired = int(batch_size * self._priority_sample_fraction)
-                desired = min(desired, remaining)
-                desired = min(desired, segment.size)
-
-                if desired <= 0:
-                    priority_chunks.append(None)
-                    priority_indices.append(None)
-                    continue
-
-                idx = self._weighted_choice(segment.size, segment.priorities[: segment.size], desired)
-                priority_chunks.append(segment.gather(idx))
-                priority_indices.append(np.full((idx.shape[0], 1), -1, dtype=np.int64))
-                remaining -= idx.shape[0]
-
-        predeath_chunk = None
-        predeath_indices = None
-        exclude_mask = None
-        desired_predeath = int(batch_size * self.pre_death_sample_fraction)
-        available_predeath = np.flatnonzero(self.pre_death_flags[: self._main.size]).astype(np.int64, copy=False)
-        if available_predeath.size > 0:
-            valid_mask = (available_predeath >= 0) & (available_predeath < self._main.size)
-            if not valid_mask.all():
-                available_predeath = available_predeath[valid_mask]
-        if desired_predeath > 0 and available_predeath.size > 0 and remaining > 0:
-            take = min(desired_predeath, available_predeath.size, remaining)
-            if take > 0:
-                selected_predeath = self._weighted_choice(
-                    available_predeath, self._main.priorities[available_predeath], take
-                )
-                if selected_predeath.size > 0:
-                    valid_mask = (selected_predeath >= 0) & (selected_predeath < self._main.size)
-                    selected_predeath = selected_predeath[valid_mask]
-                if selected_predeath.size > 0:
-                    predeath_chunk = self._main.gather(selected_predeath)
-                    predeath_indices = selected_predeath.reshape(-1, 1)
-                    remaining -= selected_predeath.size
-                    exclude_mask = np.zeros(self._main.size, dtype=bool)
-                    exclude_mask[selected_predeath] = True
-
-        main_chunk = None
-        main_indices = None
-        main_count = min(self._main.size, remaining)
-        if main_count > 0:
-            if exclude_mask is not None and exclude_mask.any():
-                available_pool = np.nonzero(~exclude_mask)[0]
-                if available_pool.size < main_count:
-                    main_count = available_pool.size
-                if main_count > 0:
-                    main_indices = self._weighted_choice(
-                        available_pool, self._main.priorities[available_pool], main_count
-                    )
+    def add(self, state, firezap_idx, spinner_idx, reward, next_state, done, actor='dqn'):
+        """Add experience to the appropriate buffer."""
+        experience = (state, firezap_idx, spinner_idx, reward, next_state, done)
+        
+        with self.lock:
+            if actor == 'expert':
+                self.buffer_expert.append(experience)
             else:
-                main_indices = self._weighted_choice(
-                    self._main.size, self._main.priorities[: self._main.size], main_count
-                )
-            if main_indices is not None and main_indices.size > 0:
-                main_chunk = self._main.gather(main_indices)
-                main_indices = main_indices.reshape(-1, 1)
+                self.buffer_agent.append(experience)
+            self.total_added += 1
 
-        sample_chunks = []
-        chunk_indices = []
-        for chunk, idx_chunk in zip(priority_chunks, priority_indices):
-            if chunk is not None:
-                sample_chunks.append(chunk)
-                chunk_indices.append(idx_chunk if idx_chunk is not None else np.full((chunk[0].shape[0], 1), -1, dtype=np.int64))
-        if predeath_chunk is not None:
-            sample_chunks.append(predeath_chunk)
-            chunk_indices.append(predeath_indices if predeath_indices is not None else np.full((predeath_chunk[0].shape[0], 1), -1, dtype=np.int64))
-        if main_chunk is not None:
-            sample_chunks.append(main_chunk)
-            chunk_indices.append(main_indices if main_indices is not None else np.full((main_chunk[0].shape[0], 1), -1, dtype=np.int64))
+    def sample(self, batch_size: int, expert_ratio: float):
+        """Sample a batch with guaranteed expert ratio."""
+        with self.lock:
+            n_expert = int(batch_size * expert_ratio)
+            n_agent = batch_size - n_expert
+            
+            # Adjust if not enough samples
+            if len(self.buffer_expert) < n_expert:
+                n_expert = len(self.buffer_expert)
+                n_agent = batch_size - n_expert # Try to fill with agent
+            
+            if len(self.buffer_agent) < n_agent:
+                n_agent = len(self.buffer_agent)
+                # If we still need more and have expert, take more expert? 
+                # For now, just return what we have, or smaller batch.
+            
+            if n_expert + n_agent == 0:
+                return None
 
-        states_list, discrete_list = [], []
-        rewards_list, next_states_list, dones_list = [], [], []
-        actors_list: List[str] = []
-        horizons_list = []
-        index_list = []
+            batch_expert = random.sample(self.buffer_expert, n_expert) if n_expert > 0 else []
+            batch_agent = random.sample(self.buffer_agent, n_agent) if n_agent > 0 else []
 
-        for chunk, idx_chunk in zip(sample_chunks, chunk_indices):
-            states_list.append(chunk[0])
-            discrete_list.append(chunk[1])
-            rewards_list.append(chunk[2])
-            next_states_list.append(chunk[3])
-            dones_list.append(chunk[4])
-            actors_list.extend(chunk[5])
-            horizons_list.append(chunk[6])
-            if idx_chunk is not None:
-                index_list.append(idx_chunk)
+            # Attach actor tags so training can apply expert-only supervision and report per-actor stats
+            batch = []
+            if batch_expert:
+                batch.extend([(state, fz, sp, r, ns, d, "expert") for (state, fz, sp, r, ns, d) in batch_expert])
+            if batch_agent:
+                batch.extend([(state, fz, sp, r, ns, d, "dqn") for (state, fz, sp, r, ns, d) in batch_agent])
+            random.shuffle(batch)  # Shuffle to mix them
 
-        states_np = np.concatenate(states_list, axis=0) if states_list else np.zeros((0, self.state_size), dtype=np.float32)
-        discrete_np = np.concatenate(discrete_list, axis=0) if discrete_list else np.zeros((0, 1), dtype=np.int64)
-        rewards_np = np.concatenate(rewards_list, axis=0) if rewards_list else np.zeros((0, 1), dtype=np.float32)
-        next_states_np = np.concatenate(next_states_list, axis=0) if next_states_list else np.zeros((0, self.state_size), dtype=np.float32)
-        dones_np = np.concatenate(dones_list, axis=0) if dones_list else np.zeros((0, 1), dtype=np.float32)
-        horizons_np = np.concatenate(horizons_list, axis=0) if horizons_list else np.zeros((0, 1), dtype=np.int32)
+            # Unzip
+            states, fz_idxs, sp_idxs, rewards, next_states, dones, actors = zip(*batch)
 
-        # If actor mix is too expert-heavy, resample a balanced batch from main buffer
-        if self._min_dqn_fraction > 0.0 and len(actors_list) > 0:
-            n_dqn = sum(1 for a in actors_list if a == "dqn")
-            frac_dqn = n_dqn / len(actors_list) if actors_list else 0.0
-            if frac_dqn < self._min_dqn_fraction:
-                balanced = self._actor_balanced_fallback(batch_size)
-                if balanced is not None:
-                    if return_indices:
-                        return balanced
-                    else:
-                        return balanced[:7]
-
-        states = torch.from_numpy(states_np).float().to(device)
-        next_states = torch.from_numpy(next_states_np).float().to(device)
-        discrete_actions = torch.from_numpy(discrete_np).long().to(device)
-        rewards = torch.from_numpy(rewards_np).float().to(device)
-        dones = torch.from_numpy(dones_np).float().to(device)
-        horizons = torch.from_numpy(horizons_np.astype(np.float32)).float().to(device)
-
-        if return_indices:
-            if not self._priority_buckets_enabled and self._min_dqn_fraction <= 0.0:
-                index_array = None
-            elif index_list:
-                index_array = np.concatenate(index_list, axis=0)
-            else:
-                index_array = np.full((0, 1), -1, dtype=np.int64)
             return (
-                states,
-                discrete_actions,
-                rewards,
-                next_states,
-                dones,
-                actors_list,
-                horizons,
-                None if index_array is None else index_array.reshape(-1),
+                np.array(states, dtype=np.float32),
+                np.array(fz_idxs, dtype=np.int64),
+                np.array(sp_idxs, dtype=np.int64),
+                np.array(rewards, dtype=np.float32),
+                np.array(next_states, dtype=np.float32),
+                np.array(dones, dtype=np.float32),
+                list(actors),
             )
-
-        return (
-            states,
-            discrete_actions,
-            rewards,
-            next_states,
-            dones,
-            actors_list,
-            horizons,
-        )
-
-    def _sample_tree_indices(self, count: int, total_alpha_sum: float | None = None) -> np.ndarray:
-        if count <= 0 or self._priority_tree is None:
-            return np.zeros((0,), dtype=np.int64)
-        total = float(total_alpha_sum) if total_alpha_sum is not None else self._priority_tree.total()
-        if total <= 0.0:
-            return self._rng.choice(self._main.size, size=count, replace=False)
-        masses = self._rng.random(count) * total
-        indices = np.empty((count,), dtype=np.int64)
-        for i, mass in enumerate(masses):
-            indices[i] = self._priority_tree.sample(float(mass))
-        return indices
-
-    def _sample_per(self, batch_size: int, return_indices: bool):
-        with self._lock:
-            if self._main.size < batch_size:
-                return None
-
-            total_alpha_sum = self._priority_tree.total() if self._priority_tree is not None else 0.0
-            if total_alpha_sum <= 0.0:
-                return None
-
-            beta = self._current_priority_beta()
-            current_size = self._main.size
-            predeath_indices = np.zeros((0,), dtype=np.int64)
-            predeath_alpha = np.zeros((0,), dtype=np.float32)
-            desired_predeath = int(batch_size * self.pre_death_sample_fraction)
-
-            if desired_predeath > 0:
-                available_predeath = np.flatnonzero(self.pre_death_flags[: self._main.size]).astype(np.int64, copy=False)
-                if available_predeath.size > 0:
-                    take = min(desired_predeath, available_predeath.size, batch_size)
-                    if take > 0:
-                        predeath_indices = self._weighted_choice(
-                            available_predeath,
-                            self._main.priorities[available_predeath],
-                            take,
-                        ).astype(np.int64, copy=False)
-                        if predeath_indices.size > 0:
-                            predeath_alpha = np.power(self._main.priorities[predeath_indices], self._priority_alpha)
-
-            remaining = batch_size - predeath_indices.size
-            tree_indices = self._sample_tree_indices(remaining, total_alpha_sum)
-            indices = tree_indices if predeath_indices.size == 0 else np.concatenate([predeath_indices, tree_indices])
-
-            if indices.size == 0:
-                return None
-
-            origin_is_predeath = (
-                np.concatenate(
-                    [np.ones((predeath_indices.size,), dtype=bool), np.zeros((tree_indices.size,), dtype=bool)]
-                )
-                if predeath_indices.size > 0
-                else np.zeros((indices.size,), dtype=bool)
-            )
-
-            shuffle_idx = self._rng.permutation(indices.size)
-            indices = indices[shuffle_idx]
-            origin_is_predeath = origin_is_predeath[shuffle_idx]
-
-            chunk = self._main.gather(indices)
-            actors_list = chunk[5]
-            priority_vals = self._main.priorities[indices].copy()
-
-        states = torch.from_numpy(chunk[0]).float().to(device)
-        discrete_actions = torch.from_numpy(chunk[1]).long().to(device)
-        rewards = torch.from_numpy(chunk[2]).float().to(device)
-        next_states = torch.from_numpy(chunk[3]).float().to(device)
-        dones = torch.from_numpy(chunk[4]).float().to(device)
-        horizons = torch.from_numpy(chunk[6].astype(np.float32)).float().to(device)
-
-        if self._min_dqn_fraction > 0.0 and len(actors_list) > 0:
-            n_dqn = sum(1 for a in actors_list if a == "dqn")
-            frac_dqn = n_dqn / len(actors_list)
-            if frac_dqn < self._min_dqn_fraction:
-                balanced = self._actor_balanced_fallback(batch_size)
-                if balanced is not None:
-                    if return_indices:
-                        return balanced
-                    return balanced[:7]
-
-        if not return_indices:
-            return (
-                states,
-                discrete_actions,
-                rewards,
-                next_states,
-                dones,
-                actors_list,
-                horizons,
-            )
-
-        # Importance sampling weights (batch-normalized)
-        priority_alpha = np.power(priority_vals, self._priority_alpha)
-        predeath_share = predeath_indices.size / float(batch_size) if batch_size > 0 else 0.0
-        predeath_alpha_sum = float(predeath_alpha.sum()) if predeath_alpha.size > 0 else 0.0
-
-        base_probs = priority_alpha / max(total_alpha_sum, self._priority_eps)
-        if predeath_share > 0.0 and predeath_alpha_sum > 0.0:
-            pre_probs = priority_alpha / max(predeath_alpha_sum, self._priority_eps)
-            sample_probs = np.where(
-                origin_is_predeath,
-                (predeath_share * pre_probs) + ((1.0 - predeath_share) * base_probs),
-                (1.0 - predeath_share) * base_probs,
-            )
-        else:
-            sample_probs = base_probs
-
-        sample_probs = np.clip(sample_probs, self._priority_eps, None)
-        weights = np.power(sample_probs * current_size, -beta)
-        max_w = weights.max() if weights.size > 0 else 1.0
-        if max_w > 0:
-            weights = weights / max_w
-
-        weight_tensor = torch.from_numpy(weights.astype(np.float32)).to(device)
-        return (
-            states,
-            discrete_actions,
-            rewards,
-            next_states,
-            dones,
-            actors_list,
-            horizons,
-            indices.reshape(-1),
-            weight_tensor,
-        )
-
-    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
-        """Update stored priorities using fresh TD-errors."""
-        if not (self._priority_buckets_enabled or self._per_tree_enabled):
-            return
-        try:
-            idx_array = np.asarray(indices, dtype=np.int64).reshape(-1)
-            pri_array = np.asarray(priorities, dtype=np.float32).reshape(-1)
-        except Exception:
-            return
-        if idx_array.size == 0 or pri_array.size == 0:
-            return
-        count = min(idx_array.size, pri_array.size)
-        idx_array = idx_array[:count]
-        pri_array = pri_array[:count]
-        with self._lock:
-            mask = (idx_array >= 0) & (idx_array < self._main.capacity)
-            if not mask.any():
-                return
-            idx_valid = idx_array[mask]
-            pri_valid = pri_array[mask]
-            safe_pri = np.abs(pri_valid) + self._priority_eps
-            safe_pri = np.where(np.isfinite(safe_pri), safe_pri, self._priority_eps)
-            self._main.priorities[idx_valid] = safe_pri
-            if self._priority_tree is not None and self._priority_alpha > 0.0:
-                encoded = np.power(safe_pri, self._priority_alpha)
-                self._priority_tree.batch_update(idx_valid, encoded)
-                self._priority_tree.size = self._main.size
-            max_new = float(np.max(safe_pri)) if safe_pri.size > 0 else self._max_priority
-            if max_new > self._max_priority:
-                self._max_priority = max_new
 
     def __len__(self):
-        with self._lock:
-            return self._main.size
-
-    def clear(self):
-        with self._lock:
-            self._main.clear()
-            for segment in self.priority_segments:
-                segment.clear()
-            self.size = self._main.size
-            self.position = self._main.position
-            self._recent_scores.clear()
-            self._priority_thresholds = [float('inf')] * len(self.priority_segments)
-            self._total_additions = 0
-            self._max_priority = 1.0
-            if self._priority_tree is not None:
-                self._priority_tree.clear()
+        with self.lock:
+            return len(self.buffer_agent) + len(self.buffer_expert)
 
     def get_partition_stats(self):
-        with self._lock:
-            main_fill_pct = (self._main.size / self._main.capacity * 100.0) if self._main.capacity > 0 else 0.0
-            stats = {
-                'total_size': self._main.size,
-                'total_capacity': self._main.capacity,
-                'priority_buckets_enabled': self.priority_buckets_enabled,
-                'per_enabled': self._per_tree_enabled,
-                'priority_bucket_count': self.n_buckets,
-                'main_size': self._main.size,
-                'main_actual_size': self._main.size,
-                'main_capacity': self._main.capacity,
-                'main_fill_pct': main_fill_pct,
-                'pre_death': int(self.pre_death_flags[: self._main.size].sum()),
+        with self.lock:
+            n_agent = len(self.buffer_agent)
+            n_expert = len(self.buffer_expert)
+            total = n_agent + n_expert
+            return {
+                'total_size': total,
+                'total_capacity': self.capacity * 2, # Roughly
+                'dqn': n_agent,
+                'expert': n_expert,
+                'frac_dqn': n_agent / total if total else 0,
+                'frac_expert': n_expert / total if total else 0
             }
-
-            if self.priority_buckets_enabled:
-                total_priority = 0
-                for idx, (label, segment) in enumerate(zip(self.bucket_labels, self.priority_segments)):
-                    fill_pct = (segment.size / segment.capacity * 100.0) if segment.capacity > 0 else 0.0
-                    stats[f'{label}_size'] = segment.size
-                    stats[f'{label}_actual_size'] = segment.size
-                    stats[f'{label}_capacity'] = segment.capacity
-                    stats[f'{label}_fill_pct'] = fill_pct
-                    threshold_val = self._priority_thresholds[idx] if idx < len(self._priority_thresholds) else float('inf')
-                    stats[f'{label}_threshold'] = threshold_val
-                    total_priority += segment.size
-                stats['total_priority_size'] = total_priority
-                stats['bucket_labels'] = list(self.bucket_labels)
-            else:
-                stats['total_priority_size'] = 0
-                stats['bucket_labels'] = []
-
-            return stats
-
+            
     def get_actor_composition(self):
-        with self._lock:
-            if self._main.size == 0:
-                return {'total': 0, 'dqn': 0, 'expert': 0, 'frac_dqn': 0.0, 'frac_expert': 0.0}
-            actors = self._main.actors[: self._main.size]
-            n_dqn = int(np.count_nonzero(actors == 'dqn'))
-            n_expert = int(np.count_nonzero(actors == 'expert'))
-            total = self._main.size
-        frac_dqn = float(n_dqn) / float(total) if total else 0.0
-        frac_expert = float(n_expert) / float(total) if total else 0.0
-        return {
-            'total': total,
-            'dqn': n_dqn,
-            'expert': n_expert,
-            'frac_dqn': frac_dqn,
-            'frac_expert': frac_expert,
-        }
-
-    def _update_priority_thresholds(self):
-        if not self.bucket_percentiles or not self._recent_scores:
-            return
-
-        scores = np.asarray(self._recent_scores, dtype=np.float32)
-        percentiles = np.asarray(self.bucket_percentiles, dtype=np.float32)
-        sorted_idx = np.argsort(percentiles)
-        sorted_percentiles = np.clip(percentiles[sorted_idx], 0.0, 0.999)
-
-        if scores.size == 1:
-            quantiles = np.full_like(sorted_percentiles, scores[0], dtype=np.float32)
-        else:
-            quantiles = np.quantile(scores, sorted_percentiles, method='nearest')
-
-        thresholds = np.zeros_like(percentiles, dtype=np.float32)
-        thresholds[sorted_idx] = quantiles
-        self._priority_thresholds = thresholds.tolist()
-
-    def _select_priority_bucket(self, score: float, actor_tag: str) -> Optional[int]:
-        if not self.priority_buckets_enabled or not self.priority_segments:
-            return None
-
-        if actor_tag == 'expert':
-            return 0
-
-        if score <= 0.0:
-            return None
-
-        fallback_idx = None
-        for idx, threshold in enumerate(self._priority_thresholds):
-            if math.isinf(threshold):
-                fallback_idx = idx
-                continue
-            if score >= threshold:
-                return idx
-
-        if fallback_idx is not None:
-            return fallback_idx
-
-        if self._priority_thresholds:
-            return len(self._priority_thresholds) - 1
-        return None
-
+        return self.get_partition_stats()
 
 class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""
     def __init__(self):
         self.platform = sys.platform
-        # Store module references or None if import failed
         self.msvcrt = msvcrt 
         self.termios = termios
         self.tty = tty
         self.fcntl = fcntl
-        
         self.fd = None
         self.old_settings = None
 
-        if not IS_INTERACTIVE:
-            return 
+        if not IS_INTERACTIVE: return 
 
-        if self.platform == 'win32':
-            if self.msvcrt:
-                print("KeyboardHandler: Using msvcrt for Windows.")
-        elif self.platform in ('linux', 'darwin'):
-            if self.termios: 
-                try:
-                    self.fd = sys.stdin.fileno()
-                    self.old_settings = self.termios.tcgetattr(self.fd)
-                    print(f"KeyboardHandler: Using termios/tty for {self.platform}.")
-                except self.termios.error as e:
-                    print(f"Warning: Failed to get terminal attributes: {e}. Keyboard input might be impaired.")
-                    self.fd = None 
-                    self.old_settings = None
-            else:
-                 print("Warning: Unix terminal modules failed to import. Keyboard input disabled.")
+        if self.platform == 'win32' and self.msvcrt:
+            pass
+        elif self.platform in ('linux', 'darwin') and self.termios:
+            try:
+                self.fd = sys.stdin.fileno()
+                self.old_settings = self.termios.tcgetattr(self.fd)
+            except Exception:
+                self.fd = None
         else:
-            print(f"Warning: Unsupported platform '{self.platform}' for KeyboardHandler. Keyboard input disabled.")
+            pass
 
     def setup_terminal(self):
-        """Set the terminal to raw/non-blocking (Unix-only)."""
-        if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
-            # Use instance attributes to check if modules were imported successfully
-            if self.tty and self.fcntl and self.termios:
-                try:
-                    self.tty.setraw(self.fd)
-                    flags = self.fcntl.fcntl(self.fd, self.fcntl.F_GETFL)
-                    self.fcntl.fcntl(self.fd, self.fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                except self.termios.error as e:
-                    print(f"Warning: Could not set terminal to raw/non-blocking mode: {e}")
-            else:
-                 print("Warning: Required Unix terminal modules not available, cannot set raw mode.")
-        # No setup needed for Windows msvcrt
+        if self.platform in ('linux', 'darwin') and self.fd is not None and self.tty and self.fcntl:
+            try:
+                self.tty.setraw(self.fd)
+                flags = self.fcntl.fcntl(self.fd, self.fcntl.F_GETFL)
+                self.fcntl.fcntl(self.fd, self.fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            except Exception: pass
 
     def __enter__(self):
         self.setup_terminal()
@@ -1537,1114 +498,400 @@ class KeyboardHandler:
         self.restore_terminal()
         
     def check_key(self):
-        """Check for keyboard input non-blockingly (cross-platform)."""
-        if not IS_INTERACTIVE:
-            return None
-
+        if not IS_INTERACTIVE: return None
         try:
             if self.platform == 'win32' and self.msvcrt:
                 if self.msvcrt.kbhit():
-                    # Read the byte and decode assuming simple ASCII/UTF-8 key
-                    key_byte = self.msvcrt.getch()
-                    try:
-                        return key_byte.decode('utf-8')
-                    except UnicodeDecodeError:
-                        return None # Or handle special keys differently
-                else:
-                    return None # No key waiting on Windows
-            elif self.platform in ('linux', 'darwin') and self.fd is not None:
-                 # Check if required modules are available via instance attributes
-                 if self.termios and select: # Need termios for setup, select for check
-                     try:
-                         if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
-                             return sys.stdin.read(1)
-                         else:
-                             return None 
-                     except Exception as e:
-                        return None
-                 else:
-                     print("Warning: Unix termios/select modules not available for key check.")
-                     return None
-            else:
-                return None
-        except (IOError, TypeError) as e:
-            return None
+                    return self.msvcrt.getch().decode('utf-8')
+            elif self.platform in ('linux', 'darwin') and self.fd is not None and select:
+                 if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+                     return sys.stdin.read(1)
+        except Exception: pass
+        return None
 
     def restore_terminal(self):
-        """Restore original terminal settings (Unix-only)."""
-        if self.platform in ('linux', 'darwin') and self.fd is not None and self.old_settings is not None:
-             # Check if termios module is available via instance attribute
-             if self.termios:
-                try:
-                    self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.old_settings)
-                except self.termios.error as e:
-                    print(f"Warning: Could not restore terminal settings: {e}")
-             else:
-                 print("Warning: Unix termios module not available for restore.")
-        # No restore needed for Windows msvcrt
+        if self.platform in ('linux', 'darwin') and self.fd is not None and self.termios:
+            try:
+                self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.old_settings)
+            except Exception: pass
 
     def set_raw_mode(self):
-        """Set terminal back to raw mode (Unix-only)."""
-        if self.platform in ('linux', 'darwin') and self.fd is not None:
-             # Check if tty/termios modules are available via instance attributes
-             if self.tty and self.termios:
-                try:
-                    self.tty.setraw(self.fd)
-                except self.termios.error as e: 
-                    print(f"Warning: Could not set terminal to raw mode: {e}")
-             else:
-                  print("Warning: Unix tty/termios modules not available for set_raw_mode.")
-        # No equivalent needed for Windows msvcrt
+        if self.platform in ('linux', 'darwin') and self.fd is not None and self.tty:
+            try: self.tty.setraw(self.fd)
+            except Exception: pass
 
 def print_with_terminal_restore(kb_handler, *args, **kwargs):
-    """Print with proper terminal settings (cross-platform safe)."""
-    # Only attempt restore/set_raw if on Unix and handler is valid
     is_unix_like = kb_handler and kb_handler.platform in ('linux', 'darwin')
-    
-    if IS_INTERACTIVE and is_unix_like:
-        kb_handler.restore_terminal()
-        
-    # Standard print call - works on all platformse
+    if IS_INTERACTIVE and is_unix_like: kb_handler.restore_terminal()
     print(*args, **kwargs, flush=True)
-    
-    if IS_INTERACTIVE and is_unix_like:
-        kb_handler.set_raw_mode()
+    if IS_INTERACTIVE and is_unix_like: kb_handler.set_raw_mode()
 
 def setup_environment():
-    """Set up environment for socket server"""
     os.makedirs(MODEL_DIR, exist_ok=True)
 
+class DiscreteDQNAgent:
+    """Agent using DiscreteDQN with two heads and StratifiedReplayBuffer."""
 
-class HybridDQNAgent:
-    """Simplified hybrid DQN agent focused on fast uniform replay."""
-
-    def __init__(
-        self,
-        state_size,
-        discrete_actions: int = 4,
-        learning_rate: float = RL_CONFIG.lr,
-        gamma: float = RL_CONFIG.gamma,
-        epsilon: float = RL_CONFIG.epsilon,
-        epsilon_min: float = RL_CONFIG.epsilon_min,
-        memory_size: int = RL_CONFIG.memory_size,
-        batch_size: int = RL_CONFIG.batch_size,
-    ):
+    def __init__(self, state_size, discrete_actions=None, learning_rate=RL_CONFIG.lr, 
+                 gamma=RL_CONFIG.gamma, epsilon=RL_CONFIG.epsilon, memory_size=RL_CONFIG.memory_size, 
+                 batch_size=RL_CONFIG.batch_size):
         self.state_size = int(state_size)
-        self.fire_zap_actions = int(discrete_actions)
-        self.spinner_actions = max(1, NUM_SPINNER_BUCKETS)
-        self.discrete_actions = max(1, self.fire_zap_actions * self.spinner_actions)
         self.learning_rate = float(learning_rate)
         self.gamma = float(gamma)
         self.epsilon = float(epsilon)
-        self.epsilon_min = float(epsilon_min)
         self.batch_size = int(batch_size)
         self.device = device
-        self.n_step = int(getattr(RL_CONFIG, "n_step", 1) or 1)
 
-        self.qnetwork_local = HybridDQN(
-            state_size=self.state_size,
-            discrete_actions=self.discrete_actions,
-            hidden_size=RL_CONFIG.hidden_size,
-            num_layers=RL_CONFIG.num_layers,
-        ).to(self.device)
-
-        self.qnetwork_target = HybridDQN(
-            state_size=self.state_size,
-            discrete_actions=self.discrete_actions,
-            hidden_size=RL_CONFIG.hidden_size,
-            num_layers=RL_CONFIG.num_layers,
-        ).to(self.device)
+        self.qnetwork_local = DiscreteDQN(state_size=self.state_size).to(self.device)
+        self.qnetwork_target = DiscreteDQN(state_size=self.state_size).to(self.device)
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
         self.qnetwork_target.eval()
         self.qnetwork_local.train()
 
-        # Inference uses the same weights but we toggle eval/train inside act()
-        self.qnetwork_inference = self.qnetwork_local
-
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=self.learning_rate)
-        self.memory = HybridReplayBuffer(memory_size, state_size=self.state_size)
-        self.n_step_buffer = NStepReplayBuffer(self.n_step, self.gamma) if self.n_step > 1 else None
-
-        self.amp_enabled = (
-            self.device.type == "cuda"
-            and torch.cuda.is_available()
-            and bool(getattr(RL_CONFIG, 'enable_amp', True))
-        )
-        if self.amp_enabled:
-            try:
-                if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-                    self.amp_scaler = torch.amp.GradScaler(device="cuda")
-                else:
-                    self.amp_scaler = torch.cuda.amp.GradScaler()
-            except AttributeError:
-                self.amp_scaler = None
-                self.amp_enabled = False
-        else:
-            self.amp_scaler = None
+        self.memory = StratifiedReplayBuffer(memory_size, state_size=self.state_size)
 
         self.training_enabled = True
         self.training_steps = 0
-        self.last_target_update_step = 0
-        self.last_save_time = 0.0
-
         self.train_queue = queue.Queue(maxsize=10000)
         self.running = True
-        self.training_threads: list[threading.Thread] = []
-        self.num_training_workers = int(getattr(RL_CONFIG, 'training_workers', 1) or 1)
-        self.training_lock = threading.Lock()
+        self.training_threads = []
+        
+        worker = threading.Thread(target=self.background_train, daemon=True, name="TrainWorker")
+        worker.start()
+        self.training_threads.append(worker)
 
-        for idx in range(self.num_training_workers):
-            worker = threading.Thread(
-                target=self.background_train,
-                daemon=True,
-                name=f"TrainWorker-{idx}",
-            )
-            worker.start()
-            self.training_threads.append(worker)
-
-    def _sample_fire_zap_action(self) -> int:
-        """Sample a fire/zap combination with optional zap discount."""
-        base_actions = max(1, self.fire_zap_actions)
-        zap_discount = float(getattr(RL_CONFIG, 'epsilon_random_zap_discount', 0.0) or 0.0)
-        if zap_discount <= 0.0 or base_actions <= 1:
-            return random.randrange(base_actions)
-
-        zap_indices = [idx for idx in (1, 3) if idx < base_actions]
-        non_zap_indices = [idx for idx in range(base_actions) if idx not in zap_indices]
-
-        if not zap_indices or not non_zap_indices:
-            return random.randrange(base_actions)
-
-        base_prob = 1.0 / float(base_actions)
-        max_discount = max(0.0, (base_prob * len(zap_indices)) - 1e-6)
-        total_discount = min(zap_discount, max_discount)
-
-        per_zap = total_discount / len(zap_indices)
-        per_non = total_discount / len(non_zap_indices)
-
-        probs = [base_prob for _ in range(base_actions)]
-        for idx in zap_indices:
-            probs[idx] = max(0.0, probs[idx] - per_zap)
-        for idx in non_zap_indices:
-            probs[idx] = max(0.0, min(1.0, probs[idx] + per_non))
-
-        r = random.random()
-        cumulative = 0.0
-        for idx, prob in enumerate(probs):
-            cumulative += prob
-            if r < cumulative:
-                return idx
-        return base_actions - 1
-
-    def _sample_random_action_index(self) -> int:
-        fire_zap_idx = self._sample_fire_zap_action()
-        spinner_idx = random.randrange(self.spinner_actions)
-        return compose_action_index(fire_zap_idx, spinner_idx)
-
-    def _queue_training_steps(self, n_steps: int):
-        for _ in range(max(0, n_steps)):
+    def act(self, state, epsilon: float, add_noise: bool = False):
+        """Return (fire_zap_idx, spinner_idx)."""
+        if random.random() < epsilon:
+            # Epsilon exploration: bias away from random zaps (they're often catastrophic noise)
+            # Actions 0..3 encode (fire,zap) as (bit1,bit0). Zap actions are 1 and 3.
             try:
-                self.train_queue.put_nowait(1)
-                metrics.training_steps_requested_interval += 1
-            except queue.Full:
-                try:
-                    metrics.training_steps_missed_interval += 1
-                    metrics.total_training_steps_missed += 1
-                except Exception:
-                    pass
-                break
+                zap_discount = float(getattr(RL_CONFIG, "epsilon_random_zap_discount", 1.0) or 1.0)
+                if not math.isfinite(zap_discount):
+                    zap_discount = 1.0
+                zap_discount = max(0.0, min(1.0, zap_discount))
+            except Exception:
+                zap_discount = 1.0
 
-    def act(self, state, epsilon: float, add_noise: bool):
-        state_arr = np.asarray(state, dtype=np.float32).reshape(-1)
-        if state_arr.size < self.state_size:
-            padded = np.zeros((self.state_size,), dtype=np.float32)
-            padded[:state_arr.size] = state_arr
-            state_arr = padded
-        elif state_arr.size > self.state_size:
-            state_arr = state_arr[:self.state_size]
+            if zap_discount >= 1.0:
+                fz = random.randrange(FIRE_ZAP_ACTIONS)
+            else:
+                weights = (1.0, zap_discount, 1.0, zap_discount)
+                total = sum(weights)
+                pick = random.random() * total
+                running = 0.0
+                fz = 0
+                for idx, w in enumerate(weights):
+                    running += w
+                    if pick <= running:
+                        fz = idx
+                        break
+            sp = random.randrange(NUM_SPINNER_BUCKETS)
+            return fz, sp
 
-        state_tensor = torch.from_numpy(state_arr).float().unsqueeze(0).to(self.device)
-
-        use_noisy = bool(getattr(self.qnetwork_local, "use_noisy", False))
+        state_t = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
         self.qnetwork_local.eval()
         with torch.no_grad():
-            q_values = self.qnetwork_local(state_tensor)
+            q_fz, q_sp = self.qnetwork_local(state_t)
         self.qnetwork_local.train()
+        
+        fz = int(q_fz.argmax(dim=1).item())
+        sp = int(q_sp.argmax(dim=1).item())
+        return fz, sp
 
-        if random.random() < epsilon:
-            return self._sample_random_action_index()
-
-        return int(q_values.argmax(dim=1).item())
-
-    def step(
-        self,
-        state,
-        discrete_action,
-        reward,
-        next_state,
-        done,
-        actor,
-        horizon,
-        priority_reward: Optional[float] = None,
-    ):
-        if self.n_step_buffer is not None:
-            experiences = self.n_step_buffer.add(
-                state,
-                discrete_action,
-                reward,
-                next_state,
-                done,
-                actor=actor,
-                priority_reward=priority_reward,
-            )
-            if experiences:
-                for (
-                    exp_state,
-                    exp_action,
-                    exp_reward,
-                    exp_priority_reward,
-                    exp_next_state,
-                    exp_done,
-                    exp_steps,
-                    exp_actor,
-                ) in experiences:
-                    self.memory.push(
-                        exp_state,
-                        exp_action,
-                        exp_reward,
-                        exp_next_state,
-                        exp_done,
-                        actor=exp_actor,
-                        horizon=exp_steps,
-                        priority_reward=exp_priority_reward,
-                    )
-        else:
-            self.memory.push(
-                state,
-                discrete_action,
-                reward,
-                next_state,
-                done,
-                actor=actor,
-                horizon=horizon,
-                priority_reward=priority_reward,
-            )
-
-        try:
-            metrics.memory_buffer_size = len(self.memory)
-        except Exception:
-            pass
-
-        if not self.training_enabled:
-            return
-
-        global_training_enabled = bool(getattr(metrics, 'training_enabled', True))
-        if not global_training_enabled:
-            return
-
-        steps_per_sample = int(getattr(RL_CONFIG, 'training_steps_per_sample', 1) or 1)
-        self._queue_training_steps(steps_per_sample)
+    def step(self, state, action, reward, next_state, done, actor='dqn', horizon=1, priority_reward=None):
+        # action is (fire_zap_idx, spinner_idx)
+        fz_idx, sp_idx = action
+        self.memory.add(state, fz_idx, sp_idx, reward, next_state, done, actor)
+        
+        if self.training_enabled:
+            try:
+                if hasattr(metrics, 'training_steps_requested_interval'):
+                    metrics.training_steps_requested_interval += 1
+                self.train_queue.put(1, block=False)
+            except queue.Full:
+                if hasattr(metrics, 'training_steps_missed_interval'):
+                    metrics.training_steps_missed_interval += 1
+                    metrics.total_training_steps_missed += 1
+                pass
 
     def background_train(self):
         while self.running:
             try:
                 token = self.train_queue.get(timeout=0.1)
+                if token is None: break
+                train_step(self)
+                self.train_queue.task_done()
             except queue.Empty:
                 continue
-
-            if token is None:
-                self.train_queue.task_done()
-                break
-
-            if not self.training_enabled or not getattr(metrics, 'training_enabled', True):
-                self.train_queue.task_done()
-                continue
-
-            try:
-                with self.training_lock:
-                    train_step(self)
-            except Exception as exc:
-                print(f"Training error: {exc}")
+            except Exception as e:
+                print(f"Training error: {e}")
                 traceback.print_exc()
-            finally:
-                self.train_queue.task_done()
 
-    def train_step(self):
-        return train_step(self)
-
-    def _apply_target_update(self):
-        if getattr(RL_CONFIG, 'use_soft_target_update', False):
-            tau = float(getattr(RL_CONFIG, 'soft_target_tau', 0.005) or 0.005)
-            with torch.no_grad():
-                for tgt_param, src_param in zip(
-                    self.qnetwork_target.parameters(),
-                    self.qnetwork_local.parameters(),
-                ):
-                    tgt_param.data.mul_(1.0 - tau).add_(src_param.data, alpha=tau)
-        else:
-            update_freq = int(getattr(RL_CONFIG, 'target_update_freq', 500) or 500)
-            if update_freq > 0 and self.training_steps % update_freq == 0:
-                self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
-                try:
-                    metrics.last_target_update_step = self.training_steps
-                    metrics.last_target_update_time = time.time()
-                    metrics.last_target_update_frame = metrics.frame_count
-                except Exception:
-                    pass
-
-    def update_target_network(self):
-        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+    def save(self, filepath, now=None, is_forced_save=False):
+        # Persist lightweight training progress so restarts keep long-run counters (Frame/Steps).
         try:
-            metrics.last_target_update_time = time.time()
-            metrics.last_target_update_frame = metrics.frame_count
-            metrics.last_target_update_step = self.training_steps
-            metrics.last_hard_target_update_frame = metrics.frame_count
-            metrics.last_hard_target_update_time = metrics.last_target_update_time
+            with metrics.lock:
+                frame_count = int(getattr(metrics, 'frame_count', 0))
+                total_training_steps = int(getattr(metrics, 'total_training_steps', self.training_steps))
+                total_training_steps_missed = int(getattr(metrics, 'total_training_steps_missed', 0))
+                expert_ratio = float(getattr(metrics, 'expert_ratio', RL_CONFIG.expert_ratio_start))
+                epsilon = float(getattr(metrics, 'epsilon', RL_CONFIG.epsilon_start))
         except Exception:
-            pass
-
-    def force_hard_target_update(self):
-        self.update_target_network()
-
-    def set_training_enabled(self, enabled: bool):
-        self.training_enabled = bool(enabled)
-        try:
-            metrics.training_enabled = bool(enabled)
-        except Exception:
-            pass
-        if not self.training_enabled:
-            try:
-                while not self.train_queue.empty():
-                    self.train_queue.get_nowait()
-                    self.train_queue.task_done()
-            except Exception:
-                pass
-
-    def stop(self, join: bool = True, timeout: float = 2.0):
-        self.running = False
-        try:
-            self.train_queue.put_nowait(None)
-        except Exception:
-            pass
-        if join:
-            for worker in self.training_threads:
-                try:
-                    worker.join(timeout=timeout)
-                except Exception:
-                    pass
-
-    def get_learning_rate(self) -> float:
-        try:
-            return float(self.optimizer.param_groups[0]['lr'])
-        except Exception:
-            return self.learning_rate
-
-    def adjust_learning_rate(self, delta: float, kb_handler=None) -> float:
-        current_lr = self.get_learning_rate()
-        new_lr = max(1e-6, current_lr + float(delta))
-        for group in self.optimizer.param_groups:
-            group['lr'] = new_lr
-        self.learning_rate = new_lr
-        try:
-            metrics.manual_lr_override = True
-            metrics.manual_learning_rate = new_lr
-        except Exception:
-            pass
-        message = f"\nLearning rate adjusted to {new_lr:.6f}\r"
-        if kb_handler and IS_INTERACTIVE:
-            try:
-                print_with_terminal_restore(kb_handler, message)
-            except Exception:
-                print(message.strip())
-        else:
-            print(message.strip())
-        return new_lr
-
-    def save(self, filepath, now=None, is_forced_save: bool = False):
-        if now is None:
-            now = time.time()
-
-        self.update_target_network()
-
-        try:
-            if metrics.expert_mode or metrics.override_expert:
-                ratio_to_save = metrics.saved_expert_ratio
-            else:
-                ratio_to_save = metrics.expert_ratio
-        except Exception:
-            ratio_to_save = float(getattr(metrics, 'expert_ratio', RL_CONFIG.expert_ratio_start))
+            frame_count = 0
+            total_training_steps = int(self.training_steps)
+            total_training_steps_missed = 0
+            expert_ratio = float(getattr(RL_CONFIG, 'expert_ratio_start', 0.0))
+            epsilon = float(getattr(RL_CONFIG, 'epsilon_start', 0.0))
 
         checkpoint = {
             'local_state_dict': self.qnetwork_local.state_dict(),
             'target_state_dict': self.qnetwork_target.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'training_steps': self.training_steps,
-            'state_size': self.state_size,
-            'discrete_actions': self.discrete_actions,
-            'memory_size': len(self.memory),
-            'architecture': 'simple_hybrid',
-            'frame_count': int(getattr(metrics, 'frame_count', 0)),
-            'epsilon': float(getattr(metrics, 'epsilon', RL_CONFIG.epsilon_start)),
-            'expert_ratio': float(ratio_to_save),
-            'last_decay_step': int(getattr(metrics, 'last_decay_step', 0)),
-            'last_epsilon_decay_step': int(getattr(metrics, 'last_epsilon_decay_step', 0)),
-            'episode_rewards': list(getattr(metrics, 'episode_rewards', []) or []),
-            'dqn_rewards': list(getattr(metrics, 'dqn_rewards', []) or []),
-            'expert_rewards': list(getattr(metrics, 'expert_rewards', []) or []),
+            'frame_count': frame_count,
+            'total_training_steps': total_training_steps,
+            'total_training_steps_missed': total_training_steps_missed,
+            'expert_ratio': expert_ratio,
+            'epsilon': epsilon,
         }
         torch.save(checkpoint, filepath)
-        self.last_save_time = now
         if is_forced_save:
-            print(f"Model saved to {filepath} (frame {getattr(metrics, 'frame_count', 0)})")
+            print(f"Model saved to {filepath}")
 
     def load(self, filepath):
-        if not os.path.exists(filepath):
-            print(f"No checkpoint found at {filepath}. Starting fresh model.")
-            return False
-
+        if not os.path.exists(filepath): return False
         try:
             checkpoint = torch.load(filepath, map_location=self.device)
-            local_sd = checkpoint.get('local_state_dict', {})
-            target_sd = checkpoint.get('target_state_dict', {})
+            self.qnetwork_local.load_state_dict(checkpoint['local_state_dict'], strict=False)
+            self.qnetwork_target.load_state_dict(checkpoint['target_state_dict'], strict=False)
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.training_steps = checkpoint.get('training_steps', 0)
 
+            # Restore long-run counters for display/schedules (optional fields in older checkpoints)
             try:
-                self.qnetwork_local.load_state_dict(local_sd)
-            except Exception as e:
-                print(f"Warning: strict load failed for local network ({e}); retrying non-strict.")
-                self.qnetwork_local.load_state_dict(local_sd, strict=False)
-
-            try:
-                self.qnetwork_target.load_state_dict(target_sd)
-            except Exception as e:
-                print(f"Warning: strict load failed for target network ({e}); retrying non-strict.")
-                self.qnetwork_target.load_state_dict(target_sd, strict=False)
-
-            try:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except Exception as e:
-                print(f"Warning: could not load optimizer state ({e}); continuing with fresh optimizer.")
-            self.training_steps = int(checkpoint.get('training_steps', 0))
-
-            try:
-                metrics.frame_count = int(checkpoint.get('frame_count', 0))
-                metrics.loaded_frame_count = metrics.frame_count
-                metrics.epsilon = float(checkpoint.get('epsilon', RL_CONFIG.epsilon_start))
-                metrics.expert_ratio = float(checkpoint.get('expert_ratio', RL_CONFIG.expert_ratio_start))
-                metrics.last_decay_step = int(checkpoint.get('last_decay_step', 0))
-                metrics.last_epsilon_decay_step = int(checkpoint.get('last_epsilon_decay_step', 0))
+                with metrics.lock:
+                    if not RESET_METRICS:
+                        metrics.expert_ratio = checkpoint.get('expert_ratio', RL_CONFIG.expert_ratio_start)
+                        metrics.epsilon = checkpoint.get('epsilon', RL_CONFIG.epsilon_start)
+                        metrics.frame_count = int(checkpoint.get('frame_count', 0))
+                        metrics.loaded_frame_count = int(getattr(metrics, 'frame_count', 0))
+                        metrics.total_training_steps = int(checkpoint.get('total_training_steps', self.training_steps))
+                        metrics.total_training_steps_missed = int(checkpoint.get('total_training_steps_missed', 0))
+                    else:
+                        # Fresh-run counters/UI state while still loading weights.
+                        metrics.expert_ratio = RL_CONFIG.expert_ratio_start
+                        metrics.epsilon = RL_CONFIG.epsilon_start
+                        metrics.frame_count = 0
+                        metrics.loaded_frame_count = 0
+                        metrics.total_training_steps = int(self.training_steps)
+                        metrics.total_training_steps_missed = 0
             except Exception:
                 pass
 
-            print(f"Loaded simplified hybrid model from {filepath}")
+            print(f"Loaded model from {filepath}")
             return True
-        except Exception as exc:
-            print(f"Error loading checkpoint {filepath}: {exc}")
-            traceback.print_exc()
+        except Exception as e:
+            print(f"Error loading {filepath}: {e}")
             return False
 
     def get_q_value_range(self):
-        try:
-            with torch.no_grad():
-                if len(self.memory) >= max(32, self.batch_size // 2):
-                    sample = self.memory.sample(min(len(self.memory), 256))
-                    if sample is not None:
-                        states = sample[0]
-                        q_values = self.qnetwork_local(states)
-                        return float(q_values.min().item()), float(q_values.max().item())
-                dummy = torch.zeros(1, self.state_size, device=self.device)
-                q_values = self.qnetwork_local(dummy)
-                return float(q_values.min().item()), float(q_values.max().item())
-        except Exception:
+        """Return (min_q, max_q) from the current Q-network on a sample batch."""
+        if len(self.memory) < 32:
             return float('nan'), float('nan')
+        
+        # Sample a small batch to estimate Q-range
+        # Use 0.5 ratio to get a mix if possible, or just whatever is available
+        batch = self.memory.sample(32, 0.5) 
+        if not batch: return float('nan'), float('nan')
+        
+        states = batch[0]
+        states_t = torch.from_numpy(states).float().to(self.device)
+        
+        self.qnetwork_local.eval()
+        with torch.no_grad():
+            q_fz, q_sp = self.qnetwork_local(states_t)
+            min_q = min(q_fz.min().item(), q_sp.min().item())
+            max_q = max(q_fz.max().item(), q_sp.max().item())
+        self.qnetwork_local.train()
+        
+        return min_q, max_q
 
+    def stop(self):
+        self.running = False
+        # Clear queue to ensure shutdown signal is received
+        try:
+            while not self.train_queue.empty():
+                self.train_queue.get_nowait()
+                self.train_queue.task_done()
+        except Exception:
+            pass
+            
+        try:
+            self.train_queue.put(None, block=False)
+        except queue.Full:
+            pass
+            
+        for t in self.training_threads: 
+            t.join(timeout=2.0)
 
-Agent = HybridDQNAgent
+# Alias for compatibility
+HybridDQNAgent = DiscreteDQNAgent
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
-    """Parse binary frame data from Lua into game state - SIMPLIFIED with float32 payload"""
     try:
-        if not data or len(data) < 10:  # Minimal size check
-            print("ERROR: Received empty or too small data packet", flush=True)
-            sys.exit(1)
-
-        # Fixed OOB header format (must match Lua exactly). Precompute once.
-        # Format: ">HddBBBHIBBBhhBBBBB"  (reward and attract removed)
-        global _FMT_OOB, _HDR_OOB
-        try:
-            _FMT_OOB
-        except NameError:
-            _FMT_OOB = ">HddBBBHIBBBhhBBBBB"
-            _HDR_OOB = struct.calcsize(_FMT_OOB)
-
-        if len(data) < _HDR_OOB:
-            print(f"ERROR: Received data too small: {len(data)} bytes, need {_HDR_OOB}", flush=True)
-            sys.exit(1)
-
-        values = struct.unpack(_FMT_OOB, data[:_HDR_OOB])
-        (num_values, subjreward, objreward, gamestate, game_mode, done, frame_counter, score,
-         save_signal, fire, zap, spinner, nearest_enemy, player_seg, is_open,
-         expert_fire, expert_zap, level_number) = values
-        header_size = _HDR_OOB
-
-        # Apply subjective/objective reward scaling and compute total
-        subjreward = float(subjreward) * float(getattr(RL_CONFIG, 'subj_reward_scale', 1.0) or 1.0)
-        objreward = float(objreward) * float(getattr(RL_CONFIG, 'obj_reward_scale', 1.0) or 1.0)
+        if not data or len(data) < 10: return None
         
-        if (ignore_subj_reward := getattr(RL_CONFIG, 'ignore_subjective_rewards', True)):
-            reward = objreward
-        else:
-            reward = float(subjreward + objreward)
-
-        state_data = memoryview(data)[header_size:]
-
-        # SIMPLIFIED: Parse as float32 array directly (no complex normalization needed!)
-        try:
-            # Each float32 is 4 bytes, big-endian format
-            expected_bytes = num_values * 4
-            if len(state_data) < expected_bytes:
-                print(f"ERROR: Expected {expected_bytes} bytes for {num_values} floats, got {len(state_data)}", flush=True)
-                sys.exit(1)
-
-            state = np.frombuffer(state_data, dtype='>f4', count=num_values)  # big-endian float32
-            state = state.astype(np.float32)  # Ensure correct dtype
-
-        except ValueError as e:
-            print(f"ERROR: frombuffer failed: {e}", flush=True)
-            sys.exit(1)
-
-        if state.size != num_values:
-            print(f"ERROR: Expected {num_values} state values but got {state.size}", flush=True)
-            sys.exit(1)
-
-        # CRITICAL: Check for NaN/Inf values that would cause training instability
-        nan_count = np.sum(np.isnan(state))
-        inf_count = np.sum(np.isinf(state))
-        if nan_count > 0 or inf_count > 0:
-            print(
-                f"[CRITICAL] Frame {frame_counter}: {nan_count} NaN values, {inf_count} Inf values detected! "
-                f"This will cause training instability!",
-                flush=True,
-            )
-
-        # Ensure all values are in expected range [-1, 1] with warnings for issues
-        # Allow small floating point precision errors (±0.01)
-        out_of_range_count = np.sum((state < -1.01) | (state > 1.01))
-        if out_of_range_count > 0:
-            # Debug: identify which values are out of range
-            out_of_range_indices = np.where((state < -1.01) | (state > 1.01))[0]
-            out_of_range_values = state[out_of_range_indices]
-            print(f"[WARNING] Frame {frame_counter}: {out_of_range_count} values outside [-1,1] range", flush=True)
-            print(f"[DEBUG] Out-of-range indices: {out_of_range_indices[:10]}...")  # Show first 10
-            print(f"[DEBUG] Out-of-range values: {out_of_range_values[:10]}...")  # Show first 10 values
-            state = np.clip(state, -1.0, 1.0)
-
-        frame_data = FrameData(
+        # Format: ">HddBBBHIBBBhhBBBBB"
+        fmt = ">HddBBBHIBBBhhBBBBB"
+        hdr_size = struct.calcsize(fmt)
+        
+        if len(data) < hdr_size: return None
+        
+        values = struct.unpack(fmt, data[:hdr_size])
+        (num_values, subj, obj, gamestate, mode, done, frame, score,
+         save, fire, zap, spinner, enemy, player, open_lvl,
+         exp_fire, exp_zap, level) = values
+         
+        state_data = data[hdr_size:]
+        state = np.frombuffer(state_data, dtype='>f4', count=num_values).astype(np.float32)
+        
+        return FrameData(
             state=state,
-            subjreward=float(subjreward),
-            objreward=float(objreward),
+            subjreward=float(subj),
+            objreward=float(obj),
             action=(bool(fire), bool(zap), spinner),
             gamestate=int(gamestate),
             done=bool(done),
-            save_signal=bool(save_signal),
-            enemy_seg=int(nearest_enemy),
-            player_seg=int(player_seg),
-            open_level=bool(is_open),
-            expert_fire=bool(expert_fire),
-            expert_zap=bool(expert_zap),
-            level_number=int(level_number),
+            save_signal=bool(save),
+            enemy_seg=int(enemy),
+            player_seg=int(player),
+            open_level=bool(open_lvl),
+            expert_fire=bool(exp_fire),
+            expert_zap=bool(exp_zap),
+            level_number=int(level)
         )
-        return frame_data
-
     except Exception as e:
-        print(f"ERROR parsing frame data: {e}", flush=True)
-        sys.exit(1)
+        print(f"Parse error: {e}")
+        return None
 
 def get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
-    """Expert policy to move toward nearest enemy with neutral tie-breaker.
-    Returns (fire, zap, spinner)
-    """
-    # Check for INVALID_SEGMENT (-32768) or no target (-1) which indicates no valid target (like during tube transitions)
-    if enemy_seg == -32768 or enemy_seg == -1:  # INVALID_SEGMENT or no target
-        return expert_fire, expert_zap, 0  # Use Lua's recommendations with no movement
+    """Returns (fire, zap, spinner_value)"""
+    if enemy_seg == -32768 or enemy_seg == -1:
+        return expert_fire, expert_zap, 0
 
-    # Normalize to ring indices
     enemy_seg = int(enemy_seg) % 16
     player_seg = int(player_seg) % 16
 
-    # Compute signed shortest distance with neutral tie-break at exactly 8
     if is_open_level:
-        # Open level: direct arithmetic distance; treat exact 8 as neutral tie
         relative_dist = enemy_seg - player_seg
         if abs(relative_dist) == 8:
             relative_dist = 8 if random.random() < 0.5 else -8
     else:
         clockwise = (enemy_seg - player_seg) % 16
         counter = (player_seg - enemy_seg) % 16
-        if clockwise < 8:
-            relative_dist = clockwise
-        elif counter < 8:
-            relative_dist = -counter
-        else:
-            # Tie (8 vs 8)
-            relative_dist = 8 if random.random() < 0.5 else -8
+        if clockwise < 8: relative_dist = clockwise
+        elif counter < 8: relative_dist = -counter
+        else: relative_dist = 8 if random.random() < 0.5 else -8
 
     if relative_dist == 0:
-        return expert_fire, expert_zap, 0  # No movement needed
+        return expert_fire, expert_zap, 0
 
-    # Calculate intensity based on distance
-    distance = abs(relative_dist)
-    intensity = min(0.9, 0.3 + (distance * 0.05))  # Match Lua intensity calculation
-
-    # For positive relative_dist (need to move clockwise), use negative spinner
+    intensity = min(0.9, 0.3 + (abs(relative_dist) * 0.05))
     spinner = -intensity if relative_dist > 0 else intensity
-
     return expert_fire, expert_zap, spinner
 
-def encode_action_to_game(fire, zap, spinner):
-    """Convert action values to game-compatible format.
-
-    Spinner mapping:
-    - Game expects an integer spinner command in [-32, +31]
-    - We interpret 'spinner' here as a normalized float roughly in [-1.0, +1.0]
-    - Encode by scaling with 32 and rounding, then clamp to the valid range
-    """
-    # Scale and round symmetrically with 32 to match original semantics
-    try:
-        sval = float(spinner)
-    except Exception:
-        sval = 0.0
-    spinner_val = int(round(sval * 32.0))
-    # Clamp to hardware range [-32, +31]
-    if spinner_val > 31:
-        spinner_val = 31
-    elif spinner_val < -32:
-        spinner_val = -32
-    return int(fire), int(zap), int(spinner_val)
-
-def fire_zap_to_discrete(fire: bool, zap: bool) -> int:
-    """Convert fire/zap booleans to discrete action index (0-3).
-
-    Historical encoding warning:
-    - Bit 0 represents ZAP.
-    - Bit 1 represents FIRE.
-    This ordering is preserved to remain compatible with existing models and replay buffers.
-    """
-    return int(fire) * 2 + int(zap)
-
-def discrete_to_fire_zap(discrete_action: int) -> tuple[bool, bool]:
-    """Convert discrete action index (0-3) back to (fire, zap) booleans using the historical bit layout."""
-    discrete_action = int(discrete_action)
-    fire = (discrete_action >> 1) & 1  # fire stored in bit 1
-    zap = discrete_action & 1          # zap stored in bit 0
-    return bool(fire), bool(zap)
-
-def get_expert_hybrid_action(enemy_seg, player_seg, is_open_level, expert_fire=False, expert_zap=False):
-    """Return (action_index, quantized_spinner) for the expert policy."""
-    fire, zap, spinner = get_expert_action(enemy_seg, player_seg, is_open_level, expert_fire, expert_zap)
-    action_index, _, quantized_spinner = encode_action_from_components(fire, zap, spinner)
-    return action_index, quantized_spinner
-
-def hybrid_to_game_action(action_index: int):
-    """Convert a joint action index to game-compatible fire/zap/spinner commands."""
-    fire, zap, _, spinner_value = action_index_to_components(action_index)
-    return encode_action_to_game(fire, zap, spinner_value)
-
-def _curriculum_target(frame_count: int, value_index: int):
-    """Return scheduled value for the given index (1=epsilon, 2=expert ratio) if curriculum defined."""
-    try:
-        curriculum = getattr(RL_CONFIG, 'exploration_curriculum', ())
-    except Exception:
-        curriculum = ()
-
-    target = None
-    if curriculum:
-        for stage in curriculum:
-            try:
-                start_frame = int(stage[0])
-            except Exception:
-                continue
-            if frame_count >= start_frame:
-                try:
-                    target = float(stage[value_index])
-                except (IndexError, TypeError, ValueError):
-                    continue
-            else:
-                break
-
-    # Optional repeating curriculum cycle with arbitrary segment lengths
-    try:
-        cycle_start = int(getattr(RL_CONFIG, 'exploration_curriculum_cycle_start', 0))
-        raw_cycle = getattr(RL_CONFIG, 'exploration_curriculum_cycle', ())
-    except Exception:
-        cycle_start, raw_cycle = 0, ()
-
-    if raw_cycle and frame_count >= cycle_start:
-        processed_segments: list[tuple[int, Optional[float], Optional[float]]] = []
-        total_length = 0
-        for segment in raw_cycle:
-            try:
-                seg_length = int(segment[0])
-            except Exception:
-                continue
-            if seg_length <= 0:
-                continue
-            seg_eps = None
-            seg_expert = None
-            try:
-                seg_eps = float(segment[1])
-            except (IndexError, TypeError, ValueError):
-                pass
-            try:
-                seg_expert = float(segment[2])
-            except (IndexError, TypeError, ValueError):
-                pass
-            processed_segments.append((seg_length, seg_eps, seg_expert))
-            total_length += seg_length
-
-        if processed_segments and total_length > 0:
-            offset = (frame_count - cycle_start) % total_length
-            cumulative = 0
-            for seg_length, seg_eps, seg_expert in processed_segments:
-                cumulative += seg_length
-                if offset < cumulative:
-                    alt_target = seg_eps if value_index == 1 else seg_expert
-                    if alt_target is not None:
-                        target = alt_target
-                    break
-
-    return target
-
-
-def decay_epsilon(frame_count):
-    """Calculate decayed exploration rate using step-based decay with adaptive floor.
-
-    Goal: when stuck near the ~2.5 band, temporarily raise the epsilon floor to
-    encourage exploration without destabilizing training.
-    """
-    # Skip decay if override or manual override is active
-    if metrics.override_epsilon or getattr(metrics, 'manual_epsilon_override', False):
-        return metrics.epsilon
-    
-    # Curriculum override
-    curriculum_eps = _curriculum_target(frame_count, 1)
-    if curriculum_eps is not None:
-        metrics.epsilon = max(0.0, min(1.0, curriculum_eps))
-        # Keep decay bookkeeping roughly aligned so downstream logic stays bounded
-        try:
-            metrics.last_epsilon_decay_step = frame_count // RL_CONFIG.epsilon_decay_steps
-        except Exception:
-            pass
-        return metrics.epsilon
-
-    step_interval = frame_count // RL_CONFIG.epsilon_decay_steps
-
-    # Only decay if a new step interval is reached
-    if step_interval > metrics.last_epsilon_decay_step:
-        # Apply decay multiplicatively for the number of steps missed
-        num_steps_to_apply = step_interval - metrics.last_epsilon_decay_step
-        decay_multiplier = RL_CONFIG.epsilon_decay_factor ** num_steps_to_apply
-        metrics.epsilon *= decay_multiplier
-
-        # Update the last step tracker
-        metrics.last_epsilon_decay_step = step_interval
-
-
-    # Enforce floor so epsilon doesn't decay below target minimum
-    try:
-        floor = float(getattr(RL_CONFIG, 'epsilon_end', getattr(RL_CONFIG, 'epsilon_min', 0.0)))
-    except Exception:
-        floor = 0.0
-    if metrics.epsilon < floor:
-        metrics.epsilon = floor
-
-    # Always return the current epsilon value (which might have just been decayed)
-    return metrics.epsilon
-
-def decay_expert_ratio(current_step):
-    """Update expert ratio periodically with a performance- and slope-aware floor.
-
-    Stronger hold when near the 2.5 plateau:
-    - Hold >=50% expert until BOTH (DQN5M > 2.55) AND (slope >= +0.03)
-    - Then allow >=45% expert while 2.55 < DQN5M <= 2.70 and slope >= 0.00
-    - Above that, revert to configured min (e.g., 0.40)
-    """
-    min_ratio = max(0.0, min(1.0, getattr(RL_CONFIG, 'expert_ratio_min', 0.0)))
-    # Skip decay if expert mode, override, or manual override is active
-    if metrics.expert_mode or metrics.override_expert or getattr(metrics, 'manual_expert_override', False):
-        return max(min_ratio, min(1.0, metrics.expert_ratio))
-    
-    curriculum_expert = _curriculum_target(current_step, 2)
-    if curriculum_expert is not None:
-        # Clamp between 0 and 1 for safety
-        metrics.expert_ratio = max(0.0, min(1.0, curriculum_expert))
-        try:
-            metrics.last_decay_step = current_step // RL_CONFIG.expert_ratio_decay_steps
-        except Exception:
-            pass
-        return metrics.expert_ratio
-
-    # DON'T auto-initialize to start value at frame 0 - respect loaded checkpoint values
-    # Only initialize if expert_ratio is somehow invalid (negative or > 1)
-    if current_step == 0 and (metrics.expert_ratio < 0 or metrics.expert_ratio > 1):
-        metrics.expert_ratio = RL_CONFIG.expert_ratio_start
-        metrics.last_decay_step = 0
-        return metrics.expert_ratio
-
-    step_interval = current_step // RL_CONFIG.expert_ratio_decay_steps
-
-    # Apply scheduled decay when we cross an interval boundary
-    if step_interval > metrics.last_decay_step:
-        steps_to_apply = step_interval - metrics.last_decay_step
-        for _ in range(steps_to_apply):
-            metrics.expert_ratio *= RL_CONFIG.expert_ratio_decay
-        metrics.last_decay_step = step_interval
-
-    try:
-        metrics.expert_ratio = max(min_ratio, min(1.0, metrics.expert_ratio))
-    except Exception:
-        metrics.expert_ratio = max(min_ratio, min(1.0, float(RL_CONFIG.expert_ratio_start)))
-    return metrics.expert_ratio
-
-# Discrete-only SimpleReplayBuffer removed (hybrid-only)
-
-# Thread-safe metrics storage
+# SafeMetrics class (simplified for brevity but functional)
 class SafeMetrics:
     def __init__(self, metrics):
         self.metrics = metrics
         self.lock = threading.Lock()
-        try:
-            self._default_reward_center = float(getattr(RL_CONFIG, 'reward_centering_init', 0.0) or 0.0)
-        except Exception:
-            self._default_reward_center = 0.0
-        try:
-            current_center = getattr(self.metrics, 'reward_center_value', None)
-        except Exception:
-            current_center = None
-        if current_center is None or not isinstance(current_center, (int, float)) or not math.isfinite(current_center):
-            try:
-                self.metrics.reward_center_value = self._default_reward_center
-            except Exception:
-                pass
-        elif current_center == 0.0 and self._default_reward_center != 0.0:
-            try:
-                self.metrics.reward_center_value = self._default_reward_center
-            except Exception:
-                pass
     
-    def update_frame_count(self, delta: int = 1):
-        with self.lock:
-            # Update total frame count
-            if delta < 1:
-                delta = 1
-            self.metrics.frame_count += delta
-            # Track interval frames for display rate
-            try:
-                self.metrics.frames_count_interval += delta
-            except Exception:
-                pass
-            
-            # Update FPS tracking
-            current_time = time.time()
-            
-            # Initialize last_fps_time if this is the first frame
-            if self.metrics.last_fps_time == 0:
-                self.metrics.last_fps_time = current_time
-                
-            # Count frames for this second
-            self.metrics.frames_last_second += delta
-            
-            # Calculate FPS every second
-            elapsed = current_time - self.metrics.last_fps_time
-            if elapsed >= 1.0:
-                # Calculate frames per second with more accuracy
-                new_fps = self.metrics.frames_last_second / elapsed
-                
-                # Store the new FPS value
-                self.metrics.fps = new_fps
-                
-                # Reset counters
-                self.metrics.frames_last_second = 0
-                self.metrics.last_fps_time = current_time
-                
-            return self.metrics.frame_count
+    def update_frame_count(self, delta=1):
+        # Delegate to the metrics object which handles FPS calculation
+        if hasattr(self.metrics, 'update_frame_count'):
+            self.metrics.update_frame_count(delta)
+        else:
+            with self.lock: self.metrics.frame_count += delta
     
-    def get_reward_center_value(self) -> float:
+    def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
-            try:
-                value = float(getattr(self.metrics, 'reward_center_value', self._default_reward_center))
-                if math.isfinite(value):
-                    return value
-            except Exception:
-                pass
-            return self._default_reward_center
-
-    def center_objective_reward(self, obj_reward: float) -> tuple[float, float]:
-        """Return centered reward and updated center value."""
+            self.metrics.episode_rewards.append(total)
+            self.metrics.dqn_rewards.append(dqn)
+            self.metrics.expert_rewards.append(expert)
+            if subj is not None: self.metrics.subj_rewards.append(subj)
+            if obj is not None: self.metrics.obj_rewards.append(obj)
+            
+            # Update interval accumulators for display
+            self.metrics.reward_sum_interval_total += total
+            self.metrics.reward_count_interval_total += 1
+            self.metrics.reward_sum_interval_dqn += dqn
+            self.metrics.reward_count_interval_dqn += 1
+            self.metrics.reward_sum_interval_expert += expert
+            self.metrics.reward_count_interval_expert += 1
+            if subj is not None:
+                self.metrics.reward_sum_interval_subj += subj
+                self.metrics.reward_count_interval_subj += 1
+            if obj is not None:
+                self.metrics.reward_sum_interval_obj += obj
+                self.metrics.reward_count_interval_obj += 1
+                
+            if length > 0:
+                self.metrics.episode_length_sum_interval += length
+                self.metrics.episode_length_count_interval += 1
+        
+        # Update rolling windows in metrics_display
         try:
-            reward_val = float(obj_reward)
-        except Exception:
-            reward_val = 0.0
-        if not math.isfinite(reward_val):
-            reward_val = 0.0
-        use_centering = bool(getattr(RL_CONFIG, 'use_reward_centering', False))
-        beta = float(getattr(RL_CONFIG, 'reward_centering_beta', 0.0) or 0.0)
-        if beta < 0.0:
-            beta = 0.0
-        with self.lock:
-            current_center = getattr(self.metrics, 'reward_center_value', self._default_reward_center)
-            if not isinstance(current_center, (int, float)) or not math.isfinite(current_center):
-                current_center = self._default_reward_center
-            if not use_centering:
-                self.metrics.reward_center_value = current_center
-                return reward_val, current_center
-            centered = reward_val - current_center
-            if beta > 0.0:
-                new_center = current_center + beta * centered
-            else:
-                new_center = current_center
-            self.metrics.reward_center_value = new_center
-            return centered, new_center
-            
-    def get_epsilon(self):
-        with self.lock:
-            return self.metrics.epsilon
+            import metrics_display
+            # Pass the raw DQN reward (already scaled in socket_server)
+            metrics_display.add_episode_to_dqn1m_window(dqn, length)
+            metrics_display.add_episode_to_dqn5m_window(dqn, length)
+        except ImportError:
+            print("Warning: Could not import metrics_display to update DQN windows")
+        except Exception as e:
+            print(f"Error updating DQN windows: {e}")
 
-    def get_effective_epsilon(self):
-        """Thread-safe access to effective epsilon (0.0 when override_epsilon is ON)."""
-        with self.lock:
-            try:
-                return 0.0 if getattr(self.metrics, 'override_epsilon', False) else float(self.metrics.epsilon)
-            except Exception:
-                return float(self.metrics.epsilon)
-
-    def get_effective_epsilon_with_state(self, gamestate: int):
-        """Return effective epsilon possibly adjusted by game state.
-
-        Currently: if GS_ZoomingDown (0x20), return epsilon * RL_CONFIG.zoom_epsilon_scale (default 0.25).
-        Honors override_epsilon by returning 0.0 regardless of state.
-        """
-        with self.lock:
-            try:
-                if getattr(self.metrics, 'override_epsilon', False):
-                    return 0.0
-                eps = float(self.metrics.epsilon)
-                if gamestate == 0x20:
-                    try:
-                        scale = float(getattr(RL_CONFIG, 'zoom_epsilon_scale', 0.25) or 0.25)
-                    except Exception:
-                        scale = 0.25
-                    eps = eps * scale
-                # Bound within [0,1] as an effective runtime parameter
-                if eps < 0.0:
-                    eps = 0.0
-                elif eps > 1.0:
-                    eps = 1.0
-                return eps
-            except Exception:
-                return float(self.metrics.epsilon)
-            
     def update_epsilon(self):
+        # Simple decay logic
         with self.lock:
-            self.metrics.epsilon = decay_epsilon(self.metrics.frame_count)
+            if self.metrics.frame_count % RL_CONFIG.epsilon_decay_steps == 0:
+                self.metrics.epsilon = max(RL_CONFIG.epsilon_end, self.metrics.epsilon * RL_CONFIG.epsilon_decay_factor)
             return self.metrics.epsilon
-            
+
     def update_expert_ratio(self):
         with self.lock:
-            # Respect expert_mode, override_expert, and manual_expert_override: freeze expert_ratio while any are ON
-            if self.metrics.expert_mode or self.metrics.override_expert or getattr(self.metrics, 'manual_expert_override', False):
-                return self.metrics.expert_ratio
-            decay_expert_ratio(self.metrics.frame_count)
+            # Simple decay logic
+            if self.metrics.frame_count % RL_CONFIG.expert_ratio_decay_steps == 0:
+                self.metrics.expert_ratio = max(0.0, self.metrics.expert_ratio * RL_CONFIG.expert_ratio_decay)
             return self.metrics.expert_ratio
-    
-    def add_episode_reward(self, total_reward, dqn_reward, expert_reward, subj_reward=None, obj_reward=None, episode_length=0):
-        """Record per-episode rewards in a thread-safe way.
+            
+    def get_effective_epsilon(self):
+        with self.lock: return self.metrics.epsilon
+        
+    def get_expert_ratio(self):
+        with self.lock: return self.metrics.expert_ratio
 
-        Forward to the underlying MetricsData.add_episode_reward when available so that:
-        - All episodes (including zero/negative totals) are recorded to keep deques aligned
-        - Interval accumulators (for per-row means) are updated consistently for Rwrd/DQN/Exp
-        Fallback to direct appends if the underlying metrics object lacks the method.
-        """
-        with self.lock:
-            try:
-                add_fn = getattr(self.metrics, 'add_episode_reward', None)
-                if callable(add_fn):
-                    add_fn(float(total_reward), float(dqn_reward), float(expert_reward), subj_reward, obj_reward, episode_length)
-                    return
-            except Exception:
-                pass
-            # Fallback: append directly without filtering to preserve alignment
-            try:
-                self.metrics.episode_rewards.append(float(total_reward))
-            except Exception:
-                pass
-            try:
-                self.metrics.dqn_rewards.append(float(dqn_reward))
-            except Exception:
-                pass
-            try:
-                self.metrics.expert_rewards.append(float(expert_reward))
-            except Exception:
-                pass
-            try:
-                if subj_reward is not None:
-                    self.metrics.subj_rewards.append(float(subj_reward))
-            except Exception:
-                pass
-            try:
-                if obj_reward is not None:
-                    self.metrics.obj_rewards.append(float(obj_reward))
-            except Exception:
-                pass
-    
     def increment_guided_count(self):
-        with self.lock:
-            self.metrics.guided_count += 1
-    
+        with self.lock: self.metrics.guided_count += 1
+        
     def increment_total_controls(self):
-        with self.lock:
-            self.metrics.total_controls += 1
-            
+        with self.lock: self.metrics.total_controls += 1
+        
     def update_action_source(self, source):
+        with self.lock: self.metrics.last_action_source = source
+
+    def get_fps(self):
+        with self.lock: return getattr(self.metrics, 'fps', 0.0)
+
+    def add_inference_time(self, t):
         with self.lock:
-            self.metrics.last_action_source = source
-            
+            if not hasattr(self.metrics, 'total_inference_time'): self.metrics.total_inference_time = 0
+            self.metrics.total_inference_time += t
+            if not hasattr(self.metrics, 'total_inference_requests'): self.metrics.total_inference_requests = 0
+            self.metrics.total_inference_requests += 1
+
     def update_game_state(self, enemy_seg, open_level):
         with self.lock:
             self.metrics.enemy_seg = enemy_seg
-            self.open_level = open_level
-    
-    def get_expert_ratio(self):
-        with self.lock:
-            return self.metrics.expert_ratio
-            
-    def is_override_active(self):
-        with self.lock:
-            return self.metrics.override_expert
-
-    def get_fps(self):
-        with self.lock:
-            return self.metrics.fps
-
-    # Thread-safe helpers for common aggregated metrics
-    def add_inference_time(self, t: float):
-        """Accumulate inference time and count in a thread-safe way."""
-        try:
-            dt = float(t)
-        except Exception:
-            dt = 0.0
-        with self.lock:
-            # Underlying MetricsData holds these fields
-            try:
-                self.metrics.total_inference_time += dt
-                self.metrics.total_inference_requests += 1
-            except Exception:
-                # If fields are missing for any reason, initialize defensively
-                try:
-                    if not hasattr(self.metrics, 'total_inference_time'):
-                        self.metrics.total_inference_time = 0.0
-                    if not hasattr(self.metrics, 'total_inference_requests'):
-                        self.metrics.total_inference_requests = 0
-                    self.metrics.total_inference_time += dt
-                    self.metrics.total_inference_requests += 1
-                except Exception:
-                    pass
+            self.metrics.open_level = open_level

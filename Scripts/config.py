@@ -89,36 +89,25 @@ class RLConfigData:
     gamma: float = 0.99                    # CRITICAL FIX: Reduced from 0.992 to prevent value instability
     n_step: int = 5                        # TEMPORARILY REDUCED from 3 to 1 to test if n-step variance prevents learning
 
-    epsilon: float = 0.35                  # Current exploration rate (stage 0 of curriculum)
-    epsilon_start: float = 0.35            # Curriculum stage 0 exploration rate
-    epsilon_min: float = 0.02              # Lower floor for exploration to let exploitation kick in
-    epsilon_end: float = 0.02              # Target minimum epsilon
-    epsilon_decay_steps: int = 5000        # Faster decay so the floor is reached quickly
+    epsilon: float = 0.08                  # Slightly more exploration to aid stalled learning
+    epsilon_start: float = 0.08            # Hold constant to keep conditions fixed
+    epsilon_min: float = 0.08              # No decay while ablation-running
+    epsilon_end: float = 0.08              # Target minimum epsilon
+    epsilon_decay_steps: int = 1_000_000   # Effectively disable decay
     epsilon_decay_factor: float = 1
     epsilon_random_zap_discount: float = 0.01  # Reduce random superzap chance by ~1% when epsilon sampling
     spinner_command_levels: tuple[int, ...] = (0, 12, 9, 6, 3, 1, -1, -3, -6, -9, -12)
-    exploration_curriculum: tuple[tuple[int, float, float], ...] = (
-        (0, 0.35, 0.35),         # Warm start with modest expert support
-        (250_000, 0.25, 0.20),   # Let DQN act more while still guided
-        (500_000, 0.15, 0.10),   # Shift majority control to DQN
-        (750_000, 0.08, 0.05),   # Light guidance only
-        (1_000_000, 0.05, 0.02), # Mostly self-play
-    )
-    exploration_curriculum_cycle_start: int = 1_250_000  # Begin repeating schedule after initial anneal
-    exploration_curriculum_cycle: tuple[tuple[int, float, float], ...] = (
-        (250_000, 0.08, 0.02),   # Short exploration bump with minimal expert
-        (250_000, 0.05, 0.01),   # Mostly DQN, tiny guidance
-        (250_000, 0.04, 0.00),   # Pure self-play exploitation
-        (250_000, 0.06, 0.01),   # Brief refresh of exploration/guidance before repeating
-    )
+    exploration_curriculum: tuple[tuple[int, float, float], ...] = ()  # Keep epsilon/expert fixed for clean ablations
+    exploration_curriculum_cycle_start: int = 0
+    exploration_curriculum_cycle: tuple[tuple[int, float, float], ...] = ()
 
     # Expert guidance ratio schedule (moved here next to epsilon for unified exploration control)
-    expert_ratio_start: float = 0.35      # Start lower to hand control to DQN sooner
-    expert_ratio_min: float = 0.02        # Allow the expert to fade almost entirely
+    expert_ratio_start: float = 0.25      # Lock expert ratio at 25% for ablations
+    expert_ratio_min: float = 0.25        # Hold constant
     # During GS_ZoomingDown (0x20), exploration is disruptive; scale epsilon down at inference time
     zoom_epsilon_scale: float = 0.10
-    expert_ratio_decay: float = 0.9975   # Faster decay between curriculum steps
-    expert_ratio_decay_steps: int = 2000  # Apply decay more frequently to keep ratcheting down
+    expert_ratio_decay: float = 1.0      # No decay while locked
+    expert_ratio_decay_steps: int = 1_000_000  # Irrelevant with decay=1
 
     memory_size: int = 2000000             # Total buffer size across all buckets
     
@@ -129,13 +118,13 @@ class RLConfigData:
     replay_main_bucket_size: int = 2000000
     priority_sample_fraction: float = 0.0  # No priority sampling
     priority_terminal_bonus: float = 0.0
-    priority_alpha: float = 0.0            # Disable PER to speed insert/sample
-    priority_beta: float = 0.0             # No IS weighting when PER is off
-    priority_beta_final: float = 0.0       # Keep beta at 0
-    priority_beta_frames: int = 1_000_000  # Unused with PER off
+    priority_alpha: float = 0.5            # Keep PER but slightly lighter weighting for speed
+    priority_beta: float = 0.3             # IS weight exponent (anneals to 1.0)
+    priority_beta_final: float = 1.0       # Target beta for full IS correction
+    priority_beta_frames: int = 3_000_000  # Anneal beta slowly to reduce weight calc overhead
     priority_eps: float = 1e-3
     priority_max_weight_elems: int = 200000
-    min_dqn_fraction: float = 0.6          # Ensure batches are majority DQN to prevent expert dominance
+    min_dqn_fraction: float = 0.6          # Allow meaningful expert samples into replay
 
     hidden_size: int = 512                 # More moderate size - 2048 too slow for rapid experimentation
     num_layers: int = 5                  
@@ -157,9 +146,10 @@ class RLConfigData:
     # Require fresh frames after load before resuming training
     min_new_frames_after_load_to_train: int = 50000
 
-    obj_reward_scale: float  = 0.000001            # Convert game score points to RL reward (1 point => 1e-4)
-    subj_reward_scale: float = 0.00000025          # Subjective shaping scaled to average ~25% of objective reward magnitude
-    ignore_subjective_rewards: bool = True
+    # Reward scaling (keep subjective at ~25% of objective magnitude)
+    obj_reward_scale: float  = 0.01                # 1 game point => 0.01 reward units (100x increase for better gradients)
+    subj_reward_scale: float = 0.0025              # Subjective shaping scaled to ~25% of objective reward magnitude
+    ignore_subjective_rewards: bool = False         # Subjective rewards are always included in totals
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
     use_reward_centering: bool = False       # Subtract a running mean of the objective reward before scaling
     reward_centering_beta: float = 0.005    # EMA rate for reward centering (lower = slower adaptation)
@@ -171,12 +161,13 @@ class RLConfigData:
 
     # Loss weighting (makes contributions explicit and tunable)
     discrete_loss_weight: float = 1.0    # Weight applied to discrete (Q) loss
-    expert_supervision_weight: float = 1.0  # Weight for imitation loss on expert fire/zap targets (was 0.05 - too weak!)
-    spinner_supervision_weight: float = 1.0  # Weight for imitation loss on expert spinner buckets (was 0.05 - too weak!)
+    expert_supervision_weight: float = 0.3  # Reintroduce imitation to kickstart learning
+    spinner_supervision_weight: float = 0.3  # Spinner imitation likewise
 
     # Target network update strategy
     use_soft_target_update: bool = True   # Keep soft updates for stability
-    soft_target_tau: float = 0.02         # Faster Polyak blending to react to policy changes
+    # A too-large tau makes the target chase the online net, which can destabilize Q-learning.
+    soft_target_tau: float = 0.005        # Polyak coefficient (smaller = more stable targets)
     # Optional safety: clip TD targets to a reasonable bound to avoid value explosion (None disables)
     td_target_clip: float | None = 300.0       # Keep TD targets bounded to avoid runaway targets
     max_q_value: float | None = None           # Disable forward clamp; rely on td_target_clip to set range
@@ -191,15 +182,13 @@ class RLConfigData:
     pre_death_sample_fraction: float = 0.25  # Fraction of each batch drawn from pre-death transitions
 
     # Supervision (expert imitation) annealing
-    supervision_decay_start: int = 300_000   # Frames before we start reducing expert imitation loss
-    supervision_decay_frames: int = 700_000  # Anneal over this many frames
-    min_supervision_weight: float = 0.1      # Keep a small imitation signal but let TD dominate
+    supervision_decay_start: int = 100_000   # Start annealing earlier
+    supervision_decay_frames: int = 400_000  # Anneal faster
+    # If this hits 0, the policy can "drift" once TD dominates, often showing up as DQN1M decay.
+    min_supervision_weight: float = 0.1      # Keep a small imitation anchor for stability
 
     # Reward safety
     reward_clip_value: float | None = 2.5    # Keep reward scale informative but bounded
-
-    # Death shaping
-    death_penalty: float = -1.0              # Extra penalty applied on death
 
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob

@@ -24,7 +24,7 @@ def test_stats_column_format():
     agent = HybridDQNAgent(
         state_size=128,
         discrete_actions=4,
-        learning_rate=0.0001,
+        learning_rate=0.00025,
         gamma=0.99,
         epsilon=0.1,
         epsilon_min=0.01,
