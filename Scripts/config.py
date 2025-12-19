@@ -148,7 +148,7 @@ class RLConfigData:
 
     # Reward scaling (keep subjective at ~25% of objective magnitude)
     obj_reward_scale: float  = 0.01                # 1 game point => 0.01 reward units (100x increase for better gradients)
-    subj_reward_scale: float = 0.0025              # Subjective shaping scaled to ~25% of objective reward magnitude
+    subj_reward_scale: float = 0.01              # Subjective shaping scaled to ~25% of objective reward magnitude
     ignore_subjective_rewards: bool = False         # Subjective rewards are always included in totals
     obj_reward_baseline: float = 0.05       # Static baseline (pre-scale units) removed from objective rewards
     use_reward_centering: bool = False       # Subtract a running mean of the objective reward before scaling
@@ -188,7 +188,7 @@ class RLConfigData:
     min_supervision_weight: float = 0.1      # Keep a small imitation anchor for stability
 
     # Reward safety
-    reward_clip_value: float | None = 2.5    # Keep reward scale informative but bounded
+    reward_clip_value: float | None = None   # Disable reward clipping to preserve signal
 
     # Superzap gate: Limits zap attempts to a low success probability
     # When enabled, zap attempts (discrete actions 1 and 3) succeed with probability superzap_prob

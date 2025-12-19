@@ -51,6 +51,7 @@ local previous_alive_state = 1 -- Track previous alive state, initialize as aliv
 local LastRewardState = 0
 local LastSubjRewardState = 0
 local LastObjRewardState = 0
+local previous_player_position = 0
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -631,66 +632,70 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
         if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
             local player_abs_seg = player_state.position & 0x0F
+            local prev_player_seg = math.floor(previous_player_position or 0) % 16
             local is_open = (level_state.level_type == 0x00) -- Updated heuristic
 
-            -- First pass: map threats (enemies or shots) within DANGER_DEPTH by lane
-            local lane_threat = {}
-            local function mark_threat(seg)
-                if seg == nil or seg == INVALID_SEGMENT then return end
-                if seg < 0 or seg > 15 then return end
-                lane_threat[seg] = true
-            end
-
-            for i = 1, 7 do
-                local depth = enemies_state.enemy_depths[i]
-                local seg = enemies_state.enemy_abs_segments[i]
-                if depth and depth > 0 and depth <= DANGER_DEPTH then
-                    mark_threat(seg)
+            -- Only apply safety shaping on lane changes to keep it action-dependent
+            if player_abs_seg ~= prev_player_seg then
+                -- First pass: map threats (enemies or shots) within DANGER_DEPTH by lane
+                local lane_threat = {}
+                local function mark_threat(seg)
+                    if seg == nil or seg == INVALID_SEGMENT then return end
+                    if seg < 0 or seg > 15 then return end
+                    lane_threat[seg] = true
                 end
-            end
 
-            for i = 1, 4 do
-                local shot_depth = enemies_state.shot_positions[i]
-                local seg = enemies_state.enemy_shot_abs_segments[i]
-                if shot_depth and shot_depth > 0 and shot_depth <= DANGER_DEPTH then
-                    mark_threat(seg)
-                end
-            end
-
-            local offsets = {0, 1, -1, 2, -2}
-            local seen = {}
-            local function offset_to_lane(offset)
-                if offset == 0 then
-                    return player_abs_seg
-                end
-                if is_open then
-                    local candidate = player_abs_seg + offset
-                    if candidate < 0 or candidate > 15 then
-                        return nil -- Off the board on open levels
+                for i = 1, 7 do
+                    local depth = enemies_state.enemy_depths[i]
+                    local seg = enemies_state.enemy_abs_segments[i]
+                    if depth and depth > 0 and depth <= DANGER_DEPTH then
+                        mark_threat(seg)
                     end
-                    return candidate
-                else
-                    return (player_abs_seg + offset + 16) % 16
                 end
-            end
 
-            for _, offset in ipairs(offsets) do
-                local lane = offset_to_lane(offset)
-                if lane ~= nil and not seen[lane] then
-                    seen[lane] = true
-
-                    local distance = math.abs(offset)
-                    local weight = 1.0
-                    if distance == 1 then
-                        weight = 0.5
-                    elseif distance == 2 then
-                        weight = 0.25
+                for i = 1, 4 do
+                    local shot_depth = enemies_state.shot_positions[i]
+                    local seg = enemies_state.enemy_shot_abs_segments[i]
+                    if shot_depth and shot_depth > 0 and shot_depth <= DANGER_DEPTH then
+                        mark_threat(seg)
                     end
+                end
 
-                    if lane_threat[lane] then
-                        subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight)
+                local offsets = {0, 1, -1, 2, -2}
+                local seen = {}
+                local function offset_to_lane(offset)
+                    if offset == 0 then
+                        return player_abs_seg
+                    end
+                    if is_open then
+                        local candidate = player_abs_seg + offset
+                        if candidate < 0 or candidate > 15 then
+                            return nil -- Off the board on open levels
+                        end
+                        return candidate
                     else
-                        subj_reward = subj_reward + (SAFE_LANE_REWARD * weight)
+                        return (player_abs_seg + offset + 16) % 16
+                    end
+                end
+
+                for _, offset in ipairs(offsets) do
+                    local lane = offset_to_lane(offset)
+                    if lane ~= nil and not seen[lane] then
+                        seen[lane] = true
+
+                        local distance = math.abs(offset)
+                        local weight = 1.0
+                        if distance == 1 then
+                            weight = 0.5
+                        elseif distance == 2 then
+                            weight = 0.25
+                        end
+
+                        if lane_threat[lane] then
+                            subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight)
+                        else
+                            subj_reward = subj_reward + (SAFE_LANE_REWARD * weight)
+                        end
                     end
                 end
             end
@@ -701,6 +706,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     previous_score = player_state.score or 0
     previous_level = level_state.level_number or 0
     previous_alive_state = player_state.alive or 0
+    previous_player_position = player_state.position or 0
 
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward

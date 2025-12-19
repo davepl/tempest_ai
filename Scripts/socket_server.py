@@ -273,22 +273,6 @@ class SocketServer:
                     
                     training_reward = obj_reward + subj_reward
 
-                    # Optional reward clipping (post-scale units) for stability.
-                    # NOTE: This clips the reward used for learning, not just display.
-                    try:
-                        reward_clip = getattr(RL_CONFIG, 'reward_clip_value', None)
-                        if reward_clip is not None:
-                            clip_val = float(reward_clip)
-                            if clip_val > 0.0 and math.isfinite(clip_val):
-                                # Preserve terminal negative penalties (e.g., death penalty) so survival pressure
-                                # isn't accidentally weakened by symmetric clipping.
-                                if bool(frame.done) and training_reward < 0.0:
-                                    pass
-                                else:
-                                    training_reward = max(-clip_val, min(clip_val, training_reward))
-                    except Exception:
-                        pass
-
                     # Push to agent
                     if self.agent:
                         actor_tag = state.get('prev_action_source', 'dqn')
