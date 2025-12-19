@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Simplified training loop for the Tempest hybrid DQN agent."""
+"""Simplified training loop for the Tempest Discrete DQN agent (2-head)."""
 
-import contextlib
 import math
 import time
-from typing import Sequence
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,7 +12,6 @@ try:
 except ImportError:
     from Scripts.config import RL_CONFIG, metrics
 
-
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -23,180 +19,79 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")
 
-
-def _to_tensor_bool(mask: Sequence[bool], length: int, *, device: torch.device) -> torch.Tensor:
-    if len(mask) != length:
-        raise ValueError("mask length mismatch")
-    return torch.tensor(mask, dtype=torch.bool, device=device)
-
-
-_SPINNER_SIGN_CACHE: dict[tuple[str, int], torch.Tensor] = {}
-
-
-def _get_spinner_signs(device: torch.device, spinner_actions: int) -> torch.Tensor:
-    """Return a tensor of spinner signs (-1, 0, 1) for each bucket on the requested device."""
-    key = (device.type, int(getattr(device, "index", -1) or -1))
-    cached = _SPINNER_SIGN_CACHE.get(key)
-    if cached is None or cached.numel() < spinner_actions:
-        levels = tuple(getattr(RL_CONFIG, "spinner_command_levels", (0,)))
-        if not levels:
-            levels = (0,)
-        sign_tensor = torch.sign(torch.tensor(levels, dtype=torch.float32, device=device))
-        if sign_tensor.numel() < spinner_actions:
-            pad = torch.zeros(spinner_actions - sign_tensor.numel(), dtype=torch.float32, device=device)
-            sign_tensor = torch.cat([sign_tensor, pad], dim=0)
-        _SPINNER_SIGN_CACHE[key] = sign_tensor
-        cached = sign_tensor
-    return cached[:spinner_actions]
-
-
-def compute_action_agreement(
-    greedy_actions: torch.Tensor,
-    taken_actions: torch.Tensor,
-    spinner_actions: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return boolean tensor where True means actions agree under sign-aware spinner matching."""
-    if greedy_actions.ndim > 1:
-        greedy_flat = greedy_actions.reshape(-1)
-    else:
-        greedy_flat = greedy_actions
-    if taken_actions.ndim > 1:
-        taken_flat = taken_actions.reshape(-1)
-    else:
-        taken_flat = taken_actions
-
-    exact_match = greedy_flat == taken_flat
-    spinner_actions = max(1, int(spinner_actions))
-
-    greedy_fire_zap = torch.div(greedy_flat, spinner_actions, rounding_mode="floor")
-    taken_fire_zap = torch.div(taken_flat, spinner_actions, rounding_mode="floor")
-    fire_zap_match = greedy_fire_zap == taken_fire_zap
-
-    sign_tensor = _get_spinner_signs(device, spinner_actions)
-    greedy_spinner_idx = torch.remainder(greedy_flat, spinner_actions).long()
-    taken_spinner_idx = torch.remainder(taken_flat, spinner_actions).long()
-    greedy_sign = sign_tensor[greedy_spinner_idx]
-    taken_sign = sign_tensor[taken_spinner_idx]
-
-    sign_match = greedy_sign == taken_sign
-    return exact_match | (fire_zap_match & sign_match)
-
-
 def train_step(agent):
-    """Run a single optimizer step for the simplified hybrid agent."""
+    """Run a single optimizer step for the DiscreteDQN agent."""
     if not getattr(metrics, "training_enabled", True) or not agent.training_enabled:
         return None
 
     if len(agent.memory) < agent.batch_size:
         return None
 
-    batch = agent.memory.sample(agent.batch_size, return_indices=True)
+    # Sample from StratifiedReplayBuffer
+    # Returns: (states, fz_idxs, sp_idxs, rewards, next_states, dones, actors)
+    batch = agent.memory.sample(agent.batch_size, metrics.expert_ratio)
     if batch is None:
         return None
 
-    # Replay buffers may optionally provide importance-sampling weights.
-    if len(batch) == 9:
-        (
-            states,
-            discrete_actions,
-            rewards,
-            next_states,
-            dones,
-            actors,
-            horizons,
-            sample_indices,
-            weights,
-        ) = batch
-    elif len(batch) == 8:
-        (
-            states,
-            discrete_actions,
-            rewards,
-            next_states,
-            dones,
-            actors,
-            horizons,
-            sample_indices,
-        ) = batch
-        weights = None
+    if len(batch) == 7:
+        states, fz_idxs, sp_idxs, rewards, next_states, dones, actors = batch
     else:
-        raise ValueError(f"Unexpected batch format from replay buffer (len={len(batch)})")
+        # Backward-compat fallback if replay buffer doesn't provide actor tags
+        states, fz_idxs, sp_idxs, rewards, next_states, dones = batch
+        actors = None
 
-
-    discrete_actions = discrete_actions.long()
-    rewards = rewards.float()
-    # Guard against any non-binary values leaking into the terminal mask
-    dones = dones.float().clamp_(0.0, 1.0)
-    horizons = horizons.float()
+    # Convert to tensors
+    states = torch.from_numpy(states).float().to(device)
+    fz_idxs = torch.from_numpy(fz_idxs).long().unsqueeze(1).to(device)
+    sp_idxs = torch.from_numpy(sp_idxs).long().unsqueeze(1).to(device)
+    rewards = torch.from_numpy(rewards).float().unsqueeze(1).to(device)
+    next_states = torch.from_numpy(next_states).float().to(device)
+    dones = torch.from_numpy(dones).float().unsqueeze(1).to(device)
 
     agent.qnetwork_local.train()
-    noisy_enabled = bool(getattr(agent.qnetwork_local, "use_noisy", False))
+    
+    # Forward pass
+    q_fz, q_sp = agent.qnetwork_local(states)
+    
+    # Double DQN Targets
+    with torch.no_grad():
+        # Get best actions from local network
+        next_q_fz_local, next_q_sp_local = agent.qnetwork_local(next_states)
+        best_fz_actions = next_q_fz_local.argmax(dim=1, keepdim=True)
+        best_sp_actions = next_q_sp_local.argmax(dim=1, keepdim=True)
+        
+        # Get values from target network
+        next_q_fz_target, next_q_sp_target = agent.qnetwork_target(next_states)
+        next_val_fz = next_q_fz_target.gather(1, best_fz_actions)
+        next_val_sp = next_q_sp_target.gather(1, best_sp_actions)
+        
+        # Compute targets
+        target_fz = rewards + (1.0 - dones) * agent.gamma * next_val_fz
+        target_sp = rewards + (1.0 - dones) * agent.gamma * next_val_sp
 
-    use_amp = bool(getattr(agent, "amp_enabled", False) and getattr(agent, "amp_scaler", None))
-    try:
-        if hasattr(agent.qnetwork_local, "reset_noise"):
-            agent.qnetwork_local.reset_noise()
-    except Exception:
-        pass
-    if use_amp:
-        device_type = None
-        try:
-            device_attr = getattr(agent, "device", None)
-            if device_attr is not None:
-                device_type = getattr(device_attr, "type", None)
-        except Exception:
-            device_type = None
-        if not device_type:
-            device_type = states.device.type if hasattr(states, "device") else "cuda"
-        try:
-            autocast_ctx = torch.amp.autocast(device_type=device_type)
-        except AttributeError:
-            autocast_ctx = torch.cuda.amp.autocast()
-    else:
-        autocast_ctx = contextlib.nullcontext()
+        # Clip targets if configured
+        td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
+        if td_clip is not None:
+            target_fz = torch.clamp(target_fz, -td_clip, td_clip)
+            target_sp = torch.clamp(target_sp, -td_clip, td_clip)
 
-    with autocast_ctx:
-        # Forward pass for current states
-        q_values = agent.qnetwork_local(states)
-        selected_q = q_values.gather(1, discrete_actions)
+    # Compute Losses
+    loss_fz = F.smooth_l1_loss(q_fz.gather(1, fz_idxs), target_fz)
+    loss_sp = F.smooth_l1_loss(q_sp.gather(1, sp_idxs), target_sp)
+    
+    w_disc = float(getattr(RL_CONFIG, 'discrete_loss_weight', 1.0) or 1.0)
+    total_loss = w_disc * (loss_fz + loss_sp)
 
-        # Build Double DQN targets
-        with torch.no_grad():
-            next_q_local = agent.qnetwork_local(next_states)
-            best_next_actions = next_q_local.argmax(dim=1, keepdim=True)
-
-            next_q_target = agent.qnetwork_target(next_states)
-            next_values = next_q_target.gather(1, best_next_actions)
-
-            gamma_h = torch.pow(torch.full_like(horizons, agent.gamma), horizons)
-            done_mask = 1.0 - dones  # Zero out bootstrap at terminal transitions
-            targets = rewards + done_mask * gamma_h * next_values
-            td_clip = getattr(RL_CONFIG, "td_target_clip", None)
-            try:
-                td_clip_val = float(td_clip)
-            except (TypeError, ValueError):
-                td_clip_val = None
-            if td_clip_val is not None and td_clip_val > 0.0 and math.isfinite(td_clip_val):
-                targets = torch.clamp(targets, -td_clip_val, td_clip_val)
-
-        td_losses = F.smooth_l1_loss(selected_q, targets, reduction="none")
-        if weights is not None:
-            td_loss = (td_losses * weights.unsqueeze(1)).mean()
-        else:
-            td_loss = td_losses.mean()
-
-
-    expert_mask_np = [actor == "expert" for actor in actors]
-    expert_mask = _to_tensor_bool(expert_mask_np, len(actors), device=states.device)
-
-    w_disc = float(getattr(RL_CONFIG, "discrete_loss_weight", 1.0))
-    total_loss = w_disc * td_loss
-
+    # Optional expert imitation losses (helps bootstrap spinner policy)
     supervised_loss_item = 0.0
     spinner_loss_item = 0.0
-    w_sup = float(getattr(RL_CONFIG, "expert_supervision_weight", 0.0) or 0.0)
-    w_spin = float(getattr(RL_CONFIG, "spinner_supervision_weight", w_sup) or 0.0)
+    try:
+        w_sup = float(getattr(RL_CONFIG, "expert_supervision_weight", 0.0) or 0.0)
+        w_spin = float(getattr(RL_CONFIG, "spinner_supervision_weight", w_sup) or 0.0)
+    except Exception:
+        w_sup = 0.0
+        w_spin = 0.0
+
     sup_scale = 1.0
     try:
         decay_start = int(getattr(RL_CONFIG, "supervision_decay_start", 0) or 0)
@@ -209,144 +104,121 @@ def train_step(agent):
             sup_scale = 1.0 - progress * (1.0 - min_sup)
     except Exception:
         sup_scale = 1.0
+
     w_sup_eff = w_sup * sup_scale
     w_spin_eff = w_spin * sup_scale
-    expert_any = bool(expert_mask.any().item())
 
-    if expert_any and (w_sup_eff > 0.0 or w_spin_eff > 0.0):
-        log_probs = F.log_softmax(q_values, dim=1)
-        spinner_actions = max(1, int(getattr(agent, "spinner_actions", 1) or 1))
-        fire_zap_actions = max(1, int(getattr(agent, "fire_zap_actions", 1) or 1))
-        taken_flat = discrete_actions.squeeze(1)
-        expert_indices = torch.nonzero(expert_mask, as_tuple=False).squeeze(1)
+    expert_mask = None
+    if actors is not None and (w_sup_eff > 0.0 or w_spin_eff > 0.0):
+        try:
+            actors_np = np.array(actors, dtype=object)
+            expert_mask_np = actors_np == "expert"
+            if expert_mask_np.any():
+                expert_mask = torch.from_numpy(expert_mask_np.astype(np.bool_)).to(device)
+                expert_idx = torch.nonzero(expert_mask, as_tuple=False).squeeze(1)
+                if expert_idx.numel() > 0:
+                    if w_sup_eff > 0.0:
+                        ce_fz = F.cross_entropy(q_fz[expert_idx], fz_idxs.squeeze(1)[expert_idx])
+                        supervised_term = w_sup_eff * ce_fz
+                        total_loss = total_loss + supervised_term
+                        supervised_loss_item += float(supervised_term.item())
+                    if w_spin_eff > 0.0:
+                        ce_sp = F.cross_entropy(q_sp[expert_idx], sp_idxs.squeeze(1)[expert_idx])
+                        spinner_term = w_spin_eff * ce_sp
+                        total_loss = total_loss + spinner_term
+                        spinner_loss_item = float(spinner_term.item())
+                        supervised_loss_item += spinner_loss_item
+        except Exception:
+            expert_mask = None
 
-        if expert_indices.numel() > 0 and w_sup_eff > 0.0:
-            total_actions = log_probs.size(1)
-            action_indices = torch.arange(total_actions, device=log_probs.device)
-            fire_zap_indices = torch.div(action_indices, spinner_actions, rounding_mode="floor")
-            fire_mask = ((fire_zap_indices >> 1) & 1).bool()
-            zap_mask = (fire_zap_indices & 1).bool()
+    # Optimize
+    try:
+        agent.optimizer.zero_grad(set_to_none=True)
+    except TypeError:
+        agent.optimizer.zero_grad()
+    total_loss.backward()
 
-            log_prob_fire1 = torch.logsumexp(log_probs[:, fire_mask], dim=1)
-            log_prob_fire0 = torch.logsumexp(log_probs[:, ~fire_mask], dim=1)
-            log_prob_zap1 = torch.logsumexp(log_probs[:, zap_mask], dim=1)
-            log_prob_zap0 = torch.logsumexp(log_probs[:, ~zap_mask], dim=1)
-
-            fire_zap_taken = torch.div(taken_flat, spinner_actions, rounding_mode="floor")
-            fire_targets = ((fire_zap_taken >> 1) & 1).float()
-            zap_targets = (fire_zap_taken & 1).float()
-
-            fire_log_prob = torch.where(fire_targets > 0.5, log_prob_fire1, log_prob_fire0)
-            zap_log_prob = torch.where(zap_targets > 0.5, log_prob_zap1, log_prob_zap0)
-
-            fire_loss = -fire_log_prob[expert_indices]
-            zap_loss = -zap_log_prob[expert_indices]
-            imitation_loss = (fire_loss.mean() + zap_loss.mean()) * 0.5
-            supervised_term = imitation_loss * w_sup_eff
-            total_loss = total_loss + supervised_term
-            supervised_loss_item += float(supervised_term.item())
-
-        if expert_indices.numel() > 0 and w_spin_eff > 0.0:
-            log_probs_reshaped = log_probs.reshape(-1, fire_zap_actions, spinner_actions)
-            spinner_log_probs = torch.logsumexp(log_probs_reshaped, dim=1)
-            spinner_taken = torch.remainder(taken_flat, spinner_actions).long()
-            spinner_log_prob = spinner_log_probs.gather(1, spinner_taken.unsqueeze(1)).squeeze(1)
-            spinner_loss = -spinner_log_prob[expert_indices].mean() * w_spin_eff
-            total_loss = total_loss + spinner_loss
-            spinner_loss_item = float(spinner_loss.item())
-            supervised_loss_item += spinner_loss_item
-
-    agent.optimizer.zero_grad(set_to_none=True)
-    grad_norm = None
     clip_norm = float(getattr(RL_CONFIG, "grad_clip_norm", 10.0) or 10.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), clip_norm)
+    agent.optimizer.step()
 
-    if use_amp and getattr(agent, "amp_scaler", None) is not None:
-        agent.amp_scaler.scale(total_loss).backward()
-        agent.amp_scaler.unscale_(agent.optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), clip_norm)
-        agent.amp_scaler.step(agent.optimizer)
-        agent.amp_scaler.update()
+    # Target network update strategy
+    now = time.time()
+    use_soft = bool(getattr(RL_CONFIG, "use_soft_target_update", True))
+    if use_soft:
+        tau = float(getattr(RL_CONFIG, "soft_target_tau", 1e-3) or 1e-3)
+        tau = max(0.0, min(1.0, tau))
+        for target_param, local_param in zip(agent.qnetwork_target.parameters(), agent.qnetwork_local.parameters()):
+            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+        try:
+            metrics.last_target_update_step = int(getattr(metrics, "total_training_steps", 0))
+            metrics.last_target_update_time = now
+        except Exception:
+            pass
     else:
-        total_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(agent.qnetwork_local.parameters(), clip_norm)
-        agent.optimizer.step()
+        freq = int(getattr(RL_CONFIG, "target_update_freq", 0) or 0)
+        if freq > 0 and (agent.training_steps % freq == 0):
+            agent.qnetwork_target.load_state_dict(agent.qnetwork_local.state_dict())
+            try:
+                metrics.last_target_update_step = int(getattr(metrics, "total_training_steps", 0))
+                metrics.last_target_update_time = now
+            except Exception:
+                pass
 
     agent.training_steps += 1
-    agent._apply_target_update()
 
-    loss_value = float(total_loss.item())
-
-    try:
-        if sample_indices is not None:
-            td_errors = torch.abs(targets.detach() - selected_q).reshape(-1)
-            agent.memory.update_priorities(sample_indices, td_errors.detach().cpu().numpy())
-    except Exception:
-        pass
-
-    # Metric updates ---------------------------------------------------------
+    # Metrics
     try:
         metrics.total_training_steps += 1
-        metrics.training_steps_interval += 1
-        metrics.memory_buffer_size = len(agent.memory)
-
-        metrics.losses.append(loss_value)
-        metrics.loss_sum_interval += loss_value
-        metrics.loss_count_interval += 1
-
-        metrics.last_d_loss = float((w_disc * td_loss).item())
-        metrics.last_supervised_loss = float(supervised_loss_item)
-        metrics.last_spinner_loss = float(spinner_loss_item)
-
-        metrics.d_loss_sum_interval += metrics.last_d_loss
-        metrics.d_loss_count_interval += 1
-
+        if hasattr(metrics, 'training_steps_interval'):
+            metrics.training_steps_interval += 1
+        try:
+            metrics.memory_buffer_size = len(agent.memory)
+        except Exception:
+            pass
+            
+        metrics.losses.append(total_loss.item())
+        metrics.last_d_loss = total_loss.item()
         grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
         metrics.last_grad_norm = grad_norm_val
         metrics.last_clip_delta = max(0.0, grad_norm_val - clip_norm)
-
-        metrics.batch_done_frac = float(dones.mean().item())
-        metrics.batch_h_mean = float(horizons.mean().item())
-
-        actors_np = np.array(actors)
-        dqn_mask_np = actors_np == "dqn"
-        expert_mask_np = actors_np == "expert"
-        n_dqn = int(dqn_mask_np.sum())
-        n_expert = int(expert_mask_np.sum())
-
-        metrics.batch_n_dqn = n_dqn
-        metrics.batch_n_expert = n_expert
-        metrics.batch_frac_dqn = (n_dqn / len(actors_np)) if len(actors_np) else 0.0
-
-        rewards_np = rewards.detach().cpu().numpy().reshape(-1)
-        if n_dqn > 0:
-            metrics.reward_mean_dqn = float(rewards_np[dqn_mask_np].mean())
-        if n_expert > 0:
-            metrics.reward_mean_expert = float(rewards_np[expert_mask_np].mean())
-
+        metrics.last_supervised_loss = float(supervised_loss_item)
+        metrics.last_spinner_loss = float(spinner_loss_item)
+        
+        # Calculate agreement (accuracy)
         with torch.no_grad():
-            policy_q = q_values.detach()
-            greedy_actions = policy_q.argmax(dim=1, keepdim=True)
-            spinner_actions = getattr(agent, "spinner_actions", 1)
-            combined_match = compute_action_agreement(
-                greedy_actions,
-                discrete_actions,
-                spinner_actions,
-                states.device,
-            )
-            action_matches = combined_match.float()
+            pred_fz = q_fz.argmax(dim=1, keepdim=True)
+            pred_sp = q_sp.argmax(dim=1, keepdim=True)
+            agree_fz = (pred_fz == fz_idxs).float().mean().item()
+            agree_sp = (pred_sp == sp_idxs).float().mean().item()
+            
+            metrics.agreement_rate = (agree_fz + agree_sp) / 2.0
+            # Store per-head agreement for debugging (not displayed by default)
+            metrics.agreement_rate_fz = float(agree_fz)
+            metrics.agreement_rate_sp = float(agree_sp)
+            
+            # Update interval stats for display
+            if hasattr(metrics, 'agree_sum_interval'):
+                metrics.agree_sum_interval += metrics.agreement_rate
+                metrics.agree_count_interval += 1
+            
+            if hasattr(metrics, 'loss_sum_interval'):
+                metrics.loss_sum_interval += total_loss.item()
+                metrics.loss_count_interval += 1
 
-            if n_dqn > 0:
-                dqn_indices = torch.tensor(np.nonzero(dqn_mask_np)[0], dtype=torch.long, device=states.device)
-                agree_mean = float(action_matches[dqn_indices].mean().item())
-
-                # Update agreement metrics atomically to avoid race-induced >100% readings
-                with metrics.lock:
-                    metrics.agree_sum_interval += agree_mean
-                    metrics.agree_count_interval += 1
-
-        metrics.last_optimizer_step_time = time.time()
+            # Per-actor batch composition diagnostics (helps spot “no expert in batch” issues)
+            if actors is not None:
+                try:
+                    actors_np = np.array(actors, dtype=object)
+                    n_expert = int((actors_np == "expert").sum())
+                    n_dqn = int((actors_np == "dqn").sum())
+                    metrics.batch_n_expert = n_expert
+                    metrics.batch_n_dqn = n_dqn
+                    metrics.batch_frac_dqn = (n_dqn / max(1, len(actors_np)))
+                except Exception:
+                    pass
+            
     except Exception:
         pass
-    # ------------------------------------------------------------------------
 
-    return loss_value
+    return total_loss.item()

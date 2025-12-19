@@ -7,7 +7,7 @@
 # ||  ROLE: Boots the socket server, spawns keyboard and stats threads, and coordinates graceful shutdown.         ||
 # ||                                                                                                              ||
 # ||  NEED TO KNOW:                                                                                               ||
-# ||   - Creates model dir; instantiates HybridDQNAgent; loads latest model if present.                           ||
+# ||   - Creates model dir; instantiates DiscreteDQNAgent; loads latest model if present.                         ||
 # ||   - Starts SocketServer (Lua <-> Python bridge) and metrics display loop.                                    ||
 # ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t,v), LR adjust (l/L), bucket stats (b).          ||
 # ||                                                                                                              ||
@@ -28,7 +28,7 @@ from datetime import datetime
 import traceback
 import torch
 
-from aimodel import HybridDQNAgent, KeyboardHandler
+from aimodel import DiscreteDQNAgent, KeyboardHandler
 from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
 
 from metrics_display import display_metrics_header, display_metrics_row
@@ -36,15 +36,14 @@ from socket_server import SocketServer
 
 
 def print_bucket_stats(agent, kb_handler):
-    """Print replay buffer statistics in the simplified uniform layout."""
+    """Print replay buffer statistics (Stratified: Agent vs Expert)."""
     try:
         if not hasattr(agent, 'memory') or agent.memory is None:
             print("\nNo replay buffer available")
             return
 
         stats = agent.memory.get_partition_stats()
-        actor_comp = agent.memory.get_actor_composition()
-
+        
         print("\n" + "=" * 90)
         print(" " * 30 + "REPLAY BUFFER STATISTICS")
         print("=" * 90)
@@ -53,76 +52,10 @@ def print_bucket_stats(agent, kb_handler):
         print("-" * 90)
         total_size = stats.get('total_size', 0)
         total_capacity = stats.get('total_capacity', max(1, total_size))
-        fill_pct = (total_size / total_capacity) * 100.0 if total_capacity else 0.0
-        print(f"  Total Size:          {total_size:>12,} / {total_capacity:>12,} ({fill_pct:>5.1f}%)")
-        print(f"  DQN Experiences:     {actor_comp.get('dqn', 0):>12,}   "
-              f"({actor_comp.get('frac_dqn', 0.0)*100:>5.1f}%)")
-        print(f"  Expert Experiences:  {actor_comp.get('expert', 0):>12,}   "
-              f"({actor_comp.get('frac_expert', 0.0)*100:>5.1f}%)")
-
-        if not stats.get('priority_buckets_enabled', False):
-            print(f"\n{'UNIFORM BUFFER OVERVIEW':<40}")
-            print("-" * 90)
-            main_capacity = stats.get('main_capacity', total_capacity)
-            main_size = stats.get('main_size', total_size)
-            main_fill_pct = stats.get('main_fill_pct', fill_pct)
-            bar_width = 40
-            filled = int(main_fill_pct / 100.0 * bar_width)
-            bar = '█' * filled + '░' * (bar_width - filled)
-            print(f"  {'Capacity':<20} {main_capacity:>12,}")
-            print(f"  {'Stored':<20} {main_size:>12,}")
-            print(f"  {'Fill':<20} {main_fill_pct:>6.1f}%  [{bar}]")
-            print("\n  Priority buckets disabled — sampling is uniform across the buffer.")
-        else:
-            print(f"\n{'PRIORITY BUCKET BREAKDOWN':<40}")
-            print("-" * 104)
-            print(f"  {'Bucket':<15} {'Percentile':<15} {'Cutoff':>12} {'Physical':>12} {'Actual':>12} "
-                  f"{'Capacity':>12} {'Fill %':>8}  {'Fill':<32}")
-            print("-" * 104)
-
-            bucket_names = list(stats.get('bucket_labels', []))
-            if not bucket_names:
-                for key in stats.keys():
-                    if key.startswith('p') and key.endswith('_size') and key != 'main_size' and 'actual_size' not in key:
-                        bucket_names.append(key.replace('_size', ''))
-            bucket_names = sorted(
-                bucket_names,
-                key=lambda x: int(x.split('_')[0][1:]) if x.startswith('p') else 0,
-                reverse=True,
-            )
-            for name in bucket_names:
-                parts = name[1:].split('_')
-                label = f"{parts[0]}-{parts[1]}%"
-                physical = stats.get(f'{name}_size', 0)
-                actual = stats.get(f'{name}_actual_size', physical)
-                capacity = stats.get(f'{name}_capacity', 0)
-                fill = stats.get(f'{name}_fill_pct', 0.0)
-                cutoff_val = stats.get(f'{name}_threshold', float('inf'))
-                if math.isinf(cutoff_val):
-                    cutoff_str = "   inf"
-                else:
-                    cutoff_str = f"{cutoff_val:12.3f}"
-                bar_width = 30
-                filled = int(fill / 100.0 * bar_width)
-                bar = '█' * filled + '░' * (bar_width - filled)
-                print(f"  {name:<15} {label:<15} {cutoff_str} {physical:>12,} {actual:>12,} {capacity:>12,} {fill:>7.1f}%  [{bar:<30}]")
-
-            main_physical = stats.get('main_size', 0)
-            main_actual = stats.get('main_actual_size', main_physical)
-            main_capacity = stats.get('main_capacity', 0)
-            main_fill = stats.get('main_fill_pct', 0.0)
-            filled = int(main_fill / 100.0 * 30)
-            bar = '█' * filled + '░' * (30 - filled)
-            lowest = int(bucket_names[-1].split('_')[0][1:]) if bucket_names else 90
-            label = f"<{lowest}%"
-            print(f"  {'main':<15} {label:<15} {'   --':>12} {main_physical:>12,} {main_actual:>12,} {main_capacity:>12,} "
-                  f"{main_fill:>7.1f}%  [{bar:<30}]")
-
-        print(f"\n{'SAMPLING METRICS':<40}")
-        print("-" * 90)
-        print(f"  {'Recent batch size:':<25} {getattr(agent, 'batch_size', 'N/A')}")
-        print(f"  {'Training steps:':<25} {getattr(metrics, 'total_training_steps', 0):>12,}")
-        print(f"  {'Experiences added:':<25} {stats.get('total_size', 0):>12,}")
+        
+        print(f"  Total Size:          {total_size:>12,} / {total_capacity:>12,}")
+        print(f"  Agent Experiences:   {stats.get('dqn', 0):>12,}   ({stats.get('frac_dqn', 0.0)*100:>5.1f}%)")
+        print(f"  Expert Experiences:  {stats.get('expert', 0):>12,}   ({stats.get('frac_expert', 0.0)*100:>5.1f}%)")
 
         print("\n" + "=" * 90 + "\n")
 
@@ -134,13 +67,13 @@ def print_bucket_stats(agent, kb_handler):
         traceback.print_exc()
         if kb_handler and IS_INTERACTIVE:
             kb_handler.set_raw_mode()
+
 def stats_reporter(agent, kb_handler):
     """Thread function to report stats periodically"""
     print("Starting stats reporter thread...")
-    
-    # Load the model if it exists
-    if os.path.exists(LATEST_MODEL_PATH):
-        agent.load(LATEST_MODEL_PATH)
+
+    # NOTE: The model is loaded once in main() before the server starts.
+    # Re-loading here can race with live frame processing and reset restored counters.
     last_report = time.time()
     report_interval = 30.0  # Print every 30 seconds
     
@@ -186,14 +119,13 @@ def keyboard_input_handler(agent, keyboard_handler):
                         pass
                     try:
                         if agent:
-                            agent.stop(join=True, timeout=2.0)
+                            agent.stop()
                     except Exception:
                         pass
                     break
                 elif key == 's':
                     print("Save command received, saving model...")
-                    agent.save(LATEST_MODEL_PATH)
-                    print(f"Model saved to {LATEST_MODEL_PATH}")
+                    agent.save(LATEST_MODEL_PATH, is_forced_save=True)
                 elif key == 'o':
                     metrics.toggle_override(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
@@ -210,7 +142,7 @@ def keyboard_input_handler(agent, keyboard_handler):
                     metrics.toggle_training_mode(keyboard_handler)
                     # Propagate to agent
                     try:
-                        agent.set_training_enabled(metrics.training_enabled)
+                        agent.training_enabled = metrics.training_enabled
                     except Exception:
                         pass
                     display_metrics_row(agent, keyboard_handler)
@@ -220,7 +152,7 @@ def keyboard_input_handler(agent, keyboard_handler):
                     display_metrics_header()
                 elif key.lower() == 'h':
                     # Do hard target update before displaying header
-                    agent.update_target_network()
+                    # agent.update_target_network() # Not exposed in DiscreteDQNAgent yet, maybe add?
                     display_metrics_header()
                 elif key == ' ':  # Handle space key
                     # Print only one row (no header)
@@ -243,14 +175,8 @@ def keyboard_input_handler(agent, keyboard_handler):
                 elif key == '6':
                     metrics.increase_epsilon(keyboard_handler)
                     display_metrics_row(agent, keyboard_handler)
-                elif key == 'L':
-                    agent.adjust_learning_rate(0.00005, keyboard_handler)
-                    display_metrics_row(agent, keyboard_handler)
-                elif key == 'l':
-                    agent.adjust_learning_rate(-0.00005, keyboard_handler)
-                    display_metrics_row(agent, keyboard_handler)
                 elif key == 'b':
-                    # Print N-bucket replay buffer statistics
+                    # Print replay buffer statistics
                     print_bucket_stats(agent, keyboard_handler)
             
             time.sleep(0.1)
@@ -267,7 +193,7 @@ def print_network_config(agent):
     # Network Architecture
     print("\n📐 NETWORK ARCHITECTURE:")
     print(f"   State Size:        {agent.state_size}")
-    print(f"   Discrete Actions:  {agent.discrete_actions} (joint FIRE/ZAP/SPINNER)")
+    print(f"   Heads:             2 (FireZap + Spinner)")
     
     # Get layer sizes from the network
     print(f"\n   Shared Trunk:      {len(agent.qnetwork_local.shared_layers)} layers")
@@ -275,14 +201,9 @@ def print_network_config(agent):
         if isinstance(layer, torch.nn.Linear):
             print(f"      Layer {i+1}:        {layer.in_features} → {layer.out_features}")
     
-    # Head architectures (support dueling/non-dueling)
-    shared_out = agent.qnetwork_local.shared_layers[-1].out_features if agent.qnetwork_local.shared_layers else 0
-    if getattr(agent.qnetwork_local, "use_dueling", False):
-        head_hidden = agent.qnetwork_local.advantage_fc.out_features
-        print(f"\n   Action Head:       {shared_out} → {head_hidden} (value/advantage, dueling) → {agent.discrete_actions}")
-    else:
-        head_hidden = agent.qnetwork_local.discrete_fc.out_features if hasattr(agent.qnetwork_local, "discrete_fc") else 0
-        print(f"\n   Action Head:       {shared_out} → {head_hidden} → {agent.discrete_actions}")
+    # Head architectures
+    print(f"\n   FireZap Head:      {agent.qnetwork_local.firezap_fc.in_features} → {agent.qnetwork_local.firezap_fc.out_features} → 4")
+    print(f"   Spinner Head:      {agent.qnetwork_local.spinner_fc.in_features} → {agent.qnetwork_local.spinner_fc.out_features} → 64")
     
     # Count total parameters
     total_params = sum(p.numel() for p in agent.qnetwork_local.parameters())
@@ -295,39 +216,31 @@ def print_network_config(agent):
     print(f"   Learning Rate:     {agent.learning_rate:.6f}")
     print(f"   Batch Size:        {agent.batch_size:,}")
     print(f"   Gamma (γ):         {agent.gamma}")
-    print(f"   Epsilon (ε):       {agent.epsilon} → {agent.epsilon_min} (exploration)")
+    print(f"   Epsilon (ε):       {agent.epsilon} (exploration)")
     print(f"   Memory Size:       {agent.memory.capacity:,} transitions")
-    print(f"   Target Update:     Every {RL_CONFIG.target_update_freq} steps")
     
     # Loss Configuration
     print("\n⚖️  LOSS CONFIGURATION:")
-    print(f"   Discrete Loss:     TD (Huber)")
-    print(f"   Loss Weight:       {RL_CONFIG.discrete_loss_weight:.1f}")
-    max_q = getattr(RL_CONFIG, 'max_q_value', None)
-    print(f"   Max Q-Value Clip:  {max_q:.1f}" if max_q else "   Max Q-Value Clip:  None")
-    td_clip = getattr(RL_CONFIG, 'td_target_clip', None)
-    print(f"   TD Target Clip:    {td_clip:.1f}" if td_clip else "   TD Target Clip:    None")
+    print(f"   Loss Function:     SmoothL1Loss (Huber)")
+    print(f"   Total Loss:        Loss_FireZap + Loss_Spinner")
     
     # Expert Configuration
     print("\n🎓 EXPERT GUIDANCE:")
     print(f"   Expert Ratio:      {RL_CONFIG.expert_ratio_start*100:.0f}%")
-    print(f"   Superzap Gate:     {'Enabled' if RL_CONFIG.enable_superzap_gate else 'Disabled'}")
     
     # Optimization
     print("\n🚀 OPTIMIZATION:")
-    print(f"   Gradient Clip:     {getattr(RL_CONFIG, 'grad_clip_norm', 10.0):.1f} (max norm)")
-    print(f"   N-Step Returns:    {RL_CONFIG.n_step}-step")
-    print(f"   Training Workers:  {RL_CONFIG.training_workers}")
+    print(f"   Gradient Clip:     10.0 (max norm)")
+    print(f"   Training Workers:  1")
     
     # Keyboard Controls
     print("\n⌨️  KEYBOARD CONTROLS:")
     print(f"   [q] Quit           [s] Save Model       [c] Clear Screen")
     print(f"   [o] Override       [e] Expert Mode      [p] Force Epsilon")
-    print(f"   [t] Training       [v] Verbose          [h] Hard Target Update")
+    print(f"   [t] Training       [v] Verbose          [space] Print Row")
     print(f"   [7] Dec Expert     [8] Reset Expert     [9] Inc Expert")
     print(f"   [4] Dec Epsilon    [5] Reset Epsilon    [6] Inc Epsilon")
-    print(f"   [l] Dec LR         [L] Inc LR           [space] Print Row")
-    print(f"   [b] Bucket Stats   - Display N-bucket replay buffer statistics")
+    print(f"   [b] Buffer Stats   - Display replay buffer statistics")
     
     print("\n" + "="*100 + "\n")
 
@@ -339,15 +252,11 @@ def main():
         os.makedirs(MODEL_DIR)
     
     # Initialize the Agent
-    # Use HybridDQNAgent (joint fire/zap/spinner action space)
-    
-    agent = HybridDQNAgent(
+    agent = DiscreteDQNAgent(
         state_size       = RL_CONFIG.state_size,
-        discrete_actions = 4,
         learning_rate    = RL_CONFIG.lr,
         gamma            = RL_CONFIG.gamma,
         epsilon          = RL_CONFIG.epsilon,
-        epsilon_min      = RL_CONFIG.epsilon_min,
         memory_size      = RL_CONFIG.memory_size,
         batch_size       = RL_CONFIG.batch_size
     )
@@ -427,7 +336,7 @@ def main():
             pass
         try:
             if agent:
-                agent.stop(join=True, timeout=2.0)
+                agent.stop()
         except Exception:
             pass
         

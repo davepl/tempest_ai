@@ -54,22 +54,10 @@ def _update_dqn_window(dqn_reward: float, episode_length: int):
     _dqn_window.append((float(dqn_reward), int(episode_length)))
     _dqn_window_frames += episode_length
 
-    # Trim window to last 5M frames
+    # Trim window to last 5M frames (remove full episodes only)
     while _dqn_window and _dqn_window_frames > DQN_WINDOW_FRAMES:
-        overflow = _dqn_window_frames - DQN_WINDOW_FRAMES
-        oldest_reward, oldest_length = _dqn_window[0]
-        
-        if oldest_length <= overflow:
-            # Remove entire oldest episode
-            _dqn_window.popleft()
-            _dqn_window_frames -= oldest_length
-        else:
-            # Partially count the oldest episode (proportional reward)
-            kept_frames = oldest_length - overflow
-            kept_reward = oldest_reward * (kept_frames / oldest_length)
-            _dqn_window[0] = (kept_reward, kept_frames)
-            _dqn_window_frames = DQN_WINDOW_FRAMES
-            break
+        oldest_reward, oldest_length = _dqn_window.popleft()
+        _dqn_window_frames -= oldest_length
 
 def _update_dqn1m_window(dqn_reward: float, episode_length: int):
     """Add a completed episode to the 1M-frames rolling window.
@@ -88,22 +76,10 @@ def _update_dqn1m_window(dqn_reward: float, episode_length: int):
     _dqn1m_window.append((float(dqn_reward), int(episode_length)))
     _dqn1m_window_frames += episode_length
 
-    # Trim window to last 1M frames
+    # Trim window to last 1M frames (remove full episodes only)
     while _dqn1m_window and _dqn1m_window_frames > DQN1M_WINDOW_FRAMES:
-        overflow = _dqn1m_window_frames - DQN1M_WINDOW_FRAMES
-        oldest_reward, oldest_length = _dqn1m_window[0]
-        
-        if oldest_length <= overflow:
-            # Remove entire oldest episode
-            _dqn1m_window.popleft()
-            _dqn1m_window_frames -= oldest_length
-        else:
-            # Partially count the oldest episode (proportional reward)
-            kept_frames = oldest_length - overflow
-            kept_reward = oldest_reward * (kept_frames / oldest_length)
-            _dqn1m_window[0] = (kept_reward, kept_frames)
-            _dqn1m_window_frames = DQN1M_WINDOW_FRAMES
-            break
+        oldest_reward, oldest_length = _dqn1m_window.popleft()
+        _dqn1m_window_frames -= oldest_length
 
 def _compute_dqn_window_stats():
     """Compute average DQN reward for the 5M-frame window.
@@ -129,7 +105,6 @@ def _compute_dqn1m_window_stats():
 
     # Sum total DQN rewards and total frames
     total_dqn_reward = sum(reward for reward, _ in _dqn1m_window)
-    total_frames = _dqn1m_window_frames
     
     # Average reward per frame, then scale to per-episode basis
     # Actually, we want average episode reward, so just compute that directly
@@ -405,12 +380,26 @@ def display_metrics_row(agent, kb_handler):
     mem_k = getattr(metrics, 'memory_buffer_size', 0) // 1000
     
     # Get partition stats if agent is available
-    # Show fill % for all N priority buckets plus main bucket
+    # Show fill % for Agent vs Expert buffers
     bucket_fill_pcts = []
     if agent and hasattr(agent, 'memory') and hasattr(agent.memory, 'get_partition_stats'):
         try:
             pstats = agent.memory.get_partition_stats()
-            if not pstats.get('priority_buckets_enabled', False):
+            # Check for new StratifiedReplayBuffer stats
+            if 'dqn' in pstats and 'expert' in pstats:
+                dqn_count = pstats['dqn']
+                expert_count = pstats['expert']
+                total = pstats.get('total_size', 1)
+                if total == 0: total = 1
+                
+                dqn_pct = (dqn_count / total) * 100
+                expert_pct = (expert_count / total) * 100
+                
+                bucket_fill_pcts.append(f"A:{dqn_pct:.0f}%")
+                bucket_fill_pcts.append(f"E:{expert_pct:.0f}%")
+            
+            # Fallback to old logic if not stratified
+            elif not pstats.get('priority_buckets_enabled', False):
                 bucket_fill_pcts.append(f"{pstats.get('main_fill_pct', 0.0):.0f}%")
             else:
                 bucket_names = list(pstats.get('bucket_labels', []))
@@ -440,13 +429,33 @@ def display_metrics_row(agent, kb_handler):
     # Format: MemK/Steps/P98/P95/P90/Main (for N=3)
     training_stats = f"{mem_k}k/{metrics.total_training_steps}/{'/'.join(bucket_fill_pcts)}"
 
+    def _safe_inverse(scale_value):
+        try:
+            scale_float = float(scale_value)
+            if scale_float == 0.0:
+                return 1.0
+            return 1.0 / scale_float
+        except Exception:
+            return 1.0
+
+    inv_obj = _safe_inverse(getattr(RL_CONFIG, 'obj_reward_scale', 1.0))
+    inv_subj = _safe_inverse(getattr(RL_CONFIG, 'subj_reward_scale', 1.0))
+
+    # Use fixed multiplier based on objective scale to ensure stability.
+    # Dynamic calculation causes fluctuations when hidden rewards (like death penalty) 
+    # affect the denominator (mean_reward) but not the numerator (total_raw).
+    reward_multiplier = inv_obj if inv_obj != 1.0 else (inv_subj if inv_subj != 1.0 else 1.0)
+
     # Get Q-value range from the agent
     q_range = "N/A"
     if agent:
         try:
             min_q, max_q = agent.get_q_value_range()
             if not (np.isnan(min_q) or np.isnan(max_q)):
-                q_range = f"[{min_q:.1f},{max_q:.1f}]"
+                # Apply multiplier to show in point units
+                min_q_scaled = min_q * reward_multiplier
+                max_q_scaled = max_q * reward_multiplier
+                q_range = f"[{min_q_scaled:.1f},{max_q_scaled:.1f}]"
         except Exception:
             q_range = "Error"
 
@@ -462,36 +471,15 @@ def display_metrics_row(agent, kb_handler):
         metrics.episode_length_sum_interval = 0
         metrics.episode_length_count_interval = 0
 
-    def _safe_inverse(scale_value):
-        try:
-            scale_float = float(scale_value)
-            if scale_float == 0.0:
-                return 1.0
-            return 1.0 / scale_float
-        except Exception:
-            return 1.0
-
-    inv_obj = _safe_inverse(getattr(RL_CONFIG, 'obj_reward_scale', 1.0))
-    inv_subj = _safe_inverse(getattr(RL_CONFIG, 'subj_reward_scale', 1.0))
-
     obj_raw = mean_obj_reward * inv_obj
     subj_raw = mean_subj_reward * inv_subj
-    ignore_subj = bool(getattr(RL_CONFIG, 'ignore_subjective_rewards', False))
-    if ignore_subj:
-        total_raw = obj_raw
-    else:
-        total_raw = obj_raw + subj_raw
-
-    reward_multiplier = None
-    if mean_reward not in (0.0, None):
-        try:
-            reward_multiplier = total_raw / mean_reward if mean_reward != 0 else None
-        except Exception:
-            reward_multiplier = None
-    if reward_multiplier is None or not math.isfinite(reward_multiplier) or reward_multiplier == 0.0:
-        reward_multiplier = inv_obj if inv_obj != 1.0 else (inv_subj if inv_subj != 1.0 else 1.0)
+    total_raw = obj_raw + subj_raw
 
     dqn_raw = mean_dqn_reward * reward_multiplier
+    
+    # DQN1M and DQN5M are already stored as scaled rewards in the window buffers
+    # (passed from aimodel.py -> socket_server.py where scaling is applied)
+    # So we just need to apply the multiplier to convert back to display units
     dqn1m_raw = dqn1m_avg * reward_multiplier
     dqn5m_raw = dqn5m_avg * reward_multiplier
 
