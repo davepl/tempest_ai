@@ -1,44 +1,15 @@
 #!/usr/bin/env python3
 # ==================================================================================================================
-# ||                                                                                                              ||
-# ||                                    TEMPEST AI • SOCKET BRIDGE SERVER                                        ||
-# ||                                                                                                              ||
-# ||  FILE: Scripts/socket_server.py                                                                              ||
-# ||  ROLE: TCP server bridging Lua (MAME) and Python: receives frames, returns actions, manages clients.          ||
-# ||                                                                                                              ||
-# ||  NEED TO KNOW:                                                                                               ||
-# ||   - Accepts Lua client(s), handshakes, reads OOB+state, decodes, queries agent, replies action bytes.         ||
-# ||   - Supports optional server-side n-step (if agent doesn’t own one); updates metrics thread-safely.          ||
-# ||   - Robust shutdown handling; per-client worker threads.                                                      ||
-# ||                                                                                                              ||
-# ||  CONSUMES: RL_CONFIG, SERVER_CONFIG, metrics, NStepReplayBuffer (optional)                                   ||
-# ||  PRODUCES: agent experiences, actions to Lua, metrics updates                                                ||
-# ||                                                                                                              ||
+# ||  TEMPEST AI v2 • SOCKET BRIDGE SERVER                                                                       ||
+# ||  TCP server bridging Lua (MAME) ↔ Python.  Protocol unchanged from v1.                                     ||
 # ==================================================================================================================
-"""
-Socket server for Tempest AI (Discrete 2-Head).
-Bridges Lua frames to a DiscreteDQNAgent with separate FireZap and Spinner heads.
-"""
+"""Socket server — receives frames from Lua, queries agent, returns 3-byte actions."""
 
-# Prevent direct execution
 if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os
-import sys
-import time
-import socket
-import select
-import struct
-import threading
-import traceback
-import random
-import errno
-import queue
-import math
-from collections import deque
-
+import os, sys, time, socket, select, struct, threading, traceback, random, queue
 import numpy as np
 
 from aimodel import (
@@ -49,97 +20,78 @@ from aimodel import (
     discrete_to_fire_zap,
     quantize_spinner_value,
     spinner_index_to_value,
+    combine_action_indices,
+    split_joint_action,
     SafeMetrics,
 )
 from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
 
+try:
+    from nstep_buffer import NStepReplayBuffer
+except ImportError:
+    from Scripts.nstep_buffer import NStepReplayBuffer
 
+try:
+    from metrics_display import add_episode_to_dqn1m_window, add_episode_to_dqn5m_window
+except ImportError:
+    add_episode_to_dqn1m_window = add_episode_to_dqn5m_window = lambda *a: None
+
+
+# ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
 class AsyncReplayBuffer:
-    """
-    Non-blocking async wrapper for agent.step() calls.
-    Queues experiences and inserts them in batches on a background thread.
-    """
-    def __init__(self, agent, batch_size=1000, max_queue_size=10000):
+    def __init__(self, agent, batch_size=100, max_queue_size=10000):
         self.agent = agent
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
-        self.put_timeout = 0.05
-        self.worker_thread = threading.Thread(target=self._consume_queue, daemon=True)
-        self.worker_thread.start()
-        self.items_queued = 0
-        self.items_processed = 0
-        self.items_dropped = 0
-        
+        self._thread = threading.Thread(target=self._consume, daemon=True)
+        self._thread.start()
+
     def step_async(self, *args, **kwargs):
-        """Non-blocking step - queues experience for later insertion."""
         try:
-            self.queue.put((args, kwargs), timeout=self.put_timeout)
-            self.items_queued += 1
-            return True
+            self.queue.put((args, kwargs), timeout=0.05)
         except queue.Full:
-            self.items_dropped += 1
-            return False
-    
-    def _consume_queue(self):
-        batch = []
+            pass
+
+    def _consume(self):
         while self.running:
             try:
-                if not batch:
-                    item = self.queue.get(timeout=0.01)
-                    batch.append(item)
-                while len(batch) < self.batch_size:
-                    try:
-                        batch.append(self.queue.get_nowait())
-                    except queue.Empty:
-                        break
-
-                for args, kwargs in batch:
-                    try:
-                        self.agent.step(*args, **kwargs)
-                        self.items_processed += 1
-                    except Exception as e:
-                        print(f"AsyncReplayBuffer: Error in agent.step(): {e}")
-                batch.clear()
+                item = self.queue.get(timeout=0.01)
             except queue.Empty:
                 continue
-            except Exception as e:
-                print(f"AsyncReplayBuffer worker error: {e}")
-                time.sleep(0.01)
-                
+            batch = [item]
+            while len(batch) < self.batch_size:
+                try:
+                    batch.append(self.queue.get_nowait())
+                except queue.Empty:
+                    break
+            for a, kw in batch:
+                try:
+                    self.agent.step(*a, **kw)
+                except Exception as e:
+                    print(f"AsyncReplayBuffer error: {e}")
+
     def stop(self):
         self.running = False
-        remaining = []
-        try:
-            while True:
-                remaining.append(self.queue.get_nowait())
-        except queue.Empty:
-            pass
-        
-        for args, kwargs in remaining:
+        # Drain remaining
+        while True:
             try:
-                self.agent.step(*args, **kwargs)
-                self.items_processed += 1
+                a, kw = self.queue.get_nowait()
+                self.agent.step(*a, **kw)
+            except queue.Empty:
+                break
             except Exception:
                 pass
-        self.worker_thread.join(timeout=5.0)
-        
-    def get_stats(self):
-        return {
-            'queued': self.items_queued,
-            'processed': self.items_processed,
-            'dropped': self.items_dropped,
-            'pending': self.queue.qsize(),
-            'queue_full': self.queue.full()
-        }
+        self._thread.join(timeout=5.0)
 
 
+# ── Socket Server ───────────────────────────────────────────────────────────
 class SocketServer:
     def __init__(self, host, port, agent, metrics_wrapper):
         self.host = host
         self.port = port
         self.agent = agent
-        self.async_buffer = AsyncReplayBuffer(agent, batch_size=100, max_queue_size=10000) if agent else None
+        self.async_buffer = AsyncReplayBuffer(agent) if agent else None
         self.metrics = SafeMetrics(metrics_wrapper)
 
         self.server_socket = None
@@ -150,356 +102,304 @@ class SocketServer:
         self.client_states = {}
         self.client_lock = threading.Lock()
 
-    def _allocate_client_id(self):
+    def _alloc_id(self):
         with self.client_lock:
-            existing = set(self.clients.keys())
             cid = 0
-            while cid in existing:
+            while cid in self.clients:
                 cid += 1
             return cid
 
-    def _init_client_state(self, client_id):
+    def _init_client(self, cid):
+        n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
+        gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
+        nstep = NStepReplayBuffer(n_step=n, gamma=gamma) if n > 1 else None
         with self.client_lock:
-            self.client_states[client_id] = {
-                'frames_processed': 0,
-                'last_frame_time': time.time(),
-                'fps': 0.0,
-                'level_number': 0,
-                'prev_frame': None,
-                'current_frame': None,
-                'last_state': None,
-                'last_action': None, # (fz_idx, sp_idx)
-                'last_action_source': None,
-                'prev_action_source': None,
-                'total_reward': 0.0,
-                'episode_dqn_reward': 0.0,
-                'episode_expert_reward': 0.0,
-                'was_done': False,
+            self.client_states[cid] = {
+                "frames": 0, "last_time": time.time(), "fps": 0.0,
+                "level_number": 0, "last_state": None, "last_action": None,
+                "last_action_source": None, "prev_action_source": None,
+                "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
+                "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
+                "was_done": False, "nstep": nstep,
             }
             metrics.client_count = len(self.client_states)
 
-    def handle_client(self, client_socket, client_id):
+    def handle_client(self, sock, cid):
         try:
-            client_socket.setblocking(False)
-            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            sock.setblocking(False)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 
-            buffer_size = 32768
-
-            # handshake
+            # Handshake
             try:
-                client_socket.setblocking(True)
-                client_socket.settimeout(5.0)
-                ping = client_socket.recv(2)
+                sock.setblocking(True)
+                sock.settimeout(5.0)
+                ping = sock.recv(2)
                 if not ping or len(ping) < 2:
-                    raise ConnectionError("No initial ping header")
+                    raise ConnectionError("No handshake")
             finally:
-                client_socket.setblocking(False)
-                client_socket.settimeout(None)
+                sock.setblocking(False)
+                sock.settimeout(None)
 
-            METRICS_BATCH = 8
-            local_frame_accum = 0
+            BATCH = 8
+            local_accum = 0
 
             while self.running and not self.shutdown_event.is_set():
-                ready = select.select([client_socket], [], [], 0.0)
+                ready = select.select([sock], [], [], 0.0)
                 if not ready[0]:
                     time.sleep(0.0005)
                     continue
 
-                length_data = client_socket.recv(2)
-                if not length_data or len(length_data) < 2:
-                    raise ConnectionError("Failed to read length")
-                data_length = struct.unpack('>H', length_data)[0]
+                # Read length header
+                hdr = sock.recv(2)
+                if not hdr or len(hdr) < 2:
+                    raise ConnectionError("EOF")
+                dlen = struct.unpack(">H", hdr)[0]
 
-                data = b''
-                remaining = data_length
-                while remaining > 0:
-                    chunk = client_socket.recv(min(buffer_size, remaining))
+                # Read payload
+                data = b""
+                rem = dlen
+                while rem > 0:
+                    chunk = sock.recv(min(32768, rem))
                     if not chunk:
-                        raise ConnectionError("Connection broken during receive")
+                        raise ConnectionError("Broken")
                     data += chunk
-                    remaining -= len(chunk)
+                    rem -= len(chunk)
 
                 if len(data) >= 2:
-                    num_values_received = struct.unpack('>H', data[:2])[0]
-                    if num_values_received != SERVER_CONFIG.params_count:
-                        print(f"Client {client_id}: Param mismatch {num_values_received} != {SERVER_CONFIG.params_count}")
+                    n = struct.unpack(">H", data[:2])[0]
+                    if n != SERVER_CONFIG.params_count:
+                        print(f"Client {cid}: param mismatch {n} != {SERVER_CONFIG.params_count}")
                         break
                 else:
                     break
 
                 frame = parse_frame_data(data)
                 if not frame:
-                    client_socket.sendall(struct.pack('bbb', 0, 0, 0))
+                    sock.sendall(struct.pack("bbb", 0, 0, 0))
                     continue
 
                 with self.client_lock:
-                    if client_id not in self.client_states:
+                    if cid not in self.client_states:
                         break
-                    state = self.client_states[client_id]
-                    state['frames_processed'] += 1
-                    state['level_number'] = frame.level_number
-                    state['prev_frame'] = state.get('current_frame')
-                    state['current_frame'] = frame
+                    cs = self.client_states[cid]
+                    cs["frames"] += 1
+                    cs["level_number"] = frame.level_number
                     now = time.time()
-                    elapsed = now - state['last_frame_time']
-                    if elapsed >= 1.0:
-                        state['fps'] = 1.0 / elapsed
-                        state['last_frame_time'] = now
+                    el = now - cs["last_time"]
+                    if el >= 1.0:
+                        cs["fps"] = 1.0 / el
+                        cs["last_time"] = now
 
-                local_frame_accum += 1
-                if local_frame_accum >= METRICS_BATCH:
-                    self.metrics.update_frame_count(delta=local_frame_accum)
-                    local_frame_accum = 0
+                local_accum += 1
+                if local_accum >= BATCH:
+                    self.metrics.update_frame_count(delta=local_accum)
+                    local_accum = 0
                     self.metrics.update_epsilon()
                     self.metrics.update_expert_ratio()
-                    try:
-                        self.calculate_average_level()
-                    except Exception:
-                        pass
+                    self._calc_avg_level()
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
 
-                # Process previous frame reward
-                if state.get('last_state') is not None and state.get('last_action') is not None:
-                    last_action = state['last_action'] # (fz_idx, sp_idx)
-                    
-                    # Apply scaling to rewards received from the game
-                    subj_scale = getattr(RL_CONFIG, 'subj_reward_scale', 1.0)
-                    obj_scale = getattr(RL_CONFIG, 'obj_reward_scale', 1.0)
-                    
-                    subj_reward = float(frame.subjreward) * subj_scale
-                    obj_reward = float(frame.objreward) * obj_scale
-                    
-                    training_reward = obj_reward + subj_reward
+                # ── Process previous step ───────────────────────────────
+                if cs.get("last_state") is not None and cs.get("last_action") is not None:
+                    fz_i, sp_i = cs["last_action"]
+                    subj_r = float(frame.subjreward) * RL_CONFIG.subj_reward_scale
+                    obj_r = float(frame.objreward) * RL_CONFIG.obj_reward_scale
+                    total_r = obj_r + subj_r
+                    total_r = max(-RL_CONFIG.reward_clip, min(RL_CONFIG.reward_clip, total_r))
 
-                    # Push to agent
                     if self.agent:
-                        actor_tag = state.get('prev_action_source', 'dqn')
-                        self.async_buffer.step_async(
-                            state['last_state'],
-                            last_action,
-                            training_reward,
-                            frame.state,
-                            bool(frame.done),
-                            actor=actor_tag,
-                            horizon=1
-                        )
+                        tag = cs.get("prev_action_source", "dqn")
+                        nstep = cs.get("nstep")
+                        if nstep is not None:
+                            joint = combine_action_indices(fz_i, sp_i)
+                            matured = nstep.add(cs["last_state"], joint, total_r,
+                                                frame.state, bool(frame.done),
+                                                actor=tag, priority_reward=total_r)
+                            for s0, a, Rn, pR, sn, dn, h, act in matured:
+                                fz_n, sp_n = split_joint_action(a)
+                                self.async_buffer.step_async(
+                                    s0, (fz_n, sp_n), Rn, sn, bool(dn),
+                                    actor=act, horizon=int(h), priority_reward=pR)
+                        else:
+                            self.async_buffer.step_async(
+                                cs["last_state"], (fz_i, sp_i), total_r,
+                                frame.state, bool(frame.done), actor=tag, horizon=1,
+                                priority_reward=total_r)
 
-                    # Reward accounting
-                    state['total_reward'] = state.get('total_reward', 0.0) + training_reward
-                    state['episode_subj_reward'] = state.get('episode_subj_reward', 0.0) + subj_reward
-                    state['episode_obj_reward'] = state.get('episode_obj_reward', 0.0) + obj_reward
-                    state['episode_frames'] = state.get('episode_frames', 0) + 1
-                    
-                    prev_src = state.get('prev_action_source')
-                    if prev_src == 'dqn':
-                        state['episode_dqn_reward'] = state.get('episode_dqn_reward', 0.0) + training_reward
-                    elif prev_src == 'expert':
-                        state['episode_expert_reward'] = state.get('episode_expert_reward', 0.0) + training_reward
+                    cs["total_reward"] += total_r
+                    cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + subj_r
+                    cs["ep_obj_reward"] = cs.get("ep_obj_reward", 0) + obj_r
+                    cs["ep_frames"] = cs.get("ep_frames", 0) + 1
+                    src = cs.get("prev_action_source")
+                    if src == "dqn":
+                        cs["ep_dqn_reward"] += total_r
+                    elif src == "expert":
+                        cs["ep_expert_reward"] += total_r
 
-                # Terminal handling
+                # ── Terminal ────────────────────────────────────────────
                 if frame.done:
-                    if not state.get('was_done', False):
+                    if not cs.get("was_done", False):
                         self.metrics.add_episode_reward(
-                            state.get('total_reward', 0.0),
-                            state.get('episode_dqn_reward', 0.0),
-                            state.get('episode_expert_reward', 0.0),
-                            state.get('episode_subj_reward', 0.0),
-                            state.get('episode_obj_reward', 0.0),
-                            length=state.get('episode_frames', 0)
-                        )
-                    state['was_done'] = True
+                            cs["total_reward"], cs["ep_dqn_reward"], cs["ep_expert_reward"],
+                            cs.get("ep_subj_reward", 0), cs.get("ep_obj_reward", 0),
+                            length=cs.get("ep_frames", 0))
+                        try:
+                            add_episode_to_dqn1m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
+                            add_episode_to_dqn5m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
+                        except Exception:
+                            pass
+                    cs["was_done"] = True
                     try:
-                        client_socket.sendall(struct.pack('bbb', 0, 0, 0))
+                        sock.sendall(struct.pack("bbb", 0, 0, 0))
                     except Exception:
                         break
-
-                    state['last_state'] = None
-                    state['last_action'] = None
-                    state['last_action_source'] = None
-                    state['prev_action_source'] = None
-                    state['total_reward'] = 0.0
-                    state['episode_dqn_reward'] = 0.0
-                    state['episode_expert_reward'] = 0.0
-                    state['episode_subj_reward'] = 0.0
-                    state['episode_obj_reward'] = 0.0
-                    state['episode_frames'] = 0
+                    cs["last_state"] = cs["last_action"] = None
+                    cs["last_action_source"] = cs["prev_action_source"] = None
+                    cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
+                    cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
+                    cs["ep_frames"] = 0
                     continue
 
-                elif state.get('was_done', False):
-                    state['was_done'] = False
-                    state['total_reward'] = 0.0
-                    state['episode_dqn_reward'] = 0.0
-                    state['episode_expert_reward'] = 0.0
-                    state['episode_subj_reward'] = 0.0
-                    state['episode_obj_reward'] = 0.0
-                    state['episode_frames'] = 0
+                if cs.get("was_done"):
+                    cs["was_done"] = False
+                    cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
+                    cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
+                    cs["ep_frames"] = 0
 
-                # Choose Action
+                # ── Choose action ───────────────────────────────────────
                 self.metrics.increment_total_controls()
-                
-                action_source = None
-                fz_idx = 0
-                sp_idx = 0
-                fire = False
-                zap = False
+                fz_idx = sp_idx = 0
+                fire = zap = False
                 spinner_val = 0.0
+                action_source = "none"
 
                 if self.agent:
                     expert_ratio = self.metrics.get_expert_ratio()
-                    if frame.gamestate == 0x20: # Zooming
-                        expert_ratio = min(1.0, expert_ratio * 4.0)
-                    
-                    use_expert = (random.random() < expert_ratio) and (not self.metrics.metrics.override_expert)
+                    use_expert = (random.random() < expert_ratio) and not metrics.override_expert
 
                     if use_expert:
                         fire, zap, spinner_val = get_expert_action(
                             frame.enemy_seg, frame.player_seg, frame.open_level,
-                            frame.expert_fire, frame.expert_zap
-                        )
+                            frame.expert_fire, frame.expert_zap)
                         fz_idx = fire_zap_to_discrete(fire, zap)
                         sp_idx = quantize_spinner_value(spinner_val)
-                        action_source = 'expert'
+                        action_source = "expert"
                     else:
                         epsilon = self.metrics.get_effective_epsilon()
-                        if frame.gamestate == 0x20:
-                            epsilon *= float(getattr(RL_CONFIG, "zoom_epsilon_scale", 0.25) or 0.25)
-                        
-                        start_t = time.perf_counter()
+                        t0 = time.perf_counter()
                         fz_idx, sp_idx = self.agent.act(frame.state, epsilon)
-                        infer_t = time.perf_counter() - start_t
-                        self.metrics.add_inference_time(infer_t)
-                        
+                        self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
                         spinner_val = spinner_index_to_value(sp_idx)
-                        action_source = 'dqn'
-                else:
-                    action_source = 'none'
+                        action_source = "dqn"
 
-                # Store for next step
-                state['last_state'] = frame.state
-                state['last_action'] = (fz_idx, sp_idx)
-                state['prev_action_source'] = action_source
-                state['last_action_source'] = action_source
+                cs["last_state"] = frame.state
+                cs["last_action"] = (fz_idx, sp_idx)
+                cs["prev_action_source"] = action_source
+                cs["last_action_source"] = action_source
 
-                # Send to game
-                game_fire, game_zap, game_spinner = encode_action_to_game(fire, zap, spinner_val)
+                gf, gz, gs = encode_action_to_game(fire, zap, spinner_val)
                 try:
-                    client_socket.sendall(struct.pack('bbb', game_fire, game_zap, game_spinner))
+                    sock.sendall(struct.pack("bbb", gf, gz, gs))
                 except Exception:
                     break
 
         except Exception as e:
-            print(f"Error handling client {client_id}: {e}")
+            print(f"Client {cid} error: {e}")
             traceback.print_exc()
         finally:
             try:
-                client_socket.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
             try:
-                client_socket.close()
+                sock.close()
             except Exception:
                 pass
-
             with self.client_lock:
-                if client_id in self.client_states:
-                    del self.client_states[client_id]
-                if client_id in self.clients:
-                    self.clients[client_id] = None
-                metrics.client_count = len([c for c in self.clients.values() if c is not None])
+                self.client_states.pop(cid, None)
+                self.clients[cid] = None
+                metrics.client_count = sum(1 for v in self.clients.values() if v is not None)
+            threading.Timer(1.0, self._cleanup).start()
 
-            threading.Timer(1.0, self.cleanup_disconnected_clients).start()
-
-    def cleanup_disconnected_clients(self):
-        cleaned = 0
+    def _cleanup(self):
         with self.client_lock:
-            to_delete = [cid for cid, t in self.clients.items() if t is None]
-            for cid in to_delete:
-                del self.clients[cid]
-                cleaned += 1
-            if cleaned:
-                metrics.client_count = len(self.clients)
+            dead = [k for k, v in self.clients.items() if v is None]
+            for k in dead:
+                del self.clients[k]
+            metrics.client_count = len(self.clients)
 
-    def calculate_average_level(self):
-        with self.client_lock:
-            valid = [s.get('level_number', 0) for s in self.client_states.values() if s.get('level_number', 0) >= 0]
-            if valid:
-                avg = sum(valid) / len(valid)
-                metrics.average_level = avg
-                return avg
-            else:
-                metrics.average_level = 0
-                return 0
+    def _calc_avg_level(self):
+        try:
+            with self.client_lock:
+                lvls = [s.get("level_number", 0) for s in self.client_states.values() if s.get("level_number", 0) >= 0]
+                metrics.average_level = sum(lvls) / len(lvls) if lvls else 0
+        except Exception:
+            pass
 
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # Retry binding if address is in use (e.g. previous instance shutting down)
+
         for i in range(10):
             try:
-                if self.shutdown_event.is_set() or self.server_socket is None:
+                if self.shutdown_event.is_set():
                     return
                 self.server_socket.bind((self.host, self.port))
                 break
             except OSError as e:
-                if e.errno == 98:  # Address already in use
-                    print(f"Port {self.port} in use, retrying in 1s... ({i+1}/10)")
+                if e.errno in (98, 48):
+                    print(f"Port {self.port} busy, retry {i+1}/10")
                     time.sleep(1.0)
                 else:
-                    raise e
+                    raise
         else:
-            raise OSError(f"Could not bind to {self.host}:{self.port} after 10 attempts")
-
-        if self.server_socket is None:
-            return
+            raise OSError(f"Cannot bind {self.host}:{self.port}")
 
         self.server_socket.listen(SERVER_CONFIG.max_clients)
         self.server_socket.setblocking(False)
-
         self.running = True
         print(f"SocketServer listening on {self.host}:{self.port}")
 
         try:
             while self.running and not self.shutdown_event.is_set():
                 try:
-                    readable, _, _ = select.select([self.server_socket], [], [], 0.05)
+                    rd, _, _ = select.select([self.server_socket], [], [], 0.05)
                 except (OSError, ValueError):
-                    if self.shutdown_event.is_set() or not self.running:
+                    if self.shutdown_event.is_set():
                         break
                     raise
-
                 if not self.server_socket:
                     break
-
-                if self.server_socket in readable:
+                if self.server_socket in rd:
                     try:
-                        client_socket, addr = self.server_socket.accept()
+                        cs, addr = self.server_socket.accept()
                     except OSError:
                         continue
-                    client_id = self._allocate_client_id()
-                    self._init_client_state(client_id)
-                    t = threading.Thread(target=self.handle_client, args=(client_socket, client_id), daemon=True)
+                    cid = self._alloc_id()
+                    self._init_client(cid)
+                    t = threading.Thread(target=self.handle_client, args=(cs, cid), daemon=True)
                     with self.client_lock:
-                        self.clients[client_id] = t
+                        self.clients[cid] = t
                     t.start()
-
         except Exception as e:
-            if not (self.shutdown_event.is_set() or not self.running):
-                print(f"Server loop error: {e}")
+            if not self.shutdown_event.is_set():
+                print(f"Server error: {e}")
                 traceback.print_exc()
         finally:
             self.stop()
 
     def stop(self):
+        if self.shutdown_event.is_set() and not self.running:
+            return
         self.running = False
         self.shutdown_event.set()
         if self.async_buffer:
             print("Flushing async replay buffer...")
             self.async_buffer.stop()
-        
+            self.async_buffer = None
         try:
             if self.server_socket:
                 try:
