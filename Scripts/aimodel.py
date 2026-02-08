@@ -602,6 +602,7 @@ class RainbowAgent:
 
     # ── Background training ─────────────────────────────────────────────
     def _background_train(self):
+        pending_batch = None                  # prefetched batch for next step
         while self.running:
             try:
                 # Check for stop signal
@@ -613,21 +614,38 @@ class RainbowAgent:
                     pass
 
                 if not self.training_enabled or not getattr(metrics, "training_enabled", True):
+                    pending_batch = None
                     time.sleep(0.01)
                     continue
 
                 did = False
                 for _ in range(RL_CONFIG.training_steps_per_cycle):
-                    loss = train_step(self)
+                    loss = train_step(self, prefetched_batch=pending_batch)
+                    pending_batch = None      # consumed
                     if loss is None:
                         break
                     did = True
+                    # Prefetch next batch while GPU may still be finishing
+                    pending_batch = self._prefetch_batch()
                 if not did:
+                    pending_batch = None
                     time.sleep(0.002)
             except Exception as e:
+                pending_batch = None
                 print(f"Training error: {e}")
                 traceback.print_exc()
                 time.sleep(0.1)
+
+    def _prefetch_batch(self):
+        """Pre-sample a batch from replay so it's ready for the next step."""
+        try:
+            if len(self.memory) < max(RL_CONFIG.min_replay_to_train, RL_CONFIG.batch_size):
+                return None
+            from training import _beta_schedule
+            beta = _beta_schedule(metrics.frame_count)
+            return self.memory.sample(RL_CONFIG.batch_size, beta=beta)
+        except Exception:
+            return None
 
     # ── Target update ───────────────────────────────────────────────────
     def update_target(self):

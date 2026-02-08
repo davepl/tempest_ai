@@ -145,6 +145,14 @@ def keyboard_handler(agent, kb):
                 display_metrics_row(agent, kb)
             elif key == "b":
                 print_buffer_stats(agent, kb)
+            elif key == "L":
+                RL_CONFIG.lr = min(1e-2, RL_CONFIG.lr * 2.0)
+                print_with_terminal_restore(kb, f"LR increased to {RL_CONFIG.lr:.2e}")
+                display_metrics_row(agent, kb)
+            elif key == "l":
+                RL_CONFIG.lr = max(1e-6, RL_CONFIG.lr / 2.0)
+                print_with_terminal_restore(kb, f"LR decreased to {RL_CONFIG.lr:.2e}")
+                display_metrics_row(agent, kb)
 
             time.sleep(0.1)
         except BlockingIOError:

@@ -635,8 +635,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             local prev_player_seg = math.floor(previous_player_position or 0) % 16
             local is_open = (level_state.level_type == 0x00) -- Updated heuristic
 
-            -- Only apply safety shaping on lane changes to keep it action-dependent
-            if player_abs_seg ~= prev_player_seg then
+            -- Apply safety shaping EVERY frame so the agent feels ongoing danger,
+            -- not just on lane changes.  Scale slightly smaller when stationary
+            -- to keep a lane-change incentive.
+            do
+                local shaping_scale = (player_abs_seg ~= prev_player_seg) and 1.0 or 0.5
                 -- First pass: map threats (enemies or shots) within DANGER_DEPTH by lane
                 local lane_threat = {}
                 local function mark_threat(seg)
@@ -692,9 +695,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
 
                         if lane_threat[lane] then
-                            subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight)
+                            subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight * shaping_scale)
                         else
-                            subj_reward = subj_reward + (SAFE_LANE_REWARD * weight)
+                            subj_reward = subj_reward + (SAFE_LANE_REWARD * weight * shaping_scale)
                         end
                     end
                 end
