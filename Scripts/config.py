@@ -113,7 +113,7 @@ class RLConfigData:
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
-    subj_reward_scale: float = 0.01
+    subj_reward_scale: float = 0.005
     reward_clip: float = 10.0
 
     # ── inference ───────────────────────────────────────────────────────

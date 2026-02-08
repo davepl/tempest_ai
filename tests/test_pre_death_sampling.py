@@ -1,39 +1,47 @@
 #!/usr/bin/env python3
-"""Tests for pre-death sampling emphasis in the replay buffer."""
+"""Replay sampling tests for the current PER implementation."""
 
 import os
 import sys
 
 import numpy as np
-import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Scripts"))
 
-from aimodel import HybridReplayBuffer  # type: ignore  # pylint: disable=import-error
-from config import RL_CONFIG, SERVER_CONFIG  # type: ignore  # pylint: disable=import-error
+from replay_buffer import PrioritizedReplayBuffer  # type: ignore  # pylint: disable=import-error
 
 
-def test_pre_death_samples_are_biased_into_batches():
+def test_priority_hint_biases_sampling():
+    np.random.seed(7)
     capacity = 512
-    buffer = HybridReplayBuffer(capacity, SERVER_CONFIG.params_count)
-    original_frac = getattr(RL_CONFIG, 'pre_death_sample_fraction', 0.25)
-    try:
-        RL_CONFIG.pre_death_sample_fraction = 0.5
-        sample_state = np.zeros((SERVER_CONFIG.params_count,), dtype=np.float32)
-        episodes = 40
-        steps_per_episode = 6
-        for _ in range(episodes):
-            for step in range(steps_per_episode):
-                done = step == steps_per_episode - 1
-                buffer.push(sample_state, 0, -1.0 if done else 0.0, sample_state, done, 'dqn', 1)
-        flagged = int(buffer.pre_death_flags[: buffer._main.size].sum())
-        assert flagged > 0
-        batch = buffer.sample(64, return_indices=True)
-        if batch is None:
-            pytest.skip("Buffer did not return a batch")
-        indices = batch[-2] if len(batch) == 9 else batch[-1]
-        selected_flags = [buffer.pre_death_flags[idx] for idx in indices if idx >= 0]
-        flagged_count = sum(1 for flag in selected_flags if flag)
-        assert flagged_count >= max(1, int(0.2 * len(selected_flags)))
-    finally:
-        RL_CONFIG.pre_death_sample_fraction = original_frac
+    state_size = 16
+    buffer = PrioritizedReplayBuffer(capacity, state_size, alpha=0.6)
+
+    state = np.zeros((state_size,), dtype=np.float32)
+    high_priority_indices = set()
+    high_count = 24
+
+    # Add a small high-priority cohort and a large low-priority cohort.
+    for i in range(capacity):
+        hint = 25.0 if i < high_count else 0.05
+        buffer.add(state, i % 4, 0.0, state, False, horizon=1, expert=0, priority_hint=hint)
+        if i < high_count:
+            high_priority_indices.add(i)
+
+    draws = 300
+    batch_size = 64
+    sampled_high = 0
+    sampled_total = 0
+
+    for _ in range(draws):
+        batch = buffer.sample(batch_size, beta=0.4)
+        assert batch is not None
+        indices = batch[7]
+        sampled_total += len(indices)
+        sampled_high += int(np.isin(indices, list(high_priority_indices)).sum())
+
+    observed_fraction = sampled_high / max(1, sampled_total)
+    baseline_fraction = high_count / capacity
+
+    # Expect material over-sampling of hinted transitions vs uniform chance.
+    assert observed_fraction > baseline_fraction * 3.0

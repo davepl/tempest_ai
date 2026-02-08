@@ -44,14 +44,31 @@ class AsyncReplayBuffer:
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
+        self.enqueue_failures = 0
+        self.sync_fallback_writes = 0
+        self.last_overflow_log = 0.0
         self._thread = threading.Thread(target=self._consume, daemon=True)
         self._thread.start()
 
     def step_async(self, *args, **kwargs):
         try:
-            self.queue.put((args, kwargs), timeout=0.05)
+            self.queue.put_nowait((args, kwargs))
         except queue.Full:
-            pass
+            self.enqueue_failures += 1
+            # Avoid silently dropping rare but important transitions (e.g., pre-death).
+            try:
+                self.agent.step(*args, **kwargs)
+                self.sync_fallback_writes += 1
+            except Exception as e:
+                print(f"AsyncReplayBuffer overflow fallback failed: {e}")
+            now = time.time()
+            if now - self.last_overflow_log >= 5.0:
+                self.last_overflow_log = now
+                print(
+                    "AsyncReplayBuffer queue full: "
+                    f"fallback_writes={self.sync_fallback_writes} "
+                    f"enqueue_failures={self.enqueue_failures}"
+                )
 
     def _consume(self):
         while self.running:
@@ -199,7 +216,7 @@ class SocketServer:
                     self.metrics.update_epsilon()
                     self.metrics.update_expert_ratio()
                     self._calc_avg_level()
-                self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
+                self.metrics.update_game_state(frame.expert_target_seg, frame.open_level)
 
                 # ── Process previous step ───────────────────────────────
                 if cs.get("last_state") is not None and cs.get("last_action") is not None:
@@ -281,7 +298,7 @@ class SocketServer:
 
                     if use_expert:
                         fire, zap, spinner_val = get_expert_action(
-                            frame.enemy_seg, frame.player_seg, frame.open_level,
+                            frame.expert_target_seg, frame.player_seg, frame.open_level,
                             frame.expert_fire, frame.expert_zap)
                         fz_idx = fire_zap_to_discrete(fire, zap)
                         sp_idx = quantize_spinner_value(spinner_val)

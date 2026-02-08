@@ -343,9 +343,16 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i])
     end
-    -- Enemy depths (7) - push 0 if inactive (depth=0), otherwise offset by 0x10
+    -- Enemy depths (7)
+    -- Keep inactive enemies at exactly 0.0, but ensure active top-rail enemies
+    -- are strictly > 0 to avoid being mistaken for empty slots by attention masking.
     for i = 1, 7 do
-        local enemy_depth_for_norm = (es.enemy_depths[i] == 0) and 0 or (es.enemy_depths[i] - 0x10)
+        local enemy_depth_for_norm
+        if es.enemy_depths[i] == 0 then
+            enemy_depth_for_norm = 0
+        else
+            enemy_depth_for_norm = math.max(1, es.enemy_depths[i] - 0x10)
+        end
         num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, enemy_depth_for_norm)
     end
     -- Top Enemy Segments (7) - relative values (enemies at collision depth 0x10)
@@ -411,11 +418,11 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     -- Format legend:
     --   >HddBBBHIBBBhhBBBBB
     --   H: num_values, dd: (subj_reward, obj_reward), BBB: (gamestate, game_mode, done), HI: (frame, score),
-    --   BBB: (save, fire, zap), h: spinner, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
+    --   BBB: (save, fire, zap), h: spinner, h: expert_target_abs_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number
     local oob_format = ">HddBBBHIBBBhhBBBBB"
-    -- Determine nearest enemy absolute segment to transmit (or -1 if none)
-    local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
+    -- Transmit Lua expert target segment so Python can mirror expert spinner intent.
+    local oob_expert_target_abs_seg = expert_target_seg or -1
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         subj_reward,                -- d: Subjective reward (double)
@@ -429,7 +436,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         ps.fire_commanded,          -- B: Commanded Fire (uchar)
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
         ps.spinner_commanded,       -- h: Commanded Spinner (short)
-        oob_nearest_enemy_abs_seg,  -- h: Nearest Enemy ABS Segment (short)
+        oob_expert_target_abs_seg,  -- h: Expert Target ABS Segment (short)
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
@@ -750,5 +757,4 @@ emu.add_machine_stop_notifier(on_mame_exit)
 
 print("Tempest AI script initialized and callbacks registered.")
 --[[ End of main.lua ]]--
-
 

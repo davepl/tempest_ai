@@ -40,10 +40,12 @@ local M = {} -- Module table
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
 
-local DEATH_PENALTY = 500            -- Edge-triggered penalty when dying (applied to objective reward only)
+local DEATH_PENALTY = 900            -- Edge-triggered penalty when dying (applied to objective reward only)
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
-local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
-local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
+local SAFE_LANE_REWARD = 1.0         -- Base reward when a lane is clear of nearby threats
+local DANGER_LANE_PENALTY = 3.0      -- Base penalty when a lane contains nearby threats
+local CURRENT_LANE_DANGER_MULT = 2.5 -- Extra weight for danger in the lane the player currently occupies
+local CURRENT_LANE_SAFE_MULT = 0.75  -- Keep center-lane safe bonus modest vs. danger penalties
 
 local previous_score = 0
 local previous_level = 0
@@ -623,8 +625,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
-        if score_delta > 0 and score_delta < 1000 then                         -- Filter out large bonuses AND negative deltas
-            local r_score = score_delta 
+        if score_delta > 0 then
+            -- Keep real score progress (including level-complete bonuses), but cap extreme jumps.
+            local r_score = math.min(score_delta, 5000)
             obj_reward = obj_reward + r_score
         end
 
@@ -695,9 +698,17 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
 
                         if lane_threat[lane] then
-                            subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight * shaping_scale)
+                            local penalty = DANGER_LANE_PENALTY * weight
+                            if distance == 0 then
+                                penalty = penalty * CURRENT_LANE_DANGER_MULT
+                            end
+                            subj_reward = subj_reward - (penalty * shaping_scale)
                         else
-                            subj_reward = subj_reward + (SAFE_LANE_REWARD * weight * shaping_scale)
+                            local safe_bonus = SAFE_LANE_REWARD * weight
+                            if distance == 0 then
+                                safe_bonus = safe_bonus * CURRENT_LANE_SAFE_MULT
+                            end
+                            subj_reward = subj_reward + (safe_bonus * shaping_scale)
                         end
                     end
                 end

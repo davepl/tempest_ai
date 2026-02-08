@@ -103,12 +103,13 @@ def case_actor_boundary_split() -> None:
     # Step 3: EXPERT
     outs.extend(buf.add("s3", 3, 1.0, "s4", False, actor="expert"))
 
-    # On boundary at step 1, the first output should have been emitted already for start=0 (only first step due to actor split)
+    # Actor switches should NOT truncate rollout. The first matured item should be full horizon n.
     assert len(outs) >= 1
-    # First output corresponds to start at 0 with horizon 1, next_state s1, done False
+    # First output corresponds to start at 0 with horizon 3, next_state s3, done False
     s0, a0, R0, priority0, sn, d0, h0, actor0 = outs[0]
-    assert s0 == "s0" and a0 == 0 and h0 == 1 and not d0 and sn == "s1" and approx(R0, 1.0)
-    assert approx(priority0, 1.0) and actor0 == "dqn"
+    exp = compute_expected_rn([1.0, 1.0, 1.0], gamma)
+    assert s0 == "s0" and a0 == 0 and h0 == 3 and not d0 and sn == "s3" and approx(R0, exp)
+    assert approx(priority0, exp) and actor0 == "dqn"
 
     # After the sequence, there should be enough EXPERT steps to emit at least one matured of horizon 3
     for tup in outs[1:]:

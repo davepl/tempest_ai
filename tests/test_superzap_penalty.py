@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Unit tests for superzap penalty bookkeeping."""
+"""Regression tests for n-step rollout behavior across actor source changes."""
 
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Scripts"))
 
-from socket_server import SocketServer  # type: ignore  # pylint: disable=import-error
-from config import RL_CONFIG  # type: ignore  # pylint: disable=import-error
+from nstep_buffer import NStepReplayBuffer  # type: ignore  # pylint: disable=import-error
 
 
-def test_zap_penalty_accumulates_and_drains():
-    state: dict[str, float] = {}
-    original_penalty = getattr(RL_CONFIG, 'superzap_block_penalty', -0.05)
-    try:
-        RL_CONFIG.superzap_block_penalty = -0.1
-        SocketServer._record_zap_block_penalty(state)
-        SocketServer._record_zap_block_penalty(state)
-        assert state['pending_zap_penalty'] == -0.2
-        drained = SocketServer._drain_zap_block_penalty(state)
-        assert drained == -0.2
-        assert state['pending_zap_penalty'] == 0.0
-    finally:
-        RL_CONFIG.superzap_block_penalty = original_penalty
+def test_nstep_does_not_truncate_on_actor_switch():
+    gamma = 0.99
+    n = 5
+    buf = NStepReplayBuffer(n_step=n, gamma=gamma)
+
+    outs = []
+    outs.extend(buf.add("s0", 0, 1.0, "s1", False, actor="dqn"))
+    outs.extend(buf.add("s1", 1, 1.0, "s2", False, actor="expert"))
+    outs.extend(buf.add("s2", 2, 1.0, "s3", False, actor="dqn"))
+    outs.extend(buf.add("s3", 3, 1.0, "s4", False, actor="expert"))
+    outs.extend(buf.add("s4", 4, 1.0, "s5", False, actor="dqn"))
+
+    assert len(outs) >= 1
+    first = outs[0]
+    # Tuple layout: (s0, a0, Rn, pRn, sn, done, horizon, actor)
+    assert first[6] == 5
+    assert first[0] == "s0"
+    assert first[4] == "s5"

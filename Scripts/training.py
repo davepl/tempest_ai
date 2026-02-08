@@ -115,9 +115,20 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             # Distribute probability
             m = torch.zeros(B, num_atoms, device=device, dtype=torch.float32)
             offset = torch.linspace(0, (B - 1) * num_atoms, B, device=device, dtype=torch.long).unsqueeze(1).expand_as(l)
+            l_flat = (l + offset).view(-1)
+            u_flat = (u + offset).view(-1)
+            lower_mass = (target_p_a * (u.float() - b)).view(-1)
+            upper_mass = (target_p_a * (b - l.float())).view(-1)
 
-            m.view(-1).index_add_(0, (l + offset).view(-1), (target_p_a * (u.float() - b)).view(-1))
-            m.view(-1).index_add_(0, (u + offset).view(-1), (target_p_a * (b - l.float())).view(-1))
+            m.view(-1).index_add_(0, l_flat, lower_mass)
+            m.view(-1).index_add_(0, u_flat, upper_mass)
+
+            # When l == u (exactly on an atom, or after clamping), put full mass on that bin.
+            eq = (u == l)
+            if eq.any():
+                eq_idx = (l + offset)[eq].view(-1)
+                eq_mass = target_p_a[eq].view(-1)
+                m.view(-1).index_add_(0, eq_idx, eq_mass)
 
         # Cross-entropy loss (weighted by IS weights)
         ce_loss = -(m * log_p_a).sum(dim=1)             # (B,)

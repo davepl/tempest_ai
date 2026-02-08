@@ -117,7 +117,7 @@ class FrameData:
     gamestate: int
     done: bool
     save_signal: bool
-    enemy_seg: int
+    expert_target_seg: int
     player_seg: int
     open_level: bool
     expert_fire: bool
@@ -132,14 +132,14 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             return None
         vals = struct.unpack(fmt, data[:hdr])
         (n, subj, obj, gs, mode, done, frame, score,
-         save, fire, zap, spinner, enemy, player, open_lvl,
+         save, fire, zap, spinner, expert_target, player, open_lvl,
          exp_fire, exp_zap, level) = vals
         state = np.frombuffer(data[hdr:], dtype=">f4", count=n).astype(np.float32)
         return FrameData(
             state=state, subjreward=float(subj), objreward=float(obj),
             action=(bool(fire), bool(zap), spinner), gamestate=int(gs),
             done=bool(done), save_signal=bool(save),
-            enemy_seg=int(enemy), player_seg=int(player),
+            expert_target_seg=int(expert_target), player_seg=int(player),
             open_level=bool(open_lvl), expert_fire=bool(exp_fire),
             expert_zap=bool(exp_zap), level_number=int(level),
         )
@@ -598,7 +598,10 @@ class RainbowAgent:
         else:
             action_idx = int(max(0, min(NUM_JOINT - 1, int(action))))
         is_expert = 1 if actor == "expert" else 0
-        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert)
+        self.memory.add(
+            state, action_idx, float(reward), next_state, bool(done),
+            int(horizon), is_expert, priority_hint=priority_reward,
+        )
 
     # ── Background training ─────────────────────────────────────────────
     def _background_train(self):
