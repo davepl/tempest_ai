@@ -291,6 +291,12 @@ class RainbowNet(nn.Module):
         so that slot position carries semantic meaning rather than reflecting
         Tempest's arbitrary hardware register assignment.
         
+        Per-slot features (9):
+          0-5: decoded (core_type, direction, between_segs, moving_away, can_shoot, split)
+          6:   relative segment
+          7:   depth (0 = inactive, small = near top rail)
+          8:   is_top_rail flag (1.0 = at collision depth, 0.0 = not)
+
         Returns:
           slots: (B, 7, 9) tensor — sorted by depth (nearest first)
           mask:  (B, 7) bool tensor — True where slot is EMPTY
@@ -301,8 +307,10 @@ class RainbowNet(nn.Module):
         # Segments: 133..139, Depths: 140..146, Top-segs: 147..153
         segs   = state[:, 133:140].unsqueeze(2)            # (B, 7, 1)
         depths = state[:, 140:147].unsqueeze(2)            # (B, 7, 1)
-        tops   = state[:, 147:154].unsqueeze(2)            # (B, 7, 1)
-        slots = torch.cat([decoded, segs, depths, tops], dim=2)  # (B, 7, 9)
+        # Convert top-seg into binary is_top_rail flag (segment info is redundant with index 6)
+        tops_raw = state[:, 147:154]                       # (B, 7)
+        is_top = (tops_raw > -0.99).float().unsqueeze(2)   # (B, 7, 1) — 1.0 if top-rail
+        slots = torch.cat([decoded, segs, depths, is_top], dim=2)  # (B, 7, 9)
 
         # Depth feature is at index 7 in slot features (segs=6, depths=7, tops=8)
         depth_vals = slots[:, :, 7]                        # (B, 7) in [0, 1]
