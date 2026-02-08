@@ -77,7 +77,7 @@ class RLConfigData:
     lr_warmup_steps: int = 5_000
     lr_cosine_period: int = 100_000        # warm-restart period (steps) ~2h cycle
     gamma: float = 0.99
-    n_step: int = 3
+    n_step: int = 5
 
     # Replay (PER with proportional priorities)
     memory_size: int = 1_000_000
@@ -122,7 +122,7 @@ class RLConfigData:
     inference_sync_steps: int = 100
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 8
+    training_steps_per_cycle: int = 16
     save_interval: int = 10_000
 
     enable_amp: bool = True

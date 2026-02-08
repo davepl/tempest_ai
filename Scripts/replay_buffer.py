@@ -110,22 +110,21 @@ class PrioritizedReplayBuffer:
             if self.size < batch_size:
                 return None
 
-            indices = np.empty(batch_size, dtype=np.int64)
-            priorities = np.empty(batch_size, dtype=np.float64)
             total = self.tree.total()
             if total <= 0:
                 return None
 
+            # Stratified sampling — one uniform draw per segment
+            indices = np.empty(batch_size, dtype=np.int64)
             segment = total / batch_size
+            tree_get = self.tree.get          # avoid repeated attr lookup
             for i in range(batch_size):
-                lo = segment * i
-                hi = segment * (i + 1)
-                val = np.random.uniform(lo, hi)
-                idx = self.tree.get(val)
-                # Clamp to valid range
-                idx = max(0, min(self.size - 1, idx))
-                indices[i] = idx
-                priorities[i] = max(1e-10, self.tree.priority(idx))
+                val = np.random.uniform(segment * i, segment * (i + 1))
+                idx = tree_get(val)
+                indices[i] = max(0, min(self.size - 1, idx))
+
+            # Gather priorities in one vectorised read
+            priorities = np.maximum(1e-10, self.tree.tree[indices + self.tree.capacity])
 
             # Importance-sampling weights
             probs = priorities / total
@@ -145,11 +144,11 @@ class PrioritizedReplayBuffer:
             )
 
     def update_priorities(self, indices, td_errors):
-        """Update priorities based on TD errors."""
+        """Update priorities based on TD errors (vectorised where possible)."""
         with self.lock:
-            for idx, td in zip(indices, td_errors):
-                p = (abs(float(td)) + 1e-6) ** self.alpha
-                self.tree.update(int(idx), p)
+            new_p = (np.abs(td_errors.astype(np.float64)) + 1e-6) ** self.alpha
+            for idx, p in zip(indices, new_p):
+                self.tree.update(int(idx), float(p))
 
     def __len__(self):
         return self.size

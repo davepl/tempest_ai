@@ -40,7 +40,7 @@ def _bc_weight_schedule(frame_count: int) -> float:
     return cfg.expert_bc_weight + progress * (cfg.expert_bc_min_weight - cfg.expert_bc_weight)
 
 
-def train_step(agent) -> float | None:
+def train_step(agent, prefetched_batch=None) -> float | None:
     """Run one C51 distributional training step.
 
     Returns the scalar loss value, or None if training was skipped.
@@ -53,7 +53,7 @@ def train_step(agent) -> float | None:
 
     # ── Sample ──────────────────────────────────────────────────────────
     beta = _beta_schedule(metrics.frame_count)
-    batch = agent.memory.sample(RL_CONFIG.batch_size, beta=beta)
+    batch = prefetched_batch if prefetched_batch is not None else agent.memory.sample(RL_CONFIG.batch_size, beta=beta)
     if batch is None:
         return None
 
