@@ -80,7 +80,7 @@ class RLConfigData:
     n_step: int = 5
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 1_000_000
+    memory_size: int = 2_000_000
     priority_alpha: float = 0.6
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -88,7 +88,7 @@ class RLConfigData:
     min_replay_to_train: int = 10_000
 
     # Target network
-    target_update_period: int = 8_000
+    target_update_period: int = 32_000
 
     # Gradient
     grad_clip_norm: float = 10.0
@@ -102,7 +102,7 @@ class RLConfigData:
     # Expert guidance
     expert_ratio_start: float = 0.50
     expert_ratio_end: float = 0.05
-    expert_ratio_decay_frames: int = 5_000_000
+    expert_ratio_decay_frames: int = 2_000_000
     expert_ratio: float = 0.50
 
     # Expert BC

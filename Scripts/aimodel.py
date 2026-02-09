@@ -235,8 +235,9 @@ class RainbowNet(nn.Module):
         if self.use_attn:
             # Enemy decoded info: indices 91–132 = 42 features (7 slots × 6)
             # Enemy segs/depths: 133–153 = 21 features (7 × 3)
-            # Total per-slot features we'll feed: 6 (decoded) + 3 (seg/depth/top) = 9
-            self.slot_features = 9
+            # Synthetic top-rail rel segs: 176–182 = 7 features (7 × 1)
+            # Total per-slot features: 6 (decoded) + 3 (seg/depth/top) + 1 (synthetic top-rail) = 10
+            self.slot_features = 10
             self.num_slots = cfg.enemy_slots
             self.attn = EnemyAttention(self.slot_features, cfg.attn_dim, cfg.attn_heads)
             attn_out_dim = cfg.attn_dim
@@ -292,7 +293,7 @@ class RainbowNet(nn.Module):
         Tempest's arbitrary hardware register assignment.
         
         Returns:
-          slots: (B, 7, 9) tensor — sorted by depth (nearest first)
+          slots: (B, 7, 10) tensor — sorted by depth (nearest first)
           mask:  (B, 7) bool tensor — True where slot is EMPTY
         """
         B = state.shape[0]
@@ -302,7 +303,8 @@ class RainbowNet(nn.Module):
         segs   = state[:, 133:140].unsqueeze(2)            # (B, 7, 1)
         depths = state[:, 140:147].unsqueeze(2)            # (B, 7, 1)
         tops   = state[:, 147:154].unsqueeze(2)            # (B, 7, 1)
-        slots = torch.cat([decoded, segs, depths, tops], dim=2)  # (B, 7, 9)
+        toprail = state[:, 176:183].unsqueeze(2)           # (B, 7, 1)
+        slots = torch.cat([decoded, segs, depths, tops, toprail], dim=2)  # (B, 7, 10)
 
         # Depth feature is at index 7 in slot features (segs=6, depths=7, tops=8)
         depth_vals = slots[:, :, 7]                        # (B, 7) in [0, 1]
@@ -315,8 +317,8 @@ class RainbowNet(nn.Module):
         order = sort_key.argsort(dim=1)                    # (B, 7) indices
 
         # Gather-sort slots and empty mask
-        order_expanded = order.unsqueeze(2).expand_as(slots)  # (B, 7, 9)
-        slots = torch.gather(slots, 1, order_expanded)       # (B, 7, 9) sorted
+        order_expanded = order.unsqueeze(2).expand_as(slots)  # (B, 7, 10)
+        slots = torch.gather(slots, 1, order_expanded)       # (B, 7, 10) sorted
         empty_mask = torch.gather(empty, 1, order)            # (B, 7) sorted
 
         # If ALL slots are empty (e.g. between rounds), unmask all to avoid NaN
@@ -598,7 +600,8 @@ class RainbowAgent:
         else:
             action_idx = int(max(0, min(NUM_JOINT - 1, int(action))))
         is_expert = 1 if actor == "expert" else 0
-        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert)
+        pri = float(priority_reward) if priority_reward is not None else 0.0
+        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri)
 
     # ── Background training ─────────────────────────────────────────────
     def _background_train(self):
@@ -771,7 +774,7 @@ class RainbowAgent:
         states = torch.from_numpy(batch[0]).float().to(self.device)
         self.online_net.eval()
         with torch.no_grad():
-            slots, empty_mask = self.online_net._extract_enemy_slots(states)  # (B, 7, 9), (B, 7)
+            slots, empty_mask = self.online_net._extract_enemy_slots(states)  # (B, 7, 10), (B, 7)
             _, attn_w = self.online_net.attn(slots, mask=empty_mask, return_weights=True)  # (B, H, 7, 7)
         self.online_net.train()
 

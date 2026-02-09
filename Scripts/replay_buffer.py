@@ -12,7 +12,7 @@ import threading
 class SumTree:
     """Binary sum-tree for efficient proportional sampling in O(log N)."""
 
-    __slots__ = ("capacity", "tree", "data_ptr", "size", "max_priority")
+    __slots__ = ("capacity", "tree", "data_ptr", "size", "max_priority", "_depth")
 
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
@@ -20,6 +20,7 @@ class SumTree:
         self.data_ptr = 0
         self.size = 0
         self.max_priority = 1.0
+        self._depth = int(np.ceil(np.log2(max(2, self.capacity))))
 
     def _propagate(self, idx: int):
         parent = idx >> 1
@@ -61,6 +62,47 @@ class SumTree:
                 idx = left + 1
         return idx - self.capacity
 
+    def batch_get(self, values: np.ndarray) -> np.ndarray:
+        """Vectorised batch sampling — all queries traverse the tree in lockstep.
+
+        Instead of a Python loop over batch_size items each doing O(log N)
+        scalar traversals, this performs log N numpy-vectorised steps.
+        """
+        n = len(values)
+        indices = np.ones(n, dtype=np.int64)
+        remaining = values.astype(np.float64, copy=True)
+        cap = self.capacity
+        for _ in range(self._depth):
+            # Mask: True where index is still an internal node
+            mask = indices < cap
+            if not mask.any():
+                break
+            # Safe left-child indices (use 0 for already-resolved leaves)
+            left = np.where(mask, indices << 1, 0)
+            left_vals = self.tree[left]
+            go_right = mask & (remaining > left_vals)
+            remaining -= left_vals * go_right
+            indices = np.where(mask, left + go_right.astype(np.int64), indices)
+        return indices - cap
+
+    def batch_update(self, data_indices: np.ndarray, priorities: np.ndarray):
+        """Vectorised batch priority update with deduped parent propagation.
+
+        Sets all leaf priorities at once then walks up the tree one level at
+        a time, merging duplicate parents with np.unique at each level.
+        """
+        tree_idx = data_indices.astype(np.int64) + self.capacity
+        self.tree[tree_idx] = priorities.astype(np.float64)
+        mx = float(priorities.max())
+        if mx > self.max_priority:
+            self.max_priority = mx
+        # Walk parents upward, deduplicating at each level
+        parents = np.unique(tree_idx >> 1)
+        while len(parents) > 0 and parents[0] >= 1:
+            self.tree[parents] = self.tree[parents * 2] + self.tree[parents * 2 + 1]
+            parents = np.unique(parents >> 1)
+            parents = parents[parents >= 1]
+
     def priority(self, data_idx: int) -> float:
         return float(self.tree[data_idx + self.capacity])
 
@@ -89,6 +131,7 @@ class PrioritizedReplayBuffer:
 
         self.tree = SumTree(self.capacity)
         self.size = 0
+        self._n_expert = 0          # O(1) expert tracking
 
     def add(self, state, action: int, reward: float, next_state, done: bool,
             horizon: int = 1, expert: int = 0, priority_hint: float = 0.0):
@@ -98,6 +141,9 @@ class PrioritizedReplayBuffer:
                 hint_pri = abs(priority_hint) ** self.alpha
                 if hint_pri > priority:
                     priority = hint_pri
+            # If buffer is full, undo the expert flag of the slot being recycled
+            if self.tree.size >= self.capacity:
+                self._n_expert -= int(self.is_expert[self.tree.data_ptr])
             idx = self.tree.add(priority)
             self.states[idx]      = np.asarray(state, dtype=np.float32)
             self.next_states[idx] = np.asarray(next_state, dtype=np.float32)
@@ -106,6 +152,7 @@ class PrioritizedReplayBuffer:
             self.dones[idx]       = 1.0 if done else 0.0
             self.horizons[idx]    = max(1, int(horizon))
             self.is_expert[idx]   = int(expert)
+            self._n_expert += int(expert)
             self.size = self.tree.size
 
     def sample(self, batch_size: int, beta: float = 0.4):
@@ -119,14 +166,13 @@ class PrioritizedReplayBuffer:
             if total <= 0:
                 return None
 
-            # Stratified sampling — one uniform draw per segment
-            indices = np.empty(batch_size, dtype=np.int64)
+            # Stratified sampling — one uniform draw per segment (vectorised)
             segment = total / batch_size
-            tree_get = self.tree.get          # avoid repeated attr lookup
-            for i in range(batch_size):
-                val = np.random.uniform(segment * i, segment * (i + 1))
-                idx = tree_get(val)
-                indices[i] = max(0, min(self.size - 1, idx))
+            lows = np.arange(batch_size, dtype=np.float64) * segment
+            highs = lows + segment
+            values = np.random.uniform(lows, highs)
+            indices = self.tree.batch_get(values)
+            np.clip(indices, 0, self.size - 1, out=indices)
 
             # Gather priorities in one vectorised read
             priorities = np.maximum(1e-10, self.tree.tree[indices + self.tree.capacity])
@@ -149,19 +195,18 @@ class PrioritizedReplayBuffer:
             )
 
     def update_priorities(self, indices, td_errors):
-        """Update priorities based on TD errors (vectorised where possible)."""
+        """Update priorities based on TD errors (fully vectorised)."""
         with self.lock:
             new_p = (np.abs(td_errors.astype(np.float64)) + 1e-6) ** self.alpha
-            for idx, p in zip(indices, new_p):
-                self.tree.update(int(idx), float(p))
+            self.tree.batch_update(np.asarray(indices, dtype=np.int64), new_p)
 
     def __len__(self):
         return self.size
 
     def get_partition_stats(self):
-        """Return buffer statistics (compatible with display code)."""
+        """Return buffer statistics (O(1) via tracked counter)."""
         with self.lock:
-            n_exp = int(self.is_expert[:self.size].sum()) if self.size > 0 else 0
+            n_exp = self._n_expert
             n_dqn = self.size - n_exp
             return {
                 "total_size": self.size,

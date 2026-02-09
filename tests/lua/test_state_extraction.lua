@@ -69,3 +69,42 @@ assert(enemies_state.enemy_shot_segments[1] == 0, string.format('Expected enemy 
 assert(enemies_state.shot_positions[1] > 0, 'Enemy shot position should remain active')
 
 print('state extraction tests passed')
+
+-- Regression: open-level top-rail fractional position near segment 0 should stay near player,
+-- not wrap to far-right (~+15).
+do
+    local values_open = {}
+    values_open[0x0000] = 0x04 -- Playing
+    values_open[0x0005] = 0x80 -- Not attract mode
+    values_open[0x0046] = 1
+    values_open[0x0048] = 3
+    values_open[0x009F] = 1
+    values_open[0x0111] = 0x00 -- Open level
+    values_open[0x0200] = 0x00 -- Player at segment 0
+    values_open[0x0201] = 0x00
+    values_open[0x0202] = 0x10
+    values_open[0x0135] = 0
+
+    -- Enemy slot #1: flipper near top, between-segments, at segment 0.
+    values_open[0x02DF] = 0x10 -- active top-rail depth
+    values_open[0x02B9] = 0x00 -- segment 0
+    values_open[0x0283] = 0x80 -- flipper + between-segments (dir=0)
+    values_open[0x028A] = 0x00
+    values_open[0x02CC] = 0x01 -- tiny progress
+
+    local mem_open = make_mem(values_open)
+    local gs_open = state_defs.GameState:new()
+    local ls_open = state_defs.LevelState:new()
+    local ps_open = state_defs.PlayerState:new()
+    local es_open = state_defs.EnemiesState:new()
+    gs_open:update(mem_open)
+    ls_open:update(mem_open)
+    ps_open:update(mem_open, logic.absolute_to_relative_segment)
+    es_open:update(mem_open, gs_open, ps_open, ls_open, logic.absolute_to_relative_segment)
+
+    local rel_top = es_open.active_top_rail_enemies[1]
+    assert(rel_top ~= state_defs.TOP_RAIL_ABSENT, 'Expected active top-rail rel segment for open-level enemy')
+    assert(math.abs(rel_top) < 1.0, string.format('Expected near-player top-rail rel seg, got %.4f', rel_top))
+end
+
+print('state extraction open-level top-rail regression passed')
