@@ -835,8 +835,8 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.enemy_type_info[i] = type_byte
             self.active_enemy_info[i] = state_byte
 
-            -- Decode Type Byte (Use assembly mask)
-            self.enemy_core_type[i] = type_byte & ENEMY_TYPE_MASK -- Apply the mask to get 0-4
+            -- Decode Type Byte (assembly uses 0x07 mask, yielding 0..7)
+            self.enemy_core_type[i] = type_byte & ENEMY_TYPE_MASK
             self.enemy_direction_moving[i] = (type_byte & 0x40) ~= 0 and 1 or 0 -- Bit 6: Segment increasing?
             self.enemy_between_segments[i] = (type_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Between segments?
 
