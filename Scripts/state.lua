@@ -598,15 +598,9 @@ function M.PlayerState:update(mem, abs_to_rel_func)
             -- Read absolute segment from PlayerShotSegments ($02AD - $02B4)
             local abs_segment = mem:read_u8(0x02AD + i - 1)
 
-            -- Shot is also inactive if segment byte is 0
-            if abs_segment == 0 then
-                self.shot_segments[i] = INVALID_SEGMENT
-                self.shot_positions[i] = 0 -- Ensure position is also zeroed if segment is invalid
-            else
-                -- Valid position and valid segment read, calculate relative segment using passed function
-                abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
-                self.shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
-            end
+            -- Segment 0 is valid in Tempest. Activity is determined by shot position.
+            abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
+            self.shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
         end
     end
 
@@ -712,7 +706,7 @@ function M.EnemiesState:new()
     -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no pulsar)
     self.active_pulsar = {} -- Relative segments of pulsars
     
-    -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper at depth 0x20)
+    -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper near top)
     -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no valid enemy)
     self.active_top_rail_enemies = {} -- Relative segments of pulsars/flippers at the top rail
     
@@ -825,8 +819,8 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.enemy_type_info[i] = 0
         self.active_enemy_info[i] = 0
 
-        -- Check if enemy is active (depth > 0 and segment raw byte > 0)
-        if enemy_depth_raw > 0 and abs_segment_raw > 0 then
+        -- Enemy activity is driven by depth/along value (>0). Segment 0 is valid.
+        if enemy_depth_raw > 0 then
             local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
             self.enemy_abs_segments[i] = abs_segment
             self.enemy_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
@@ -937,21 +931,14 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         else
             -- Read shot segment byte
             local abs_segment_raw = mem:read_u8(0x02B5 + i - 1) -- EnemyShotSegments ($02B5-$02B8)
-             -- Also inactive if segment byte is 0
-            if abs_segment_raw == 0 then
-                self.enemy_shot_segments[i] = INVALID_SEGMENT
-                self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
-                self.shot_positions_lsb[i] = 0
-                self.shot_positions[i] = 0 -- Ensure position is zeroed
-            else
-                local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
-                self.enemy_shot_abs_segments[i] = abs_segment
-                self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
-                -- Combine integer position with LSB to form full 8.8 fixed-point as a float
-                -- Range remains < 256.0 (pos_int in [1,255], pos_lsb in [0,255])
-                self.shot_positions_lsb[i] = pos_lsb
-                self.shot_positions[i] = pos_int + (pos_lsb / 256.0)
-            end
+            -- Segment 0 is valid in Tempest. Activity is determined by shot position.
+            local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+            self.enemy_shot_abs_segments[i] = abs_segment
+            self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
+            -- Combine integer position with LSB to form full 8.8 fixed-point as a float
+            -- Range remains < 256.0 (pos_int in [1,255], pos_lsb in [0,255])
+            self.shot_positions_lsb[i] = pos_lsb
+            self.shot_positions[i] = pos_int + (pos_lsb / 256.0)
         end
     end
 

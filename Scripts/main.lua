@@ -245,8 +245,9 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return push_float32(parts, val)
     end
     
-    -- Normalize offset depth values [-16, 239] to [0, 1] 
-    -- Maps: inactive enemies (0) → 0.063, collision depth (0) → 0.063, max depth (239+16=255) → 1.0
+    -- Normalize raw Tempest depth values [0, 255] to [0, 1].
+    -- IMPORTANT: TOP_OF_TUNNEL is 0x10 in Tempest; keep raw values so top-rail
+    -- enemies do not collapse to 0 (which is reserved for inactive slots).
     local function push_depth_norm(parts, v)
         local num = tonumber(v) or 0
         if num < 0 then num = 0 end
@@ -275,9 +276,8 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.position)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.alive)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_state)
-    -- Player depth: offset by 0x10
-    local player_depth_for_norm = (ps.player_depth == 0) and 0 or (ps.player_depth - 0x10)
-    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, player_depth_for_norm)
+    -- Player depth: raw value from Tempest memory ($0202)
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, ps.player_depth)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_uses)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, 8 - ps.shot_count)
@@ -343,10 +343,9 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i])
     end
-    -- Enemy depths (7) - push 0 if inactive (depth=0), otherwise offset by 0x10
+    -- Enemy depths (7) - raw Tempest depth (0 means inactive)
     for i = 1, 7 do
-        local enemy_depth_for_norm = (es.enemy_depths[i] == 0) and 0 or (es.enemy_depths[i] - 0x10)
-        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, enemy_depth_for_norm)
+        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, es.enemy_depths[i])
     end
     -- Top Enemy Segments (7) - relative values (enemies at collision depth 0x10)
     for i = 1, 7 do
@@ -750,5 +749,4 @@ emu.add_machine_stop_notifier(on_mame_exit)
 
 print("Tempest AI script initialized and callbacks registered.")
 --[[ End of main.lua ]]--
-
 
