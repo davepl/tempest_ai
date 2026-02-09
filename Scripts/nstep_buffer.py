@@ -49,8 +49,6 @@ class NStepReplayBuffer:
 
         for i in range(min(self.n_step, len(self._deque))):
             step = self._deque[i]
-            if i > 0 and step.actor != actor0:
-                break
             R += (self.gamma ** i) * step.reward
             priority_R += (self.gamma ** i) * step.priority_reward
             last_next = step.next_state
@@ -66,12 +64,8 @@ class NStepReplayBuffer:
             return False
         if len(self._deque) >= self.n_step:
             return True
-        first_actor = self._deque[0].actor
         for i in range(min(self.n_step, len(self._deque))):
-            step = self._deque[i]
-            if i > 0 and step.actor != first_actor:
-                return True
-            if step.done:
+            if self._deque[i].done:
                 return True
         return False
 
