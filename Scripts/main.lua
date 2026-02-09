@@ -233,9 +233,10 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         if num == INVALID_SEGMENT then
             return push_float32(parts, -1.0)  -- INVALID sentinel
         end
-        -- Assert actual Tempest range and normalize to [-1,+1]
-        local validated = assert_range(num, -15, 15, "relative_segment")
-        local normalized = validated / 15.0  -- [-15,+15] → [-1,+1]
+        -- Clamp to [-15,+15] — fractional sub-segment positions on open levels
+        -- can slightly exceed 15 (e.g. 15.3125), so clamp rather than crash
+        local clamped = math.max(-15.0, math.min(15.0, num))
+        local normalized = clamped / 15.0  -- [-15,+15] → [-1,+1]
         return push_float32(parts, normalized)
     end
     
@@ -540,7 +541,7 @@ local function handle_ai_interaction()
     end
     
     -- NOTE: Removed reward clamping [-1,1] since rewards are now properly scaled in logic.calculate_reward()    -- Calculate expert advice (target segment, fire, zap)
-    local is_open_level = (level_state.level_number - 1) % 4 == 2
+    local is_open_level = (level_state.level_type == 0x00)
     local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = logic.find_target_segment(
         game_state, player_state, level_state, enemies_state, logic.absolute_to_relative_segment, is_open_level
     )
