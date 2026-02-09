@@ -91,17 +91,22 @@ class PrioritizedReplayBuffer:
         self.size = 0
 
     def add(self, state, action: int, reward: float, next_state, done: bool,
-            horizon: int = 1, expert: int = 0):
-        priority = self.tree.max_priority ** self.alpha
-        idx = self.tree.add(priority)
-        self.states[idx]      = np.asarray(state, dtype=np.float32)
-        self.next_states[idx] = np.asarray(next_state, dtype=np.float32)
-        self.actions[idx]     = int(action)
-        self.rewards[idx]     = float(reward)
-        self.dones[idx]       = 1.0 if done else 0.0
-        self.horizons[idx]    = max(1, int(horizon))
-        self.is_expert[idx]   = int(expert)
-        self.size = self.tree.size
+            horizon: int = 1, expert: int = 0, priority_hint: float = 0.0):
+        with self.lock:
+            priority = self.tree.max_priority
+            if priority_hint != 0.0:
+                hint_pri = abs(priority_hint) ** self.alpha
+                if hint_pri > priority:
+                    priority = hint_pri
+            idx = self.tree.add(priority)
+            self.states[idx]      = np.asarray(state, dtype=np.float32)
+            self.next_states[idx] = np.asarray(next_state, dtype=np.float32)
+            self.actions[idx]     = int(action)
+            self.rewards[idx]     = float(reward)
+            self.dones[idx]       = 1.0 if done else 0.0
+            self.horizons[idx]    = max(1, int(horizon))
+            self.is_expert[idx]   = int(expert)
+            self.size = self.tree.size
 
     def sample(self, batch_size: int, beta: float = 0.4):
         """Sample a prioritised batch. Returns (states, actions, rewards,

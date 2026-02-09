@@ -116,8 +116,14 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             m = torch.zeros(B, num_atoms, device=device, dtype=torch.float32)
             offset = torch.linspace(0, (B - 1) * num_atoms, B, device=device, dtype=torch.long).unsqueeze(1).expand_as(l)
 
-            m.view(-1).index_add_(0, (l + offset).view(-1), (target_p_a * (u.float() - b)).view(-1))
-            m.view(-1).index_add_(0, (u + offset).view(-1), (target_p_a * (b - l.float())).view(-1))
+            # When l == u, both (u-b) and (b-l) are 0 → mass is lost.
+            # Fix: assign full mass to that bin directly.
+            eq_mask = (l == u)
+            neq_mask = ~eq_mask
+
+            m.view(-1).index_add_(0, (l + offset).view(-1), (target_p_a * (u.float() - b) * neq_mask.float()).view(-1))
+            m.view(-1).index_add_(0, (u + offset).view(-1), (target_p_a * (b - l.float()) * neq_mask.float()).view(-1))
+            m.view(-1).index_add_(0, (l + offset).view(-1), (target_p_a * eq_mask.float()).view(-1))
 
         # Cross-entropy loss (weighted by IS weights)
         ce_loss = -(m * log_p_a).sum(dim=1)             # (B,)
