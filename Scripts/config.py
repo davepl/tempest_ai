@@ -72,8 +72,8 @@ class RLConfigData:
 
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 512
-    lr: float = 6.25e-5
-    lr_min: float = 1e-5
+    lr: float = 3e-5
+    lr_min: float = 3e-5
     lr_warmup_steps: int = 5_000
     lr_cosine_period: int = 100_000        # warm-restart period (steps) ~2h cycle
     gamma: float = 0.99
