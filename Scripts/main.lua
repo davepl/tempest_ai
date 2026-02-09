@@ -228,6 +228,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
 
     -- Normalize relative segments with proper Tempest range handling
     local INVALID_SEGMENT = state_defs.INVALID_SEGMENT or -32768
+    local TOP_RAIL_ABSENT = state_defs.TOP_RAIL_ABSENT or 255
     local function push_relative_norm(parts, v)
         local num = tonumber(v) or 0
         if num == INVALID_SEGMENT then
@@ -239,11 +240,36 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         local normalized = clamped / 15.0  -- [-15,+15] → [-1,+1]
         return push_float32(parts, normalized)
     end
+
+    -- Top-rail synthetic rel segments use 255 as "not present" default.
+    local function push_toprail_relative_norm(parts, v)
+        local num = tonumber(v) or TOP_RAIL_ABSENT
+        if num == TOP_RAIL_ABSENT then
+            return push_float32(parts, -1.0)
+        end
+        return push_relative_norm(parts, num)
+    end
     
     -- Normalize boolean to [0,1]
     local function push_bool_norm(parts, v)
-        local val = v and 1.0 or 0.0
+        local val
+        if type(v) == "number" then
+            val = (v ~= 0) and 1.0 or 0.0
+        else
+            val = v and 1.0 or 0.0
+        end
         return push_float32(parts, val)
+    end
+
+    -- Normalize small enums/bitfields [0,maxv] to [0,1] so low-cardinality
+    -- semantic features (type/bits) are not compressed into ~0.
+    local function push_small_enum_norm(parts, v, maxv, context)
+        local num = tonumber(v) or 0
+        local validated = assert_range(num, 0, maxv, context or "small_enum")
+        if maxv == 0 then
+            return push_float32(parts, 0.0)
+        end
+        return push_float32(parts, validated / maxv)
     end
     
     -- Normalize raw Tempest depth values [0, 255] to [0, 1].
@@ -330,14 +356,14 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_msb or 0)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_msb or 0)
 
-    -- Decoded Enemy Info (7 * 6 = 42) - all natural values
+    -- Decoded Enemy Info (7 * 6 = 42) - keep meaningful dynamic range
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_core_type[i])
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_direction_moving[i])
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_between_segments[i])
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_moving_away[i])
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_can_shoot[i])
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemy_split_behavior[i])
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_core_type[i], 4, "enemy_core_type")
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_direction_moving[i], 1, "enemy_direction_moving")
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_between_segments[i], 1, "enemy_between_segments")
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_moving_away[i], 1, "enemy_moving_away")
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_can_shoot[i], 1, "enemy_can_shoot")
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_split_behavior[i], 3, "enemy_split_behavior")
     end
 
     -- Enemy segments (7) - relative values
@@ -371,10 +397,10 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     end
     -- Top Rail Enemy segments (7) - relative values
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
+        num_values_packed = num_values_packed + push_toprail_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
     end
 
-    -- Total main payload size: 175
+    -- Total main payload size: 183
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
@@ -750,4 +776,3 @@ emu.add_machine_stop_notifier(on_mame_exit)
 
 print("Tempest AI script initialized and callbacks registered.")
 --[[ End of main.lua ]]--
-

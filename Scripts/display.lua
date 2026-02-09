@@ -7,6 +7,7 @@ local M = {} -- Module table for export
 
 -- Constants (Copied from main.lua's original display logic context)
 local INVALID_SEGMENT = -32768
+local TOP_RAIL_ABSENT = 255
 
 -- Helper function to format segment values for display
 local function format_segment(value)
@@ -20,8 +21,8 @@ end
 
 -- Helper function to format a fixed-width segment value for our enemy tables
 local function format_enemy_segment(value)
-    -- Display as '---' when zero/absent (matches prior convention)
-    if value == nil or value == 0 then
+    -- Display as '---' when absent/sentinel.
+    if value == nil or value == INVALID_SEGMENT or value == TOP_RAIL_ABSENT then
         return string.format("%7s", "---")
     end
 

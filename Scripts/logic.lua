@@ -9,6 +9,7 @@ local ENEMY_TYPE_FUSEBALL = 4
 
 -- Define constants (copy from main.lua)
 local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
+local TOP_RAIL_ABSENT = state_defs.TOP_RAIL_ABSENT or 255
 
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
@@ -40,7 +41,7 @@ local M = {} -- Module table
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
 
-local DEATH_PENALTY = 500            -- Edge-triggered penalty when dying (applied to objective reward only)
+local DEATH_PENALTY = 1000           -- Edge-triggered penalty when dying (applied to objective reward only)
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
@@ -444,7 +445,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                     if seg ~= INVALID_SEGMENT then
                         local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
                         local rel_float = enemies_state.active_top_rail_enemies[i]
-                        if not rel_float or rel_float == 0 then
+                        if rel_float == nil or rel_float == TOP_RAIL_ABSENT then
                             rel_float = rel_int
                         end
                         consider_top(rel_float)

@@ -18,6 +18,8 @@ local ENEMY_TYPE_SPIKER   = 3
 local ENEMY_TYPE_FUSEBALL = 4
 local ENEMY_TYPE_MASK = 0x07 -- <<< ADDED THIS DEFINITION (%00000111)
 local TOP_RAIL_AVOID_DEPTH = 0x60
+local TOP_RAIL_ABSENT = 255
+M.TOP_RAIL_ABSENT = TOP_RAIL_ABSENT
 
 -- Helper function for BCD conversion (local to this module)
 local function bcd_to_decimal(bcd)
@@ -700,15 +702,15 @@ function M.EnemiesState:new()
     self.pending_seg = {}              -- Relative segment ($0203 + i - 1, or INVALID_SEGMENT)
 
     -- Charging Fuseball Tracking (Size 7, one per enemy slot that can be a fuseball)
-    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no charging fuseball)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or INVALID_SEGMENT when absent)
     self.charging_fuseball = {} -- Relative segments of charging fuseballs
     
     -- Pulsar Tracking (Size 7, one per enemy slot that can be a pulsar)
-    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no pulsar)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or INVALID_SEGMENT when absent)
     self.active_pulsar = {} -- Relative segments of pulsars
     
-    -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper near top)
-    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or 0 when no valid enemy)
+    -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper on/at top rail)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or TOP_RAIL_ABSENT=255 when absent)
     self.active_top_rail_enemies = {} -- Relative segments of pulsars/flippers at the top rail
     
     -- NEW: Fractional Enemy Segments By Slot (Size 7, indexed 1-7)
@@ -750,9 +752,9 @@ function M.EnemiesState:new()
         self.pending_seg[i] = INVALID_SEGMENT
     end
     for i = 1, 7 do
-        self.charging_fuseball[i] = 0
-        self.active_pulsar[i] = 0
-        self.active_top_rail_enemies[i] = 0
+        self.charging_fuseball[i] = INVALID_SEGMENT
+        self.active_pulsar[i] = INVALID_SEGMENT
+        self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
         self.fractional_enemy_segments_by_slot[i] = 0
     end
 
@@ -850,9 +852,9 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
     -- Calculate charging Fuseball segments (reset first)
     for i = 1, 7 do 
-        self.charging_fuseball[i] = 0
-        self.active_pulsar[i] = 0
-        self.active_top_rail_enemies[i] = 0
+        self.charging_fuseball[i] = INVALID_SEGMENT
+        self.active_pulsar[i] = INVALID_SEGMENT
+        self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
     end
     
     for i = 1, 7 do
@@ -866,8 +868,8 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.active_pulsar[i] = self.enemy_segments[i]
         end
 
-        -- Check if it's a top rail Pulsar or Flipper (close to top)
-        if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH) then
+        -- Check if it's a top rail Pulsar or Flipper (depth at/near player rail)
+        if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] > 0 and self.enemy_depths[i] <= 0x10) then
             -- Build absolute floating segment using between-segment progress (from more_enemy_info low nibble)
             local abs_int = self.enemy_abs_segments[i]
             local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
@@ -883,31 +885,23 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
                 end
             end
 
-            -- Absolute float using StartFlip semantics:
-            -- When increasing, enemy_seg already points to the DESTINATION segment; position is (dest - (1 - progress)).
-            -- When decreasing, enemy_seg points to the SOURCE segment; position is (source - progress).
-            local abs_float
+            local rel_float
+            -- Build relative float directly from integer relative lane and progress.
+            -- This avoids open-level edge wrap artefacts (e.g. near-seg-0 enemies
+            -- appearing near +15 due to modulo normalization).
+            local rel_int = abs_to_rel_func(player_abs_segment, abs_int, is_open)
             if self.enemy_between_segments[i] == 1 then
                 if self.enemy_direction_moving[i] == 1 then
-                    abs_float = abs_int + progress - 1.0
+                    rel_float = rel_int + progress - 1.0
                 else
-                    abs_float = abs_int - progress
+                    rel_float = rel_int - progress
                 end
             else
-                abs_float = abs_int
+                rel_float = rel_int
             end
 
-            -- Normalize to [0,16)
-            abs_float = abs_float % 16.0
-            if abs_float < 0 then abs_float = abs_float + 16.0 end
-
-            -- Convert to relative float
-            local rel_float
-            if is_open then
-                rel_float = abs_float - player_abs_segment
-            else
-                -- Wrap into [-8,+8]
-                rel_float = abs_float - player_abs_segment
+            if not is_open then
+                -- Wrap into [-8,+8] for closed levels
                 while rel_float > 8.0 do rel_float = rel_float - 16.0 end
                 while rel_float < -8.0 do rel_float = rel_float + 16.0 end
             end
