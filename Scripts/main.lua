@@ -358,7 +358,8 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
 
     -- Decoded Enemy Info (7 * 6 = 42) - keep meaningful dynamic range
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_core_type[i], 4, "enemy_core_type")
+        -- Enemy core type is decoded with mask 0x07, so allow full 0..7 range.
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_core_type[i], 7, "enemy_core_type")
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_direction_moving[i], 1, "enemy_direction_moving")
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_between_segments[i], 1, "enemy_between_segments")
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_moving_away[i], 1, "enemy_moving_away")
