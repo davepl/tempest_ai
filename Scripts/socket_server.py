@@ -277,6 +277,10 @@ class SocketServer:
 
                 if self.agent:
                     expert_ratio = self.metrics.get_expert_ratio()
+                    # Boost expert sampling during tube zoom (e.g., 0.5 -> 1.0 with 2x multiplier).
+                    if frame.gamestate == int(getattr(RL_CONFIG, "expert_ratio_zoom_gamestate", 0x20)):
+                        zoom_mult = float(getattr(RL_CONFIG, "expert_ratio_zoom_multiplier", 1.0))
+                        expert_ratio = max(0.0, min(1.0, expert_ratio * zoom_mult))
                     use_expert = (random.random() < expert_ratio) and not metrics.override_expert
 
                     if use_expert:
