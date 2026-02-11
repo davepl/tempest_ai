@@ -127,7 +127,8 @@ end
 
 -- Function to handle tube zoom state (0x20)
 function M.zoom_down_tube(player_abs_seg, level_state, is_open)
-    local current_spike_h = level_state.spike_heights[player_abs_seg]
+    -- Use adjusted spike heights (0 = no spike, low = shorter/safer, high = longer/more dangerous).
+    local current_spike_h = level_state.spike_heights[player_abs_seg] or 0
     if current_spike_h == 0 then return player_abs_seg, 0, true, false end
 
     local left_neighbour_seg, right_neighbour_seg = -1, -1
@@ -139,20 +140,23 @@ function M.zoom_down_tube(player_abs_seg, level_state, is_open)
         right_neighbour_seg = (player_abs_seg + 1) % 16
     end
 
-    local left_spike_h = (left_neighbour_seg ~= -1) and level_state.spike_heights[left_neighbour_seg] or -1
-    local right_spike_h = (right_neighbour_seg ~= -1) and level_state.spike_heights[right_neighbour_seg] or -1
+    local left_spike_h = (left_neighbour_seg ~= -1) and (level_state.spike_heights[left_neighbour_seg] or 0) or 255
+    local right_spike_h = (right_neighbour_seg ~= -1) and (level_state.spike_heights[right_neighbour_seg] or 0) or 255
 
     if left_spike_h == 0 then return left_neighbour_seg, 0, true, false end
     if right_spike_h == 0 then return right_neighbour_seg, 0, true, false end
 
+    -- Pick the lowest adjusted spike height among current and immediate neighbors.
     local temp_target = player_abs_seg
-    local is_left_better = (left_spike_h > current_spike_h)
-    local is_right_better = (right_spike_h > current_spike_h)
+    local best_spike_h = current_spike_h
 
-    if is_left_better and is_right_better then
-        temp_target = (left_spike_h >= right_spike_h) and left_neighbour_seg or right_neighbour_seg
-    elseif is_left_better then temp_target = left_neighbour_seg
-    elseif is_right_better then temp_target = right_neighbour_seg end
+    if left_neighbour_seg ~= -1 and left_spike_h < best_spike_h then
+        temp_target = left_neighbour_seg
+        best_spike_h = left_spike_h
+    end
+    if right_neighbour_seg ~= -1 and right_spike_h < best_spike_h then
+        temp_target = right_neighbour_seg
+    end
 
     return temp_target, 0, true, false
 end

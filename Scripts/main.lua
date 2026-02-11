@@ -217,19 +217,15 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return push_float32(parts, val)
     end
 
-    -- Normalize spike heights: INVERT so longer spikes (smaller raw values) = HIGHER output.
-    -- Raw: 0=no spike, small positive=long dangerous spike, large=short safe spike.
-    -- Output: 0.0=no spike, ~1.0=extremely long dangerous spike, small positive=short spike.
+    -- Normalize precomputed spike heights to [0,1].
+    -- LevelState builds these per lane as:
+    --   depth == 0 and 0 or (255 - depth)
     local function push_spike_norm(parts, v)
         local num = tonumber(v) or 0
         if num < 0 or num > 255 then
             error(string.format("Value %g out of range [0,255] in spike_norm", num))
         end
-        if num == 0 then
-            return push_float32(parts, 0.0)  -- No spike: safe
-        end
-        -- Spike exists: invert so danger increases with value
-        local val = 1.0 - (num / 255.0)
+        local val = num / 255.0
         return push_float32(parts, val)
     end
 
@@ -383,9 +379,10 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_split_behavior[i], 3, "enemy_split_behavior")
     end
 
-    -- Enemy segments (7) - relative values
+    -- Enemy segments (7) - relative values (fractional when between segments)
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_segments[i])
+        local seg = es.enemy_segments_fractional[i] or es.enemy_segments[i]
+        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
     end
     -- Enemy depths (7) - raw Tempest depth (0 means inactive)
     for i = 1, 7 do
@@ -393,7 +390,8 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     end
     -- Top Enemy Segments (7) - relative values (enemies at collision depth 0x10)
     for i = 1, 7 do
-        local seg = (es.enemy_depths[i] == 0x10) and es.enemy_segments[i] or INVALID_SEGMENT
+        local rel_seg = es.enemy_segments_fractional[i] or es.enemy_segments[i]
+        local seg = (es.enemy_depths[i] == 0x10) and rel_seg or INVALID_SEGMENT
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, seg)
     end
     -- Enemy shot positions (4) - fixed point values
@@ -454,11 +452,11 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     -- Format legend:
     --   >HddBBBHIBBBhhBBBBB
     --   H: num_values, dd: (subj_reward, obj_reward), BBB: (gamestate, game_mode, done), HI: (frame, score),
-    --   BBB: (save, fire, zap), h: spinner, h: nearest_enemy_abs_seg, B: player_seg, B: is_open,
+    --   BBB: (save, fire, zap), h: spinner, h: expert_target_abs_seg, B: player_seg, B: is_open,
     --   BB: (expert_fire, expert_zap), B: level_number
     local oob_format = ">HddBBBHIBBBhhBBBBB"
-    -- Determine nearest enemy absolute segment to transmit (or -1 if none)
-    local oob_nearest_enemy_abs_seg = es.nearest_enemy_abs_seg_internal or -1
+    -- Use logic.find_target_segment() output as the authoritative expert target segment.
+    local oob_expert_target_abs_seg = expert_target_seg or -1
     local oob_data = string.pack(oob_format,
         num_values_packed,          -- H: Number of values in main payload (ushort)
         subj_reward,                -- d: Subjective reward (double)
@@ -472,7 +470,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         ps.fire_commanded,          -- B: Commanded Fire (uchar)
         ps.zap_commanded,           -- B: Commanded Zap (uchar)
         ps.spinner_commanded,       -- h: Commanded Spinner (short)
-        oob_nearest_enemy_abs_seg,  -- h: Nearest Enemy ABS Segment (short)
+        oob_expert_target_abs_seg,  -- h: Expert target ABS Segment (short)
         ps.position & 0x0F,         -- B: Player Abs Segment (uchar)
         is_open_level and 1 or 0,   -- B: Is Open Level (uchar)
         expert_fire_packed,         -- B: Expert Fire (uchar)
@@ -670,7 +668,7 @@ local function determine_final_actions()
         -- end
         level_select_counter = 0 -- Reset level select counter here
 
-    elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 or game_state.gamestate == 0x20 then -- Normal Play or Tube Zoom
+    elseif game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then -- Normal Play or Tube Zoom
         -- Use AI commands stored in player_state
         final_fire_cmd = player_state.fire_commanded
         final_zap_cmd = player_state.zap_commanded
