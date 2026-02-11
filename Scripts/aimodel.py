@@ -297,13 +297,13 @@ class RainbowNet(nn.Module):
           mask:  (B, 7) bool tensor — True where slot is EMPTY
         """
         B = state.shape[0]
-        # Decoded info: 7 slots × 6 features at indices 91..132
-        decoded = state[:, 91:133].reshape(B, 7, 6)       # (B, 7, 6)
-        # Segments: 133..139, Depths: 140..146, Top-segs: 147..153
-        segs   = state[:, 133:140].unsqueeze(2)            # (B, 7, 1)
-        depths = state[:, 140:147].unsqueeze(2)            # (B, 7, 1)
-        tops   = state[:, 147:154].unsqueeze(2)            # (B, 7, 1)
-        toprail = state[:, 176:183].unsqueeze(2)           # (B, 7, 1)
+        # Decoded info: 7 slots × 6 features at indices 86..127
+        decoded = state[:, 86:128].reshape(B, 7, 6)       # (B, 7, 6)
+        # Segments: 128..134, Depths: 135..141, Top-segs: 142..148
+        segs   = state[:, 128:135].unsqueeze(2)            # (B, 7, 1)
+        depths = state[:, 135:142].unsqueeze(2)            # (B, 7, 1)
+        tops   = state[:, 142:149].unsqueeze(2)            # (B, 7, 1)
+        toprail = state[:, 171:178].unsqueeze(2)           # (B, 7, 1)
         slots = torch.cat([decoded, segs, depths, tops, toprail], dim=2)  # (B, 7, 10)
 
         # Depth feature is at index 7 in slot features (segs=6, depths=7, tops=8)
