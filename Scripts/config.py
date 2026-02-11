@@ -72,8 +72,8 @@ class RLConfigData:
 
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 512
-    lr: float = 3e-5
-    lr_min: float = 3e-5
+    lr: float = 1e-5
+    lr_min: float = 1e-5
     lr_warmup_steps: int = 5_000
     lr_cosine_period: int = 100_000        # warm-restart period (steps) ~2h cycle
     gamma: float = 0.99
@@ -81,14 +81,15 @@ class RLConfigData:
 
     # Replay (PER with proportional priorities)
     memory_size: int = 2_000_000
-    priority_alpha: float = 0.6
+    priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
     priority_eps: float = 1e-6
     min_replay_to_train: int = 10_000
 
-    # Target network
-    target_update_period: int = 32_000
+    # Target network (soft Polyak averaging)
+    target_update_period: int = 1
+    target_tau: float = 0.001
 
     # Gradient
     grad_clip_norm: float = 10.0
@@ -101,7 +102,7 @@ class RLConfigData:
 
     # Expert guidance
     expert_ratio_start: float = 0.50
-    expert_ratio_end: float = 0.05
+    expert_ratio_end: float = 0.0
     expert_ratio_decay_frames: int = 2_000_000
     expert_ratio: float = 0.50
 
@@ -109,7 +110,7 @@ class RLConfigData:
     expert_bc_weight: float = 1.0
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
-    expert_bc_min_weight: float = 0.05
+    expert_bc_min_weight: float = 0.0
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
@@ -122,7 +123,7 @@ class RLConfigData:
     inference_sync_steps: int = 100
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 16
+    training_steps_per_cycle: int = 8
     save_interval: int = 10_000
 
     enable_amp: bool = True

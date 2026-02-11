@@ -217,6 +217,22 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return push_float32(parts, val)
     end
 
+    -- Normalize spike heights: INVERT so longer spikes (smaller raw values) = HIGHER output.
+    -- Raw: 0=no spike, small positive=long dangerous spike, large=short safe spike.
+    -- Output: 0.0=no spike, ~1.0=extremely long dangerous spike, small positive=short spike.
+    local function push_spike_norm(parts, v)
+        local num = tonumber(v) or 0
+        if num < 0 or num > 255 then
+            error(string.format("Value %g out of range [0,255] in spike_norm", num))
+        end
+        if num == 0 then
+            return push_float32(parts, 0.0)  -- No spike: safe
+        end
+        -- Spike exists: invert so danger increases with value
+        local val = 1.0 - (num / 255.0)
+        return push_float32(parts, val)
+    end
+
     -- Normalize 8.8 fixed point values [0,255.996] to [0,1]
     local function push_fixed_norm(parts, v)
         local num = tonumber(v) or 0
@@ -320,7 +336,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_type)
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_shape)
     for i = 0, 15 do
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.spike_heights[i] or 0)
+        num_values_packed = num_values_packed + push_spike_norm(binary_data_parts, ls.spike_heights[i] or 0)
     end
     for i = 0, 15 do
         num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_angles[i] or 0)
