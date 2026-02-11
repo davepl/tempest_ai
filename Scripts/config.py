@@ -105,6 +105,9 @@ class RLConfigData:
     expert_ratio_end: float = 0.0
     expert_ratio_decay_frames: int = 5_000_000
     expert_ratio: float = 0.50
+    # During tube zoom (gamestate 0x20), temporarily boost expert usage.
+    expert_ratio_zoom_multiplier: float = 2.0
+    expert_ratio_zoom_gamestate: int = 0x20
 
     # Expert BC
     expert_bc_weight: float = 1.0

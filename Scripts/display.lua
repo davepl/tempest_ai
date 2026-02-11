@@ -143,7 +143,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     -- Level State Section
     local level_metrics = {
          ["Level Num"] = level_state.level_number,
-         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type == 0x00) and "Open" or "Closed"), -- Updated heuristic
+         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type ~= 0x00) and "Open" or "Closed"),
          ["Level Shape"] = level_state.level_shape,
     }
     display_str = display_str .. format_section("Level State", level_metrics)
@@ -165,7 +165,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         ["In Tube"] = enemies_state.num_enemies_in_tube,
         ["On Top"] = enemies_state.num_enemies_on_top,
         ["Pending"] = enemies_state.enemies_pending,
-        ["Pulse State"] = string.format("Beat:%02X Pulse:%02X Rate:%02X", enemies_state.pulse_beat, enemies_state.pulsing, enemies_state.pulsar_fliprate),
+        ["Pulse State"] = string.format("Beat:%+d Pulse:%02X Rate:%02X", enemies_state.pulse_beat, enemies_state.pulsing, enemies_state.pulsar_fliprate),
         ["Nearest Target"] = string.format("Seg:%s Depth:%02X Align:%.0f Err:%.0f",
                                     format_segment(enemies_state.nearest_enemy_seg),
                                     enemies_state.nearest_enemy_depth_raw,
