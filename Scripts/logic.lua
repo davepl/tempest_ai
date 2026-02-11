@@ -35,6 +35,8 @@ local CONSERVE_REACT_DISTANCE = 1.10
 -- Configurable pulsar hunting preferences
 local PULSAR_PREF_DISTANCE = 1.0   -- desired lanes away from the pulsar (can be fractional for hold/fire logic)
 local PULSAR_PREF_TOLERANCE = 0.15 -- acceptable window around preferred distance to hold and fire
+-- Expert fire control: per-frame Bernoulli probability for emitting fire.
+local EXPERT_FIRE_PROBABILITY = 0.95
 
 local M = {} -- Module table
 
@@ -53,6 +55,10 @@ local LastRewardState = 0
 local LastSubjRewardState = 0
 local LastObjRewardState = 0
 local previous_player_position = 0
+
+local function sample_expert_fire()
+    return math.random() < EXPERT_FIRE_PROBABILITY
+end
 
 -- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
 -- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
@@ -286,6 +292,22 @@ function M.get_conserve_fire_mode()
     return CONSERVE_FIRE_MODE, CONSERVE_REACT_DISTANCE
 end
 
+function M.set_expert_fire_probability(probability)
+    if type(probability) ~= "number" then
+        return
+    end
+    if probability < 0.0 then
+        probability = 0.0
+    elseif probability > 1.0 then
+        probability = 1.0
+    end
+    EXPERT_FIRE_PROBABILITY = probability
+end
+
+function M.get_expert_fire_probability()
+    return EXPERT_FIRE_PROBABILITY
+end
+
 -- Helper to find the nearest safe segment (not a danger lane)
 local function find_nearest_safe_segment(start_seg, enemies_state, is_open)
     if not M.is_danger_lane(start_seg, enemies_state) then return start_seg end
@@ -475,18 +497,16 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         if flee_target == nil then
             flee_target = try_offset(player_abs_seg, -flee_dir) or player_abs_seg
         end
-        return flee_target, 0, true, false
+        return flee_target, 0, sample_expert_fire(), false
     end
 
     -- Tube Zoom behavior unchanged
     if game_state.gamestate == 0x20 then
-        local seg, _, should_fire, _ = M.zoom_down_tube(player_abs_seg, level_state, is_open)
-        -- Force fire even during tube zoom
-        should_fire = true
-        return seg, 0, should_fire, false
+        local seg = M.zoom_down_tube(player_abs_seg, level_state, is_open)
+        return seg, 0, sample_expert_fire(), false
     end
     if game_state.gamestate ~= 0x04 then
-        return player_abs_seg, 0, true, false
+        return player_abs_seg, 0, sample_expert_fire(), false
     end
 
     -- Immediate fuseball avoidance: if a charging fuseball is in our lane or adjacent and near the top,
@@ -546,7 +566,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 end
             end
             if candidate ~= -1 then
-                return candidate, 0, true, false
+                return candidate, 0, sample_expert_fire(), false
             end
         end
     end
@@ -561,26 +581,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     end
 
     local shots_remaining = math.max(0, 8 - shot_count)
-    if shots_remaining <= 2 or shot_threat_near then
+    -- Keep lane-hunting active even when ammo is low.
+    -- Previously we froze target_seg to the current lane at low ammo, which
+    -- effectively disabled spinner movement unless a top-rail flee case fired.
+    if shot_threat_near then
         target_seg = player_abs_seg
-    end
-
-    -- Firing policy
-    -- Shoot if: something is in our lane OR any top-rail flipper/pulsar within shooting distance (~0.8)
-    -- AND we have ammo available (shot_count < 8)
-    local SHOOT_DIST = 0.80
-    local lane_has_threat = M.check_segment_threat(player_abs_seg, enemies_state)
-    local within_shooting_distance = (min_abs_rel_float ~= nil and min_abs_rel_float <= SHOOT_DIST)
-
-    local should_fire
-    if shots_remaining <= 0 then
-        -- No ammo available, never fire
-        should_fire = false
-    elseif lane_has_threat or within_shooting_distance then
-        should_fire = true
-    else
-        -- Keep only 5 shots onscreen
-        should_fire = (shots_remaining > 3)
     end
 
     -- Superzap heuristic retained (3+ top-rail enemies)
@@ -595,9 +600,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
     local should_superzap = superzapper_available and (top_rail_count >= 3)
 
-    -- Per request: Always recommend fire from the Lua expert
-    should_fire = true
-    return target_seg, 0, should_fire, should_superzap
+    return target_seg, 0, sample_expert_fire(), should_superzap
 end
 
 -- Function to calculate desired spinner direction and distance to target enemy
