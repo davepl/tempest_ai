@@ -275,13 +275,15 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
 
     -- Normalize small enums/bitfields [0,maxv] to [0,1] so low-cardinality
     -- semantic features (type/bits) are not compressed into ~0.
+    -- Clamps to [0,maxv] since raw memory can hold garbage during attract/init.
     local function push_small_enum_norm(parts, v, maxv, context)
         local num = tonumber(v) or 0
-        local validated = assert_range(num, 0, maxv, context or "small_enum")
+        if num < 0 then num = 0 end
+        if num > maxv then num = maxv end
         if maxv == 0 then
             return push_float32(parts, 0.0)
         end
-        return push_float32(parts, validated / maxv)
+        return push_float32(parts, num / maxv)
     end
     
     -- Normalize raw Tempest depth values [0, 255] to [0, 1].
@@ -313,7 +315,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.game_mode)  -- bitmask, full byte
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.countdown_timer) -- BCD or binary, keep raw
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, gs.p1_lives, 6, "lives") -- 0-6 (capped at 6)
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, gs.p1_level, 98, "p1_level") -- 0-98 max
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, math.min(gs.p1_level, 98), 98, "p1_level") -- 0-98 max, clamp 255 during attract
 
     -- Targeting / Engineered Features (4) - FIXED: Removed duplicate nearest_enemy_seg
     -- num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
@@ -338,7 +340,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     end
 
     -- Level state (3 + 16 + 16 = 35)
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ls.level_number, 98, "level_number") -- 0-98 max
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, math.min(ls.level_number, 98), 98, "level_number") -- 0-98 max, clamp 255 during attract
     num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, ls.level_type)  -- $00=closed(0), $FF=open(1)
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ls.level_shape, 15, "level_shape") -- 0-15
     for i = 0, 15 do
