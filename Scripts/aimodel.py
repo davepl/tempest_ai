@@ -651,8 +651,16 @@ class RainbowAgent:
             return None
 
     # ── Target update ───────────────────────────────────────────────────
-    def update_target(self):
-        self.target_net.load_state_dict(self.online_net.state_dict())
+    def update_target(self, tau: float = None):
+        if tau is None:
+            tau = RL_CONFIG.target_tau
+        if tau >= 1.0:
+            # Hard copy
+            self.target_net.load_state_dict(self.online_net.state_dict())
+        else:
+            # Polyak (soft) averaging: target = (1-tau)*target + tau*online
+            for tp, op in zip(self.target_net.parameters(), self.online_net.parameters()):
+                tp.data.mul_(1.0 - tau).add_(op.data, alpha=tau)
         self.target_net.eval()
         try:
             metrics.last_target_update_step = metrics.total_training_steps
