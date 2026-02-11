@@ -96,7 +96,7 @@ class RLConfigData:
 
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.01q
+    epsilon_end: float = 0.01
     epsilon_decay_frames: int = 1_000_000
     epsilon: float = 1.0
 
