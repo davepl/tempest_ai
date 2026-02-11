@@ -214,8 +214,11 @@ def main():
     print_network_info(agent)
 
     if os.path.exists(LATEST_MODEL_PATH):
-        agent.load(LATEST_MODEL_PATH)
-        print(f"✓ Loaded model from: {LATEST_MODEL_PATH}\n")
+        loaded = agent.load(LATEST_MODEL_PATH)
+        if loaded:
+            print(f"✓ Loaded model from: {LATEST_MODEL_PATH}\n")
+        else:
+            print("⚠ Model load failed/incompatible, starting fresh\n")
     else:
         print("⚠ No model found, starting fresh\n")
 

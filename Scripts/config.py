@@ -96,21 +96,22 @@ class RLConfigData:
 
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.01
+    epsilon_end: float = 0.01q
     epsilon_decay_frames: int = 1_000_000
     epsilon: float = 1.0
 
     # Expert guidance
     expert_ratio_start: float = 0.50
     expert_ratio_end: float = 0.0
-    expert_ratio_decay_frames: int = 2_000_000
+    expert_ratio_decay_frames: int = 5_000_000
     expert_ratio: float = 0.50
 
     # Expert BC
     expert_bc_weight: float = 1.0
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
-    expert_bc_min_weight: float = 0.0
+    # Keep a small non-zero floor to reduce late-training policy drift.
+    expert_bc_min_weight: float = 0.1
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01

@@ -149,7 +149,10 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     display_str = display_str .. format_section("Level State", level_metrics)
     local spike_heights_str = ""
     for i = 0, 15 do spike_heights_str = spike_heights_str .. string.format("%02X ", level_state.spike_heights[i] or 0) end
-    display_str = display_str .. "Spike Heights: " .. spike_heights_str .. "\n\n"
+    local spike_depths_str = ""
+    for i = 0, 15 do spike_depths_str = spike_depths_str .. string.format("%02X ", level_state.spike_depths[i] or 0) end
+    display_str = display_str .. "Spike Heights: " .. spike_heights_str .. "\n"
+    display_str = display_str .. "Spike Depths : " .. spike_depths_str .. "\n\n"
 
     -- Enemies State Section
     local enemies_metrics = {

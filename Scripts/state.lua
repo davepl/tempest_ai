@@ -36,6 +36,59 @@ local find_target_segment
 local find_forbidden_segments
 local find_nearest_safe_segment
 
+-- Tempest segment-angle helper mirroring get_angle ($9ee6):
+-- - direction bit set   (segment increasing): angle = tube_angle[(seg-1)&0x0f] + 8
+-- - direction bit clear (segment decreasing): angle = tube_angle[seg]
+local function get_tempest_segment_angle_nibble(level_angles, seg_abs, seg_increasing)
+    local seg = (tonumber(seg_abs) or 0) & 0x0F
+    local lane_angle = 0
+    if seg_increasing == 1 then
+        local prev_seg = (seg - 1) & 0x0F
+        lane_angle = (tonumber(level_angles[prev_seg]) or 0)
+        return (lane_angle + 8) & 0x0F
+    end
+    lane_angle = (tonumber(level_angles[seg]) or 0)
+    return lane_angle & 0x0F
+end
+
+-- Convert more_enemy_info low nibble into 0..1 progress along a between-segment move.
+-- This follows PC_ContFinishFlip ($9d8a) semantics instead of treating nibble as linear /16.
+local function compute_between_progress(level_angles, seg_abs, seg_increasing, angle_nibble)
+    local start_angle = get_tempest_segment_angle_nibble(level_angles, seg_abs, seg_increasing)
+    local target_angle = get_tempest_segment_angle_nibble(level_angles, seg_abs, (seg_increasing == 1) and 0 or 1)
+    local current_angle = (tonumber(angle_nibble) or 0) & 0x0F
+
+    local traveled = 0
+    local total = 0
+    if seg_increasing == 1 then
+        -- Increasing segment: nibble decrements each tick while flipping.
+        traveled = (start_angle - current_angle) & 0x0F
+        total = (start_angle - target_angle) & 0x0F
+    else
+        -- Decreasing segment: nibble increments each tick while flipping.
+        traveled = (current_angle - start_angle) & 0x0F
+        total = (target_angle - start_angle) & 0x0F
+    end
+
+    if total <= 0 then
+        return 0.0
+    end
+    local progress = traveled / total
+    if progress < 0.0 then
+        progress = 0.0
+    elseif progress > 1.0 then
+        progress = 1.0
+    end
+    return progress
+end
+
+local function wrap_closed_relative_segment(rel_float)
+    local v = rel_float
+    while v > 8.0 do v = v - 16.0 end
+    while v < -8.0 do v = v + 16.0 end
+    return v
+end
+
 -- ====================
 -- Helper Functions (Internal to this State Module)
 -- ====================
@@ -227,37 +280,9 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     local did_flee = false
     local hunting_target_info = "N/A"
 
-    -- Check for Tube Zoom state first
-    if game_state.gamestate == 0x20 then
-        -- Spike heights are depths: 0=clear/no spike, >0 means spike exists, smaller number = longer spike
-        local current_spike_h = level_state.spike_heights[player_abs_seg]
-        if current_spike_h == 0 then return player_abs_seg, 0, true, false end
-        local left_neighbour_seg = -1
-        local right_neighbour_seg = -1
-        if is_open then
-            if player_abs_seg > 0 then left_neighbour_seg = player_abs_seg - 1 end
-            if player_abs_seg < 15 then right_neighbour_seg = player_abs_seg + 1 end
-        else
-            left_neighbour_seg = (player_abs_seg - 1 + 16) % 16
-            right_neighbour_seg = (player_abs_seg + 1) % 16
-        end
-        local left_spike_h = -1; if left_neighbour_seg ~= -1 then left_spike_h = level_state.spike_heights[left_neighbour_seg] end
-        local right_spike_h = -1; if right_neighbour_seg ~= -1 then right_spike_h = level_state.spike_heights[right_neighbour_seg] end
-        if left_spike_h == 0 then return left_neighbour_seg, 0, true, false end
-        if right_spike_h == 0 then return right_neighbour_seg, 0, true, false end
-        local temp_target = player_abs_seg
-        local is_left_better = (left_spike_h > current_spike_h)
-        local is_right_better = (right_spike_h > current_spike_h)
-        if is_left_better and is_right_better then temp_target = (left_spike_h >= right_spike_h) and left_neighbour_seg or right_neighbour_seg
-        elseif is_left_better then temp_target = left_neighbour_seg
-        elseif is_right_better then temp_target = right_neighbour_seg
-        end
-        initial_target_seg_abs, target_depth, should_fire, should_zap = (function()
-           -- ... (spike logic returns temp_target, 0, true, false)
-           return temp_target, 0, true, false
-        end)()
-    -- Check Flee/Hunt Logic (only in normal play mode)
-    elseif game_state.gamestate == 0x04 then
+    -- NOTE: Tube-zoom expert steering is owned by logic.find_target_segment()/zoom_down_tube.
+    -- This state-local helper is telemetry-only and should not duplicate zoom steering logic.
+    if game_state.gamestate == 0x04 then
         local forbidden_segments = find_forbidden_segments(enemies_state, level_state, player_state)
         local current_segment_is_forbidden = forbidden_segments[player_abs_seg] or false
 
@@ -495,13 +520,15 @@ M.LevelState.__index = M.LevelState
 function M.LevelState:new()
     local self = setmetatable({}, M.LevelState)
     self.level_number = 0
-    self.spike_heights = {} -- Array of 16 spike heights (0-15 index)
+    self.spike_heights = {} -- Array of 16 spike heights (0-15 index): 0 or (255 - depth)
+    self.spike_depths = {}  -- Array of 16 raw spike depths (0-15 index)
     self.level_type = 0     -- 00 = OPEN, FF = closed (Updated: original assumption inverted after assembly review)
     self.level_angles = {}  -- Array of 16 tube angles (0-15 index)
     self.level_shape = 0    -- Level shape (level_number % 16)
     -- Initialize tables
     for i = 0, 15 do
         self.spike_heights[i] = 0
+        self.spike_depths[i] = 0
         self.level_angles[i] = 0
     end
     return self
@@ -512,9 +539,17 @@ function M.LevelState:update(mem)
     self.level_type = mem:read_u8(0x0111)     -- Level type raw flag at $0111 (00=open, FF=closed after inversion)
     self.level_shape = self.level_number % 16 -- Calculate level shape
 
-    -- Read spike heights for all 16 segments and store them indexed by absolute segment number (0-15)
+    -- Read spike depths for all 16 segments and derive lane spike heights.
+    -- Raw depth semantics: 0 = no spike, 0x10 = near top rail, 0xFF = very far.
+    -- Height semantics used by RL features: 0 = no spike, otherwise (255 - depth).
     for i = 0, 15 do
-        self.spike_heights[i] = mem:read_u8(0x03AC + i)
+        local depth = mem:read_u8(0x03AC + i)
+        self.spike_depths[i] = depth
+        if depth == 0 then
+            self.spike_heights[i] = 0
+        else
+            self.spike_heights[i] = 255 - depth
+        end
     end
 
     -- Read tube angles for all 16 segments indexed by absolute segment number (0-15)
@@ -675,7 +710,8 @@ function M.EnemiesState:new()
     -- Enemy info arrays (Size 7, for enemy slots 1-7)
     self.enemy_type_info = {} -- Raw type byte ($0283 + i - 1)
     self.active_enemy_info = {} -- Raw state byte ($028A + i - 1)
-    self.enemy_segments = {}  -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
+    self.enemy_segments = {}  -- Relative integer segment (-7..+8 or -15..+15, or INVALID_SEGMENT)
+    self.enemy_segments_fractional = {} -- Relative segment with fractional offset when between segments
     self.enemy_abs_segments = {} -- Absolute segment (0-15, or INVALID_SEGMENT)
     self.enemy_depths = {}    -- Enemy depth/position ($02DF + i - 1)
 
@@ -731,6 +767,7 @@ function M.EnemiesState:new()
         self.enemy_type_info[i] = 0
         self.active_enemy_info[i] = 0
         self.enemy_segments[i] = INVALID_SEGMENT
+        self.enemy_segments_fractional[i] = INVALID_SEGMENT
         self.enemy_abs_segments[i] = INVALID_SEGMENT
         self.enemy_depths[i] = 0
         self.enemy_core_type[i] = 0
@@ -817,6 +854,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.enemy_can_shoot[i] = 0
         self.enemy_split_behavior[i] = 0
         self.enemy_segments[i] = INVALID_SEGMENT
+        self.enemy_segments_fractional[i] = INVALID_SEGMENT
         self.enemy_abs_segments[i] = INVALID_SEGMENT
         self.enemy_depths[i] = 0
         self.enemy_type_info[i] = 0
@@ -825,8 +863,10 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         -- Enemy activity is driven by depth/along value (>0). Segment 0 is valid.
         if enemy_depth_raw > 0 then
             local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+            local rel_segment = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
             self.enemy_abs_segments[i] = abs_segment
-            self.enemy_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
+            self.enemy_segments[i] = rel_segment
+            self.enemy_segments_fractional[i] = rel_segment
             self.enemy_depths[i] = enemy_depth_raw
 
             -- Read raw type/state bytes only for active enemies
@@ -847,6 +887,32 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
 
             -- Read raw more_enemy_info angle/progress byte ($02CC-$02D2)
             self.more_enemy_info[i] = mem:read_u8(0x02CC + i - 1)
+
+            -- Derive fractional segment for moving-between-segment enemies.
+            -- For non-fuseballs this follows Tempest flip-angle progression.
+            -- (Fuseballs use a special representation; keep integer lane there.)
+            if self.enemy_between_segments[i] == 1 and self.enemy_core_type[i] ~= ENEMY_TYPE_FUSEBALL then
+                local progress = compute_between_progress(
+                    level_state.level_angles,
+                    abs_segment,
+                    self.enemy_direction_moving[i],
+                    self.more_enemy_info[i] & 0x0F
+                )
+
+                local rel_float = rel_segment
+                if self.enemy_direction_moving[i] == 1 then
+                    -- Moving to the next higher segment: [seg-1 .. seg]
+                    rel_float = rel_segment + progress - 1.0
+                else
+                    -- Moving to the next lower segment: [seg .. seg-1]
+                    rel_float = rel_segment - progress
+                end
+
+                if not is_open then
+                    rel_float = wrap_closed_relative_segment(rel_float)
+                end
+                self.enemy_segments_fractional[i] = rel_float
+            end
         end -- End if enemy active
     end -- End enemy slot loop
 
@@ -860,54 +926,18 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
         if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
-            self.charging_fuseball[i] = self.enemy_segments[i]
+            self.charging_fuseball[i] = self.enemy_segments_fractional[i]
         end
         
         -- Check if it's an active Pulsar (type 1)
         if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then -- Pulsar type 1
-            self.active_pulsar[i] = self.enemy_segments[i]
+            self.active_pulsar[i] = self.enemy_segments_fractional[i]
         end
 
         -- Check if it's a top rail Pulsar or Flipper (depth at/near player rail)
         if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] > 0 and self.enemy_depths[i] <= 0x10) then
-            -- Build absolute floating segment using between-segment progress (from more_enemy_info low nibble)
-            local abs_int = self.enemy_abs_segments[i]
-            local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
-            -- Compute a monotonically increasing progress [0,1) based on direction semantics:
-            -- Direction bit set (increasing): nibble DECREMENTS each tick -> progress = (15 - nibble)/16
-            -- Direction bit clear (decreasing): nibble INCREMENTS each tick -> progress = nibble/16
-            local progress = 0.0
-            if self.enemy_between_segments[i] == 1 then
-                if self.enemy_direction_moving[i] == 1 then
-                    progress = (15.0 - angle_nibble) / 16.0
-                else
-                    progress = angle_nibble / 16.0
-                end
-            end
-
-            local rel_float
-            -- Build relative float directly from integer relative lane and progress.
-            -- This avoids open-level edge wrap artefacts (e.g. near-seg-0 enemies
-            -- appearing near +15 due to modulo normalization).
-            local rel_int = abs_to_rel_func(player_abs_segment, abs_int, is_open)
-            if self.enemy_between_segments[i] == 1 then
-                if self.enemy_direction_moving[i] == 1 then
-                    rel_float = rel_int + progress - 1.0
-                else
-                    rel_float = rel_int - progress
-                end
-            else
-                rel_float = rel_int
-            end
-
-            if not is_open then
-                -- Wrap into [-8,+8] for closed levels
-                while rel_float > 8.0 do rel_float = rel_float - 16.0 end
-                while rel_float < -8.0 do rel_float = rel_float + 16.0 end
-            end
-
-            self.active_top_rail_enemies[i] = rel_float
-            -- print("Top rail at: " .. string.format("%.3f", rel_float) .. " (slot " .. i .. ")")
+            self.active_top_rail_enemies[i] = self.enemy_segments_fractional[i]
+            -- print("Top rail at: " .. string.format("%.3f", self.active_top_rail_enemies[i]) .. " (slot " .. i .. ")")
         end
     end
 
@@ -958,15 +988,18 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         if self.enemy_abs_segments[i] == INVALID_SEGMENT then
             self.fractional_enemy_segments_by_slot[i] = INVALID_SEGMENT
         else
-            -- Use the same direction-aware progress as above
+            -- Progress in [0,1] through the current between-segment transition.
             local progress = 0.0
-            if self.enemy_between_segments[i] == 1 then
-                local angle_nibble = self.more_enemy_info[i] & 0x0F -- 0..15
-                if self.enemy_direction_moving[i] == 1 then
-                    progress = (15.0 - angle_nibble) / 16.0
-                else
-                    progress = angle_nibble / 16.0
-                end
+            if self.enemy_between_segments[i] == 1 and self.enemy_core_type[i] ~= ENEMY_TYPE_FUSEBALL then
+                progress = compute_between_progress(
+                    level_state.level_angles,
+                    self.enemy_abs_segments[i],
+                    self.enemy_direction_moving[i],
+                    self.more_enemy_info[i] & 0x0F
+                )
+            elseif self.enemy_between_segments[i] == 1 then
+                -- Fuseball between-state uses a special 3-bit phase.
+                progress = (self.more_enemy_info[i] & 0x07) / 8.0
             end
             local scaled_value = math.floor(progress * 4096.0 + 0.5) -- Round to nearest
             if scaled_value >= 4096 then scaled_value = 4095 end
