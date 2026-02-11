@@ -295,15 +295,25 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         return push_float32(parts, val)
     end
 
+    -- Normalize a signed value with known magnitude range to [-1, +1].
+    -- Used for pulse_beat which oscillates e.g. +12 to -12.
+    local function push_signed_norm(parts, v, max_magnitude, context)
+        local num = tonumber(v) or 0
+        if max_magnitude <= 0 then return push_float32(parts, 0.0) end
+        local clamped = math.max(-max_magnitude, math.min(max_magnitude, num))
+        local val = clamped / max_magnitude
+        return push_float32(parts, val)
+    end
+
     local binary_data_parts = {}
     local num_values_packed = 0
 
-    -- Game state (5) - all natural values
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.gamestate)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.game_mode)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.countdown_timer)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_lives)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.p1_level)
+    -- Game state (5) - proper range normalization
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, gs.gamestate, 36, "gamestate") -- even values 0-36 ($00-$24)
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.game_mode)  -- bitmask, full byte
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, gs.countdown_timer) -- BCD or binary, keep raw
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, gs.p1_lives, 6, "lives") -- 0-6 (capped at 6)
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, gs.p1_level, 98, "p1_level") -- 0-98 max
 
     -- Targeting / Engineered Features (4) - FIXED: Removed duplicate nearest_enemy_seg
     -- num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.nearest_enemy_seg)
@@ -312,14 +322,14 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     -- num_values_packed = num_values_packed + push_unit_norm(binary_data_parts, es.alignment_error_magnitude)
 
     -- Player state (7 + 8 + 8 = 23)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.position)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.alive)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.player_state)
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ps.position, 15, "position") -- segment 0-15
+    num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, ps.alive)  -- 0 or 1
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ps.player_state & 0x0F, 15, "player_state_nibble") -- low nibble = next seg (0-15)
     -- Player depth: raw value from Tempest memory ($0202)
     num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, ps.player_depth)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_uses)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ps.superzapper_active)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, 8 - ps.shot_count)
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ps.superzapper_uses, 2, "zap_uses") -- 0-2 uses consumed
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, math.min(ps.superzapper_active, 19), 19, "zap_active") -- 0-19 countdown, $FF clamped
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, 8 - ps.shot_count, 8, "remaining_shots") -- 0-8 remaining
     for i = 1, 8 do
         num_values_packed = num_values_packed + push_fixed_norm(binary_data_parts, ps.shot_positions[i])
     end
@@ -327,46 +337,48 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, ps.shot_segments[i])
     end
 
-    -- Level state (3 + 16 + 16 = 35) - all natural values
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_number)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_type)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_shape)
+    -- Level state (3 + 16 + 16 = 35)
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ls.level_number, 98, "level_number") -- 0-98 max
+    num_values_packed = num_values_packed + push_bool_norm(binary_data_parts, ls.level_type)  -- $00=closed(0), $FF=open(1)
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ls.level_shape, 15, "level_shape") -- 0-15
     for i = 0, 15 do
         num_values_packed = num_values_packed + push_spike_norm(binary_data_parts, ls.spike_heights[i] or 0)
     end
     for i = 0, 15 do
-        num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, ls.level_angles[i] or 0)
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, ls.level_angles[i] or 0, 15, "level_angle") -- 0-15 nibble
     end
 
-    -- Enemies state (counts: 10 + other: 6 = 16) - all natural values
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_flippers)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_pulsars)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_tankers)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_spikers)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.active_fuseballs)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_flippers)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_pulsars)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_tankers)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_spikers)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spawn_slots_fuseballs)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.num_enemies_in_tube)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.num_enemies_on_top)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.enemies_pending)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsar_fliprate)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulse_beat)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsing)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.flipper_move or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.fuse_move_prb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_flipper_lsb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_pulsar_lsb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_tanker_lsb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_lsb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_lsb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_flipper_msb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_pulsar_msb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_tanker_msb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_spiker_msb or 0)
-    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.spd_fuseball_msb or 0)
+    -- Enemies state — counts use proper ranges, speeds/misc keep raw byte
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_flippers, 7, "active_flippers")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_pulsars, 7, "active_pulsars")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_tankers, 7, "active_tankers")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_spikers, 7, "active_spikers")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_fuseballs, 7, "active_fuseballs")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_flippers, 7, "spawn_flippers") -- 0-7 available slots
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_pulsars, 7, "spawn_pulsars")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_tankers, 7, "spawn_tankers")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_spikers, 7, "spawn_spikers")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_fuseballs, 7, "spawn_fuseballs")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.num_enemies_in_tube, 7, "num_in_tube")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.num_enemies_on_top, 7, "num_on_top")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemies_pending, 63, "enemies_pending") -- capped at 63
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, math.min(es.pulsar_fliprate, 40), 40, "pulsar_fliprate") -- 10-40 active, clamp 255→40
+    -- pulse_beat is now signed (-12..+12); use signed normalization
+    num_values_packed = num_values_packed + push_signed_norm(binary_data_parts, es.pulse_beat, 12, "pulse_beat")
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsing)  -- oscillator phase 0-255, keep raw
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.flipper_move or 0, 135, "flipper_move") -- p-code PC, max 135
+    num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.fuse_move_prb or 0) -- probability threshold, /255 OK
+    -- Combined 16-bit signed speeds: MSB*256+LSB, sign-extended, normalized by max magnitude 1536
+    local function push_combined_speed(parts, lsb, msb)
+        local combined = (msb or 0) * 256 + (lsb or 0)
+        if combined > 32767 then combined = combined - 65536 end -- sign extend
+        return push_signed_norm(parts, combined, 1536, "enemy_speed")
+    end
+    num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_flipper_lsb, es.spd_flipper_msb)
+    num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_pulsar_lsb, es.spd_pulsar_msb)
+    num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_tanker_lsb, es.spd_tanker_msb)
+    num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_spiker_lsb, es.spd_spiker_msb)
+    num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_fuseball_lsb, es.spd_fuseball_msb)
 
     -- Decoded Enemy Info (7 * 6 = 42) - keep meaningful dynamic range
     for i = 1, 7 do
@@ -415,7 +427,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_toprail_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
     end
 
-    -- Total main payload size: 183
+    -- Total main payload size: 178
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
@@ -434,7 +446,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
 
     -- --- OOB Data Packing ---
     -- Python expects OOB header format: >HddBBBHIBBBhhBBBBB (no total reward, no attract byte)
-    local is_open_level = ls.level_type == 0x00 -- Updated heuristic
+    local is_open_level = ls.level_type ~= 0x00 -- Assembly: $00=closed, $FF=open
     local score = ps.score or 0
     local frame = gs.frame_counter % 65536
 
@@ -582,7 +594,7 @@ local function handle_ai_interaction()
     end
     
     -- NOTE: Removed reward clamping [-1,1] since rewards are now properly scaled in logic.calculate_reward()    -- Calculate expert advice (target segment, fire, zap)
-    local is_open_level = (level_state.level_type == 0x00)
+    local is_open_level = (level_state.level_type ~= 0x00)
     local expert_target_seg, _, expert_should_fire_lua, expert_should_zap_lua = logic.find_target_segment(
         game_state, player_state, level_state, enemies_state, logic.absolute_to_relative_segment, is_open_level
     )

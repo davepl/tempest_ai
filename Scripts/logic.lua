@@ -21,7 +21,7 @@ local FLIPPER_REACT_DISTANCE_L = 2.0 -- distance at which we move one segment an
 local FREEZE_FIRE_PRIO_LOW = 2
 local FREEZE_FIRE_PRIO_HIGH = 8
 local AVOID_FIRE_PRIORITY = 3
-local PULSAR_THRESHOLD = 0xE0 -- Pulsing threshold for avoidance (match dangerous pulsar threshold)
+local PULSAR_THRESHOLD = 0xE0 -- DEPRECATED: see assembly-correct pulsing checks below
 -- Open-level tuning: react slightly sooner to top-rail flippers using fractional distance
 local OPEN_FLIPPER_REACT_DISTANCE = 1.10
 -- Retreat positions for open level flipper handling
@@ -189,7 +189,8 @@ end
 
 -- Function to check for pulsar threats
 function M.pulsar_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func, forbidden_segments)
-    if enemies_state.pulsing < PULSAR_THRESHOLD then return false, player_abs_seg, 0, false, false end
+    -- Assembly: pulsing bit 7 CLEAR ($01-$7F) = dangerous, bit 7 SET or 0 = safe
+    if enemies_state.pulsing == 0 or enemies_state.pulsing >= 0x80 then return false, player_abs_seg, 0, false, false end
 
     local is_in_pulsar_lane = false
     local current_pulsar_seg = -1
@@ -229,7 +230,8 @@ end
 
 -- Returns true if the segment is a danger lane (more specific criteria for immediate action)
 function M.is_danger_lane(segment, enemies_state)
-    if enemies_state.pulsing >= PULSAR_THRESHOLD then -- Check dangerous pulsars first
+    -- Assembly: pulsing bit 7 CLEAR ($01-$7F) = dangerous
+    if enemies_state.pulsing > 0 and enemies_state.pulsing < 0x80 then -- Check dangerous pulsars first
         for i = 1, 7 do
             if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and enemies_state.enemy_abs_segments[i] == segment and enemies_state.enemy_depths[i] > 0 then return true end
         end
@@ -409,7 +411,7 @@ end
 -- Function to find the target segment and recommended action (expert policy)
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
     -- Simplified targeting logic per spec
-    local is_open = (level_state.level_type == 0x00) -- Updated: 0x00 now considered open
+    local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
     local player_abs_seg = math.floor(player_state.position) % 16
     local shot_count = player_state.shot_count or 0
     local min_abs_rel_float = nil
@@ -606,7 +608,7 @@ end
 -- Function to calculate desired spinner direction and distance to target enemy
 function M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local player_abs_seg = math.floor(player_state.position) % 16
-    local is_open = (level_state.level_type == 0x00) -- Updated heuristic
+    local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
     local target_abs_segment = enemies_state.nearest_enemy_abs_seg_internal or -1
 
     if target_abs_segment == -1 then return 0, 0, 255 end -- No target
@@ -641,7 +643,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
             local player_abs_seg = player_state.position & 0x0F
             local prev_player_seg = math.floor(previous_player_position or 0) % 16
-            local is_open = (level_state.level_type == 0x00) -- Updated heuristic
+            local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
 
             -- Apply safety shaping EVERY frame so the agent feels ongoing danger,
             -- not just on lane changes.  Scale slightly smaller when stationary
