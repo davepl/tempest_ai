@@ -370,11 +370,13 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.pulsing)  -- oscillator phase 0-255, keep raw
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.flipper_move or 0, 135, "flipper_move") -- p-code PC, max 135
     num_values_packed = num_values_packed + push_natural_norm(binary_data_parts, es.fuse_move_prb or 0) -- probability threshold, /255 OK
-    -- Combined 16-bit signed speeds: MSB*256+LSB, sign-extended, normalized by max magnitude 1536
+    -- Combined 16-bit signed speeds: MSB*256+LSB, sign-extended.
+    -- All crack_speed outputs are negative (enemies move toward player).
+    -- Max magnitude 2560 = fuseball (flipper_speed × 2, worst case -1280 × 2).
     local function push_combined_speed(parts, lsb, msb)
         local combined = (msb or 0) * 256 + (lsb or 0)
         if combined > 32767 then combined = combined - 65536 end -- sign extend
-        return push_signed_norm(parts, combined, 1536, "enemy_speed")
+        return push_signed_norm(parts, combined, 2560, "enemy_speed")
     end
     num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_flipper_lsb, es.spd_flipper_msb)
     num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.spd_pulsar_lsb, es.spd_pulsar_msb)
@@ -429,7 +431,48 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_toprail_relative_norm(binary_data_parts, es.active_top_rail_enemies[i])
     end
 
-    -- Total main payload size: 178
+    -- ── Danger Proximity Features (3) ──────────────────────────────────
+    -- Pre-computed nearest-threat depth for player's lane and ±1 adjacent lanes.
+    -- Gives the network direct "danger here / escape there" signals without
+    -- needing to cross-reference segment + depth arrays itself.
+    -- Encoding: 0.0 = threat at rim (imminent danger), ~1.0 = no threat (safe)
+    local player_abs_seg = ps.position & 0x0F
+    local is_open = (ls.level_type ~= 0x00)
+
+    -- Adjacent segments with open/closed topology awareness
+    local adj_left, adj_right
+    if is_open then
+        adj_left  = (player_abs_seg > 0)  and (player_abs_seg - 1) or -1
+        adj_right = (player_abs_seg < 15) and (player_abs_seg + 1) or -1
+    else
+        adj_left  = (player_abs_seg - 1) % 16
+        adj_right = (player_abs_seg + 1) % 16
+    end
+
+    -- Scan enemies + enemy shots for a lane, return min depth [1..255] or 255 (safe)
+    local function nearest_threat_in_lane(target_seg)
+        if target_seg < 0 then return 255 end  -- open-level edge: no lane exists → safe
+        local best = 255
+        for i = 1, 7 do
+            local d = es.enemy_depths[i]
+            if d > 0 and es.enemy_abs_segments[i] == target_seg and d < best then
+                best = d
+            end
+        end
+        for i = 1, 4 do
+            if es.enemy_shot_abs_segments[i] == target_seg then
+                local d = math.floor(es.shot_positions[i])
+                if d > 0 and d < best then best = d end
+            end
+        end
+        return best
+    end
+
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, nearest_threat_in_lane(player_abs_seg))
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, nearest_threat_in_lane(adj_left))
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, nearest_threat_in_lane(adj_right))
+
+    -- Total main payload size: 181
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)

@@ -601,6 +601,11 @@ class RainbowAgent:
             action_idx = int(max(0, min(NUM_JOINT - 1, int(action))))
         is_expert = 1 if actor == "expert" else 0
         pri = float(priority_reward) if priority_reward is not None else 0.0
+        # Ensure terminal transitions get a minimum priority floor
+        if done:
+            boost = float(getattr(RL_CONFIG, 'death_priority_boost', 0.0))
+            if boost > 0:
+                pri = max(abs(pri), boost) * (-1.0 if pri < 0 else 1.0)
         self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri)
 
     # ── Background training ─────────────────────────────────────────────

@@ -207,7 +207,9 @@ class SocketServer:
                     subj_r = float(frame.subjreward) * RL_CONFIG.subj_reward_scale
                     obj_r = float(frame.objreward) * RL_CONFIG.obj_reward_scale
                     total_r = obj_r + subj_r
-                    total_r = max(-RL_CONFIG.reward_clip, min(RL_CONFIG.reward_clip, total_r))
+                    # Use wider clip on terminal frames so death penalty passes through
+                    clip = RL_CONFIG.death_reward_clip if frame.done else RL_CONFIG.reward_clip
+                    total_r = max(-clip, min(clip, total_r))
 
                     if self.agent:
                         tag = cs.get("prev_action_source", "dqn")
