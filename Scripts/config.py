@@ -27,7 +27,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 178
+    params_count: int = 181
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -63,21 +63,25 @@ class RLConfigData:
     attn_dim: int = 64
 
     # Distributional C51
+    # Support scaled to match Rainbow's 20:1 ratio (support range / reward_clip).
+    # Old [-50,50] was 10:1 — too tight, causing Bellman target clipping on
+    # kill rewards above 245 points.  New [-100,100] eliminates clipping for
+    # kills under 490 pts and gives ~5× headroom for Q-value growth.
     use_distributional: bool = True
     num_atoms: int = 51
-    v_min: float = -50.0
-    v_max: float = 50.0
+    v_min: float = -100.0
+    v_max: float = 100.0
 
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 512
-    lr: float = 1e-5
-    lr_min: float = 1e-5
+    lr: float = 6.25e-5
+    lr_min: float = 6.25e-5              # Same as lr = fixed LR, no cosine restarts
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 100_000        # warm-restart period (steps) ~2h cycle
+    lr_cosine_period: int = 100_000        # (inert when lr == lr_min)
     gamma: float = 0.99
-    n_step: int = 5
+    n_step: int = 10                        # Doubled from 5 for wider death attribution window
 
     # Replay (PER with proportional priorities)
     memory_size: int = 2_000_000
@@ -120,6 +124,10 @@ class RLConfigData:
     obj_reward_scale: float = 0.01
     subj_reward_scale: float = 0.01
     reward_clip: float = 10.0
+    death_reward_clip: float = 100.0       # Separate clip for terminal frames — lets death penalty pass
+
+    # ── death attribution ───────────────────────────────────────────────
+    death_priority_boost: float = 10.0     # Minimum PER priority for terminal transitions
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
