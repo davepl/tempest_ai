@@ -124,7 +124,7 @@ class RLConfigData:
     obj_reward_scale: float = 0.01
     subj_reward_scale: float = 0.01
     reward_clip: float = 10.0
-    death_reward_clip: float = 100.0       # Separate clip for terminal frames — lets death penalty pass
+    death_reward_clip: float = 25.0        # 2.5× normal clip — death is special but doesn't crush C51 support
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 10.0     # Minimum PER priority for terminal transitions
