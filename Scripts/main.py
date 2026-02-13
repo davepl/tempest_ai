@@ -10,6 +10,7 @@ import torch
 
 from aimodel import RainbowAgent, KeyboardHandler, print_with_terminal_restore
 from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
+from metrics_dashboard import MetricsDashboard
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
 
@@ -213,6 +214,8 @@ def main():
 
     print_network_info(agent)
 
+    dashboard = None
+
     if os.path.exists(LATEST_MODEL_PATH):
         loaded = agent.load(LATEST_MODEL_PATH)
         if loaded:
@@ -221,6 +224,27 @@ def main():
             print("⚠ Model load failed/incompatible, starting fresh\n")
     else:
         print("⚠ No model found, starting fresh\n")
+
+    dashboard_enabled = os.getenv("TEMPEST_DASHBOARD", "1").strip().lower() not in {"0", "false", "off", "no"}
+    dashboard_open_browser = os.getenv("TEMPEST_DASHBOARD_BROWSER", "1").strip().lower() not in {"0", "false", "off", "no"}
+    try:
+        dashboard_port = int(os.getenv("TEMPEST_DASHBOARD_PORT", "8765"))
+    except Exception:
+        dashboard_port = 8765
+    if dashboard_enabled:
+        try:
+            dashboard = MetricsDashboard(
+                metrics_obj=metrics,
+                agent_obj=agent,
+                host="127.0.0.1",
+                port=dashboard_port,
+                open_browser=dashboard_open_browser,
+            )
+            dashboard_url = dashboard.start()
+            print(f"📊 Metrics dashboard: {dashboard_url}")
+        except Exception as e:
+            dashboard = None
+            print(f"⚠ Dashboard startup failed: {e}")
 
     server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, metrics)
     metrics.global_server = server
@@ -261,6 +285,11 @@ def main():
             pass
         try:
             srv_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            if dashboard:
+                dashboard.stop()
         except Exception:
             pass
         print("Shutdown complete")
