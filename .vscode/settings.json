@@ -2,5 +2,8 @@
     "cSpell.words": [
         "fuseballs",
         "maincpu"
-    ]
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "/usr/local/bin/python3": true
+    }
 }

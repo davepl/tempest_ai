@@ -794,6 +794,20 @@ function M.EnemiesState:new()
         self.fractional_enemy_segments_by_slot[i] = 0
     end
 
+    -- Velocity tracking (previous frame state for delta computation)
+    self.prev_enemy_abs_segments = {}
+    self.prev_enemy_depths = {}
+    self.prev_enemy_core_type = {}
+    self.enemy_delta_seg = {}
+    self.enemy_delta_depth = {}
+    for i = 1, 7 do
+        self.prev_enemy_abs_segments[i] = INVALID_SEGMENT
+        self.prev_enemy_depths[i] = 0
+        self.prev_enemy_core_type[i] = 0
+        self.enemy_delta_seg[i] = 0
+        self.enemy_delta_depth[i] = 0
+    end
+
     return self
 end
 
@@ -1006,6 +1020,41 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             if scaled_value < 0 then scaled_value = 0 end
             self.fractional_enemy_segments_by_slot[i] = scaled_value
         end
+    end
+
+    -- ── Velocity features (Δseg, Δdepth per enemy slot) ─────────────────
+    -- Only compute during active gameplay to avoid garbage across episode boundaries
+    if game_state.gamestate == 0x04 then
+        for i = 1, 7 do
+            if self.enemy_depths[i] > 0 and self.prev_enemy_depths[i] > 0
+               and self.enemy_core_type[i] == self.prev_enemy_core_type[i]
+               and self.enemy_abs_segments[i] ~= INVALID_SEGMENT
+               and self.prev_enemy_abs_segments[i] ~= INVALID_SEGMENT then
+                -- Segment delta (handle wrapping for closed levels)
+                local dseg = self.enemy_abs_segments[i] - self.prev_enemy_abs_segments[i]
+                if not is_open then
+                    if dseg > 8 then dseg = dseg - 16
+                    elseif dseg < -8 then dseg = dseg + 16 end
+                end
+                self.enemy_delta_seg[i] = dseg
+                -- Depth delta (negative = approaching player)
+                self.enemy_delta_depth[i] = self.enemy_depths[i] - self.prev_enemy_depths[i]
+            else
+                self.enemy_delta_seg[i] = 0
+                self.enemy_delta_depth[i] = 0
+            end
+        end
+    else
+        for i = 1, 7 do
+            self.enemy_delta_seg[i] = 0
+            self.enemy_delta_depth[i] = 0
+        end
+    end
+    -- Save current state for next frame's delta computation
+    for i = 1, 7 do
+        self.prev_enemy_abs_segments[i] = self.enemy_abs_segments[i]
+        self.prev_enemy_depths[i] = self.enemy_depths[i]
+        self.prev_enemy_core_type[i] = self.enemy_core_type[i]
     end
 
     -- === Calculate and store nearest enemy segment and engineered features ===
