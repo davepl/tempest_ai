@@ -30,6 +30,15 @@ try:
 except ImportError:
     from Scripts.config import RL_CONFIG
 
+try:
+    from metrics_display import get_dqn_window_averages
+except ImportError:
+    try:
+        from Scripts.metrics_display import get_dqn_window_averages
+    except ImportError:
+        def get_dqn_window_averages():
+            return 0.0, 0.0, 0.0
+
 
 def _tail_mean(values, count: int = 20) -> float:
     if not values:
@@ -63,7 +72,10 @@ class _DashboardState:
             expert_ratio = float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
             average_level = float(self.metrics.average_level + 1.0)
-            memory_buffer_k = int(self.metrics.memory_buffer_size // 1000)
+            memory_buffer_size = int(self.metrics.memory_buffer_size)
+            memory_buffer_k = int(memory_buffer_size // 1000)
+            buffer_capacity = int(max(1, getattr(RL_CONFIG, "memory_size", 1)))
+            memory_buffer_pct = max(0.0, min(100.0, (memory_buffer_size / buffer_capacity) * 100.0))
             total_training_steps = int(self.metrics.total_training_steps)
             last_loss = float(self.metrics.last_loss)
             last_grad_norm = float(self.metrics.last_grad_norm)
@@ -77,6 +89,11 @@ class _DashboardState:
             reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
             reward_subj = _tail_mean(self.metrics.subj_rewards) * inv_subj
             reward_obj = _tail_mean(self.metrics.obj_rewards) * inv_obj
+
+        try:
+            dqn1k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
+        except Exception:
+            dqn1k_raw = dqn1m_raw = dqn5m_raw = 0.0
 
         steps_per_sec = 0.0
         if self.last_steps is not None and self.last_steps_time is not None:
@@ -115,6 +132,7 @@ class _DashboardState:
             "client_count": client_count,
             "average_level": average_level,
             "memory_buffer_k": memory_buffer_k,
+            "memory_buffer_pct": memory_buffer_pct,
             "loss": last_loss,
             "grad_norm": last_grad_norm,
             "bc_loss": last_bc_loss,
@@ -123,6 +141,9 @@ class _DashboardState:
             "reward_dqn": reward_dqn,
             "reward_subj": reward_subj,
             "reward_obj": reward_obj,
+            "dqn_1k": float(dqn1k_raw) * inv_obj,
+            "dqn_1m": float(dqn1m_raw) * inv_obj,
+            "dqn_5m": float(dqn5m_raw) * inv_obj,
             "training_enabled": training_enabled,
             "override_expert": override_expert,
             "override_epsilon": override_epsilon,
@@ -255,7 +276,7 @@ def _render_dashboard_html() -> str:
       letter-spacing: 0.2px;
     }
     .gauge-card {
-      grid-column: span 2;
+      grid-column: span 1;
       grid-row: span 2;
       min-height: 188px;
       padding: 12px;
@@ -272,7 +293,7 @@ def _render_dashboard_html() -> str:
       display: inline-flex;
       align-items: baseline;
       gap: 6px;
-      font-size: 34px;
+      font-size: 30px;
       line-height: 1;
       font-weight: 700;
       letter-spacing: 0.3px;
@@ -345,7 +366,7 @@ def _render_dashboard_html() -> str:
     }
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
-      .gauge-card { grid-column: span 2; grid-row: span 1; min-height: 180px; }
+      .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 188px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
@@ -368,21 +389,28 @@ def _render_dashboard_html() -> str:
     <section class="cards">
       <article class="card gauge-card">
         <div class="gauge-head">
-          <div class="label">FPS Speedometer</div>
+          <div class="label">FPS SPD</div>
           <div class="gauge-readout"><span id="mFps">0.0</span><small>fps</small></div>
         </div>
         <canvas id="cFpsGauge" class="gauge-canvas"></canvas>
-        <div class="gauge-foot"><span>Redline 1000</span><span>Max 1200</span></div>
+        <div class="gauge-foot"><span>RL 1K</span><span>MX 1.2K</span></div>
+      </article>
+      <article class="card gauge-card">
+        <div class="gauge-head">
+          <div class="label">STEP SPD</div>
+          <div class="gauge-readout"><span id="mSteps">0.0</span><small>s/s</small></div>
+        </div>
+        <canvas id="cStepGauge" class="gauge-canvas"></canvas>
+        <div class="gauge-foot"><span>R10 Y20</span><span>G30</span></div>
       </article>
       <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
-      <article class="card"><div class="label">Steps/Sec</div><div class="value" id="mSteps">0</div></article>
       <article class="card"><div class="label">Clients</div><div class="value" id="mClients">0</div></article>
       <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
       <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
       <article class="card"><div class="label">Avg Reward</div><div class="value" id="mRwrd">0</div></article>
       <article class="card"><div class="label">Loss</div><div class="value" id="mLoss">0</div></article>
       <article class="card"><div class="label">Grad Norm</div><div class="value" id="mGrad">0</div></article>
-      <article class="card"><div class="label">Buffer</div><div class="value" id="mBuf">0k</div></article>
+      <article class="card"><div class="label">Buffer</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card"><div class="label">LR</div><div class="value" id="mLr">-</div></article>
       <article class="card"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
     </section>
@@ -392,7 +420,7 @@ def _render_dashboard_html() -> str:
         <h2>Throughput</h2>
         <div class="legend">
           <span><span class="sw" style="background:#22d3ee;"></span>FPS</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>Training Steps/Sec</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
         </div>
         <canvas id="cThroughput"></canvas>
       </article>
@@ -419,13 +447,13 @@ def _render_dashboard_html() -> str:
       </article>
 
       <article class="panel">
-        <h2>Policy & Exploration</h2>
+        <h2>DQN Rolling</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#22d3ee;"></span>Epsilon %</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>Expert %</span>
-          <span><span class="sw" style="background:#34d399;"></span>Level</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>DQN1K</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>DQN1M</span>
+          <span><span class="sw" style="background:#34d399;"></span>DQN5M</span>
         </div>
-        <canvas id="cPolicy"></canvas>
+        <canvas id="cDqn"></canvas>
       </article>
     </section>
   </main>
@@ -436,6 +464,8 @@ def _render_dashboard_html() -> str:
     const GAUGE_MIN_FPS = 0;
     const GAUGE_MAX_FPS = 1200;
     const GAUGE_REDLINE_FPS = 1000;
+    const GAUGE_MIN_STEPS = 0;
+    const GAUGE_MAX_STEPS = 30;
     let failedPings = 0;
 
     const cards = {
@@ -453,6 +483,7 @@ def _render_dashboard_html() -> str:
       q: document.getElementById("mQ"),
     };
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
+    const stepGaugeCanvas = document.getElementById("cStepGauge");
 
     const charts = {
       throughput: {
@@ -461,12 +492,12 @@ def _render_dashboard_html() -> str:
           {
             key: "fps",
             color: "#22d3ee",
-            axis: { side: "left", min: 0, max: 1200, ticks: [0, 300, 600, 900, 1200], label: "FPS" }
+            axis: { side: "left", min: 0, max: 1200, ticks: [0, 300, 600, 900, 1200] }
           },
           {
             key: "steps_per_sec",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50], label: "STEPS/S" }
+            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] }
           }
         ]
       },
@@ -476,7 +507,10 @@ def _render_dashboard_html() -> str:
           {
             key: "reward_total",
             color: "#22d3ee",
-            axis: { side: "left", label: "TOTAL" }
+            axis: {
+              side: "left",
+              group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
+            }
           },
           { key: "reward_dqn", color: "#f59e0b", axis_ref: "reward_total" },
           { key: "reward_obj", color: "#34d399", axis_ref: "reward_total" },
@@ -486,17 +520,25 @@ def _render_dashboard_html() -> str:
       learning: {
         canvas: document.getElementById("cLearning"),
         series: [
-          { key: "loss", color: "#22d3ee" },
-          { key: "grad_norm", color: "#f59e0b" },
-          { key: "bc_loss", color: "#34d399" }
+          {
+            key: "loss",
+            color: "#22d3ee",
+            axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"] },
+          },
+          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss" },
+          { key: "bc_loss", color: "#34d399", axis_ref: "loss" }
         ]
       },
-      policy: {
-        canvas: document.getElementById("cPolicy"),
+      dqn: {
+        canvas: document.getElementById("cDqn"),
         series: [
-          { key: "epsilon", color: "#22d3ee", map: (v) => (v ?? 0) * 100.0 },
-          { key: "expert_ratio", color: "#f59e0b", map: (v) => (v ?? 0) * 100.0 },
-          { key: "average_level", color: "#34d399" }
+          {
+            key: "dqn_1k",
+            color: "#22d3ee",
+            axis: { side: "left", group_keys: ["dqn_1k", "dqn_1m", "dqn_5m"] },
+          },
+          { key: "dqn_1m", color: "#f59e0b", axis_ref: "dqn_1k" },
+          { key: "dqn_5m", color: "#34d399", axis_ref: "dqn_1k" }
         ]
       }
     };
@@ -628,6 +670,106 @@ def _render_dashboard_html() -> str:
       ctx.fill();
     }
 
+    function drawStepGauge(canvas, stepsPerSec) {
+      if (!canvas) return;
+
+      const width = canvas.clientWidth || 360;
+      const height = canvas.clientHeight || 160;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      const cx = width * 0.5;
+      const cy = height * 0.68;
+      const radius = Math.max(44, Math.min(width * 0.30, height * 0.56));
+
+      const startDeg = 150;
+      const spanDeg = 240;
+      const degToRad = (d) => (d * Math.PI) / 180.0;
+      const clampSteps = (v) => Math.max(GAUGE_MIN_STEPS, Math.min(GAUGE_MAX_STEPS, Number(v) || 0));
+      const valToAngle = (v) => {
+        const t = (clampSteps(v) - GAUGE_MIN_STEPS) / (GAUGE_MAX_STEPS - GAUGE_MIN_STEPS);
+        return degToRad(startDeg + spanDeg * t);
+      };
+
+      const trackW = Math.max(9, radius * 0.11);
+      ctx.lineCap = "round";
+
+      // Zone arcs: red [0,10], yellow (10,20], green (20,30].
+      ctx.lineWidth = trackW + 1.0;
+      ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, valToAngle(0), valToAngle(10), false);
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(245, 158, 11, 0.95)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, valToAngle(10), valToAngle(20), false);
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, valToAngle(20), valToAngle(30), false);
+      ctx.stroke();
+
+      // Tick marks (major each 10, minor each 5)
+      for (let v = GAUGE_MIN_STEPS; v <= GAUGE_MAX_STEPS; v += 5) {
+        const isMajor = (v % 10) === 0;
+        const a = valToAngle(v);
+        const cosA = Math.cos(a);
+        const sinA = Math.sin(a);
+
+        const outer = radius + trackW * 0.38;
+        const inner = outer - (isMajor ? trackW * 1.6 : trackW * 0.95);
+
+        let tickColor = "rgba(239, 68, 68, 0.95)";
+        if (v > 10 && v <= 20) tickColor = "rgba(245, 158, 11, 0.95)";
+        else if (v > 20) tickColor = "rgba(34, 197, 94, 0.95)";
+
+        ctx.strokeStyle = tickColor;
+        ctx.lineWidth = isMajor ? 3.0 : 1.8;
+        ctx.beginPath();
+        ctx.moveTo(cx + outer * cosA, cy + outer * sinA);
+        ctx.lineTo(cx + inner * cosA, cy + inner * sinA);
+        ctx.stroke();
+      }
+
+      // Needle
+      const needleAngle = valToAngle(stepsPerSec);
+      const nCos = Math.cos(needleAngle);
+      const nSin = Math.sin(needleAngle);
+      const needleLen = radius * 0.98;
+
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+      ctx.lineWidth = 7.5;
+      ctx.beginPath();
+      ctx.moveTo(cx + 3, cy + 3);
+      ctx.lineTo(cx + needleLen * nCos + 3, cy + needleLen * nSin + 3);
+      ctx.stroke();
+
+      ctx.strokeStyle = "#e2e8f0";
+      ctx.lineWidth = 6.0;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + needleLen * nCos, cy + needleLen * nSin);
+      ctx.stroke();
+
+      // Hub
+      ctx.fillStyle = "rgba(2, 6, 23, 0.95)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 14, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "rgba(100, 116, 139, 0.82)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
     function drawChart(canvas, history, seriesDefs) {
       const points = history.slice(-maxPoints);
       const width = canvas.clientWidth || 320;
@@ -643,11 +785,11 @@ def _render_dashboard_html() -> str:
       if (!points.length) return;
 
       const axisDefs = seriesDefs.filter((s) => !!s.axis);
-      const axisDefCount = axisDefs.length ? axisDefs.length : 1;
-      const leftAxisCount = Math.max(1, axisDefs.filter((s) => (s.axis?.side || "left") === "left").length || (axisDefCount ? 0 : 1));
-      const rightAxisCount = Math.max(1, axisDefs.filter((s) => (s.axis?.side || "right") === "right").length || 0);
+      const axisSourceSeries = axisDefs.length ? axisDefs : seriesDefs;
+      const leftAxisCount = Math.max(1, axisSourceSeries.filter((s) => (s.axis?.side || "left") === "left").length);
+      const rightAxisCount = Math.max(0, axisSourceSeries.filter((s) => (s.axis?.side || "right") === "right").length);
       const padL = 26 + (leftAxisCount * 34);
-      const padR = 26 + (rightAxisCount * 34);
+      const padR = 26 + (Math.max(1, rightAxisCount) * 34);
       const padT = 10, padB = 18;
       const plotW = width - padL - padR;
       const plotH = height - padT - padB;
@@ -693,17 +835,30 @@ def _render_dashboard_html() -> str:
         return padL + (xn * plotW);
       };
 
+      const seriesByKey = new Map(seriesDefs.map((s) => [s.key, s]));
+      const seriesValue = (row, key) => {
+        const spec = seriesByKey.get(key);
+        const raw = row[key];
+        const val = spec && spec.map ? spec.map(raw) : raw;
+        return Number(val);
+      };
+
       const axes = [];
       let leftUsed = 0;
       let rightUsed = 0;
-      const axisSourceSeries = axisDefs.length ? axisDefs : [seriesDefs[0]];
       for (const s of axisSourceSeries) {
         const side = s.axis?.side === "right" ? "right" : "left";
+        const sourceKeys = Array.isArray(s.axis?.group_keys) && s.axis.group_keys.length
+          ? s.axis.group_keys
+          : [s.key];
         const values = [];
         for (const row of points) {
-          const raw = row[s.key];
-          const val = s.map ? s.map(raw) : raw;
-          if (typeof val === "number" && Number.isFinite(val)) values.push(val);
+          for (const key of sourceKeys) {
+            const val = seriesValue(row, key);
+            if (Number.isFinite(val)) {
+              values.push(val);
+            }
+          }
         }
 
         let minV = Number.isFinite(s.axis?.min) ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
@@ -733,7 +888,6 @@ def _render_dashboard_html() -> str:
           min: minV,
           max: maxV,
           ticks,
-          label: s.axis?.label || s.key,
         });
       }
       if (!axes.length) return;
@@ -805,9 +959,6 @@ def _render_dashboard_html() -> str:
           ctx.fillText(labelText, axis.x - tickDir * 12, y);
         }
 
-        ctx.fillStyle = axis.color;
-        ctx.textAlign = isLeft ? "right" : "left";
-        ctx.fillText(axis.label, axis.x - tickDir * 12, padT + 8);
       }
 
       const n = points.length;
@@ -821,8 +972,7 @@ def _render_dashboard_html() -> str:
         ctx.beginPath();
         let started = false;
         for (let i = 0; i < n; i++) {
-          const raw = points[i][s.key];
-          const val = s.map ? s.map(raw) : raw;
+          const val = seriesValue(points[i], s.key);
           if (!Number.isFinite(val)) continue;
           const x = xAt(i);
           const y = yAt(axis, Number(val));
@@ -847,7 +997,7 @@ def _render_dashboard_html() -> str:
       cards.rwrd.textContent = fmtInt(now.reward_total);
       cards.loss.textContent = fmtFloat(now.loss, 4);
       cards.grad.textContent = fmtFloat(now.grad_norm, 3);
-      cards.buf.textContent = `${fmtInt(now.memory_buffer_k)}k`;
+      cards.buf.textContent = `${fmtInt(now.memory_buffer_k)}k (${fmtInt(now.memory_buffer_pct)}%)`;
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
       cards.q.textContent = (now.q_min === null || now.q_max === null)
         ? "-"
@@ -859,10 +1009,11 @@ def _render_dashboard_html() -> str:
       const history = payload.history || [];
       updateCards(payload.now);
       drawFpsGauge(fpsGaugeCanvas, payload.now.fps);
+      drawStepGauge(stepGaugeCanvas, payload.now.steps_per_sec);
       drawChart(charts.throughput.canvas, history, charts.throughput.series);
       drawChart(charts.rewards.canvas, history, charts.rewards.series);
       drawChart(charts.learning.canvas, history, charts.learning.series);
-      drawChart(charts.policy.canvas, history, charts.policy.series);
+      drawChart(charts.dqn.canvas, history, charts.dqn.series);
     }
 
     async function fetchMetrics() {
