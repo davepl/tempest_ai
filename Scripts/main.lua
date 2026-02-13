@@ -472,7 +472,17 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, nearest_threat_in_lane(adj_left))
     num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, nearest_threat_in_lane(adj_right))
 
-    -- Total main payload size: 181
+    -- ── Enemy Velocity Features (14) ─────────────────────────────────
+    -- Per-slot segment delta and depth delta from previous frame.
+    -- Gives the network direct velocity signals for each enemy.
+    for i = 1, 7 do
+        num_values_packed = num_values_packed + push_signed_norm(binary_data_parts, es.enemy_delta_seg[i], 8, "enemy_delta_seg")
+    end
+    for i = 1, 7 do
+        num_values_packed = num_values_packed + push_signed_norm(binary_data_parts, es.enemy_delta_depth[i], 128, "enemy_delta_depth")
+    end
+
+    -- Total main payload size: 195
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
