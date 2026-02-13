@@ -1,5 +1,19 @@
 This is a system that uses LUA script within Mame and a Python script to operate as a Reinforcement Learning system for Tempest.
 
+Dashboard
+---------
+
+The Python app now starts a local live metrics dashboard automatically (Grafana-style cards/charts) while the app is running.
+
+- Default URL: `http://127.0.0.1:8765` (auto-opens in a browser window)
+- The dashboard process is tied to the Python app lifecycle and is stopped during Python shutdown.
+
+Environment flags:
+
+- `TEMPEST_DASHBOARD=0` disables dashboard startup.
+- `TEMPEST_DASHBOARD_BROWSER=0` keeps the dashboard server running but does not auto-open a browser.
+- `TEMPEST_DASHBOARD_PORT=8770` chooses a preferred starting port (auto-increments if busy).
+
 The system is comprised of N clients of MAME, each running a custom startup script called 'main.lua' which registers a frame callback.  Each time a frame is generated in the Tempest game, the frame callback inspects the game memory to extract on the order of 175 parameters about the game state.  Only things visible to a human player are considered.  Those parameters are flattened to a floating point array and passed over a standard socket to the python application.  The python application returns the action the player should take in this instance.  Those recommendations are applied to the game's control input, and operation proceeds to the next frame.
 
 On the python side, a socket server receives requests from the LUA clients across the socket interface each time a packet of state+reward+etc data is received.  That data is placed in a training queue and added to a replay buffer of on the order of 2M frames.  
@@ -49,4 +63,3 @@ Now at 5M frames it was hunting effectively
 
 May 18-25:
 With smaller model and enemy avoidance rewards, makes it to yellow on a couple of players by 25M frames (Start 15)
-
