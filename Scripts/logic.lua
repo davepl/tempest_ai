@@ -43,7 +43,7 @@ local M = {} -- Module table
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
 
-local DEATH_PENALTY = 10000          -- Edge-triggered penalty when dying (≈ value of one life)
+local DEATH_PENALTY = 1000           -- Edge-triggered penalty when dying (same clip as normal rewards)
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats

@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import sys, time, math
+import sys, time, math, threading
 import numpy as np
 from collections import deque
 
@@ -18,6 +18,10 @@ from config import metrics, IS_INTERACTIVE, RL_CONFIG
 row_counter = 0
 
 # Rolling DQN reward windows
+DQN1K_FRAMES = 1_000
+_dqn1k = deque()
+_dqn1k_frames = 0
+
 DQN1M_FRAMES = 1_000_000
 _dqn1m = deque()
 _dqn1m_frames = 0
@@ -26,33 +30,54 @@ DQN5M_FRAMES = 5_000_000
 _dqn5m = deque()
 _dqn5m_frames = 0
 
+_dqn_windows_lock = threading.Lock()
+
+
+def add_episode_to_dqn1k_window(dqn_reward: float, ep_len: int):
+    global _dqn1k_frames
+    if ep_len <= 0:
+        return
+    with _dqn_windows_lock:
+        _dqn1k.append((float(dqn_reward), int(ep_len)))
+        _dqn1k_frames += ep_len
+        while _dqn1k and _dqn1k_frames > DQN1K_FRAMES:
+            _, l = _dqn1k.popleft()
+            _dqn1k_frames -= l
+
 
 def add_episode_to_dqn1m_window(dqn_reward: float, ep_len: int):
     global _dqn1m_frames
     if ep_len <= 0:
         return
-    _dqn1m.append((float(dqn_reward), int(ep_len)))
-    _dqn1m_frames += ep_len
-    while _dqn1m and _dqn1m_frames > DQN1M_FRAMES:
-        _, l = _dqn1m.popleft()
-        _dqn1m_frames -= l
+    with _dqn_windows_lock:
+        _dqn1m.append((float(dqn_reward), int(ep_len)))
+        _dqn1m_frames += ep_len
+        while _dqn1m and _dqn1m_frames > DQN1M_FRAMES:
+            _, l = _dqn1m.popleft()
+            _dqn1m_frames -= l
 
 
 def add_episode_to_dqn5m_window(dqn_reward: float, ep_len: int):
     global _dqn5m_frames
     if ep_len <= 0:
         return
-    _dqn5m.append((float(dqn_reward), int(ep_len)))
-    _dqn5m_frames += ep_len
-    while _dqn5m and _dqn5m_frames > DQN5M_FRAMES:
-        _, l = _dqn5m.popleft()
-        _dqn5m_frames -= l
+    with _dqn_windows_lock:
+        _dqn5m.append((float(dqn_reward), int(ep_len)))
+        _dqn5m_frames += ep_len
+        while _dqn5m and _dqn5m_frames > DQN5M_FRAMES:
+            _, l = _dqn5m.popleft()
+            _dqn5m_frames -= l
 
 
 def _avg_window(win):
     if not win:
         return 0.0
     return sum(r for r, _ in win) / len(win)
+
+
+def get_dqn_window_averages() -> tuple[float, float, float]:
+    with _dqn_windows_lock:
+        return _avg_window(_dqn1k), _avg_window(_dqn1m), _avg_window(_dqn5m)
 
 
 def clear_screen():
@@ -171,8 +196,7 @@ def display_metrics_row(agent, kb_handler):
     display_level = metrics.average_level + 1.0
 
     # ── DQN windows ─────────────────────────────────────────────────────
-    dqn1m = _avg_window(_dqn1m)
-    dqn5m = _avg_window(_dqn5m)
+    _, dqn1m, dqn5m = get_dqn_window_averages()
 
     # ── Q range ─────────────────────────────────────────────────────────
     q_range = "N/A"
@@ -180,8 +204,7 @@ def display_metrics_row(agent, kb_handler):
         try:
             mn, mx = agent.get_q_value_range()
             if not (np.isnan(mn) or np.isnan(mx)):
-                inv = 1.0 / max(1e-9, RL_CONFIG.obj_reward_scale)
-                q_range = f"[{mn*inv:.1f},{mx*inv:.1f}]"
+                q_range = f"[{mn:.1f},{mx:.1f}]"
         except Exception:
             q_range = "err"
 
