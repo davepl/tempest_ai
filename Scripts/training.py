@@ -51,6 +51,22 @@ def train_step(agent, prefetched_batch=None) -> float | None:
     if len(agent.memory) < max(RL_CONFIG.min_replay_to_train, RL_CONFIG.batch_size):
         return None
 
+    # Keep replay pressure bounded so optimization does not outrun data refresh.
+    try:
+        with metrics.lock:
+            frame_count = int(metrics.frame_count)
+            loaded_frame_count = int(getattr(metrics, "loaded_frame_count", 0))
+        loaded_training_steps = int(getattr(agent, "loaded_training_steps", 0))
+        max_spf = float(getattr(RL_CONFIG, "max_samples_per_frame", 0.0))
+        if max_spf > 0.0 and frame_count > 0:
+            recent_frames = max(1, frame_count - loaded_frame_count)
+            recent_steps = max(0, int(agent.training_steps) - loaded_training_steps)
+            sampled_per_frame = (float(recent_steps) * float(RL_CONFIG.batch_size)) / float(recent_frames)
+            if sampled_per_frame >= max_spf:
+                return None
+    except Exception:
+        pass
+
     # ── Sample ──────────────────────────────────────────────────────────
     beta = _beta_schedule(metrics.frame_count)
     batch = prefetched_batch if prefetched_batch is not None else agent.memory.sample(RL_CONFIG.batch_size, beta=beta)

@@ -616,6 +616,7 @@ class RainbowAgent:
 
         # Counters and locks (must be created before _sync_inference)
         self.training_steps = 0
+        self.loaded_training_steps = 0
         self.last_inference_sync = 0
         self._sync_lock = threading.Lock()
         self.training_enabled = True
@@ -667,8 +668,13 @@ class RainbowAgent:
         step = self.training_steps
         if step < cfg.lr_warmup_steps:
             return cfg.lr * (step + 1) / max(1, cfg.lr_warmup_steps)
-        t = (step - cfg.lr_warmup_steps) % max(1, cfg.lr_cosine_period)   # warm-restart
-        cosine = 0.5 * (1.0 + math.cos(math.pi * t / max(1, cfg.lr_cosine_period)))
+        decay_horizon = max(1, cfg.lr_cosine_period)
+        if bool(getattr(cfg, "lr_use_restarts", False)):
+            t = (step - cfg.lr_warmup_steps) % decay_horizon
+        else:
+            # Monotonic cosine decay: reach lr_min, then stay there.
+            t = min(step - cfg.lr_warmup_steps, decay_horizon)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * t / decay_horizon))
         return cfg.lr_min + (cfg.lr - cfg.lr_min) * cosine
 
     def _update_lr(self):
@@ -851,6 +857,7 @@ class RainbowAgent:
                     print(f"Optimizer state skipped: {e}")
 
             self.training_steps = ckpt.get("training_steps", 0)
+            self.loaded_training_steps = self.training_steps
             self._sync_inference(force=True)
 
             if m1 or u1 or m2 or u2:

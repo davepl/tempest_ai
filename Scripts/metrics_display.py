@@ -18,9 +18,9 @@ from config import metrics, IS_INTERACTIVE, RL_CONFIG
 row_counter = 0
 
 # Rolling DQN reward windows
-DQN1K_FRAMES = 1_000
-_dqn1k = deque()
-_dqn1k_frames = 0
+DQN100K_FRAMES = 100_000
+_dqn100k = deque()
+_dqn100k_frames = 0
 
 DQN1M_FRAMES = 1_000_000
 _dqn1m = deque()
@@ -33,16 +33,26 @@ _dqn5m_frames = 0
 _dqn_windows_lock = threading.Lock()
 
 
-def add_episode_to_dqn1k_window(dqn_reward: float, ep_len: int):
-    global _dqn1k_frames
+def add_episode_to_dqn100k_window(dqn_reward: float, ep_len: int):
+    global _dqn100k_frames
     if ep_len <= 0:
         return
     with _dqn_windows_lock:
-        _dqn1k.append((float(dqn_reward), int(ep_len)))
-        _dqn1k_frames += ep_len
-        while _dqn1k and _dqn1k_frames > DQN1K_FRAMES:
-            _, l = _dqn1k.popleft()
-            _dqn1k_frames -= l
+        _dqn100k.append((float(dqn_reward), int(ep_len)))
+        _dqn100k_frames += ep_len
+        while _dqn100k and _dqn100k_frames > DQN100K_FRAMES:
+            _, l = _dqn100k.popleft()
+            _dqn100k_frames -= l
+
+
+def add_episode_to_dqn25k_window(dqn_reward: float, ep_len: int):
+    # Backward-compat alias for older callers.
+    add_episode_to_dqn100k_window(dqn_reward, ep_len)
+
+
+def add_episode_to_dqn1k_window(dqn_reward: float, ep_len: int):
+    # Backward-compat alias for very old callers.
+    add_episode_to_dqn100k_window(dqn_reward, ep_len)
 
 
 def add_episode_to_dqn1m_window(dqn_reward: float, ep_len: int):
@@ -77,7 +87,7 @@ def _avg_window(win):
 
 def get_dqn_window_averages() -> tuple[float, float, float]:
     with _dqn_windows_lock:
-        return _avg_window(_dqn1k), _avg_window(_dqn1m), _avg_window(_dqn5m)
+        return _avg_window(_dqn100k), _avg_window(_dqn1m), _avg_window(_dqn5m)
 
 
 def clear_screen():
@@ -103,11 +113,11 @@ def display_metrics_header():
     row_counter = 0
     hdr = (
         f"{'Frame':>11} {'FPS':>7} {'Epsi':>7} {'Xprt':>7} "
-        f"{'Rwrd':>9} {'Subj':>9} {'Obj':>9} {'DQN':>9} {'DQN1M':>9} {'DQN5M':>9} "
+        f"{'Rwrd':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
         f"{'Loss':>10} {'Agree%':>7} "
         f"{'EpLen':>8} {'BCLoss':>8} "
         f"{'Clnt':>4} {'Levl':>5} "
-        f"{'AvgInf':>7} {'Steps/s':>8} {'GrNorm':>8} {'Q-Range':>14} {'Mem':>10} {'LR':>9}"
+        f"{'AvgInf':>7} {'Steps/s':>8} {'Rpl/F':>7} {'GrNorm':>8} {'Q-Range':>14} {'Mem':>10} {'LR':>9}"
     )
     _print_line(hdr, is_header=True)
     try:
@@ -125,16 +135,10 @@ def display_metrics_row(agent, kb_handler):
         display_metrics_header()
 
     # ── Interval averages ───────────────────────────────────────────────
-    mean_reward = mean_subj = mean_obj = mean_dqn = 0.0
+    mean_reward = 0.0
     with metrics.lock:
         if metrics.reward_count_interval > 0:
             mean_reward = metrics.reward_sum_interval / max(1, metrics.reward_count_interval)
-        if metrics.reward_count_interval_dqn > 0:
-            mean_dqn = metrics.reward_sum_interval_dqn / max(1, metrics.reward_count_interval_dqn)
-        if metrics.reward_count_interval_subj > 0:
-            mean_subj = metrics.reward_sum_interval_subj / max(1, metrics.reward_count_interval_subj)
-        if metrics.reward_count_interval_obj > 0:
-            mean_obj = metrics.reward_sum_interval_obj / max(1, metrics.reward_count_interval_obj)
         # Reset
         metrics.reward_sum_interval = metrics.reward_count_interval = 0
         metrics.reward_sum_interval_dqn = metrics.reward_count_interval_dqn = 0
@@ -142,18 +146,11 @@ def display_metrics_row(agent, kb_handler):
         metrics.reward_sum_interval_obj = metrics.reward_count_interval_obj = 0
 
     # Fallback to deque
-    if mean_reward == 0.0 and mean_dqn == 0.0:
+    if mean_reward == 0.0:
         try:
             n = min(len(metrics.episode_rewards), len(metrics.dqn_rewards), 20)
             if n > 0:
                 mean_reward = sum(list(metrics.episode_rewards)[-n:]) / n
-                mean_dqn = sum(list(metrics.dqn_rewards)[-n:]) / n
-                s = list(metrics.subj_rewards) if metrics.subj_rewards else []
-                o = list(metrics.obj_rewards) if metrics.obj_rewards else []
-                if s:
-                    mean_subj = sum(s[-n:]) / min(n, len(s))
-                if o:
-                    mean_obj = sum(o[-n:]) / min(n, len(o))
         except Exception:
             pass
 
@@ -196,7 +193,7 @@ def display_metrics_row(agent, kb_handler):
     display_level = metrics.average_level + 1.0
 
     # ── DQN windows ─────────────────────────────────────────────────────
-    _, dqn1m, dqn5m = get_dqn_window_averages()
+    dqn100k, dqn1m, dqn5m = get_dqn_window_averages()
 
     # ── Q range ─────────────────────────────────────────────────────────
     q_range = "N/A"
@@ -221,7 +218,6 @@ def display_metrics_row(agent, kb_handler):
 
     # ── Reward scaling for display ──────────────────────────────────────
     inv = 1.0 / max(1e-9, RL_CONFIG.obj_reward_scale)
-    inv_s = 1.0 / max(1e-9, RL_CONFIG.subj_reward_scale)
 
     def _fr(v, w=9):
         try:
@@ -231,15 +227,16 @@ def display_metrics_row(agent, kb_handler):
 
     eps_pct = f"{metrics.get_effective_epsilon()*100:.0f}%".rjust(7)
     xprt_pct = f"{metrics.get_expert_ratio()*100:.0f}%".rjust(7)
+    replay_ratio = (steps_per_sec * float(RL_CONFIG.batch_size)) / max(1e-6, float(metrics.fps))
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_pct} {xprt_pct} "
-        f"{_fr(mean_reward*inv)} {_fr(mean_subj*inv_s)} {_fr(mean_obj*inv)} {_fr(mean_dqn*inv)} "
+        f"{_fr(mean_reward*inv)} {_fr(dqn100k*inv)} "
         f"{_fr(dqn1m*inv)} {_fr(dqn5m*inv)} "
         f"{loss_avg:>10.6f} {agree_avg*100:>6.1f}% "
         f"{avg_ep_len:>8.1f} {metrics.last_bc_loss:>8.4f} "
         f"{metrics.client_count:>4} {display_level:>5.1f} "
         f"{avg_inf_ms:>7.2f} {steps_per_sec:>8.1f} "
-        f"{metrics.last_grad_norm:>8.3f} {q_range:>14} {mem_k:>8}k {lr_str:>9}"
+        f"{replay_ratio:>7.2f} {metrics.last_grad_norm:>8.3f} {q_range:>14} {mem_k:>8}k {lr_str:>9}"
     )
     _print_line(row)
