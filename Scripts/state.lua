@@ -17,6 +17,9 @@ local ENEMY_TYPE_TANKER   = 2
 local ENEMY_TYPE_SPIKER   = 3
 local ENEMY_TYPE_FUSEBALL = 4
 local ENEMY_TYPE_MASK = 0x07 -- <<< ADDED THIS DEFINITION (%00000111)
+local TOP_RAIL_AVOID_DEPTH = 0x60
+local TOP_RAIL_ABSENT = 255
+M.TOP_RAIL_ABSENT = TOP_RAIL_ABSENT
 
 -- Helper function for BCD conversion (local to this module)
 local function bcd_to_decimal(bcd)
@@ -33,6 +36,59 @@ local find_target_segment
 local find_forbidden_segments
 local find_nearest_safe_segment
 
+-- Tempest segment-angle helper mirroring get_angle ($9ee6):
+-- - direction bit set   (segment increasing): angle = tube_angle[(seg-1)&0x0f] + 8
+-- - direction bit clear (segment decreasing): angle = tube_angle[seg]
+local function get_tempest_segment_angle_nibble(level_angles, seg_abs, seg_increasing)
+    local seg = (tonumber(seg_abs) or 0) & 0x0F
+    local lane_angle = 0
+    if seg_increasing == 1 then
+        local prev_seg = (seg - 1) & 0x0F
+        lane_angle = (tonumber(level_angles[prev_seg]) or 0)
+        return (lane_angle + 8) & 0x0F
+    end
+    lane_angle = (tonumber(level_angles[seg]) or 0)
+    return lane_angle & 0x0F
+end
+
+-- Convert more_enemy_info low nibble into 0..1 progress along a between-segment move.
+-- This follows PC_ContFinishFlip ($9d8a) semantics instead of treating nibble as linear /16.
+local function compute_between_progress(level_angles, seg_abs, seg_increasing, angle_nibble)
+    local start_angle = get_tempest_segment_angle_nibble(level_angles, seg_abs, seg_increasing)
+    local target_angle = get_tempest_segment_angle_nibble(level_angles, seg_abs, (seg_increasing == 1) and 0 or 1)
+    local current_angle = (tonumber(angle_nibble) or 0) & 0x0F
+
+    local traveled = 0
+    local total = 0
+    if seg_increasing == 1 then
+        -- Increasing segment: nibble decrements each tick while flipping.
+        traveled = (start_angle - current_angle) & 0x0F
+        total = (start_angle - target_angle) & 0x0F
+    else
+        -- Decreasing segment: nibble increments each tick while flipping.
+        traveled = (current_angle - start_angle) & 0x0F
+        total = (target_angle - start_angle) & 0x0F
+    end
+
+    if total <= 0 then
+        return 0.0
+    end
+    local progress = traveled / total
+    if progress < 0.0 then
+        progress = 0.0
+    elseif progress > 1.0 then
+        progress = 1.0
+    end
+    return progress
+end
+
+local function wrap_closed_relative_segment(rel_float)
+    local v = rel_float
+    while v > 8.0 do v = v - 16.0 end
+    while v < -8.0 do v = v + 16.0 end
+    return v
+end
+
 -- ====================
 -- Helper Functions (Internal to this State Module)
 -- ====================
@@ -40,8 +96,9 @@ local find_nearest_safe_segment
 -- NEW Helper: Identify forbidden segments
 find_forbidden_segments = function(enemies_state, level_state, player_state)
     local forbidden = {} -- Use a table as a set (keys are forbidden segments 0-15)
-    local is_pulsing = enemies_state.pulsing ~= 0
-    -- print(string.format("FIND_FORBIDDEN: Pulsing active = %s", tostring(is_pulsing))) -- DEBUG
+    -- Assembly: pulsing bit 7 CLEAR ($01-$7F) = dangerous, bit 7 SET ($80-$FF) = safe, 0 = inactive
+    local is_pulsing = (enemies_state.pulsing > 0 and enemies_state.pulsing < 0x80)
+    -- print(string.format("FIND_FORBIDDEN: Pulsing active = %s (raw=0x%02X)", tostring(is_pulsing), enemies_state.pulsing)) -- DEBUG
 
     -- Check enemies
     for i = 1, 7 do
@@ -55,9 +112,9 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
                 -- print(string.format("  -> FORBIDDEN (Pulsing Pulsar): Slot %d, Seg %d", i, abs_seg)) -- DEBUG
                 forbidden[abs_seg] = true
             end
-            -- 2. Top-level enemies (depth <= 0x20)
+            -- 2. Top-level enemies (depth <= 0x10)
             -- Includes Flippers, Pulsars, Tankers, Fuseballs, Spikers if they are close
-            if depth <= 0x20 then
+            if depth <= 0x10 then
                  -- print(string.format("  -> FORBIDDEN (Top Enemy): Slot %d, Type %d, Seg %d, Depth %02X", i, core_type, abs_seg, depth)) -- DEBUG
                  forbidden[abs_seg] = true
             end
@@ -71,7 +128,7 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
         local shot_abs_seg = enemies_state.enemy_shot_abs_segments[i]
         local shot_depth = enemies_state.shot_positions[i]
         -- Mark forbidden if shot is close AND player cannot shoot back
-        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= 0x20 and not has_ammo then
+        if shot_abs_seg ~= INVALID_SEGMENT and shot_depth > 0 and shot_depth <= TOP_RAIL_AVOID_DEPTH and not has_ammo then
             -- print(string.format("  -> FORBIDDEN (Enemy Shot): Shot %d, Seg %d, Depth %02X", i, shot_abs_seg, shot_depth)) -- DEBUG
             forbidden[shot_abs_seg] = true
         end
@@ -139,12 +196,12 @@ find_nearest_enemy_of_type = function(enemies_state, player_abs_segment, is_open
         end
         --]]
 
-        -- Check if this is the enemy type we're looking for, if it's active,
-        -- if its depth is > 0x30, AND if the segment is NOT forbidden
-        if core_type == type_id and
-           enemy_abs_seg ~= INVALID_SEGMENT and
-           enemy_depth > 0x30 and
-           not is_forbidden then
+            -- Check if this is the enemy type we're looking for, if it's active,
+            -- if its depth is above zero (valid), AND if the segment is NOT forbidden
+            if core_type == type_id and
+               enemy_abs_seg ~= INVALID_SEGMENT and
+               enemy_depth > 0 and
+               not is_forbidden then
 
             -- Calculate distance using the provided function
             local rel_dist = abs_to_rel_func(player_abs_segment, enemy_abs_seg, is_open)
@@ -172,10 +229,10 @@ hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_f
     -- Corrected Hunt Order (based on assembly types): Fuseball(4), Pulsar(1), Tanker(2), Flipper(0), Spiker(3)
     local hunt_order = {
         ENEMY_TYPE_FUSEBALL, -- 4
-        ENEMY_TYPE_PULSAR,   -- 1
         ENEMY_TYPE_TANKER,   -- 2
         ENEMY_TYPE_FLIPPER,  -- 0
-        ENEMY_TYPE_SPIKER    -- 3
+        ENEMY_TYPE_SPIKER,   -- 3
+        ENEMY_TYPE_PULSAR    -- 1
     }
 
     for _, enemy_type in ipairs(hunt_order) do
@@ -224,37 +281,9 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     local did_flee = false
     local hunting_target_info = "N/A"
 
-    -- Check for Tube Zoom state first
-    if game_state.gamestate == 0x20 then
-        -- Spike heights are depths: 0=clear/no spike, >0 means spike exists, smaller number = longer spike
-        local current_spike_h = level_state.spike_heights[player_abs_seg]
-        if current_spike_h == 0 then return player_abs_seg, 0, true, false end
-        local left_neighbour_seg = -1
-        local right_neighbour_seg = -1
-        if is_open then
-            if player_abs_seg > 0 then left_neighbour_seg = player_abs_seg - 1 end
-            if player_abs_seg < 15 then right_neighbour_seg = player_abs_seg + 1 end
-        else
-            left_neighbour_seg = (player_abs_seg - 1 + 16) % 16
-            right_neighbour_seg = (player_abs_seg + 1) % 16
-        end
-        local left_spike_h = -1; if left_neighbour_seg ~= -1 then left_spike_h = level_state.spike_heights[left_neighbour_seg] end
-        local right_spike_h = -1; if right_neighbour_seg ~= -1 then right_spike_h = level_state.spike_heights[right_neighbour_seg] end
-        if left_spike_h == 0 then return left_neighbour_seg, 0, true, false end
-        if right_spike_h == 0 then return right_neighbour_seg, 0, true, false end
-        local temp_target = player_abs_seg
-        local is_left_better = (left_spike_h > current_spike_h)
-        local is_right_better = (right_spike_h > current_spike_h)
-        if is_left_better and is_right_better then temp_target = (left_spike_h >= right_spike_h) and left_neighbour_seg or right_neighbour_seg
-        elseif is_left_better then temp_target = left_neighbour_seg
-        elseif is_right_better then temp_target = right_neighbour_seg
-        end
-        initial_target_seg_abs, target_depth, should_fire, should_zap = (function()
-           -- ... (spike logic returns temp_target, 0, true, false)
-           return temp_target, 0, true, false
-        end)()
-    -- Check Flee/Hunt Logic (only in normal play mode)
-    elseif game_state.gamestate == 0x04 then
+    -- NOTE: Tube-zoom expert steering is owned by logic.find_target_segment()/zoom_down_tube.
+    -- This state-local helper is telemetry-only and should not duplicate zoom steering logic.
+    if game_state.gamestate == 0x04 then
         local forbidden_segments = find_forbidden_segments(enemies_state, level_state, player_state)
         local current_segment_is_forbidden = forbidden_segments[player_abs_seg] or false
 
@@ -266,13 +295,13 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_zap = false
         else -- Current segment is SAFE, proceed to HUNT
             -- Pass forbidden_segments to hunt_enemies
-            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_seg, is_open, abs_to_rel_func, forbidden_segments)
+            local hunt_target_seg, hunt_target_depth, should_avoid = hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
             hunting_target_info = string.format("HuntTgt=%d, HuntDepth=%02X", hunt_target_seg, hunt_target_depth) -- DEBUG
 
             if hunt_target_seg ~= -1 then
                 initial_target_seg_abs = hunt_target_seg
                 target_depth = hunt_target_depth
-                local rel_dist = abs_to_rel_func(player_abs_seg, initial_target_seg_abs, is_open)
+                local rel_dist = abs_to_rel_func(player_abs_segment, initial_target_seg_abs, is_open)
                 should_fire = (rel_dist <= 1) -- Initial fire recommendation if aligned
             else
                 initial_target_seg_abs = player_abs_seg -- Stay put if no hunt target
@@ -315,7 +344,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             for i = 1, 4 do
                 if enemies_state.enemy_shot_abs_segments[i] == next_segment_abs and
                    enemies_state.shot_positions[i] > 0 and
-                   enemies_state.shot_positions[i] <= 0x30 then
+                   enemies_state.shot_positions[i] <= TOP_RAIL_AVOID_DEPTH then
                     brake_condition_met = true; break
                 end
             end
@@ -326,7 +355,7 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
                     if (enemies_state.enemy_core_type[i] == ENEMY_TYPE_FLIPPER or enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR) and -- <<< CORRECTED TYPE
                        enemies_state.enemy_abs_segments[i] == next_segment_abs and
                        enemies_state.enemy_depths[i] > 0 and
-                       enemies_state.enemy_depths[i] <= 0x30 then
+                       enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then
                         brake_condition_met = true; break
                     end
                 end
@@ -428,21 +457,24 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
     local initial_should_fire = should_fire -- Store initial recommendation before override
     if not initial_should_fire then -- Only override if not already firing
         for i = 1, 7 do
-            if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= 0x30 then -- Is it close vertically?
-                local flipper_abs_seg = enemies_state.enemy_abs_segments[i]
-                if flipper_abs_seg ~= INVALID_SEGMENT then
-                    local flipper_rel_seg = abs_to_rel_func(player_abs_seg, flipper_abs_seg, is_open)
-                    if math.abs(flipper_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
-                        should_fire = true -- Force firing recommendation
-                        break -- Found a dangerous flipper, no need to check others
+            if enemies_state.enemy_depths[i] > 0 and enemies_state.enemy_depths[i] <= TOP_RAIL_AVOID_DEPTH then -- Is it close vertically?
+                local threat_abs_seg = enemies_state.enemy_abs_segments[i]
+                if threat_abs_seg ~= INVALID_SEGMENT then
+                    local threat_rel_seg = abs_to_rel_func(player_abs_seg, threat_abs_seg, is_open)
+                    if math.abs(threat_rel_seg) <= 1 then -- Is it close laterally (or aligned)?
+                        -- Always recommend firing at close threats (unless out of ammo)
+                        if player_state.shot_count < 8 then
+                            should_fire = true
+                        end
+
+                        break -- Found a dangerous close threat, no need to check others
                     end
                 end
             end
         end
     end
 
-    -- Apply shot count override (happens last)
-    should_fire = should_fire or player_state.shot_count < 3
+    should_fire = should_fire or player_state.shot_count < 5
 
     return final_target_seg_abs, target_depth, should_fire, should_zap
 end
@@ -489,13 +521,15 @@ M.LevelState.__index = M.LevelState
 function M.LevelState:new()
     local self = setmetatable({}, M.LevelState)
     self.level_number = 0
-    self.spike_heights = {} -- Array of 16 spike heights (0-15 index)
-    self.level_type = 0     -- 00 = closed, FF = open (Read from memory, but might be unreliable)
+    self.spike_heights = {} -- Array of 16 spike heights (0-15 index): 0 or (255 - depth)
+    self.spike_depths = {}  -- Array of 16 raw spike depths (0-15 index)
+    self.level_type = 0     -- 00 = CLOSED, FF = OPEN (per assembly: $0111 open_level)
     self.level_angles = {}  -- Array of 16 tube angles (0-15 index)
     self.level_shape = 0    -- Level shape (level_number % 16)
     -- Initialize tables
     for i = 0, 15 do
         self.spike_heights[i] = 0
+        self.spike_depths[i] = 0
         self.level_angles[i] = 0
     end
     return self
@@ -503,12 +537,20 @@ end
 
 function M.LevelState:update(mem)
     self.level_number = mem:read_u8(0x009F)   -- Level number
-    self.level_type = mem:read_u8(0x0111)     -- Level type (00=closed, FF=open)
+    self.level_type = mem:read_u8(0x0111)     -- Level type raw flag at $0111 (00=closed, FF=open per assembly)
     self.level_shape = self.level_number % 16 -- Calculate level shape
 
-    -- Read spike heights for all 16 segments and store them indexed by absolute segment number (0-15)
+    -- Read spike depths for all 16 segments and derive lane spike heights.
+    -- Raw depth semantics: 0 = no spike, 0x10 = near top rail, 0xFF = very far.
+    -- Height semantics used by RL features: 0 = no spike, otherwise (255 - depth).
     for i = 0, 15 do
-        self.spike_heights[i] = mem:read_u8(0x03AC + i)
+        local depth = mem:read_u8(0x03AC + i)
+        self.spike_depths[i] = depth
+        if depth == 0 then
+            self.spike_heights[i] = 0
+        else
+            self.spike_heights[i] = 255 - depth
+        end
     end
 
     -- Read tube angles for all 16 segments indexed by absolute segment number (0-15)
@@ -574,12 +616,12 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     self.shot_count = mem:read_u8(0x0135)         -- Number of active player shots ($0135)
 
     -- Read all 8 shot positions and segments
-    -- Determine if level is open based on the level type flag (might be unreliable)
+    -- Determine if level is open based on the level type flag
+    -- Assembly: $0111 open_level — $00 = closed, $FF = open
     local level_type_flag = mem:read_u8(0x0111)
-    local is_open = (level_type_flag == 0xFF)
-    -- Or use level number pattern if flag is known bad:
-    -- local level_num_zero_based = (mem:read_u8(0x009F) - 1)
-    -- local is_open = (level_num_zero_based % 4 == 2)
+    local is_open = (level_type_flag ~= 0x00)
+
+    
 
     local player_abs_segment = self.position & 0x0F
     for i = 1, 8 do
@@ -593,15 +635,9 @@ function M.PlayerState:update(mem, abs_to_rel_func)
             -- Read absolute segment from PlayerShotSegments ($02AD - $02B4)
             local abs_segment = mem:read_u8(0x02AD + i - 1)
 
-            -- Shot is also inactive if segment byte is 0
-            if abs_segment == 0 then
-                self.shot_segments[i] = INVALID_SEGMENT
-                self.shot_positions[i] = 0 -- Ensure position is also zeroed if segment is invalid
-            else
-                -- Valid position and valid segment read, calculate relative segment using passed function
-                abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
-                self.shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
-            end
+            -- Segment 0 is valid in Tempest. Activity is determined by shot position.
+            abs_segment = abs_segment & 0x0F  -- Mask to get valid segment 0-15
+            self.shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
         end
     end
 
@@ -657,11 +693,24 @@ function M.EnemiesState:new()
     self.num_enemies_in_tube = 0 -- ($0108)
     self.num_enemies_on_top = 0  -- ($0109)
     self.enemies_pending = 0 -- ($03AB)
+    self.flipper_move = 0       -- ($015D)
+    self.fuse_move_prb = 0      -- ($015F)
+    self.spd_flipper_lsb = 0    -- ($0160)
+    self.spd_pulsar_lsb = 0     -- ($0161)
+    self.spd_tanker_lsb = 0     -- ($0162)
+    self.spd_spiker_lsb = 0     -- ($0163)
+    self.spd_fuseball_lsb = 0   -- ($0164)
+    self.spd_flipper_msb = 0    -- ($0165)
+    self.spd_pulsar_msb = 0     -- ($0166)
+    self.spd_tanker_msb = 0     -- ($0167)
+    self.spd_spiker_msb = 0     -- ($0168)
+    self.spd_fuseball_msb = 0   -- ($0169)
 
     -- Enemy info arrays (Size 7, for enemy slots 1-7)
     self.enemy_type_info = {} -- Raw type byte ($0283 + i - 1)
     self.active_enemy_info = {} -- Raw state byte ($028A + i - 1)
-    self.enemy_segments = {}  -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
+    self.enemy_segments = {}  -- Relative integer segment (-7..+8 or -15..+15, or INVALID_SEGMENT)
+    self.enemy_segments_fractional = {} -- Relative segment with fractional offset when between segments
     self.enemy_abs_segments = {} -- Absolute segment (0-15, or INVALID_SEGMENT)
     self.enemy_depths = {}    -- Enemy depth/position ($02DF + i - 1)
 
@@ -673,8 +722,13 @@ function M.EnemiesState:new()
     self.enemy_can_shoot = {}      -- Bit 6 from state byte (0/1)
     self.enemy_split_behavior = {} -- Bits 0-1 from state byte
 
+    -- Raw angle/progress per enemy (Size 7)
+    -- Mirrors more_enemy_info at $02CC..$02D2; low nibble (0-15) increments/decrements while between segments
+    self.more_enemy_info = {}
+
     -- Enemy Shot Info (Size 4)
     self.shot_positions = {}          -- Absolute depth/position ($02DB + i - 1)
+    self.shot_positions_lsb = {}      -- Fractional LSB for enemy shots ($02E6 + i - 1)
     self.enemy_shot_segments = {}     -- Relative segment (-7 to +8 or -15 to +15, or INVALID_SEGMENT)
     self.enemy_shot_abs_segments = {} -- Absolute segment (0-15, or INVALID_SEGMENT)
 
@@ -682,8 +736,21 @@ function M.EnemiesState:new()
     self.pending_vid = {}              -- ($0243 + i - 1)
     self.pending_seg = {}              -- Relative segment ($0203 + i - 1, or INVALID_SEGMENT)
 
-    -- Charging Fuseball Tracking (Size 16, indexed 1-16 for abs seg 0-15)
-    self.charging_fuseball_segments = {} -- 1 if charging in segment, 0 otherwise
+    -- Charging Fuseball Tracking (Size 7, one per enemy slot that can be a fuseball)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or INVALID_SEGMENT when absent)
+    self.charging_fuseball = {} -- Relative segments of charging fuseballs
+    
+    -- Pulsar Tracking (Size 7, one per enemy slot that can be a pulsar)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or INVALID_SEGMENT when absent)
+    self.active_pulsar = {} -- Relative segments of pulsars
+    
+    -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper on/at top rail)
+    -- Array contains relative segment positions (-7 to +8 or -15 to +15, or TOP_RAIL_ABSENT=255 when absent)
+    self.active_top_rail_enemies = {} -- Relative segments of pulsars/flippers at the top rail
+    
+    -- NEW: Fractional Enemy Segments By Slot (Size 7, indexed 1-7)
+    -- Stores fractional segment position as 12-bit integer
+    self.fractional_enemy_segments_by_slot = {}
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -699,6 +766,7 @@ function M.EnemiesState:new()
         self.enemy_type_info[i] = 0
         self.active_enemy_info[i] = 0
         self.enemy_segments[i] = INVALID_SEGMENT
+        self.enemy_segments_fractional[i] = INVALID_SEGMENT
         self.enemy_abs_segments[i] = INVALID_SEGMENT
         self.enemy_depths[i] = 0
         self.enemy_core_type[i] = 0
@@ -707,9 +775,11 @@ function M.EnemiesState:new()
         self.enemy_moving_away[i] = 0
         self.enemy_can_shoot[i] = 0
         self.enemy_split_behavior[i] = 0
+        self.more_enemy_info[i] = 0
     end
     for i = 1, 4 do
         self.shot_positions[i] = 0
+        self.shot_positions_lsb[i] = 0
         self.enemy_shot_segments[i] = INVALID_SEGMENT
         self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
     end
@@ -717,8 +787,25 @@ function M.EnemiesState:new()
         self.pending_vid[i] = 0
         self.pending_seg[i] = INVALID_SEGMENT
     end
-    for i = 1, 16 do
-        self.charging_fuseball_segments[i] = 0
+    for i = 1, 7 do
+        self.charging_fuseball[i] = INVALID_SEGMENT
+        self.active_pulsar[i] = INVALID_SEGMENT
+        self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
+        self.fractional_enemy_segments_by_slot[i] = 0
+    end
+
+    -- Velocity tracking (previous frame state for delta computation)
+    self.prev_enemy_abs_segments = {}
+    self.prev_enemy_depths = {}
+    self.prev_enemy_core_type = {}
+    self.enemy_delta_seg = {}
+    self.enemy_delta_depth = {}
+    for i = 1, 7 do
+        self.prev_enemy_abs_segments[i] = INVALID_SEGMENT
+        self.prev_enemy_depths[i] = 0
+        self.prev_enemy_core_type[i] = 0
+        self.enemy_delta_seg[i] = 0
+        self.enemy_delta_depth[i] = 0
     end
 
     return self
@@ -728,9 +815,8 @@ end
 function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_to_rel_func)
     -- Get player position and level type for relative calculations
     local player_abs_segment = player_state.position & 0x0F -- Get current player absolute segment
-    -- Determine if level is open based *only* on the memory flag now
-    local is_open = (level_state.level_type == 0xFF)
-    -- Re-enable debug print to monitor memory flag and resulting is_open
+    -- Assembly: $0111 open_level — $00 = closed, $FF = open
+    local is_open = (level_state.level_type ~= 0x00)
 
     -- Read active enemy counts and related state
     self.active_flippers         = mem:read_u8(0x0142) -- n_flippers
@@ -738,7 +824,9 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     self.active_tankers          = mem:read_u8(0x0144) -- n_tankers
     self.active_spikers          = mem:read_u8(0x0145) -- n_spikers
     self.active_fuseballs        = mem:read_u8(0x0146) -- n_fuseballs
-    self.pulse_beat              = mem:read_u8(0x0147) -- pulse_beat
+    -- pulse_beat is a SIGNED byte in assembly (oscillates via two's complement negation)
+    local raw_pulse_beat         = mem:read_u8(0x0147)
+    self.pulse_beat              = (raw_pulse_beat > 127) and (raw_pulse_beat - 256) or raw_pulse_beat
     self.pulsing                 = mem:read_u8(0x0148) -- pulsing state
     self.pulsar_fliprate         = mem:read_u8(0x00B2) -- Pulsar flip rate
     self.num_enemies_in_tube     = mem:read_u8(0x0108) -- NumInTube
@@ -752,9 +840,23 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     self.spawn_slots_spikers = mem:read_u8(0x0140)   -- avl_spikers
     self.spawn_slots_fuseballs = mem:read_u8(0x0141) -- avl_fuseballs
 
+    -- Global movement / velocity registers
+    self.flipper_move = mem:read_u8(0x015D)
+    self.fuse_move_prb = mem:read_u8(0x015F)
+    self.spd_flipper_lsb = mem:read_u8(0x0160)
+    self.spd_pulsar_lsb = mem:read_u8(0x0161)
+    self.spd_tanker_lsb = mem:read_u8(0x0162)
+    self.spd_spiker_lsb = mem:read_u8(0x0163)
+    self.spd_fuseball_lsb = mem:read_u8(0x0164)
+    self.spd_flipper_msb = mem:read_u8(0x0165)
+    self.spd_pulsar_msb = mem:read_u8(0x0166)
+    self.spd_tanker_msb = mem:read_u8(0x0167)
+    self.spd_spiker_msb = mem:read_u8(0x0168)
+    self.spd_fuseball_msb = mem:read_u8(0x0169)
+
     -- Read and process enemy slots (1-7)
     for i = 1, 7 do
-        -- Read depth and segment first to determine activity
+    -- Read depth and segment first to determine activity
         local enemy_depth_raw = mem:read_u8(0x02DF + i - 1) -- EnemyPositions ($02DF-$02E5)
         local abs_segment_raw = mem:read_u8(0x02B9 + i - 1) -- EnemySegments ($02B9-$02BF)
 
@@ -766,16 +868,19 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.enemy_can_shoot[i] = 0
         self.enemy_split_behavior[i] = 0
         self.enemy_segments[i] = INVALID_SEGMENT
+        self.enemy_segments_fractional[i] = INVALID_SEGMENT
         self.enemy_abs_segments[i] = INVALID_SEGMENT
         self.enemy_depths[i] = 0
         self.enemy_type_info[i] = 0
         self.active_enemy_info[i] = 0
 
-        -- Check if enemy is active (depth > 0 and segment raw byte > 0)
-        if enemy_depth_raw > 0 and abs_segment_raw > 0 then
+        -- Enemy activity is driven by depth/along value (>0). Segment 0 is valid.
+        if enemy_depth_raw > 0 then
             local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+            local rel_segment = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
             self.enemy_abs_segments[i] = abs_segment
-            self.enemy_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
+            self.enemy_segments[i] = rel_segment
+            self.enemy_segments_fractional[i] = rel_segment
             self.enemy_depths[i] = enemy_depth_raw
 
             -- Read raw type/state bytes only for active enemies
@@ -784,8 +889,8 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.enemy_type_info[i] = type_byte
             self.active_enemy_info[i] = state_byte
 
-            -- Decode Type Byte (Use assembly mask)
-            self.enemy_core_type[i] = type_byte & ENEMY_TYPE_MASK -- Apply the mask to get 0-4
+            -- Decode Type Byte (assembly uses 0x07 mask, yielding 0..7)
+            self.enemy_core_type[i] = type_byte & ENEMY_TYPE_MASK
             self.enemy_direction_moving[i] = (type_byte & 0x40) ~= 0 and 1 or 0 -- Bit 6: Segment increasing?
             self.enemy_between_segments[i] = (type_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Between segments?
 
@@ -793,43 +898,86 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             self.enemy_moving_away[i] = (state_byte & 0x80) ~= 0 and 1 or 0 -- Bit 7: Moving Away?
             self.enemy_can_shoot[i] = (state_byte & 0x40) ~= 0 and 1 or 0   -- Bit 6: Can Shoot?
             self.enemy_split_behavior[i] = state_byte & 0x03                -- Bits 0-1: Split Behavior
+
+            -- Read raw more_enemy_info angle/progress byte ($02CC-$02D2)
+            self.more_enemy_info[i] = mem:read_u8(0x02CC + i - 1)
+
+            -- Derive fractional segment for moving-between-segment enemies.
+            -- For non-fuseballs this follows Tempest flip-angle progression.
+            -- (Fuseballs use a special representation; keep integer lane there.)
+            if self.enemy_between_segments[i] == 1 and self.enemy_core_type[i] ~= ENEMY_TYPE_FUSEBALL then
+                local progress = compute_between_progress(
+                    level_state.level_angles,
+                    abs_segment,
+                    self.enemy_direction_moving[i],
+                    self.more_enemy_info[i] & 0x0F
+                )
+
+                local rel_float = rel_segment
+                if self.enemy_direction_moving[i] == 1 then
+                    -- Moving to the next higher segment: [seg-1 .. seg]
+                    rel_float = rel_segment + progress - 1.0
+                else
+                    -- Moving to the next lower segment: [seg .. seg-1]
+                    rel_float = rel_segment - progress
+                end
+
+                if not is_open then
+                    rel_float = wrap_closed_relative_segment(rel_float)
+                end
+                self.enemy_segments_fractional[i] = rel_float
+            end
         end -- End if enemy active
     end -- End enemy slot loop
 
     -- Calculate charging Fuseball segments (reset first)
-    for seg = 1, 16 do self.charging_fuseball_segments[seg] = 0 end
+    for i = 1, 7 do 
+        self.charging_fuseball[i] = INVALID_SEGMENT
+        self.active_pulsar[i] = INVALID_SEGMENT
+        self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
+    end
+    
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
         if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
-            local abs_segment_idx = self.enemy_abs_segments[i] + 1 -- Convert 0-15 to 1-16 index
-            if abs_segment_idx >= 1 and abs_segment_idx <= 16 then
-                 self.charging_fuseball_segments[abs_segment_idx] = 1
-            end
+            self.charging_fuseball[i] = self.enemy_segments_fractional[i]
+        end
+        
+        -- Check if it's an active Pulsar (type 1)
+        if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then -- Pulsar type 1
+            self.active_pulsar[i] = self.enemy_segments_fractional[i]
+        end
+
+        -- Check if it's a top rail Pulsar or Flipper (depth at/near player rail)
+        if (self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.enemy_core_type[i] == ENEMY_TYPE_PULSAR or self.enemy_core_type[i] == ENEMY_TYPE_FLIPPER) and self.enemy_depths[i] > 0 and self.enemy_depths[i] <= 0x10) then
+            self.active_top_rail_enemies[i] = self.enemy_segments_fractional[i]
+            -- print("Top rail at: " .. string.format("%.3f", self.active_top_rail_enemies[i]) .. " (slot " .. i .. ")")
         end
     end
 
     -- Read and process enemy shots (1-4)
     for i = 1, 4 do
-        -- Read shot depth/position first
-        self.shot_positions[i] = mem:read_u8(0x02DB + i - 1) -- EnemyShotPositions ($02DB-$02DE)
+        -- Read integer depth/position and fractional LSB
+        local pos_int = mem:read_u8(0x02DB + i - 1)  -- EnemyShotPositions ($02DB-$02DE)
+        local pos_lsb = mem:read_u8(0x02E6 + i - 1)  -- enm_shot_lsb ($02E6-$02E9)
 
-        -- If shot position is 0, it's inactive
-        if self.shot_positions[i] == 0 then
+        -- If integer position is 0, shot is inactive regardless of LSB
+        if pos_int == 0 then
             self.enemy_shot_segments[i] = INVALID_SEGMENT
             self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
+            self.shot_positions_lsb[i] = 0
+            self.shot_positions[i] = 0
         else
             -- Read shot segment byte
             local abs_segment_raw = mem:read_u8(0x02B5 + i - 1) -- EnemyShotSegments ($02B5-$02B8)
-             -- Also inactive if segment byte is 0
-            if abs_segment_raw == 0 then
-                self.enemy_shot_segments[i] = INVALID_SEGMENT
-                self.enemy_shot_abs_segments[i] = INVALID_SEGMENT
-                self.shot_positions[i] = 0 -- Ensure position is zeroed
-            else
-                local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
-                self.enemy_shot_abs_segments[i] = abs_segment
-                self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
-            end
+            -- Segment 0 is valid in Tempest. Activity is determined by shot position.
+            local abs_segment = abs_segment_raw & 0x0F -- Mask to 0-15
+            self.enemy_shot_abs_segments[i] = abs_segment
+            self.enemy_shot_segments[i] = abs_to_rel_func(player_abs_segment, abs_segment, is_open)
+            -- Combine integer position with LSB to form full 8.8 fixed-point as a float
+            -- Range remains < 256.0 (pos_int in [1,255], pos_lsb in [0,255])
+            self.shot_positions_lsb[i] = pos_lsb
+            self.shot_positions[i] = pos_int + (pos_lsb / 256.0)
         end
     end
 
@@ -847,6 +995,66 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- Read pending_vid (64 bytes starting at 0x0243)
     for i = 1, 64 do
         self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
+    end
+    
+    -- Calculate true between-segment progress per slot (scaled to 12-bit, 0..4095)
+    for i = 1, 7 do
+        if self.enemy_abs_segments[i] == INVALID_SEGMENT then
+            self.fractional_enemy_segments_by_slot[i] = INVALID_SEGMENT
+        else
+            -- Progress in [0,1] through the current between-segment transition.
+            local progress = 0.0
+            if self.enemy_between_segments[i] == 1 and self.enemy_core_type[i] ~= ENEMY_TYPE_FUSEBALL then
+                progress = compute_between_progress(
+                    level_state.level_angles,
+                    self.enemy_abs_segments[i],
+                    self.enemy_direction_moving[i],
+                    self.more_enemy_info[i] & 0x0F
+                )
+            elseif self.enemy_between_segments[i] == 1 then
+                -- Fuseball between-state uses a special 3-bit phase.
+                progress = (self.more_enemy_info[i] & 0x07) / 8.0
+            end
+            local scaled_value = math.floor(progress * 4096.0 + 0.5) -- Round to nearest
+            if scaled_value >= 4096 then scaled_value = 4095 end
+            if scaled_value < 0 then scaled_value = 0 end
+            self.fractional_enemy_segments_by_slot[i] = scaled_value
+        end
+    end
+
+    -- ── Velocity features (Δseg, Δdepth per enemy slot) ─────────────────
+    -- Only compute during active gameplay to avoid garbage across episode boundaries
+    if game_state.gamestate == 0x04 then
+        for i = 1, 7 do
+            if self.enemy_depths[i] > 0 and self.prev_enemy_depths[i] > 0
+               and self.enemy_core_type[i] == self.prev_enemy_core_type[i]
+               and self.enemy_abs_segments[i] ~= INVALID_SEGMENT
+               and self.prev_enemy_abs_segments[i] ~= INVALID_SEGMENT then
+                -- Segment delta (handle wrapping for closed levels)
+                local dseg = self.enemy_abs_segments[i] - self.prev_enemy_abs_segments[i]
+                if not is_open then
+                    if dseg > 8 then dseg = dseg - 16
+                    elseif dseg < -8 then dseg = dseg + 16 end
+                end
+                self.enemy_delta_seg[i] = dseg
+                -- Depth delta (negative = approaching player)
+                self.enemy_delta_depth[i] = self.enemy_depths[i] - self.prev_enemy_depths[i]
+            else
+                self.enemy_delta_seg[i] = 0
+                self.enemy_delta_depth[i] = 0
+            end
+        end
+    else
+        for i = 1, 7 do
+            self.enemy_delta_seg[i] = 0
+            self.enemy_delta_depth[i] = 0
+        end
+    end
+    -- Save current state for next frame's delta computation
+    for i = 1, 7 do
+        self.prev_enemy_abs_segments[i] = self.enemy_abs_segments[i]
+        self.prev_enemy_depths[i] = self.enemy_depths[i]
+        self.prev_enemy_core_type[i] = self.enemy_core_type[i]
     end
 
     -- === Calculate and store nearest enemy segment and engineered features ===
@@ -915,4 +1123,4 @@ function M.EnemiesState:get_total_active()
 end
 
 -- Return the module table
-return M 
+return M
