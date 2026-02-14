@@ -21,3 +21,12 @@ So, if there is danger in the current lane, the spinner seeks the first safe seg
 If it finds a safe lane but no target, it remembers the safe lane
 If it finds a safe target, it targets that lane
 
+----
+
+Basic BLUE gameplay
+
+If there are enemies on the top rail:
+    - Avoid fuseballs by staying at least 3 segments away from them as long as possible.  
+    - On a closed level, if there are flippers on the top rail to the right:
+    - Move to segment 1 (0-based).  Wait until the 
+    - 

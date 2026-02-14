@@ -7,6 +7,7 @@ local M = {} -- Module table for export
 
 -- Constants (Copied from main.lua's original display logic context)
 local INVALID_SEGMENT = -32768
+local TOP_RAIL_ABSENT = 255
 
 -- Helper function to format segment values for display
 local function format_segment(value)
@@ -15,6 +16,39 @@ local function format_segment(value)
     else
         -- Use %+03d: sign, pad with 0 to width 2 (total 3 chars like +01, -07)
         return string.format("%+03d", value)
+    end
+end
+
+-- Helper function to format a fixed-width segment value for our enemy tables
+local function format_enemy_segment(value)
+    -- Display as '---' when absent/sentinel.
+    if value == nil or value == INVALID_SEGMENT or value == TOP_RAIL_ABSENT then
+        return string.format("%7s", "---")
+    end
+
+    -- Use integer format for true integers; otherwise print as signed float with 2 decimals
+    if type(value) == "number" then
+        if value == math.floor(value) then
+            -- Pad to a fixed width for column alignment
+            return string.format("%7s", string.format("%+03d", value))
+        else
+            -- Two-decimal float, signed, then pad to fixed width
+            return string.format("%7s", string.format("%+.2f", value))
+        end
+    end
+
+    -- Fallback to tostring padded
+    return string.format("%7s", tostring(value))
+end
+
+-- Helper to format a segment with a fixed overall width (including sign)
+local function format_segment_wide(value, width)
+    width = width or 6
+    if value == INVALID_SEGMENT or value == nil then
+        return string.format("%" .. width .. "s", "---")
+    else
+        -- Right-align the signed integer within the given width
+        return string.format("%" .. width .. "s", string.format("%+d", value))
     end
 end
 
@@ -109,13 +143,16 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     -- Level State Section
     local level_metrics = {
          ["Level Num"] = level_state.level_number,
-         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type == 0xFF) and "Open" or "Closed"),
+         ["Level Type"] = string.format("0x%02X (%s)", level_state.level_type, (level_state.level_type ~= 0x00) and "Open" or "Closed"),
          ["Level Shape"] = level_state.level_shape,
     }
     display_str = display_str .. format_section("Level State", level_metrics)
     local spike_heights_str = ""
     for i = 0, 15 do spike_heights_str = spike_heights_str .. string.format("%02X ", level_state.spike_heights[i] or 0) end
-    display_str = display_str .. "Spike Heights: " .. spike_heights_str .. "\n\n"
+    local spike_depths_str = ""
+    for i = 0, 15 do spike_depths_str = spike_depths_str .. string.format("%02X ", level_state.spike_depths[i] or 0) end
+    display_str = display_str .. "Spike Heights: " .. spike_heights_str .. "\n"
+    display_str = display_str .. "Spike Depths : " .. spike_depths_str .. "\n\n"
 
     -- Enemies State Section
     local enemies_metrics = {
@@ -128,7 +165,7 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         ["In Tube"] = enemies_state.num_enemies_in_tube,
         ["On Top"] = enemies_state.num_enemies_on_top,
         ["Pending"] = enemies_state.enemies_pending,
-        ["Pulse State"] = string.format("Beat:%02X Pulse:%02X Rate:%02X", enemies_state.pulse_beat, enemies_state.pulsing, enemies_state.pulsar_fliprate),
+        ["Pulse State"] = string.format("Beat:%+d Pulse:%02X Rate:%02X", enemies_state.pulse_beat, enemies_state.pulsing, enemies_state.pulsar_fliprate),
         ["Nearest Target"] = string.format("Seg:%s Depth:%02X Align:%.0f Err:%.0f",
                                     format_segment(enemies_state.nearest_enemy_seg),
                                     enemies_state.nearest_enemy_depth_raw,
@@ -156,16 +193,48 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     local e_shots_pos_str = ""
     local e_shots_seg_str = ""
     for i = 1, 4 do
-        e_shots_pos_str = e_shots_pos_str .. string.format(" %02X ", enemies_state.shot_positions[i])
-        e_shots_seg_str = e_shots_seg_str .. " " .. format_segment(enemies_state.enemy_shot_segments[i])
+        -- Show precise shot positions with two decimals, width-aligned
+        local pos = enemies_state.shot_positions[i] or 0.0
+        e_shots_pos_str = e_shots_pos_str .. string.format(" %6.2f", pos)
+        -- Widen segment formatting to align with positions
+        e_shots_seg_str = e_shots_seg_str .. " " .. format_segment_wide(enemies_state.enemy_shot_segments[i], 6)
     end
     display_str = display_str .. "Enemy Shots Pos:" .. e_shots_pos_str .. "\n"
     display_str = display_str .. "Enemy Shots Seg:" .. e_shots_seg_str .. "\n\n"
 
-    -- Charging Fuseballs
-    local charging_fuseball_str = {}
-    for i = 1, 16 do table.insert(charging_fuseball_str, enemies_state.charging_fuseball_segments[i] == 1 and "*" or "-") end
-    display_str = display_str .. "Fuseball Chrg: " .. table.concat(charging_fuseball_str, " ") .. "\n\n"
+    -- Display our three enemy tables with consistent formatting
+    -- Charging Fuseballs array (7 entries)
+    local charging_fuseball_str = "Charging Fuseball: "
+    for i = 1, 7 do
+        charging_fuseball_str = charging_fuseball_str .. format_enemy_segment(enemies_state.charging_fuseball[i]) .. " "
+    end
+    display_str = display_str .. charging_fuseball_str .. "\n"
+    
+    -- Active Pulsars array (7 entries)
+    local active_pulsar_str = "Active Pulsars:    "
+    for i = 1, 7 do
+        active_pulsar_str = active_pulsar_str .. format_enemy_segment(enemies_state.active_pulsar[i]) .. " "
+    end
+    display_str = display_str .. active_pulsar_str .. "\n"
+    
+    -- Top Rail Enemies array (7 entries)
+    local top_rail_enemies_str = "Top Rail Enemies:  "
+    for i = 1, 7 do
+        top_rail_enemies_str = top_rail_enemies_str .. format_enemy_segment(enemies_state.active_top_rail_enemies[i]) .. " "
+    end
+    display_str = display_str .. top_rail_enemies_str .. "\n"
+    
+    -- Fractional Enemy Segments array (7 entries)
+    local fractional_segs_str = "Fractional Segs:   "
+    for i = 1, 7 do
+        local value = enemies_state.fractional_enemy_segments_by_slot[i]
+        if value == INVALID_SEGMENT then
+            fractional_segs_str = fractional_segs_str .. " ---- "
+        else
+            fractional_segs_str = fractional_segs_str .. string.format(" %04X ", value & 0xFFFF)
+        end
+    end
+    display_str = display_str .. fractional_segs_str .. "\n\n"
 
     -- Pending Data (Show first 16 for brevity)
     local pending_vid_str = ""
@@ -185,4 +254,4 @@ function M.update(status_message, game_state, level_state, player_state, enemies
     io.flush() -- Ensure output is written immediately
 end
 
-return M 
+return M
