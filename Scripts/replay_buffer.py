@@ -8,6 +8,11 @@
 import numpy as np
 import threading
 
+try:
+    from config import RL_CONFIG
+except ImportError:
+    from Scripts.config import RL_CONFIG
+
 
 class SumTree:
     """Binary sum-tree for efficient proportional sampling in O(log N)."""
@@ -137,10 +142,19 @@ class PrioritizedReplayBuffer:
             horizon: int = 1, expert: int = 0, priority_hint: float = 0.0):
         with self.lock:
             priority = self.tree.max_priority
+            cap_mult = float(getattr(RL_CONFIG, "per_new_priority_cap_multiplier", 0.0))
+            mean_pri = 0.0
+            if cap_mult > 0.0 and self.size > 0:
+                mean_pri = self.tree.total() / max(1, self.size)
+                if mean_pri > 0.0:
+                    priority = min(priority, mean_pri * cap_mult)
             if priority_hint != 0.0:
                 hint_pri = abs(priority_hint) ** self.alpha
                 if hint_pri > priority:
                     priority = hint_pri
+            if cap_mult > 0.0 and mean_pri > 0.0:
+                priority = min(priority, mean_pri * cap_mult)
+            priority = max(1e-6, float(priority))
             # If buffer is full, undo the expert flag of the slot being recycled
             if self.tree.size >= self.capacity:
                 self._n_expert -= int(self.is_expert[self.tree.data_ptr])

@@ -75,13 +75,15 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 512
+    batch_size: int = 256
     lr: float = 6.25e-5
-    lr_min: float = 6.25e-5              # Same as lr = fixed LR, no cosine restarts
+    lr_min: float = 1e-5                  # Decay to 1/6 of peak — lets network settle
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 100_000        # (inert when lr == lr_min)
+    lr_cosine_period: int = 500_000        # Used as full decay horizon for non-restart cosine
+    lr_use_restarts: bool = False          # False = monotonic cosine decay to lr_min (no warm restarts)
     gamma: float = 0.99
     n_step: int = 10                        # Doubled from 5 for wider death attribution window
+    max_samples_per_frame: float = 8.0      # Cap replay pressure: sampled transitions per env frame
 
     # Replay (PER with proportional priorities)
     memory_size: int = 2_000_000
@@ -89,14 +91,15 @@ class RLConfigData:
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
     priority_eps: float = 1e-6
+    per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
     min_replay_to_train: int = 10_000
 
     # Target network (soft Polyak averaging)
     target_update_period: int = 1
-    target_tau: float = 0.001
+    target_tau: float = 0.0005             # Slower tracking → more stable anchor
 
     # Gradient
-    grad_clip_norm: float = 10.0
+    grad_clip_norm: float = 5.0            # Tighter clipping dampens large updates
 
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
@@ -106,7 +109,7 @@ class RLConfigData:
 
     # Expert guidance
     expert_ratio_start: float = 0.50
-    expert_ratio_end: float = 0.0
+    expert_ratio_end: float = 0.05
     expert_ratio_decay_frames: int = 5_000_000
     expert_ratio: float = 0.50
     # During tube zoom (gamestate 0x20), temporarily boost expert usage.
@@ -117,8 +120,8 @@ class RLConfigData:
     expert_bc_weight: float = 1.0
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
-    # Keep a small non-zero floor to reduce late-training policy drift.
-    expert_bc_min_weight: float = 0.1
+    # Keep a small floor to anchor policy as expert ratio approaches its minimum.
+    expert_bc_min_weight: float = 0.05
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
@@ -127,7 +130,7 @@ class RLConfigData:
     death_reward_clip: float = 10.0        # Same as normal reward_clip — no special death amplification
 
     # ── death attribution ───────────────────────────────────────────────
-    death_priority_boost: float = 10.0     # Minimum PER priority for terminal transitions
+    death_priority_boost: float = 3.0      # Lower terminal boost to reduce over-focusing on death tails
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True

@@ -49,6 +49,11 @@ def _tail_mean(values, count: int = 20) -> float:
     return float(sum(tail) / max(1, len(tail)))
 
 
+LEVEL_25K_FRAMES = 25_000
+LEVEL_1M_FRAMES = 1_000_000
+LEVEL_5M_FRAMES = 5_000_000
+
+
 class _DashboardState:
     def __init__(self, metrics_obj, agent_obj=None, history_limit: int = 900):
         self.metrics = metrics_obj
@@ -58,6 +63,71 @@ class _DashboardState:
         self.lock = threading.Lock()
         self.last_steps: int | None = None
         self.last_steps_time: float | None = None
+        self._level_windows = {
+            "25k": {"limit": LEVEL_25K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "1m": {"limit": LEVEL_1M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "5m": {"limit": LEVEL_5M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+        }
+        self._last_level_frame_count: int | None = None
+        self._last_avg_inf_ms = 0.0
+        self._cached_now_body = b"{}"
+
+    def _clear_level_windows(self):
+        for win in self._level_windows.values():
+            win["samples"].clear()
+            win["frames"] = 0
+            win["weighted"] = 0.0
+
+    def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float]:
+        raw_level = float(average_level)
+        level = round(raw_level, 4) if math.isfinite(raw_level) else 0.0
+        if self._last_level_frame_count is None:
+            self._last_level_frame_count = frame_count
+            return level, level, level
+
+        if frame_count < self._last_level_frame_count:
+            self._clear_level_windows()
+            self._last_level_frame_count = frame_count
+            return level, level, level
+
+        frame_delta = max(0, int(frame_count - self._last_level_frame_count))
+        self._last_level_frame_count = frame_count
+
+        if frame_delta > 0:
+            for win in self._level_windows.values():
+                samples = win["samples"]
+                if samples and abs(samples[-1][0] - level) < 1e-9:
+                    last_level, last_frames = samples[-1]
+                    samples[-1] = (last_level, last_frames + frame_delta)
+                else:
+                    samples.append((level, frame_delta))
+
+                win["frames"] += frame_delta
+                win["weighted"] += (level * frame_delta)
+
+                while samples and win["frames"] > win["limit"]:
+                    overflow = win["frames"] - win["limit"]
+                    oldest_level, oldest_frames = samples[0]
+                    if oldest_frames <= overflow:
+                        samples.popleft()
+                        win["frames"] -= oldest_frames
+                        win["weighted"] -= (oldest_level * oldest_frames)
+                    else:
+                        samples[0] = (oldest_level, oldest_frames - overflow)
+                        win["frames"] -= overflow
+                        win["weighted"] -= (oldest_level * overflow)
+                        break
+
+        def _mean_or_level(win):
+            if win["frames"] <= 0:
+                return level
+            return win["weighted"] / max(1, win["frames"])
+
+        return (
+            _mean_or_level(self._level_windows["25k"]),
+            _mean_or_level(self._level_windows["1m"]),
+            _mean_or_level(self._level_windows["5m"]),
+        )
 
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -84,6 +154,8 @@ class _DashboardState:
             training_enabled = bool(self.metrics.training_enabled)
             override_expert = bool(self.metrics.override_expert)
             override_epsilon = bool(self.metrics.override_epsilon)
+            inference_requests = int(self.metrics.total_inference_requests)
+            inference_time = float(self.metrics.total_inference_time)
 
             reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
             reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
@@ -91,9 +163,13 @@ class _DashboardState:
             reward_obj = _tail_mean(self.metrics.obj_rewards) * inv_obj
 
         try:
-            dqn1k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
+            dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
         except Exception:
-            dqn1k_raw = dqn1m_raw = dqn5m_raw = 0.0
+            dqn100k_raw = dqn1m_raw = dqn5m_raw = 0.0
+        level_25k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
+        if inference_requests > 0:
+            self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
+        avg_inf_ms = self._last_avg_inf_ms
 
         steps_per_sec = 0.0
         if self.last_steps is not None and self.last_steps_time is not None:
@@ -133,6 +209,7 @@ class _DashboardState:
             "average_level": average_level,
             "memory_buffer_k": memory_buffer_k,
             "memory_buffer_pct": memory_buffer_pct,
+            "avg_inf_ms": avg_inf_ms,
             "loss": last_loss,
             "grad_norm": last_grad_norm,
             "bc_loss": last_bc_loss,
@@ -141,9 +218,12 @@ class _DashboardState:
             "reward_dqn": reward_dqn,
             "reward_subj": reward_subj,
             "reward_obj": reward_obj,
-            "dqn_1k": float(dqn1k_raw) * inv_obj,
+            "dqn_100k": float(dqn100k_raw) * inv_obj,
             "dqn_1m": float(dqn1m_raw) * inv_obj,
             "dqn_5m": float(dqn5m_raw) * inv_obj,
+            "level_25k": float(level_25k),
+            "level_1m": float(level_1m),
+            "level_5m": float(level_5m),
             "training_enabled": training_enabled,
             "override_expert": override_expert,
             "override_epsilon": override_epsilon,
@@ -157,6 +237,7 @@ class _DashboardState:
         with self.lock:
             self.latest = snap
             self.history.append(snap)
+            self._cached_now_body = json.dumps(snap).encode("utf-8")
 
     def payload(self) -> dict[str, Any]:
         with self.lock:
@@ -164,6 +245,10 @@ class _DashboardState:
                 "now": self.latest,
                 "history": list(self.history),
             }
+
+    def now_body(self) -> bytes:
+        with self.lock:
+            return self._cached_now_body
 
 
 def _render_dashboard_html() -> str:
@@ -274,6 +359,19 @@ def _render_dashboard_html() -> str:
       line-height: 1;
       font-weight: 670;
       letter-spacing: 0.2px;
+    }
+    .value-inline {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .metric-led {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+      box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.20);
+      flex: 0 0 auto;
     }
     .gauge-card {
       grid-column: span 1;
@@ -405,6 +503,11 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
       <article class="card"><div class="label">Clients</div><div class="value" id="mClients">0</div></article>
+      <article class="card"><div class="label">Avg Level</div><div class="value" id="mLevel">0.0</div></article>
+      <article class="card">
+        <div class="label">Avg Inf</div>
+        <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
+      </article>
       <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
       <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
       <article class="card"><div class="label">Avg Reward</div><div class="value" id="mRwrd">0</div></article>
@@ -419,7 +522,7 @@ def _render_dashboard_html() -> str:
       <article class="panel">
         <h2>Throughput</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#22d3ee;"></span>FPS</span>
+          <span><span class="sw" style="background:#22c55e;"></span>FPS</span>
           <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
         </div>
         <canvas id="cThroughput"></canvas>
@@ -428,9 +531,9 @@ def _render_dashboard_html() -> str:
       <article class="panel">
         <h2>Rewards</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#22d3ee;"></span>Total</span>
+          <span><span class="sw" style="background:#22c55e;"></span>Total</span>
           <span><span class="sw" style="background:#f59e0b;"></span>DQN</span>
-          <span><span class="sw" style="background:#34d399;"></span>Objective</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>Objective</span>
           <span><span class="sw" style="background:#f43f5e;"></span>Subjective</span>
         </div>
         <canvas id="cRewards"></canvas>
@@ -439,9 +542,9 @@ def _render_dashboard_html() -> str:
       <article class="panel">
         <h2>Learning</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#22d3ee;"></span>Loss</span>
+          <span><span class="sw" style="background:#22c55e;"></span>Loss</span>
           <span><span class="sw" style="background:#f59e0b;"></span>Grad Norm</span>
-          <span><span class="sw" style="background:#34d399;"></span>BC Loss</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>BC Loss</span>
         </div>
         <canvas id="cLearning"></canvas>
       </article>
@@ -449,11 +552,22 @@ def _render_dashboard_html() -> str:
       <article class="panel">
         <h2>DQN Rolling</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#22d3ee;"></span>DQN1K</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>DQN1M</span>
-          <span><span class="sw" style="background:#34d399;"></span>DQN5M</span>
+          <span><span class="sw" style="background:#22c55e;"></span>DQN Inst</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>DQN100K</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>DQN1M</span>
+          <span><span class="sw" style="background:#f43f5e;"></span>DQN5M</span>
         </div>
         <canvas id="cDqn"></canvas>
+      </article>
+
+      <article class="panel">
+        <h2>Level Rolling</h2>
+        <div class="legend">
+          <span><span class="sw" style="background:#22c55e;"></span>Level25K</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>Level1M</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>Level5M</span>
+        </div>
+        <canvas id="cLevel1M"></canvas>
       </article>
     </section>
   </main>
@@ -461,6 +575,7 @@ def _render_dashboard_html() -> str:
   <script>
     const num = new Intl.NumberFormat("en-US");
     const maxPoints = 900;
+    const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
     const GAUGE_MAX_FPS = 1200;
     const GAUGE_REDLINE_FPS = 1000;
@@ -473,6 +588,9 @@ def _render_dashboard_html() -> str:
       fps: document.getElementById("mFps"),
       steps: document.getElementById("mSteps"),
       clients: document.getElementById("mClients"),
+      level: document.getElementById("mLevel"),
+      inf: document.getElementById("mInf"),
+      infLed: document.getElementById("mInfLed"),
       eps: document.getElementById("mEps"),
       xprt: document.getElementById("mXprt"),
       rwrd: document.getElementById("mRwrd"),
@@ -491,7 +609,7 @@ def _render_dashboard_html() -> str:
         series: [
           {
             key: "fps",
-            color: "#22d3ee",
+            color: "#22c55e",
             axis: { side: "left", min: 0, max: 1200, ticks: [0, 300, 600, 900, 1200] }
           },
           {
@@ -506,14 +624,14 @@ def _render_dashboard_html() -> str:
         series: [
           {
             key: "reward_total",
-            color: "#22d3ee",
+            color: "#22c55e",
             axis: {
               side: "left",
               group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
             }
           },
           { key: "reward_dqn", color: "#f59e0b", axis_ref: "reward_total" },
-          { key: "reward_obj", color: "#34d399", axis_ref: "reward_total" },
+          { key: "reward_obj", color: "#22d3ee", axis_ref: "reward_total" },
           { key: "reward_subj", color: "#f43f5e", axis_ref: "reward_total" }
         ]
       },
@@ -522,23 +640,36 @@ def _render_dashboard_html() -> str:
         series: [
           {
             key: "loss",
-            color: "#22d3ee",
+            color: "#22c55e",
             axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"] },
           },
           { key: "grad_norm", color: "#f59e0b", axis_ref: "loss" },
-          { key: "bc_loss", color: "#34d399", axis_ref: "loss" }
+          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss" }
         ]
       },
       dqn: {
         canvas: document.getElementById("cDqn"),
         series: [
+          { key: "dqn_100k", color: "#f59e0b", axis_ref: "reward_dqn" },
+          { key: "dqn_1m", color: "#22d3ee", axis_ref: "reward_dqn" },
+          { key: "dqn_5m", color: "#f43f5e", axis_ref: "reward_dqn" },
           {
-            key: "dqn_1k",
-            color: "#22d3ee",
-            axis: { side: "left", group_keys: ["dqn_1k", "dqn_1m", "dqn_5m"] },
+            key: "reward_dqn",
+            color: "#22c55e",
+            axis: { side: "left", min: 0, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
+          }
+        ]
+      },
+      level1m: {
+        canvas: document.getElementById("cLevel1M"),
+        series: [
+          {
+            key: "level_25k",
+            color: "#22c55e",
+            axis: { side: "left", min: 0, group_keys: ["level_25k", "level_1m", "level_5m"] },
           },
-          { key: "dqn_1m", color: "#f59e0b", axis_ref: "dqn_1k" },
-          { key: "dqn_5m", color: "#34d399", axis_ref: "dqn_1k" }
+          { key: "level_1m", color: "#f59e0b", axis_ref: "level_25k" },
+          { key: "level_5m", color: "#22d3ee", axis_ref: "level_25k" }
         ]
       }
     };
@@ -570,6 +701,23 @@ def _render_dashboard_html() -> str:
         dot.style.boxShadow = "0 0 0 6px rgba(244,63,94,0.18)";
         text.textContent = "Disconnected";
       }
+    }
+
+    function setInfLed(avgInfMs) {
+      if (!cards.infLed) return;
+      const ms = Number(avgInfMs);
+      if (!Number.isFinite(ms) || ms < 5.0) {
+        cards.infLed.style.background = "#22c55e";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(34, 197, 94, 0.22)";
+        return;
+      }
+      if (ms < 10.0) {
+        cards.infLed.style.background = "#f59e0b";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(245, 158, 11, 0.22)";
+        return;
+      }
+      cards.infLed.style.background = "#ef4444";
+      cards.infLed.style.boxShadow = "0 0 0 4px rgba(239, 68, 68, 0.22)";
     }
 
     function drawFpsGauge(canvas, fps) {
@@ -861,15 +1009,30 @@ def _render_dashboard_html() -> str:
           }
         }
 
-        let minV = Number.isFinite(s.axis?.min) ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
-        let maxV = Number.isFinite(s.axis?.max) ? Number(s.axis.max) : (values.length ? Math.max(...values) : 1.0);
+        const hasFixedMin = Number.isFinite(s.axis?.min);
+        const hasFixedMax = Number.isFinite(s.axis?.max);
+        let minV = hasFixedMin ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
+        let maxV = hasFixedMax ? Number(s.axis.max) : (values.length ? Math.max(...values) : 1.0);
+        if (maxV < minV) {
+          maxV = minV + 1.0;
+        }
         if (minV === maxV) {
-          minV -= 1.0;
-          maxV += 1.0;
-        } else if (!Number.isFinite(s.axis?.min) || !Number.isFinite(s.axis?.max)) {
+          if (hasFixedMin && !hasFixedMax) {
+            maxV = minV + 1.0;
+          } else if (!hasFixedMin && hasFixedMax) {
+            minV = maxV - 1.0;
+          } else {
+            minV -= 1.0;
+            maxV += 1.0;
+          }
+        } else {
           const p = (maxV - minV) * 0.12;
-          minV -= p;
-          maxV += p;
+          if (!hasFixedMin) {
+            minV -= p;
+          }
+          if (!hasFixedMax) {
+            maxV += p;
+          }
         }
 
         const axisIndex = side === "left" ? leftUsed++ : rightUsed++;
@@ -987,11 +1150,30 @@ def _render_dashboard_html() -> str:
       }
     }
 
-    function updateCards(now) {
+    function computeSmoothedStepSpd(now, history) {
+      const rows = Array.isArray(history) ? history.slice(-STEP_GAUGE_AVG_WINDOW) : [];
+      const vals = [];
+      for (const row of rows) {
+        const v = Number(row && row.steps_per_sec);
+        if (Number.isFinite(v)) {
+          vals.push(v);
+        }
+      }
+      if (!vals.length) {
+        const fallback = Number(now && now.steps_per_sec);
+        return Number.isFinite(fallback) ? fallback : 0.0;
+      }
+      return vals.reduce((a, b) => a + b, 0.0) / vals.length;
+    }
+
+    function updateCards(now, smoothedSteps) {
       cards.frame.textContent = fmtInt(now.frame_count);
       cards.fps.textContent = fmtFloat(now.fps, 1);
-      cards.steps.textContent = fmtFloat(now.steps_per_sec, 1);
+      cards.steps.textContent = fmtFloat(smoothedSteps, 1);
       cards.clients.textContent = fmtInt(now.client_count);
+      cards.level.textContent = fmtFloat(now.average_level, 2);
+      cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)}ms`;
+      setInfLed(now.avg_inf_ms);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.rwrd.textContent = fmtInt(now.reward_total);
@@ -1007,21 +1189,61 @@ def _render_dashboard_html() -> str:
     function render(payload) {
       if (!payload || !payload.now) return;
       const history = payload.history || [];
-      updateCards(payload.now);
+      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history);
+      updateCards(payload.now, smoothedStepSpd);
       drawFpsGauge(fpsGaugeCanvas, payload.now.fps);
-      drawStepGauge(stepGaugeCanvas, payload.now.steps_per_sec);
+      drawStepGauge(stepGaugeCanvas, smoothedStepSpd);
       drawChart(charts.throughput.canvas, history, charts.throughput.series);
       drawChart(charts.rewards.canvas, history, charts.rewards.series);
       drawChart(charts.learning.canvas, history, charts.learning.series);
       drawChart(charts.dqn.canvas, history, charts.dqn.series);
+      drawChart(charts.level1m.canvas, history, charts.level1m.series);
     }
 
-    async function fetchMetrics() {
+    let historyCache = [];
+    let latestNow = null;
+    let lastTs = -1;
+
+    function renderCurrent() {
+      if (!latestNow) return;
+      render({ now: latestNow, history: historyCache });
+    }
+
+    async function fetchHistory() {
       try {
         const res = await fetch(`/api/history?t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const payload = await res.json();
-        render(payload);
+        const now = payload && payload.now ? payload.now : null;
+        const history = Array.isArray(payload && payload.history) ? payload.history : [];
+        historyCache = history.slice(-maxPoints);
+        latestNow = now || historyCache[historyCache.length - 1] || latestNow;
+        const ts = Number(latestNow && latestNow.ts);
+        if (Number.isFinite(ts)) {
+          lastTs = ts;
+        }
+        renderCurrent();
+        setConnected(true);
+      } catch (err) {
+        setConnected(false);
+      }
+    }
+
+    async function fetchNow() {
+      try {
+        const res = await fetch(`/api/now?t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("bad response");
+        const now = await res.json();
+        latestNow = now;
+        const ts = Number(now && now.ts);
+        if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
+          historyCache.push(now);
+          if (historyCache.length > maxPoints) {
+            historyCache.shift();
+          }
+          lastTs = ts;
+        }
+        renderCurrent();
         setConnected(true);
       } catch (err) {
         setConnected(false);
@@ -1043,10 +1265,10 @@ def _render_dashboard_html() -> str:
       }
     }
 
-    fetchMetrics();
-    setInterval(fetchMetrics, 250);
+    fetchHistory().then(() => fetchNow()).catch(() => {});
+    setInterval(fetchNow, 100);
     setInterval(heartbeat, 1000);
-    window.addEventListener("resize", () => fetchMetrics());
+    window.addEventListener("resize", () => renderCurrent());
   </script>
 </body>
 </html>
@@ -1074,6 +1296,9 @@ def _make_handler(state: _DashboardState):
                 body = json.dumps({"ok": True, "ts": time.time()}).encode("utf-8")
                 self._send(body, "application/json")
                 return
+            if path == "/api/now":
+                self._send(state.now_body(), "application/json")
+                return
             if path == "/api/history":
                 body = json.dumps(state.payload()).encode("utf-8")
                 self._send(body, "application/json")
@@ -1095,7 +1320,7 @@ class MetricsDashboard:
         agent_obj=None,
         host: str = "127.0.0.1",
         port: int = 8765,
-        sample_interval: float = 0.25,
+        sample_interval: float = 0.10,
         history_limit: int = 900,
         open_browser: bool = True,
     ):
@@ -1103,7 +1328,7 @@ class MetricsDashboard:
         self.agent = agent_obj
         self.host = host
         self.port = port
-        self.sample_interval = max(0.2, sample_interval)
+        self.sample_interval = max(0.05, sample_interval)
         self.open_browser = open_browser
 
         self.state = _DashboardState(metrics_obj, agent_obj, history_limit=history_limit)
