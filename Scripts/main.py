@@ -146,6 +146,11 @@ def keyboard_handler(agent, kb):
                 display_metrics_row(agent, kb)
             elif key == "b":
                 print_buffer_stats(agent, kb)
+            elif key == "f":
+                print_with_terminal_restore(kb, "\nFlushing replay buffer...")
+                agent.flush_replay_buffer()
+                print_with_terminal_restore(kb, "Replay buffer flushed.")
+                display_metrics_row(agent, kb)
             elif key == "L":
                 RL_CONFIG.lr = min(1e-2, RL_CONFIG.lr * 2.0)
                 print_with_terminal_restore(kb, f"LR increased to {RL_CONFIG.lr:.2e}")
@@ -200,7 +205,7 @@ def print_network_info(agent):
     print(f"   BC weight: {RL_CONFIG.expert_bc_weight} → {RL_CONFIG.expert_bc_min_weight}")
 
     print(f"\n⌨️  Keys: [q]uit [s]ave [c]lear [h]eader [space]row [o]override [e]xpert [p]epsilon [t]rain [v]erbose [a]ttention")
-    print(f"   [7/8/9] expert−/reset/+   [4/5/6] epsilon−/reset/+   [b] buffer stats")
+    print(f"   [7/8/9] expert−/reset/+   [4/5/6] epsilon−/reset/+   [b] buffer stats   [f] flush buffer")
     print("\n" + "=" * 90 + "\n")
 
 

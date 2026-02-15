@@ -743,6 +743,7 @@ function M.EnemiesState:new()
     -- Pulsar Tracking (Size 7, one per enemy slot that can be a pulsar)
     -- Array contains relative segment positions (-7 to +8 or -15 to +15, or INVALID_SEGMENT when absent)
     self.active_pulsar = {} -- Relative segments of pulsars
+    self.active_pulsar_depths = {} -- Raw depths of pulsars (0 when absent)
     
     -- Top Rail Enemy Tracking (Size 7, one per enemy slot that can be a pulsar or flipper on/at top rail)
     -- Array contains relative segment positions (-7 to +8 or -15 to +15, or TOP_RAIL_ABSENT=255 when absent)
@@ -790,6 +791,7 @@ function M.EnemiesState:new()
     for i = 1, 7 do
         self.charging_fuseball[i] = INVALID_SEGMENT
         self.active_pulsar[i] = INVALID_SEGMENT
+        self.active_pulsar_depths[i] = 0
         self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
         self.fractional_enemy_segments_by_slot[i] = 0
     end
@@ -934,6 +936,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     for i = 1, 7 do 
         self.charging_fuseball[i] = INVALID_SEGMENT
         self.active_pulsar[i] = INVALID_SEGMENT
+        self.active_pulsar_depths[i] = 0
         self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
     end
     
@@ -946,6 +949,7 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         -- Check if it's an active Pulsar (type 1)
         if self.enemy_core_type[i] == ENEMY_TYPE_PULSAR and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then -- Pulsar type 1
             self.active_pulsar[i] = self.enemy_segments_fractional[i]
+            self.active_pulsar_depths[i] = self.enemy_depths[i]
         end
 
         -- Check if it's a top rail Pulsar or Flipper (depth at/near player rail)
