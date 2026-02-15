@@ -6,6 +6,7 @@
 """Tempest AI main entry point — Rainbow-Attention engine."""
 
 import os, sys, time, threading, traceback
+import socket
 import torch
 
 from aimodel import RainbowAgent, KeyboardHandler, print_with_terminal_restore
@@ -13,6 +14,72 @@ from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metr
 from metrics_dashboard import MetricsDashboard
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
+
+
+def _env_enabled(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _has_desktop_session() -> bool:
+    # Respect explicit SSH sessions as non-local by default.
+    if any(os.getenv(k) for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+        return False
+
+    # Display/session markers used by Linux/*nix desktop sessions.
+    if os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY") or os.getenv("MIR_SOCKET"):
+        return True
+    if os.getenv("XDG_CURRENT_DESKTOP") or os.getenv("DESKTOP_SESSION"):
+        return True
+    if (os.getenv("XDG_SESSION_TYPE") or "").strip().lower() in {"x11", "wayland", "mir"}:
+        return True
+
+    # Windows service session is typically headless.
+    if os.name == "nt":
+        return (os.getenv("SESSIONNAME") or "").strip().lower() != "services"
+
+    # macOS local terminal sessions usually have a desktop but no DISPLAY.
+    if sys.platform == "darwin":
+        return True
+
+    # Safe fallback for unknown/non-desktop environments.
+    return False
+
+
+def _resolve_dashboard_host() -> str:
+    explicit = os.getenv("TEMPEST_DASHBOARD_HOST", "").strip()
+    if explicit:
+        return explicit
+    return "127.0.0.1" if _has_desktop_session() else "0.0.0.0"
+
+
+def _best_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def _resolve_dashboard_url_host(bind_host: str) -> str:
+    explicit = os.getenv("TEMPEST_DASHBOARD_PUBLIC_HOST", "").strip()
+    if explicit:
+        return explicit
+    if bind_host in {"0.0.0.0", "::", "[::]"}:
+        return _best_lan_ip()
+    return bind_host
 
 
 # ── Buffer stats ────────────────────────────────────────────────────────────
@@ -230,8 +297,13 @@ def main():
     else:
         print("⚠ No model found, starting fresh\n")
 
-    dashboard_enabled = os.getenv("TEMPEST_DASHBOARD", "1").strip().lower() not in {"0", "false", "off", "no"}
-    dashboard_open_browser = os.getenv("TEMPEST_DASHBOARD_BROWSER", "1").strip().lower() not in {"0", "false", "off", "no"}
+    dashboard_enabled = _env_enabled("TEMPEST_DASHBOARD", True)
+    dashboard_host = _resolve_dashboard_host()
+    desktop_session = _has_desktop_session()
+    if os.getenv("TEMPEST_DASHBOARD_BROWSER") is None:
+        dashboard_open_browser = desktop_session
+    else:
+        dashboard_open_browser = _env_enabled("TEMPEST_DASHBOARD_BROWSER", desktop_session)
     try:
         dashboard_port = int(os.getenv("TEMPEST_DASHBOARD_PORT", "8765"))
     except Exception:
@@ -241,12 +313,16 @@ def main():
             dashboard = MetricsDashboard(
                 metrics_obj=metrics,
                 agent_obj=agent,
-                host="127.0.0.1",
+                host=dashboard_host,
                 port=dashboard_port,
                 open_browser=dashboard_open_browser,
             )
-            dashboard_url = dashboard.start()
+            dashboard.start()
+            dashboard_url_host = _resolve_dashboard_url_host(dashboard.host)
+            dashboard_url = f"http://{dashboard_url_host}:{dashboard.port}"
             print(f"📊 Metrics dashboard: {dashboard_url}")
+            if dashboard.host != dashboard_url_host:
+                print(f"   Bound on {dashboard.host}:{dashboard.port}")
         except Exception as e:
             dashboard = None
             print(f"⚠ Dashboard startup failed: {e}")
