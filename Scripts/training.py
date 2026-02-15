@@ -154,7 +154,10 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             if expert_idx.numel() > 0:
                 q_expert = agent.online_net.q_values(states_t[expert_idx])
                 bc_loss = F.cross_entropy(q_expert, actions_t[expert_idx])
-                weighted_loss = weighted_loss + bc_w * bc_loss
+                # Scale BC by sampled expert fraction to avoid over-weighting when
+                # expert transitions are sparse but present in most batches.
+                bc_scale = float(expert_idx.numel()) / float(B)
+                weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
                 bc_loss_val = float(bc_loss.detach().item())
 
     # ── Optimise ────────────────────────────────────────────────────────

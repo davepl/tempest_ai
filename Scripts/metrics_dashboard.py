@@ -258,29 +258,86 @@ def _render_dashboard_html() -> str:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tempest AI Metrics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DotGothic16&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg0: #070c14;
-      --bg1: #0f172a;
-      --bg2: #172554;
-      --panel: rgba(15, 23, 42, 0.78);
-      --line: rgba(148, 163, 184, 0.22);
-      --ink: #e2e8f0;
-      --muted: #93a4bc;
-      --accentA: #22d3ee;
-      --accentB: #f59e0b;
-      --accentC: #34d399;
-      --accentD: #f43f5e;
+      --bg0: #040510;
+      --bg1: #0b1433;
+      --bg2: #1a0a33;
+      --panel: rgba(6, 10, 28, 0.78);
+      --line: rgba(0, 229, 255, 0.26);
+      --ink: #e8f6ff;
+      --muted: #9cb6d4;
+      --accentA: #00e5ff;
+      --accentB: #ffe600;
+      --accentC: #39ff14;
+      --accentD: #ff2bd6;
+      --neonRed: #ff2a55;
+      --neonEdge: rgba(0, 229, 255, 0.65);
+      --panelGlowA: rgba(0, 229, 255, 0.22);
+      --panelGlowB: rgba(255, 43, 214, 0.18);
+      --vfdCyan: #70f7ff;
     }
     * { box-sizing: border-box; }
+    *::before, *::after { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; color: var(--ink); background: var(--bg0); }
     body {
       font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
       min-height: 100vh;
+      position: relative;
+      isolation: isolate;
+      overflow-x: hidden;
       background:
-        radial-gradient(1200px 600px at 0% 0%, rgba(14, 165, 233, 0.20), transparent 60%),
-        radial-gradient(900px 500px at 100% 0%, rgba(245, 158, 11, 0.18), transparent 58%),
-        linear-gradient(160deg, var(--bg0) 0%, var(--bg1) 60%, var(--bg2) 100%);
+        radial-gradient(1300px 650px at 6% -8%, rgba(0, 229, 255, 0.24), transparent 58%),
+        radial-gradient(950px 540px at 102% -4%, rgba(255, 43, 214, 0.22), transparent 56%),
+        radial-gradient(900px 500px at 52% 112%, rgba(57, 255, 20, 0.12), transparent 62%),
+        repeating-linear-gradient(0deg, rgba(130, 168, 224, 0.03) 0px, rgba(130, 168, 224, 0.03) 1px, transparent 1px, transparent 4px),
+        linear-gradient(158deg, var(--bg0) 0%, var(--bg1) 58%, var(--bg2) 100%);
+      background-attachment: fixed;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -35vh -20vw;
+      pointer-events: none;
+      z-index: 0;
+      background:
+        radial-gradient(circle at 18% 24%, rgba(0, 229, 255, 0.24), transparent 30%),
+        radial-gradient(circle at 78% 18%, rgba(255, 43, 214, 0.22), transparent 34%),
+        radial-gradient(circle at 68% 78%, rgba(57, 255, 20, 0.18), transparent 36%);
+      animation: orbDrift 20s ease-in-out infinite alternate;
+    }
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 1;
+      background: linear-gradient(90deg, rgba(0, 229, 255, 0.045), transparent 36%, transparent 64%, rgba(255, 43, 214, 0.045));
+      mix-blend-mode: screen;
+      animation: rgbSweep 14s linear infinite;
+    }
+    @keyframes orbDrift {
+      0% { transform: translate3d(-2.5%, -2%, 0) scale(1.0); }
+      50% { transform: translate3d(2%, 1.5%, 0) scale(1.08); }
+      100% { transform: translate3d(3%, -1.5%, 0) scale(1.03); }
+    }
+    @keyframes rgbSweep {
+      0% { opacity: 0.15; transform: translateX(-5%); }
+      50% { opacity: 0.42; transform: translateX(5%); }
+      100% { opacity: 0.15; transform: translateX(-5%); }
+    }
+    @keyframes borderShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    @keyframes ledPulse {
+      0% { transform: scale(0.95); filter: saturate(1.0); }
+      50% { transform: scale(1.10); filter: saturate(1.5); }
+      100% { transform: scale(0.95); filter: saturate(1.0); }
     }
     main {
       max-width: 1500px;
@@ -288,49 +345,95 @@ def _render_dashboard_html() -> str:
       padding: 20px;
       display: grid;
       gap: 16px;
+      position: relative;
+      z-index: 2;
+    }
+    .top, .card, .panel {
+      position: relative;
+      overflow: hidden;
+      background:
+        radial-gradient(120% 160% at 0% 0%, rgba(0, 229, 255, 0.10), transparent 58%),
+        radial-gradient(140% 150% at 100% 0%, rgba(255, 43, 214, 0.10), transparent 58%),
+        linear-gradient(155deg, rgba(7, 12, 30, 0.86) 0%, rgba(7, 10, 27, 0.74) 100%);
+      border: 1px solid var(--line);
+      box-shadow:
+        inset 0 0 0 1px rgba(0, 229, 255, 0.06),
+        0 0 26px var(--panelGlowA),
+        0 0 36px var(--panelGlowB);
+      backdrop-filter: blur(10px) saturate(118%);
+    }
+    .top::before, .card::before, .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      padding: 1px;
+      background: linear-gradient(110deg, rgba(0, 229, 255, 0.95), rgba(57, 255, 20, 0.9), rgba(255, 43, 214, 0.95), rgba(255, 230, 0, 0.9));
+      background-size: 250% 250%;
+      animation: borderShift 7s linear infinite;
+      opacity: 0.35;
+      pointer-events: none;
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+    }
+    .top::after, .card::after, .panel::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 36%);
+      opacity: 0.35;
     }
     .top {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
-      background: var(--panel);
-      border: 1px solid var(--line);
       border-radius: 16px;
       padding: 14px 18px;
-      backdrop-filter: blur(8px);
     }
     .title {
       display: flex;
       flex-direction: column;
       gap: 3px;
+      position: relative;
+      z-index: 2;
     }
     .title h1 {
       margin: 0;
       font-size: 24px;
-      letter-spacing: 0.2px;
-      font-weight: 650;
+      letter-spacing: 0.5px;
+      font-weight: 700;
+      color: #f5fbff;
+      text-shadow: 0 0 14px rgba(0, 229, 255, 0.45), 0 0 28px rgba(57, 255, 20, 0.24);
     }
     .subtitle {
       color: var(--muted);
       font-size: 13px;
+      text-shadow: 0 0 9px rgba(0, 229, 255, 0.14);
     }
     .status {
       display: inline-flex;
       align-items: center;
       gap: 9px;
       font-size: 13px;
-      border: 1px solid var(--line);
+      border: 1px solid rgba(0, 229, 255, 0.33);
       padding: 8px 12px;
       border-radius: 999px;
-      background: rgba(2, 6, 23, 0.35);
+      background: rgba(2, 6, 23, 0.50);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.18), 0 0 16px rgba(0, 229, 255, 0.16);
+      position: relative;
+      z-index: 2;
     }
     .dot {
       width: 10px;
       height: 10px;
       border-radius: 50%;
       background: var(--accentC);
-      box-shadow: 0 0 0 6px rgba(52, 211, 153, 0.15);
+      box-shadow: 0 0 0 7px rgba(57, 255, 20, 0.2), 0 0 14px rgba(57, 255, 20, 0.5);
+      animation: ledPulse 1.8s ease-in-out infinite;
     }
     .cards {
       display: grid;
@@ -338,8 +441,6 @@ def _render_dashboard_html() -> str:
       gap: 12px;
     }
     .card {
-      background: var(--panel);
-      border: 1px solid var(--line);
       border-radius: 14px;
       padding: 10px 12px;
       min-height: 86px;
@@ -349,16 +450,30 @@ def _render_dashboard_html() -> str:
       gap: 6px;
     }
     .label {
-      color: var(--muted);
+      color: #a5bfde;
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.7px;
+      letter-spacing: 0.8px;
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.18);
+      position: relative;
+      z-index: 2;
     }
     .value {
       font-size: 28px;
       line-height: 1;
-      font-weight: 670;
-      letter-spacing: 0.2px;
+      font-weight: 700;
+      letter-spacing: 0.35px;
+      color: #f0fbff;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.28), 0 0 22px rgba(57, 255, 20, 0.16);
+      position: relative;
+      z-index: 2;
+    }
+    .card:not(.gauge-card) .value {
+      font-family: "DotGothic16", "Courier New", monospace;
+      color: var(--vfdCyan);
+      letter-spacing: 0.95px;
+      font-variant-numeric: tabular-nums;
+      text-shadow: none;
     }
     .value-inline {
       display: inline-flex;
@@ -369,9 +484,10 @@ def _render_dashboard_html() -> str:
       width: 10px;
       height: 10px;
       border-radius: 50%;
-      background: #ef4444;
-      box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.20);
+      background: var(--neonRed);
+      box-shadow: 0 0 0 4px rgba(255, 42, 85, 0.24), 0 0 12px rgba(255, 42, 85, 0.58);
       flex: 0 0 auto;
+      animation: ledPulse 1.4s ease-in-out infinite;
     }
     .gauge-card {
       grid-column: span 1;
@@ -396,7 +512,9 @@ def _render_dashboard_html() -> str:
       font-weight: 700;
       letter-spacing: 0.3px;
       color: #d8f5ff;
-      text-shadow: 0 0 14px rgba(34, 211, 238, 0.22);
+      text-shadow: 0 0 14px rgba(0, 229, 255, 0.34), 0 0 30px rgba(57, 255, 20, 0.22);
+      position: relative;
+      z-index: 2;
     }
     .gauge-readout small {
       color: var(--muted);
@@ -409,7 +527,13 @@ def _render_dashboard_html() -> str:
       width: 100%;
       height: 158px;
       border-radius: 12px;
-      background: radial-gradient(circle at 50% 56%, rgba(2, 6, 23, 0.20) 0%, rgba(2, 6, 23, 0.52) 68%, rgba(2, 6, 23, 0.80) 100%);
+      border: 1px solid rgba(0, 229, 255, 0.30);
+      background:
+        radial-gradient(circle at 50% 56%, rgba(2, 6, 23, 0.16) 0%, rgba(2, 6, 23, 0.56) 68%, rgba(2, 6, 23, 0.84) 100%),
+        repeating-linear-gradient(0deg, rgba(130, 168, 224, 0.045) 0px, rgba(130, 168, 224, 0.045) 1px, transparent 1px, transparent 4px);
+      box-shadow: inset 0 0 22px rgba(0, 229, 255, 0.10), 0 0 18px rgba(0, 229, 255, 0.12);
+      position: relative;
+      z-index: 2;
     }
     .gauge-foot {
       display: flex;
@@ -418,6 +542,8 @@ def _render_dashboard_html() -> str:
       font-size: 11px;
       letter-spacing: 0.3px;
       text-transform: uppercase;
+      position: relative;
+      z-index: 2;
     }
     .charts {
       display: grid;
@@ -425,8 +551,6 @@ def _render_dashboard_html() -> str:
       gap: 14px;
     }
     .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
       border-radius: 14px;
       padding: 12px;
       min-height: 280px;
@@ -437,15 +561,22 @@ def _render_dashboard_html() -> str:
     .panel h2 {
       margin: 0;
       font-size: 16px;
-      font-weight: 620;
-      letter-spacing: 0.2px;
+      font-weight: 640;
+      letter-spacing: 0.35px;
+      color: #effbff;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.28), 0 0 22px rgba(255, 43, 214, 0.18);
+      position: relative;
+      z-index: 2;
     }
     .legend {
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
-      color: var(--muted);
+      color: #adc4df;
       font-size: 12px;
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.14);
+      position: relative;
+      z-index: 2;
     }
     .legend .sw {
       width: 10px;
@@ -455,12 +586,36 @@ def _render_dashboard_html() -> str:
       margin-right: 6px;
       position: relative;
       top: 1px;
+      box-shadow: 0 0 10px currentColor;
     }
     canvas {
       width: 100%;
       height: 210px;
       border-radius: 10px;
-      background: rgba(2, 6, 23, 0.30);
+      border: 1px solid rgba(0, 229, 255, 0.26);
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.28), rgba(2, 6, 23, 0.36)),
+        repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.04) 0px, rgba(120, 150, 210, 0.04) 1px, transparent 1px, transparent 5px);
+      box-shadow: inset 0 0 28px rgba(0, 229, 255, 0.10), 0 0 20px rgba(0, 229, 255, 0.12);
+      position: relative;
+      z-index: 2;
+    }
+    /* Low-GPU mode: disable continuous compositing-heavy effects. */
+    body::before,
+    body::after,
+    .top::before,
+    .card::before,
+    .panel::before,
+    .dot,
+    .metric-led {
+      animation: none !important;
+    }
+    .top, .card, .panel {
+      backdrop-filter: none;
+    }
+    body::after {
+      mix-blend-mode: normal;
+      opacity: 0.10;
     }
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
@@ -575,6 +730,7 @@ def _render_dashboard_html() -> str:
   <script>
     const num = new Intl.NumberFormat("en-US");
     const maxPoints = 900;
+    const DASH_REFRESH_MS = 100;
     const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
     const GAUGE_MAX_FPS = 1200;
@@ -627,6 +783,7 @@ def _render_dashboard_html() -> str:
             color: "#22c55e",
             axis: {
               side: "left",
+              label_pad: 52,
               group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
             }
           },
@@ -656,7 +813,7 @@ def _render_dashboard_html() -> str:
           {
             key: "reward_dqn",
             color: "#22c55e",
-            axis: { side: "left", min: 0, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
+            axis: { side: "left", min: 0, label_pad: 52, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
           }
         ]
       },
@@ -693,12 +850,12 @@ def _render_dashboard_html() -> str:
       const dot = document.getElementById("statusDot");
       const text = document.getElementById("statusText");
       if (connected) {
-        dot.style.background = "#34d399";
-        dot.style.boxShadow = "0 0 0 6px rgba(52,211,153,0.15)";
+        dot.style.background = "#39ff14";
+        dot.style.boxShadow = "0 0 0 7px rgba(57,255,20,0.22), 0 0 16px rgba(57,255,20,0.55)";
         text.textContent = "Connected";
       } else {
-        dot.style.background = "#f43f5e";
-        dot.style.boxShadow = "0 0 0 6px rgba(244,63,94,0.18)";
+        dot.style.background = "#ff2a55";
+        dot.style.boxShadow = "0 0 0 7px rgba(255,42,85,0.24), 0 0 16px rgba(255,42,85,0.55)";
         text.textContent = "Disconnected";
       }
     }
@@ -707,17 +864,17 @@ def _render_dashboard_html() -> str:
       if (!cards.infLed) return;
       const ms = Number(avgInfMs);
       if (!Number.isFinite(ms) || ms < 5.0) {
-        cards.infLed.style.background = "#22c55e";
-        cards.infLed.style.boxShadow = "0 0 0 4px rgba(34, 197, 94, 0.22)";
+        cards.infLed.style.background = "#39ff14";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(57,255,20,0.22), 0 0 12px rgba(57,255,20,0.6)";
         return;
       }
       if (ms < 10.0) {
-        cards.infLed.style.background = "#f59e0b";
-        cards.infLed.style.boxShadow = "0 0 0 4px rgba(245, 158, 11, 0.22)";
+        cards.infLed.style.background = "#ffe600";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
         return;
       }
-      cards.infLed.style.background = "#ef4444";
-      cards.infLed.style.boxShadow = "0 0 0 4px rgba(239, 68, 68, 0.22)";
+      cards.infLed.style.background = "#ff2a55";
+      cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
     }
 
     function drawFpsGauge(canvas, fps) {
@@ -934,11 +1091,22 @@ def _render_dashboard_html() -> str:
 
       const axisDefs = seriesDefs.filter((s) => !!s.axis);
       const axisSourceSeries = axisDefs.length ? axisDefs : seriesDefs;
-      const leftAxisCount = Math.max(1, axisSourceSeries.filter((s) => (s.axis?.side || "left") === "left").length);
-      const rightAxisCount = Math.max(0, axisSourceSeries.filter((s) => (s.axis?.side || "right") === "right").length);
-      const padL = 26 + (leftAxisCount * 34);
-      const padR = 26 + (Math.max(1, rightAxisCount) * 34);
-      const padT = 10, padB = 18;
+      const axisSlotDefault = 34;
+      const axisSlotFor = (s) => {
+        const v = Number(s?.axis?.label_pad);
+        return Number.isFinite(v) ? Math.max(20, v) : axisSlotDefault;
+      };
+      const leftAxisSeries = axisSourceSeries.filter((s) => (s.axis?.side || "left") === "left");
+      const rightAxisSeries = axisSourceSeries.filter((s) => (s.axis?.side || "right") === "right");
+      const leftAxisPad = leftAxisSeries.length
+        ? leftAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
+        : axisSlotDefault;
+      const rightAxisPad = rightAxisSeries.length
+        ? rightAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
+        : axisSlotDefault;
+      const padL = 26 + leftAxisPad;
+      const padR = 26 + rightAxisPad;
+      const padT = 10, padB = 30;
       const plotW = width - padL - padR;
       const plotH = height - padT - padB;
       if (plotW <= 20 || plotH <= 20) return;
@@ -972,6 +1140,38 @@ def _render_dashboard_html() -> str:
         return 0.25 - (((age - (4.0 * baseAge)) / (4.0 * baseAge)) * 0.25);
       };
 
+      const ageFromXNorm = (xNormRaw) => {
+        if (!hasTimeAxis || baseAge <= 0) return 0.0;
+        const xn = Math.max(0.0, Math.min(1.0, xNormRaw));
+        if (xn >= 0.75) {
+          return (1.0 - xn) * 4.0 * baseAge;
+        }
+        if (xn >= 0.50) {
+          return baseAge + ((0.75 - xn) * 4.0 * baseAge);
+        }
+        if (xn >= 0.25) {
+          return (2.0 * baseAge) + ((0.50 - xn) * 8.0 * baseAge);
+        }
+        return (4.0 * baseAge) + ((0.25 - xn) * 16.0 * baseAge);
+      };
+
+      const formatLookback = (ageSecRaw) => {
+        const ageSec = Math.max(0.0, Number(ageSecRaw) || 0.0);
+        if (ageSec < 90.0) {
+          return `${Math.round(ageSec)}s`;
+        }
+        const mins = ageSec / 60.0;
+        if (mins < 90.0) {
+          return `${Math.round(mins)}m`;
+        }
+        const hours = mins / 60.0;
+        if (hours < 48.0) {
+          return `${hours < 10.0 ? hours.toFixed(1) : Math.round(hours)}h`;
+        }
+        const days = hours / 24.0;
+        return `${days < 10.0 ? days.toFixed(1) : Math.round(days)}d`;
+      };
+
       const xAt = (i) => {
         if (!hasTimeAxis) {
           const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
@@ -992,10 +1192,11 @@ def _render_dashboard_html() -> str:
       };
 
       const axes = [];
-      let leftUsed = 0;
-      let rightUsed = 0;
+      let leftAxisOffset = 0;
+      let rightAxisOffset = 0;
       for (const s of axisSourceSeries) {
         const side = s.axis?.side === "right" ? "right" : "left";
+        const axisSlot = axisSlotFor(s);
         const sourceKeys = Array.isArray(s.axis?.group_keys) && s.axis.group_keys.length
           ? s.axis.group_keys
           : [s.key];
@@ -1035,10 +1236,14 @@ def _render_dashboard_html() -> str:
           }
         }
 
-        const axisIndex = side === "left" ? leftUsed++ : rightUsed++;
         const axisX = side === "left"
-          ? (padL - 20 - (axisIndex * 28))
-          : (width - padR + 20 + (axisIndex * 28));
+          ? (padL - 20 - leftAxisOffset)
+          : (width - padR + 20 + rightAxisOffset);
+        if (side === "left") {
+          leftAxisOffset += axisSlot;
+        } else {
+          rightAxisOffset += axisSlot;
+        }
         const ticks = Array.isArray(s.axis?.ticks) && s.axis.ticks.length
           ? s.axis.ticks
           : [minV, minV + (maxV - minV) * 0.25, minV + (maxV - minV) * 0.5, minV + (maxV - minV) * 0.75, maxV];
@@ -1122,6 +1327,62 @@ def _render_dashboard_html() -> str:
           ctx.fillText(labelText, axis.x - tickDir * 12, y);
         }
 
+      }
+
+      // Horizontal lookback axis (0 = now at right, 1 = oldest at left).
+      const xAxisColor = axes[0]?.color || "#22c55e";
+      const xAxisY = height - 18;
+      const xTickDefs = [
+        { frac: 0.0 },
+        { frac: 0.25 },
+        { frac: 0.5 },
+        { frac: 0.75 },
+        { frac: 1.0 },
+      ];
+      ctx.strokeStyle = xAxisColor;
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(padL, xAxisY);
+      ctx.lineTo(width - padR, xAxisY);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      ctx.font = "11px 'Avenir Next', 'Segoe UI', sans-serif";
+      ctx.textBaseline = "top";
+      for (const tk of xTickDefs) {
+        const frac = Math.max(0.0, Math.min(1.0, Number(tk.frac)));
+        const xNorm = 1.0 - frac;
+        const x = padL + (xNorm * plotW);
+        const labelText = hasTimeAxis
+          ? formatLookback(ageFromXNorm(xNorm))
+          : (frac === 0.0 ? "0s" : "n/a");
+
+        // Bright tick plus faint extension, matching vertical style.
+        ctx.strokeStyle = xAxisColor;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(x, xAxisY);
+        ctx.lineTo(x, xAxisY - 8);
+        ctx.stroke();
+
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x, xAxisY - 8);
+        ctx.lineTo(x, xAxisY - 14);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+
+        ctx.fillStyle = xAxisColor;
+        if (frac <= 1e-9) {
+          ctx.textAlign = "right";
+        } else if (frac >= (1.0 - 1e-9)) {
+          ctx.textAlign = "left";
+        } else {
+          ctx.textAlign = "center";
+        }
+        ctx.fillText(labelText, x, xAxisY + 2);
       }
 
       const n = points.length;
@@ -1234,16 +1495,21 @@ def _render_dashboard_html() -> str:
         const res = await fetch(`/api/now?t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const now = await res.json();
+        const hadNow = !!latestNow;
         latestNow = now;
         const ts = Number(now && now.ts);
+        let hasNewSample = false;
         if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
           historyCache.push(now);
           if (historyCache.length > maxPoints) {
             historyCache.shift();
           }
           lastTs = ts;
+          hasNewSample = true;
         }
-        renderCurrent();
+        if (hasNewSample || !hadNow) {
+          renderCurrent();
+        }
         setConnected(true);
       } catch (err) {
         setConnected(false);
@@ -1266,7 +1532,7 @@ def _render_dashboard_html() -> str:
     }
 
     fetchHistory().then(() => fetchNow()).catch(() => {});
-    setInterval(fetchNow, 100);
+    setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
     window.addEventListener("resize", () => renderCurrent());
   </script>
@@ -1328,7 +1594,8 @@ class MetricsDashboard:
         self.agent = agent_obj
         self.host = host
         self.port = port
-        self.sample_interval = max(0.05, sample_interval)
+        # Cap sampler refresh at 10 Hz max.
+        self.sample_interval = max(0.1, sample_interval)
         self.open_browser = open_browser
 
         self.state = _DashboardState(metrics_obj, agent_obj, history_limit=history_limit)
