@@ -79,8 +79,8 @@ class RLConfigData:
     lr: float = 6.25e-5
     lr_min: float = 1e-5                  # Decay to 1/6 of peak — lets network settle
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 500_000        # Used as full decay horizon for non-restart cosine
-    lr_use_restarts: bool = False          # False = monotonic cosine decay to lr_min (no warm restarts)
+    lr_cosine_period: int = 500_000        # Each restart cycle decays over this many training steps
+    lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 10                        # Doubled from 5 for wider death attribution window
     max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
@@ -106,7 +106,7 @@ class RLConfigData:
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 1_000_000
     # Late-training exploration pulses to escape local optima.
-    epsilon_pulse_max: float = 0.06
+    epsilon_pulse_max: float = 0.10
     epsilon_pulse_period_frames: int = 300_000
     epsilon_pulse_start_frame: int = 3_000_000
     epsilon: float = 1.0

@@ -834,6 +834,13 @@ class RainbowAgent:
         if is_forced_save:
             print(f"Model saved to {filepath}")
 
+        # Save replay buffer alongside the model
+        buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+        try:
+            self.memory.save(buf_path)
+        except Exception as e:
+            print(f"  Replay buffer save failed: {e}")
+
     def load(self, filepath) -> bool:
         if not os.path.exists(filepath):
             return False
@@ -881,11 +888,26 @@ class RainbowAgent:
                 pass
 
             print(f"Loaded v2 model from {filepath}")
+
+            # Load replay buffer if present alongside the model
+            buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+            try:
+                if os.path.exists(buf_path):
+                    self.memory.load(buf_path)
+                else:
+                    print("  No replay buffer file found — starting with empty buffer.")
+            except Exception as e:
+                print(f"  Replay buffer load failed: {e}")
+
             return True
         except Exception as e:
             print(f"Error loading {filepath}: {e}")
             traceback.print_exc()
             return False
+
+    def flush_replay_buffer(self):
+        """Clear the entire replay buffer."""
+        self.memory.flush()
 
     def reset_attention_weights(self):
         """Reinitialize only the lane-cross-attention weights, keeping trunk and heads intact."""

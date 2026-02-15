@@ -480,6 +480,26 @@ def _render_dashboard_html() -> str:
       align-items: center;
       gap: 10px;
     }
+    .avg-level-card .level-inline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 58px;
+    }
+    .avg-level-card .level-mini-canvas {
+      width: 132px;
+      height: 58px;
+      border-radius: 8px;
+      border: 1px solid rgba(0, 229, 255, 0.30);
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.30)),
+        repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.035) 0px, rgba(120, 150, 210, 0.035) 1px, transparent 1px, transparent 4px);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.10), 0 0 12px rgba(0, 229, 255, 0.09);
+      position: relative;
+      z-index: 2;
+      flex: 0 0 auto;
+    }
     .metric-led {
       width: 10px;
       height: 10px;
@@ -620,12 +640,14 @@ def _render_dashboard_html() -> str:
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
       .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 188px; }
+      .avg-level-card .level-mini-canvas { width: 110px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
+      .avg-level-card .level-mini-canvas { width: 96px; height: 52px; }
     }
   </style>
 </head>
@@ -658,7 +680,13 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
       <article class="card"><div class="label">Clients</div><div class="value" id="mClients">0</div></article>
-      <article class="card"><div class="label">Avg Level</div><div class="value" id="mLevel">0.0</div></article>
+      <article class="card avg-level-card">
+        <div class="label">Avg Level</div>
+        <div class="level-inline">
+          <div class="value" id="mLevel">0.0</div>
+          <canvas id="cLevelMini" class="level-mini-canvas"></canvas>
+        </div>
+      </article>
       <article class="card">
         <div class="label">Avg Inf</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
@@ -715,15 +743,6 @@ def _render_dashboard_html() -> str:
         <canvas id="cDqn"></canvas>
       </article>
 
-      <article class="panel">
-        <h2>Level Rolling</h2>
-        <div class="legend">
-          <span><span class="sw" style="background:#22c55e;"></span>Level25K</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>Level1M</span>
-          <span><span class="sw" style="background:#22d3ee;"></span>Level5M</span>
-        </div>
-        <canvas id="cLevel1M"></canvas>
-      </article>
     </section>
   </main>
 
@@ -818,7 +837,7 @@ def _render_dashboard_html() -> str:
         ]
       },
       level1m: {
-        canvas: document.getElementById("cLevel1M"),
+        canvas: document.getElementById("cLevelMini"),
         series: [
           {
             key: "level_25k",
@@ -1411,6 +1430,89 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    function drawMiniChart(canvas, history, seriesDefs) {
+      if (!canvas) return;
+      const points = history.slice(-240);
+      const width = canvas.clientWidth || 120;
+      const height = canvas.clientHeight || 56;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      if (!points.length) return;
+
+      const padX = 4;
+      const padY = 6;
+      const plotW = width - (2 * padX);
+      const plotH = height - (2 * padY);
+      if (plotW <= 4 || plotH <= 4) return;
+
+      const values = [];
+      for (const row of points) {
+        for (const s of seriesDefs) {
+          const v = Number(row[s.key]);
+          if (Number.isFinite(v)) {
+            values.push(v);
+          }
+        }
+      }
+      if (!values.length) return;
+
+      let minV = Math.min(...values);
+      let maxV = Math.max(...values);
+      if (maxV <= minV) {
+        maxV = minV + 1.0;
+      } else {
+        const p = (maxV - minV) * 0.08;
+        minV -= p;
+        maxV += p;
+      }
+
+      const xAt = (i) => {
+        const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+        return padX + (t * plotW);
+      };
+      const yAt = (v) => {
+        const t = (v - minV) / (maxV - minV);
+        return padY + ((1.0 - t) * plotH);
+      };
+
+      // Soft center guide.
+      const yMid = padY + (plotH * 0.5);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(padX, yMid);
+      ctx.lineTo(width - padX, yMid);
+      ctx.stroke();
+
+      const n = points.length;
+      for (const s of seriesDefs) {
+        ctx.strokeStyle = s.color;
+        ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
+        ctx.lineWidth = (s.key === "level_1m") ? 2.0 : 1.6;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < n; i++) {
+          const val = Number(points[i][s.key]);
+          if (!Number.isFinite(val)) continue;
+          const x = xAt(i);
+          const y = yAt(val);
+          if (!started) {
+            ctx.moveTo(x, y);
+            started = true;
+          } else {
+            ctx.lineTo(x, y);
+          }
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
     function computeSmoothedStepSpd(now, history) {
       const rows = Array.isArray(history) ? history.slice(-STEP_GAUGE_AVG_WINDOW) : [];
       const vals = [];
@@ -1458,7 +1560,7 @@ def _render_dashboard_html() -> str:
       drawChart(charts.rewards.canvas, history, charts.rewards.series);
       drawChart(charts.learning.canvas, history, charts.learning.series);
       drawChart(charts.dqn.canvas, history, charts.dqn.series);
-      drawChart(charts.level1m.canvas, history, charts.level1m.series);
+      drawMiniChart(charts.level1m.canvas, history, charts.level1m.series);
     }
 
     let historyCache = [];

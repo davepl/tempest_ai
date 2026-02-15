@@ -5,6 +5,7 @@
 # ==================================================================================================================
 """Prioritized replay buffer using a sum-tree for O(log N) sampling."""
 
+import os, sys, time
 import numpy as np
 import threading
 
@@ -230,3 +231,122 @@ class PrioritizedReplayBuffer:
                 "frac_dqn": n_dqn / max(1, self.size),
                 "frac_expert": n_exp / max(1, self.size),
             }
+
+    # ── Persistence ─────────────────────────────────────────────────────
+
+    def save(self, filepath: str):
+        """Save the full replay buffer (data + priorities) to disk with progress."""
+        with self.lock:
+            if self.size == 0:
+                print("  Replay buffer is empty — nothing to save.")
+                return
+
+            n = self.size
+            print(f"  Saving replay buffer ({n:,} transitions)...")
+            t0 = time.time()
+
+            # Collect all arrays into a dict; only save filled portion
+            data = {
+                "states":      self.states[:n],
+                "next_states": self.next_states[:n],
+                "actions":     self.actions[:n],
+                "rewards":     self.rewards[:n],
+                "dones":       self.dones[:n],
+                "horizons":    self.horizons[:n],
+                "is_expert":   self.is_expert[:n],
+                "priorities":  self.tree.tree[self.tree.capacity:self.tree.capacity + n].copy(),
+                "data_ptr":    np.int64(self.tree.data_ptr),
+                "max_priority": np.float64(self.tree.max_priority),
+            }
+
+        # Write outside the lock to minimise contention
+        tmp = filepath + ".tmp"
+        np.savez_compressed(tmp, **data)
+        os.replace(tmp, filepath)
+        elapsed = time.time() - t0
+        mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")
+
+    def load(self, filepath: str) -> bool:
+        """Load a replay buffer from disk with progress. Returns True on success."""
+        if not os.path.exists(filepath):
+            return False
+
+        print(f"  Loading replay buffer from {filepath}...")
+        t0 = time.time()
+
+        try:
+            arch = np.load(filepath, allow_pickle=False)
+        except Exception as e:
+            print(f"  Failed to read replay buffer: {e}")
+            return False
+
+        n = len(arch["states"])
+        if n == 0:
+            print("  Replay buffer file is empty.")
+            return False
+
+        # Validate state size compatibility
+        saved_state_size = arch["states"].shape[1]
+        if saved_state_size != self.state_size:
+            print(f"  State size mismatch: saved={saved_state_size}, expected={self.state_size}")
+            return False
+
+        # If saved data exceeds our capacity, take only the most recent entries
+        if n > self.capacity:
+            print(f"  Saved buffer ({n:,}) exceeds capacity ({self.capacity:,}), truncating to most recent.")
+            offset = n - self.capacity
+            n = self.capacity
+        else:
+            offset = 0
+
+        with self.lock:
+            print(f"  Restoring {n:,} transitions...", end="", flush=True)
+
+            self.states[:n]      = arch["states"][offset:offset + n]
+            self.next_states[:n] = arch["next_states"][offset:offset + n]
+            self.actions[:n]     = arch["actions"][offset:offset + n]
+            self.rewards[:n]     = arch["rewards"][offset:offset + n]
+            self.dones[:n]       = arch["dones"][offset:offset + n]
+            self.horizons[:n]    = arch["horizons"][offset:offset + n]
+            self.is_expert[:n]   = arch["is_expert"][offset:offset + n]
+
+            # Restore SumTree state
+            priorities = arch["priorities"][offset:offset + n]
+            self.tree.size = n
+            self.tree.data_ptr = int(arch["data_ptr"]) if offset == 0 else n % self.capacity
+            self.tree.max_priority = float(arch["max_priority"])
+
+            # Write all leaf priorities and rebuild the tree
+            self.tree.tree[self.tree.capacity:self.tree.capacity + n] = priorities.astype(np.float64)
+            # Zero out unused leaves
+            if n < self.capacity:
+                self.tree.tree[self.tree.capacity + n:] = 0.0
+
+            # Rebuild internal nodes bottom-up
+            for i in range(self.tree.capacity - 1, 0, -1):
+                self.tree.tree[i] = self.tree.tree[2 * i] + self.tree.tree[2 * i + 1]
+
+            self.size = n
+            self._n_expert = int(self.is_expert[:n].sum())
+
+        elapsed = time.time() - t0
+        mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f" done ({mb:.0f} MB, {elapsed:.1f}s)")
+        return True
+
+    def flush(self):
+        """Clear the entire replay buffer."""
+        with self.lock:
+            self.tree = SumTree(self.capacity)
+            self.size = 0
+            self._n_expert = 0
+            # Zero the storage arrays so stale data can't leak
+            self.states.fill(0)
+            self.next_states.fill(0)
+            self.actions.fill(0)
+            self.rewards.fill(0)
+            self.dones.fill(0)
+            self.horizons.fill(1)
+            self.is_expert.fill(0)
+        print("  Replay buffer flushed.")

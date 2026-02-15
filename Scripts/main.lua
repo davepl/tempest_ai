@@ -418,11 +418,12 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     for i = 1, 4 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_shot_segments[i])
     end
-    -- Charging Fuseball segments (7) - relative values
+    -- Pulsar depths table (7) - raw depth for active pulsars, 0 otherwise.
+    -- Reuses this 7-wide block so payload width stays fixed at 195.
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.charging_fuseball[i])
+        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, es.active_pulsar_depths[i] or 0)
     end
-    -- Active Pulsar segments (7) - relative values
+    -- Pulsar lanes table (7) - relative segment for active pulsars.
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_pulsar[i])
     end
