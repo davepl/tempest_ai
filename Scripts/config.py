@@ -83,7 +83,7 @@ class RLConfigData:
     lr_use_restarts: bool = False          # False = monotonic cosine decay to lr_min (no warm restarts)
     gamma: float = 0.99
     n_step: int = 10                        # Doubled from 5 for wider death attribution window
-    max_samples_per_frame: float = 8.0      # Cap replay pressure: sampled transitions per env frame
+    max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
     memory_size: int = 2_000_000
@@ -94,9 +94,9 @@ class RLConfigData:
     per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
     min_replay_to_train: int = 10_000
 
-    # Target network (soft Polyak averaging)
-    target_update_period: int = 1
-    target_tau: float = 0.0005             # Slower tracking → more stable anchor
+    # Target network (periodic hard sync; faster refresh to reduce staleness in plateau phase)
+    target_update_period: int = 1_000
+    target_tau: float = 1.0
 
     # Gradient
     grad_clip_norm: float = 5.0            # Tighter clipping dampens large updates
@@ -105,6 +105,10 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 1_000_000
+    # Late-training exploration pulses to escape local optima.
+    epsilon_pulse_max: float = 0.06
+    epsilon_pulse_period_frames: int = 300_000
+    epsilon_pulse_start_frame: int = 3_000_000
     epsilon: float = 1.0
 
     # Expert guidance
@@ -121,7 +125,7 @@ class RLConfigData:
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
     # Keep a small floor to anchor policy as expert ratio approaches its minimum.
-    expert_bc_min_weight: float = 0.05
+    expert_bc_min_weight: float = 0.01
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
@@ -138,7 +142,7 @@ class RLConfigData:
     inference_sync_steps: int = 100
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 8
+    training_steps_per_cycle: int = 4
     save_interval: int = 10_000
 
     enable_amp: bool = True
@@ -242,12 +246,27 @@ class MetricsData:
         with self.lock:
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
+    @staticmethod
+    def _natural_epsilon_for_frame(frame_count: int) -> float:
+        progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
+        base = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+
+        pulse_max = float(getattr(RL_CONFIG, "epsilon_pulse_max", base))
+        pulse_period = int(getattr(RL_CONFIG, "epsilon_pulse_period_frames", 0))
+        pulse_start = int(getattr(RL_CONFIG, "epsilon_pulse_start_frame", RL_CONFIG.epsilon_decay_frames))
+        if frame_count < pulse_start or pulse_period <= 0 or pulse_max <= base:
+            return base
+
+        phase = ((frame_count - pulse_start) % pulse_period) / float(pulse_period)
+        # Triangle wave: 0 → 1 → 0 over one period.
+        pulse = 1.0 - abs((2.0 * phase) - 1.0)
+        return base + (pulse_max - base) * pulse
+
     def update_epsilon(self):
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
-            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-            self.epsilon = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+            self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
             return self.epsilon
 
     def get_expert_ratio(self):
@@ -365,8 +384,7 @@ class MetricsData:
     def restore_natural_epsilon(self, kb=None):
         with self.lock:
             self.manual_epsilon_override = False
-            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-            self.epsilon = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+            self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
 
 
 metrics = MetricsData()
