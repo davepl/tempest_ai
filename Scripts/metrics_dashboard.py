@@ -23,7 +23,7 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     from config import RL_CONFIG
@@ -52,6 +52,7 @@ def _tail_mean(values, count: int = 20) -> float:
 LEVEL_25K_FRAMES = 25_000
 LEVEL_1M_FRAMES = 1_000_000
 LEVEL_5M_FRAMES = 5_000_000
+WEB_CLIENT_TIMEOUT_S = 5.0
 
 
 class _DashboardState:
@@ -70,6 +71,7 @@ class _DashboardState:
         }
         self._last_level_frame_count: int | None = None
         self._last_avg_inf_ms = 0.0
+        self._web_clients: dict[str, float] = {}
         self._cached_now_body = b"{}"
 
     def _clear_level_windows(self):
@@ -77,6 +79,25 @@ class _DashboardState:
             win["samples"].clear()
             win["frames"] = 0
             win["weighted"] = 0.0
+
+    def _update_web_client_count_locked(self, now_ts: float | None = None) -> int:
+        now = float(now_ts if now_ts is not None else time.time())
+        stale_before = now - WEB_CLIENT_TIMEOUT_S
+        stale = [cid for cid, ts in self._web_clients.items() if ts < stale_before]
+        for cid in stale:
+            self._web_clients.pop(cid, None)
+        active = len(self._web_clients)
+        with self.metrics.lock:
+            self.metrics.web_client_count = active
+        return active
+
+    def touch_web_client(self, client_id: str | None):
+        if not client_id:
+            return
+        now = time.time()
+        with self.lock:
+            self._web_clients[client_id] = now
+            self._update_web_client_count_locked(now)
 
     def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float]:
         raw_level = float(average_level)
@@ -141,6 +162,7 @@ class _DashboardState:
             epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
             expert_ratio = float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
+            web_client_count = int(self.metrics.web_client_count)
             average_level = float(self.metrics.average_level + 1.0)
             memory_buffer_size = int(self.metrics.memory_buffer_size)
             memory_buffer_k = int(memory_buffer_size // 1000)
@@ -206,6 +228,7 @@ class _DashboardState:
             "epsilon_raw": epsilon_raw,
             "expert_ratio": expert_ratio,
             "client_count": client_count,
+            "web_client_count": web_client_count,
             "average_level": average_level,
             "memory_buffer_k": memory_buffer_k,
             "memory_buffer_pct": memory_buffer_pct,
@@ -233,6 +256,8 @@ class _DashboardState:
         }
 
     def sample(self):
+        with self.lock:
+            self._update_web_client_count_locked()
         snap = self._build_snapshot()
         with self.lock:
             self.latest = snap
@@ -679,7 +704,8 @@ def _render_dashboard_html() -> str:
         <div class="gauge-foot"><span>R10 Y20</span><span>G30</span></div>
       </article>
       <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
-      <article class="card"><div class="label">Clients</div><div class="value" id="mClients">0</div></article>
+      <article class="card"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card avg-level-card">
         <div class="label">Avg Level</div>
         <div class="level-inline">
@@ -757,12 +783,19 @@ def _render_dashboard_html() -> str:
     const GAUGE_MIN_STEPS = 0;
     const GAUGE_MAX_STEPS = 30;
     let failedPings = 0;
+    const CLIENT_ID = (() => {
+      try {
+        if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+      } catch (_) {}
+      return `c_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    })();
 
     const cards = {
       frame: document.getElementById("mFrame"),
       fps: document.getElementById("mFps"),
       steps: document.getElementById("mSteps"),
       clients: document.getElementById("mClients"),
+      web: document.getElementById("mWeb"),
       level: document.getElementById("mLevel"),
       inf: document.getElementById("mInf"),
       infLed: document.getElementById("mInfLed"),
@@ -1534,6 +1567,7 @@ def _render_dashboard_html() -> str:
       cards.fps.textContent = fmtFloat(now.fps, 1);
       cards.steps.textContent = fmtFloat(smoothedSteps, 1);
       cards.clients.textContent = fmtInt(now.client_count);
+      cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
       cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)}ms`;
       setInfLed(now.avg_inf_ms);
@@ -1574,7 +1608,7 @@ def _render_dashboard_html() -> str:
 
     async function fetchHistory() {
       try {
-        const res = await fetch(`/api/history?t=${Date.now()}`, { cache: "no-store" });
+        const res = await fetch(`/api/history?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const payload = await res.json();
         const now = payload && payload.now ? payload.now : null;
@@ -1594,7 +1628,7 @@ def _render_dashboard_html() -> str:
 
     async function fetchNow() {
       try {
-        const res = await fetch(`/api/now?t=${Date.now()}`, { cache: "no-store" });
+        const res = await fetch(`/api/now?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const now = await res.json();
         const hadNow = !!latestNow;
@@ -1620,7 +1654,7 @@ def _render_dashboard_html() -> str:
 
     async function heartbeat() {
       try {
-        const res = await fetch(`/api/ping?t=${Date.now()}`, { cache: "no-store" });
+        const res = await fetch(`/api/ping?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("no ping");
         failedPings = 0;
         setConnected(true);
@@ -1656,7 +1690,12 @@ def _make_handler(state: _DashboardState):
             self.wfile.write(payload)
 
         def do_GET(self):
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            client_id = (query.get("cid") or [None])[0]
+            if path in ("/api/ping", "/api/now", "/api/history"):
+                state.touch_web_client(client_id)
             if path == "/":
                 self._send(page, "text/html; charset=utf-8")
                 return

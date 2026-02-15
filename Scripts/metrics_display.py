@@ -116,7 +116,7 @@ def display_metrics_header():
         f"{'Rwrd':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
         f"{'Loss':>10} {'Agree%':>7} "
         f"{'EpLen':>8} {'BCLoss':>8} "
-        f"{'Clnt':>4} {'Levl':>5} "
+        f"{'Clnt':>4} {'Web':>4} {'Levl':>5} "
         f"{'AvgInf':>7} {'Steps/s':>8} {'Rpl/F':>7} {'GrNorm':>8} {'Q-Range':>14} {'Mem':>10} {'LR':>9}"
     )
     _print_line(hdr, is_header=True)
@@ -235,7 +235,7 @@ def display_metrics_row(agent, kb_handler):
         f"{_fr(dqn1m*inv)} {_fr(dqn5m*inv)} "
         f"{loss_avg:>10.6f} {agree_avg*100:>6.1f}% "
         f"{avg_ep_len:>8.1f} {metrics.last_bc_loss:>8.4f} "
-        f"{metrics.client_count:>4} {display_level:>5.1f} "
+        f"{metrics.client_count:>4} {metrics.web_client_count:>4} {display_level:>5.1f} "
         f"{avg_inf_ms:>7.2f} {steps_per_sec:>8.1f} "
         f"{replay_ratio:>7.2f} {metrics.last_grad_norm:>8.3f} {q_range:>14} {mem_k:>8}k {lr_str:>9}"
     )

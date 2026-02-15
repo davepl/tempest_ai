@@ -138,7 +138,9 @@ class RLConfigData:
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
-    inference_on_cpu: bool = True
+    # Keep inference on GPU when available; CPU inference can become a bottleneck
+    # at higher frame rates even with low overall system utilization.
+    inference_on_cpu: bool = False
     inference_sync_steps: int = 100
 
     # ── background training ─────────────────────────────────────────────
@@ -160,6 +162,7 @@ class MetricsData:
     total_training_steps: int = 0
     memory_buffer_size: int = 0
     client_count: int = 0
+    web_client_count: int = 0
 
     epsilon: float = RL_CONFIG.epsilon_start
     expert_ratio: float = RL_CONFIG.expert_ratio_start
