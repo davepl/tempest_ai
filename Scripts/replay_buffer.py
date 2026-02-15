@@ -261,8 +261,27 @@ class PrioritizedReplayBuffer:
 
         # Write outside the lock to minimise contention
         tmp = filepath + ".tmp"
-        np.savez_compressed(tmp, **data)
-        os.replace(tmp, filepath)
+        legacy_tmp_npz = tmp + ".npz"
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        for stale in (tmp, legacy_tmp_npz):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except Exception:
+                    pass
+        try:
+            # Use a file handle so numpy does not rewrite the path/extension.
+            with open(tmp, "wb") as f:
+                np.savez_compressed(f, **data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, filepath)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
         elapsed = time.time() - t0
         mb = os.path.getsize(filepath) / (1024 * 1024)
         print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")

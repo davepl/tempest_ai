@@ -639,6 +639,10 @@ class RainbowAgent:
             self._sync_inference(force=True)
         else:
             self.infer_net = self.online_net
+        print(
+            f"Agent devices: train={self.device.type}, infer={self.inference_device.type}, "
+            f"separate_infer={self.use_separate_inference}"
+        )
 
         # Optimizer
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=cfg.lr, eps=1.5e-4)
