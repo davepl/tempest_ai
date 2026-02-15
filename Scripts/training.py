@@ -18,7 +18,11 @@ except ImportError:
 
 # Device (mirrors aimodel.py)
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
+    n = torch.cuda.device_count()
+    idx = int(getattr(RL_CONFIG, "train_cuda_device_index", 0))
+    if idx < 0 or idx >= n:
+        idx = 0
+    device = torch.device(f"cuda:{idx}")
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = torch.device("mps")
 else:

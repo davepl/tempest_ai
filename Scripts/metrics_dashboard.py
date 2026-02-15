@@ -12,6 +12,7 @@ if __name__ == "__main__":
 import atexit
 import json
 import math
+import mimetypes
 import os
 import shutil
 import signal
@@ -23,7 +24,7 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
     from config import RL_CONFIG
@@ -53,10 +54,35 @@ LEVEL_25K_FRAMES = 25_000
 LEVEL_1M_FRAMES = 1_000_000
 LEVEL_5M_FRAMES = 5_000_000
 WEB_CLIENT_TIMEOUT_S = 5.0
+DASH_HISTORY_LIMIT = 18_000
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
+
+
+def _audio_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "audio")
+
+
+def _list_audio_files() -> list[str]:
+    root = _audio_dir()
+    try:
+        names = os.listdir(root)
+    except Exception:
+        return []
+    files = []
+    for name in names:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in AUDIO_EXTENSIONS:
+            continue
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            files.append(name)
+    files.sort(key=lambda s: s.lower())
+    return files
 
 
 class _DashboardState:
-    def __init__(self, metrics_obj, agent_obj=None, history_limit: int = 900):
+    def __init__(self, metrics_obj, agent_obj=None, history_limit: int = DASH_HISTORY_LIMIT):
         self.metrics = metrics_obj
         self.agent = agent_obj
         self.history = deque(maxlen=max(120, history_limit))
@@ -200,6 +226,7 @@ class _DashboardState:
             steps_per_sec = ds / dt
         self.last_steps = total_training_steps
         self.last_steps_time = now
+        replay_per_frame = (steps_per_sec * float(getattr(RL_CONFIG, "batch_size", 1))) / max(1e-6, float(fps))
 
         lr = None
         q_min = None
@@ -224,6 +251,7 @@ class _DashboardState:
             "fps": fps,
             "training_steps": total_training_steps,
             "steps_per_sec": steps_per_sec,
+            "rpl_per_frame": replay_per_frame,
             "epsilon": epsilon_effective,
             "epsilon_raw": epsilon_raw,
             "expert_ratio": expert_ratio,
@@ -452,6 +480,35 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
+    .top-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      position: relative;
+      z-index: 2;
+    }
+    .audio-toggle {
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      background: rgba(2, 6, 23, 0.50);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      line-height: 1;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      cursor: pointer;
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
+    }
+    .audio-toggle.on {
+      border-color: rgba(57, 255, 20, 0.50);
+      box-shadow: inset 0 0 14px rgba(57, 255, 20, 0.18), 0 0 14px rgba(57, 255, 20, 0.14);
+      color: #d9ffd0;
+    }
+    .audio-toggle:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
     .dot {
       width: 10px;
       height: 10px;
@@ -494,10 +551,11 @@ def _render_dashboard_html() -> str:
       z-index: 2;
     }
     .card:not(.gauge-card) .value {
-      font-family: "DotGothic16", "Courier New", monospace;
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
       color: var(--vfdCyan);
-      letter-spacing: 0.95px;
-      font-variant-numeric: tabular-nums;
+      font-weight: 400;
+      letter-spacing: normal;
+      font-variant-numeric: normal;
       text-shadow: none;
     }
     .value-inline {
@@ -505,18 +563,18 @@ def _render_dashboard_html() -> str:
       align-items: center;
       gap: 10px;
     }
-    .avg-level-card .level-inline {
+    .mini-metric-card .mini-inline {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
       min-height: 58px;
     }
-    .avg-level-card .level-mini-canvas {
+    .mini-metric-card .mini-canvas {
       width: 132px;
       height: 58px;
       border-radius: 8px;
-      border: 1px solid rgba(0, 229, 255, 0.30);
+      border: none;
       background:
         linear-gradient(180deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.30)),
         repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.035) 0px, rgba(120, 150, 210, 0.035) 1px, transparent 1px, transparent 4px);
@@ -567,6 +625,13 @@ def _render_dashboard_html() -> str:
       font-weight: 560;
       letter-spacing: 0.3px;
       text-transform: uppercase;
+    }
+    #mFps, #mSteps {
+      font-family: "DS-Digital", "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 39px;
+      line-height: 1;
+      color: #ff2b2b;
+      text-shadow: 0 0 10px rgba(255, 43, 43, 0.55);
     }
     .gauge-canvas {
       width: 100%;
@@ -665,14 +730,14 @@ def _render_dashboard_html() -> str:
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
       .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 188px; }
-      .avg-level-card .level-mini-canvas { width: 110px; }
+      .mini-metric-card .mini-canvas { width: 110px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
-      .avg-level-card .level-mini-canvas { width: 96px; height: 52px; }
+      .mini-metric-card .mini-canvas { width: 96px; height: 52px; }
     }
   </style>
 </head>
@@ -683,7 +748,10 @@ def _render_dashboard_html() -> str:
         <h1>Tempest AI Dashboard</h1>
         <div class="subtitle">Primary training and runtime telemetry (live)</div>
       </div>
-      <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
+      <div class="top-right">
+        <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
+        <button id="audioToggle" class="audio-toggle" type="button">Audio Off</button>
+      </div>
     </section>
 
     <section class="cards">
@@ -693,7 +761,7 @@ def _render_dashboard_html() -> str:
           <div class="gauge-readout"><span id="mFps">0.0</span><small>fps</small></div>
         </div>
         <canvas id="cFpsGauge" class="gauge-canvas"></canvas>
-        <div class="gauge-foot"><span>RL 1K</span><span>MX 1.2K</span></div>
+        <div class="gauge-foot"><span>R 1.0K Y 1.5K</span><span>G 2.5K</span></div>
       </article>
       <article class="card gauge-card">
         <div class="gauge-head">
@@ -706,22 +774,44 @@ def _render_dashboard_html() -> str:
       <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
       <article class="card"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
       <article class="card"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
-      <article class="card avg-level-card">
+      <article class="card mini-metric-card">
         <div class="label">Avg Level</div>
-        <div class="level-inline">
+        <div class="mini-inline">
           <div class="value" id="mLevel">0.0</div>
-          <canvas id="cLevelMini" class="level-mini-canvas"></canvas>
+          <canvas id="cLevelMini" class="mini-canvas"></canvas>
         </div>
       </article>
       <article class="card">
         <div class="label">Avg Inf</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
       </article>
+      <article class="card">
+        <div class="label">Rpl/F</div>
+        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
+      </article>
       <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
       <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
-      <article class="card"><div class="label">Avg Reward</div><div class="value" id="mRwrd">0</div></article>
-      <article class="card"><div class="label">Loss</div><div class="value" id="mLoss">0</div></article>
-      <article class="card"><div class="label">Grad Norm</div><div class="value" id="mGrad">0</div></article>
+      <article class="card mini-metric-card">
+        <div class="label">Avg Reward</div>
+        <div class="mini-inline">
+          <div class="value" id="mRwrd">0</div>
+          <canvas id="cRewardMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card">
+        <div class="label">Loss</div>
+        <div class="mini-inline">
+          <div class="value" id="mLoss">0</div>
+          <canvas id="cLossMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card">
+        <div class="label">Grad Norm</div>
+        <div class="mini-inline">
+          <div class="value" id="mGrad">0</div>
+          <canvas id="cGradMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
       <article class="card"><div class="label">Buffer</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card"><div class="label">LR</div><div class="value" id="mLr">-</div></article>
       <article class="card"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
@@ -771,17 +861,28 @@ def _render_dashboard_html() -> str:
 
     </section>
   </main>
+  <audio id="bgAudio" preload="auto" autoplay></audio>
 
   <script>
     const num = new Intl.NumberFormat("en-US");
-    const maxPoints = 900;
     const DASH_REFRESH_MS = 100;
+    const HISTORY_WINDOW_MINUTES = 30;
+    const MAX_HISTORY_POINTS = Math.max(
+      900,
+      Math.round((HISTORY_WINDOW_MINUTES * 60 * 1000) / DASH_REFRESH_MS)
+    );
+    const MAX_CHART_POINTS = 1400;
     const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
-    const GAUGE_MAX_FPS = 1200;
-    const GAUGE_REDLINE_FPS = 1000;
+    const GAUGE_MAX_FPS = 2500;
+    const GAUGE_FPS_RED_MAX = 1000;
+    const GAUGE_FPS_YELLOW_MAX = 1500;
     const GAUGE_MIN_STEPS = 0;
     const GAUGE_MAX_STEPS = 30;
+    const AUDIO_PREF_COOKIE = "tempest_dashboard_audio_enabled";
+    const AUDIO_START_RETRY_MS = 800;
+    const CHART_VALUE_SMOOTH_ALPHA = 0.22;
+    const MINI_CHART_VALUE_SMOOTH_ALPHA = 0.28;
     let failedPings = 0;
     const CLIENT_ID = (() => {
       try {
@@ -789,6 +890,12 @@ def _render_dashboard_html() -> str:
       } catch (_) {}
       return `c_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     })();
+    const bgAudio = document.getElementById("bgAudio");
+    const audioToggle = document.getElementById("audioToggle");
+    let audioPlaylist = [];
+    let audioIndex = 0;
+    let audioEnabled = false;
+    let audioRetryTimer = null;
 
     const cards = {
       frame: document.getElementById("mFrame"),
@@ -799,6 +906,8 @@ def _render_dashboard_html() -> str:
       level: document.getElementById("mLevel"),
       inf: document.getElementById("mInf"),
       infLed: document.getElementById("mInfLed"),
+      rplf: document.getElementById("mRplF"),
+      rplLed: document.getElementById("mRplLed"),
       eps: document.getElementById("mEps"),
       xprt: document.getElementById("mXprt"),
       rwrd: document.getElementById("mRwrd"),
@@ -880,6 +989,24 @@ def _render_dashboard_html() -> str:
           { key: "level_1m", color: "#f59e0b", axis_ref: "level_25k" },
           { key: "level_5m", color: "#22d3ee", axis_ref: "level_25k" }
         ]
+      },
+      rewardMini: {
+        canvas: document.getElementById("cRewardMini"),
+        series: [
+          { key: "reward_total", color: "#22c55e" }
+        ]
+      },
+      lossMini: {
+        canvas: document.getElementById("cLossMini"),
+        series: [
+          { key: "loss", color: "#22c55e" }
+        ]
+      },
+      gradMini: {
+        canvas: document.getElementById("cGradMini"),
+        series: [
+          { key: "grad_norm", color: "#f59e0b" }
+        ]
       }
     };
 
@@ -893,9 +1020,128 @@ def _render_dashboard_html() -> str:
       return Number(v).toFixed(d);
     }
 
+    function downsampleHistory(rows, targetPoints) {
+      if (!Array.isArray(rows)) return [];
+      const n = rows.length;
+      const limit = Math.max(2, Number(targetPoints) || 0);
+      if (n <= limit) return rows;
+      const out = [];
+      const step = (n - 1) / (limit - 1);
+      for (let i = 0; i < limit; i++) {
+        out.push(rows[Math.floor(i * step)]);
+      }
+      out[limit - 1] = rows[n - 1];
+      return out;
+    }
+
     function fmtPct(v) {
       if (v === null || v === undefined || Number.isNaN(v)) return "0%";
       return `${(Number(v) * 100.0).toFixed(1)}%`;
+    }
+
+    function setAudioToggle(enabled, hasTracks = true) {
+      if (!audioToggle) return;
+      audioToggle.textContent = hasTracks ? (enabled ? "Audio On" : "Audio Off") : "No Audio";
+      audioToggle.classList.toggle("on", !!enabled && !!hasTracks);
+      audioToggle.disabled = !hasTracks;
+    }
+
+    function clearAudioRetryTimer() {
+      if (audioRetryTimer) {
+        clearTimeout(audioRetryTimer);
+        audioRetryTimer = null;
+      }
+    }
+
+    function scheduleAudioRetry() {
+      clearAudioRetryTimer();
+      if (!audioEnabled || !audioPlaylist.length) return;
+      audioRetryTimer = setTimeout(() => {
+        audioRetryTimer = null;
+        ensureAudioPlaying();
+      }, AUDIO_START_RETRY_MS);
+    }
+
+    function getCookieValue(name) {
+      const key = `${name}=`;
+      const parts = String(document.cookie || "").split(";");
+      for (const raw of parts) {
+        const part = raw.trim();
+        if (part.startsWith(key)) {
+          return decodeURIComponent(part.slice(key.length));
+        }
+      }
+      return null;
+    }
+
+    function setCookieValue(name, value) {
+      // Keep preference for ~1 year and scope to dashboard path.
+      document.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=31536000; Path=/; SameSite=Lax`;
+    }
+
+    function stopAudio() {
+      clearAudioRetryTimer();
+      if (!bgAudio) return;
+      bgAudio.pause();
+      bgAudio.removeAttribute("src");
+      try { bgAudio.load(); } catch (_) {}
+    }
+
+    function playAudioAt(index) {
+      if (!bgAudio || !audioPlaylist.length) return;
+      const n = audioPlaylist.length;
+      audioIndex = ((index % n) + n) % n;
+      bgAudio.src = audioPlaylist[audioIndex].url;
+      try { bgAudio.load(); } catch (_) {}
+      const p = bgAudio.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          clearAudioRetryTimer();
+        }).catch(() => {
+          scheduleAudioRetry();
+        });
+      }
+    }
+
+    function ensureAudioPlaying() {
+      if (!audioEnabled || !audioPlaylist.length) return;
+      if (!bgAudio || !bgAudio.src) {
+        playAudioAt(audioIndex);
+        return;
+      }
+      const p = bgAudio.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          clearAudioRetryTimer();
+        }).catch(() => {
+          scheduleAudioRetry();
+        });
+      }
+    }
+
+    function setAudioEnabled(next) {
+      audioEnabled = !!next;
+      setCookieValue(AUDIO_PREF_COOKIE, audioEnabled ? "1" : "0");
+      setAudioToggle(audioEnabled, audioPlaylist.length > 0);
+      if (audioEnabled) ensureAudioPlaying();
+      else stopAudio();
+    }
+
+    async function loadAudioPlaylist() {
+      try {
+        const res = await fetch(`/api/audio_playlist?t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("playlist");
+        const payload = await res.json();
+        const tracks = Array.isArray(payload && payload.tracks) ? payload.tracks : [];
+        audioPlaylist = tracks
+          .map((t) => ({ name: String(t.name || ""), url: String(t.url || "") }))
+          .filter((t) => t.url.length > 0);
+      } catch (_) {
+        audioPlaylist = [];
+      }
+      if (audioIndex >= audioPlaylist.length) audioIndex = 0;
+      setAudioToggle(audioEnabled, audioPlaylist.length > 0);
+      if (audioEnabled) ensureAudioPlaying();
     }
 
     function setConnected(connected) {
@@ -927,6 +1173,33 @@ def _render_dashboard_html() -> str:
       }
       cards.infLed.style.background = "#ff2a55";
       cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
+    }
+
+    function setRplLed(rplPerFrame) {
+      if (!cards.rplLed) return;
+      const v = Number(rplPerFrame);
+      if (!Number.isFinite(v)) {
+        cards.rplLed.style.background = "#94a3b8";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(148,163,184,0.18), 0 0 12px rgba(148,163,184,0.35)";
+        return;
+      }
+      if (v > 8.0 || v < 0.25) {
+        cards.rplLed.style.background = "#ff2a55";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
+        return;
+      }
+      if (v >= 4.0) {
+        cards.rplLed.style.background = "#f59e0b";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(245,158,11,0.24), 0 0 12px rgba(245,158,11,0.58)";
+        return;
+      }
+      if (v >= 1.0) {
+        cards.rplLed.style.background = "#39ff14";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(57,255,20,0.22), 0 0 12px rgba(57,255,20,0.6)";
+        return;
+      }
+      cards.rplLed.style.background = "#ffe600";
+      cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
     }
 
     function drawFpsGauge(canvas, fps) {
@@ -966,16 +1239,26 @@ def _render_dashboard_html() -> str:
       ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(startDeg + spanDeg), false);
       ctx.stroke();
 
-      // Redline arc
-      ctx.strokeStyle = "rgba(255, 59, 78, 0.92)";
+      // Zone arcs: red [0,1000], yellow (1000,1500], green (1500,2500].
       ctx.lineWidth = trackW + 1.0;
       ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(GAUGE_REDLINE_FPS), valToAngle(GAUGE_MAX_FPS), false);
+      ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
+      ctx.arc(cx, cy, radius, valToAngle(GAUGE_MIN_FPS), valToAngle(GAUGE_FPS_RED_MAX), false);
       ctx.stroke();
 
-      // Tick marks (major every 200, minor every 100)
-      for (let v = GAUGE_MIN_FPS; v <= GAUGE_MAX_FPS; v += 100) {
-        const isMajor = (v % 200) === 0;
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(245, 158, 11, 0.95)";
+      ctx.arc(cx, cy, radius, valToAngle(GAUGE_FPS_RED_MAX), valToAngle(GAUGE_FPS_YELLOW_MAX), false);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
+      ctx.arc(cx, cy, radius, valToAngle(GAUGE_FPS_YELLOW_MAX), valToAngle(GAUGE_MAX_FPS), false);
+      ctx.stroke();
+
+      // Tick marks (major every 250, minor every 125)
+      for (let v = GAUGE_MIN_FPS; v <= GAUGE_MAX_FPS; v += 125) {
+        const isMajor = (v % 250) === 0;
         const a = valToAngle(v);
         const cosA = Math.cos(a);
         const sinA = Math.sin(a);
@@ -983,11 +1266,10 @@ def _render_dashboard_html() -> str:
         const outer = radius + trackW * 0.38;
         const inner = outer - (isMajor ? trackW * 1.6 : trackW * 0.95);
 
-        ctx.strokeStyle = v >= GAUGE_REDLINE_FPS
-          ? "rgba(255, 76, 98, 0.96)"
-          : isMajor
-            ? "rgba(226, 232, 240, 0.95)"
-            : "rgba(148, 163, 184, 0.78)";
+        let tickColor = "rgba(239, 68, 68, 0.95)";
+        if (v > GAUGE_FPS_RED_MAX && v <= GAUGE_FPS_YELLOW_MAX) tickColor = "rgba(245, 158, 11, 0.95)";
+        else if (v > GAUGE_FPS_YELLOW_MAX) tickColor = "rgba(34, 197, 94, 0.95)";
+        ctx.strokeStyle = tickColor;
         ctx.lineWidth = isMajor ? 3.0 : 1.8;
         ctx.beginPath();
         ctx.moveTo(cx + outer * cosA, cy + outer * sinA);
@@ -1008,7 +1290,7 @@ def _render_dashboard_html() -> str:
       ctx.lineTo(cx + needleLen * nCos + 3, cy + needleLen * nSin + 3);
       ctx.stroke();
 
-      ctx.strokeStyle = "#22d3ee";
+      ctx.strokeStyle = "#e2e8f0";
       ctx.lineWidth = 6.0;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
@@ -1128,7 +1410,7 @@ def _render_dashboard_html() -> str:
     }
 
     function drawChart(canvas, history, seriesDefs) {
-      const points = history.slice(-maxPoints);
+      const points = Array.isArray(history) ? history : [];
       const width = canvas.clientWidth || 320;
       const height = canvas.clientHeight || 210;
       const dpr = window.devicePixelRatio || 1;
@@ -1163,11 +1445,8 @@ def _render_dashboard_html() -> str:
       const plotH = height - padT - padB;
       if (plotW <= 20 || plotH <= 20) return;
 
-      // Time-compressed x-axis:
-      // right quarter = recent 1x window
-      // to half mark = 2x history
-      // next quarter = 4x history
-      // far left = 8x history
+      // Time-compressed x-axis with fixed quarter anchors:
+      // left→right: 20m, 2m, 1m, 10s, 0s
       const tsVals = points
         .map((p) => Number(p.ts))
         .filter((v) => Number.isFinite(v));
@@ -1175,36 +1454,81 @@ def _render_dashboard_html() -> str:
       const newestTs = hasTimeAxis ? Math.max(...tsVals) : 0.0;
       const oldestTs = hasTimeAxis ? Math.min(...tsVals) : 0.0;
       const maxAge = hasTimeAxis ? Math.max(1e-6, newestTs - oldestTs) : 0.0;
-      const baseAge = maxAge / 8.0;
+      const AXIS_MAX_LOOKBACK_S = 20 * 60;
+      const LOOKBACK_FRAC_ANCHORS = [0.0, 0.25, 0.50, 0.75, 1.0];
+      const LOOKBACK_AGE_ANCHORS = [0.0, 10.0, 60.0, 120.0, AXIS_MAX_LOOKBACK_S];
+      // Shape-preserving monotone cubic interpolation (continuous slope)
+      // so compression changes smoothly instead of with visible segment kinks.
+      const makeMonotoneSpline = (xsRaw, ysRaw) => {
+        const n = Math.min(xsRaw.length, ysRaw.length);
+        if (n < 2) {
+          const y0 = Number(ysRaw?.[0]) || 0.0;
+          return () => y0;
+        }
+        const xs = xsRaw.slice(0, n).map((v) => Number(v));
+        const ys = ysRaw.slice(0, n).map((v) => Number(v));
+        const h = new Array(n - 1);
+        const d = new Array(n - 1);
+        for (let i = 0; i < n - 1; i++) {
+          const dx = Math.max(1e-9, xs[i + 1] - xs[i]);
+          h[i] = dx;
+          d[i] = (ys[i + 1] - ys[i]) / dx;
+        }
+        const m = new Array(n);
+        m[0] = d[0];
+        m[n - 1] = d[n - 2];
+        for (let i = 1; i < n - 1; i++) {
+          m[i] = 0.5 * (d[i - 1] + d[i]);
+        }
+        for (let i = 0; i < n - 1; i++) {
+          if (Math.abs(d[i]) <= 1e-12) {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+            continue;
+          }
+          const a = m[i] / d[i];
+          const b = m[i + 1] / d[i];
+          const s = (a * a) + (b * b);
+          if (s > 9.0) {
+            const t = 3.0 / Math.sqrt(s);
+            m[i] = t * a * d[i];
+            m[i + 1] = t * b * d[i];
+          }
+        }
+        return (xRaw) => {
+          const x = Math.max(xs[0], Math.min(xs[n - 1], Number(xRaw) || 0.0));
+          let k = n - 2;
+          for (let i = 0; i < n - 1; i++) {
+            if (x <= xs[i + 1]) {
+              k = i;
+              break;
+            }
+          }
+          const hk = h[k];
+          const t = (x - xs[k]) / hk;
+          const t2 = t * t;
+          const t3 = t2 * t;
+          const h00 = (2.0 * t3) - (3.0 * t2) + 1.0;
+          const h10 = t3 - (2.0 * t2) + t;
+          const h01 = (-2.0 * t3) + (3.0 * t2);
+          const h11 = t3 - t2;
+          return (h00 * ys[k]) + (h10 * hk * m[k]) + (h01 * ys[k + 1]) + (h11 * hk * m[k + 1]);
+        };
+      };
+      const ageFromLookbackFrac = makeMonotoneSpline(LOOKBACK_FRAC_ANCHORS, LOOKBACK_AGE_ANCHORS);
+      const lookbackFracFromAge = makeMonotoneSpline(LOOKBACK_AGE_ANCHORS, LOOKBACK_FRAC_ANCHORS);
 
       const xNormFromAge = (ageRaw) => {
-        if (!hasTimeAxis || baseAge <= 0) return 1.0;
-        const age = Math.max(0.0, Math.min(maxAge, ageRaw));
-        if (age <= baseAge) {
-          return 1.0 - ((age / baseAge) * 0.25);
-        }
-        if (age <= (2.0 * baseAge)) {
-          return 0.75 - (((age - baseAge) / baseAge) * 0.25);
-        }
-        if (age <= (4.0 * baseAge)) {
-          return 0.50 - (((age - (2.0 * baseAge)) / (2.0 * baseAge)) * 0.25);
-        }
-        return 0.25 - (((age - (4.0 * baseAge)) / (4.0 * baseAge)) * 0.25);
+        if (!hasTimeAxis || maxAge <= 0) return 1.0;
+        const age = Math.max(0.0, Math.min(AXIS_MAX_LOOKBACK_S, ageRaw));
+        const lookbackFrac = lookbackFracFromAge(age);
+        return 1.0 - lookbackFrac;
       };
 
       const ageFromXNorm = (xNormRaw) => {
-        if (!hasTimeAxis || baseAge <= 0) return 0.0;
         const xn = Math.max(0.0, Math.min(1.0, xNormRaw));
-        if (xn >= 0.75) {
-          return (1.0 - xn) * 4.0 * baseAge;
-        }
-        if (xn >= 0.50) {
-          return baseAge + ((0.75 - xn) * 4.0 * baseAge);
-        }
-        if (xn >= 0.25) {
-          return (2.0 * baseAge) + ((0.50 - xn) * 8.0 * baseAge);
-        }
-        return (4.0 * baseAge) + ((0.25 - xn) * 16.0 * baseAge);
+        const lookbackFrac = 1.0 - xn;
+        return ageFromLookbackFrac(lookbackFrac);
       };
 
       const formatLookback = (ageSecRaw) => {
@@ -1443,15 +1767,20 @@ def _render_dashboard_html() -> str:
           ? axisByKey.get(s.axis_ref)
           : (axisByKey.get(s.key) || axes[0]);
         if (!axis) continue;
+        const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : CHART_VALUE_SMOOTH_ALPHA;
         ctx.strokeStyle = s.color;
         ctx.lineWidth = 2.0;
         ctx.beginPath();
         let started = false;
+        let smoothVal = null;
         for (let i = 0; i < n; i++) {
           const val = seriesValue(points[i], s.key);
           if (!Number.isFinite(val)) continue;
+          smoothVal = (smoothVal === null)
+            ? Number(val)
+            : (smoothVal + ((Number(val) - smoothVal) * smoothAlpha));
           const x = xAt(i);
-          const y = yAt(axis, Number(val));
+          const y = yAt(axis, smoothVal);
           if (!started) {
             ctx.moveTo(x, y);
             started = true;
@@ -1477,9 +1806,11 @@ def _render_dashboard_html() -> str:
       ctx.clearRect(0, 0, width, height);
       if (!points.length) return;
 
-      const padX = 4;
+      const axisPad = 20;
+      const padL = axisPad;
+      const padR = 4;
       const padY = 6;
-      const plotW = width - (2 * padX);
+      const plotW = width - padL - padR;
       const plotH = height - (2 * padY);
       if (plotW <= 4 || plotH <= 4) return;
 
@@ -1494,46 +1825,92 @@ def _render_dashboard_html() -> str:
       }
       if (!values.length) return;
 
-      let minV = Math.min(...values);
-      let maxV = Math.max(...values);
+      const hasFixedMin = Number.isFinite(seriesDefs?.[0]?.axis?.min);
+      const hasFixedMax = Number.isFinite(seriesDefs?.[0]?.axis?.max);
+      let minV = hasFixedMin ? Number(seriesDefs[0].axis.min) : Math.min(...values);
+      let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
       if (maxV <= minV) {
         maxV = minV + 1.0;
       } else {
         const p = (maxV - minV) * 0.08;
-        minV -= p;
-        maxV += p;
+        if (!hasFixedMin) minV -= p;
+        if (!hasFixedMax) maxV += p;
       }
 
       const xAt = (i) => {
         const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
-        return padX + (t * plotW);
+        return padL + (t * plotW);
       };
       const yAt = (v) => {
         const t = (v - minV) / (maxV - minV);
         return padY + ((1.0 - t) * plotH);
       };
 
+      const fmtTick = (v) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return "";
+        const a = Math.abs(n);
+        if (a >= 100) return `${Math.round(n)}`;
+        if (a >= 10) return `${n.toFixed(1)}`;
+        if (a >= 1) return `${n.toFixed(2)}`;
+        return `${n.toFixed(3)}`;
+      };
+
+      const axisColor = seriesDefs?.[0]?.color || "#22c55e";
+      const axisX = padL - 1;
+      const yTicks = [minV, minV + ((maxV - minV) * 0.5), maxV];
+      ctx.strokeStyle = axisColor;
+      ctx.globalAlpha = 0.52;
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(axisX, padY);
+      ctx.lineTo(axisX, height - padY);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      ctx.font = "7px 'DotGothic16', 'Courier New', monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (const tv of yTicks) {
+        const y = yAt(tv);
+        ctx.strokeStyle = axisColor;
+        ctx.globalAlpha = 0.70;
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(axisX - 2, y);
+        ctx.lineTo(axisX + 2, y);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+        ctx.fillStyle = "rgba(165, 191, 222, 0.95)";
+        ctx.fillText(fmtTick(tv), axisX - 3, y);
+      }
+
       // Soft center guide.
       const yMid = padY + (plotH * 0.5);
       ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
       ctx.lineWidth = 1.0;
       ctx.beginPath();
-      ctx.moveTo(padX, yMid);
-      ctx.lineTo(width - padX, yMid);
+      ctx.moveTo(padL, yMid);
+      ctx.lineTo(width - padR, yMid);
       ctx.stroke();
 
       const n = points.length;
       for (const s of seriesDefs) {
+        const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : MINI_CHART_VALUE_SMOOTH_ALPHA;
         ctx.strokeStyle = s.color;
         ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
         ctx.lineWidth = (s.key === "level_1m") ? 2.0 : 1.6;
         ctx.beginPath();
         let started = false;
+        let smoothVal = null;
         for (let i = 0; i < n; i++) {
           const val = Number(points[i][s.key]);
           if (!Number.isFinite(val)) continue;
+          smoothVal = (smoothVal === null)
+            ? val
+            : (smoothVal + ((val - smoothVal) * smoothAlpha));
           const x = xAt(i);
-          const y = yAt(val);
+          const y = yAt(smoothVal);
           if (!started) {
             ctx.moveTo(x, y);
             started = true;
@@ -1571,6 +1948,8 @@ def _render_dashboard_html() -> str:
       cards.level.textContent = fmtFloat(now.average_level, 2);
       cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)}ms`;
       setInfLed(now.avg_inf_ms);
+      cards.rplf.textContent = fmtFloat(now.rpl_per_frame, 2);
+      setRplLed(now.rpl_per_frame);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.rwrd.textContent = fmtInt(now.reward_total);
@@ -1585,16 +1964,20 @@ def _render_dashboard_html() -> str:
 
     function render(payload) {
       if (!payload || !payload.now) return;
-      const history = payload.history || [];
+      const history = Array.isArray(payload.history) ? payload.history.slice(-MAX_HISTORY_POINTS) : [];
+      const chartHistory = downsampleHistory(history, MAX_CHART_POINTS);
       const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history);
       updateCards(payload.now, smoothedStepSpd);
       drawFpsGauge(fpsGaugeCanvas, payload.now.fps);
       drawStepGauge(stepGaugeCanvas, smoothedStepSpd);
-      drawChart(charts.throughput.canvas, history, charts.throughput.series);
-      drawChart(charts.rewards.canvas, history, charts.rewards.series);
-      drawChart(charts.learning.canvas, history, charts.learning.series);
-      drawChart(charts.dqn.canvas, history, charts.dqn.series);
+      drawChart(charts.throughput.canvas, chartHistory, charts.throughput.series);
+      drawChart(charts.rewards.canvas, chartHistory, charts.rewards.series);
+      drawChart(charts.learning.canvas, chartHistory, charts.learning.series);
+      drawChart(charts.dqn.canvas, chartHistory, charts.dqn.series);
       drawMiniChart(charts.level1m.canvas, history, charts.level1m.series);
+      drawMiniChart(charts.rewardMini.canvas, history, charts.rewardMini.series);
+      drawMiniChart(charts.lossMini.canvas, history, charts.lossMini.series);
+      drawMiniChart(charts.gradMini.canvas, history, charts.gradMini.series);
     }
 
     let historyCache = [];
@@ -1613,7 +1996,7 @@ def _render_dashboard_html() -> str:
         const payload = await res.json();
         const now = payload && payload.now ? payload.now : null;
         const history = Array.isArray(payload && payload.history) ? payload.history : [];
-        historyCache = history.slice(-maxPoints);
+        historyCache = history.slice(-MAX_HISTORY_POINTS);
         latestNow = now || historyCache[historyCache.length - 1] || latestNow;
         const ts = Number(latestNow && latestNow.ts);
         if (Number.isFinite(ts)) {
@@ -1637,7 +2020,7 @@ def _render_dashboard_html() -> str:
         let hasNewSample = false;
         if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
           historyCache.push(now);
-          if (historyCache.length > maxPoints) {
+          if (historyCache.length > MAX_HISTORY_POINTS) {
             historyCache.shift();
           }
           lastTs = ts;
@@ -1667,6 +2050,34 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    const cookiePref = getCookieValue(AUDIO_PREF_COOKIE);
+    audioEnabled = (cookiePref === null) ? true : (cookiePref === "1");
+    setAudioToggle(audioEnabled, false);
+    const kickAudioStart = () => {
+      if (audioEnabled) ensureAudioPlaying();
+    };
+    document.addEventListener("pointerdown", kickAudioStart, { passive: true });
+    document.addEventListener("keydown", kickAudioStart);
+    window.addEventListener("focus", kickAudioStart);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) kickAudioStart();
+    });
+    if (audioToggle) {
+      audioToggle.addEventListener("click", () => setAudioEnabled(!audioEnabled));
+    }
+    if (bgAudio) {
+      bgAudio.addEventListener("playing", () => clearAudioRetryTimer());
+      bgAudio.addEventListener("ended", () => {
+        if (!audioEnabled || !audioPlaylist.length) return;
+        playAudioAt(audioIndex + 1);
+      });
+      bgAudio.addEventListener("error", () => {
+        if (!audioEnabled || !audioPlaylist.length) return;
+        playAudioAt(audioIndex + 1);
+      });
+    }
+    loadAudioPlaylist().catch(() => {});
+
     fetchHistory().then(() => fetchNow()).catch(() => {});
     setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
@@ -1679,15 +2090,54 @@ def _render_dashboard_html() -> str:
 
 def _make_handler(state: _DashboardState):
     page = _render_dashboard_html().encode("utf-8")
+    audio_root = os.path.abspath(_audio_dir())
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        def _send(self, payload: bytes, content_type: str = "text/plain", status: int = 200):
+        def _send(
+            self,
+            payload: bytes,
+            content_type: str = "text/plain",
+            status: int = 200,
+            cache_control: str = "no-store",
+        ):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache_control)
             self.end_headers()
             self.wfile.write(payload)
+
+        def _send_file(self, filepath: str, content_type: str):
+            try:
+                size = os.path.getsize(filepath)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                with open(filepath, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, length=64 * 1024)
+            except Exception:
+                self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+
+        @staticmethod
+        def _safe_audio_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(audio_root, name))
+            try:
+                if os.path.commonpath([audio_root, candidate]) != audio_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in AUDIO_EXTENSIONS:
+                return None
+            return candidate
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -1710,6 +2160,22 @@ def _make_handler(state: _DashboardState):
                 body = json.dumps(state.payload()).encode("utf-8")
                 self._send(body, "application/json")
                 return
+            if path == "/api/audio_playlist":
+                tracks = _list_audio_files()
+                body = json.dumps({
+                    "tracks": [{"name": name, "url": f"/api/audio/{quote(name)}"} for name in tracks]
+                }).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            if path.startswith("/api/audio/"):
+                raw_name = unquote(path[len("/api/audio/"):])
+                safe_path = self._safe_audio_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+                self._send_file(safe_path, ctype)
+                return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
 
         def log_message(self, fmt, *args):
@@ -1728,7 +2194,7 @@ class MetricsDashboard:
         host: str = "127.0.0.1",
         port: int = 8765,
         sample_interval: float = 0.10,
-        history_limit: int = 900,
+        history_limit: int = DASH_HISTORY_LIMIT,
         open_browser: bool = True,
     ):
         self.metrics = metrics_obj

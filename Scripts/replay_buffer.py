@@ -139,6 +139,17 @@ class PrioritizedReplayBuffer:
         self.size = 0
         self._n_expert = 0          # O(1) expert tracking
 
+    @staticmethod
+    def _progress_bar(label: str, frac: float, width: int = 28):
+        frac_clamped = max(0.0, min(1.0, float(frac)))
+        filled = int(round(frac_clamped * width))
+        bar = "#" * filled + "-" * (width - filled)
+        sys.stdout.write(f"\r{label} [{bar}] {frac_clamped * 100.0:5.1f}%")
+        sys.stdout.flush()
+        if frac_clamped >= 1.0:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
     def add(self, state, action: int, reward: float, next_state, done: bool,
             horizon: int = 1, expert: int = 0, priority_hint: float = 0.0):
         with self.lock:
@@ -234,16 +245,20 @@ class PrioritizedReplayBuffer:
 
     # ── Persistence ─────────────────────────────────────────────────────
 
-    def save(self, filepath: str):
+    def save(self, filepath: str, verbose: bool = True):
         """Save the full replay buffer (data + priorities) to disk with progress."""
         with self.lock:
             if self.size == 0:
-                print("  Replay buffer is empty — nothing to save.")
+                if verbose:
+                    print("  Replay buffer is empty — nothing to save.")
                 return
 
             n = self.size
-            print(f"  Saving replay buffer ({n:,} transitions)...")
+            if verbose:
+                print(f"  Saving replay buffer ({n:,} transitions)...")
             t0 = time.time()
+            if verbose:
+                self._progress_bar("  Replay save", 0.10)
 
             # Collect all arrays into a dict; only save filled portion
             data = {
@@ -258,6 +273,8 @@ class PrioritizedReplayBuffer:
                 "data_ptr":    np.int64(self.tree.data_ptr),
                 "max_priority": np.float64(self.tree.max_priority),
             }
+            if verbose:
+                self._progress_bar("  Replay save", 0.40)
 
         # Write outside the lock to minimise contention
         tmp = filepath + ".tmp"
@@ -272,10 +289,16 @@ class PrioritizedReplayBuffer:
         try:
             # Use a file handle so numpy does not rewrite the path/extension.
             with open(tmp, "wb") as f:
-                np.savez_compressed(f, **data)
+                if verbose:
+                    self._progress_bar("  Replay save", 0.55)
+                np.savez(f, **data)
                 f.flush()
                 os.fsync(f.fileno())
+                if verbose:
+                    self._progress_bar("  Replay save", 0.85)
             os.replace(tmp, filepath)
+            if verbose:
+                self._progress_bar("  Replay save", 1.0)
         finally:
             if os.path.exists(tmp):
                 try:
@@ -284,21 +307,27 @@ class PrioritizedReplayBuffer:
                     pass
         elapsed = time.time() - t0
         mb = os.path.getsize(filepath) / (1024 * 1024)
-        print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")
+        if verbose:
+            print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")
 
-    def load(self, filepath: str) -> bool:
+    def load(self, filepath: str, verbose: bool = True) -> bool:
         """Load a replay buffer from disk with progress. Returns True on success."""
         if not os.path.exists(filepath):
             return False
 
-        print(f"  Loading replay buffer from {filepath}...")
+        if verbose:
+            print(f"  Loading replay buffer from {filepath}...")
         t0 = time.time()
+        if verbose:
+            self._progress_bar("  Replay load", 0.05)
 
         try:
             arch = np.load(filepath, allow_pickle=False)
         except Exception as e:
             print(f"  Failed to read replay buffer: {e}")
             return False
+        if verbose:
+            self._progress_bar("  Replay load", 0.20)
 
         n = len(arch["states"])
         if n == 0:
@@ -318,9 +347,12 @@ class PrioritizedReplayBuffer:
             n = self.capacity
         else:
             offset = 0
+        if verbose:
+            self._progress_bar("  Replay load", 0.35)
 
         with self.lock:
-            print(f"  Restoring {n:,} transitions...", end="", flush=True)
+            if verbose:
+                self._progress_bar("  Replay load", 0.45)
 
             self.states[:n]      = arch["states"][offset:offset + n]
             self.next_states[:n] = arch["next_states"][offset:offset + n]
@@ -329,6 +361,8 @@ class PrioritizedReplayBuffer:
             self.dones[:n]       = arch["dones"][offset:offset + n]
             self.horizons[:n]    = arch["horizons"][offset:offset + n]
             self.is_expert[:n]   = arch["is_expert"][offset:offset + n]
+            if verbose:
+                self._progress_bar("  Replay load", 0.62)
 
             # Restore SumTree state
             priorities = arch["priorities"][offset:offset + n]
@@ -343,15 +377,23 @@ class PrioritizedReplayBuffer:
                 self.tree.tree[self.tree.capacity + n:] = 0.0
 
             # Rebuild internal nodes bottom-up
+            total_nodes = max(1, self.tree.capacity - 1)
+            update_every = max(1, total_nodes // 64)
             for i in range(self.tree.capacity - 1, 0, -1):
                 self.tree.tree[i] = self.tree.tree[2 * i] + self.tree.tree[2 * i + 1]
+                if verbose and ((self.tree.capacity - i) % update_every == 0):
+                    rebuilt = self.tree.capacity - i
+                    frac = 0.62 + (0.33 * (rebuilt / total_nodes))
+                    self._progress_bar("  Replay load", frac)
 
             self.size = n
             self._n_expert = int(self.is_expert[:n].sum())
 
         elapsed = time.time() - t0
         mb = os.path.getsize(filepath) / (1024 * 1024)
-        print(f" done ({mb:.0f} MB, {elapsed:.1f}s)")
+        if verbose:
+            self._progress_bar("  Replay load", 1.0)
+            print(f"  Replay buffer loaded: {mb:.0f} MB in {elapsed:.1f}s")
         return True
 
     def flush(self):
