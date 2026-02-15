@@ -89,6 +89,89 @@ class AsyncReplayBuffer:
         self._thread.join(timeout=5.0)
 
 
+class _InferenceRequest:
+    __slots__ = ("state", "epsilon", "event", "action")
+
+    def __init__(self, state, epsilon: float):
+        self.state = state
+        self.epsilon = float(epsilon)
+        self.event = threading.Event()
+        self.action = None
+
+
+class AsyncInferenceBatcher:
+    """Micro-batch inference requests across clients for better GPU utilization."""
+
+    def __init__(self, agent, max_batch_size=32, max_wait_ms=1.0, request_timeout_ms=50.0):
+        self.agent = agent
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.max_wait_s = max(0.0, float(max_wait_ms) / 1000.0)
+        self.request_timeout_s = max(0.001, float(request_timeout_ms) / 1000.0)
+        self.queue = queue.Queue(maxsize=20000)
+        self.running = True
+        self._thread = threading.Thread(target=self._consume, daemon=True, name="InferBatchWorker")
+        self._thread.start()
+
+    def infer(self, state, epsilon: float):
+        if not self.running:
+            return self.agent.act(state, epsilon)
+        req = _InferenceRequest(state, epsilon)
+        try:
+            self.queue.put(req, timeout=self.request_timeout_s)
+        except queue.Full:
+            return self.agent.act(state, epsilon)
+        if not req.event.wait(timeout=self.request_timeout_s):
+            return self.agent.act(state, epsilon)
+        return req.action if req.action is not None else (0, 0)
+
+    def _consume(self):
+        while self.running or not self.queue.empty():
+            try:
+                first = self.queue.get(timeout=0.01)
+            except queue.Empty:
+                continue
+
+            batch = [first]
+            deadline = time.perf_counter() + self.max_wait_s
+            while len(batch) < self.max_batch_size:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(self.queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            try:
+                states = [r.state for r in batch]
+                epsilons = [r.epsilon for r in batch]
+                actions = self.agent.act_batch(states, epsilons)
+            except Exception as e:
+                print(f"AsyncInferenceBatcher error: {e}")
+                actions = []
+
+            for idx, req in enumerate(batch):
+                act = actions[idx] if idx < len(actions) else None
+                if act is None:
+                    try:
+                        act = self.agent.act(req.state, req.epsilon)
+                    except Exception:
+                        act = (0, 0)
+                req.action = act
+                req.event.set()
+
+    def stop(self):
+        self.running = False
+        self._thread.join(timeout=5.0)
+        while True:
+            try:
+                req = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            req.action = (0, 0)
+            req.event.set()
+
+
 # ── Socket Server ───────────────────────────────────────────────────────────
 class SocketServer:
     def __init__(self, host, port, agent, metrics_wrapper):
@@ -96,6 +179,19 @@ class SocketServer:
         self.port = port
         self.agent = agent
         self.async_buffer = AsyncReplayBuffer(agent) if agent else None
+        self.inference_batcher = None
+        if agent and bool(getattr(RL_CONFIG, "inference_batching_enabled", True)):
+            self.inference_batcher = AsyncInferenceBatcher(
+                agent,
+                max_batch_size=int(getattr(RL_CONFIG, "inference_batch_max_size", 32)),
+                max_wait_ms=float(getattr(RL_CONFIG, "inference_batch_wait_ms", 1.0)),
+                request_timeout_ms=float(getattr(RL_CONFIG, "inference_request_timeout_ms", 50.0)),
+            )
+            print(
+                "Async inference batching enabled: "
+                f"max_batch={self.inference_batcher.max_batch_size}, "
+                f"wait_ms={self.inference_batcher.max_wait_s * 1000.0:.2f}"
+            )
         self.metrics = SafeMetrics(metrics_wrapper)
 
         self.server_socket = None
@@ -300,7 +396,10 @@ class SocketServer:
                     else:
                         epsilon = self.metrics.get_effective_epsilon()
                         t0 = time.perf_counter()
-                        fz_idx, sp_idx = self.agent.act(frame.state, epsilon)
+                        if self.inference_batcher is not None:
+                            fz_idx, sp_idx = self.inference_batcher.infer(frame.state, epsilon)
+                        else:
+                            fz_idx, sp_idx = self.agent.act(frame.state, epsilon)
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
                         spinner_val = spinner_index_to_value(sp_idx)
@@ -407,6 +506,10 @@ class SocketServer:
             return
         self.running = False
         self.shutdown_event.set()
+        if self.inference_batcher:
+            print("Stopping async inference batcher...")
+            self.inference_batcher.stop()
+            self.inference_batcher = None
         if self.async_buffer:
             print("Flushing async replay buffer...")
             self.async_buffer.stop()

@@ -141,7 +141,15 @@ class RLConfigData:
     # Keep inference on GPU when available; CPU inference can become a bottleneck
     # at higher frame rates even with low overall system utilization.
     inference_on_cpu: bool = False
+    # Device placement (CUDA only): useful on multi-GPU hosts.
+    train_cuda_device_index: int = 0
+    inference_cuda_device_index: int = 0
     inference_sync_steps: int = 100
+    # Micro-batch inference requests across clients to increase GPU work per launch.
+    inference_batching_enabled: bool = True
+    inference_batch_max_size: int = 32
+    inference_batch_wait_ms: float = 1.0
+    inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
     training_steps_per_cycle: int = 4
