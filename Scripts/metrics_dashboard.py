@@ -566,12 +566,17 @@ def _render_dashboard_html() -> str:
     }
     .card:not(.gauge-card) .value {
       font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
-      color: var(--vfdCyan);
+      color: #d8fdff;
       font-weight: 400;
       letter-spacing: normal;
       font-variant-numeric: normal;
-      text-shadow: 0 0 4px rgba(112, 247, 255, 0.32), 0 0 10px rgba(112, 247, 255, 0.18);
-      filter: drop-shadow(0 0 4px rgba(112, 247, 255, 0.16));
+      text-shadow:
+        0 0 4px rgba(190, 248, 255, 0.55),
+        0 0 12px rgba(120, 232, 255, 0.42),
+        0 0 22px rgba(76, 199, 255, 0.36);
+      filter:
+        drop-shadow(0 0 6px rgba(116, 226, 255, 0.35))
+        drop-shadow(0 0 12px rgba(72, 174, 255, 0.28));
     }
     .value-inline {
       display: inline-flex;
@@ -902,7 +907,19 @@ def _render_dashboard_html() -> str:
 
   <script>
     const num = new Intl.NumberFormat("en-US");
-    const DASH_REFRESH_MS = 100;
+    const DASH_MAX_FPS = 30;
+    const DASH_DEFAULT_FPS = 2;
+    const DASH_REFRESH_FPS = (() => {
+      try {
+        const raw = new URLSearchParams(window.location.search).get("fps");
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed <= 0) return DASH_DEFAULT_FPS;
+        return Math.min(DASH_MAX_FPS, parsed);
+      } catch (_) {
+        return DASH_DEFAULT_FPS;
+      }
+    })();
+    const DASH_REFRESH_MS = Math.max(1, Math.round(1000 / DASH_REFRESH_FPS));
     const HISTORY_WINDOW_MINUTES = 30;
     const MAX_HISTORY_POINTS = Math.max(
       900,
@@ -968,10 +985,10 @@ def _render_dashboard_html() -> str:
             smooth_alpha: 0.14,
           },
           {
-            key: "steps_per_sec",
+            key: "steps_per_sec_chart",
             color: "#f59e0b",
             axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] },
-            smooth_alpha: 0.05,
+            smooth_alpha: 0.10,
           }
         ]
       },
@@ -999,10 +1016,10 @@ def _render_dashboard_html() -> str:
             key: "loss",
             color: "#22c55e",
             axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"], min_floor: 0, max_floor: 5 },
-            smooth_alpha: 0.14,
+            smooth_alpha: 0.55,
           },
-          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss", smooth_alpha: 0.14 },
-          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss", smooth_alpha: 0.14 }
+          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss", smooth_alpha: 0.55 },
+          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss", smooth_alpha: 0.55 }
         ]
       },
       dqn: {
@@ -1085,13 +1102,17 @@ def _render_dashboard_html() -> str:
       const n = rows.length;
       const limit = Math.max(2, Number(targetPoints) || 0);
       if (n <= limit) return rows;
-      const out = [];
+      // End-anchored sampling keeps newest (right-side) points stable as new
+      // samples arrive, reducing visible squirm near "now".
+      const outRev = [];
       const step = (n - 1) / (limit - 1);
       for (let i = 0; i < limit; i++) {
-        out.push(rows[Math.floor(i * step)]);
+        const fromEnd = Math.floor(i * step);
+        outRev.push(rows[n - 1 - fromEnd]);
       }
-      out[limit - 1] = rows[n - 1];
-      return out;
+      outRev[0] = rows[n - 1];
+      outRev[limit - 1] = rows[0];
+      return outRev.reverse();
     }
 
     function fmtPct(v) {
@@ -1373,28 +1394,41 @@ def _render_dashboard_html() -> str:
         ctx.stroke();
       }
 
-      // Needle (cyan with shadow).
+      // Needle (classic pointy orange with shadow).
       const needleAngle = valToAngle(value);
       const nCos = Math.cos(needleAngle);
       const nSin = Math.sin(needleAngle);
       const needleLen = radius * 0.84;
-      ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-      ctx.lineWidth = Math.max(6.0, radius * 0.08);
-      ctx.beginPath();
-      ctx.moveTo(cx + 3, cy + 3);
-      ctx.lineTo(cx + (needleLen * nCos) + 3, cy + (needleLen * nSin) + 3);
-      ctx.stroke();
+      const tailLen = radius * 0.10;
+      const baseHalfW = Math.max(4.0, radius * 0.030);
+      const pTipX = cx + (needleLen * nCos);
+      const pTipY = cy + (needleLen * nSin);
+      const pTailX = cx - (tailLen * nCos);
+      const pTailY = cy - (tailLen * nSin);
+      const perpX = -nSin;
+      const perpY = nCos;
 
-      const needleGrad = ctx.createLinearGradient(cx, cy, cx + needleLen * nCos, cy + needleLen * nSin);
-      needleGrad.addColorStop(0.0, "#21f3ff");
-      needleGrad.addColorStop(1.0, "#00b8ff");
-      ctx.strokeStyle = needleGrad;
-      ctx.lineWidth = Math.max(5.0, radius * 0.06);
-      ctx.lineCap = "round";
+      // Shadow
+      ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
       ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + (needleLen * nCos), cy + (needleLen * nSin));
-      ctx.stroke();
+      ctx.moveTo(pTipX + 2.5, pTipY + 2.5);
+      ctx.lineTo(pTailX + (perpX * baseHalfW) + 2.5, pTailY + (perpY * baseHalfW) + 2.5);
+      ctx.lineTo(pTailX - (perpX * baseHalfW) + 2.5, pTailY - (perpY * baseHalfW) + 2.5);
+      ctx.closePath();
+      ctx.fill();
+
+      // Pointy needle
+      const needleGrad = ctx.createLinearGradient(pTailX, pTailY, pTipX, pTipY);
+      needleGrad.addColorStop(0.0, "#c85a00");
+      needleGrad.addColorStop(0.6, "#ff8a00");
+      needleGrad.addColorStop(1.0, "#ffc04d");
+      ctx.fillStyle = needleGrad;
+      ctx.beginPath();
+      ctx.moveTo(pTipX, pTipY);
+      ctx.lineTo(pTailX + (perpX * baseHalfW), pTailY + (perpY * baseHalfW));
+      ctx.lineTo(pTailX - (perpX * baseHalfW), pTailY - (perpY * baseHalfW));
+      ctx.closePath();
+      ctx.fill();
 
       // Hub.
       const hubOuter = ctx.createRadialGradient(cx - 2, cy - 2, 2, cx, cy, radius * 0.16);
@@ -1854,7 +1888,7 @@ def _render_dashboard_html() -> str:
         ctx.beginPath();
         let started = false;
         let smoothVal = null;
-        for (let i = 0; i < n; i++) {
+        for (let i = n - 1; i >= 0; i--) {
           const val = seriesValue(points[i], s.key);
           if (!Number.isFinite(val)) continue;
           smoothVal = (smoothVal === null)
@@ -1984,7 +2018,7 @@ def _render_dashboard_html() -> str:
         ctx.beginPath();
         let started = false;
         let smoothVal = null;
-        for (let i = 0; i < n; i++) {
+        for (let i = n - 1; i >= 0; i--) {
           const val = Number(points[i][s.key]);
           if (!Number.isFinite(val)) continue;
           smoothVal = (smoothVal === null)
@@ -2020,6 +2054,87 @@ def _render_dashboard_html() -> str:
       return vals.reduce((a, b) => a + b, 0.0) / vals.length;
     }
 
+    function buildThroughputHistory(rows, stepWindowSec = 2.0, emaAlpha = 0.12) {
+      const src = Array.isArray(rows) ? rows : [];
+      if (!src.length) return [];
+      const out = new Array(src.length);
+      let j = 0;
+      let ema = null;
+      for (let i = 0; i < src.length; i++) {
+        const row = src[i] || {};
+        const tsI = Number(row.ts);
+        const stI = Number(row.training_steps);
+        while (j < i) {
+          const tsJ = Number(src[j] && src[j].ts);
+          if (!Number.isFinite(tsI) || !Number.isFinite(tsJ) || (tsI - tsJ) <= stepWindowSec) break;
+          j += 1;
+        }
+
+        let rate = Number(row.steps_per_sec);
+        if (i > j) {
+          const tsJ = Number(src[j] && src[j].ts);
+          const stJ = Number(src[j] && src[j].training_steps);
+          const dt = tsI - tsJ;
+          const ds = stI - stJ;
+          if (Number.isFinite(dt) && dt > 1e-6 && Number.isFinite(ds) && ds >= 0) {
+            rate = ds / dt;
+          }
+        }
+        if (!Number.isFinite(rate)) rate = 0.0;
+        ema = (ema === null) ? rate : (ema + ((rate - ema) * emaAlpha));
+        out[i] = { ...row, steps_per_sec_chart: ema };
+      }
+      return out;
+    }
+
+    function buildWindowSmoothedHistory(rows, specs, windowSec = 2.0) {
+      const src = Array.isArray(rows) ? rows : [];
+      if (!src.length) return [];
+      const defs = Array.isArray(specs) ? specs : [];
+      const out = new Array(src.length);
+      const starts = new Array(defs.length).fill(0);
+      const sums = new Array(defs.length).fill(0.0);
+      const counts = new Array(defs.length).fill(0);
+      const emas = new Array(defs.length).fill(null);
+
+      for (let i = 0; i < src.length; i++) {
+        const row = src[i] || {};
+        const tsI = Number(row.ts);
+        const nextRow = { ...row };
+
+        for (let k = 0; k < defs.length; k++) {
+          const def = defs[k] || {};
+          const key = String(def.key || "");
+          if (!key) continue;
+          const alpha = Number.isFinite(def.alpha) ? Number(def.alpha) : 0.12;
+
+          const vNow = Number(row[key]);
+          if (Number.isFinite(vNow)) {
+            sums[k] += vNow;
+            counts[k] += 1;
+          }
+
+          while (starts[k] < i) {
+            const rowStart = src[starts[k]] || {};
+            const tsS = Number(rowStart.ts);
+            if (!Number.isFinite(tsI) || !Number.isFinite(tsS) || (tsI - tsS) <= windowSec) break;
+            const vS = Number(rowStart[key]);
+            if (Number.isFinite(vS)) {
+              sums[k] -= vS;
+              counts[k] = Math.max(0, counts[k] - 1);
+            }
+            starts[k] += 1;
+          }
+
+          const avg = counts[k] > 0 ? (sums[k] / counts[k]) : (Number.isFinite(vNow) ? vNow : 0.0);
+          emas[k] = (emas[k] === null) ? avg : (emas[k] + ((avg - emas[k]) * alpha));
+          nextRow[key] = emas[k];
+        }
+        out[i] = nextRow;
+      }
+      return out;
+    }
+
     function updateCards(now, smoothedSteps) {
       cards.frame.textContent = fmtInt(now.frame_count);
       if (cards.fps) cards.fps.textContent = fmtInt(now.fps);
@@ -2047,11 +2162,12 @@ def _render_dashboard_html() -> str:
       if (!payload || !payload.now) return;
       const history = Array.isArray(payload.history) ? payload.history.slice(-MAX_HISTORY_POINTS) : [];
       const chartHistory = downsampleHistory(history, MAX_CHART_POINTS);
+      const throughputHistory = buildThroughputHistory(chartHistory);
       const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history);
       updateCards(payload.now, smoothedStepSpd);
       drawFpsGauge(fpsGaugeCanvas, payload.now.fps);
       drawStepGauge(stepGaugeCanvas, smoothedStepSpd);
-      drawChart(charts.throughput.canvas, chartHistory, charts.throughput.series);
+      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series);
       drawChart(charts.rewards.canvas, chartHistory, charts.rewards.series);
       drawChart(charts.learning.canvas, chartHistory, charts.learning.series);
       drawChart(charts.dqn.canvas, chartHistory, charts.dqn.series);
