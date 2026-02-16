@@ -86,7 +86,7 @@ class RLConfigData:
     max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 2_000_000
+    memory_size: int = 10_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -94,8 +94,8 @@ class RLConfigData:
     per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
     min_replay_to_train: int = 10_000
 
-    # Target network (periodic hard sync; faster refresh to reduce staleness in plateau phase)
-    target_update_period: int = 1_000
+    # Target network (periodic hard sync; moderate refresh for stable learning)
+    target_update_period: int = 2_000
     target_tau: float = 1.0
 
     # Gradient
