@@ -32,15 +32,17 @@ except ImportError:
     from Scripts.config import RL_CONFIG
 
 try:
-    from metrics_display import get_dqn_window_averages, get_total_window_averages
+    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average
 except ImportError:
     try:
-        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages
+        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average
     except ImportError:
         def get_dqn_window_averages():
             return 0.0, 0.0, 0.0
         def get_total_window_averages():
             return 0.0, 0.0, 0.0
+        def get_eplen_1m_average():
+            return 0.0
 
 
 def _tail_mean(values, count: int = 20) -> float:
@@ -300,6 +302,7 @@ class _DashboardState:
             "lr": lr,
             "q_min": q_min,
             "q_max": q_max,
+            "eplen_1m": get_eplen_1m_average(),
         }
 
     def sample(self):
@@ -441,7 +444,16 @@ def _render_dashboard_html() -> str:
         0 0 36px var(--panelGlowB);
       backdrop-filter: blur(10px) saturate(118%);
     }
-    .top::before, .card::before, .panel::before {
+    .card {
+      --card-border: rgba(100, 180, 255, 0.45);
+      --card-glow: rgba(100, 180, 255, 0.18);
+      border: 2px solid var(--card-border);
+      box-shadow:
+        inset 0 0 0 1px color-mix(in srgb, var(--card-border) 15%, transparent),
+        0 0 18px var(--card-glow),
+        0 0 32px var(--card-glow);
+    }
+    .top::before, .panel::before {
       content: "";
       position: absolute;
       inset: 0;
@@ -456,7 +468,15 @@ def _render_dashboard_html() -> str:
       -webkit-mask-composite: xor;
       mask-composite: exclude;
     }
-    .top::after, .card::after, .panel::after {
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      opacity: 0;
+    }
+    .top::after, .panel::after {
       content: "";
       position: absolute;
       inset: 0;
@@ -569,10 +589,11 @@ def _render_dashboard_html() -> str:
     }
     .cards {
       display: grid;
-      grid-template-columns: repeat(6, minmax(140px, 1fr));
+      grid-template-columns: repeat(12, minmax(0, 1fr));
       gap: 10px;
     }
     .card {
+      grid-column: span 2;
       border-radius: 14px;
       padding: 6px 9px;
       min-height: 44px;
@@ -643,7 +664,7 @@ def _render_dashboard_html() -> str:
     .mini-metric-card .mini-inline {
       display: grid;
       grid-template-columns: minmax(0, 23fr) minmax(0, 37fr);
-      align-items: center;
+      align-items: stretch;
       column-gap: 8px;
       min-height: 18px;
     }
@@ -677,10 +698,16 @@ def _render_dashboard_html() -> str:
       animation: ledPulse 1.4s ease-in-out infinite;
     }
     .gauge-card {
-      grid-column: span 1;
+      grid-column: span 2;
       grid-row: span 2;
       min-height: 200px;
       max-height: 320px;
+    }
+    .card-narrow {
+      grid-column: span 1;
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
     }
     .card-half {
       min-height: 0;
@@ -689,9 +716,12 @@ def _render_dashboard_html() -> str:
     }
     .card-half.mini-metric-card .mini-inline {
       min-height: 0;
+      flex: 1;
     }
     .card-half.mini-metric-card .mini-canvas {
       height: 36px;
+      min-height: 36px;
+      flex: 1;
       border-radius: 4px;
     }
     .gauge-card canvas {
@@ -788,14 +818,14 @@ def _render_dashboard_html() -> str:
       opacity: 0.10;
     }
     @media (max-width: 1300px) {
-      .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
-      .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 180px; }
+      .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+      .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
     }
     @media (max-width: 950px) {
-      .cards { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
-      .gauge-card { grid-column: span 1; }
+      .gauge-card { grid-column: span 2; }
       .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
@@ -803,69 +833,76 @@ def _render_dashboard_html() -> str:
 <body>
   <main>
     <section class="cards">
-      <article class="card gauge-card">
+      <article class="card gauge-card" style="--card-border:rgba(255,60,60,0.55);--card-glow:rgba(255,40,40,0.22)">
         <div class="gauge-head">
           <div class="label">FRAMES PER SECOND</div>
         </div>
         <canvas id="cFpsGauge"></canvas>
       </article>
-      <article class="card gauge-card">
+      <article class="card gauge-card" style="--card-border:rgba(255,220,40,0.55);--card-glow:rgba(255,200,20,0.22)">
         <div class="gauge-head">
           <div class="label">STEPS PER SECOND</div>
         </div>
         <canvas id="cStepGauge"></canvas>
       </article>
-      <article class="card mini-metric-card">
+      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.55);--card-glow:rgba(255,120,20,0.22)">
         <div class="label">DQN REWARD 1M</div>
         <div class="mini-inline">
           <div class="value" id="mDqnRwrd">0</div>
           <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card">
+      <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.55);--card-glow:rgba(40,200,60,0.22)">
         <div class="label">AVG REWARD 1M</div>
         <div class="mini-inline">
           <div class="value" id="mRwrd">0</div>
           <canvas id="cRewardMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card card-half">
+      <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.55);--card-glow:rgba(40,100,255,0.22)">
         <div class="label">Avg Level</div>
         <div class="mini-inline">
           <div class="value" id="mLevel">0.0</div>
           <canvas id="cLevelMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card card-half">
+      <article class="card mini-metric-card" style="--card-border:rgba(180,80,255,0.55);--card-glow:rgba(160,50,255,0.22)">
         <div class="label">Loss</div>
         <div class="mini-inline">
           <div class="value" id="mLoss">0</div>
           <canvas id="cLossMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card card-half">
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,60,180,0.55);--card-glow:rgba(255,40,160,0.22)">
         <div class="label">Grad Norm</div>
         <div class="mini-inline">
           <div class="value" id="mGrad">0</div>
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
-      <article class="card card-half"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card card-half"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
-      <article class="card">
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,160,80,0.55);--card-glow:rgba(255,140,60,0.22)">
+        <div class="label">EPISODE LENGTH</div>
+        <div class="mini-inline">
+          <div class="value" id="mEpLen">0</div>
+          <canvas id="cEpLenMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.55);--card-glow:rgba(100,200,40,0.22)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.55);--card-glow:rgba(255,160,40,0.22)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.55);--card-glow:rgba(255,80,80,0.22)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.55);--card-glow:rgba(60,235,160,0.22)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card" style="--card-border:rgba(100,200,255,0.55);--card-glow:rgba(80,180,255,0.22)">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
       </article>
-      <article class="card">
+      <article class="card" style="--card-border:rgba(220,180,255,0.55);--card-glow:rgba(200,150,255,0.22)">
         <div class="label">REPLAYS PER FRAME</div>
         <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
       </article>
-      <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
-      <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
-      <article class="card"><div class="label">Buffer</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
-      <article class="card"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card" style="--card-border:rgba(255,220,100,0.55);--card-glow:rgba(255,200,80,0.22)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
+      <article class="card" style="--card-border:rgba(100,160,255,0.55);--card-glow:rgba(80,140,255,0.22)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
+      <article class="card" style="--card-border:rgba(200,100,255,0.55);--card-glow:rgba(180,80,255,0.22)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card card-half" style="--card-border:rgba(0,220,200,0.55);--card-glow:rgba(0,200,180,0.22)"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
     </section>
 
     <section class="charts">
@@ -1008,6 +1045,7 @@ def _render_dashboard_html() -> str:
       buf: document.getElementById("mBuf"),
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
+      epLen: document.getElementById("mEpLen"),
     };
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
@@ -1161,6 +1199,12 @@ def _render_dashboard_html() -> str:
         canvas: document.getElementById("cGradMini"),
         series: [
           { key: "grad_norm", color: "#f59e0b", axis: { min: 0 } }
+        ]
+      },
+      epLenMini: {
+        canvas: document.getElementById("cEpLenMini"),
+        series: [
+          { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
         ]
       }
     };
@@ -2361,6 +2405,7 @@ def _render_dashboard_html() -> str:
       cards.q.innerHTML = (now.q_min === null || now.q_max === null)
         ? toFixedCharCells("-")
         : toFixedCharCells(`${fmtSignedFloat(now.q_min, 1)},${fmtSignedFloat(now.q_max, 1)}`);
+      cards.epLen.textContent = fmtInt(now.eplen_1m);
     }
 
     function render(payload) {
@@ -2387,6 +2432,7 @@ def _render_dashboard_html() -> str:
       drawMiniChart(charts.level1m.canvas, history60m, charts.level1m.series);
       drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
       drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
+      drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
     }
 
     let historyCache = [];
