@@ -50,8 +50,8 @@ class RLConfigData:
         return self.num_firezap_actions * self.num_spinner_actions
 
     # ── network architecture ────────────────────────────────────────────
-    trunk_hidden: int = 512
-    trunk_layers: int = 3
+    trunk_hidden: int = 256
+    trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
 
@@ -77,12 +77,12 @@ class RLConfigData:
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 256
     lr: float = 6.25e-5
-    lr_min: float = 1e-5                  # Decay to 1/6 of peak — lets network settle
+    lr_min: float = 2e-5                  # Higher floor keeps learning alive across restarts
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 500_000        # Each restart cycle decays over this many training steps
+    lr_cosine_period: int = 1_000_000      # Longer ramp = more time to explore at high LR per cycle
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
-    n_step: int = 10                        # Doubled from 5 for wider death attribution window
+    n_step: int = 12                        # Wider horizon for better long-range credit assignment
     max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
@@ -106,15 +106,15 @@ class RLConfigData:
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 1_000_000
     # Late-training exploration pulses to escape local optima.
-    epsilon_pulse_max: float = 0.10
-    epsilon_pulse_period_frames: int = 300_000
+    epsilon_pulse_max: float = 0.20
+    epsilon_pulse_period_frames: int = 500_000
     epsilon_pulse_start_frame: int = 3_000_000
     epsilon: float = 1.0
 
     # Expert guidance
     expert_ratio_start: float = 0.50
-    expert_ratio_end: float = 0.05
-    expert_ratio_decay_frames: int = 5_000_000
+    expert_ratio_end: float = 0.08
+    expert_ratio_decay_frames: int = 10_000_000
     expert_ratio: float = 0.50
     # During tube zoom (gamestate 0x20), temporarily boost expert usage.
     expert_ratio_zoom_multiplier: float = 2.0

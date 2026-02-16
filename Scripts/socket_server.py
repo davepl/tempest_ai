@@ -36,9 +36,11 @@ try:
         add_episode_to_dqn100k_window,
         add_episode_to_dqn1m_window,
         add_episode_to_dqn5m_window,
+        add_episode_to_total_windows,
     )
 except ImportError:
     add_episode_to_dqn100k_window = add_episode_to_dqn1m_window = add_episode_to_dqn5m_window = lambda *a: None
+    add_episode_to_total_windows = lambda *a: None
 
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
@@ -351,6 +353,7 @@ class SocketServer:
                             add_episode_to_dqn100k_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
                             add_episode_to_dqn1m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
                             add_episode_to_dqn5m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
+                            add_episode_to_total_windows(cs["total_reward"], cs.get("ep_frames", 0))
                         except Exception:
                             pass
                     cs["was_done"] = True
