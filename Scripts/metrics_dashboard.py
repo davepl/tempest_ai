@@ -56,11 +56,17 @@ LEVEL_5M_FRAMES = 5_000_000
 WEB_CLIENT_TIMEOUT_S = 5.0
 DASH_HISTORY_LIMIT = 18_000
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
+FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
 
 
 def _audio_dir() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(os.path.dirname(script_dir), "audio")
+
+
+def _fonts_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "fonts")
 
 
 def _list_audio_files() -> list[str]:
@@ -258,6 +264,7 @@ class _DashboardState:
             "client_count": client_count,
             "web_client_count": web_client_count,
             "average_level": average_level,
+            "memory_buffer_size": memory_buffer_size,
             "memory_buffer_k": memory_buffer_k,
             "memory_buffer_pct": memory_buffer_pct,
             "avg_inf_ms": avg_inf_ms,
@@ -311,10 +318,17 @@ def _render_dashboard_html() -> str:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tempest AI Metrics</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DotGothic16&display=swap" rel="stylesheet">
   <style>
+    @font-face {
+      font-family: "LED Dot-Matrix";
+      src: url("/api/font/LED%20Dot-Matrix.ttf") format("truetype");
+      font-display: swap;
+    }
+    @font-face {
+      font-family: "DS-Digital";
+      src: url("/api/font/DS-DIGI.TTF") format("truetype");
+      font-display: swap;
+    }
     :root {
       --bg0: #040510;
       --bg1: #0b1433;
@@ -520,16 +534,16 @@ def _render_dashboard_html() -> str:
     .cards {
       display: grid;
       grid-template-columns: repeat(6, minmax(140px, 1fr));
-      gap: 12px;
+      gap: 10px;
     }
     .card {
       border-radius: 14px;
-      padding: 10px 12px;
-      min-height: 86px;
+      padding: 6px 9px;
+      min-height: 44px;
       display: flex;
       flex-direction: column;
-      justify-content: center;
-      gap: 6px;
+      justify-content: flex-start;
+      gap: 3px;
     }
     .label {
       color: #a5bfde;
@@ -556,23 +570,49 @@ def _render_dashboard_html() -> str:
       font-weight: 400;
       letter-spacing: normal;
       font-variant-numeric: normal;
-      text-shadow: none;
+      text-shadow: 0 0 4px rgba(112, 247, 255, 0.32), 0 0 10px rgba(112, 247, 255, 0.18);
+      filter: drop-shadow(0 0 4px rgba(112, 247, 255, 0.16));
     }
     .value-inline {
       display: inline-flex;
       align-items: center;
       gap: 10px;
     }
-    .mini-metric-card .mini-inline {
-      display: flex;
+    #mQ {
+      display: inline-grid;
+      grid-auto-flow: column;
+      grid-auto-columns: 0.62em;
       align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      min-height: 58px;
+      justify-content: start;
+      white-space: nowrap;
+      font-variant-ligatures: none;
+      font-kerning: none;
+      letter-spacing: 0 !important;
+      line-height: 1;
+    }
+    #mQ .qch {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 0.70em;
+      min-width: 0.70em;
+    }
+    .mini-metric-card .mini-inline {
+      display: grid;
+      grid-template-columns: minmax(0, 23fr) minmax(0, 37fr);
+      align-items: center;
+      column-gap: 8px;
+      min-height: 18px;
+    }
+    .mini-metric-card .mini-inline .value {
+      justify-self: start;
+      min-width: 0;
+      white-space: nowrap;
     }
     .mini-metric-card .mini-canvas {
-      width: 132px;
-      height: 58px;
+      width: 100%;
+      max-width: 100%;
+      height: 104px;
       border-radius: 8px;
       border: none;
       background:
@@ -582,6 +622,7 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
       flex: 0 0 auto;
+      justify-self: end;
     }
     .metric-led {
       width: 10px;
@@ -595,10 +636,10 @@ def _render_dashboard_html() -> str:
     .gauge-card {
       grid-column: span 1;
       grid-row: span 2;
-      min-height: 188px;
-      padding: 12px;
+      min-height: 108px;
+      padding: 5px 7px;
       justify-content: flex-start;
-      gap: 8px;
+      gap: 2px;
     }
     .gauge-head {
       display: flex;
@@ -607,7 +648,7 @@ def _render_dashboard_html() -> str:
       gap: 8px;
     }
     .gauge-readout {
-      display: inline-flex;
+      display: none;
       align-items: baseline;
       gap: 6px;
       font-size: 30px;
@@ -635,7 +676,7 @@ def _render_dashboard_html() -> str:
     }
     .gauge-canvas {
       width: 100%;
-      height: 158px;
+      height: 164px;
       border-radius: 12px;
       border: 1px solid rgba(0, 229, 255, 0.30);
       background:
@@ -663,7 +704,7 @@ def _render_dashboard_html() -> str:
     .panel {
       border-radius: 14px;
       padding: 12px;
-      min-height: 280px;
+      min-height: 224px;
       display: grid;
       grid-template-rows: auto auto 1fr;
       gap: 8px;
@@ -729,51 +770,34 @@ def _render_dashboard_html() -> str:
     }
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
-      .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 188px; }
-      .mini-metric-card .mini-canvas { width: 110px; }
+      .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 108px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
-      .mini-metric-card .mini-canvas { width: 96px; height: 52px; }
+      .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
 </head>
 <body>
   <main>
-    <section class="top">
-      <div class="title">
-        <h1>Tempest AI Dashboard</h1>
-        <div class="subtitle">Primary training and runtime telemetry (live)</div>
-      </div>
-      <div class="top-right">
-        <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
-        <button id="audioToggle" class="audio-toggle" type="button">Audio Off</button>
-      </div>
-    </section>
-
     <section class="cards">
       <article class="card gauge-card">
         <div class="gauge-head">
-          <div class="label">FPS SPD</div>
+          <div class="label">FRAMES PER SECOND</div>
           <div class="gauge-readout"><span id="mFps">0.0</span><small>fps</small></div>
         </div>
         <canvas id="cFpsGauge" class="gauge-canvas"></canvas>
-        <div class="gauge-foot"><span>R 1.0K Y 1.5K</span><span>G 2.5K</span></div>
       </article>
       <article class="card gauge-card">
         <div class="gauge-head">
-          <div class="label">STEP SPD</div>
+          <div class="label">STEPS PER SECOND</div>
           <div class="gauge-readout"><span id="mSteps">0.0</span><small>s/s</small></div>
         </div>
         <canvas id="cStepGauge" class="gauge-canvas"></canvas>
-        <div class="gauge-foot"><span>R10 Y20</span><span>G30</span></div>
       </article>
-      <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
-      <article class="card"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card mini-metric-card">
         <div class="label">Avg Level</div>
         <div class="mini-inline">
@@ -781,16 +805,6 @@ def _render_dashboard_html() -> str:
           <canvas id="cLevelMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card">
-        <div class="label">Avg Inf</div>
-        <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
-      </article>
-      <article class="card">
-        <div class="label">Rpl/F</div>
-        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
-      </article>
-      <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
-      <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
       <article class="card mini-metric-card">
         <div class="label">Avg Reward</div>
         <div class="mini-inline">
@@ -812,8 +826,21 @@ def _render_dashboard_html() -> str:
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
+      <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
+      <article class="card"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card">
+        <div class="label">AVG INFERENCE</div>
+        <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
+      </article>
+      <article class="card">
+        <div class="label">REPLAYS PER FRAME</div>
+        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
+      </article>
+      <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
+      <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
       <article class="card"><div class="label">Buffer</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card"><div class="label">LR</div><div class="value" id="mLr">-</div></article>
+      <article class="card"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
       <article class="card"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
     </section>
 
@@ -859,6 +886,16 @@ def _render_dashboard_html() -> str:
         <canvas id="cDqn"></canvas>
       </article>
 
+    </section>
+    <section class="top">
+      <div class="title">
+        <h1>Tempest AI Dashboard</h1>
+        <div class="subtitle">Primary training and runtime telemetry (live)</div>
+      </div>
+      <div class="top-right">
+        <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
+        <button id="audioToggle" class="audio-toggle" type="button">Audio Off</button>
+      </div>
     </section>
   </main>
   <audio id="bgAudio" preload="auto" autoplay></audio>
@@ -927,12 +964,14 @@ def _render_dashboard_html() -> str:
           {
             key: "fps",
             color: "#22c55e",
-            axis: { side: "left", min: 0, max: 1200, ticks: [0, 300, 600, 900, 1200] }
+            axis: { side: "left", min: 0 },
+            smooth_alpha: 0.14,
           },
           {
             key: "steps_per_sec",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] }
+            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] },
+            smooth_alpha: 0.05,
           }
         ]
       },
@@ -959,10 +998,11 @@ def _render_dashboard_html() -> str:
           {
             key: "loss",
             color: "#22c55e",
-            axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"] },
+            axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"], min_floor: 0, max_floor: 5 },
+            smooth_alpha: 0.14,
           },
-          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss" },
-          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss" }
+          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss", smooth_alpha: 0.14 },
+          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss", smooth_alpha: 0.14 }
         ]
       },
       dqn: {
@@ -1018,6 +1058,26 @@ def _render_dashboard_html() -> str:
     function fmtFloat(v, d = 2) {
       if (v === null || v === undefined || Number.isNaN(v)) return "0";
       return Number(v).toFixed(d);
+    }
+
+    function fmtSignedFloat(v, d = 2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "+0";
+      const n = Number(v);
+      const mag = Math.abs(n).toFixed(d);
+      return (n < 0 ? "-" : "+") + mag;
+    }
+
+    function toFixedCharCells(text) {
+      const s = String(text ?? "");
+      return Array.from(s).map((ch) => {
+        const html = (ch === " ") ? "&nbsp;" : ch
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+        return `<span class="qch">${html}</span>`;
+      }).join("");
     }
 
     function downsampleHistory(rows, targetPoints) {
@@ -1202,7 +1262,18 @@ def _render_dashboard_html() -> str:
       cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
     }
 
-    function drawFpsGauge(canvas, fps) {
+    function roundRectPath(ctx, x, y, w, h, r) {
+      const rr = Math.max(0, Math.min(r, Math.min(w, h) * 0.5));
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rr);
+      ctx.arcTo(x + w, y + h, x, y + h, rr);
+      ctx.arcTo(x, y + h, x, y, rr);
+      ctx.arcTo(x, y, x + w, y, rr);
+      ctx.closePath();
+    }
+
+    function drawStyledGauge(canvas, valueRaw, cfg) {
       if (!canvas) return;
 
       const width = canvas.clientWidth || 360;
@@ -1215,198 +1286,186 @@ def _render_dashboard_html() -> str:
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
-      const cx = width * 0.5;
-      const cy = height * 0.68;
-      const radius = Math.max(44, Math.min(width * 0.30, height * 0.56));
+      const minV = Number(cfg.min);
+      const maxV = Number(cfg.max);
+      const spanV = Math.max(1e-9, maxV - minV);
+      const clampVal = (v) => Math.max(minV, Math.min(maxV, Number(v) || 0));
+      const value = clampVal(valueRaw);
 
-      // Sweep 240° from lower-left to lower-right across the top.
-      const startDeg = 150;
-      const spanDeg = 240;
+      const cx = width * 0.5;
+      const cy = height * 0.63;
+      const radius = Math.max(44, Math.min(width * 0.34, height * 0.64));
+
       const degToRad = (d) => (d * Math.PI) / 180.0;
-      const clampFps = (v) => Math.max(GAUGE_MIN_FPS, Math.min(GAUGE_MAX_FPS, Number(v) || 0));
+      const startDeg = 135;
+      const spanDeg = 270;
+      const startRad = degToRad(startDeg);
+      const endRad = degToRad(startDeg + spanDeg);
       const valToAngle = (v) => {
-        const t = (clampFps(v) - GAUGE_MIN_FPS) / (GAUGE_MAX_FPS - GAUGE_MIN_FPS);
-        return degToRad(startDeg + spanDeg * t);
+        const t = (clampVal(v) - minV) / spanV;
+        return startRad + (t * (endRad - startRad));
       };
 
-      const trackW = Math.max(9, radius * 0.11);
-      ctx.lineCap = "round";
-
-      // Main arc track
-      ctx.strokeStyle = "rgba(148, 163, 184, 0.58)";
-      ctx.lineWidth = trackW;
+      // Outer glow + bezel (metallic ring style).
+      const glow = ctx.createRadialGradient(cx, cy, radius * 0.9, cx, cy, radius * 1.45);
+      glow.addColorStop(0.0, "rgba(0, 0, 0, 0.00)");
+      glow.addColorStop(1.0, "rgba(0, 0, 0, 0.55)");
+      ctx.fillStyle = glow;
       ctx.beginPath();
-      ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(startDeg + spanDeg), false);
+      ctx.arc(cx, cy, radius * 1.45, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.lineWidth = Math.max(10, radius * 0.14);
+      const bezel = ctx.createLinearGradient(cx - radius, cy - radius, cx + radius, cy + radius);
+      bezel.addColorStop(0.0, "#8f979f");
+      bezel.addColorStop(0.20, "#31373d");
+      bezel.addColorStop(0.55, "#14181d");
+      bezel.addColorStop(0.80, "#6f7881");
+      bezel.addColorStop(1.0, "#d8dde1");
+      ctx.strokeStyle = bezel;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius * 1.15, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Zone arcs: red [0,1000], yellow (1000,1500], green (1500,2500].
-      ctx.lineWidth = trackW + 1.0;
+      // Dial face.
+      const face = ctx.createRadialGradient(cx, cy - radius * 0.5, radius * 0.2, cx, cy, radius * 1.02);
+      face.addColorStop(0.0, "rgba(62, 67, 73, 0.96)");
+      face.addColorStop(0.55, "rgba(39, 42, 47, 0.98)");
+      face.addColorStop(1.0, "rgba(22, 25, 30, 0.99)");
+      ctx.fillStyle = face;
       ctx.beginPath();
-      ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
-      ctx.arc(cx, cy, radius, valToAngle(GAUGE_MIN_FPS), valToAngle(GAUGE_FPS_RED_MAX), false);
+      ctx.arc(cx, cy, radius * 1.02, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Dial ring.
+      ctx.strokeStyle = "rgba(210, 215, 221, 0.72)";
+      ctx.lineWidth = Math.max(3.5, radius * 0.040);
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius * 0.92, startRad, endRad, false);
       ctx.stroke();
 
-      ctx.beginPath();
-      ctx.strokeStyle = "rgba(245, 158, 11, 0.95)";
-      ctx.arc(cx, cy, radius, valToAngle(GAUGE_FPS_RED_MAX), valToAngle(GAUGE_FPS_YELLOW_MAX), false);
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
-      ctx.arc(cx, cy, radius, valToAngle(GAUGE_FPS_YELLOW_MAX), valToAngle(GAUGE_MAX_FPS), false);
-      ctx.stroke();
-
-      // Tick marks (major every 250, minor every 125)
-      for (let v = GAUGE_MIN_FPS; v <= GAUGE_MAX_FPS; v += 125) {
-        const isMajor = (v % 250) === 0;
-        const a = valToAngle(v);
+      // Scale ticks with threshold coloring.
+      const minorStep = Math.max(1e-9, Number(cfg.minor_step));
+      const majorStep = Math.max(minorStep, Number(cfg.major_step));
+      const majorEvery = Math.max(1, Math.round(majorStep / minorStep));
+      const tickOuter = radius * 0.89;
+      const tickMinorInner = radius * 0.76;
+      const tickMajorInner = radius * 0.66;
+      const tickCount = Math.max(1, Math.round((maxV - minV) / minorStep));
+      for (let i = 0; i <= tickCount; i++) {
+        const vv = (i >= tickCount) ? maxV : (minV + (i * minorStep));
+        const a = valToAngle(vv);
         const cosA = Math.cos(a);
         const sinA = Math.sin(a);
-
-        const outer = radius + trackW * 0.38;
-        const inner = outer - (isMajor ? trackW * 1.6 : trackW * 0.95);
-
-        let tickColor = "rgba(239, 68, 68, 0.95)";
-        if (v > GAUGE_FPS_RED_MAX && v <= GAUGE_FPS_YELLOW_MAX) tickColor = "rgba(245, 158, 11, 0.95)";
-        else if (v > GAUGE_FPS_YELLOW_MAX) tickColor = "rgba(34, 197, 94, 0.95)";
-        ctx.strokeStyle = tickColor;
-        ctx.lineWidth = isMajor ? 3.0 : 1.8;
+        const isMajor = ((i % majorEvery) === 0) || i === tickCount;
+        const inner = isMajor ? tickMajorInner : tickMinorInner;
+        let c = "rgba(236, 241, 247, 0.90)";
+        if (isMajor) {
+          if (vv <= cfg.red_max) c = "rgba(255, 58, 58, 0.95)";
+          else if (vv <= cfg.yellow_max) c = "rgba(252, 176, 44, 0.95)";
+          else c = "rgba(51, 219, 107, 0.95)";
+        }
+        ctx.strokeStyle = c;
+        ctx.lineWidth = isMajor ? Math.max(3.0, radius * 0.03) : Math.max(0.9, radius * 0.008);
         ctx.beginPath();
-        ctx.moveTo(cx + outer * cosA, cy + outer * sinA);
-        ctx.lineTo(cx + inner * cosA, cy + inner * sinA);
+        ctx.moveTo(cx + (tickOuter * cosA), cy + (tickOuter * sinA));
+        ctx.lineTo(cx + (inner * cosA), cy + (inner * sinA));
         ctx.stroke();
       }
 
-      // Needle
-      const needleAngle = valToAngle(fps);
+      // Needle (cyan with shadow).
+      const needleAngle = valToAngle(value);
       const nCos = Math.cos(needleAngle);
       const nSin = Math.sin(needleAngle);
-      const needleLen = radius * 0.98;
-
+      const needleLen = radius * 0.84;
       ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-      ctx.lineWidth = 7.5;
+      ctx.lineWidth = Math.max(6.0, radius * 0.08);
       ctx.beginPath();
       ctx.moveTo(cx + 3, cy + 3);
-      ctx.lineTo(cx + needleLen * nCos + 3, cy + needleLen * nSin + 3);
+      ctx.lineTo(cx + (needleLen * nCos) + 3, cy + (needleLen * nSin) + 3);
       ctx.stroke();
 
-      ctx.strokeStyle = "#e2e8f0";
-      ctx.lineWidth = 6.0;
+      const needleGrad = ctx.createLinearGradient(cx, cy, cx + needleLen * nCos, cy + needleLen * nSin);
+      needleGrad.addColorStop(0.0, "#21f3ff");
+      needleGrad.addColorStop(1.0, "#00b8ff");
+      ctx.strokeStyle = needleGrad;
+      ctx.lineWidth = Math.max(5.0, radius * 0.06);
+      ctx.lineCap = "round";
       ctx.beginPath();
       ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + needleLen * nCos, cy + needleLen * nSin);
+      ctx.lineTo(cx + (needleLen * nCos), cy + (needleLen * nSin));
       ctx.stroke();
 
-      // Hub
-      ctx.fillStyle = "rgba(2, 6, 23, 0.95)";
+      // Hub.
+      const hubOuter = ctx.createRadialGradient(cx - 2, cy - 2, 2, cx, cy, radius * 0.16);
+      hubOuter.addColorStop(0.0, "rgba(167, 174, 180, 0.98)");
+      hubOuter.addColorStop(1.0, "rgba(38, 44, 51, 0.98)");
+      ctx.fillStyle = hubOuter;
       ctx.beginPath();
-      ctx.arc(cx, cy, 14, 0, Math.PI * 2);
+      ctx.arc(cx, cy, radius * 0.16, 0, Math.PI * 2);
       ctx.fill();
 
-      ctx.fillStyle = "rgba(100, 116, 139, 0.82)";
+      ctx.fillStyle = "rgba(8, 12, 17, 0.96)";
       ctx.beginPath();
-      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+      ctx.arc(cx, cy, radius * 0.09, 0, Math.PI * 2);
       ctx.fill();
+
+      // Center title (matching reference style).
+      ctx.fillStyle = "rgba(232, 236, 241, 0.85)";
+      ctx.font = `700 ${Math.max(13, Math.round(radius * 0.16))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(cfg.title || "", cx, cy - radius * 0.36);
+
+      // Bottom value badge.
+      const badgeW = radius * 0.86;
+      const badgeH = radius * 0.48;
+      const badgeX = cx - (badgeW * 0.5);
+      const badgeY = cy + radius * 0.30;
+      const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
+      badgeFill.addColorStop(0.0, "rgba(16, 18, 22, 0.92)");
+      badgeFill.addColorStop(1.0, "rgba(8, 10, 13, 0.96)");
+      roundRectPath(ctx, badgeX, badgeY, badgeW, badgeH, Math.max(8, radius * 0.08));
+      ctx.fillStyle = badgeFill;
+      ctx.fill();
+
+      const valueText = Number(value).toFixed(cfg.decimals ?? 1);
+      ctx.fillStyle = "rgba(255, 52, 52, 0.98)";
+      ctx.shadowColor = "rgba(255, 52, 52, 0.45)";
+      ctx.shadowBlur = Math.max(4, radius * 0.08);
+      ctx.font = `400 ${Math.max(20, Math.round(radius * 0.44))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(valueText, cx, badgeY + (badgeH * 0.58));
+      ctx.shadowBlur = 0;
+    }
+
+    function drawFpsGauge(canvas, fps) {
+      drawStyledGauge(canvas, fps, {
+        min: GAUGE_MIN_FPS,
+        max: GAUGE_MAX_FPS,
+        red_max: GAUGE_FPS_RED_MAX,
+        yellow_max: GAUGE_FPS_YELLOW_MAX,
+        minor_step: 50,
+        major_step: 250,
+        title: "FPS",
+        unit: "FPS",
+        decimals: 0,
+      });
     }
 
     function drawStepGauge(canvas, stepsPerSec) {
-      if (!canvas) return;
-
-      const width = canvas.clientWidth || 360;
-      const height = canvas.clientHeight || 160;
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(width * dpr);
-      canvas.height = Math.floor(height * dpr);
-
-      const ctx = canvas.getContext("2d");
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, width, height);
-
-      const cx = width * 0.5;
-      const cy = height * 0.68;
-      const radius = Math.max(44, Math.min(width * 0.30, height * 0.56));
-
-      const startDeg = 150;
-      const spanDeg = 240;
-      const degToRad = (d) => (d * Math.PI) / 180.0;
-      const clampSteps = (v) => Math.max(GAUGE_MIN_STEPS, Math.min(GAUGE_MAX_STEPS, Number(v) || 0));
-      const valToAngle = (v) => {
-        const t = (clampSteps(v) - GAUGE_MIN_STEPS) / (GAUGE_MAX_STEPS - GAUGE_MIN_STEPS);
-        return degToRad(startDeg + spanDeg * t);
-      };
-
-      const trackW = Math.max(9, radius * 0.11);
-      ctx.lineCap = "round";
-
-      // Zone arcs: red [0,10], yellow (10,20], green (20,30].
-      ctx.lineWidth = trackW + 1.0;
-      ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(0), valToAngle(10), false);
-      ctx.stroke();
-
-      ctx.strokeStyle = "rgba(245, 158, 11, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(10), valToAngle(20), false);
-      ctx.stroke();
-
-      ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(20), valToAngle(30), false);
-      ctx.stroke();
-
-      // Tick marks (major each 10, minor each 5)
-      for (let v = GAUGE_MIN_STEPS; v <= GAUGE_MAX_STEPS; v += 5) {
-        const isMajor = (v % 10) === 0;
-        const a = valToAngle(v);
-        const cosA = Math.cos(a);
-        const sinA = Math.sin(a);
-
-        const outer = radius + trackW * 0.38;
-        const inner = outer - (isMajor ? trackW * 1.6 : trackW * 0.95);
-
-        let tickColor = "rgba(239, 68, 68, 0.95)";
-        if (v > 10 && v <= 20) tickColor = "rgba(245, 158, 11, 0.95)";
-        else if (v > 20) tickColor = "rgba(34, 197, 94, 0.95)";
-
-        ctx.strokeStyle = tickColor;
-        ctx.lineWidth = isMajor ? 3.0 : 1.8;
-        ctx.beginPath();
-        ctx.moveTo(cx + outer * cosA, cy + outer * sinA);
-        ctx.lineTo(cx + inner * cosA, cy + inner * sinA);
-        ctx.stroke();
-      }
-
-      // Needle
-      const needleAngle = valToAngle(stepsPerSec);
-      const nCos = Math.cos(needleAngle);
-      const nSin = Math.sin(needleAngle);
-      const needleLen = radius * 0.98;
-
-      ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-      ctx.lineWidth = 7.5;
-      ctx.beginPath();
-      ctx.moveTo(cx + 3, cy + 3);
-      ctx.lineTo(cx + needleLen * nCos + 3, cy + needleLen * nSin + 3);
-      ctx.stroke();
-
-      ctx.strokeStyle = "#e2e8f0";
-      ctx.lineWidth = 6.0;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + needleLen * nCos, cy + needleLen * nSin);
-      ctx.stroke();
-
-      // Hub
-      ctx.fillStyle = "rgba(2, 6, 23, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 14, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = "rgba(100, 116, 139, 0.82)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
-      ctx.fill();
+      drawStyledGauge(canvas, stepsPerSec, {
+        min: GAUGE_MIN_STEPS,
+        max: GAUGE_MAX_STEPS,
+        red_max: 10,
+        yellow_max: 20,
+        minor_step: 1,
+        major_step: 10,
+        title: "STEP",
+        unit: "S/S",
+        decimals: 0,
+      });
     }
 
     function drawChart(canvas, history, seriesDefs) {
@@ -1445,8 +1504,9 @@ def _render_dashboard_html() -> str:
       const plotH = height - padT - padB;
       if (plotW <= 20 || plotH <= 20) return;
 
-      // Time-compressed x-axis with fixed quarter anchors:
-      // left→right: 20m, 2m, 1m, 10s, 0s
+      // Time-compressed x-axis with quarter anchors.
+      // Window spans min(20m, actual buffered time), so during first 20m
+      // nothing scrolls off the left edge.
       const tsVals = points
         .map((p) => Number(p.ts))
         .filter((v) => Number.isFinite(v));
@@ -1454,9 +1514,19 @@ def _render_dashboard_html() -> str:
       const newestTs = hasTimeAxis ? Math.max(...tsVals) : 0.0;
       const oldestTs = hasTimeAxis ? Math.min(...tsVals) : 0.0;
       const maxAge = hasTimeAxis ? Math.max(1e-6, newestTs - oldestTs) : 0.0;
-      const AXIS_MAX_LOOKBACK_S = 20 * 60;
+      const AXIS_HARD_MAX_LOOKBACK_S = 4 * 60;
+      const axisMaxLookbackSec = hasTimeAxis
+        ? Math.min(AXIS_HARD_MAX_LOOKBACK_S, maxAge)
+        : AXIS_HARD_MAX_LOOKBACK_S;
+      const anchorScale = axisMaxLookbackSec / AXIS_HARD_MAX_LOOKBACK_S;
       const LOOKBACK_FRAC_ANCHORS = [0.0, 0.25, 0.50, 0.75, 1.0];
-      const LOOKBACK_AGE_ANCHORS = [0.0, 10.0, 60.0, 120.0, AXIS_MAX_LOOKBACK_S];
+      const LOOKBACK_AGE_ANCHORS = [
+        0.0,
+        10.0 * anchorScale,
+        60.0 * anchorScale,
+        120.0 * anchorScale,
+        axisMaxLookbackSec,
+      ];
       // Shape-preserving monotone cubic interpolation (continuous slope)
       // so compression changes smoothly instead of with visible segment kinks.
       const makeMonotoneSpline = (xsRaw, ysRaw) => {
@@ -1520,7 +1590,7 @@ def _render_dashboard_html() -> str:
 
       const xNormFromAge = (ageRaw) => {
         if (!hasTimeAxis || maxAge <= 0) return 1.0;
-        const age = Math.max(0.0, Math.min(AXIS_MAX_LOOKBACK_S, ageRaw));
+        const age = Math.max(0.0, Math.min(axisMaxLookbackSec, ageRaw));
         const lookbackFrac = lookbackFracFromAge(age);
         return 1.0 - lookbackFrac;
       };
@@ -1590,6 +1660,14 @@ def _render_dashboard_html() -> str:
         const hasFixedMax = Number.isFinite(s.axis?.max);
         let minV = hasFixedMin ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
         let maxV = hasFixedMax ? Number(s.axis.max) : (values.length ? Math.max(...values) : 1.0);
+        const minFloor = Number(s.axis?.min_floor);
+        const maxFloor = Number(s.axis?.max_floor);
+        if (!hasFixedMin && Number.isFinite(minFloor)) {
+          minV = Math.min(minV, minFloor);
+        }
+        if (!hasFixedMax && Number.isFinite(maxFloor)) {
+          maxV = Math.max(maxV, maxFloor);
+        }
         if (maxV < minV) {
           maxV = minV + 1.0;
         }
@@ -1644,15 +1722,18 @@ def _render_dashboard_html() -> str:
 
       ctx.lineWidth = 1.0;
       ctx.strokeStyle = "rgba(148,163,184,0.18)";
-      for (let i = 0; i < 4; i++) {
-        const y = padT + (plotH * i / 3.0);
+      // Denser grid: 4x the prior vertical density, then mirror that pixel step
+      // on X so the plot reads as a true grid.
+      const gridRows = 12; // was effectively 3 intervals
+      const gridStep = plotH / gridRows;
+      for (let i = 0; i <= gridRows; i++) {
+        const y = padT + (gridStep * i);
         ctx.beginPath();
         ctx.moveTo(padL, y);
         ctx.lineTo(width - padR, y);
         ctx.stroke();
       }
-      for (let i = 1; i < 4; i++) {
-        const x = padL + (plotW * (i / 4.0));
+      for (let x = padL + gridStep; x < (width - padR - 0.5); x += gridStep) {
         ctx.beginPath();
         ctx.moveTo(x, padT);
         ctx.lineTo(x, height - padB);
@@ -1796,7 +1877,7 @@ def _render_dashboard_html() -> str:
       if (!canvas) return;
       const points = history.slice(-240);
       const width = canvas.clientWidth || 120;
-      const height = canvas.clientHeight || 56;
+      const height = canvas.clientHeight || 104;
       const dpr = window.devicePixelRatio || 1;
       canvas.width = Math.floor(width * dpr);
       canvas.height = Math.floor(height * dpr);
@@ -1941,25 +2022,25 @@ def _render_dashboard_html() -> str:
 
     function updateCards(now, smoothedSteps) {
       cards.frame.textContent = fmtInt(now.frame_count);
-      cards.fps.textContent = fmtFloat(now.fps, 1);
-      cards.steps.textContent = fmtFloat(smoothedSteps, 1);
+      if (cards.fps) cards.fps.textContent = fmtInt(now.fps);
+      if (cards.steps) cards.steps.textContent = fmtInt(smoothedSteps);
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
-      cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)}ms`;
+      cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)} ms`;
       setInfLed(now.avg_inf_ms);
       cards.rplf.textContent = fmtFloat(now.rpl_per_frame, 2);
       setRplLed(now.rpl_per_frame);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.rwrd.textContent = fmtInt(now.reward_total);
-      cards.loss.textContent = fmtFloat(now.loss, 4);
+      cards.loss.textContent = fmtFloat(now.loss, 2);
       cards.grad.textContent = fmtFloat(now.grad_norm, 3);
-      cards.buf.textContent = `${fmtInt(now.memory_buffer_k)}k (${fmtInt(now.memory_buffer_pct)}%)`;
+      cards.buf.textContent = fmtInt(now.memory_buffer_size);
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
-      cards.q.textContent = (now.q_min === null || now.q_max === null)
-        ? "-"
-        : `[${fmtFloat(now.q_min, 1)}, ${fmtFloat(now.q_max, 1)}]`;
+      cards.q.innerHTML = (now.q_min === null || now.q_max === null)
+        ? toFixedCharCells("-")
+        : toFixedCharCells(`${fmtSignedFloat(now.q_min, 1)},${fmtSignedFloat(now.q_max, 1)}`);
     }
 
     function render(payload) {
@@ -2091,6 +2172,7 @@ def _render_dashboard_html() -> str:
 def _make_handler(state: _DashboardState):
     page = _render_dashboard_html().encode("utf-8")
     audio_root = os.path.abspath(_audio_dir())
+    fonts_root = os.path.abspath(_fonts_dir())
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def _send(
@@ -2139,6 +2221,25 @@ def _make_handler(state: _DashboardState):
                 return None
             return candidate
 
+        @staticmethod
+        def _safe_font_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(fonts_root, name))
+            try:
+                if os.path.commonpath([fonts_root, candidate]) != fonts_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in FONT_EXTENSIONS:
+                return None
+            return candidate
+
         def do_GET(self):
             parsed = urlparse(self.path)
             path = parsed.path
@@ -2174,6 +2275,15 @@ def _make_handler(state: _DashboardState):
                     self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
                     return
                 ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+                self._send_file(safe_path, ctype)
+                return
+            if path.startswith("/api/font/"):
+                raw_name = unquote(path[len("/api/font/"):])
+                safe_path = self._safe_font_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "font/ttf"
                 self._send_file(safe_path, ctype)
                 return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
