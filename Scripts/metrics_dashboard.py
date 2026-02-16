@@ -51,6 +51,7 @@ def _tail_mean(values, count: int = 20) -> float:
 
 
 LEVEL_25K_FRAMES = 25_000
+LEVEL_100K_FRAMES = 100_000
 LEVEL_1M_FRAMES = 1_000_000
 LEVEL_5M_FRAMES = 5_000_000
 WEB_CLIENT_TIMEOUT_S = 5.0
@@ -98,6 +99,7 @@ class _DashboardState:
         self.last_steps_time: float | None = None
         self._level_windows = {
             "25k": {"limit": LEVEL_25K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "100k": {"limit": LEVEL_100K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
             "1m": {"limit": LEVEL_1M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
             "5m": {"limit": LEVEL_5M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
         }
@@ -131,17 +133,17 @@ class _DashboardState:
             self._web_clients[client_id] = now
             self._update_web_client_count_locked(now)
 
-    def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float]:
+    def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float, float]:
         raw_level = float(average_level)
         level = round(raw_level, 4) if math.isfinite(raw_level) else 0.0
         if self._last_level_frame_count is None:
             self._last_level_frame_count = frame_count
-            return level, level, level
+            return level, level, level, level
 
         if frame_count < self._last_level_frame_count:
             self._clear_level_windows()
             self._last_level_frame_count = frame_count
-            return level, level, level
+            return level, level, level, level
 
         frame_delta = max(0, int(frame_count - self._last_level_frame_count))
         self._last_level_frame_count = frame_count
@@ -178,6 +180,7 @@ class _DashboardState:
 
         return (
             _mean_or_level(self._level_windows["25k"]),
+            _mean_or_level(self._level_windows["100k"]),
             _mean_or_level(self._level_windows["1m"]),
             _mean_or_level(self._level_windows["5m"]),
         )
@@ -220,7 +223,7 @@ class _DashboardState:
             dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
         except Exception:
             dqn100k_raw = dqn1m_raw = dqn5m_raw = 0.0
-        level_25k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
+        level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
         if inference_requests > 0:
             self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
         avg_inf_ms = self._last_avg_inf_ms
@@ -280,6 +283,7 @@ class _DashboardState:
             "dqn_1m": float(dqn1m_raw) * inv_obj,
             "dqn_5m": float(dqn5m_raw) * inv_obj,
             "level_25k": float(level_25k),
+            "level_100k": float(level_100k),
             "level_1m": float(level_1m),
             "level_5m": float(level_5m),
             "training_enabled": training_enabled,
@@ -855,6 +859,7 @@ def _render_dashboard_html() -> str:
         <div class="legend">
           <span><span class="sw" style="background:#22c55e;"></span>FPS</span>
           <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>Avg Lvl (100K)</span>
         </div>
         <canvas id="cThroughput"></canvas>
       </article>
@@ -989,6 +994,12 @@ def _render_dashboard_html() -> str:
             color: "#f59e0b",
             axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] },
             smooth_alpha: 0.10,
+          },
+          {
+            key: "level_100k",
+            color: "#22d3ee",
+            axis_ref: "steps_per_sec_chart",
+            smooth_alpha: 0.20,
           }
         ]
       },
@@ -1015,11 +1026,16 @@ def _render_dashboard_html() -> str:
           {
             key: "loss",
             color: "#22c55e",
-            axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"], min_floor: 0, max_floor: 5 },
+            axis: { side: "left", min: 0, group_keys: ["loss", "grad_norm"], max_floor: 1.5, tick_decimals: 1 },
             smooth_alpha: 0.55,
           },
           { key: "grad_norm", color: "#f59e0b", axis_ref: "loss", smooth_alpha: 0.55 },
-          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss", smooth_alpha: 0.55 }
+          {
+            key: "bc_loss",
+            color: "#22d3ee",
+            axis: { side: "right", min: 0, group_keys: ["bc_loss"], max_floor: 1.5, tick_decimals: 1 },
+            smooth_alpha: 0.55,
+          }
         ]
       },
       dqn: {
@@ -1056,13 +1072,13 @@ def _render_dashboard_html() -> str:
       lossMini: {
         canvas: document.getElementById("cLossMini"),
         series: [
-          { key: "loss", color: "#22c55e" }
+          { key: "loss", color: "#22c55e", axis: { min: 0 } }
         ]
       },
       gradMini: {
         canvas: document.getElementById("cGradMini"),
         series: [
-          { key: "grad_norm", color: "#f59e0b" }
+          { key: "grad_norm", color: "#f59e0b", axis: { min: 0 } }
         ]
       }
     };
@@ -1113,6 +1129,22 @@ def _render_dashboard_html() -> str:
       outRev[0] = rows[n - 1];
       outRev[limit - 1] = rows[0];
       return outRev.reverse();
+    }
+
+    function sliceHistoryLookback(rows, lookbackSec) {
+      if (!Array.isArray(rows) || !rows.length) return [];
+      const lb = Number(lookbackSec);
+      if (!Number.isFinite(lb) || lb <= 0) return rows.slice();
+      const newestTs = Number(rows[rows.length - 1] && rows[rows.length - 1].ts);
+      if (!Number.isFinite(newestTs)) return rows.slice();
+      const cutoff = newestTs - lb;
+      let start = 0;
+      while (start < rows.length) {
+        const ts = Number(rows[start] && rows[start].ts);
+        if (!Number.isFinite(ts) || ts >= cutoff) break;
+        start += 1;
+      }
+      return rows.slice(start);
     }
 
     function fmtPct(v) {
@@ -1502,7 +1534,7 @@ def _render_dashboard_html() -> str:
       });
     }
 
-    function drawChart(canvas, history, seriesDefs) {
+    function drawChart(canvas, history, seriesDefs, maxLookbackSec = (5 * 60), useLinearTime = false) {
       const points = Array.isArray(history) ? history : [];
       const width = canvas.clientWidth || 320;
       const height = canvas.clientHeight || 210;
@@ -1548,7 +1580,7 @@ def _render_dashboard_html() -> str:
       const newestTs = hasTimeAxis ? Math.max(...tsVals) : 0.0;
       const oldestTs = hasTimeAxis ? Math.min(...tsVals) : 0.0;
       const maxAge = hasTimeAxis ? Math.max(1e-6, newestTs - oldestTs) : 0.0;
-      const AXIS_HARD_MAX_LOOKBACK_S = 4 * 60;
+      const AXIS_HARD_MAX_LOOKBACK_S = Math.max(1, Number(maxLookbackSec) || (5 * 60));
       const axisMaxLookbackSec = hasTimeAxis
         ? Math.min(AXIS_HARD_MAX_LOOKBACK_S, maxAge)
         : AXIS_HARD_MAX_LOOKBACK_S;
@@ -1625,14 +1657,18 @@ def _render_dashboard_html() -> str:
       const xNormFromAge = (ageRaw) => {
         if (!hasTimeAxis || maxAge <= 0) return 1.0;
         const age = Math.max(0.0, Math.min(axisMaxLookbackSec, ageRaw));
-        const lookbackFrac = lookbackFracFromAge(age);
+        const lookbackFrac = useLinearTime
+          ? (age / Math.max(1e-9, axisMaxLookbackSec))
+          : lookbackFracFromAge(age);
         return 1.0 - lookbackFrac;
       };
 
       const ageFromXNorm = (xNormRaw) => {
         const xn = Math.max(0.0, Math.min(1.0, xNormRaw));
         const lookbackFrac = 1.0 - xn;
-        return ageFromLookbackFrac(lookbackFrac);
+        return useLinearTime
+          ? (lookbackFrac * axisMaxLookbackSec)
+          : ageFromLookbackFrac(lookbackFrac);
       };
 
       const formatLookback = (ageSecRaw) => {
@@ -1744,6 +1780,7 @@ def _render_dashboard_html() -> str:
           min: minV,
           max: maxV,
           ticks,
+          tickDecimals: Number.isFinite(s.axis?.tick_decimals) ? Math.max(0, Number(s.axis.tick_decimals)) : null,
         });
       }
       if (!axes.length) return;
@@ -1812,7 +1849,9 @@ def _render_dashboard_html() -> str:
           ctx.stroke();
           ctx.globalAlpha = 1.0;
 
-          const labelText = Math.abs(tv) >= 100 ? `${Math.round(tv)}` : `${Number(tv).toFixed(0)}`;
+          const labelText = Number.isFinite(axis.tickDecimals)
+            ? Number(tv).toFixed(axis.tickDecimals)
+            : (Math.abs(tv) >= 100 ? `${Math.round(tv)}` : `${Number(tv).toFixed(0)}`);
           ctx.fillStyle = axis.color;
           ctx.textAlign = isLeft ? "right" : "left";
           ctx.fillText(labelText, axis.x - tickDir * 12, y);
@@ -1888,19 +1927,52 @@ def _render_dashboard_html() -> str:
         ctx.beginPath();
         let started = false;
         let smoothVal = null;
-        for (let i = n - 1; i >= 0; i--) {
-          const val = seriesValue(points[i], s.key);
-          if (!Number.isFinite(val)) continue;
-          smoothVal = (smoothVal === null)
-            ? Number(val)
-            : (smoothVal + ((Number(val) - smoothVal) * smoothAlpha));
-          const x = xAt(i);
-          const y = yAt(axis, smoothVal);
-          if (!started) {
-            ctx.moveTo(x, y);
-            started = true;
-          } else {
-            ctx.lineTo(x, y);
+        if (s.pixel_bin_avg) {
+          const bins = new Map();
+          for (let i = n - 1; i >= 0; i--) {
+            const val = seriesValue(points[i], s.key);
+            if (!Number.isFinite(val)) continue;
+            const x = xAt(i);
+            const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
+            const b = bins.get(xPx);
+            if (b) {
+              b.sum += Number(val);
+              b.count += 1;
+            } else {
+              bins.set(xPx, { sum: Number(val), count: 1 });
+            }
+          }
+          const xKeys = Array.from(bins.keys()).sort((a, b) => b - a);
+          for (const xPx of xKeys) {
+            const b = bins.get(xPx);
+            if (!b || b.count <= 0) continue;
+            const vAvg = b.sum / b.count;
+            smoothVal = (smoothVal === null)
+              ? vAvg
+              : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
+            const y = yAt(axis, smoothVal);
+            if (!started) {
+              ctx.moveTo(xPx, y);
+              started = true;
+            } else {
+              ctx.lineTo(xPx, y);
+            }
+          }
+        } else {
+          for (let i = n - 1; i >= 0; i--) {
+            const val = seriesValue(points[i], s.key);
+            if (!Number.isFinite(val)) continue;
+            smoothVal = (smoothVal === null)
+              ? Number(val)
+              : (smoothVal + ((Number(val) - smoothVal) * smoothAlpha));
+            const x = xAt(i);
+            const y = yAt(axis, smoothVal);
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else {
+              ctx.lineTo(x, y);
+            }
           }
         }
         ctx.stroke();
@@ -2018,19 +2090,52 @@ def _render_dashboard_html() -> str:
         ctx.beginPath();
         let started = false;
         let smoothVal = null;
-        for (let i = n - 1; i >= 0; i--) {
-          const val = Number(points[i][s.key]);
-          if (!Number.isFinite(val)) continue;
-          smoothVal = (smoothVal === null)
-            ? val
-            : (smoothVal + ((val - smoothVal) * smoothAlpha));
-          const x = xAt(i);
-          const y = yAt(smoothVal);
-          if (!started) {
-            ctx.moveTo(x, y);
-            started = true;
-          } else {
-            ctx.lineTo(x, y);
+        if (s.pixel_bin_avg) {
+          const bins = new Map();
+          for (let i = n - 1; i >= 0; i--) {
+            const val = Number(points[i][s.key]);
+            if (!Number.isFinite(val)) continue;
+            const x = xAt(i);
+            const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
+            const b = bins.get(xPx);
+            if (b) {
+              b.sum += val;
+              b.count += 1;
+            } else {
+              bins.set(xPx, { sum: val, count: 1 });
+            }
+          }
+          const xKeys = Array.from(bins.keys()).sort((a, b) => b - a);
+          for (const xPx of xKeys) {
+            const b = bins.get(xPx);
+            if (!b || b.count <= 0) continue;
+            const vAvg = b.sum / b.count;
+            smoothVal = (smoothVal === null)
+              ? vAvg
+              : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
+            const y = yAt(smoothVal);
+            if (!started) {
+              ctx.moveTo(xPx, y);
+              started = true;
+            } else {
+              ctx.lineTo(xPx, y);
+            }
+          }
+        } else {
+          for (let i = n - 1; i >= 0; i--) {
+            const val = Number(points[i][s.key]);
+            if (!Number.isFinite(val)) continue;
+            smoothVal = (smoothVal === null)
+              ? val
+              : (smoothVal + ((val - smoothVal) * smoothAlpha));
+            const x = xAt(i);
+            const y = yAt(smoothVal);
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else {
+              ctx.lineTo(x, y);
+            }
           }
         }
         ctx.stroke();
@@ -2161,20 +2266,25 @@ def _render_dashboard_html() -> str:
     function render(payload) {
       if (!payload || !payload.now) return;
       const history = Array.isArray(payload.history) ? payload.history.slice(-MAX_HISTORY_POINTS) : [];
-      const chartHistory = downsampleHistory(history, MAX_CHART_POINTS);
-      const throughputHistory = buildThroughputHistory(chartHistory);
-      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history);
+      const history5m = sliceHistoryLookback(history, 5 * 60);
+      const history2m = sliceHistoryLookback(history, 2 * 60);
+      const history1m = sliceHistoryLookback(history, 30);
+      const chartHistory5m = downsampleHistory(history5m, MAX_CHART_POINTS);
+      const chartHistory2m = downsampleHistory(history2m, MAX_CHART_POINTS);
+      const chartHistory1m = downsampleHistory(history1m, MAX_CHART_POINTS);
+      const throughputHistory = buildThroughputHistory(chartHistory5m);
+      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history5m);
       updateCards(payload.now, smoothedStepSpd);
       drawFpsGauge(fpsGaugeCanvas, payload.now.fps);
       drawStepGauge(stepGaugeCanvas, smoothedStepSpd);
-      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series);
-      drawChart(charts.rewards.canvas, chartHistory, charts.rewards.series);
-      drawChart(charts.learning.canvas, chartHistory, charts.learning.series);
-      drawChart(charts.dqn.canvas, chartHistory, charts.dqn.series);
-      drawMiniChart(charts.level1m.canvas, history, charts.level1m.series);
-      drawMiniChart(charts.rewardMini.canvas, history, charts.rewardMini.series);
-      drawMiniChart(charts.lossMini.canvas, history, charts.lossMini.series);
-      drawMiniChart(charts.gradMini.canvas, history, charts.gradMini.series);
+      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 5 * 60);
+      drawChart(charts.rewards.canvas, chartHistory5m, charts.rewards.series, 5 * 60);
+      drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 30, true);
+      drawChart(charts.dqn.canvas, chartHistory5m, charts.dqn.series, 5 * 60);
+      drawMiniChart(charts.level1m.canvas, history5m, charts.level1m.series);
+      drawMiniChart(charts.rewardMini.canvas, history5m, charts.rewardMini.series);
+      drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
+      drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
     }
 
     let historyCache = [];
