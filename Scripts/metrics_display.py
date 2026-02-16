@@ -32,6 +32,14 @@ _dqn5m_frames = 0
 
 _dqn_windows_lock = threading.Lock()
 
+# Rolling TOTAL reward windows (all episodes, not just DQN)
+_total100k = deque()
+_total100k_frames = 0
+_total1m = deque()
+_total1m_frames = 0
+_total5m = deque()
+_total5m_frames = 0
+
 
 def add_episode_to_dqn100k_window(dqn_reward: float, ep_len: int):
     global _dqn100k_frames
@@ -88,6 +96,32 @@ def _avg_window(win):
 def get_dqn_window_averages() -> tuple[float, float, float]:
     with _dqn_windows_lock:
         return _avg_window(_dqn100k), _avg_window(_dqn1m), _avg_window(_dqn5m)
+
+
+def add_episode_to_total_windows(total_reward: float, ep_len: int):
+    """Add an episode's total reward to all total-reward rolling windows."""
+    global _total100k_frames, _total1m_frames, _total5m_frames
+    if ep_len <= 0:
+        return
+    r = float(total_reward)
+    l = int(ep_len)
+    with _dqn_windows_lock:
+        for buf, frames_ref, limit in (
+            (_total100k, "_total100k_frames", DQN100K_FRAMES),
+            (_total1m, "_total1m_frames", DQN1M_FRAMES),
+            (_total5m, "_total5m_frames", DQN5M_FRAMES),
+        ):
+            buf.append((r, l))
+            cur = globals()[frames_ref] + l
+            while buf and cur > limit:
+                _, ol = buf.popleft()
+                cur -= ol
+            globals()[frames_ref] = cur
+
+
+def get_total_window_averages() -> tuple[float, float, float]:
+    with _dqn_windows_lock:
+        return _avg_window(_total100k), _avg_window(_total1m), _avg_window(_total5m)
 
 
 def clear_screen():

@@ -32,12 +32,14 @@ except ImportError:
     from Scripts.config import RL_CONFIG
 
 try:
-    from metrics_display import get_dqn_window_averages
+    from metrics_display import get_dqn_window_averages, get_total_window_averages
 except ImportError:
     try:
-        from Scripts.metrics_display import get_dqn_window_averages
+        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages
     except ImportError:
         def get_dqn_window_averages():
+            return 0.0, 0.0, 0.0
+        def get_total_window_averages():
             return 0.0, 0.0, 0.0
 
 
@@ -55,7 +57,7 @@ LEVEL_100K_FRAMES = 100_000
 LEVEL_1M_FRAMES = 1_000_000
 LEVEL_5M_FRAMES = 5_000_000
 WEB_CLIENT_TIMEOUT_S = 5.0
-DASH_HISTORY_LIMIT = 18_000
+DASH_HISTORY_LIMIT = 40_000
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
 
@@ -223,6 +225,10 @@ class _DashboardState:
             dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
         except Exception:
             dqn100k_raw = dqn1m_raw = dqn5m_raw = 0.0
+        try:
+            total100k_raw, total1m_raw, total5m_raw = get_total_window_averages()
+        except Exception:
+            total100k_raw = total1m_raw = total5m_raw = 0.0
         level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
         if inference_requests > 0:
             self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
@@ -282,6 +288,8 @@ class _DashboardState:
             "dqn_100k": float(dqn100k_raw) * inv_obj,
             "dqn_1m": float(dqn1m_raw) * inv_obj,
             "dqn_5m": float(dqn5m_raw) * inv_obj,
+            "total_1m": float(total1m_raw) * inv_obj,
+            "total_5m": float(total5m_raw) * inv_obj,
             "level_25k": float(level_25k),
             "level_100k": float(level_100k),
             "level_1m": float(level_1m),
@@ -505,6 +513,30 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
+    .display-fps-box {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: rgba(2, 6, 23, 0.50);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
+    }
+    .display-fps-label {
+      font-size: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: rgba(0, 229, 255, 0.55);
+    }
+    .display-fps-value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 16px;
+      color: #c8e8ff;
+      text-shadow: 0 0 5px rgba(100, 160, 255, 0.7), 0 0 14px rgba(60, 120, 255, 0.55), 0 0 28px rgba(40, 80, 255, 0.4);
+      line-height: 1;
+    }
     .audio-toggle {
       border: 1px solid rgba(0, 229, 255, 0.33);
       background: rgba(2, 6, 23, 0.50);
@@ -571,17 +603,18 @@ def _render_dashboard_html() -> str:
     }
     .card:not(.gauge-card) .value {
       font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
-      color: #d8fdff;
+      color: #c8e8ff;
       font-weight: 400;
       letter-spacing: normal;
       font-variant-numeric: normal;
       text-shadow:
-        0 0 4px rgba(190, 248, 255, 0.55),
-        0 0 12px rgba(120, 232, 255, 0.42),
-        0 0 22px rgba(76, 199, 255, 0.36);
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45),
+        0 0 48px rgba(30, 60, 220, 0.3);
       filter:
-        drop-shadow(0 0 6px rgba(116, 226, 255, 0.35))
-        drop-shadow(0 0 12px rgba(72, 174, 255, 0.28));
+        drop-shadow(0 0 8px rgba(60, 130, 255, 0.5))
+        drop-shadow(0 0 18px rgba(40, 80, 255, 0.35));
     }
     .value-inline {
       display: inline-flex;
@@ -648,6 +681,18 @@ def _render_dashboard_html() -> str:
       grid-row: span 2;
       min-height: 200px;
       max-height: 320px;
+    }
+    .card-half {
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
+    }
+    .card-half.mini-metric-card .mini-inline {
+      min-height: 0;
+    }
+    .card-half.mini-metric-card .mini-canvas {
+      height: 36px;
+      border-radius: 4px;
     }
     .gauge-card canvas {
       border: none;
@@ -771,10 +816,10 @@ def _render_dashboard_html() -> str:
         <canvas id="cStepGauge"></canvas>
       </article>
       <article class="card mini-metric-card">
-        <div class="label">Avg Level</div>
+        <div class="label">DQN REWARD 1M</div>
         <div class="mini-inline">
-          <div class="value" id="mLevel">0.0</div>
-          <canvas id="cLevelMini" class="mini-canvas"></canvas>
+          <div class="value" id="mDqnRwrd">0</div>
+          <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
         </div>
       </article>
       <article class="card mini-metric-card">
@@ -784,23 +829,30 @@ def _render_dashboard_html() -> str:
           <canvas id="cRewardMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card">
+      <article class="card mini-metric-card card-half">
+        <div class="label">Avg Level</div>
+        <div class="mini-inline">
+          <div class="value" id="mLevel">0.0</div>
+          <canvas id="cLevelMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half">
         <div class="label">Loss</div>
         <div class="mini-inline">
           <div class="value" id="mLoss">0</div>
           <canvas id="cLossMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card">
+      <article class="card mini-metric-card card-half">
         <div class="label">Grad Norm</div>
         <div class="mini-inline">
           <div class="value" id="mGrad">0</div>
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
-      <article class="card"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card card-half"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
+      <article class="card card-half"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
@@ -867,6 +919,7 @@ def _render_dashboard_html() -> str:
       </div>
       <div class="top-right">
         <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
+        <div class="display-fps-box"><span class="display-fps-label">Display FPS</span><span class="display-fps-value" id="displayFps">0</span></div>
         <button id="audioToggle" class="audio-toggle" type="button">Audio Off</button>
       </div>
     </section>
@@ -888,7 +941,7 @@ def _render_dashboard_html() -> str:
       }
     })();
     const DASH_REFRESH_MS = Math.max(1, Math.round(1000 / DASH_REFRESH_FPS));
-    const HISTORY_WINDOW_MINUTES = 30;
+    const HISTORY_WINDOW_MINUTES = 65;
     const MAX_HISTORY_POINTS = Math.max(
       900,
       Math.round((HISTORY_WINDOW_MINUTES * 60 * 1000) / DASH_REFRESH_MS)
@@ -896,13 +949,29 @@ def _render_dashboard_html() -> str:
     const MAX_CHART_POINTS = 1400;
     const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
-    const GAUGE_MAX_FPS = 3000;
+    const GAUGE_MAX_FPS = 5000;
     const GAUGE_FPS_RED_MAX = 1000;
     const GAUGE_FPS_YELLOW_MAX = 1500;
     const GAUGE_MIN_STEPS = 0;
     const GAUGE_MAX_STEPS = 50;
     const AUDIO_PREF_COOKIE = "tempest_dashboard_audio_enabled";
     const AUDIO_START_RETRY_MS = 800;
+
+    /* ── Display FPS counter ──────────────────────────────────────────── */
+    let _dispFpsFrames = 0;
+    let _dispFpsLast = performance.now();
+    const _dispFpsEl = document.getElementById("displayFps");
+    function _tickDisplayFps() {
+      _dispFpsFrames++;
+      const now = performance.now();
+      const elapsed = now - _dispFpsLast;
+      if (elapsed >= 1000) {
+        const fps = Math.round((_dispFpsFrames * 1000) / elapsed);
+        _dispFpsEl.textContent = fps;
+        _dispFpsFrames = 0;
+        _dispFpsLast = now;
+      }
+    }
     const CHART_VALUE_SMOOTH_ALPHA = 0.22;
     const MINI_CHART_VALUE_SMOOTH_ALPHA = 0.28;
     let failedPings = 0;
@@ -933,6 +1002,7 @@ def _render_dashboard_html() -> str:
       eps: document.getElementById("mEps"),
       xprt: document.getElementById("mXprt"),
       rwrd: document.getElementById("mRwrd"),
+      dqnRwrd: document.getElementById("mDqnRwrd"),
       loss: document.getElementById("mLoss"),
       grad: document.getElementById("mGrad"),
       buf: document.getElementById("mBuf"),
@@ -1070,7 +1140,15 @@ def _render_dashboard_html() -> str:
       rewardMini: {
         canvas: document.getElementById("cRewardMini"),
         series: [
-          { key: "dqn_1m", color: "#22c55e" }
+          { key: "total_5m", color: "#3b82f6" },
+          { key: "total_1m", color: "#22c55e" }
+        ]
+      },
+      dqnRewardMini: {
+        canvas: document.getElementById("cDqnRewardMini"),
+        series: [
+          { key: "dqn_5m", color: "#3b82f6" },
+          { key: "dqn_1m", color: "#f59e0b" }
         ]
       },
       lossMini: {
@@ -1605,7 +1683,7 @@ def _render_dashboard_html() -> str:
         0.0,
         10.0 * anchorScale,
         60.0 * anchorScale,
-        120.0 * anchorScale,
+        600.0 * anchorScale,
         axisMaxLookbackSec,
       ];
       // Shape-preserving monotone cubic interpolation (continuous slope)
@@ -2015,9 +2093,11 @@ def _render_dashboard_html() -> str:
       const axisPad = 20;
       const padL = axisPad;
       const padR = 4;
-      const padY = 6;
+      const isHalf = canvas.closest && canvas.closest('.card-half');
+      const padTop = isHalf ? 1 : 6;
+      const padBot = isHalf ? 3 : 6;
       const plotW = width - padL - padR;
-      const plotH = height - (2 * padY);
+      const plotH = height - padTop - padBot;
       if (plotW <= 4 || plotH <= 4) return;
 
       const values = [];
@@ -2049,7 +2129,7 @@ def _render_dashboard_html() -> str:
       };
       const yAt = (v) => {
         const t = (v - minV) / (maxV - minV);
-        return padY + ((1.0 - t) * plotH);
+        return padTop + ((1.0 - t) * plotH);
       };
 
       const fmtTick = (v) => {
@@ -2062,15 +2142,15 @@ def _render_dashboard_html() -> str:
         return `${n.toFixed(3)}`;
       };
 
-      const axisColor = seriesDefs?.[0]?.color || "#22c55e";
+      const axisColor = seriesDefs?.[seriesDefs.length - 1]?.color || "#22c55e";
       const axisX = padL - 1;
       const yTicks = [minV, minV + ((maxV - minV) * 0.5), maxV];
       ctx.strokeStyle = axisColor;
       ctx.globalAlpha = 0.52;
       ctx.lineWidth = 1.0;
       ctx.beginPath();
-      ctx.moveTo(axisX, padY);
-      ctx.lineTo(axisX, height - padY);
+      ctx.moveTo(axisX, padTop);
+      ctx.lineTo(axisX, height - padBot);
       ctx.stroke();
       ctx.globalAlpha = 1.0;
 
@@ -2092,7 +2172,7 @@ def _render_dashboard_html() -> str:
       }
 
       // Soft center guide.
-      const yMid = padY + (plotH * 0.5);
+      const yMid = padTop + (plotH * 0.5);
       ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
       ctx.lineWidth = 1.0;
       ctx.beginPath();
@@ -2272,7 +2352,8 @@ def _render_dashboard_html() -> str:
       setRplLed(now.rpl_per_frame);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
-      cards.rwrd.textContent = fmtInt(now.dqn_1m);
+      cards.rwrd.textContent = fmtInt(now.total_1m);
+      cards.dqnRwrd.textContent = fmtInt(now.dqn_1m);
       cards.loss.textContent = fmtFloat(now.loss, 2);
       cards.grad.textContent = fmtFloat(now.grad_norm, 3);
       cards.buf.textContent = fmtInt(now.memory_buffer_size);
@@ -2283,25 +2364,27 @@ def _render_dashboard_html() -> str:
     }
 
     function render(payload) {
+      _tickDisplayFps();
       if (!payload || !payload.now) return;
       const history = Array.isArray(payload.history) ? payload.history.slice(-MAX_HISTORY_POINTS) : [];
-      const history5m = sliceHistoryLookback(history, 5 * 60);
+      const history60m = sliceHistoryLookback(history, 60 * 60);
       const history2m = sliceHistoryLookback(history, 2 * 60);
-      const history1m = sliceHistoryLookback(history, 30);
-      const chartHistory5m = downsampleHistory(history5m, MAX_CHART_POINTS);
+      const history1m = sliceHistoryLookback(history, 60);
+      const chartHistory60m = downsampleHistory(history60m, MAX_CHART_POINTS);
       const chartHistory2m = downsampleHistory(history2m, MAX_CHART_POINTS);
       const chartHistory1m = downsampleHistory(history1m, MAX_CHART_POINTS);
-      const throughputHistory = buildThroughputHistory(chartHistory5m);
-      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history5m);
+      const throughputHistory = buildThroughputHistory(chartHistory60m);
+      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history60m);
       updateCards(payload.now, smoothedStepSpd);
       gaugeState.fps.target  = payload.now.fps;
       gaugeState.step.target = smoothedStepSpd;
-      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 5 * 60);
-      drawChart(charts.rewards.canvas, chartHistory5m, charts.rewards.series, 5 * 60);
-      drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 30, true);
-      drawChart(charts.dqn.canvas, chartHistory5m, charts.dqn.series, 5 * 60);
-      drawMiniChart(charts.level1m.canvas, history5m, charts.level1m.series);
-      drawMiniChart(charts.rewardMini.canvas, history5m, charts.rewardMini.series);
+      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 60 * 60);
+      drawChart(charts.rewards.canvas, chartHistory60m, charts.rewards.series, 60 * 60);
+      drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 60, true);
+      drawChart(charts.dqn.canvas, chartHistory60m, charts.dqn.series, 60 * 60);
+      drawMiniChart(charts.dqnRewardMini.canvas, history60m, charts.dqnRewardMini.series);
+      drawMiniChart(charts.rewardMini.canvas, history60m, charts.rewardMini.series);
+      drawMiniChart(charts.level1m.canvas, history60m, charts.level1m.series);
       drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
       drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
     }
@@ -2352,9 +2435,7 @@ def _render_dashboard_html() -> str:
           lastTs = ts;
           hasNewSample = true;
         }
-        if (hasNewSample || !hadNow) {
-          renderCurrent();
-        }
+        renderCurrent();
         setConnected(true);
       } catch (err) {
         setConnected(false);
@@ -2556,8 +2637,8 @@ class MetricsDashboard:
         self.agent = agent_obj
         self.host = host
         self.port = port
-        # Cap sampler refresh at 10 Hz max.
-        self.sample_interval = max(0.1, sample_interval)
+        # Cap sampler refresh at 30 Hz max.
+        self.sample_interval = max(0.033, sample_interval)
         self.open_browser = open_browser
 
         self.state = _DashboardState(metrics_obj, agent_obj, history_limit=history_limit)
