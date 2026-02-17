@@ -401,6 +401,9 @@ class SocketServer:
                         action_source = "expert"
                     else:
                         epsilon = self.metrics.get_effective_epsilon()
+                        # Suppress exploration during tube zoom — random lane changes hit spikes
+                        if frame.gamestate == int(getattr(RL_CONFIG, "expert_ratio_zoom_gamestate", 0x20)):
+                            epsilon *= float(getattr(RL_CONFIG, "epsilon_zoom_multiplier", 0.2))
                         t0 = time.perf_counter()
                         if self.inference_batcher is not None:
                             fz_idx, sp_idx = self.inference_batcher.infer(frame.state, epsilon)
