@@ -18,7 +18,11 @@ except ImportError:
 
 # Device (mirrors aimodel.py)
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
+    n = torch.cuda.device_count()
+    idx = int(getattr(RL_CONFIG, "train_cuda_device_index", 0))
+    if idx < 0 or idx >= n:
+        idx = 0
+    device = torch.device(f"cuda:{idx}")
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
@@ -154,7 +158,10 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             if expert_idx.numel() > 0:
                 q_expert = agent.online_net.q_values(states_t[expert_idx])
                 bc_loss = F.cross_entropy(q_expert, actions_t[expert_idx])
-                weighted_loss = weighted_loss + bc_w * bc_loss
+                # Scale BC by sampled expert fraction to avoid over-weighting when
+                # expert transitions are sparse but present in most batches.
+                bc_scale = float(expert_idx.numel()) / float(B)
+                weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
                 bc_loss_val = float(bc_loss.detach().item())
 
     # ── Optimise ────────────────────────────────────────────────────────

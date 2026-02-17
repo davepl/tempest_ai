@@ -32,6 +32,22 @@ _dqn5m_frames = 0
 
 _dqn_windows_lock = threading.Lock()
 
+# Rolling TOTAL reward windows (all episodes, not just DQN)
+_total100k = deque()
+_total100k_frames = 0
+_total1m = deque()
+_total1m_frames = 0
+_total5m = deque()
+_total5m_frames = 0
+
+# Rolling episode-length windows
+EPLEN100K_FRAMES = 100_000
+_eplen100k = deque()
+_eplen100k_frames = 0
+
+_eplen1m = deque()
+_eplen1m_frames = 0
+
 
 def add_episode_to_dqn100k_window(dqn_reward: float, ep_len: int):
     global _dqn100k_frames
@@ -90,6 +106,62 @@ def get_dqn_window_averages() -> tuple[float, float, float]:
         return _avg_window(_dqn100k), _avg_window(_dqn1m), _avg_window(_dqn5m)
 
 
+def add_episode_to_total_windows(total_reward: float, ep_len: int):
+    """Add an episode's total reward to all total-reward rolling windows."""
+    global _total100k_frames, _total1m_frames, _total5m_frames
+    if ep_len <= 0:
+        return
+    r = float(total_reward)
+    l = int(ep_len)
+    with _dqn_windows_lock:
+        for buf, frames_ref, limit in (
+            (_total100k, "_total100k_frames", DQN100K_FRAMES),
+            (_total1m, "_total1m_frames", DQN1M_FRAMES),
+            (_total5m, "_total5m_frames", DQN5M_FRAMES),
+        ):
+            buf.append((r, l))
+            cur = globals()[frames_ref] + l
+            while buf and cur > limit:
+                _, ol = buf.popleft()
+                cur -= ol
+            globals()[frames_ref] = cur
+
+
+def get_total_window_averages() -> tuple[float, float, float]:
+    with _dqn_windows_lock:
+        return _avg_window(_total100k), _avg_window(_total1m), _avg_window(_total5m)
+
+
+def add_episode_to_eplen_window(ep_len: int):
+    """Add an episode's length to the 100K and 1M-frame rolling windows."""
+    global _eplen100k_frames, _eplen1m_frames
+    if ep_len <= 0:
+        return
+    l = int(ep_len)
+    with _dqn_windows_lock:
+        _eplen100k.append((float(l), l))
+        _eplen100k_frames += l
+        while _eplen100k and _eplen100k_frames > EPLEN100K_FRAMES:
+            _, ol = _eplen100k.popleft()
+            _eplen100k_frames -= ol
+
+        _eplen1m.append((float(l), l))
+        _eplen1m_frames += l
+        while _eplen1m and _eplen1m_frames > DQN1M_FRAMES:
+            _, ol = _eplen1m.popleft()
+            _eplen1m_frames -= ol
+
+
+def get_eplen_100k_average() -> float:
+    with _dqn_windows_lock:
+        return _avg_window(_eplen100k) if _eplen100k else 0.0
+
+
+def get_eplen_1m_average() -> float:
+    with _dqn_windows_lock:
+        return _avg_window(_eplen1m) if _eplen1m else 0.0
+
+
 def clear_screen():
     if IS_INTERACTIVE:
         sys.stdout.write("\033[2J\033[H")
@@ -116,7 +188,7 @@ def display_metrics_header():
         f"{'Rwrd':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
         f"{'Loss':>10} {'Agree%':>7} "
         f"{'EpLen':>8} {'BCLoss':>8} "
-        f"{'Clnt':>4} {'Levl':>5} "
+        f"{'Clnt':>4} {'Web':>4} {'Levl':>5} "
         f"{'AvgInf':>7} {'Steps/s':>8} {'Rpl/F':>7} {'GrNorm':>8} {'Q-Range':>14} {'Mem':>10} {'LR':>9}"
     )
     _print_line(hdr, is_header=True)
@@ -235,7 +307,7 @@ def display_metrics_row(agent, kb_handler):
         f"{_fr(dqn1m*inv)} {_fr(dqn5m*inv)} "
         f"{loss_avg:>10.6f} {agree_avg*100:>6.1f}% "
         f"{avg_ep_len:>8.1f} {metrics.last_bc_loss:>8.4f} "
-        f"{metrics.client_count:>4} {display_level:>5.1f} "
+        f"{metrics.client_count:>4} {metrics.web_client_count:>4} {display_level:>5.1f} "
         f"{avg_inf_ms:>7.2f} {steps_per_sec:>8.1f} "
         f"{replay_ratio:>7.2f} {metrics.last_grad_norm:>8.3f} {q_range:>14} {mem_k:>8}k {lr_str:>9}"
     )

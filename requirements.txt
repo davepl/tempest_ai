@@ -1,0 +1,12 @@
+# Core runtime
+numpy
+torch
+
+# Testing
+pytest
+
+# Optional tools
+# Used by tools/rotating_torus_boxes.py
+matplotlib
+# Used by tile.py (Windows only)
+pywin32

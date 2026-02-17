@@ -216,6 +216,12 @@ function M.update(status_message, game_state, level_state, player_state, enemies
         active_pulsar_str = active_pulsar_str .. format_enemy_segment(enemies_state.active_pulsar[i]) .. " "
     end
     display_str = display_str .. active_pulsar_str .. "\n"
+
+    local pulsar_depths_str = "Pulsar Depths:     "
+    for i = 1, 7 do
+        pulsar_depths_str = pulsar_depths_str .. string.format(" %02X ", enemies_state.active_pulsar_depths[i] or 0)
+    end
+    display_str = display_str .. pulsar_depths_str .. "\n"
     
     -- Top Rail Enemies array (7 entries)
     local top_rail_enemies_str = "Top Rail Enemies:  "
