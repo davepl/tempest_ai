@@ -32,16 +32,18 @@ except ImportError:
     from Scripts.config import RL_CONFIG
 
 try:
-    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average
+    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
 except ImportError:
     try:
-        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average
+        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
     except ImportError:
         def get_dqn_window_averages():
             return 0.0, 0.0, 0.0
         def get_total_window_averages():
             return 0.0, 0.0, 0.0
         def get_eplen_1m_average():
+            return 0.0
+        def get_eplen_100k_average():
             return 0.0
 
 
@@ -303,6 +305,7 @@ class _DashboardState:
             "q_min": q_min,
             "q_max": q_max,
             "eplen_1m": get_eplen_1m_average(),
+            "eplen_100k": get_eplen_100k_average(),
         }
 
     def sample(self):
@@ -672,6 +675,7 @@ def _render_dashboard_html() -> str:
       justify-self: start;
       min-width: 0;
       white-space: nowrap;
+      font-size: 21px;
     }
     .mini-metric-card .mini-canvas {
       width: 100%;
@@ -701,7 +705,6 @@ def _render_dashboard_html() -> str:
       grid-column: span 2;
       grid-row: span 2;
       min-height: 200px;
-      max-height: 320px;
     }
     .card-narrow {
       grid-column: span 1;
@@ -833,76 +836,76 @@ def _render_dashboard_html() -> str:
 <body>
   <main>
     <section class="cards">
-      <article class="card gauge-card" style="--card-border:rgba(255,60,60,0.55);--card-glow:rgba(255,40,40,0.22)">
+      <article class="card gauge-card" style="--card-border:rgba(255,60,60,0.66);--card-glow:rgba(255,40,40,0.26)">
         <div class="gauge-head">
           <div class="label">FRAMES PER SECOND</div>
         </div>
         <canvas id="cFpsGauge"></canvas>
       </article>
-      <article class="card gauge-card" style="--card-border:rgba(255,220,40,0.55);--card-glow:rgba(255,200,20,0.22)">
+      <article class="card gauge-card" style="--card-border:rgba(255,220,40,0.66);--card-glow:rgba(255,200,20,0.26)">
         <div class="gauge-head">
           <div class="label">STEPS PER SECOND</div>
         </div>
         <canvas id="cStepGauge"></canvas>
       </article>
-      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.55);--card-glow:rgba(255,120,20,0.22)">
+      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.66);--card-glow:rgba(255,120,20,0.26)">
         <div class="label">DQN REWARD 1M</div>
         <div class="mini-inline">
           <div class="value" id="mDqnRwrd">0</div>
           <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.55);--card-glow:rgba(40,200,60,0.22)">
+      <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
         <div class="label">AVG REWARD 1M</div>
         <div class="mini-inline">
           <div class="value" id="mRwrd">0</div>
           <canvas id="cRewardMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.55);--card-glow:rgba(40,100,255,0.22)">
+      <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
         <div class="label">Avg Level</div>
         <div class="mini-inline">
           <div class="value" id="mLevel">0.0</div>
           <canvas id="cLevelMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card" style="--card-border:rgba(180,80,255,0.55);--card-glow:rgba(160,50,255,0.22)">
-        <div class="label">Loss</div>
-        <div class="mini-inline">
-          <div class="value" id="mLoss">0</div>
-          <canvas id="cLossMini" class="mini-canvas"></canvas>
-        </div>
-      </article>
-      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,60,180,0.55);--card-glow:rgba(255,40,160,0.22)">
-        <div class="label">Grad Norm</div>
-        <div class="mini-inline">
-          <div class="value" id="mGrad">0</div>
-          <canvas id="cGradMini" class="mini-canvas"></canvas>
-        </div>
-      </article>
-      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,160,80,0.55);--card-glow:rgba(255,140,60,0.22)">
+      <article class="card mini-metric-card" style="--card-border:rgba(255,160,80,0.66);--card-glow:rgba(255,140,60,0.26)">
         <div class="label">EPISODE LENGTH</div>
         <div class="mini-inline">
           <div class="value" id="mEpLen">0</div>
           <canvas id="cEpLenMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.55);--card-glow:rgba(100,200,40,0.22)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.55);--card-glow:rgba(255,160,40,0.22)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.55);--card-glow:rgba(255,80,80,0.22)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.55);--card-glow:rgba(60,235,160,0.22)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
-      <article class="card" style="--card-border:rgba(100,200,255,0.55);--card-glow:rgba(80,180,255,0.22)">
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(180,80,255,0.66);--card-glow:rgba(160,50,255,0.26)">
+        <div class="label">Loss</div>
+        <div class="mini-inline">
+          <div class="value" id="mLoss">0</div>
+          <canvas id="cLossMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,60,180,0.66);--card-glow:rgba(255,40,160,0.26)">
+        <div class="label">Grad Norm</div>
+        <div class="mini-inline">
+          <div class="value" id="mGrad">0</div>
+          <canvas id="cGradMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
       </article>
-      <article class="card" style="--card-border:rgba(220,180,255,0.55);--card-glow:rgba(200,150,255,0.22)">
+      <article class="card" style="--card-border:rgba(220,180,255,0.66);--card-glow:rgba(200,150,255,0.26)">
         <div class="label">REPLAYS PER FRAME</div>
         <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
       </article>
-      <article class="card" style="--card-border:rgba(255,220,100,0.55);--card-glow:rgba(255,200,80,0.22)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card" style="--card-border:rgba(100,160,255,0.55);--card-glow:rgba(80,140,255,0.22)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
-      <article class="card" style="--card-border:rgba(200,100,255,0.55);--card-glow:rgba(180,80,255,0.22)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
-      <article class="card card-half" style="--card-border:rgba(0,220,200,0.55);--card-glow:rgba(0,200,180,0.22)"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
+      <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
+      <article class="card" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
+      <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card card-half" style="--card-border:rgba(0,220,200,0.66);--card-glow:rgba(0,200,180,0.26)"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
     </section>
 
     <section class="charts">
@@ -912,6 +915,7 @@ def _render_dashboard_html() -> str:
           <span><span class="sw" style="background:#22c55e;"></span>FPS</span>
           <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
           <span><span class="sw" style="background:#22d3ee;"></span>Avg Lvl (100K)</span>
+          <span><span class="sw" style="background:#e879f9;"></span>Ep Len (100K)</span>
         </div>
         <canvas id="cThroughput"></canvas>
       </article>
@@ -1058,6 +1062,7 @@ def _render_dashboard_html() -> str:
       fps:  { current: 0, target: 0 },
       step: { current: 0, target: 0 },
     };
+    let latestRow = null;
     let lastGaugeFrameTs = 0;
 
     function gaugeAnimationLoop(ts) {
@@ -1081,8 +1086,8 @@ def _render_dashboard_html() -> str:
       }
 
       if (needsRedraw) {
-        drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current);
-        drawStepGauge(stepGaugeCanvas, gaugeState.step.current);
+        drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
+        drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
       }
 
       requestAnimationFrame(gaugeAnimationLoop);
@@ -1109,6 +1114,12 @@ def _render_dashboard_html() -> str:
             key: "level_100k",
             color: "#22d3ee",
             axis_ref: "steps_per_sec_chart",
+            smooth_alpha: 0.20,
+          },
+          {
+            key: "eplen_100k",
+            color: "#e879f9",
+            axis_ref: "fps",
             smooth_alpha: 0.20,
           }
         ]
@@ -1159,7 +1170,7 @@ def _render_dashboard_html() -> str:
           {
             key: "reward_dqn",
             color: "#22c55e",
-            axis: { side: "left", min: 0, label_pad: 52, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
+            axis: { side: "left", min: 0, label_pad: 52, round_max: 100, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
           }
         ]
       },
@@ -1473,11 +1484,11 @@ def _render_dashboard_html() -> str:
 
       const pad = 2;
       const outerExtent = 1.08;   // tight fit — faint glow may clip, bezel stays
-      const downExtent  = 0.78;   // badge hangs below center
+      const downExtent  = 1.00;   // badge hangs below center — room for LED box
       // Size the radius so the dial fits snugly inside the canvas
       const maxRByWidth  = (width  - 2 * pad) / (2.0 * outerExtent);
       const maxRByHeight = (height - 2 * pad) / (outerExtent + downExtent);
-      const radius = Math.max(20, Math.min(maxRByWidth, maxRByHeight));
+      const radius = Math.max(20, Math.min(maxRByWidth, maxRByHeight) * 1.08);
       // Center the full envelope (bezel-top to badge-bottom) in the canvas
       const cx = width  * 0.5;
       const cy = (height * 0.5) + ((outerExtent - downExtent) * radius * 0.5);
@@ -1517,28 +1528,58 @@ def _render_dashboard_html() -> str:
 
       // Dial face.
       const face = ctx.createRadialGradient(cx, cy - radius * 0.5, radius * 0.2, cx, cy, radius * 1.02);
-      face.addColorStop(0.0, "rgba(62, 67, 73, 0.96)");
-      face.addColorStop(0.55, "rgba(39, 42, 47, 0.98)");
-      face.addColorStop(1.0, "rgba(22, 25, 30, 0.99)");
+      face.addColorStop(0.0, "rgba(36, 40, 46, 0.0)");
+      face.addColorStop(0.55, "rgba(22, 25, 30, 0.0)");
+      face.addColorStop(1.0, "rgba(12, 14, 18, 0.0)");
       ctx.fillStyle = face;
       ctx.beginPath();
       ctx.arc(cx, cy, radius * 1.02, 0, Math.PI * 2);
       ctx.fill();
 
-      // Dial ring.
-      ctx.strokeStyle = "rgba(210, 215, 221, 0.72)";
-      ctx.lineWidth = Math.max(3.5, radius * 0.040);
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius * 0.92, startRad, endRad, false);
-      ctx.stroke();
+      // Dial ring — colored by threshold zones (red → yellow → green).
+      const arcLW = Math.max(3.5, radius * 0.040);
+      const arcR  = radius * 0.92;
+      // Draw a smooth continuous gradient along the arc
+      const arcSegs = 120;
+      ctx.lineWidth = arcLW;
+      ctx.lineCap = "butt";
+      for (let s = 0; s < arcSegs; s++) {
+        const t0 = s / arcSegs;
+        const t1 = (s + 1) / arcSegs;
+        const tMid = (t0 + t1) * 0.5;
+        const vMid = minV + tMid * spanV;
+        // Interpolate color: red at red_max, yellow at yellow_max, green above
+        const redEnd = (cfg.red_max - minV) / spanV;
+        const yelEnd = (cfg.yellow_max - minV) / spanV;
+        let r, g, b;
+        if (tMid <= redEnd) {
+          // Pure red zone
+          r = 255; g = 58; b = 58;
+        } else if (tMid <= yelEnd) {
+          // Red → Yellow transition
+          const f = (tMid - redEnd) / Math.max(1e-9, yelEnd - redEnd);
+          r = 255; g = Math.round(58 + f * (176 - 58)); b = Math.round(58 - f * (58 - 44));
+        } else {
+          // Yellow → Green transition
+          const f = (tMid - yelEnd) / Math.max(1e-9, 1.0 - yelEnd);
+          r = Math.round(252 - f * (252 - 51)); g = Math.round(176 + f * (219 - 176)); b = Math.round(44 + f * (107 - 44));
+        }
+        const a0 = startRad + t0 * (endRad - startRad);
+        const a1 = startRad + t1 * (endRad - startRad);
+        ctx.strokeStyle = `rgba(${r},${g},${b},0.85)`;
+        ctx.beginPath();
+        ctx.arc(cx, cy, arcR, a0, a1 + 0.005, false);
+        ctx.stroke();
+      }
 
       // Scale ticks with threshold coloring.
       const minorStep = Math.max(1e-9, Number(cfg.minor_step));
       const majorStep = Math.max(minorStep, Number(cfg.major_step));
       const majorEvery = Math.max(1, Math.round(majorStep / minorStep));
       const tickOuter = radius * 0.89;
-      const tickMinorInner = radius * 0.76;
-      const tickMajorInner = radius * 0.66;
+      const tickMinorInner = radius * 0.825;
+      const tickMajorInner = radius * 0.775;
+      const labelRadius = radius * 0.66 - (cfg.label_inset || 0);
       const tickCount = Math.max(1, Math.round((maxV - minV) / minorStep));
       for (let i = 0; i <= tickCount; i++) {
         const vv = (i >= tickCount) ? maxV : (minV + (i * minorStep));
@@ -1546,19 +1587,63 @@ def _render_dashboard_html() -> str:
         const cosA = Math.cos(a);
         const sinA = Math.sin(a);
         const isMajor = ((i % majorEvery) === 0) || i === tickCount;
-        const inner = isMajor ? tickMajorInner : tickMinorInner;
+        // Skip major tick at end if it doesn't align with a clean major step
+        const isLastAndUnaligned = (i === tickCount) && (Math.abs(vv % majorStep) > 1e-6) && (Math.abs((vv % majorStep) - majorStep) > 1e-6);
+        const drawAsMajor = isMajor && !isLastAndUnaligned;
+        const inner = drawAsMajor ? tickMajorInner : tickMinorInner;
         let c = "rgba(236, 241, 247, 0.90)";
-        if (isMajor) {
+        if (drawAsMajor) {
           if (vv <= cfg.red_max) c = "rgba(255, 58, 58, 0.95)";
           else if (vv <= cfg.yellow_max) c = "rgba(252, 176, 44, 0.95)";
           else c = "rgba(51, 219, 107, 0.95)";
         }
         ctx.strokeStyle = c;
-        ctx.lineWidth = isMajor ? Math.max(3.0, radius * 0.03) : Math.max(0.9, radius * 0.008);
+        ctx.lineWidth = drawAsMajor ? Math.max(3.0, radius * 0.03) : Math.max(0.9, radius * 0.008);
         ctx.beginPath();
         ctx.moveTo(cx + (tickOuter * cosA), cy + (tickOuter * sinA));
         ctx.lineTo(cx + (inner * cosA), cy + (inner * sinA));
         ctx.stroke();
+
+        // Value labels at major ticks (infinity symbol on last tick)
+        const labelEvery = cfg.label_every || 1;
+        const majorIdx = Math.round(i / majorEvery);  // which major tick is this (0, 1, 2...)
+        const showLabel = drawAsMajor && (i >= tickCount || (majorIdx % labelEvery) === 0);
+        if (showLabel) {
+          // Push bottom labels outward (closer to ticks) so they don't overlap the LED badge
+          const bottomFactor = Math.max(0, sinA);  // 0 at top, 1 at bottom
+          const inwardOffset = 8 - (bottomFactor * 16);  // 8px inward at top, -8px outward at bottom
+          // Additional radial offset for non-endpoint labels (push toward tick marks)
+          const radialExtra = (cfg.label_radial_offset && i > 0 && i < tickCount) ? cfg.label_radial_offset : 0;
+          let lx = cx + ((labelRadius - inwardOffset - radialExtra) * cosA);
+          let ly = cy + ((labelRadius - inwardOffset - radialExtra) * sinA);
+          // For non-endpoint labels, apply lateral inset toward center (FPS uses label_lateral)
+          const lateralPx = cfg.label_lateral || 0;
+          if (lateralPx && i > 0 && i < tickCount && Math.abs(cosA) > 0.25) {
+            // Shift label horizontally toward cx (skip near-top-center labels)
+            lx += (lx < cx) ? lateralPx : -lateralPx;
+          }
+          ctx.fillStyle = "rgba(230, 235, 242, 0.82)";
+          ctx.textBaseline = "middle";
+          // Outward-justify: left-align on left side, right-align on right side
+          const normA = ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+          if (Math.abs(cosA) < 0.15) ctx.textAlign = "center";
+          else if (normA > Math.PI * 0.5 && normA < Math.PI * 1.5) ctx.textAlign = "right";
+          else ctx.textAlign = "left";
+          if (i >= tickCount) {
+            ctx.font = `${Math.max(12, Math.round(radius * 0.196))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+            ctx.fillText("\u221E", lx, ly);
+          } else {
+            const labelFontScale = cfg.label_font_scale || 0.11;
+            ctx.font = `${Math.max(8, Math.round(radius * labelFontScale))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+            let labelStr;
+            if (vv >= 1000) {
+              labelStr = `${Math.round(vv / 1000)}K`;
+            } else {
+              labelStr = `${Math.round(vv)}`;
+            }
+            ctx.fillText(labelStr, lx, ly);
+          }
+        }
       }
 
       // Needle geometry for classic pointy orange pointer.
@@ -1576,6 +1661,7 @@ def _render_dashboard_html() -> str:
       const perpY = nCos;
 
       const drawNeedle = () => {
+        // Drop shadow
         ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
         ctx.beginPath();
         ctx.moveTo(pTipX + 2.5, pTipY + 2.5);
@@ -1584,16 +1670,39 @@ def _render_dashboard_html() -> str:
         ctx.closePath();
         ctx.fill();
 
+        // Multi-layer yellow-orange bloom glow (like VFD but warm)
+        const glowLayers = [
+          { blur: 64, color: "rgba(255, 140, 10, 0.70)", fill: "rgba(255, 120, 10, 0.06)" },
+          { blur: 38, color: "rgba(255, 160, 20, 0.80)", fill: "rgba(255, 130, 10, 0.10)" },
+          { blur: 18, color: "rgba(255, 170, 40, 0.90)", fill: "rgba(255, 140, 20, 0.14)" },
+          { blur:  7, color: "rgba(255, 190, 60, 1.00)", fill: "rgba(255, 160, 30, 0.18)" },
+        ];
+        const needlePath = () => {
+          ctx.beginPath();
+          ctx.moveTo(pTipX, pTipY);
+          ctx.lineTo(pTailX + (perpX * baseHalfW), pTailY + (perpY * baseHalfW));
+          ctx.lineTo(pTailX - (perpX * baseHalfW), pTailY - (perpY * baseHalfW));
+          ctx.closePath();
+        };
+        ctx.save();
+        for (const gl of glowLayers) {
+          ctx.shadowColor = gl.color;
+          ctx.shadowBlur = gl.blur;
+          ctx.shadowOffsetX = 0;
+          ctx.shadowOffsetY = 0;
+          ctx.fillStyle = gl.fill;
+          needlePath();
+          ctx.fill();
+        }
+        ctx.restore();
+
+        // Crisp needle fill
         const needleGrad = ctx.createLinearGradient(pTailX, pTailY, pTipX, pTipY);
         needleGrad.addColorStop(0.0, "#c85a00");
         needleGrad.addColorStop(0.6, "#ff8a00");
         needleGrad.addColorStop(1.0, "#ffc04d");
         ctx.fillStyle = needleGrad;
-        ctx.beginPath();
-        ctx.moveTo(pTipX, pTipY);
-        ctx.lineTo(pTailX + (perpX * baseHalfW), pTailY + (perpY * baseHalfW));
-        ctx.lineTo(pTailX - (perpX * baseHalfW), pTailY - (perpY * baseHalfW));
-        ctx.closePath();
+        needlePath();
         ctx.fill();
       };
       const drawHub = () => {
@@ -1622,52 +1731,174 @@ def _render_dashboard_html() -> str:
       const badgeW = radius * 0.86;
       const badgeH = radius * 0.48;
       const badgeX = cx - (badgeW * 0.5);
-      const badgeY = cy + radius * 0.30;
+      const badgeY = cy + radius * 0.44;
+
+      // Sub-text above the badge (e.g. total training steps) — VFD odometer display
+      if (cfg.sub_text) {
+        const subFont = `400 ${Math.max(12, Math.round(radius * 0.156))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+        ctx.font = subFont;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        // Fixed width: measure max-width template so box never resizes
+        const maxTemplate = "8,888,888,888";
+        const tmMax = ctx.measureText(maxTemplate);
+        const odoPad = radius * 0.12;
+        const odoW = tmMax.width + odoPad * 2;
+        const odoH = Math.max(16, Math.round(radius * 0.20));
+        const odoX = cx - odoW * 0.5;
+        const odoY = badgeY - odoH - 3;
+        const odoR = Math.max(3, radius * 0.035);
+        const subX = odoX + odoW - odoPad;  // right-justified with padding
+        // VFD housing background — color keyed to gauge type
+        ctx.save();
+        ctx.shadowBlur = 0;
+        const odoColor = cfg.sub_text_color || "amber";
+        roundRectPath(ctx, odoX, odoY, odoW, odoH, odoR);
+        ctx.fillStyle = "#130A2C";  // uniform dark VFD housing
+        ctx.fill();
+        // Subtle inset border matching text color
+        ctx.strokeStyle = odoColor === "orange"
+          ? "rgba(180, 100, 20, 0.35)"
+          : "rgba(60, 130, 255, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+        // Text centered in the VFD box
+        const subTextY = odoY + odoH * 0.5;
+        if (odoColor === "orange") {
+          // 5-layer bloom in orange — doubled intensity
+          ctx.fillStyle = "rgba(180, 80, 0, 0.50)";
+          ctx.shadowColor = "rgba(255, 100, 0, 0.60)";
+          ctx.shadowBlur = 48;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(220, 120, 10, 0.70)";
+          ctx.shadowColor = "rgba(255, 130, 10, 0.70)";
+          ctx.shadowBlur = 28;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(240, 160, 30, 0.80)";
+          ctx.shadowColor = "rgba(255, 160, 20, 0.80)";
+          ctx.shadowBlur = 14;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(255, 190, 60, 0.90)";
+          ctx.shadowColor = "rgba(255, 180, 40, 0.90)";
+          ctx.shadowBlur = 5;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          // Crisp orange text on top with residual glow
+          ctx.fillStyle = "#ffaa33";
+          ctx.shadowColor = "rgba(255, 140, 20, 0.60)";
+          ctx.shadowBlur = 10;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.shadowBlur = 0;
+        } else {
+          // 5-layer bloom in blue — strong glow visible against dark housing
+          ctx.fillStyle = "rgba(60, 120, 255, 0.50)";
+          ctx.shadowColor = "rgba(60, 130, 255, 0.80)";
+          ctx.shadowBlur = 52;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(80, 140, 255, 0.65)";
+          ctx.shadowColor = "rgba(80, 150, 255, 0.85)";
+          ctx.shadowBlur = 30;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(100, 160, 255, 0.75)";
+          ctx.shadowColor = "rgba(100, 170, 255, 0.90)";
+          ctx.shadowBlur = 16;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(140, 190, 255, 0.85)";
+          ctx.shadowColor = "rgba(120, 180, 255, 0.95)";
+          ctx.shadowBlur = 6;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          // Crisp blue-white text on top with residual glow
+          ctx.fillStyle = "#c8e8ff";
+          ctx.shadowColor = "rgba(80, 160, 255, 0.70)";
+          ctx.shadowBlur = 12;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.shadowBlur = 0;
+        }
+      }
+
       const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
-      badgeFill.addColorStop(0.0, "rgba(16, 18, 22, 0.92)");
-      badgeFill.addColorStop(1.0, "rgba(8, 10, 13, 0.96)");
+      badgeFill.addColorStop(0.0, "rgba(24, 27, 33, 0.92)");
+      badgeFill.addColorStop(1.0, "rgba(12, 15, 20, 0.96)");
       roundRectPath(ctx, badgeX, badgeY, badgeW, badgeH, Math.max(8, radius * 0.08));
       ctx.fillStyle = badgeFill;
       ctx.fill();
 
       const valueText = Number(value).toFixed(cfg.decimals ?? 1);
-      ctx.fillStyle = "rgba(255, 52, 52, 0.98)";
-      ctx.shadowColor = "rgba(255, 52, 52, 0.45)";
-      ctx.shadowBlur = Math.max(4, radius * 0.08);
-      ctx.font = `400 ${Math.max(20, Math.round(radius * 0.44))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      const ledX = cx;
+      const ledY = badgeY + (badgeH * 0.5);
+      const ledFont = `400 ${Math.max(16, Math.round(radius * 0.422))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      ctx.font = ledFont;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(valueText, cx, badgeY + (badgeH * 0.58));
+      // Multi-layer LED bloom (widest/faintest first)
+      ctx.fillStyle = "rgba(255, 20, 20, 0.45)";
+      ctx.shadowColor = "rgba(255, 30, 30, 0.80)";
+      ctx.shadowBlur = Math.max(48, radius * 0.55);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 30, 30, 0.55)";
+      ctx.shadowColor = "rgba(255, 40, 40, 0.85)";
+      ctx.shadowBlur = Math.max(28, radius * 0.35);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 40, 40, 0.65)";
+      ctx.shadowColor = "rgba(255, 50, 50, 0.90)";
+      ctx.shadowBlur = Math.max(14, radius * 0.18);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 50, 50, 0.80)";
+      ctx.shadowColor = "rgba(255, 60, 60, 0.95)";
+      ctx.shadowBlur = Math.max(5, radius * 0.08);
+      ctx.fillText(valueText, ledX, ledY);
+      // Bright LED text on top
+      ctx.fillStyle = "rgba(255, 52, 52, 0.98)";
       ctx.shadowBlur = 0;
+      ctx.fillText(valueText, ledX, ledY);
       drawNeedle();
       drawHub();
     }
 
-    function drawFpsGauge(canvas, fps) {
+    function drawFpsGauge(canvas, fps, totalFrames) {
+      const framesText = totalFrames != null ? Number(totalFrames).toLocaleString() : null;
       drawStyledGauge(canvas, fps, {
         min: GAUGE_MIN_FPS,
         max: GAUGE_MAX_FPS,
         red_max: GAUGE_FPS_RED_MAX,
         yellow_max: GAUGE_FPS_YELLOW_MAX,
-        minor_step: 50,
-        major_step: 250,
+        minor_step: 250,
+        major_step: 500,
         title: "FPS",
         unit: "FPS",
         decimals: 0,
+        label_inset: 4,
+        label_lateral: 8,
+        label_font_scale: 0.088,
+        label_every: 2,
+        label_radial_offset: -16,
+        sub_text: framesText,
+        sub_text_color: "blue",
       });
     }
 
-    function drawStepGauge(canvas, stepsPerSec) {
+    function drawStepGauge(canvas, stepsPerSec, totalSteps) {
+      const stepsText = totalSteps != null ? Number(totalSteps).toLocaleString() : null;
       drawStyledGauge(canvas, stepsPerSec, {
         min: GAUGE_MIN_STEPS,
         max: GAUGE_MAX_STEPS,
         red_max: 10,
         yellow_max: 20,
-        minor_step: 1,
-        major_step: 10,
-        title: "STEP",
+        minor_step: 2.5,
+        major_step: 5,
+        title: "STEPS/s",
         unit: "S/S",
         decimals: 0,
+        label_font_scale: 0.088,
+        label_radial_offset: -4,
+        sub_text: stepsText,
+        sub_text_color: "orange",
       });
     }
 
@@ -1876,8 +2107,10 @@ def _render_dashboard_html() -> str:
           maxV = Math.max(maxV, maxFloor);
         }
         const roundMax = Number(s.axis?.round_max);
+        let didRoundMax = false;
         if (!hasFixedMax && roundMax > 0 && Number.isFinite(roundMax)) {
           maxV = Math.ceil(maxV / roundMax) * roundMax;
+          didRoundMax = true;
         }
         if (maxV < minV) {
           maxV = minV + 1.0;
@@ -1896,7 +2129,7 @@ def _render_dashboard_html() -> str:
           if (!hasFixedMin) {
             minV -= p;
           }
-          if (!hasFixedMax) {
+          if (!hasFixedMax && !didRoundMax) {
             maxV += p;
           }
         }
@@ -2134,7 +2367,7 @@ def _render_dashboard_html() -> str:
       ctx.clearRect(0, 0, width, height);
       if (!points.length) return;
 
-      const axisPad = 20;
+      const axisPad = 30;
       const padL = axisPad;
       const padR = 4;
       const isHalf = canvas.closest && canvas.closest('.card-half');
@@ -2423,6 +2656,7 @@ def _render_dashboard_html() -> str:
       updateCards(payload.now, smoothedStepSpd);
       gaugeState.fps.target  = payload.now.fps;
       gaugeState.step.target = smoothedStepSpd;
+      latestRow = payload.now;
       drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 60 * 60);
       drawChart(charts.rewards.canvas, chartHistory60m, charts.rewards.series, 60 * 60);
       drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 60, true);
@@ -2554,12 +2788,15 @@ def _make_handler(state: _DashboardState):
             status: int = 200,
             cache_control: str = "no-store",
         ):
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", cache_control)
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
 
         def _send_file(self, filepath: str, content_type: str):
             try:
@@ -2571,8 +2808,13 @@ def _make_handler(state: _DashboardState):
                 self.end_headers()
                 with open(filepath, "rb") as f:
                     shutil.copyfileobj(f, self.wfile, length=64 * 1024)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
             except Exception:
-                self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                try:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
 
         @staticmethod
         def _safe_audio_file(name: str) -> str | None:
@@ -2662,6 +2904,12 @@ def _make_handler(state: _DashboardState):
 
         def log_message(self, fmt, *args):
             return
+
+        def handle_one_request(self):
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
     return DashboardHandler
 

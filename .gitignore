@@ -8,3 +8,4 @@ models
 venv/
 *.log
 *.pyc
+audio/*.mp3

@@ -450,10 +450,17 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         adj_right = (player_abs_seg + 1) % 16
     end
 
-    -- Scan enemies + enemy shots for a lane, return min depth [1..255] or 255 (safe)
+    -- Scan enemies, enemy shots, AND spikes for a lane, return min depth [1..255] or 255 (safe)
     local function nearest_threat_in_lane(target_seg)
         if target_seg < 0 then return 255 end  -- open-level edge: no lane exists → safe
         local best = 255
+        -- Include spike depth: raw depth in same coordinate space as enemy depths.
+        -- Lower depth = spike extends closer to tube rim = more dangerous.
+        -- Critical during zoom when spikes are the ONLY threat.
+        local sd = ls.spike_depths[target_seg] or 0
+        if sd > 0 and sd < best then
+            best = sd
+        end
         for i = 1, 7 do
             local d = es.enemy_depths[i]
             if d > 0 and es.enemy_abs_segments[i] == target_seg and d < best then

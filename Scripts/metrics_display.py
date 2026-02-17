@@ -40,7 +40,11 @@ _total1m_frames = 0
 _total5m = deque()
 _total5m_frames = 0
 
-# Rolling episode-length window (1M frames)
+# Rolling episode-length windows
+EPLEN100K_FRAMES = 100_000
+_eplen100k = deque()
+_eplen100k_frames = 0
+
 _eplen1m = deque()
 _eplen1m_frames = 0
 
@@ -129,17 +133,28 @@ def get_total_window_averages() -> tuple[float, float, float]:
 
 
 def add_episode_to_eplen_window(ep_len: int):
-    """Add an episode's length to the 1M-frame rolling window."""
-    global _eplen1m_frames
+    """Add an episode's length to the 100K and 1M-frame rolling windows."""
+    global _eplen100k_frames, _eplen1m_frames
     if ep_len <= 0:
         return
     l = int(ep_len)
     with _dqn_windows_lock:
+        _eplen100k.append((float(l), l))
+        _eplen100k_frames += l
+        while _eplen100k and _eplen100k_frames > EPLEN100K_FRAMES:
+            _, ol = _eplen100k.popleft()
+            _eplen100k_frames -= ol
+
         _eplen1m.append((float(l), l))
         _eplen1m_frames += l
         while _eplen1m and _eplen1m_frames > DQN1M_FRAMES:
             _, ol = _eplen1m.popleft()
             _eplen1m_frames -= ol
+
+
+def get_eplen_100k_average() -> float:
+    with _dqn_windows_lock:
+        return _avg_window(_eplen100k) if _eplen100k else 0.0
 
 
 def get_eplen_1m_average() -> float:

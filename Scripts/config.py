@@ -79,7 +79,7 @@ class RLConfigData:
     lr: float = 6.25e-5
     lr_min: float = 2e-5                  # Higher floor keeps learning alive across restarts
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 1_000_000      # Longer ramp = more time to explore at high LR per cycle
+    lr_cosine_period: int = 2_000_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
@@ -106,26 +106,28 @@ class RLConfigData:
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 1_000_000
     # Late-training exploration pulses to escape local optima.
-    epsilon_pulse_max: float = 0.20
+    epsilon_pulse_max: float = 0.25
     epsilon_pulse_period_frames: int = 500_000
     epsilon_pulse_start_frame: int = 3_000_000
     epsilon: float = 1.0
 
     # Expert guidance
     expert_ratio_start: float = 0.50
-    expert_ratio_end: float = 0.08
+    expert_ratio_end: float = 0.02
     expert_ratio_decay_frames: int = 10_000_000
     expert_ratio: float = 0.50
     # During tube zoom (gamestate 0x20), temporarily boost expert usage.
     expert_ratio_zoom_multiplier: float = 2.0
     expert_ratio_zoom_gamestate: int = 0x20
+    # Suppress random exploration during tube zoom — any lane twitch kills on spikes.
+    epsilon_zoom_multiplier: float = 0.2
 
     # Expert BC
     expert_bc_weight: float = 1.0
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
     # Keep a small floor to anchor policy as expert ratio approaches its minimum.
-    expert_bc_min_weight: float = 0.01
+    expert_bc_min_weight: float = 0.001
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
