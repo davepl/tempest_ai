@@ -50,8 +50,8 @@ class RLConfigData:
         return self.num_firezap_actions * self.num_spinner_actions
 
     # ── network architecture ────────────────────────────────────────────
-    trunk_hidden: int = 512
-    trunk_layers: int = 3
+    trunk_hidden: int = 256
+    trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
 
@@ -77,16 +77,16 @@ class RLConfigData:
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 256
     lr: float = 6.25e-5
-    lr_min: float = 1e-5                  # Decay to 1/6 of peak — lets network settle
+    lr_min: float = 2e-5                  # Higher floor keeps learning alive across restarts
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 500_000        # Used as full decay horizon for non-restart cosine
-    lr_use_restarts: bool = False          # False = monotonic cosine decay to lr_min (no warm restarts)
+    lr_cosine_period: int = 2_000_000       # Longer period to prevent destructive restarts
+    lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
-    n_step: int = 10                        # Doubled from 5 for wider death attribution window
-    max_samples_per_frame: float = 8.0      # Cap replay pressure: sampled transitions per env frame
+    n_step: int = 12                        # Wider horizon for better long-range credit assignment
+    max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 2_000_000
+    memory_size: int = 10_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -94,9 +94,9 @@ class RLConfigData:
     per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
     min_replay_to_train: int = 10_000
 
-    # Target network (soft Polyak averaging)
-    target_update_period: int = 1
-    target_tau: float = 0.0005             # Slower tracking → more stable anchor
+    # Target network (periodic hard sync; moderate refresh for stable learning)
+    target_update_period: int = 2_000
+    target_tau: float = 1.0
 
     # Gradient
     grad_clip_norm: float = 5.0            # Tighter clipping dampens large updates
@@ -105,23 +105,29 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 1_000_000
+    # Late-training exploration pulses to escape local optima.
+    epsilon_pulse_max: float = 0.25
+    epsilon_pulse_period_frames: int = 500_000
+    epsilon_pulse_start_frame: int = 3_000_000
     epsilon: float = 1.0
 
     # Expert guidance
     expert_ratio_start: float = 0.50
-    expert_ratio_end: float = 0.05
-    expert_ratio_decay_frames: int = 5_000_000
+    expert_ratio_end: float = 0.02
+    expert_ratio_decay_frames: int = 10_000_000
     expert_ratio: float = 0.50
     # During tube zoom (gamestate 0x20), temporarily boost expert usage.
     expert_ratio_zoom_multiplier: float = 2.0
     expert_ratio_zoom_gamestate: int = 0x20
+    # Suppress random exploration during tube zoom — any lane twitch kills on spikes.
+    epsilon_zoom_multiplier: float = 0.2
 
     # Expert BC
     expert_bc_weight: float = 1.0
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
     # Keep a small floor to anchor policy as expert ratio approaches its minimum.
-    expert_bc_min_weight: float = 0.05
+    expert_bc_min_weight: float = 0.001
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
@@ -134,11 +140,21 @@ class RLConfigData:
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
-    inference_on_cpu: bool = True
+    # Keep inference on GPU when available; CPU inference can become a bottleneck
+    # at higher frame rates even with low overall system utilization.
+    inference_on_cpu: bool = False
+    # Device placement (CUDA only): useful on multi-GPU hosts.
+    train_cuda_device_index: int = 0
+    inference_cuda_device_index: int = 0
     inference_sync_steps: int = 100
+    # Micro-batch inference requests across clients to increase GPU work per launch.
+    inference_batching_enabled: bool = True
+    inference_batch_max_size: int = 32
+    inference_batch_wait_ms: float = 1.0
+    inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 8
+    training_steps_per_cycle: int = 4
     save_interval: int = 10_000
 
     enable_amp: bool = True
@@ -156,6 +172,7 @@ class MetricsData:
     total_training_steps: int = 0
     memory_buffer_size: int = 0
     client_count: int = 0
+    web_client_count: int = 0
 
     epsilon: float = RL_CONFIG.epsilon_start
     expert_ratio: float = RL_CONFIG.expert_ratio_start
@@ -242,12 +259,27 @@ class MetricsData:
         with self.lock:
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
+    @staticmethod
+    def _natural_epsilon_for_frame(frame_count: int) -> float:
+        progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
+        base = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+
+        pulse_max = float(getattr(RL_CONFIG, "epsilon_pulse_max", base))
+        pulse_period = int(getattr(RL_CONFIG, "epsilon_pulse_period_frames", 0))
+        pulse_start = int(getattr(RL_CONFIG, "epsilon_pulse_start_frame", RL_CONFIG.epsilon_decay_frames))
+        if frame_count < pulse_start or pulse_period <= 0 or pulse_max <= base:
+            return base
+
+        phase = ((frame_count - pulse_start) % pulse_period) / float(pulse_period)
+        # Triangle wave: 0 → 1 → 0 over one period.
+        pulse = 1.0 - abs((2.0 * phase) - 1.0)
+        return base + (pulse_max - base) * pulse
+
     def update_epsilon(self):
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
-            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-            self.epsilon = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+            self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
             return self.epsilon
 
     def get_expert_ratio(self):
@@ -365,8 +397,7 @@ class MetricsData:
     def restore_natural_epsilon(self, kb=None):
         with self.lock:
             self.manual_epsilon_override = False
-            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-            self.epsilon = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+            self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
 
 
 metrics = MetricsData()

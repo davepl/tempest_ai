@@ -22,7 +22,7 @@ local SHOW_DISPLAY            = false
 local START_ADVANCED          = false
 local START_LEVEL_MIN         = 9
 local DISPLAY_UPDATE_INTERVAL = 0.02
-local SOCKET_ADDRESS          = "socket.m2macpro:9999"
+local SOCKET_ADDRESS          = "socket.ubvmdell:9999"
 local SOCKET_READ_TIMEOUT_S   = 3.5  
 local SOCKET_RETRY_WAIT_S     = 0.01
 local CONNECTION_RETRY_INTERVAL_S = 5 -- How often to retry connecting (seconds)
@@ -418,11 +418,12 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     for i = 1, 4 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_shot_segments[i])
     end
-    -- Charging Fuseball segments (7) - relative values
+    -- Pulsar depths table (7) - raw depth for active pulsars, 0 otherwise.
+    -- Reuses this 7-wide block so payload width stays fixed at 195.
     for i = 1, 7 do
-        num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.charging_fuseball[i])
+        num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, es.active_pulsar_depths[i] or 0)
     end
-    -- Active Pulsar segments (7) - relative values
+    -- Pulsar lanes table (7) - relative segment for active pulsars.
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.active_pulsar[i])
     end
@@ -449,10 +450,17 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         adj_right = (player_abs_seg + 1) % 16
     end
 
-    -- Scan enemies + enemy shots for a lane, return min depth [1..255] or 255 (safe)
+    -- Scan enemies, enemy shots, AND spikes for a lane, return min depth [1..255] or 255 (safe)
     local function nearest_threat_in_lane(target_seg)
         if target_seg < 0 then return 255 end  -- open-level edge: no lane exists → safe
         local best = 255
+        -- Include spike depth: raw depth in same coordinate space as enemy depths.
+        -- Lower depth = spike extends closer to tube rim = more dangerous.
+        -- Critical during zoom when spikes are the ONLY threat.
+        local sd = ls.spike_depths[target_seg] or 0
+        if sd > 0 and sd < best then
+            best = sd
+        end
         for i = 1, 7 do
             local d = es.enemy_depths[i]
             if d > 0 and es.enemy_abs_segments[i] == target_seg and d < best then

@@ -12,6 +12,7 @@ if __name__ == "__main__":
 import atexit
 import json
 import math
+import mimetypes
 import os
 import shutil
 import signal
@@ -23,7 +24,7 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
     from config import RL_CONFIG
@@ -31,13 +32,19 @@ except ImportError:
     from Scripts.config import RL_CONFIG
 
 try:
-    from metrics_display import get_dqn_window_averages
+    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
 except ImportError:
     try:
-        from Scripts.metrics_display import get_dqn_window_averages
+        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
     except ImportError:
         def get_dqn_window_averages():
             return 0.0, 0.0, 0.0
+        def get_total_window_averages():
+            return 0.0, 0.0, 0.0
+        def get_eplen_1m_average():
+            return 0.0
+        def get_eplen_100k_average():
+            return 0.0
 
 
 def _tail_mean(values, count: int = 20) -> float:
@@ -50,12 +57,45 @@ def _tail_mean(values, count: int = 20) -> float:
 
 
 LEVEL_25K_FRAMES = 25_000
+LEVEL_100K_FRAMES = 100_000
 LEVEL_1M_FRAMES = 1_000_000
 LEVEL_5M_FRAMES = 5_000_000
+WEB_CLIENT_TIMEOUT_S = 5.0
+DASH_HISTORY_LIMIT = 40_000
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
+FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
+
+
+def _audio_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "audio")
+
+
+def _fonts_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "fonts")
+
+
+def _list_audio_files() -> list[str]:
+    root = _audio_dir()
+    try:
+        names = os.listdir(root)
+    except Exception:
+        return []
+    files = []
+    for name in names:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in AUDIO_EXTENSIONS:
+            continue
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            files.append(name)
+    files.sort(key=lambda s: s.lower())
+    return files
 
 
 class _DashboardState:
-    def __init__(self, metrics_obj, agent_obj=None, history_limit: int = 900):
+    def __init__(self, metrics_obj, agent_obj=None, history_limit: int = DASH_HISTORY_LIMIT):
         self.metrics = metrics_obj
         self.agent = agent_obj
         self.history = deque(maxlen=max(120, history_limit))
@@ -65,11 +105,13 @@ class _DashboardState:
         self.last_steps_time: float | None = None
         self._level_windows = {
             "25k": {"limit": LEVEL_25K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "100k": {"limit": LEVEL_100K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
             "1m": {"limit": LEVEL_1M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
             "5m": {"limit": LEVEL_5M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
         }
         self._last_level_frame_count: int | None = None
         self._last_avg_inf_ms = 0.0
+        self._web_clients: dict[str, float] = {}
         self._cached_now_body = b"{}"
 
     def _clear_level_windows(self):
@@ -78,17 +120,36 @@ class _DashboardState:
             win["frames"] = 0
             win["weighted"] = 0.0
 
-    def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float]:
+    def _update_web_client_count_locked(self, now_ts: float | None = None) -> int:
+        now = float(now_ts if now_ts is not None else time.time())
+        stale_before = now - WEB_CLIENT_TIMEOUT_S
+        stale = [cid for cid, ts in self._web_clients.items() if ts < stale_before]
+        for cid in stale:
+            self._web_clients.pop(cid, None)
+        active = len(self._web_clients)
+        with self.metrics.lock:
+            self.metrics.web_client_count = active
+        return active
+
+    def touch_web_client(self, client_id: str | None):
+        if not client_id:
+            return
+        now = time.time()
+        with self.lock:
+            self._web_clients[client_id] = now
+            self._update_web_client_count_locked(now)
+
+    def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float, float]:
         raw_level = float(average_level)
         level = round(raw_level, 4) if math.isfinite(raw_level) else 0.0
         if self._last_level_frame_count is None:
             self._last_level_frame_count = frame_count
-            return level, level, level
+            return level, level, level, level
 
         if frame_count < self._last_level_frame_count:
             self._clear_level_windows()
             self._last_level_frame_count = frame_count
-            return level, level, level
+            return level, level, level, level
 
         frame_delta = max(0, int(frame_count - self._last_level_frame_count))
         self._last_level_frame_count = frame_count
@@ -125,6 +186,7 @@ class _DashboardState:
 
         return (
             _mean_or_level(self._level_windows["25k"]),
+            _mean_or_level(self._level_windows["100k"]),
             _mean_or_level(self._level_windows["1m"]),
             _mean_or_level(self._level_windows["5m"]),
         )
@@ -141,6 +203,7 @@ class _DashboardState:
             epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
             expert_ratio = float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
+            web_client_count = int(self.metrics.web_client_count)
             average_level = float(self.metrics.average_level + 1.0)
             memory_buffer_size = int(self.metrics.memory_buffer_size)
             memory_buffer_k = int(memory_buffer_size // 1000)
@@ -166,7 +229,11 @@ class _DashboardState:
             dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
         except Exception:
             dqn100k_raw = dqn1m_raw = dqn5m_raw = 0.0
-        level_25k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
+        try:
+            total100k_raw, total1m_raw, total5m_raw = get_total_window_averages()
+        except Exception:
+            total100k_raw = total1m_raw = total5m_raw = 0.0
+        level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
         if inference_requests > 0:
             self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
         avg_inf_ms = self._last_avg_inf_ms
@@ -178,6 +245,7 @@ class _DashboardState:
             steps_per_sec = ds / dt
         self.last_steps = total_training_steps
         self.last_steps_time = now
+        replay_per_frame = (steps_per_sec * float(getattr(RL_CONFIG, "batch_size", 1))) / max(1e-6, float(fps))
 
         lr = None
         q_min = None
@@ -202,11 +270,14 @@ class _DashboardState:
             "fps": fps,
             "training_steps": total_training_steps,
             "steps_per_sec": steps_per_sec,
+            "rpl_per_frame": replay_per_frame,
             "epsilon": epsilon_effective,
             "epsilon_raw": epsilon_raw,
             "expert_ratio": expert_ratio,
             "client_count": client_count,
+            "web_client_count": web_client_count,
             "average_level": average_level,
+            "memory_buffer_size": memory_buffer_size,
             "memory_buffer_k": memory_buffer_k,
             "memory_buffer_pct": memory_buffer_pct,
             "avg_inf_ms": avg_inf_ms,
@@ -221,7 +292,10 @@ class _DashboardState:
             "dqn_100k": float(dqn100k_raw) * inv_obj,
             "dqn_1m": float(dqn1m_raw) * inv_obj,
             "dqn_5m": float(dqn5m_raw) * inv_obj,
+            "total_1m": float(total1m_raw) * inv_obj,
+            "total_5m": float(total5m_raw) * inv_obj,
             "level_25k": float(level_25k),
+            "level_100k": float(level_100k),
             "level_1m": float(level_1m),
             "level_5m": float(level_5m),
             "training_enabled": training_enabled,
@@ -230,9 +304,13 @@ class _DashboardState:
             "lr": lr,
             "q_min": q_min,
             "q_max": q_max,
+            "eplen_1m": get_eplen_1m_average(),
+            "eplen_100k": get_eplen_100k_average(),
         }
 
     def sample(self):
+        with self.lock:
+            self._update_web_client_count_locked()
         snap = self._build_snapshot()
         with self.lock:
             self.latest = snap
@@ -259,28 +337,92 @@ def _render_dashboard_html() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tempest AI Metrics</title>
   <style>
+    @font-face {
+      font-family: "LED Dot-Matrix";
+      src: url("/api/font/LED%20Dot-Matrix.ttf") format("truetype");
+      font-display: swap;
+    }
+    @font-face {
+      font-family: "DS-Digital";
+      src: url("/api/font/DS-DIGI.TTF") format("truetype");
+      font-display: swap;
+    }
     :root {
-      --bg0: #070c14;
-      --bg1: #0f172a;
-      --bg2: #172554;
-      --panel: rgba(15, 23, 42, 0.78);
-      --line: rgba(148, 163, 184, 0.22);
-      --ink: #e2e8f0;
-      --muted: #93a4bc;
-      --accentA: #22d3ee;
-      --accentB: #f59e0b;
-      --accentC: #34d399;
-      --accentD: #f43f5e;
+      --bg0: #040510;
+      --bg1: #0b1433;
+      --bg2: #1a0a33;
+      --panel: rgba(6, 10, 28, 0.78);
+      --line: rgba(0, 229, 255, 0.26);
+      --ink: #e8f6ff;
+      --muted: #9cb6d4;
+      --accentA: #00e5ff;
+      --accentB: #ffe600;
+      --accentC: #39ff14;
+      --accentD: #ff2bd6;
+      --neonRed: #ff2a55;
+      --neonEdge: rgba(0, 229, 255, 0.65);
+      --panelGlowA: rgba(0, 229, 255, 0.22);
+      --panelGlowB: rgba(255, 43, 214, 0.18);
+      --vfdCyan: #70f7ff;
     }
     * { box-sizing: border-box; }
+    *::before, *::after { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; color: var(--ink); background: var(--bg0); }
     body {
       font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
       min-height: 100vh;
+      position: relative;
+      isolation: isolate;
+      overflow-x: hidden;
       background:
-        radial-gradient(1200px 600px at 0% 0%, rgba(14, 165, 233, 0.20), transparent 60%),
-        radial-gradient(900px 500px at 100% 0%, rgba(245, 158, 11, 0.18), transparent 58%),
-        linear-gradient(160deg, var(--bg0) 0%, var(--bg1) 60%, var(--bg2) 100%);
+        radial-gradient(1300px 650px at 6% -8%, rgba(0, 229, 255, 0.24), transparent 58%),
+        radial-gradient(950px 540px at 102% -4%, rgba(255, 43, 214, 0.22), transparent 56%),
+        radial-gradient(900px 500px at 52% 112%, rgba(57, 255, 20, 0.12), transparent 62%),
+        repeating-linear-gradient(0deg, rgba(130, 168, 224, 0.03) 0px, rgba(130, 168, 224, 0.03) 1px, transparent 1px, transparent 4px),
+        linear-gradient(158deg, var(--bg0) 0%, var(--bg1) 58%, var(--bg2) 100%);
+      background-attachment: fixed;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -35vh -20vw;
+      pointer-events: none;
+      z-index: 0;
+      background:
+        radial-gradient(circle at 18% 24%, rgba(0, 229, 255, 0.24), transparent 30%),
+        radial-gradient(circle at 78% 18%, rgba(255, 43, 214, 0.22), transparent 34%),
+        radial-gradient(circle at 68% 78%, rgba(57, 255, 20, 0.18), transparent 36%);
+      animation: orbDrift 20s ease-in-out infinite alternate;
+    }
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 1;
+      background: linear-gradient(90deg, rgba(0, 229, 255, 0.045), transparent 36%, transparent 64%, rgba(255, 43, 214, 0.045));
+      mix-blend-mode: screen;
+      animation: rgbSweep 14s linear infinite;
+    }
+    @keyframes orbDrift {
+      0% { transform: translate3d(-2.5%, -2%, 0) scale(1.0); }
+      50% { transform: translate3d(2%, 1.5%, 0) scale(1.08); }
+      100% { transform: translate3d(3%, -1.5%, 0) scale(1.03); }
+    }
+    @keyframes rgbSweep {
+      0% { opacity: 0.15; transform: translateX(-5%); }
+      50% { opacity: 0.42; transform: translateX(5%); }
+      100% { opacity: 0.15; transform: translateX(-5%); }
+    }
+    @keyframes borderShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    @keyframes ledPulse {
+      0% { transform: scale(0.95); filter: saturate(1.0); }
+      50% { transform: scale(1.10); filter: saturate(1.5); }
+      100% { transform: scale(0.95); filter: saturate(1.0); }
     }
     main {
       max-width: 1500px;
@@ -288,136 +430,321 @@ def _render_dashboard_html() -> str:
       padding: 20px;
       display: grid;
       gap: 16px;
+      position: relative;
+      z-index: 2;
+    }
+    .top, .card, .panel {
+      position: relative;
+      overflow: hidden;
+      background:
+        radial-gradient(120% 160% at 0% 0%, rgba(0, 229, 255, 0.10), transparent 58%),
+        radial-gradient(140% 150% at 100% 0%, rgba(255, 43, 214, 0.10), transparent 58%),
+        linear-gradient(155deg, rgba(7, 12, 30, 0.86) 0%, rgba(7, 10, 27, 0.74) 100%);
+      border: 1px solid var(--line);
+      box-shadow:
+        inset 0 0 0 1px rgba(0, 229, 255, 0.06),
+        0 0 26px var(--panelGlowA),
+        0 0 36px var(--panelGlowB);
+      backdrop-filter: blur(10px) saturate(118%);
+    }
+    .card {
+      --card-border: rgba(100, 180, 255, 0.45);
+      --card-glow: rgba(100, 180, 255, 0.18);
+      border: 2px solid var(--card-border);
+      box-shadow:
+        inset 0 0 0 1px color-mix(in srgb, var(--card-border) 15%, transparent),
+        0 0 18px var(--card-glow),
+        0 0 32px var(--card-glow);
+    }
+    .top::before, .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      padding: 1px;
+      background: linear-gradient(110deg, rgba(0, 229, 255, 0.95), rgba(57, 255, 20, 0.9), rgba(255, 43, 214, 0.95), rgba(255, 230, 0, 0.9));
+      background-size: 250% 250%;
+      animation: borderShift 7s linear infinite;
+      opacity: 0.35;
+      pointer-events: none;
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+    }
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      opacity: 0;
+    }
+    .top::after, .panel::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 36%);
+      opacity: 0.35;
     }
     .top {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
-      background: var(--panel);
-      border: 1px solid var(--line);
       border-radius: 16px;
       padding: 14px 18px;
-      backdrop-filter: blur(8px);
     }
     .title {
       display: flex;
       flex-direction: column;
       gap: 3px;
+      position: relative;
+      z-index: 2;
     }
     .title h1 {
       margin: 0;
       font-size: 24px;
-      letter-spacing: 0.2px;
-      font-weight: 650;
+      letter-spacing: 0.5px;
+      font-weight: 700;
+      color: #f5fbff;
+      text-shadow: 0 0 14px rgba(0, 229, 255, 0.45), 0 0 28px rgba(57, 255, 20, 0.24);
     }
     .subtitle {
       color: var(--muted);
       font-size: 13px;
+      text-shadow: 0 0 9px rgba(0, 229, 255, 0.14);
     }
     .status {
       display: inline-flex;
       align-items: center;
       gap: 9px;
       font-size: 13px;
-      border: 1px solid var(--line);
+      border: 1px solid rgba(0, 229, 255, 0.33);
       padding: 8px 12px;
       border-radius: 999px;
-      background: rgba(2, 6, 23, 0.35);
+      background: rgba(2, 6, 23, 0.50);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.18), 0 0 16px rgba(0, 229, 255, 0.16);
+      position: relative;
+      z-index: 2;
+    }
+    .top-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      position: relative;
+      z-index: 2;
+    }
+    .display-fps-box {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: rgba(2, 6, 23, 0.50);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
+    }
+    .display-fps-label {
+      font-size: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: rgba(0, 229, 255, 0.55);
+    }
+    .display-fps-value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 16px;
+      color: #c8e8ff;
+      text-shadow: 0 0 5px rgba(100, 160, 255, 0.7), 0 0 14px rgba(60, 120, 255, 0.55), 0 0 28px rgba(40, 80, 255, 0.4);
+      line-height: 1;
+    }
+    .audio-toggle {
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      background: rgba(2, 6, 23, 0.50);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      line-height: 1;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      cursor: pointer;
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
+    }
+    .audio-toggle.on {
+      border-color: rgba(57, 255, 20, 0.50);
+      box-shadow: inset 0 0 14px rgba(57, 255, 20, 0.18), 0 0 14px rgba(57, 255, 20, 0.14);
+      color: #d9ffd0;
+    }
+    .audio-toggle:disabled {
+      opacity: 0.55;
+      cursor: default;
     }
     .dot {
       width: 10px;
       height: 10px;
       border-radius: 50%;
       background: var(--accentC);
-      box-shadow: 0 0 0 6px rgba(52, 211, 153, 0.15);
+      box-shadow: 0 0 0 7px rgba(57, 255, 20, 0.2), 0 0 14px rgba(57, 255, 20, 0.5);
+      animation: ledPulse 1.8s ease-in-out infinite;
     }
     .cards {
       display: grid;
-      grid-template-columns: repeat(6, minmax(140px, 1fr));
-      gap: 12px;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 10px;
     }
     .card {
-      background: var(--panel);
-      border: 1px solid var(--line);
+      grid-column: span 2;
       border-radius: 14px;
-      padding: 10px 12px;
-      min-height: 86px;
+      padding: 6px 9px;
+      min-height: 44px;
       display: flex;
       flex-direction: column;
-      justify-content: center;
-      gap: 6px;
+      justify-content: flex-start;
+      gap: 3px;
+      overflow: hidden;
     }
     .label {
-      color: var(--muted);
+      color: #a5bfde;
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.7px;
+      letter-spacing: 0.8px;
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.18);
+      position: relative;
+      z-index: 2;
     }
     .value {
       font-size: 28px;
       line-height: 1;
-      font-weight: 670;
-      letter-spacing: 0.2px;
+      font-weight: 700;
+      letter-spacing: 0.35px;
+      color: #f0fbff;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.28), 0 0 22px rgba(57, 255, 20, 0.16);
+      position: relative;
+      z-index: 2;
+    }
+    .card:not(.gauge-card) .value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      color: #c8e8ff;
+      font-weight: 400;
+      letter-spacing: normal;
+      font-variant-numeric: normal;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45),
+        0 0 48px rgba(30, 60, 220, 0.3);
+      filter:
+        drop-shadow(0 0 8px rgba(60, 130, 255, 0.5))
+        drop-shadow(0 0 18px rgba(40, 80, 255, 0.35));
     }
     .value-inline {
       display: inline-flex;
       align-items: center;
       gap: 10px;
     }
+    #mQ {
+      display: inline-grid;
+      grid-auto-flow: column;
+      grid-auto-columns: 0.62em;
+      align-items: center;
+      justify-content: start;
+      white-space: nowrap;
+      font-variant-ligatures: none;
+      font-kerning: none;
+      letter-spacing: 0 !important;
+      line-height: 1;
+    }
+    #mQ .qch {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 0.70em;
+      min-width: 0.70em;
+    }
+    .mini-metric-card .mini-inline {
+      display: grid;
+      grid-template-columns: minmax(0, 23fr) minmax(0, 37fr);
+      align-items: stretch;
+      column-gap: 8px;
+      min-height: 18px;
+    }
+    .mini-metric-card .mini-inline .value {
+      justify-self: start;
+      min-width: 0;
+      white-space: nowrap;
+      font-size: 21px;
+    }
+    .mini-metric-card .mini-canvas {
+      width: 100%;
+      max-width: 100%;
+      height: 104px;
+      border-radius: 8px;
+      border: none;
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.30)),
+        repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.035) 0px, rgba(120, 150, 210, 0.035) 1px, transparent 1px, transparent 4px);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.10), 0 0 12px rgba(0, 229, 255, 0.09);
+      position: relative;
+      z-index: 2;
+      flex: 0 0 auto;
+      justify-self: end;
+    }
     .metric-led {
       width: 10px;
       height: 10px;
       border-radius: 50%;
-      background: #ef4444;
-      box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.20);
+      background: var(--neonRed);
+      box-shadow: 0 0 0 4px rgba(255, 42, 85, 0.24), 0 0 12px rgba(255, 42, 85, 0.58);
       flex: 0 0 auto;
+      animation: ledPulse 1.4s ease-in-out infinite;
     }
     .gauge-card {
-      grid-column: span 1;
+      grid-column: span 2;
       grid-row: span 2;
-      min-height: 188px;
-      padding: 12px;
-      justify-content: flex-start;
-      gap: 8px;
+      min-height: 200px;
+    }
+    .card-narrow {
+      grid-column: span 1;
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
+    }
+    .card-half {
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
+    }
+    .card-half.mini-metric-card .mini-inline {
+      min-height: 0;
+      flex: 1;
+    }
+    .card-half.mini-metric-card .mini-canvas {
+      height: 36px;
+      min-height: 36px;
+      flex: 1;
+      border-radius: 4px;
+    }
+    .gauge-card canvas {
+      border: none;
+      background: transparent;
+      box-shadow: none;
     }
     .gauge-head {
       display: flex;
       justify-content: space-between;
       align-items: baseline;
       gap: 8px;
+      padding: 0 4px;
     }
     .gauge-readout {
-      display: inline-flex;
-      align-items: baseline;
-      gap: 6px;
-      font-size: 30px;
-      line-height: 1;
-      font-weight: 700;
-      letter-spacing: 0.3px;
-      color: #d8f5ff;
-      text-shadow: 0 0 14px rgba(34, 211, 238, 0.22);
+      display: none;
     }
-    .gauge-readout small {
-      color: var(--muted);
-      font-size: 14px;
-      font-weight: 560;
-      letter-spacing: 0.3px;
-      text-transform: uppercase;
-    }
-    .gauge-canvas {
-      width: 100%;
-      height: 158px;
-      border-radius: 12px;
-      background: radial-gradient(circle at 50% 56%, rgba(2, 6, 23, 0.20) 0%, rgba(2, 6, 23, 0.52) 68%, rgba(2, 6, 23, 0.80) 100%);
-    }
+    .gauge-canvas-wrap,
     .gauge-foot {
-      display: flex;
-      justify-content: space-between;
-      color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.3px;
-      text-transform: uppercase;
+      display: none;
     }
     .charts {
       display: grid;
@@ -425,27 +752,33 @@ def _render_dashboard_html() -> str:
       gap: 14px;
     }
     .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
       border-radius: 14px;
       padding: 12px;
-      min-height: 280px;
+      min-height: 224px;
       display: grid;
       grid-template-rows: auto auto 1fr;
       gap: 8px;
+      overflow: hidden;
     }
     .panel h2 {
       margin: 0;
       font-size: 16px;
-      font-weight: 620;
-      letter-spacing: 0.2px;
+      font-weight: 640;
+      letter-spacing: 0.35px;
+      color: #effbff;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.28), 0 0 22px rgba(255, 43, 214, 0.18);
+      position: relative;
+      z-index: 2;
     }
     .legend {
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
-      color: var(--muted);
+      color: #adc4df;
       font-size: 12px;
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.14);
+      position: relative;
+      z-index: 2;
     }
     .legend .sw {
       width: 10px;
@@ -455,67 +788,124 @@ def _render_dashboard_html() -> str:
       margin-right: 6px;
       position: relative;
       top: 1px;
+      box-shadow: 0 0 10px currentColor;
     }
     canvas {
+      display: block;
       width: 100%;
       height: 210px;
       border-radius: 10px;
-      background: rgba(2, 6, 23, 0.30);
+      border: 1px solid rgba(0, 229, 255, 0.26);
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.28), rgba(2, 6, 23, 0.36)),
+        repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.04) 0px, rgba(120, 150, 210, 0.04) 1px, transparent 1px, transparent 5px);
+      box-shadow: inset 0 0 28px rgba(0, 229, 255, 0.10), 0 0 20px rgba(0, 229, 255, 0.12);
+      position: relative;
+      z-index: 2;
+    }
+    /* Low-GPU mode: disable continuous compositing-heavy effects. */
+    body::before,
+    body::after,
+    .top::before,
+    .card::before,
+    .panel::before,
+    .dot,
+    .metric-led {
+      animation: none !important;
+    }
+    .top, .card, .panel {
+      backdrop-filter: none;
+    }
+    body::after {
+      mix-blend-mode: normal;
+      opacity: 0.10;
     }
     @media (max-width: 1300px) {
-      .cards { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
-      .gauge-card { grid-column: span 1; grid-row: span 2; min-height: 188px; }
+      .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+      .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
     }
     @media (max-width: 950px) {
-      .cards { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
+      .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
 </head>
 <body>
   <main>
-    <section class="top">
-      <div class="title">
-        <h1>Tempest AI Dashboard</h1>
-        <div class="subtitle">Primary training and runtime telemetry (live)</div>
-      </div>
-      <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
-    </section>
-
     <section class="cards">
-      <article class="card gauge-card">
+      <article class="card gauge-card" style="--card-border:rgba(255,60,60,0.66);--card-glow:rgba(255,40,40,0.26)">
         <div class="gauge-head">
-          <div class="label">FPS SPD</div>
-          <div class="gauge-readout"><span id="mFps">0.0</span><small>fps</small></div>
+          <div class="label">FRAMES PER SECOND</div>
         </div>
-        <canvas id="cFpsGauge" class="gauge-canvas"></canvas>
-        <div class="gauge-foot"><span>RL 1K</span><span>MX 1.2K</span></div>
+        <canvas id="cFpsGauge"></canvas>
       </article>
-      <article class="card gauge-card">
+      <article class="card gauge-card" style="--card-border:rgba(255,220,40,0.66);--card-glow:rgba(255,200,20,0.26)">
         <div class="gauge-head">
-          <div class="label">STEP SPD</div>
-          <div class="gauge-readout"><span id="mSteps">0.0</span><small>s/s</small></div>
+          <div class="label">STEPS PER SECOND</div>
         </div>
-        <canvas id="cStepGauge" class="gauge-canvas"></canvas>
-        <div class="gauge-foot"><span>R10 Y20</span><span>G30</span></div>
+        <canvas id="cStepGauge"></canvas>
       </article>
-      <article class="card"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
-      <article class="card"><div class="label">Clients</div><div class="value" id="mClients">0</div></article>
-      <article class="card"><div class="label">Avg Level</div><div class="value" id="mLevel">0.0</div></article>
-      <article class="card">
-        <div class="label">Avg Inf</div>
+      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.66);--card-glow:rgba(255,120,20,0.26)">
+        <div class="label">DQN REWARD 1M</div>
+        <div class="mini-inline">
+          <div class="value" id="mDqnRwrd">0</div>
+          <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
+        <div class="label">AVG REWARD 1M</div>
+        <div class="mini-inline">
+          <div class="value" id="mRwrd">0</div>
+          <canvas id="cRewardMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
+        <div class="label">Avg Level</div>
+        <div class="mini-inline">
+          <div class="value" id="mLevel">0.0</div>
+          <canvas id="cLevelMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(255,160,80,0.66);--card-glow:rgba(255,140,60,0.26)">
+        <div class="label">EPISODE LENGTH</div>
+        <div class="mini-inline">
+          <div class="value" id="mEpLen">0</div>
+          <canvas id="cEpLenMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(180,80,255,0.66);--card-glow:rgba(160,50,255,0.26)">
+        <div class="label">Loss</div>
+        <div class="mini-inline">
+          <div class="value" id="mLoss">0</div>
+          <canvas id="cLossMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,60,180,0.66);--card-glow:rgba(255,40,160,0.26)">
+        <div class="label">Grad Norm</div>
+        <div class="mini-inline">
+          <div class="value" id="mGrad">0</div>
+          <canvas id="cGradMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
+        <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
       </article>
-      <article class="card"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
-      <article class="card"><div class="label">Expert Ratio</div><div class="value" id="mXprt">0%</div></article>
-      <article class="card"><div class="label">Avg Reward</div><div class="value" id="mRwrd">0</div></article>
-      <article class="card"><div class="label">Loss</div><div class="value" id="mLoss">0</div></article>
-      <article class="card"><div class="label">Grad Norm</div><div class="value" id="mGrad">0</div></article>
-      <article class="card"><div class="label">Buffer</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card"><div class="label">LR</div><div class="value" id="mLr">-</div></article>
-      <article class="card"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card" style="--card-border:rgba(220,180,255,0.66);--card-glow:rgba(200,150,255,0.26)">
+        <div class="label">REPLAYS PER FRAME</div>
+        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
+      </article>
+      <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
+      <article class="card" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
+      <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card card-half" style="--card-border:rgba(0,220,200,0.66);--card-glow:rgba(0,200,180,0.26)"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
     </section>
 
     <section class="charts">
@@ -524,6 +914,8 @@ def _render_dashboard_html() -> str:
         <div class="legend">
           <span><span class="sw" style="background:#22c55e;"></span>FPS</span>
           <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>Avg Lvl (100K)</span>
+          <span><span class="sw" style="background:#e879f9;"></span>Ep Len (100K)</span>
         </div>
         <canvas id="cThroughput"></canvas>
       </article>
@@ -560,48 +952,147 @@ def _render_dashboard_html() -> str:
         <canvas id="cDqn"></canvas>
       </article>
 
-      <article class="panel">
-        <h2>Level Rolling</h2>
-        <div class="legend">
-          <span><span class="sw" style="background:#22c55e;"></span>Level25K</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>Level1M</span>
-          <span><span class="sw" style="background:#22d3ee;"></span>Level5M</span>
-        </div>
-        <canvas id="cLevel1M"></canvas>
-      </article>
+    </section>
+    <section class="top">
+      <div class="title">
+        <h1>Tempest AI Dashboard</h1>
+        <div class="subtitle">Primary training and runtime telemetry (live)</div>
+      </div>
+      <div class="top-right">
+        <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
+        <div class="display-fps-box"><span class="display-fps-label">Display FPS</span><span class="display-fps-value" id="displayFps">0</span></div>
+        <button id="audioToggle" class="audio-toggle" type="button">Audio Off</button>
+      </div>
     </section>
   </main>
+  <audio id="bgAudio" preload="auto" autoplay></audio>
 
   <script>
     const num = new Intl.NumberFormat("en-US");
-    const maxPoints = 900;
+    const DASH_MAX_FPS = 30;
+    const DASH_DEFAULT_FPS = 2;
+    const DASH_REFRESH_FPS = (() => {
+      try {
+        const raw = new URLSearchParams(window.location.search).get("fps");
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed <= 0) return DASH_DEFAULT_FPS;
+        return Math.min(DASH_MAX_FPS, parsed);
+      } catch (_) {
+        return DASH_DEFAULT_FPS;
+      }
+    })();
+    const DASH_REFRESH_MS = Math.max(1, Math.round(1000 / DASH_REFRESH_FPS));
+    const HISTORY_WINDOW_MINUTES = 65;
+    const MAX_HISTORY_POINTS = Math.max(
+      900,
+      Math.round((HISTORY_WINDOW_MINUTES * 60 * 1000) / DASH_REFRESH_MS)
+    );
+    const MAX_CHART_POINTS = 1400;
     const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
-    const GAUGE_MAX_FPS = 1200;
-    const GAUGE_REDLINE_FPS = 1000;
+    const GAUGE_MAX_FPS = 5000;
+    const GAUGE_FPS_RED_MAX = 1000;
+    const GAUGE_FPS_YELLOW_MAX = 1500;
     const GAUGE_MIN_STEPS = 0;
-    const GAUGE_MAX_STEPS = 30;
+    const GAUGE_MAX_STEPS = 50;
+    const AUDIO_PREF_COOKIE = "tempest_dashboard_audio_enabled";
+    const AUDIO_START_RETRY_MS = 800;
+
+    /* ── Display FPS counter ──────────────────────────────────────────── */
+    let _dispFpsFrames = 0;
+    let _dispFpsLast = performance.now();
+    const _dispFpsEl = document.getElementById("displayFps");
+    function _tickDisplayFps() {
+      _dispFpsFrames++;
+      const now = performance.now();
+      const elapsed = now - _dispFpsLast;
+      if (elapsed >= 1000) {
+        const fps = Math.round((_dispFpsFrames * 1000) / elapsed);
+        _dispFpsEl.textContent = fps;
+        _dispFpsFrames = 0;
+        _dispFpsLast = now;
+      }
+    }
+    const CHART_VALUE_SMOOTH_ALPHA = 0.22;
+    const MINI_CHART_VALUE_SMOOTH_ALPHA = 0.28;
     let failedPings = 0;
+    const CLIENT_ID = (() => {
+      try {
+        if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+      } catch (_) {}
+      return `c_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    })();
+    const bgAudio = document.getElementById("bgAudio");
+    const audioToggle = document.getElementById("audioToggle");
+    let audioPlaylist = [];
+    let audioIndex = 0;
+    let audioEnabled = false;
+    let audioRetryTimer = null;
 
     const cards = {
       frame: document.getElementById("mFrame"),
       fps: document.getElementById("mFps"),
       steps: document.getElementById("mSteps"),
       clients: document.getElementById("mClients"),
+      web: document.getElementById("mWeb"),
       level: document.getElementById("mLevel"),
       inf: document.getElementById("mInf"),
       infLed: document.getElementById("mInfLed"),
+      rplf: document.getElementById("mRplF"),
+      rplLed: document.getElementById("mRplLed"),
       eps: document.getElementById("mEps"),
       xprt: document.getElementById("mXprt"),
       rwrd: document.getElementById("mRwrd"),
+      dqnRwrd: document.getElementById("mDqnRwrd"),
       loss: document.getElementById("mLoss"),
       grad: document.getElementById("mGrad"),
       buf: document.getElementById("mBuf"),
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
+      epLen: document.getElementById("mEpLen"),
     };
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
+
+    // ── Gauge needle damping ────────────────────────────────────────
+    // Time-constant in seconds: the needle closes ~63% of the gap
+    // in this many seconds.  Lower = snappier, higher = smoother.
+    const GAUGE_DAMPING_TAU = 0.35;
+    const gaugeState = {
+      fps:  { current: 0, target: 0 },
+      step: { current: 0, target: 0 },
+    };
+    let latestRow = null;
+    let lastGaugeFrameTs = 0;
+
+    function gaugeAnimationLoop(ts) {
+      if (!lastGaugeFrameTs) lastGaugeFrameTs = ts;
+      const dtSec = Math.min((ts - lastGaugeFrameTs) / 1000, 0.25); // cap to avoid jump after tab-hide
+      lastGaugeFrameTs = ts;
+
+      // Exponential ease: factor = 1 - e^(-dt/tau)
+      const alpha = 1.0 - Math.exp(-dtSec / GAUGE_DAMPING_TAU);
+
+      let needsRedraw = false;
+      for (const g of Object.values(gaugeState)) {
+        const diff = g.target - g.current;
+        if (Math.abs(diff) > 0.05) {
+          g.current += diff * alpha;
+          needsRedraw = true;
+        } else if (g.current !== g.target) {
+          g.current = g.target;
+          needsRedraw = true;
+        }
+      }
+
+      if (needsRedraw) {
+        drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
+        drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+      }
+
+      requestAnimationFrame(gaugeAnimationLoop);
+    }
+    requestAnimationFrame(gaugeAnimationLoop);
 
     const charts = {
       throughput: {
@@ -610,12 +1101,26 @@ def _render_dashboard_html() -> str:
           {
             key: "fps",
             color: "#22c55e",
-            axis: { side: "left", min: 0, max: 1200, ticks: [0, 300, 600, 900, 1200] }
+            axis: { side: "left", min: 0 },
+            smooth_alpha: 0.14,
           },
           {
-            key: "steps_per_sec",
+            key: "steps_per_sec_chart",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] }
+            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] },
+            smooth_alpha: 0.10,
+          },
+          {
+            key: "level_100k",
+            color: "#22d3ee",
+            axis_ref: "steps_per_sec_chart",
+            smooth_alpha: 0.20,
+          },
+          {
+            key: "eplen_100k",
+            color: "#e879f9",
+            axis_ref: "fps",
+            smooth_alpha: 0.20,
           }
         ]
       },
@@ -627,6 +1132,9 @@ def _render_dashboard_html() -> str:
             color: "#22c55e",
             axis: {
               side: "left",
+              min: 0,
+              label_pad: 52,
+              round_max: 1000,
               group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
             }
           },
@@ -641,10 +1149,16 @@ def _render_dashboard_html() -> str:
           {
             key: "loss",
             color: "#22c55e",
-            axis: { side: "left", group_keys: ["loss", "grad_norm", "bc_loss"] },
+            axis: { side: "left", min: 0, group_keys: ["loss", "grad_norm"], max_floor: 1.5, tick_decimals: 1 },
+            smooth_alpha: 0.55,
           },
-          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss" },
-          { key: "bc_loss", color: "#22d3ee", axis_ref: "loss" }
+          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss", smooth_alpha: 0.55 },
+          {
+            key: "bc_loss",
+            color: "#22d3ee",
+            axis: { side: "right", min: 0, group_keys: ["bc_loss"], max_floor: 1.5, tick_decimals: 1 },
+            smooth_alpha: 0.55,
+          }
         ]
       },
       dqn: {
@@ -656,12 +1170,12 @@ def _render_dashboard_html() -> str:
           {
             key: "reward_dqn",
             color: "#22c55e",
-            axis: { side: "left", min: 0, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
+            axis: { side: "left", min: 0, label_pad: 52, round_max: 100, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
           }
         ]
       },
       level1m: {
-        canvas: document.getElementById("cLevel1M"),
+        canvas: document.getElementById("cLevelMini"),
         series: [
           {
             key: "level_25k",
@@ -670,6 +1184,38 @@ def _render_dashboard_html() -> str:
           },
           { key: "level_1m", color: "#f59e0b", axis_ref: "level_25k" },
           { key: "level_5m", color: "#22d3ee", axis_ref: "level_25k" }
+        ]
+      },
+      rewardMini: {
+        canvas: document.getElementById("cRewardMini"),
+        series: [
+          { key: "total_5m", color: "#3b82f6" },
+          { key: "total_1m", color: "#22c55e" }
+        ]
+      },
+      dqnRewardMini: {
+        canvas: document.getElementById("cDqnRewardMini"),
+        series: [
+          { key: "dqn_5m", color: "#3b82f6" },
+          { key: "dqn_1m", color: "#f59e0b" }
+        ]
+      },
+      lossMini: {
+        canvas: document.getElementById("cLossMini"),
+        series: [
+          { key: "loss", color: "#22c55e", axis: { min: 0 } }
+        ]
+      },
+      gradMini: {
+        canvas: document.getElementById("cGradMini"),
+        series: [
+          { key: "grad_norm", color: "#f59e0b", axis: { min: 0 } }
+        ]
+      },
+      epLenMini: {
+        canvas: document.getElementById("cEpLenMini"),
+        series: [
+          { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
         ]
       }
     };
@@ -684,21 +1230,180 @@ def _render_dashboard_html() -> str:
       return Number(v).toFixed(d);
     }
 
+    function fmtSignedFloat(v, d = 2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "+0";
+      const n = Number(v);
+      const mag = Math.abs(n).toFixed(d);
+      return (n < 0 ? "-" : "+") + mag;
+    }
+
+    function toFixedCharCells(text) {
+      const s = String(text ?? "");
+      return Array.from(s).map((ch) => {
+        const html = (ch === " ") ? "&nbsp;" : ch
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+        return `<span class="qch">${html}</span>`;
+      }).join("");
+    }
+
+    function downsampleHistory(rows, targetPoints) {
+      if (!Array.isArray(rows)) return [];
+      const n = rows.length;
+      const limit = Math.max(2, Number(targetPoints) || 0);
+      if (n <= limit) return rows;
+      // End-anchored sampling keeps newest (right-side) points stable as new
+      // samples arrive, reducing visible squirm near "now".
+      const outRev = [];
+      const step = (n - 1) / (limit - 1);
+      for (let i = 0; i < limit; i++) {
+        const fromEnd = Math.floor(i * step);
+        outRev.push(rows[n - 1 - fromEnd]);
+      }
+      outRev[0] = rows[n - 1];
+      outRev[limit - 1] = rows[0];
+      return outRev.reverse();
+    }
+
+    function sliceHistoryLookback(rows, lookbackSec) {
+      if (!Array.isArray(rows) || !rows.length) return [];
+      const lb = Number(lookbackSec);
+      if (!Number.isFinite(lb) || lb <= 0) return rows.slice();
+      const newestTs = Number(rows[rows.length - 1] && rows[rows.length - 1].ts);
+      if (!Number.isFinite(newestTs)) return rows.slice();
+      const cutoff = newestTs - lb;
+      let start = 0;
+      while (start < rows.length) {
+        const ts = Number(rows[start] && rows[start].ts);
+        if (!Number.isFinite(ts) || ts >= cutoff) break;
+        start += 1;
+      }
+      return rows.slice(start);
+    }
+
     function fmtPct(v) {
       if (v === null || v === undefined || Number.isNaN(v)) return "0%";
       return `${(Number(v) * 100.0).toFixed(1)}%`;
+    }
+
+    function setAudioToggle(enabled, hasTracks = true) {
+      if (!audioToggle) return;
+      audioToggle.textContent = hasTracks ? (enabled ? "Audio On" : "Audio Off") : "No Audio";
+      audioToggle.classList.toggle("on", !!enabled && !!hasTracks);
+      audioToggle.disabled = !hasTracks;
+    }
+
+    function clearAudioRetryTimer() {
+      if (audioRetryTimer) {
+        clearTimeout(audioRetryTimer);
+        audioRetryTimer = null;
+      }
+    }
+
+    function scheduleAudioRetry() {
+      clearAudioRetryTimer();
+      if (!audioEnabled || !audioPlaylist.length) return;
+      audioRetryTimer = setTimeout(() => {
+        audioRetryTimer = null;
+        ensureAudioPlaying();
+      }, AUDIO_START_RETRY_MS);
+    }
+
+    function getCookieValue(name) {
+      const key = `${name}=`;
+      const parts = String(document.cookie || "").split(";");
+      for (const raw of parts) {
+        const part = raw.trim();
+        if (part.startsWith(key)) {
+          return decodeURIComponent(part.slice(key.length));
+        }
+      }
+      return null;
+    }
+
+    function setCookieValue(name, value) {
+      // Keep preference for ~1 year and scope to dashboard path.
+      document.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=31536000; Path=/; SameSite=Lax`;
+    }
+
+    function stopAudio() {
+      clearAudioRetryTimer();
+      if (!bgAudio) return;
+      bgAudio.pause();
+      bgAudio.removeAttribute("src");
+      try { bgAudio.load(); } catch (_) {}
+    }
+
+    function playAudioAt(index) {
+      if (!bgAudio || !audioPlaylist.length) return;
+      const n = audioPlaylist.length;
+      audioIndex = ((index % n) + n) % n;
+      bgAudio.src = audioPlaylist[audioIndex].url;
+      try { bgAudio.load(); } catch (_) {}
+      const p = bgAudio.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          clearAudioRetryTimer();
+        }).catch(() => {
+          scheduleAudioRetry();
+        });
+      }
+    }
+
+    function ensureAudioPlaying() {
+      if (!audioEnabled || !audioPlaylist.length) return;
+      if (!bgAudio || !bgAudio.src) {
+        playAudioAt(audioIndex);
+        return;
+      }
+      const p = bgAudio.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          clearAudioRetryTimer();
+        }).catch(() => {
+          scheduleAudioRetry();
+        });
+      }
+    }
+
+    function setAudioEnabled(next) {
+      audioEnabled = !!next;
+      setCookieValue(AUDIO_PREF_COOKIE, audioEnabled ? "1" : "0");
+      setAudioToggle(audioEnabled, audioPlaylist.length > 0);
+      if (audioEnabled) ensureAudioPlaying();
+      else stopAudio();
+    }
+
+    async function loadAudioPlaylist() {
+      try {
+        const res = await fetch(`/api/audio_playlist?t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("playlist");
+        const payload = await res.json();
+        const tracks = Array.isArray(payload && payload.tracks) ? payload.tracks : [];
+        audioPlaylist = tracks
+          .map((t) => ({ name: String(t.name || ""), url: String(t.url || "") }))
+          .filter((t) => t.url.length > 0);
+      } catch (_) {
+        audioPlaylist = [];
+      }
+      if (audioIndex >= audioPlaylist.length) audioIndex = 0;
+      setAudioToggle(audioEnabled, audioPlaylist.length > 0);
+      if (audioEnabled) ensureAudioPlaying();
     }
 
     function setConnected(connected) {
       const dot = document.getElementById("statusDot");
       const text = document.getElementById("statusText");
       if (connected) {
-        dot.style.background = "#34d399";
-        dot.style.boxShadow = "0 0 0 6px rgba(52,211,153,0.15)";
+        dot.style.background = "#39ff14";
+        dot.style.boxShadow = "0 0 0 7px rgba(57,255,20,0.22), 0 0 16px rgba(57,255,20,0.55)";
         text.textContent = "Connected";
       } else {
-        dot.style.background = "#f43f5e";
-        dot.style.boxShadow = "0 0 0 6px rgba(244,63,94,0.18)";
+        dot.style.background = "#ff2a55";
+        dot.style.boxShadow = "0 0 0 7px rgba(255,42,85,0.24), 0 0 16px rgba(255,42,85,0.55)";
         text.textContent = "Disconnected";
       }
     }
@@ -707,24 +1412,62 @@ def _render_dashboard_html() -> str:
       if (!cards.infLed) return;
       const ms = Number(avgInfMs);
       if (!Number.isFinite(ms) || ms < 5.0) {
-        cards.infLed.style.background = "#22c55e";
-        cards.infLed.style.boxShadow = "0 0 0 4px rgba(34, 197, 94, 0.22)";
+        cards.infLed.style.background = "#39ff14";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(57,255,20,0.22), 0 0 12px rgba(57,255,20,0.6)";
         return;
       }
       if (ms < 10.0) {
-        cards.infLed.style.background = "#f59e0b";
-        cards.infLed.style.boxShadow = "0 0 0 4px rgba(245, 158, 11, 0.22)";
+        cards.infLed.style.background = "#ffe600";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
         return;
       }
-      cards.infLed.style.background = "#ef4444";
-      cards.infLed.style.boxShadow = "0 0 0 4px rgba(239, 68, 68, 0.22)";
+      cards.infLed.style.background = "#ff2a55";
+      cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
     }
 
-    function drawFpsGauge(canvas, fps) {
+    function setRplLed(rplPerFrame) {
+      if (!cards.rplLed) return;
+      const v = Number(rplPerFrame);
+      if (!Number.isFinite(v)) {
+        cards.rplLed.style.background = "#94a3b8";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(148,163,184,0.18), 0 0 12px rgba(148,163,184,0.35)";
+        return;
+      }
+      if (v > 8.0 || v < 0.25) {
+        cards.rplLed.style.background = "#ff2a55";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
+        return;
+      }
+      if (v >= 4.0) {
+        cards.rplLed.style.background = "#f59e0b";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(245,158,11,0.24), 0 0 12px rgba(245,158,11,0.58)";
+        return;
+      }
+      if (v >= 1.0) {
+        cards.rplLed.style.background = "#39ff14";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(57,255,20,0.22), 0 0 12px rgba(57,255,20,0.6)";
+        return;
+      }
+      cards.rplLed.style.background = "#ffe600";
+      cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
+    }
+
+    function roundRectPath(ctx, x, y, w, h, r) {
+      const rr = Math.max(0, Math.min(r, Math.min(w, h) * 0.5));
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rr);
+      ctx.arcTo(x + w, y + h, x, y + h, rr);
+      ctx.arcTo(x, y + h, x, y, rr);
+      ctx.arcTo(x, y, x + w, y, rr);
+      ctx.closePath();
+    }
+
+    function drawStyledGauge(canvas, valueRaw, cfg) {
       if (!canvas) return;
 
-      const width = canvas.clientWidth || 360;
-      const height = canvas.clientHeight || 160;
+      const width  = canvas.clientWidth  || 360;
+      const height = canvas.clientHeight || 210;
       const dpr = window.devicePixelRatio || 1;
       canvas.width = Math.floor(width * dpr);
       canvas.height = Math.floor(height * dpr);
@@ -733,193 +1476,434 @@ def _render_dashboard_html() -> str:
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
-      const cx = width * 0.5;
-      const cy = height * 0.68;
-      const radius = Math.max(44, Math.min(width * 0.30, height * 0.56));
+      const minV = Number(cfg.min);
+      const maxV = Number(cfg.max);
+      const spanV = Math.max(1e-9, maxV - minV);
+      const clampVal = (v) => Math.max(minV, Math.min(maxV, Number(v) || 0));
+      const value = clampVal(valueRaw);
 
-      // Sweep 240° from lower-left to lower-right across the top.
-      const startDeg = 150;
-      const spanDeg = 240;
+      const pad = 2;
+      const outerExtent = 1.08;   // tight fit — faint glow may clip, bezel stays
+      const downExtent  = 1.00;   // badge hangs below center — room for LED box
+      // Size the radius so the dial fits snugly inside the canvas
+      const maxRByWidth  = (width  - 2 * pad) / (2.0 * outerExtent);
+      const maxRByHeight = (height - 2 * pad) / (outerExtent + downExtent);
+      const radius = Math.max(20, Math.min(maxRByWidth, maxRByHeight) * 1.08);
+      // Center the full envelope (bezel-top to badge-bottom) in the canvas
+      const cx = width  * 0.5;
+      const cy = (height * 0.5) + ((outerExtent - downExtent) * radius * 0.5);
+
       const degToRad = (d) => (d * Math.PI) / 180.0;
-      const clampFps = (v) => Math.max(GAUGE_MIN_FPS, Math.min(GAUGE_MAX_FPS, Number(v) || 0));
+      const startDeg = 135;
+      const spanDeg = 270;
+      const startRad = degToRad(startDeg);
+      const endRad = degToRad(startDeg + spanDeg);
       const valToAngle = (v) => {
-        const t = (clampFps(v) - GAUGE_MIN_FPS) / (GAUGE_MAX_FPS - GAUGE_MIN_FPS);
-        return degToRad(startDeg + spanDeg * t);
+        const t = (clampVal(v) - minV) / spanV;
+        return startRad + (t * (endRad - startRad));
       };
 
-      const trackW = Math.max(9, radius * 0.11);
-      ctx.lineCap = "round";
-
-      // Main arc track
-      ctx.strokeStyle = "rgba(148, 163, 184, 0.58)";
-      ctx.lineWidth = trackW;
+      // Outer glow + bezel (metallic ring style). [TEMPORARILY HIDDEN]
+      /*
+      const glow = ctx.createRadialGradient(cx, cy, radius * 0.9, cx, cy, radius * 1.22);
+      glow.addColorStop(0.0, "rgba(0, 0, 0, 0.00)");
+      glow.addColorStop(1.0, "rgba(0, 0, 0, 0.55)");
+      ctx.fillStyle = glow;
       ctx.beginPath();
-      ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(startDeg + spanDeg), false);
-      ctx.stroke();
+      ctx.arc(cx, cy, radius * 1.22, 0, Math.PI * 2);
+      ctx.fill();
 
-      // Redline arc
-      ctx.strokeStyle = "rgba(255, 59, 78, 0.92)";
-      ctx.lineWidth = trackW + 1.0;
+      ctx.lineWidth = Math.max(10, radius * 0.14);
+      const bezel = ctx.createLinearGradient(cx - radius, cy - radius, cx + radius, cy + radius);
+      bezel.addColorStop(0.0, "#8f979f");
+      bezel.addColorStop(0.20, "#31373d");
+      bezel.addColorStop(0.55, "#14181d");
+      bezel.addColorStop(0.80, "#6f7881");
+      bezel.addColorStop(1.0, "#d8dde1");
+      ctx.strokeStyle = bezel;
       ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(GAUGE_REDLINE_FPS), valToAngle(GAUGE_MAX_FPS), false);
+      ctx.arc(cx, cy, radius * 1.15, 0, Math.PI * 2);
       ctx.stroke();
+      */
 
-      // Tick marks (major every 200, minor every 100)
-      for (let v = GAUGE_MIN_FPS; v <= GAUGE_MAX_FPS; v += 100) {
-        const isMajor = (v % 200) === 0;
-        const a = valToAngle(v);
-        const cosA = Math.cos(a);
-        const sinA = Math.sin(a);
+      // Dial face.
+      const face = ctx.createRadialGradient(cx, cy - radius * 0.5, radius * 0.2, cx, cy, radius * 1.02);
+      face.addColorStop(0.0, "rgba(36, 40, 46, 0.0)");
+      face.addColorStop(0.55, "rgba(22, 25, 30, 0.0)");
+      face.addColorStop(1.0, "rgba(12, 14, 18, 0.0)");
+      ctx.fillStyle = face;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius * 1.02, 0, Math.PI * 2);
+      ctx.fill();
 
-        const outer = radius + trackW * 0.38;
-        const inner = outer - (isMajor ? trackW * 1.6 : trackW * 0.95);
-
-        ctx.strokeStyle = v >= GAUGE_REDLINE_FPS
-          ? "rgba(255, 76, 98, 0.96)"
-          : isMajor
-            ? "rgba(226, 232, 240, 0.95)"
-            : "rgba(148, 163, 184, 0.78)";
-        ctx.lineWidth = isMajor ? 3.0 : 1.8;
+      // Dial ring — colored by threshold zones (red → yellow → green).
+      const arcLW = Math.max(3.5, radius * 0.040);
+      const arcR  = radius * 0.92;
+      // Draw a smooth continuous gradient along the arc
+      const arcSegs = 120;
+      ctx.lineWidth = arcLW;
+      ctx.lineCap = "butt";
+      for (let s = 0; s < arcSegs; s++) {
+        const t0 = s / arcSegs;
+        const t1 = (s + 1) / arcSegs;
+        const tMid = (t0 + t1) * 0.5;
+        const vMid = minV + tMid * spanV;
+        // Interpolate color: red at red_max, yellow at yellow_max, green above
+        const redEnd = (cfg.red_max - minV) / spanV;
+        const yelEnd = (cfg.yellow_max - minV) / spanV;
+        let r, g, b;
+        if (tMid <= redEnd) {
+          // Pure red zone
+          r = 255; g = 58; b = 58;
+        } else if (tMid <= yelEnd) {
+          // Red → Yellow transition
+          const f = (tMid - redEnd) / Math.max(1e-9, yelEnd - redEnd);
+          r = 255; g = Math.round(58 + f * (176 - 58)); b = Math.round(58 - f * (58 - 44));
+        } else {
+          // Yellow → Green transition
+          const f = (tMid - yelEnd) / Math.max(1e-9, 1.0 - yelEnd);
+          r = Math.round(252 - f * (252 - 51)); g = Math.round(176 + f * (219 - 176)); b = Math.round(44 + f * (107 - 44));
+        }
+        const a0 = startRad + t0 * (endRad - startRad);
+        const a1 = startRad + t1 * (endRad - startRad);
+        ctx.strokeStyle = `rgba(${r},${g},${b},0.85)`;
         ctx.beginPath();
-        ctx.moveTo(cx + outer * cosA, cy + outer * sinA);
-        ctx.lineTo(cx + inner * cosA, cy + inner * sinA);
+        ctx.arc(cx, cy, arcR, a0, a1 + 0.005, false);
         ctx.stroke();
       }
 
-      // Needle
-      const needleAngle = valToAngle(fps);
-      const nCos = Math.cos(needleAngle);
-      const nSin = Math.sin(needleAngle);
-      const needleLen = radius * 0.98;
-
-      ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-      ctx.lineWidth = 7.5;
-      ctx.beginPath();
-      ctx.moveTo(cx + 3, cy + 3);
-      ctx.lineTo(cx + needleLen * nCos + 3, cy + needleLen * nSin + 3);
-      ctx.stroke();
-
-      ctx.strokeStyle = "#22d3ee";
-      ctx.lineWidth = 6.0;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + needleLen * nCos, cy + needleLen * nSin);
-      ctx.stroke();
-
-      // Hub
-      ctx.fillStyle = "rgba(2, 6, 23, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 14, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = "rgba(100, 116, 139, 0.82)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    function drawStepGauge(canvas, stepsPerSec) {
-      if (!canvas) return;
-
-      const width = canvas.clientWidth || 360;
-      const height = canvas.clientHeight || 160;
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(width * dpr);
-      canvas.height = Math.floor(height * dpr);
-
-      const ctx = canvas.getContext("2d");
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, width, height);
-
-      const cx = width * 0.5;
-      const cy = height * 0.68;
-      const radius = Math.max(44, Math.min(width * 0.30, height * 0.56));
-
-      const startDeg = 150;
-      const spanDeg = 240;
-      const degToRad = (d) => (d * Math.PI) / 180.0;
-      const clampSteps = (v) => Math.max(GAUGE_MIN_STEPS, Math.min(GAUGE_MAX_STEPS, Number(v) || 0));
-      const valToAngle = (v) => {
-        const t = (clampSteps(v) - GAUGE_MIN_STEPS) / (GAUGE_MAX_STEPS - GAUGE_MIN_STEPS);
-        return degToRad(startDeg + spanDeg * t);
-      };
-
-      const trackW = Math.max(9, radius * 0.11);
-      ctx.lineCap = "round";
-
-      // Zone arcs: red [0,10], yellow (10,20], green (20,30].
-      ctx.lineWidth = trackW + 1.0;
-      ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(0), valToAngle(10), false);
-      ctx.stroke();
-
-      ctx.strokeStyle = "rgba(245, 158, 11, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(10), valToAngle(20), false);
-      ctx.stroke();
-
-      ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, valToAngle(20), valToAngle(30), false);
-      ctx.stroke();
-
-      // Tick marks (major each 10, minor each 5)
-      for (let v = GAUGE_MIN_STEPS; v <= GAUGE_MAX_STEPS; v += 5) {
-        const isMajor = (v % 10) === 0;
-        const a = valToAngle(v);
+      // Scale ticks with threshold coloring.
+      const minorStep = Math.max(1e-9, Number(cfg.minor_step));
+      const majorStep = Math.max(minorStep, Number(cfg.major_step));
+      const majorEvery = Math.max(1, Math.round(majorStep / minorStep));
+      const tickOuter = radius * 0.89;
+      const tickMinorInner = radius * 0.825;
+      const tickMajorInner = radius * 0.775;
+      const labelRadius = radius * 0.66 - (cfg.label_inset || 0);
+      const tickCount = Math.max(1, Math.round((maxV - minV) / minorStep));
+      for (let i = 0; i <= tickCount; i++) {
+        const vv = (i >= tickCount) ? maxV : (minV + (i * minorStep));
+        const a = valToAngle(vv);
         const cosA = Math.cos(a);
         const sinA = Math.sin(a);
-
-        const outer = radius + trackW * 0.38;
-        const inner = outer - (isMajor ? trackW * 1.6 : trackW * 0.95);
-
-        let tickColor = "rgba(239, 68, 68, 0.95)";
-        if (v > 10 && v <= 20) tickColor = "rgba(245, 158, 11, 0.95)";
-        else if (v > 20) tickColor = "rgba(34, 197, 94, 0.95)";
-
-        ctx.strokeStyle = tickColor;
-        ctx.lineWidth = isMajor ? 3.0 : 1.8;
+        const isMajor = ((i % majorEvery) === 0) || i === tickCount;
+        // Skip major tick at end if it doesn't align with a clean major step
+        const isLastAndUnaligned = (i === tickCount) && (Math.abs(vv % majorStep) > 1e-6) && (Math.abs((vv % majorStep) - majorStep) > 1e-6);
+        const drawAsMajor = isMajor && !isLastAndUnaligned;
+        const inner = drawAsMajor ? tickMajorInner : tickMinorInner;
+        let c = "rgba(236, 241, 247, 0.90)";
+        if (drawAsMajor) {
+          if (vv <= cfg.red_max) c = "rgba(255, 58, 58, 0.95)";
+          else if (vv <= cfg.yellow_max) c = "rgba(252, 176, 44, 0.95)";
+          else c = "rgba(51, 219, 107, 0.95)";
+        }
+        ctx.strokeStyle = c;
+        ctx.lineWidth = drawAsMajor ? Math.max(3.0, radius * 0.03) : Math.max(0.9, radius * 0.008);
         ctx.beginPath();
-        ctx.moveTo(cx + outer * cosA, cy + outer * sinA);
-        ctx.lineTo(cx + inner * cosA, cy + inner * sinA);
+        ctx.moveTo(cx + (tickOuter * cosA), cy + (tickOuter * sinA));
+        ctx.lineTo(cx + (inner * cosA), cy + (inner * sinA));
         ctx.stroke();
+
+        // Value labels at major ticks (infinity symbol on last tick)
+        const labelEvery = cfg.label_every || 1;
+        const majorIdx = Math.round(i / majorEvery);  // which major tick is this (0, 1, 2...)
+        const showLabel = drawAsMajor && (i >= tickCount || (majorIdx % labelEvery) === 0);
+        if (showLabel) {
+          // Push bottom labels outward (closer to ticks) so they don't overlap the LED badge
+          const bottomFactor = Math.max(0, sinA);  // 0 at top, 1 at bottom
+          const inwardOffset = 8 - (bottomFactor * 16);  // 8px inward at top, -8px outward at bottom
+          // Additional radial offset for non-endpoint labels (push toward tick marks)
+          const radialExtra = (cfg.label_radial_offset && i > 0 && i < tickCount) ? cfg.label_radial_offset : 0;
+          let lx = cx + ((labelRadius - inwardOffset - radialExtra) * cosA);
+          let ly = cy + ((labelRadius - inwardOffset - radialExtra) * sinA);
+          // For non-endpoint labels, apply lateral inset toward center (FPS uses label_lateral)
+          const lateralPx = cfg.label_lateral || 0;
+          if (lateralPx && i > 0 && i < tickCount && Math.abs(cosA) > 0.25) {
+            // Shift label horizontally toward cx (skip near-top-center labels)
+            lx += (lx < cx) ? lateralPx : -lateralPx;
+          }
+          ctx.fillStyle = "rgba(230, 235, 242, 0.82)";
+          ctx.textBaseline = "middle";
+          // Outward-justify: left-align on left side, right-align on right side
+          const normA = ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+          if (Math.abs(cosA) < 0.15) ctx.textAlign = "center";
+          else if (normA > Math.PI * 0.5 && normA < Math.PI * 1.5) ctx.textAlign = "right";
+          else ctx.textAlign = "left";
+          if (i >= tickCount) {
+            ctx.font = `${Math.max(12, Math.round(radius * 0.196))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+            ctx.fillText("\u221E", lx, ly);
+          } else {
+            const labelFontScale = cfg.label_font_scale || 0.11;
+            ctx.font = `${Math.max(8, Math.round(radius * labelFontScale))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+            let labelStr;
+            if (vv >= 1000) {
+              labelStr = `${Math.round(vv / 1000)}K`;
+            } else {
+              labelStr = `${Math.round(vv)}`;
+            }
+            ctx.fillText(labelStr, lx, ly);
+          }
+        }
       }
 
-      // Needle
-      const needleAngle = valToAngle(stepsPerSec);
+      // Needle geometry for classic pointy orange pointer.
+      const needleAngle = valToAngle(value);
       const nCos = Math.cos(needleAngle);
       const nSin = Math.sin(needleAngle);
-      const needleLen = radius * 0.98;
+      const needleLen = radius * 0.84;
+      const tailLen = radius * 0.10;
+      const baseHalfW = Math.max(4.0, radius * 0.030);
+      const pTipX = cx + (needleLen * nCos);
+      const pTipY = cy + (needleLen * nSin);
+      const pTailX = cx - (tailLen * nCos);
+      const pTailY = cy - (tailLen * nSin);
+      const perpX = -nSin;
+      const perpY = nCos;
 
-      ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-      ctx.lineWidth = 7.5;
-      ctx.beginPath();
-      ctx.moveTo(cx + 3, cy + 3);
-      ctx.lineTo(cx + needleLen * nCos + 3, cy + needleLen * nSin + 3);
-      ctx.stroke();
+      const drawNeedle = () => {
+        // Drop shadow
+        ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
+        ctx.beginPath();
+        ctx.moveTo(pTipX + 2.5, pTipY + 2.5);
+        ctx.lineTo(pTailX + (perpX * baseHalfW) + 2.5, pTailY + (perpY * baseHalfW) + 2.5);
+        ctx.lineTo(pTailX - (perpX * baseHalfW) + 2.5, pTailY - (perpY * baseHalfW) + 2.5);
+        ctx.closePath();
+        ctx.fill();
 
-      ctx.strokeStyle = "#e2e8f0";
-      ctx.lineWidth = 6.0;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + needleLen * nCos, cy + needleLen * nSin);
-      ctx.stroke();
+        // Multi-layer yellow-orange bloom glow (like VFD but warm)
+        const glowLayers = [
+          { blur: 64, color: "rgba(255, 140, 10, 0.70)", fill: "rgba(255, 120, 10, 0.06)" },
+          { blur: 38, color: "rgba(255, 160, 20, 0.80)", fill: "rgba(255, 130, 10, 0.10)" },
+          { blur: 18, color: "rgba(255, 170, 40, 0.90)", fill: "rgba(255, 140, 20, 0.14)" },
+          { blur:  7, color: "rgba(255, 190, 60, 1.00)", fill: "rgba(255, 160, 30, 0.18)" },
+        ];
+        const needlePath = () => {
+          ctx.beginPath();
+          ctx.moveTo(pTipX, pTipY);
+          ctx.lineTo(pTailX + (perpX * baseHalfW), pTailY + (perpY * baseHalfW));
+          ctx.lineTo(pTailX - (perpX * baseHalfW), pTailY - (perpY * baseHalfW));
+          ctx.closePath();
+        };
+        ctx.save();
+        for (const gl of glowLayers) {
+          ctx.shadowColor = gl.color;
+          ctx.shadowBlur = gl.blur;
+          ctx.shadowOffsetX = 0;
+          ctx.shadowOffsetY = 0;
+          ctx.fillStyle = gl.fill;
+          needlePath();
+          ctx.fill();
+        }
+        ctx.restore();
 
-      // Hub
-      ctx.fillStyle = "rgba(2, 6, 23, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 14, 0, Math.PI * 2);
+        // Crisp needle fill
+        const needleGrad = ctx.createLinearGradient(pTailX, pTailY, pTipX, pTipY);
+        needleGrad.addColorStop(0.0, "#c85a00");
+        needleGrad.addColorStop(0.6, "#ff8a00");
+        needleGrad.addColorStop(1.0, "#ffc04d");
+        ctx.fillStyle = needleGrad;
+        needlePath();
+        ctx.fill();
+      };
+      const drawHub = () => {
+        const hubOuter = ctx.createRadialGradient(cx - 2, cy - 2, 2, cx, cy, radius * 0.16);
+        hubOuter.addColorStop(0.0, "rgba(167, 174, 180, 0.98)");
+        hubOuter.addColorStop(1.0, "rgba(38, 44, 51, 0.98)");
+        ctx.fillStyle = hubOuter;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.16, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = "rgba(8, 12, 17, 0.96)";
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.09, 0, Math.PI * 2);
+        ctx.fill();
+      };
+
+      // Center title (matching reference style).
+      ctx.fillStyle = "rgba(232, 236, 241, 0.85)";
+      ctx.font = `700 ${Math.max(13, Math.round(radius * 0.16))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(cfg.title || "", cx, cy - radius * 0.36);
+
+      // Bottom value badge.
+      const badgeW = radius * 0.86;
+      const badgeH = radius * 0.48;
+      const badgeX = cx - (badgeW * 0.5);
+      const badgeY = cy + radius * 0.44;
+
+      // Sub-text above the badge (e.g. total training steps) — VFD odometer display
+      if (cfg.sub_text) {
+        const subFont = `400 ${Math.max(12, Math.round(radius * 0.156))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+        ctx.font = subFont;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        // Fixed width: measure max-width template so box never resizes
+        const maxTemplate = "8,888,888,888";
+        const tmMax = ctx.measureText(maxTemplate);
+        const odoPad = radius * 0.12;
+        const odoW = tmMax.width + odoPad * 2;
+        const odoH = Math.max(16, Math.round(radius * 0.20));
+        const odoX = cx - odoW * 0.5;
+        const odoY = badgeY - odoH - 3;
+        const odoR = Math.max(3, radius * 0.035);
+        const subX = odoX + odoW - odoPad;  // right-justified with padding
+        // VFD housing background — color keyed to gauge type
+        ctx.save();
+        ctx.shadowBlur = 0;
+        const odoColor = cfg.sub_text_color || "amber";
+        roundRectPath(ctx, odoX, odoY, odoW, odoH, odoR);
+        ctx.fillStyle = "#130A2C";  // uniform dark VFD housing
+        ctx.fill();
+        // Subtle inset border matching text color
+        ctx.strokeStyle = odoColor === "orange"
+          ? "rgba(180, 100, 20, 0.35)"
+          : "rgba(60, 130, 255, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+        // Text centered in the VFD box
+        const subTextY = odoY + odoH * 0.5;
+        if (odoColor === "orange") {
+          // 5-layer bloom in orange — doubled intensity
+          ctx.fillStyle = "rgba(180, 80, 0, 0.50)";
+          ctx.shadowColor = "rgba(255, 100, 0, 0.60)";
+          ctx.shadowBlur = 48;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(220, 120, 10, 0.70)";
+          ctx.shadowColor = "rgba(255, 130, 10, 0.70)";
+          ctx.shadowBlur = 28;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(240, 160, 30, 0.80)";
+          ctx.shadowColor = "rgba(255, 160, 20, 0.80)";
+          ctx.shadowBlur = 14;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(255, 190, 60, 0.90)";
+          ctx.shadowColor = "rgba(255, 180, 40, 0.90)";
+          ctx.shadowBlur = 5;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          // Crisp orange text on top with residual glow
+          ctx.fillStyle = "#ffaa33";
+          ctx.shadowColor = "rgba(255, 140, 20, 0.60)";
+          ctx.shadowBlur = 10;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.shadowBlur = 0;
+        } else {
+          // 5-layer bloom in blue — strong glow visible against dark housing
+          ctx.fillStyle = "rgba(60, 120, 255, 0.50)";
+          ctx.shadowColor = "rgba(60, 130, 255, 0.80)";
+          ctx.shadowBlur = 52;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(80, 140, 255, 0.65)";
+          ctx.shadowColor = "rgba(80, 150, 255, 0.85)";
+          ctx.shadowBlur = 30;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(100, 160, 255, 0.75)";
+          ctx.shadowColor = "rgba(100, 170, 255, 0.90)";
+          ctx.shadowBlur = 16;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.fillStyle = "rgba(140, 190, 255, 0.85)";
+          ctx.shadowColor = "rgba(120, 180, 255, 0.95)";
+          ctx.shadowBlur = 6;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          // Crisp blue-white text on top with residual glow
+          ctx.fillStyle = "#c8e8ff";
+          ctx.shadowColor = "rgba(80, 160, 255, 0.70)";
+          ctx.shadowBlur = 12;
+          ctx.fillText(cfg.sub_text, subX, subTextY);
+          ctx.shadowBlur = 0;
+        }
+      }
+
+      const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
+      badgeFill.addColorStop(0.0, "rgba(24, 27, 33, 0.92)");
+      badgeFill.addColorStop(1.0, "rgba(12, 15, 20, 0.96)");
+      roundRectPath(ctx, badgeX, badgeY, badgeW, badgeH, Math.max(8, radius * 0.08));
+      ctx.fillStyle = badgeFill;
       ctx.fill();
 
-      ctx.fillStyle = "rgba(100, 116, 139, 0.82)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
-      ctx.fill();
+      const valueText = Number(value).toFixed(cfg.decimals ?? 1);
+      const ledX = cx;
+      const ledY = badgeY + (badgeH * 0.5);
+      const ledFont = `400 ${Math.max(16, Math.round(radius * 0.422))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      ctx.font = ledFont;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      // Multi-layer LED bloom (widest/faintest first)
+      ctx.fillStyle = "rgba(255, 20, 20, 0.45)";
+      ctx.shadowColor = "rgba(255, 30, 30, 0.80)";
+      ctx.shadowBlur = Math.max(48, radius * 0.55);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 30, 30, 0.55)";
+      ctx.shadowColor = "rgba(255, 40, 40, 0.85)";
+      ctx.shadowBlur = Math.max(28, radius * 0.35);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 40, 40, 0.65)";
+      ctx.shadowColor = "rgba(255, 50, 50, 0.90)";
+      ctx.shadowBlur = Math.max(14, radius * 0.18);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 50, 50, 0.80)";
+      ctx.shadowColor = "rgba(255, 60, 60, 0.95)";
+      ctx.shadowBlur = Math.max(5, radius * 0.08);
+      ctx.fillText(valueText, ledX, ledY);
+      // Bright LED text on top
+      ctx.fillStyle = "rgba(255, 52, 52, 0.98)";
+      ctx.shadowBlur = 0;
+      ctx.fillText(valueText, ledX, ledY);
+      drawNeedle();
+      drawHub();
     }
 
-    function drawChart(canvas, history, seriesDefs) {
-      const points = history.slice(-maxPoints);
+    function drawFpsGauge(canvas, fps, totalFrames) {
+      const framesText = totalFrames != null ? Number(totalFrames).toLocaleString() : null;
+      drawStyledGauge(canvas, fps, {
+        min: GAUGE_MIN_FPS,
+        max: GAUGE_MAX_FPS,
+        red_max: GAUGE_FPS_RED_MAX,
+        yellow_max: GAUGE_FPS_YELLOW_MAX,
+        minor_step: 250,
+        major_step: 500,
+        title: "FPS",
+        unit: "FPS",
+        decimals: 0,
+        label_inset: 4,
+        label_lateral: 8,
+        label_font_scale: 0.088,
+        label_every: 2,
+        label_radial_offset: -16,
+        sub_text: framesText,
+        sub_text_color: "blue",
+      });
+    }
+
+    function drawStepGauge(canvas, stepsPerSec, totalSteps) {
+      const stepsText = totalSteps != null ? Number(totalSteps).toLocaleString() : null;
+      drawStyledGauge(canvas, stepsPerSec, {
+        min: GAUGE_MIN_STEPS,
+        max: GAUGE_MAX_STEPS,
+        red_max: 10,
+        yellow_max: 20,
+        minor_step: 2.5,
+        major_step: 5,
+        title: "STEPS/s",
+        unit: "S/S",
+        decimals: 0,
+        label_font_scale: 0.088,
+        label_radial_offset: -4,
+        sub_text: stepsText,
+        sub_text_color: "orange",
+      });
+    }
+
+    function drawChart(canvas, history, seriesDefs, maxLookbackSec = (5 * 60), useLinearTime = false) {
+      const points = Array.isArray(history) ? history : [];
       const width = canvas.clientWidth || 320;
       const height = canvas.clientHeight || 210;
       const dpr = window.devicePixelRatio || 1;
@@ -934,20 +1918,29 @@ def _render_dashboard_html() -> str:
 
       const axisDefs = seriesDefs.filter((s) => !!s.axis);
       const axisSourceSeries = axisDefs.length ? axisDefs : seriesDefs;
-      const leftAxisCount = Math.max(1, axisSourceSeries.filter((s) => (s.axis?.side || "left") === "left").length);
-      const rightAxisCount = Math.max(0, axisSourceSeries.filter((s) => (s.axis?.side || "right") === "right").length);
-      const padL = 26 + (leftAxisCount * 34);
-      const padR = 26 + (Math.max(1, rightAxisCount) * 34);
-      const padT = 10, padB = 18;
+      const axisSlotDefault = 34;
+      const axisSlotFor = (s) => {
+        const v = Number(s?.axis?.label_pad);
+        return Number.isFinite(v) ? Math.max(20, v) : axisSlotDefault;
+      };
+      const leftAxisSeries = axisSourceSeries.filter((s) => (s.axis?.side || "left") === "left");
+      const rightAxisSeries = axisSourceSeries.filter((s) => (s.axis?.side || "right") === "right");
+      const leftAxisPad = leftAxisSeries.length
+        ? leftAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
+        : axisSlotDefault;
+      const rightAxisPad = rightAxisSeries.length
+        ? rightAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
+        : axisSlotDefault;
+      const padL = 26 + leftAxisPad;
+      const padR = 26 + rightAxisPad;
+      const padT = 10, padB = 30;
       const plotW = width - padL - padR;
       const plotH = height - padT - padB;
       if (plotW <= 20 || plotH <= 20) return;
 
-      // Time-compressed x-axis:
-      // right quarter = recent 1x window
-      // to half mark = 2x history
-      // next quarter = 4x history
-      // far left = 8x history
+      // Time-compressed x-axis with quarter anchors.
+      // Window spans min(20m, actual buffered time), so during first 20m
+      // nothing scrolls off the left edge.
       const tsVals = points
         .map((p) => Number(p.ts))
         .filter((v) => Number.isFinite(v));
@@ -955,21 +1948,112 @@ def _render_dashboard_html() -> str:
       const newestTs = hasTimeAxis ? Math.max(...tsVals) : 0.0;
       const oldestTs = hasTimeAxis ? Math.min(...tsVals) : 0.0;
       const maxAge = hasTimeAxis ? Math.max(1e-6, newestTs - oldestTs) : 0.0;
-      const baseAge = maxAge / 8.0;
+      const AXIS_HARD_MAX_LOOKBACK_S = Math.max(1, Number(maxLookbackSec) || (5 * 60));
+      const axisMaxLookbackSec = hasTimeAxis
+        ? Math.min(AXIS_HARD_MAX_LOOKBACK_S, maxAge)
+        : AXIS_HARD_MAX_LOOKBACK_S;
+      const anchorScale = axisMaxLookbackSec / AXIS_HARD_MAX_LOOKBACK_S;
+      const LOOKBACK_FRAC_ANCHORS = [0.0, 0.25, 0.50, 0.75, 1.0];
+      const LOOKBACK_AGE_ANCHORS = [
+        0.0,
+        10.0 * anchorScale,
+        60.0 * anchorScale,
+        600.0 * anchorScale,
+        axisMaxLookbackSec,
+      ];
+      // Shape-preserving monotone cubic interpolation (continuous slope)
+      // so compression changes smoothly instead of with visible segment kinks.
+      const makeMonotoneSpline = (xsRaw, ysRaw) => {
+        const n = Math.min(xsRaw.length, ysRaw.length);
+        if (n < 2) {
+          const y0 = Number(ysRaw?.[0]) || 0.0;
+          return () => y0;
+        }
+        const xs = xsRaw.slice(0, n).map((v) => Number(v));
+        const ys = ysRaw.slice(0, n).map((v) => Number(v));
+        const h = new Array(n - 1);
+        const d = new Array(n - 1);
+        for (let i = 0; i < n - 1; i++) {
+          const dx = Math.max(1e-9, xs[i + 1] - xs[i]);
+          h[i] = dx;
+          d[i] = (ys[i + 1] - ys[i]) / dx;
+        }
+        const m = new Array(n);
+        m[0] = d[0];
+        m[n - 1] = d[n - 2];
+        for (let i = 1; i < n - 1; i++) {
+          m[i] = 0.5 * (d[i - 1] + d[i]);
+        }
+        for (let i = 0; i < n - 1; i++) {
+          if (Math.abs(d[i]) <= 1e-12) {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+            continue;
+          }
+          const a = m[i] / d[i];
+          const b = m[i + 1] / d[i];
+          const s = (a * a) + (b * b);
+          if (s > 9.0) {
+            const t = 3.0 / Math.sqrt(s);
+            m[i] = t * a * d[i];
+            m[i + 1] = t * b * d[i];
+          }
+        }
+        return (xRaw) => {
+          const x = Math.max(xs[0], Math.min(xs[n - 1], Number(xRaw) || 0.0));
+          let k = n - 2;
+          for (let i = 0; i < n - 1; i++) {
+            if (x <= xs[i + 1]) {
+              k = i;
+              break;
+            }
+          }
+          const hk = h[k];
+          const t = (x - xs[k]) / hk;
+          const t2 = t * t;
+          const t3 = t2 * t;
+          const h00 = (2.0 * t3) - (3.0 * t2) + 1.0;
+          const h10 = t3 - (2.0 * t2) + t;
+          const h01 = (-2.0 * t3) + (3.0 * t2);
+          const h11 = t3 - t2;
+          return (h00 * ys[k]) + (h10 * hk * m[k]) + (h01 * ys[k + 1]) + (h11 * hk * m[k + 1]);
+        };
+      };
+      const ageFromLookbackFrac = makeMonotoneSpline(LOOKBACK_FRAC_ANCHORS, LOOKBACK_AGE_ANCHORS);
+      const lookbackFracFromAge = makeMonotoneSpline(LOOKBACK_AGE_ANCHORS, LOOKBACK_FRAC_ANCHORS);
 
       const xNormFromAge = (ageRaw) => {
-        if (!hasTimeAxis || baseAge <= 0) return 1.0;
-        const age = Math.max(0.0, Math.min(maxAge, ageRaw));
-        if (age <= baseAge) {
-          return 1.0 - ((age / baseAge) * 0.25);
+        if (!hasTimeAxis || maxAge <= 0) return 1.0;
+        const age = Math.max(0.0, Math.min(axisMaxLookbackSec, ageRaw));
+        const lookbackFrac = useLinearTime
+          ? (age / Math.max(1e-9, axisMaxLookbackSec))
+          : lookbackFracFromAge(age);
+        return 1.0 - lookbackFrac;
+      };
+
+      const ageFromXNorm = (xNormRaw) => {
+        const xn = Math.max(0.0, Math.min(1.0, xNormRaw));
+        const lookbackFrac = 1.0 - xn;
+        return useLinearTime
+          ? (lookbackFrac * axisMaxLookbackSec)
+          : ageFromLookbackFrac(lookbackFrac);
+      };
+
+      const formatLookback = (ageSecRaw) => {
+        const ageSec = Math.max(0.0, Number(ageSecRaw) || 0.0);
+        if (ageSec < 90.0) {
+          return `${Math.round(ageSec)}s`;
         }
-        if (age <= (2.0 * baseAge)) {
-          return 0.75 - (((age - baseAge) / baseAge) * 0.25);
+        const mins = ageSec / 60.0;
+        if (mins < 90.0) {
+          return `${Math.round(mins)}m`;
         }
-        if (age <= (4.0 * baseAge)) {
-          return 0.50 - (((age - (2.0 * baseAge)) / (2.0 * baseAge)) * 0.25);
+        const hours = mins / 60.0;
+        if (hours < 48.0) {
+          return `${hours < 10.0 ? hours.toFixed(1) : Math.round(hours)}h`;
         }
-        return 0.25 - (((age - (4.0 * baseAge)) / (4.0 * baseAge)) * 0.25);
+        const days = hours / 24.0;
+        return `${days < 10.0 ? days.toFixed(1) : Math.round(days)}d`;
       };
 
       const xAt = (i) => {
@@ -992,10 +2076,11 @@ def _render_dashboard_html() -> str:
       };
 
       const axes = [];
-      let leftUsed = 0;
-      let rightUsed = 0;
+      let leftAxisOffset = 0;
+      let rightAxisOffset = 0;
       for (const s of axisSourceSeries) {
         const side = s.axis?.side === "right" ? "right" : "left";
+        const axisSlot = axisSlotFor(s);
         const sourceKeys = Array.isArray(s.axis?.group_keys) && s.axis.group_keys.length
           ? s.axis.group_keys
           : [s.key];
@@ -1013,6 +2098,20 @@ def _render_dashboard_html() -> str:
         const hasFixedMax = Number.isFinite(s.axis?.max);
         let minV = hasFixedMin ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
         let maxV = hasFixedMax ? Number(s.axis.max) : (values.length ? Math.max(...values) : 1.0);
+        const minFloor = Number(s.axis?.min_floor);
+        const maxFloor = Number(s.axis?.max_floor);
+        if (!hasFixedMin && Number.isFinite(minFloor)) {
+          minV = Math.min(minV, minFloor);
+        }
+        if (!hasFixedMax && Number.isFinite(maxFloor)) {
+          maxV = Math.max(maxV, maxFloor);
+        }
+        const roundMax = Number(s.axis?.round_max);
+        let didRoundMax = false;
+        if (!hasFixedMax && roundMax > 0 && Number.isFinite(roundMax)) {
+          maxV = Math.ceil(maxV / roundMax) * roundMax;
+          didRoundMax = true;
+        }
         if (maxV < minV) {
           maxV = minV + 1.0;
         }
@@ -1030,15 +2129,19 @@ def _render_dashboard_html() -> str:
           if (!hasFixedMin) {
             minV -= p;
           }
-          if (!hasFixedMax) {
+          if (!hasFixedMax && !didRoundMax) {
             maxV += p;
           }
         }
 
-        const axisIndex = side === "left" ? leftUsed++ : rightUsed++;
         const axisX = side === "left"
-          ? (padL - 20 - (axisIndex * 28))
-          : (width - padR + 20 + (axisIndex * 28));
+          ? (padL - 20 - leftAxisOffset)
+          : (width - padR + 20 + rightAxisOffset);
+        if (side === "left") {
+          leftAxisOffset += axisSlot;
+        } else {
+          rightAxisOffset += axisSlot;
+        }
         const ticks = Array.isArray(s.axis?.ticks) && s.axis.ticks.length
           ? s.axis.ticks
           : [minV, minV + (maxV - minV) * 0.25, minV + (maxV - minV) * 0.5, minV + (maxV - minV) * 0.75, maxV];
@@ -1051,6 +2154,7 @@ def _render_dashboard_html() -> str:
           min: minV,
           max: maxV,
           ticks,
+          tickDecimals: Number.isFinite(s.axis?.tick_decimals) ? Math.max(0, Number(s.axis.tick_decimals)) : null,
         });
       }
       if (!axes.length) return;
@@ -1063,15 +2167,18 @@ def _render_dashboard_html() -> str:
 
       ctx.lineWidth = 1.0;
       ctx.strokeStyle = "rgba(148,163,184,0.18)";
-      for (let i = 0; i < 4; i++) {
-        const y = padT + (plotH * i / 3.0);
+      // Denser grid: 4x the prior vertical density, then mirror that pixel step
+      // on X so the plot reads as a true grid.
+      const gridRows = 12; // was effectively 3 intervals
+      const gridStep = plotH / gridRows;
+      for (let i = 0; i <= gridRows; i++) {
+        const y = padT + (gridStep * i);
         ctx.beginPath();
         ctx.moveTo(padL, y);
         ctx.lineTo(width - padR, y);
         ctx.stroke();
       }
-      for (let i = 1; i < 4; i++) {
-        const x = padL + (plotW * (i / 4.0));
+      for (let x = padL + gridStep; x < (width - padR - 0.5); x += gridStep) {
         ctx.beginPath();
         ctx.moveTo(x, padT);
         ctx.lineTo(x, height - padB);
@@ -1116,12 +2223,70 @@ def _render_dashboard_html() -> str:
           ctx.stroke();
           ctx.globalAlpha = 1.0;
 
-          const labelText = Math.abs(tv) >= 100 ? `${Math.round(tv)}` : `${Number(tv).toFixed(0)}`;
+          const labelText = Number.isFinite(axis.tickDecimals)
+            ? Number(tv).toFixed(axis.tickDecimals)
+            : (Math.abs(tv) >= 100 ? `${Math.round(tv)}` : `${Number(tv).toFixed(0)}`);
           ctx.fillStyle = axis.color;
           ctx.textAlign = isLeft ? "right" : "left";
           ctx.fillText(labelText, axis.x - tickDir * 12, y);
         }
 
+      }
+
+      // Horizontal lookback axis (0 = now at right, 1 = oldest at left).
+      const xAxisColor = axes[0]?.color || "#22c55e";
+      const xAxisY = height - 18;
+      const xTickDefs = [
+        { frac: 0.0 },
+        { frac: 0.25 },
+        { frac: 0.5 },
+        { frac: 0.75 },
+        { frac: 1.0 },
+      ];
+      ctx.strokeStyle = xAxisColor;
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(padL, xAxisY);
+      ctx.lineTo(width - padR, xAxisY);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      ctx.font = "11px 'Avenir Next', 'Segoe UI', sans-serif";
+      ctx.textBaseline = "top";
+      for (const tk of xTickDefs) {
+        const frac = Math.max(0.0, Math.min(1.0, Number(tk.frac)));
+        const xNorm = 1.0 - frac;
+        const x = padL + (xNorm * plotW);
+        const labelText = hasTimeAxis
+          ? formatLookback(ageFromXNorm(xNorm))
+          : (frac === 0.0 ? "0s" : "n/a");
+
+        // Bright tick plus faint extension, matching vertical style.
+        ctx.strokeStyle = xAxisColor;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(x, xAxisY);
+        ctx.lineTo(x, xAxisY - 8);
+        ctx.stroke();
+
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x, xAxisY - 8);
+        ctx.lineTo(x, xAxisY - 14);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+
+        ctx.fillStyle = xAxisColor;
+        if (frac <= 1e-9) {
+          ctx.textAlign = "right";
+        } else if (frac >= (1.0 - 1e-9)) {
+          ctx.textAlign = "left";
+        } else {
+          ctx.textAlign = "center";
+        }
+        ctx.fillText(labelText, x, xAxisY + 2);
       }
 
       const n = points.length;
@@ -1130,24 +2295,228 @@ def _render_dashboard_html() -> str:
           ? axisByKey.get(s.axis_ref)
           : (axisByKey.get(s.key) || axes[0]);
         if (!axis) continue;
+        const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : CHART_VALUE_SMOOTH_ALPHA;
         ctx.strokeStyle = s.color;
         ctx.lineWidth = 2.0;
         ctx.beginPath();
         let started = false;
-        for (let i = 0; i < n; i++) {
-          const val = seriesValue(points[i], s.key);
-          if (!Number.isFinite(val)) continue;
-          const x = xAt(i);
-          const y = yAt(axis, Number(val));
-          if (!started) {
-            ctx.moveTo(x, y);
-            started = true;
-          } else {
-            ctx.lineTo(x, y);
+        let smoothVal = null;
+        if (s.pixel_bin_avg) {
+          const bins = new Map();
+          for (let i = n - 1; i >= 0; i--) {
+            const val = seriesValue(points[i], s.key);
+            if (!Number.isFinite(val)) continue;
+            const x = xAt(i);
+            const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
+            const b = bins.get(xPx);
+            if (b) {
+              b.sum += Number(val);
+              b.count += 1;
+            } else {
+              bins.set(xPx, { sum: Number(val), count: 1 });
+            }
+          }
+          const xKeys = Array.from(bins.keys()).sort((a, b) => b - a);
+          for (const xPx of xKeys) {
+            const b = bins.get(xPx);
+            if (!b || b.count <= 0) continue;
+            const vAvg = b.sum / b.count;
+            smoothVal = (smoothVal === null)
+              ? vAvg
+              : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
+            const y = yAt(axis, smoothVal);
+            if (!started) {
+              ctx.moveTo(xPx, y);
+              started = true;
+            } else {
+              ctx.lineTo(xPx, y);
+            }
+          }
+        } else {
+          for (let i = n - 1; i >= 0; i--) {
+            const val = seriesValue(points[i], s.key);
+            if (!Number.isFinite(val)) continue;
+            smoothVal = (smoothVal === null)
+              ? Number(val)
+              : (smoothVal + ((Number(val) - smoothVal) * smoothAlpha));
+            const x = xAt(i);
+            const y = yAt(axis, smoothVal);
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else {
+              ctx.lineTo(x, y);
+            }
           }
         }
         ctx.stroke();
       }
+    }
+
+    function drawMiniChart(canvas, history, seriesDefs) {
+      if (!canvas) return;
+      const points = history.slice(-240);
+      const width = canvas.clientWidth || 120;
+      const height = canvas.clientHeight || 104;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      if (!points.length) return;
+
+      const axisPad = 30;
+      const padL = axisPad;
+      const padR = 4;
+      const isHalf = canvas.closest && canvas.closest('.card-half');
+      const padTop = isHalf ? 1 : 6;
+      const padBot = isHalf ? 3 : 6;
+      const plotW = width - padL - padR;
+      const plotH = height - padTop - padBot;
+      if (plotW <= 4 || plotH <= 4) return;
+
+      const values = [];
+      for (const row of points) {
+        for (const s of seriesDefs) {
+          const v = Number(row[s.key]);
+          if (Number.isFinite(v)) {
+            values.push(v);
+          }
+        }
+      }
+      if (!values.length) return;
+
+      const hasFixedMin = Number.isFinite(seriesDefs?.[0]?.axis?.min);
+      const hasFixedMax = Number.isFinite(seriesDefs?.[0]?.axis?.max);
+      let minV = hasFixedMin ? Number(seriesDefs[0].axis.min) : Math.min(...values);
+      let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
+      if (maxV <= minV) {
+        maxV = minV + 1.0;
+      } else {
+        const p = (maxV - minV) * 0.08;
+        if (!hasFixedMin) minV -= p;
+        if (!hasFixedMax) maxV += p;
+      }
+
+      const xAt = (i) => {
+        const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+        return padL + (t * plotW);
+      };
+      const yAt = (v) => {
+        const t = (v - minV) / (maxV - minV);
+        return padTop + ((1.0 - t) * plotH);
+      };
+
+      const fmtTick = (v) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return "";
+        const a = Math.abs(n);
+        if (a >= 100) return `${Math.round(n)}`;
+        if (a >= 10) return `${n.toFixed(1)}`;
+        if (a >= 1) return `${n.toFixed(2)}`;
+        return `${n.toFixed(3)}`;
+      };
+
+      const axisColor = seriesDefs?.[seriesDefs.length - 1]?.color || "#22c55e";
+      const axisX = padL - 1;
+      const yTicks = [minV, minV + ((maxV - minV) * 0.5), maxV];
+      ctx.strokeStyle = axisColor;
+      ctx.globalAlpha = 0.52;
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(axisX, padTop);
+      ctx.lineTo(axisX, height - padBot);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      ctx.font = "7px 'DotGothic16', 'Courier New', monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (const tv of yTicks) {
+        const y = yAt(tv);
+        ctx.strokeStyle = axisColor;
+        ctx.globalAlpha = 0.70;
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(axisX - 2, y);
+        ctx.lineTo(axisX + 2, y);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+        ctx.fillStyle = "rgba(165, 191, 222, 0.95)";
+        ctx.fillText(fmtTick(tv), axisX - 3, y);
+      }
+
+      // Soft center guide.
+      const yMid = padTop + (plotH * 0.5);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(padL, yMid);
+      ctx.lineTo(width - padR, yMid);
+      ctx.stroke();
+
+      const n = points.length;
+      for (const s of seriesDefs) {
+        const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : MINI_CHART_VALUE_SMOOTH_ALPHA;
+        ctx.strokeStyle = s.color;
+        ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
+        ctx.lineWidth = (s.key === "level_1m") ? 2.0 : 1.6;
+        ctx.beginPath();
+        let started = false;
+        let smoothVal = null;
+        if (s.pixel_bin_avg) {
+          const bins = new Map();
+          for (let i = n - 1; i >= 0; i--) {
+            const val = Number(points[i][s.key]);
+            if (!Number.isFinite(val)) continue;
+            const x = xAt(i);
+            const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
+            const b = bins.get(xPx);
+            if (b) {
+              b.sum += val;
+              b.count += 1;
+            } else {
+              bins.set(xPx, { sum: val, count: 1 });
+            }
+          }
+          const xKeys = Array.from(bins.keys()).sort((a, b) => b - a);
+          for (const xPx of xKeys) {
+            const b = bins.get(xPx);
+            if (!b || b.count <= 0) continue;
+            const vAvg = b.sum / b.count;
+            smoothVal = (smoothVal === null)
+              ? vAvg
+              : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
+            const y = yAt(smoothVal);
+            if (!started) {
+              ctx.moveTo(xPx, y);
+              started = true;
+            } else {
+              ctx.lineTo(xPx, y);
+            }
+          }
+        } else {
+          for (let i = n - 1; i >= 0; i--) {
+            const val = Number(points[i][s.key]);
+            if (!Number.isFinite(val)) continue;
+            smoothVal = (smoothVal === null)
+              ? val
+              : (smoothVal + ((val - smoothVal) * smoothAlpha));
+            const x = xAt(i);
+            const y = yAt(smoothVal);
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else {
+              ctx.lineTo(x, y);
+            }
+          }
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
     }
 
     function computeSmoothedStepSpd(now, history) {
@@ -1166,38 +2535,138 @@ def _render_dashboard_html() -> str:
       return vals.reduce((a, b) => a + b, 0.0) / vals.length;
     }
 
+    function buildThroughputHistory(rows, stepWindowSec = 2.0, emaAlpha = 0.12) {
+      const src = Array.isArray(rows) ? rows : [];
+      if (!src.length) return [];
+      const out = new Array(src.length);
+      let j = 0;
+      let ema = null;
+      for (let i = 0; i < src.length; i++) {
+        const row = src[i] || {};
+        const tsI = Number(row.ts);
+        const stI = Number(row.training_steps);
+        while (j < i) {
+          const tsJ = Number(src[j] && src[j].ts);
+          if (!Number.isFinite(tsI) || !Number.isFinite(tsJ) || (tsI - tsJ) <= stepWindowSec) break;
+          j += 1;
+        }
+
+        let rate = Number(row.steps_per_sec);
+        if (i > j) {
+          const tsJ = Number(src[j] && src[j].ts);
+          const stJ = Number(src[j] && src[j].training_steps);
+          const dt = tsI - tsJ;
+          const ds = stI - stJ;
+          if (Number.isFinite(dt) && dt > 1e-6 && Number.isFinite(ds) && ds >= 0) {
+            rate = ds / dt;
+          }
+        }
+        if (!Number.isFinite(rate)) rate = 0.0;
+        ema = (ema === null) ? rate : (ema + ((rate - ema) * emaAlpha));
+        out[i] = { ...row, steps_per_sec_chart: ema };
+      }
+      return out;
+    }
+
+    function buildWindowSmoothedHistory(rows, specs, windowSec = 2.0) {
+      const src = Array.isArray(rows) ? rows : [];
+      if (!src.length) return [];
+      const defs = Array.isArray(specs) ? specs : [];
+      const out = new Array(src.length);
+      const starts = new Array(defs.length).fill(0);
+      const sums = new Array(defs.length).fill(0.0);
+      const counts = new Array(defs.length).fill(0);
+      const emas = new Array(defs.length).fill(null);
+
+      for (let i = 0; i < src.length; i++) {
+        const row = src[i] || {};
+        const tsI = Number(row.ts);
+        const nextRow = { ...row };
+
+        for (let k = 0; k < defs.length; k++) {
+          const def = defs[k] || {};
+          const key = String(def.key || "");
+          if (!key) continue;
+          const alpha = Number.isFinite(def.alpha) ? Number(def.alpha) : 0.12;
+
+          const vNow = Number(row[key]);
+          if (Number.isFinite(vNow)) {
+            sums[k] += vNow;
+            counts[k] += 1;
+          }
+
+          while (starts[k] < i) {
+            const rowStart = src[starts[k]] || {};
+            const tsS = Number(rowStart.ts);
+            if (!Number.isFinite(tsI) || !Number.isFinite(tsS) || (tsI - tsS) <= windowSec) break;
+            const vS = Number(rowStart[key]);
+            if (Number.isFinite(vS)) {
+              sums[k] -= vS;
+              counts[k] = Math.max(0, counts[k] - 1);
+            }
+            starts[k] += 1;
+          }
+
+          const avg = counts[k] > 0 ? (sums[k] / counts[k]) : (Number.isFinite(vNow) ? vNow : 0.0);
+          emas[k] = (emas[k] === null) ? avg : (emas[k] + ((avg - emas[k]) * alpha));
+          nextRow[key] = emas[k];
+        }
+        out[i] = nextRow;
+      }
+      return out;
+    }
+
     function updateCards(now, smoothedSteps) {
       cards.frame.textContent = fmtInt(now.frame_count);
-      cards.fps.textContent = fmtFloat(now.fps, 1);
-      cards.steps.textContent = fmtFloat(smoothedSteps, 1);
+      if (cards.fps) cards.fps.textContent = fmtInt(now.fps);
+      if (cards.steps) cards.steps.textContent = fmtInt(smoothedSteps);
       cards.clients.textContent = fmtInt(now.client_count);
+      cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
-      cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)}ms`;
+      cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)} ms`;
       setInfLed(now.avg_inf_ms);
+      cards.rplf.textContent = fmtFloat(now.rpl_per_frame, 2);
+      setRplLed(now.rpl_per_frame);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
-      cards.rwrd.textContent = fmtInt(now.reward_total);
-      cards.loss.textContent = fmtFloat(now.loss, 4);
+      cards.rwrd.textContent = fmtInt(now.total_1m);
+      cards.dqnRwrd.textContent = fmtInt(now.dqn_1m);
+      cards.loss.textContent = fmtFloat(now.loss, 2);
       cards.grad.textContent = fmtFloat(now.grad_norm, 3);
-      cards.buf.textContent = `${fmtInt(now.memory_buffer_k)}k (${fmtInt(now.memory_buffer_pct)}%)`;
+      cards.buf.textContent = fmtInt(now.memory_buffer_size);
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
-      cards.q.textContent = (now.q_min === null || now.q_max === null)
-        ? "-"
-        : `[${fmtFloat(now.q_min, 1)}, ${fmtFloat(now.q_max, 1)}]`;
+      cards.q.innerHTML = (now.q_min === null || now.q_max === null)
+        ? toFixedCharCells("-")
+        : toFixedCharCells(`${fmtSignedFloat(now.q_min, 1)},${fmtSignedFloat(now.q_max, 1)}`);
+      cards.epLen.textContent = fmtInt(now.eplen_1m);
     }
 
     function render(payload) {
+      _tickDisplayFps();
       if (!payload || !payload.now) return;
-      const history = payload.history || [];
-      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history);
+      const history = Array.isArray(payload.history) ? payload.history.slice(-MAX_HISTORY_POINTS) : [];
+      const history60m = sliceHistoryLookback(history, 60 * 60);
+      const history2m = sliceHistoryLookback(history, 2 * 60);
+      const history1m = sliceHistoryLookback(history, 60);
+      const chartHistory60m = downsampleHistory(history60m, MAX_CHART_POINTS);
+      const chartHistory2m = downsampleHistory(history2m, MAX_CHART_POINTS);
+      const chartHistory1m = downsampleHistory(history1m, MAX_CHART_POINTS);
+      const throughputHistory = buildThroughputHistory(chartHistory60m);
+      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history60m);
       updateCards(payload.now, smoothedStepSpd);
-      drawFpsGauge(fpsGaugeCanvas, payload.now.fps);
-      drawStepGauge(stepGaugeCanvas, smoothedStepSpd);
-      drawChart(charts.throughput.canvas, history, charts.throughput.series);
-      drawChart(charts.rewards.canvas, history, charts.rewards.series);
-      drawChart(charts.learning.canvas, history, charts.learning.series);
-      drawChart(charts.dqn.canvas, history, charts.dqn.series);
-      drawChart(charts.level1m.canvas, history, charts.level1m.series);
+      gaugeState.fps.target  = payload.now.fps;
+      gaugeState.step.target = smoothedStepSpd;
+      latestRow = payload.now;
+      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 60 * 60);
+      drawChart(charts.rewards.canvas, chartHistory60m, charts.rewards.series, 60 * 60);
+      drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 60, true);
+      drawChart(charts.dqn.canvas, chartHistory60m, charts.dqn.series, 60 * 60);
+      drawMiniChart(charts.dqnRewardMini.canvas, history60m, charts.dqnRewardMini.series);
+      drawMiniChart(charts.rewardMini.canvas, history60m, charts.rewardMini.series);
+      drawMiniChart(charts.level1m.canvas, history60m, charts.level1m.series);
+      drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
+      drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
+      drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
     }
 
     let historyCache = [];
@@ -1211,12 +2680,12 @@ def _render_dashboard_html() -> str:
 
     async function fetchHistory() {
       try {
-        const res = await fetch(`/api/history?t=${Date.now()}`, { cache: "no-store" });
+        const res = await fetch(`/api/history?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const payload = await res.json();
         const now = payload && payload.now ? payload.now : null;
         const history = Array.isArray(payload && payload.history) ? payload.history : [];
-        historyCache = history.slice(-maxPoints);
+        historyCache = history.slice(-MAX_HISTORY_POINTS);
         latestNow = now || historyCache[historyCache.length - 1] || latestNow;
         const ts = Number(latestNow && latestNow.ts);
         if (Number.isFinite(ts)) {
@@ -1231,17 +2700,20 @@ def _render_dashboard_html() -> str:
 
     async function fetchNow() {
       try {
-        const res = await fetch(`/api/now?t=${Date.now()}`, { cache: "no-store" });
+        const res = await fetch(`/api/now?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const now = await res.json();
+        const hadNow = !!latestNow;
         latestNow = now;
         const ts = Number(now && now.ts);
+        let hasNewSample = false;
         if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
           historyCache.push(now);
-          if (historyCache.length > maxPoints) {
+          if (historyCache.length > MAX_HISTORY_POINTS) {
             historyCache.shift();
           }
           lastTs = ts;
+          hasNewSample = true;
         }
         renderCurrent();
         setConnected(true);
@@ -1252,7 +2724,7 @@ def _render_dashboard_html() -> str:
 
     async function heartbeat() {
       try {
-        const res = await fetch(`/api/ping?t=${Date.now()}`, { cache: "no-store" });
+        const res = await fetch(`/api/ping?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("no ping");
         failedPings = 0;
         setConnected(true);
@@ -1265,8 +2737,36 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    const cookiePref = getCookieValue(AUDIO_PREF_COOKIE);
+    audioEnabled = (cookiePref === null) ? true : (cookiePref === "1");
+    setAudioToggle(audioEnabled, false);
+    const kickAudioStart = () => {
+      if (audioEnabled) ensureAudioPlaying();
+    };
+    document.addEventListener("pointerdown", kickAudioStart, { passive: true });
+    document.addEventListener("keydown", kickAudioStart);
+    window.addEventListener("focus", kickAudioStart);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) kickAudioStart();
+    });
+    if (audioToggle) {
+      audioToggle.addEventListener("click", () => setAudioEnabled(!audioEnabled));
+    }
+    if (bgAudio) {
+      bgAudio.addEventListener("playing", () => clearAudioRetryTimer());
+      bgAudio.addEventListener("ended", () => {
+        if (!audioEnabled || !audioPlaylist.length) return;
+        playAudioAt(audioIndex + 1);
+      });
+      bgAudio.addEventListener("error", () => {
+        if (!audioEnabled || !audioPlaylist.length) return;
+        playAudioAt(audioIndex + 1);
+      });
+    }
+    loadAudioPlaylist().catch(() => {});
+
     fetchHistory().then(() => fetchNow()).catch(() => {});
-    setInterval(fetchNow, 100);
+    setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
     window.addEventListener("resize", () => renderCurrent());
   </script>
@@ -1277,18 +2777,90 @@ def _render_dashboard_html() -> str:
 
 def _make_handler(state: _DashboardState):
     page = _render_dashboard_html().encode("utf-8")
+    audio_root = os.path.abspath(_audio_dir())
+    fonts_root = os.path.abspath(_fonts_dir())
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        def _send(self, payload: bytes, content_type: str = "text/plain", status: int = 200):
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(payload)
+        def _send(
+            self,
+            payload: bytes,
+            content_type: str = "text/plain",
+            status: int = 200,
+            cache_control: str = "no-store",
+        ):
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _send_file(self, filepath: str, content_type: str):
+            try:
+                size = os.path.getsize(filepath)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                with open(filepath, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, length=64 * 1024)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            except Exception:
+                try:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+        @staticmethod
+        def _safe_audio_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(audio_root, name))
+            try:
+                if os.path.commonpath([audio_root, candidate]) != audio_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in AUDIO_EXTENSIONS:
+                return None
+            return candidate
+
+        @staticmethod
+        def _safe_font_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(fonts_root, name))
+            try:
+                if os.path.commonpath([fonts_root, candidate]) != fonts_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in FONT_EXTENSIONS:
+                return None
+            return candidate
 
         def do_GET(self):
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            client_id = (query.get("cid") or [None])[0]
+            if path in ("/api/ping", "/api/now", "/api/history"):
+                state.touch_web_client(client_id)
             if path == "/":
                 self._send(page, "text/html; charset=utf-8")
                 return
@@ -1303,10 +2875,41 @@ def _make_handler(state: _DashboardState):
                 body = json.dumps(state.payload()).encode("utf-8")
                 self._send(body, "application/json")
                 return
+            if path == "/api/audio_playlist":
+                tracks = _list_audio_files()
+                body = json.dumps({
+                    "tracks": [{"name": name, "url": f"/api/audio/{quote(name)}"} for name in tracks]
+                }).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            if path.startswith("/api/audio/"):
+                raw_name = unquote(path[len("/api/audio/"):])
+                safe_path = self._safe_audio_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+                self._send_file(safe_path, ctype)
+                return
+            if path.startswith("/api/font/"):
+                raw_name = unquote(path[len("/api/font/"):])
+                safe_path = self._safe_font_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "font/ttf"
+                self._send_file(safe_path, ctype)
+                return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
 
         def log_message(self, fmt, *args):
             return
+
+        def handle_one_request(self):
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
     return DashboardHandler
 
@@ -1321,14 +2924,15 @@ class MetricsDashboard:
         host: str = "127.0.0.1",
         port: int = 8765,
         sample_interval: float = 0.10,
-        history_limit: int = 900,
+        history_limit: int = DASH_HISTORY_LIMIT,
         open_browser: bool = True,
     ):
         self.metrics = metrics_obj
         self.agent = agent_obj
         self.host = host
         self.port = port
-        self.sample_interval = max(0.05, sample_interval)
+        # Cap sampler refresh at 30 Hz max.
+        self.sample_interval = max(0.033, sample_interval)
         self.open_browser = open_browser
 
         self.state = _DashboardState(metrics_obj, agent_obj, history_limit=history_limit)

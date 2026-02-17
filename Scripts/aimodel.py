@@ -54,8 +54,18 @@ warnings.filterwarnings("default")
 metrics = config_metrics
 
 # ── Device selection ────────────────────────────────────────────────────────
+def _cuda_device(index_hint: int) -> torch.device:
+    n = torch.cuda.device_count()
+    if n <= 0:
+        return torch.device("cpu")
+    idx = int(index_hint)
+    if idx < 0 or idx >= n:
+        idx = 0
+    return torch.device(f"cuda:{idx}")
+
+
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
+    device = _cuda_device(getattr(RL_CONFIG, "train_cuda_device_index", 0))
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -631,7 +641,12 @@ class RainbowAgent:
 
         # Inference model (optionally on CPU for non-blocking frame serving)
         self.use_separate_inference = cfg.use_separate_inference_model
-        infer_dev = torch.device("cpu") if cfg.inference_on_cpu else self.device
+        if cfg.inference_on_cpu:
+            infer_dev = torch.device("cpu")
+        elif torch.cuda.is_available():
+            infer_dev = _cuda_device(getattr(cfg, "inference_cuda_device_index", 0))
+        else:
+            infer_dev = self.device
         self.inference_device = infer_dev
         if self.use_separate_inference:
             self.infer_net = RainbowNet(state_size).to(infer_dev)
@@ -639,6 +654,10 @@ class RainbowAgent:
             self._sync_inference(force=True)
         else:
             self.infer_net = self.online_net
+        print(
+            f"Agent devices: train={self.device}, infer={self.inference_device}, "
+            f"separate_infer={self.use_separate_inference}"
+        )
 
         # Optimizer
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=cfg.lr, eps=1.5e-4)
@@ -689,8 +708,17 @@ class RainbowAgent:
         if not force and (self.training_steps - self.last_inference_sync < RL_CONFIG.inference_sync_steps):
             return
         with self._sync_lock:
-            sd = {k: v.detach().cpu() for k, v in self.online_net.state_dict().items()} \
-                 if self.inference_device.type == "cpu" else self.online_net.state_dict()
+            same_cuda_device = (
+                self.device.type == "cuda"
+                and self.inference_device.type == "cuda"
+                and self.device.index == self.inference_device.index
+            )
+            if self.inference_device.type == "cpu":
+                sd = {k: v.detach().cpu() for k, v in self.online_net.state_dict().items()}
+            elif same_cuda_device:
+                sd = self.online_net.state_dict()
+            else:
+                sd = {k: v.detach().to(self.inference_device) for k, v in self.online_net.state_dict().items()}
             self.infer_net.load_state_dict(sd, strict=False)
             self.infer_net.eval()
             self.last_inference_sync = self.training_steps
@@ -700,13 +728,47 @@ class RainbowAgent:
         if random.random() < epsilon:
             return random.randrange(NUM_FIREZAP), random.randrange(NUM_SPINNER)
 
-        net = self.infer_net if self.use_separate_inference else self.online_net
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
-        net.eval()
-        with torch.no_grad():
-            q = net.q_values(st)
+        q = self._infer_q_values(st)
         joint = int(q.argmax(dim=1).item())
         return split_joint_action(joint)
+
+    def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
+        net = self.infer_net if self.use_separate_inference else self.online_net
+        net.eval()
+        with torch.no_grad():
+            if self.use_separate_inference:
+                with self._sync_lock:
+                    return net.q_values(states_t)
+            return net.q_values(states_t)
+
+    def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int]]:
+        """Return batched actions for aligned state/epsilon lists."""
+        n = min(len(states), len(epsilons))
+        if n <= 0:
+            return []
+
+        actions: list[Tuple[int, int] | None] = [None] * n
+        greedy_idx: list[int] = []
+        greedy_states: list[np.ndarray] = []
+
+        for i in range(n):
+            eps = float(epsilons[i])
+            if random.random() < eps:
+                actions[i] = (random.randrange(NUM_FIREZAP), random.randrange(NUM_SPINNER))
+            else:
+                greedy_idx.append(i)
+                greedy_states.append(states[i])
+
+        if greedy_idx:
+            batch_np = np.asarray(greedy_states, dtype=np.float32)
+            st = torch.from_numpy(batch_np).to(self.inference_device)
+            q = self._infer_q_values(st)
+            joints = q.argmax(dim=1).detach().cpu().tolist()
+            for pos, joint in zip(greedy_idx, joints):
+                actions[pos] = split_joint_action(int(joint))
+
+        return [a if a is not None else (0, 0) for a in actions]
 
     # ── Step (add experience) ───────────────────────────────────────────
     def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None):
@@ -809,7 +871,18 @@ class RainbowAgent:
                 print(f"    ... and {len(skipped) - 5} more")
         return model.load_state_dict(compatible, strict=False)
 
-    def save(self, filepath, is_forced_save=False):
+    @staticmethod
+    def _text_progress(label: str, frac: float, width: int = 24):
+        frac_clamped = max(0.0, min(1.0, float(frac)))
+        filled = int(round(frac_clamped * width))
+        bar = "#" * filled + "-" * (width - filled)
+        sys.stdout.write(f"\r{label} [{bar}] {frac_clamped * 100.0:5.1f}%")
+        sys.stdout.flush()
+        if frac_clamped >= 1.0:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def save(self, filepath, is_forced_save=False, show_status=True):
         try:
             with metrics.lock:
                 fc = int(metrics.frame_count)
@@ -830,15 +903,30 @@ class RainbowAgent:
             "epsilon": ep,
             "engine_version": 2,
         }
+        if show_status:
+            self._text_progress("  Model save", 0.0)
         torch.save(ckpt, filepath)
-        if is_forced_save:
+        if show_status:
+            self._text_progress("  Model save", 1.0)
+        if is_forced_save and show_status:
             print(f"Model saved to {filepath}")
 
-    def load(self, filepath) -> bool:
+        # Save replay buffer alongside the model
+        buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+        try:
+            self.memory.save(buf_path, verbose=bool(show_status))
+        except Exception as e:
+            print(f"  Replay buffer save failed: {e}")
+
+    def load(self, filepath, show_status=True) -> bool:
         if not os.path.exists(filepath):
             return False
         try:
+            if show_status:
+                self._text_progress("  Model load", 0.0)
             ckpt = torch.load(filepath, map_location=self.device, weights_only=False)
+            if show_status:
+                self._text_progress("  Model load", 1.0)
 
             # Detect old engine (v1) checkpoints
             if "engine_version" not in ckpt:
@@ -881,11 +969,26 @@ class RainbowAgent:
                 pass
 
             print(f"Loaded v2 model from {filepath}")
+
+            # Load replay buffer if present alongside the model
+            buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+            try:
+                if os.path.exists(buf_path):
+                    self.memory.load(buf_path, verbose=bool(show_status))
+                else:
+                    print("  No replay buffer file found — starting with empty buffer.")
+            except Exception as e:
+                print(f"  Replay buffer load failed: {e}")
+
             return True
         except Exception as e:
             print(f"Error loading {filepath}: {e}")
             traceback.print_exc()
             return False
+
+    def flush_replay_buffer(self):
+        """Clear the entire replay buffer."""
+        self.memory.flush()
 
     def reset_attention_weights(self):
         """Reinitialize only the lane-cross-attention weights, keeping trunk and heads intact."""
