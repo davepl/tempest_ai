@@ -113,6 +113,7 @@ class _DashboardState:
         self._last_avg_inf_ms = 0.0
         self._web_clients: dict[str, float] = {}
         self._cached_now_body = b"{}"
+        self._model_desc: str | None = None
 
     def _clear_level_windows(self):
         for win in self._level_windows.values():
@@ -190,6 +191,45 @@ class _DashboardState:
             _mean_or_level(self._level_windows["1m"]),
             _mean_or_level(self._level_windows["5m"]),
         )
+
+    def _get_model_desc(self) -> str:
+        if self._model_desc is not None:
+            return self._model_desc
+        cfg = RL_CONFIG
+        try:
+            if self.agent is not None and hasattr(self.agent, 'online_net'):
+                param_count = sum(p.numel() for p in self.agent.online_net.parameters())
+            else:
+                ad = cfg.attn_dim
+                th = cfg.trunk_hidden
+                tl = cfg.trunk_layers
+                ss = cfg.state_size
+                na = cfg.num_firezap_actions * len(cfg.spinner_command_levels)
+                n_atoms = cfg.num_atoms if cfg.use_distributional else 1
+                hm = th // 2
+                attn_p = (5 * ad + ad) + 2 * ad + (14 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
+                trunk_p = (ss + ad) * th + th + 2 * th
+                for _ in range(1, tl):
+                    trunk_p += th * th + th + 2 * th
+                heads_p = 2 * (th * hm + hm) + hm * n_atoms + n_atoms + hm * (na * n_atoms) + na * n_atoms
+                param_count = attn_p + trunk_p + heads_p
+        except Exception:
+            param_count = 0
+        trunk_in = cfg.state_size + (cfg.attn_dim if cfg.use_enemy_attention else 0)
+        layers = [str(trunk_in)]
+        for _ in range(cfg.trunk_layers):
+            layers.append(str(cfg.trunk_hidden))
+        layers.append(str(cfg.trunk_hidden // 2))
+        arch_str = " \u00bb ".join(layers)
+        if param_count >= 1_000_000:
+            p_str = f"{param_count / 1_000_000:.1f}M"
+        elif param_count >= 1_000:
+            p_str = f"{param_count / 1_000:.0f}K"
+        else:
+            p_str = str(param_count)
+        desc = f"Model: {arch_str} \u00b7 {p_str} params"
+        self._model_desc = desc
+        return desc
 
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -306,6 +346,9 @@ class _DashboardState:
             "q_max": q_max,
             "eplen_1m": get_eplen_1m_average(),
             "eplen_100k": get_eplen_100k_average(),
+            "peak_level": float(self.metrics.peak_level + 1),
+            "peak_episode_reward": float(self.metrics.peak_episode_reward) * inv_obj,
+            "model_desc": self._get_model_desc(),
         }
 
     def sample(self):
@@ -337,6 +380,9 @@ def _render_dashboard_html() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tempest AI Metrics</title>
   <style>
+    /* ══════════════════════════════════════════════════════════════
+     * FONTS — Custom typefaces for VFD / LED readouts
+     * ══════════════════════════════════════════════════════════════ */
     @font-face {
       font-family: "LED Dot-Matrix";
       src: url("/api/font/LED%20Dot-Matrix.ttf") format("truetype");
@@ -347,6 +393,9 @@ def _render_dashboard_html() -> str:
       src: url("/api/font/DS-DIGI.TTF") format("truetype");
       font-display: swap;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * CSS VARIABLES — Theme colors and neon accents
+     * ══════════════════════════════════════════════════════════════ */
     :root {
       --bg0: #040510;
       --bg1: #0b1433;
@@ -367,6 +416,10 @@ def _render_dashboard_html() -> str:
     }
     * { box-sizing: border-box; }
     *::before, *::after { box-sizing: border-box; }
+    /* ══════════════════════════════════════════════════════════════
+     * BASE LAYOUT — Body background, pseudo-element overlays
+     * Animations intentionally removed for GPU performance.
+     * ══════════════════════════════════════════════════════════════ */
     html, body { margin: 0; padding: 0; color: var(--ink); background: var(--bg0); }
     body {
       font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
@@ -382,6 +435,7 @@ def _render_dashboard_html() -> str:
         linear-gradient(158deg, var(--bg0) 0%, var(--bg1) 58%, var(--bg2) 100%);
       background-attachment: fixed;
     }
+    /* Ambient orb pseudo-element (static — animations disabled for GPU perf) */
     body::before {
       content: "";
       position: fixed;
@@ -392,8 +446,8 @@ def _render_dashboard_html() -> str:
         radial-gradient(circle at 18% 24%, rgba(0, 229, 255, 0.24), transparent 30%),
         radial-gradient(circle at 78% 18%, rgba(255, 43, 214, 0.22), transparent 34%),
         radial-gradient(circle at 68% 78%, rgba(57, 255, 20, 0.18), transparent 36%);
-      animation: orbDrift 20s ease-in-out infinite alternate;
     }
+    /* Subtle color sweep overlay (static for GPU perf) */
     body::after {
       content: "";
       position: fixed;
@@ -401,29 +455,11 @@ def _render_dashboard_html() -> str:
       pointer-events: none;
       z-index: 1;
       background: linear-gradient(90deg, rgba(0, 229, 255, 0.045), transparent 36%, transparent 64%, rgba(255, 43, 214, 0.045));
-      mix-blend-mode: screen;
-      animation: rgbSweep 14s linear infinite;
+      mix-blend-mode: normal;
+      opacity: 0.10;
     }
-    @keyframes orbDrift {
-      0% { transform: translate3d(-2.5%, -2%, 0) scale(1.0); }
-      50% { transform: translate3d(2%, 1.5%, 0) scale(1.08); }
-      100% { transform: translate3d(3%, -1.5%, 0) scale(1.03); }
-    }
-    @keyframes rgbSweep {
-      0% { opacity: 0.15; transform: translateX(-5%); }
-      50% { opacity: 0.42; transform: translateX(5%); }
-      100% { opacity: 0.15; transform: translateX(-5%); }
-    }
-    @keyframes borderShift {
-      0% { background-position: 0% 50%; }
-      50% { background-position: 100% 50%; }
-      100% { background-position: 0% 50%; }
-    }
-    @keyframes ledPulse {
-      0% { transform: scale(0.95); filter: saturate(1.0); }
-      50% { transform: scale(1.10); filter: saturate(1.5); }
-      100% { transform: scale(0.95); filter: saturate(1.0); }
-    }
+    /* @keyframes removed — animations disabled for GPU perf.
+       orbDrift, rgbSweep, borderShift, ledPulse were here. */
     main {
       max-width: 1500px;
       margin: 0 auto;
@@ -433,6 +469,11 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * CARD & PANEL COMPONENTS — Metric cards, gauge cards, borders
+     * Each card gets --card-border and --card-glow via inline style.
+     * ══════════════════════════════════════════════════════════════ */
+    /* Shared base for header bar, metric cards, and chart panels */
     .top, .card, .panel {
       position: relative;
       overflow: hidden;
@@ -445,7 +486,6 @@ def _render_dashboard_html() -> str:
         inset 0 0 0 1px rgba(0, 229, 255, 0.06),
         0 0 26px var(--panelGlowA),
         0 0 36px var(--panelGlowB);
-      backdrop-filter: blur(10px) saturate(118%);
     }
     .card {
       --card-border: rgba(100, 180, 255, 0.45);
@@ -464,7 +504,6 @@ def _render_dashboard_html() -> str:
       padding: 1px;
       background: linear-gradient(110deg, rgba(0, 229, 255, 0.95), rgba(57, 255, 20, 0.9), rgba(255, 43, 214, 0.95), rgba(255, 230, 0, 0.9));
       background-size: 250% 250%;
-      animation: borderShift 7s linear infinite;
       opacity: 0.35;
       pointer-events: none;
       -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
@@ -488,6 +527,9 @@ def _render_dashboard_html() -> str:
       background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 36%);
       opacity: 0.35;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * HEADER BAR — Title, subtitle, status dot, display FPS, audio
+     * ══════════════════════════════════════════════════════════════ */
     .top {
       display: flex;
       justify-content: space-between;
@@ -582,13 +624,13 @@ def _render_dashboard_html() -> str:
       opacity: 0.55;
       cursor: default;
     }
+    /* Status LED dot (connection indicator) */
     .dot {
       width: 10px;
       height: 10px;
       border-radius: 50%;
       background: var(--accentC);
       box-shadow: 0 0 0 7px rgba(57, 255, 20, 0.2), 0 0 14px rgba(57, 255, 20, 0.5);
-      animation: ledPulse 1.8s ease-in-out infinite;
     }
     .cards {
       display: grid;
@@ -615,6 +657,10 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * METRIC VALUES — VFD-style text, fixed-width char cells,
+     * record-high labels, mini-chart inline layout
+     * ══════════════════════════════════════════════════════════════ */
     .value {
       font-size: 28px;
       line-height: 1;
@@ -645,7 +691,7 @@ def _render_dashboard_html() -> str:
       align-items: center;
       gap: 10px;
     }
-    #mQ {
+    #mQ, #mLoss, #mGrad, #mRplF {
       display: inline-grid;
       grid-auto-flow: column;
       grid-auto-columns: 0.62em;
@@ -656,13 +702,17 @@ def _render_dashboard_html() -> str:
       font-kerning: none;
       letter-spacing: 0 !important;
       line-height: 1;
+      font-size: 144%;
     }
-    #mQ .qch {
+    #mQ .qch, #mLoss .qch, #mGrad .qch, #mRplF .qch {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 0.70em;
-      min-width: 0.70em;
+      width: 0.72em;
+      min-width: 0.72em;
+    }
+    #mRplF {
+      font-size: 100%;
     }
     .mini-metric-card .mini-inline {
       display: grid;
@@ -676,6 +726,32 @@ def _render_dashboard_html() -> str:
       min-width: 0;
       white-space: nowrap;
       font-size: 21px;
+    }
+    .record-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 2px;
+      position: relative;
+      z-index: 2;
+    }
+    .record-label {
+      font-size: 10px;
+      color: var(--muted);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .record-value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 11px;
+      color: #c8e8ff;
+      letter-spacing: 0.3px;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45);
+      filter:
+        drop-shadow(0 0 6px rgba(60, 130, 255, 0.5));
     }
     .mini-metric-card .mini-canvas {
       width: 100%;
@@ -692,6 +768,7 @@ def _render_dashboard_html() -> str:
       flex: 0 0 auto;
       justify-self: end;
     }
+    /* Per-metric status LED (colored via JS) */
     .metric-led {
       width: 10px;
       height: 10px;
@@ -699,7 +776,6 @@ def _render_dashboard_html() -> str:
       background: var(--neonRed);
       box-shadow: 0 0 0 4px rgba(255, 42, 85, 0.24), 0 0 12px rgba(255, 42, 85, 0.58);
       flex: 0 0 auto;
-      animation: ledPulse 1.4s ease-in-out infinite;
     }
     .gauge-card {
       grid-column: span 2;
@@ -739,13 +815,7 @@ def _render_dashboard_html() -> str:
       gap: 8px;
       padding: 0 4px;
     }
-    .gauge-readout {
-      display: none;
-    }
-    .gauge-canvas-wrap,
-    .gauge-foot {
-      display: none;
-    }
+    /* ── Chart panels ────────────────────────────────────────────── */
     .charts {
       display: grid;
       grid-template-columns: repeat(2, minmax(320px, 1fr));
@@ -803,23 +873,7 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
-    /* Low-GPU mode: disable continuous compositing-heavy effects. */
-    body::before,
-    body::after,
-    .top::before,
-    .card::before,
-    .panel::before,
-    .dot,
-    .metric-led {
-      animation: none !important;
-    }
-    .top, .card, .panel {
-      backdrop-filter: none;
-    }
-    body::after {
-      mix-blend-mode: normal;
-      opacity: 0.10;
-    }
+    /* ── Responsive breakpoints ───────────────────────────────────── */
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
       .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
@@ -833,6 +887,11 @@ def _render_dashboard_html() -> str:
     }
   </style>
 </head>
+<!-- ══════════════════════════════════════════════════════════════════
+     HTML MARKUP — Dashboard layout: cards grid, gauge canvases,
+     mini-metric cards with sparklines, time-series chart panels,
+     and the header bar (rendered last, positioned via CSS grid).
+     ══════════════════════════════════════════════════════════════════ -->
 <body>
   <main>
     <section class="cards">
@@ -854,6 +913,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mDqnRwrd">0</div>
           <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recDqnRwrd">—</span></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
         <div class="label">AVG REWARD 1M</div>
@@ -861,6 +921,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mRwrd">0</div>
           <canvas id="cRewardMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recRwrd">—</span></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
         <div class="label">Avg Level</div>
@@ -868,6 +929,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mLevel">0.0</div>
           <canvas id="cLevelMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recLevel">—</span></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(255,160,80,0.66);--card-glow:rgba(255,140,60,0.26)">
         <div class="label">EPISODE LENGTH</div>
@@ -875,6 +937,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mEpLen">0</div>
           <canvas id="cEpLenMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
       </article>
       <article class="card mini-metric-card card-half" style="--card-border:rgba(180,80,255,0.66);--card-glow:rgba(160,50,255,0.26)">
         <div class="label">Loss</div>
@@ -956,7 +1019,7 @@ def _render_dashboard_html() -> str:
     <section class="top">
       <div class="title">
         <h1>Tempest AI Dashboard</h1>
-        <div class="subtitle">Primary training and runtime telemetry (live)</div>
+        <div class="subtitle" id="modelDesc">Loading model info…</div>
       </div>
       <div class="top-right">
         <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
@@ -968,6 +1031,9 @@ def _render_dashboard_html() -> str:
   <audio id="bgAudio" preload="auto" autoplay></audio>
 
   <script>
+    /* ══════════════════════════════════════════════════════════════
+     * CONSTANTS — Refresh rates, history depth, gauge ranges
+     * ══════════════════════════════════════════════════════════════ */
     const num = new Intl.NumberFormat("en-US");
     const DASH_MAX_FPS = 30;
     const DASH_DEFAULT_FPS = 2;
@@ -1022,6 +1088,9 @@ def _render_dashboard_html() -> str:
       } catch (_) {}
       return `c_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     })();
+    /* ══════════════════════════════════════════════════════════════
+     * AUDIO — Background music playlist with cookie-based preference
+     * ══════════════════════════════════════════════════════════════ */
     const bgAudio = document.getElementById("bgAudio");
     const audioToggle = document.getElementById("audioToggle");
     let audioPlaylist = [];
@@ -1029,10 +1098,11 @@ def _render_dashboard_html() -> str:
     let audioEnabled = false;
     let audioRetryTimer = null;
 
+    /* ══════════════════════════════════════════════════════════════
+     * DOM REFERENCES — Metric card elements, record labels, gauges
+     * ══════════════════════════════════════════════════════════════ */
     const cards = {
       frame: document.getElementById("mFrame"),
-      fps: document.getElementById("mFps"),
-      steps: document.getElementById("mSteps"),
       clients: document.getElementById("mClients"),
       web: document.getElementById("mWeb"),
       level: document.getElementById("mLevel"),
@@ -1051,6 +1121,14 @@ def _render_dashboard_html() -> str:
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
     };
+    const recEls = {
+      dqnRwrd: document.getElementById("recDqnRwrd"),
+      rwrd: document.getElementById("recRwrd"),
+      level: document.getElementById("recLevel"),
+      epLen: document.getElementById("recEpLen"),
+    };
+    const modelDescEl = document.getElementById("modelDesc");
+    const recordHighs = { dqnRwrd: -Infinity, rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
 
@@ -1092,6 +1170,9 @@ def _render_dashboard_html() -> str:
 
       requestAnimationFrame(gaugeAnimationLoop);
     }
+    // Draw gauges once at zero so they appear before any data arrives
+    drawFpsGauge(fpsGaugeCanvas, 0, null);
+    drawStepGauge(stepGaugeCanvas, 0, null);
     requestAnimationFrame(gaugeAnimationLoop);
 
     const charts = {
@@ -1234,7 +1315,45 @@ def _render_dashboard_html() -> str:
       if (v === null || v === undefined || Number.isNaN(v)) return "+0";
       const n = Number(v);
       const mag = Math.abs(n).toFixed(d);
-      return (n < 0 ? "-" : "+") + mag;
+      // Pad integer part to 2 digits so display stays fixed-width
+      const [ip, fp] = mag.split(".");
+      const padded = ip.padStart(2, "0") + (fp !== undefined ? "." + fp : "");
+      return (n < 0 ? "-" : "+") + padded;
+    }
+
+    function fmtPaddedFloat(v, intDigits = 2, decDigits = 2, padChar = "0") {
+      if (v === null || v === undefined || Number.isNaN(v)) return "0";
+      const n = Math.abs(Number(v));
+      const [ip, fp] = n.toFixed(decDigits).split(".");
+      return ip.padStart(intDigits, padChar) + (fp !== undefined ? "." + fp : "");
+    }
+
+    function qColor(v) {
+      // Color by absolute magnitude relative to C51 support [-100,100]
+      const m = Math.abs(v);
+      if (m < 20) return "#39ff14";         // green – healthy
+      if (m < 40) return "#b8ff14";         // yellow-green
+      if (m < 60) return "#ffe014";         // yellow – concerning
+      if (m < 80) return "#ff8c14";         // orange – warning
+      return "#ff2020";                      // red – exploding
+    }
+
+    function toColoredQRange(qMin, qMax) {
+      const minStr = fmtSignedFloat(qMin, 1);
+      const maxStr = fmtSignedFloat(qMax, 1);
+      const minColor = qColor(qMin);
+      const maxColor = qColor(qMax);
+      function coloredCells(text, color) {
+        return Array.from(String(text)).map((ch) => {
+          const html = (ch === " ") ? "&nbsp;" : ch
+            .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+          return `<span class="qch" style="color:${color};text-shadow:0 0 6px ${color}44">${html}</span>`;
+        }).join("");
+      }
+      return coloredCells(minStr, minColor) +
+             `<span class="qch">,</span>` +
+             coloredCells(maxStr, maxColor);
     }
 
     function toFixedCharCells(text) {
@@ -1394,6 +1513,10 @@ def _render_dashboard_html() -> str:
       if (audioEnabled) ensureAudioPlaying();
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * STATUS & LED INDICATORS — Connection dot, inference/replay LEDs
+     * Colors change based on metric thresholds (green/yellow/red).
+     * ══════════════════════════════════════════════════════════════ */
     function setConnected(connected) {
       const dot = document.getElementById("statusDot");
       const text = document.getElementById("statusText");
@@ -1463,6 +1586,58 @@ def _render_dashboard_html() -> str:
       ctx.closePath();
     }
 
+    /* ── VFD bloom text helper ───────────────────────────────────────
+     * Draws multi-layer glowing text simulating a vacuum fluorescent
+     * display (VFD).  Each layer is progressively brighter and tighter
+     * to create a realistic bloom/glow effect.
+     *
+     * @param {CanvasRenderingContext2D} ctx   Canvas context
+     * @param {string}  text    The text to render
+     * @param {number}  x, y   Position to draw at
+     * @param {Array}   layers  Array of {fill, shadow, blur} objects,
+     *                          ordered widest/faintest → tightest/brightest.
+     *                          Each layer is drawn twice for extra intensity.
+     * @param {object}  crisp   Final crisp layer: {fill, shadow, blur}
+     */
+    function drawBloomText(ctx, text, x, y, layers, crisp) {
+      for (const l of layers) {
+        ctx.fillStyle = l.fill;
+        ctx.shadowColor = l.shadow;
+        ctx.shadowBlur = l.blur;
+        ctx.fillText(text, x, y);
+        ctx.fillText(text, x, y);
+      }
+      ctx.fillStyle = crisp.fill;
+      ctx.shadowColor = crisp.shadow;
+      ctx.shadowBlur = crisp.blur;
+      ctx.fillText(text, x, y);
+      ctx.shadowBlur = 0;
+    }
+
+    /* VFD bloom color presets for gauge sub-text */
+    const VFD_BLOOM_ORANGE = {
+      layers: [
+        { fill: "rgba(180, 80, 0, 0.50)",  shadow: "rgba(255, 100, 0, 0.60)",  blur: 48 },
+        { fill: "rgba(220, 120, 10, 0.70)", shadow: "rgba(255, 130, 10, 0.70)", blur: 28 },
+        { fill: "rgba(240, 160, 30, 0.80)", shadow: "rgba(255, 160, 20, 0.80)", blur: 14 },
+        { fill: "rgba(255, 190, 60, 0.90)", shadow: "rgba(255, 180, 40, 0.90)", blur: 5 },
+      ],
+      crisp: { fill: "#ffaa33", shadow: "rgba(255, 140, 20, 0.60)", blur: 10 },
+    };
+    const VFD_BLOOM_BLUE = {
+      layers: [
+        { fill: "rgba(60, 120, 255, 0.50)",  shadow: "rgba(60, 130, 255, 0.80)",  blur: 52 },
+        { fill: "rgba(80, 140, 255, 0.65)",  shadow: "rgba(80, 150, 255, 0.85)",  blur: 30 },
+        { fill: "rgba(100, 160, 255, 0.75)", shadow: "rgba(100, 170, 255, 0.90)", blur: 16 },
+        { fill: "rgba(140, 190, 255, 0.85)", shadow: "rgba(120, 180, 255, 0.95)", blur: 6 },
+      ],
+      crisp: { fill: "#c8e8ff", shadow: "rgba(80, 160, 255, 0.70)", blur: 12 },
+    };
+
+    /* ══════════════════════════════════════════════════════════════
+     * GAUGE RENDERING — Analogue-style gauge with needle, color arc,
+     * VFD sub-text, and LED odometer badge.
+     * ══════════════════════════════════════════════════════════════ */
     function drawStyledGauge(canvas, valueRaw, cfg) {
       if (!canvas) return;
 
@@ -1502,29 +1677,6 @@ def _render_dashboard_html() -> str:
         const t = (clampVal(v) - minV) / spanV;
         return startRad + (t * (endRad - startRad));
       };
-
-      // Outer glow + bezel (metallic ring style). [TEMPORARILY HIDDEN]
-      /*
-      const glow = ctx.createRadialGradient(cx, cy, radius * 0.9, cx, cy, radius * 1.22);
-      glow.addColorStop(0.0, "rgba(0, 0, 0, 0.00)");
-      glow.addColorStop(1.0, "rgba(0, 0, 0, 0.55)");
-      ctx.fillStyle = glow;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius * 1.22, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.lineWidth = Math.max(10, radius * 0.14);
-      const bezel = ctx.createLinearGradient(cx - radius, cy - radius, cx + radius, cy + radius);
-      bezel.addColorStop(0.0, "#8f979f");
-      bezel.addColorStop(0.20, "#31373d");
-      bezel.addColorStop(0.55, "#14181d");
-      bezel.addColorStop(0.80, "#6f7881");
-      bezel.addColorStop(1.0, "#d8dde1");
-      ctx.strokeStyle = bezel;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius * 1.15, 0, Math.PI * 2);
-      ctx.stroke();
-      */
 
       // Dial face.
       const face = ctx.createRadialGradient(cx, cy - radius * 0.5, radius * 0.2, cx, cy, radius * 1.02);
@@ -1735,16 +1887,16 @@ def _render_dashboard_html() -> str:
 
       // Sub-text above the badge (e.g. total training steps) — VFD odometer display
       if (cfg.sub_text) {
-        const subFont = `400 ${Math.max(12, Math.round(radius * 0.156))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+        const subFont = `400 ${Math.max(10, Math.round(radius * 0.125))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
         ctx.font = subFont;
         ctx.textAlign = "right";
         ctx.textBaseline = "middle";
         // Fixed width: measure max-width template so box never resizes
         const maxTemplate = "8,888,888,888";
         const tmMax = ctx.measureText(maxTemplate);
-        const odoPad = radius * 0.12;
+        const odoPad = radius * 0.05;
         const odoW = tmMax.width + odoPad * 2;
-        const odoH = Math.max(16, Math.round(radius * 0.20));
+        const odoH = Math.max(14, Math.round(radius * 0.16));
         const odoX = cx - odoW * 0.5;
         const odoY = badgeY - odoH - 3;
         const odoR = Math.max(3, radius * 0.035);
@@ -1765,61 +1917,8 @@ def _render_dashboard_html() -> str:
         ctx.restore();
         // Text centered in the VFD box
         const subTextY = odoY + odoH * 0.5;
-        if (odoColor === "orange") {
-          // 5-layer bloom in orange — doubled intensity
-          ctx.fillStyle = "rgba(180, 80, 0, 0.50)";
-          ctx.shadowColor = "rgba(255, 100, 0, 0.60)";
-          ctx.shadowBlur = 48;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(220, 120, 10, 0.70)";
-          ctx.shadowColor = "rgba(255, 130, 10, 0.70)";
-          ctx.shadowBlur = 28;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(240, 160, 30, 0.80)";
-          ctx.shadowColor = "rgba(255, 160, 20, 0.80)";
-          ctx.shadowBlur = 14;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(255, 190, 60, 0.90)";
-          ctx.shadowColor = "rgba(255, 180, 40, 0.90)";
-          ctx.shadowBlur = 5;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          // Crisp orange text on top with residual glow
-          ctx.fillStyle = "#ffaa33";
-          ctx.shadowColor = "rgba(255, 140, 20, 0.60)";
-          ctx.shadowBlur = 10;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.shadowBlur = 0;
-        } else {
-          // 5-layer bloom in blue — strong glow visible against dark housing
-          ctx.fillStyle = "rgba(60, 120, 255, 0.50)";
-          ctx.shadowColor = "rgba(60, 130, 255, 0.80)";
-          ctx.shadowBlur = 52;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(80, 140, 255, 0.65)";
-          ctx.shadowColor = "rgba(80, 150, 255, 0.85)";
-          ctx.shadowBlur = 30;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(100, 160, 255, 0.75)";
-          ctx.shadowColor = "rgba(100, 170, 255, 0.90)";
-          ctx.shadowBlur = 16;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(140, 190, 255, 0.85)";
-          ctx.shadowColor = "rgba(120, 180, 255, 0.95)";
-          ctx.shadowBlur = 6;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          // Crisp blue-white text on top with residual glow
-          ctx.fillStyle = "#c8e8ff";
-          ctx.shadowColor = "rgba(80, 160, 255, 0.70)";
-          ctx.shadowBlur = 12;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.shadowBlur = 0;
-        }
+        const bloom = (odoColor === "orange") ? VFD_BLOOM_ORANGE : VFD_BLOOM_BLUE;
+        drawBloomText(ctx, cfg.sub_text, subX, subTextY, bloom.layers, bloom.crisp);
       }
 
       const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
@@ -1902,6 +2001,10 @@ def _render_dashboard_html() -> str:
       });
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * CHART RENDERING — Time-series line charts with gradient fill,
+     * smoothing, grid, axes, and auto-scaled Y range.
+     * ══════════════════════════════════════════════════════════════ */
     function drawChart(canvas, history, seriesDefs, maxLookbackSec = (5 * 60), useLinearTime = false) {
       const points = Array.isArray(history) ? history : [];
       const width = canvas.clientWidth || 320;
@@ -2353,6 +2456,7 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    /* ── Mini chart (sparkline) for inline card display ─────────── */
     function drawMiniChart(canvas, history, seriesDefs) {
       if (!canvas) return;
       const points = history.slice(-240);
@@ -2616,29 +2720,48 @@ def _render_dashboard_html() -> str:
       return out;
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * CARD UPDATER — Pushes latest snapshot values into DOM elements,
+     * updates record highs, and sets model description.
+     * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
       cards.frame.textContent = fmtInt(now.frame_count);
-      if (cards.fps) cards.fps.textContent = fmtInt(now.fps);
-      if (cards.steps) cards.steps.textContent = fmtInt(smoothedSteps);
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
       cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)} ms`;
       setInfLed(now.avg_inf_ms);
-      cards.rplf.textContent = fmtFloat(now.rpl_per_frame, 2);
+      cards.rplf.innerHTML = toFixedCharCells(fmtPaddedFloat(now.rpl_per_frame, 2, 2, " "));
       setRplLed(now.rpl_per_frame);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.rwrd.textContent = fmtInt(now.total_1m);
       cards.dqnRwrd.textContent = fmtInt(now.dqn_1m);
-      cards.loss.textContent = fmtFloat(now.loss, 2);
-      cards.grad.textContent = fmtFloat(now.grad_norm, 3);
+      cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
+      cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
       cards.buf.textContent = fmtInt(now.memory_buffer_size);
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
       cards.q.innerHTML = (now.q_min === null || now.q_max === null)
         ? toFixedCharCells("-")
-        : toFixedCharCells(`${fmtSignedFloat(now.q_min, 1)},${fmtSignedFloat(now.q_max, 1)}`);
+        : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
+
+      // ── Record highs ──────────────────────────────────────────────
+      const recPairs = [
+        ["dqnRwrd", now.dqn_1m, fmtInt],
+        ["rwrd", now.peak_episode_reward, fmtInt],
+        ["level", now.peak_level, v => "LEVEL " + Math.round(v)],
+        ["epLen", now.eplen_1m, fmtInt],
+      ];
+      for (const [k, v, fmt] of recPairs) {
+        if (v != null && isFinite(v) && v > recordHighs[k]) {
+          recordHighs[k] = v;
+          if (recEls[k]) recEls[k].textContent = fmt(v);
+        }
+      }
+
+      // ── Model description ─────────────────────────────────────────
+      if (now.model_desc && modelDescEl) modelDescEl.textContent = now.model_desc;
     }
 
     function render(payload) {
@@ -2698,22 +2821,23 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * DATA FETCH LOOP — Polls /api/now and /api/ping at intervals,
+     * maintains history cache, and triggers re-renders.
+     * ══════════════════════════════════════════════════════════════ */
     async function fetchNow() {
       try {
         const res = await fetch(`/api/now?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const now = await res.json();
-        const hadNow = !!latestNow;
         latestNow = now;
         const ts = Number(now && now.ts);
-        let hasNewSample = false;
         if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
           historyCache.push(now);
           if (historyCache.length > MAX_HISTORY_POINTS) {
             historyCache.shift();
           }
           lastTs = ts;
-          hasNewSample = true;
         }
         renderCurrent();
         setConnected(true);
@@ -2768,7 +2892,12 @@ def _render_dashboard_html() -> str:
     fetchHistory().then(() => fetchNow()).catch(() => {});
     setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
-    window.addEventListener("resize", () => renderCurrent());
+    window.addEventListener("resize", () => {
+      renderCurrent();
+      // Force gauge repaint since canvas dimensions changed
+      drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
+      drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+    });
   </script>
 </body>
 </html>

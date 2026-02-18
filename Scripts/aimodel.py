@@ -26,7 +26,7 @@ def _flushing_print(*args, **kwargs):
     return _original_print(*args, **kwargs)
 builtins.print = _flushing_print
 
-import os, sys, time, struct, random, math, warnings, threading, queue, traceback
+import os, sys, time, struct, random, math, warnings, threading, queue, traceback, shutil
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 from collections import deque
@@ -903,9 +903,23 @@ class RainbowAgent:
             "epsilon": ep,
             "engine_version": 2,
         }
+        if hasattr(self, "grad_scaler") and self.grad_scaler is not None:
+            ckpt["grad_scaler_state_dict"] = self.grad_scaler.state_dict()
         if show_status:
             self._text_progress("  Model save", 0.0)
-        torch.save(ckpt, filepath)
+
+        # Backup existing checkpoint before overwriting
+        if os.path.exists(filepath):
+            try:
+                shutil.copy2(filepath, filepath + ".bak")
+            except Exception as e:
+                print(f"  [WARN] Backup copy failed: {e}")
+
+        # Atomic save: write to .tmp then rename
+        tmp_path = filepath + ".tmp"
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, filepath)
+
         if show_status:
             self._text_progress("  Model save", 1.0)
         if is_forced_save and show_status:
@@ -943,6 +957,13 @@ class RainbowAgent:
                     self.optimizer.load_state_dict(opt_sd)
                 except Exception as e:
                     print(f"Optimizer state skipped: {e}")
+
+            gs_sd = ckpt.get("grad_scaler_state_dict")
+            if gs_sd and hasattr(self, "grad_scaler") and self.grad_scaler is not None:
+                try:
+                    self.grad_scaler.load_state_dict(gs_sd)
+                except Exception as e:
+                    print(f"GradScaler state skipped: {e}")
 
             self.training_steps = ckpt.get("training_steps", 0)
             self.loaded_training_steps = self.training_steps
