@@ -255,6 +255,15 @@ class MetricsData:
                 self.frames_last_second = 0
                 self.last_fps_time = now
 
+    def get_fps(self) -> float:
+        """Return current FPS, decaying to 0 if no frames arrive for >2s."""
+        with self.lock:
+            if self.last_fps_time > 0:
+                stale = time.time() - self.last_fps_time
+                if stale >= 2.0:
+                    self.fps = 0.0
+            return float(self.fps)
+
     def get_epsilon(self):
         with self.lock:
             return float(self.epsilon)

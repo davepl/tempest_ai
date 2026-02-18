@@ -281,9 +281,10 @@ class _DashboardState:
         inv_obj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "obj_reward_scale", 1.0)))
         inv_subj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "subj_reward_scale", 1.0)))
 
+        fps = self.metrics.get_fps()
+
         with self.metrics.lock:
             frame_count = int(self.metrics.frame_count)
-            fps = float(self.metrics.fps)
             epsilon_raw = float(self.metrics.epsilon)
             epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
             expert_ratio = float(self.metrics.expert_ratio)
@@ -1002,10 +1003,6 @@ def _render_dashboard_html() -> str:
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
       <article class="card mini-metric-card card-half" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,235,0.26)">
         <div class="label">AGREEMENT</div>
         <div class="mini-inline">
@@ -1013,6 +1010,10 @@ def _render_dashboard_html() -> str:
           <canvas id="cAgreeMini" class="mini-canvas"></canvas>
         </div>
       </article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
@@ -1326,14 +1327,14 @@ def _render_dashboard_html() -> str:
         canvas: document.getElementById("cRewardMini"),
         series: [
           { key: "total_5m", color: "#3b82f6" },
-          { key: "total_1m", color: "#22c55e" }
+          { key: "total_1m", color: "#22c55e", linearTime: true }
         ]
       },
       dqnRewardMini: {
         canvas: document.getElementById("cDqnRewardMini"),
         series: [
           { key: "dqn_5m", color: "#3b82f6" },
-          { key: "dqn_1m", color: "#f59e0b" }
+          { key: "dqn_1m", color: "#f59e0b", linearTime: true }
         ]
       },
       lossMini: {
@@ -1357,8 +1358,8 @@ def _render_dashboard_html() -> str:
       agreeMini: {
         canvas: document.getElementById("cAgreeMini"),
         series: [
-          { key: "agreement_1m", color: "#00c8ff", axis: { min: 0, max: 1 } },
-          { key: "agreement", color: "#0090cc55", axis: { min: 0, max: 1 } }
+          { key: "agreement_1m", color: "#00c8ff", axis: { min: 0, min_range: 0.10 } },
+          { key: "agreement", color: "#0090cc55", axis: { min: 0, min_range: 0.10 } }
         ]
       }
     };
@@ -2556,6 +2557,8 @@ def _render_dashboard_html() -> str:
 
       const hasFixedMin = Number.isFinite(seriesDefs?.[0]?.axis?.min);
       const hasFixedMax = Number.isFinite(seriesDefs?.[0]?.axis?.max);
+      const minRange = Number.isFinite(seriesDefs?.[0]?.axis?.min_range)
+        ? Number(seriesDefs[0].axis.min_range) : 0;
       let minV = hasFixedMin ? Number(seriesDefs[0].axis.min) : Math.min(...values);
       let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
       if (maxV <= minV) {
@@ -2564,6 +2567,20 @@ def _render_dashboard_html() -> str:
         const p = (maxV - minV) * 0.08;
         if (!hasFixedMin) minV -= p;
         if (!hasFixedMax) maxV += p;
+      }
+      // Enforce minimum visible range (expand around midpoint, respecting fixed bounds)
+      if (minRange > 0 && (maxV - minV) < minRange) {
+        const mid = (minV + maxV) * 0.5;
+        minV = mid - minRange * 0.5;
+        maxV = mid + minRange * 0.5;
+        if (hasFixedMin && minV < Number(seriesDefs[0].axis.min)) {
+          minV = Number(seriesDefs[0].axis.min);
+          maxV = minV + minRange;
+        }
+        if (hasFixedMax && maxV > Number(seriesDefs[0].axis.max)) {
+          maxV = Number(seriesDefs[0].axis.max);
+          minV = maxV - minRange;
+        }
       }
 
       // Logarithmic time-compressed x-axis (same anchors as big charts)
@@ -2605,7 +2622,7 @@ def _render_dashboard_html() -> str:
         };
       };
       const fracFromAge = buildSpline(AGE_A, FRAC_A);
-      const xAt = (i) => {
+      const xAtLog = (i) => {
         if (!hasTs) {
           const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
           return padL + (t * plotW);
@@ -2616,6 +2633,11 @@ def _render_dashboard_html() -> str:
         const frac = fracFromAge(age);
         return padL + ((1.0 - frac) * plotW);
       };
+      const xAtLinear = (i) => {
+        const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+        return padL + (t * plotW);
+      };
+      const xAt = xAtLog;
       const yAt = (v) => {
         const t = (v - minV) / (maxV - minV);
         return padTop + ((1.0 - t) * plotH);
@@ -2671,6 +2693,7 @@ def _render_dashboard_html() -> str:
 
       const n = points.length;
       for (const s of seriesDefs) {
+        const xFn = s.linearTime ? xAtLinear : xAtLog;
         const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : MINI_CHART_VALUE_SMOOTH_ALPHA;
         ctx.strokeStyle = s.color;
         ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
@@ -2683,7 +2706,7 @@ def _render_dashboard_html() -> str:
           for (let i = n - 1; i >= 0; i--) {
             const val = Number(points[i][s.key]);
             if (!Number.isFinite(val)) continue;
-            const x = xAt(i);
+            const x = xFn(i);
             const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
             const b = bins.get(xPx);
             if (b) {
@@ -2716,7 +2739,7 @@ def _render_dashboard_html() -> str:
             smoothVal = (smoothVal === null)
               ? val
               : (smoothVal + ((val - smoothVal) * smoothAlpha));
-            const x = xAt(i);
+            const x = xFn(i);
             const y = yAt(smoothVal);
             if (!started) {
               ctx.moveTo(x, y);
