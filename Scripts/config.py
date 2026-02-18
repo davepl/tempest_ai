@@ -50,7 +50,7 @@ class RLConfigData:
         return self.num_firezap_actions * self.num_spinner_actions
 
     # ── network architecture ────────────────────────────────────────────
-    trunk_hidden: int = 256
+    trunk_hidden: int = 384
     trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
@@ -59,8 +59,8 @@ class RLConfigData:
     use_enemy_attention: bool = True
     enemy_slots: int = 7
     enemy_features: int = 6
-    attn_heads: int = 4
-    attn_dim: int = 64
+    attn_heads: int = 8
+    attn_dim: int = 128
 
     # Distributional C51
     # Support scaled to match Rainbow's 20:1 ratio (support range / reward_clip).
@@ -76,17 +76,17 @@ class RLConfigData:
 
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 256
-    lr: float = 6.25e-5
+    lr: float = 5e-5
     lr_min: float = 2e-5                  # Higher floor keeps learning alive across restarts
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 2_000_000       # Longer period to prevent destructive restarts
+    lr_cosine_period: int = 3_000_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
     max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 10_000_000
+    memory_size: int = 15_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -95,7 +95,7 @@ class RLConfigData:
     min_replay_to_train: int = 10_000
 
     # Target network (periodic hard sync; moderate refresh for stable learning)
-    target_update_period: int = 2_000
+    target_update_period: int = 2_500
     target_tau: float = 1.0
 
     # Gradient
@@ -104,7 +104,7 @@ class RLConfigData:
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
-    epsilon_decay_frames: int = 1_000_000
+    epsilon_decay_frames: int = 500_000
     # Late-training exploration pulses to escape local optima.
     epsilon_pulse_max: float = 0.25
     epsilon_pulse_period_frames: int = 500_000
@@ -114,7 +114,7 @@ class RLConfigData:
     # Expert guidance
     expert_ratio_start: float = 0.50
     expert_ratio_end: float = 0.02
-    expert_ratio_decay_frames: int = 10_000_000
+    expert_ratio_decay_frames: int = 5_000_000
     expert_ratio: float = 0.50
     # During tube zoom (gamestate 0x20), temporarily boost expert usage.
     expert_ratio_zoom_multiplier: float = 2.0
@@ -218,6 +218,8 @@ class MetricsData:
     last_priority_mean: float = 0.0
 
     average_level: float = 0.0
+    peak_level: int = 0
+    peak_episode_reward: float = 0.0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
@@ -228,6 +230,7 @@ class MetricsData:
     manual_expert_override: bool = False
     override_epsilon: bool = False
     manual_epsilon_override: bool = False
+    epsilon_pulse_enabled: bool = True
     training_enabled: bool = True
     verbose_mode: bool = False
     saved_expert_ratio: float = 0.50
@@ -260,9 +263,12 @@ class MetricsData:
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
     @staticmethod
-    def _natural_epsilon_for_frame(frame_count: int) -> float:
+    def _natural_epsilon_for_frame(frame_count: int, pulse_enabled: bool = True) -> float:
         progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
         base = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
+
+        if not pulse_enabled:
+            return base
 
         pulse_max = float(getattr(RL_CONFIG, "epsilon_pulse_max", base))
         pulse_period = int(getattr(RL_CONFIG, "epsilon_pulse_period_frames", 0))
@@ -279,7 +285,9 @@ class MetricsData:
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
-            self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
+            self.epsilon = self._natural_epsilon_for_frame(
+                int(self.frame_count), pulse_enabled=self.epsilon_pulse_enabled
+            )
             return self.epsilon
 
     def get_expert_ratio(self):
@@ -316,6 +324,8 @@ class MetricsData:
             if length > 0:
                 self.episode_length_sum_interval += length
                 self.episode_length_count_interval += 1
+            if float(total) > self.peak_episode_reward:
+                self.peak_episode_reward = float(total)
 
     def increment_total_controls(self):
         with self.lock:
@@ -359,6 +369,10 @@ class MetricsData:
     def toggle_verbose_mode(self, kb=None):
         with self.lock:
             self.verbose_mode = not self.verbose_mode
+
+    def toggle_epsilon_pulse(self, kb=None):
+        with self.lock:
+            self.epsilon_pulse_enabled = not self.epsilon_pulse_enabled
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:

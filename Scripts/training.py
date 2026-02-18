@@ -164,6 +164,11 @@ def train_step(agent, prefetched_batch=None) -> float | None:
                 weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
                 bc_loss_val = float(bc_loss.detach().item())
 
+    # ── NaN / Inf guard ───────────────────────────────────────────────────
+    if not torch.isfinite(weighted_loss):
+        print(f"[WARN] Non-finite loss detected ({weighted_loss.item():.4g}), skipping step")
+        return None
+
     # ── Optimise ────────────────────────────────────────────────────────
     try:
         agent.optimizer.zero_grad(set_to_none=True)
