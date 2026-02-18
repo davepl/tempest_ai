@@ -149,7 +149,7 @@ class RLConfigData:
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True
-    inference_batch_max_size: int = 32
+    inference_batch_max_size: int = 128
     inference_batch_wait_ms: float = 1.0
     inference_request_timeout_ms: float = 50.0
 
