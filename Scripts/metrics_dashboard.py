@@ -114,6 +114,11 @@ class _DashboardState:
         self._web_clients: dict[str, float] = {}
         self._cached_now_body = b"{}"
         self._model_desc: str | None = None
+        # Agreement 1M window (frame-weighted EMA)
+        self._agree_window: deque = deque()  # [(agreement, frame_delta), ...]
+        self._agree_window_frames: int = 0
+        self._agree_window_weighted: float = 0.0
+        self._last_agree_frame_count: int | None = None
 
     def _clear_level_windows(self):
         for win in self._level_windows.values():
@@ -192,6 +197,46 @@ class _DashboardState:
             _mean_or_level(self._level_windows["5m"]),
         )
 
+    def _update_agreement_window(self, frame_count: int, agreement: float) -> float:
+        """Track agreement over a 1M-frame sliding window, frame-weighted."""
+        agree = round(float(agreement), 6) if math.isfinite(float(agreement)) else 0.0
+        if self._last_agree_frame_count is None:
+            self._last_agree_frame_count = frame_count
+            return agree
+        if frame_count < self._last_agree_frame_count:
+            self._agree_window.clear()
+            self._agree_window_frames = 0
+            self._agree_window_weighted = 0.0
+            self._last_agree_frame_count = frame_count
+            return agree
+        frame_delta = max(0, int(frame_count - self._last_agree_frame_count))
+        self._last_agree_frame_count = frame_count
+        if frame_delta > 0:
+            samples = self._agree_window
+            if samples and abs(samples[-1][0] - agree) < 1e-9:
+                old_a, old_f = samples[-1]
+                samples[-1] = (old_a, old_f + frame_delta)
+            else:
+                samples.append((agree, frame_delta))
+            self._agree_window_frames += frame_delta
+            self._agree_window_weighted += (agree * frame_delta)
+            limit = LEVEL_1M_FRAMES
+            while samples and self._agree_window_frames > limit:
+                overflow = self._agree_window_frames - limit
+                oldest_a, oldest_f = samples[0]
+                if oldest_f <= overflow:
+                    samples.popleft()
+                    self._agree_window_frames -= oldest_f
+                    self._agree_window_weighted -= (oldest_a * oldest_f)
+                else:
+                    samples[0] = (oldest_a, oldest_f - overflow)
+                    self._agree_window_frames -= overflow
+                    self._agree_window_weighted -= (oldest_a * overflow)
+                    break
+        if self._agree_window_frames <= 0:
+            return agree
+        return self._agree_window_weighted / max(1, self._agree_window_frames)
+
     def _get_model_desc(self) -> str:
         if self._model_desc is not None:
             return self._model_desc
@@ -259,6 +304,7 @@ class _DashboardState:
             override_epsilon = bool(self.metrics.override_epsilon)
             inference_requests = int(self.metrics.total_inference_requests)
             inference_time = float(self.metrics.total_inference_time)
+            last_agreement = float(self.metrics.last_agreement)
 
             reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
             reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
@@ -274,6 +320,7 @@ class _DashboardState:
         except Exception:
             total100k_raw = total1m_raw = total5m_raw = 0.0
         level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
+        agreement_1m = self._update_agreement_window(frame_count, last_agreement)
         if inference_requests > 0:
             self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
         avg_inf_ms = self._last_avg_inf_ms
@@ -348,6 +395,8 @@ class _DashboardState:
             "eplen_100k": get_eplen_100k_average(),
             "peak_level": float(self.metrics.peak_level + 1),
             "peak_episode_reward": float(self.metrics.peak_episode_reward) * inv_obj,
+            "agreement": last_agreement,
+            "agreement_1m": agreement_1m,
             "model_desc": self._get_model_desc(),
         }
 
@@ -957,6 +1006,13 @@ def _render_dashboard_html() -> str:
       <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,235,0.26)">
+        <div class="label">AGREEMENT</div>
+        <div class="mini-inline">
+          <div class="value" id="mAgree">00.0%</div>
+          <canvas id="cAgreeMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
@@ -968,7 +1024,6 @@ def _render_dashboard_html() -> str:
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
-      <article class="card card-half" style="--card-border:rgba(0,220,200,0.66);--card-glow:rgba(0,200,180,0.26)"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
     </section>
 
     <section class="charts">
@@ -1102,7 +1157,6 @@ def _render_dashboard_html() -> str:
      * DOM REFERENCES — Metric card elements, record labels, gauges
      * ══════════════════════════════════════════════════════════════ */
     const cards = {
-      frame: document.getElementById("mFrame"),
       clients: document.getElementById("mClients"),
       web: document.getElementById("mWeb"),
       level: document.getElementById("mLevel"),
@@ -1120,6 +1174,7 @@ def _render_dashboard_html() -> str:
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
+      agree: document.getElementById("mAgree"),
     };
     const recEls = {
       dqnRwrd: document.getElementById("recDqnRwrd"),
@@ -1297,6 +1352,13 @@ def _render_dashboard_html() -> str:
         canvas: document.getElementById("cEpLenMini"),
         series: [
           { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
+        ]
+      },
+      agreeMini: {
+        canvas: document.getElementById("cAgreeMini"),
+        series: [
+          { key: "agreement_1m", color: "#00c8ff", axis: { min: 0, max: 1 } },
+          { key: "agreement", color: "#0090cc55", axis: { min: 0, max: 1 } }
         ]
       }
     };
@@ -2504,9 +2566,55 @@ def _render_dashboard_html() -> str:
         if (!hasFixedMax) maxV += p;
       }
 
+      // Logarithmic time-compressed x-axis (same anchors as big charts)
+      const tsVals = points.map(p => Number(p.ts)).filter(v => Number.isFinite(v));
+      const hasTs = tsVals.length >= 2;
+      const newestTs = hasTs ? Math.max(...tsVals) : 0;
+      const oldestTs = hasTs ? Math.min(...tsVals) : 0;
+      const maxAge = hasTs ? Math.max(1e-6, newestTs - oldestTs) : 0;
+      const HARD_MAX = 60 * 60;
+      const axisMax = hasTs ? Math.min(HARD_MAX, maxAge) : HARD_MAX;
+      const sc = axisMax / HARD_MAX;
+      const FRAC_A = [0, 0.25, 0.50, 0.75, 1.0];
+      const AGE_A = [0, 10 * sc, 60 * sc, 600 * sc, axisMax];
+      const buildSpline = (xs, ys) => {
+        const n2 = xs.length;
+        if (n2 < 2) return () => ys[0] || 0;
+        const h2 = [], d2 = [];
+        for (let j = 0; j < n2 - 1; j++) {
+          h2[j] = Math.max(1e-9, xs[j+1] - xs[j]);
+          d2[j] = (ys[j+1] - ys[j]) / h2[j];
+        }
+        const m2 = [d2[0]];
+        for (let j = 1; j < n2 - 1; j++) m2[j] = 0.5 * (d2[j-1] + d2[j]);
+        m2[n2-1] = d2[n2-2];
+        for (let j = 0; j < n2 - 1; j++) {
+          if (Math.abs(d2[j]) <= 1e-12) { m2[j] = 0; m2[j+1] = 0; continue; }
+          const aa = m2[j]/d2[j], bb = m2[j+1]/d2[j];
+          const ss = aa*aa + bb*bb;
+          if (ss > 9) { const tt = 3/Math.sqrt(ss); m2[j]=tt*aa*d2[j]; m2[j+1]=tt*bb*d2[j]; }
+        }
+        return (xr) => {
+          const x2 = Math.max(xs[0], Math.min(xs[n2-1], xr));
+          let k2 = n2 - 2;
+          for (let j = 0; j < n2 - 1; j++) { if (x2 <= xs[j+1]) { k2 = j; break; } }
+          const hk = h2[k2], t2 = (x2 - xs[k2]) / hk;
+          const t22 = t2*t2, t23 = t22*t2;
+          return ((2*t23 - 3*t22 + 1)*ys[k2]) + ((t23 - 2*t22 + t2)*hk*m2[k2])
+               + ((-2*t23 + 3*t22)*ys[k2+1]) + ((t23 - t22)*hk*m2[k2+1]);
+        };
+      };
+      const fracFromAge = buildSpline(AGE_A, FRAC_A);
       const xAt = (i) => {
-        const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
-        return padL + (t * plotW);
+        if (!hasTs) {
+          const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+          return padL + (t * plotW);
+        }
+        const ts = Number(points[i].ts);
+        if (!Number.isFinite(ts)) return padL;
+        const age = Math.max(0, Math.min(axisMax, newestTs - ts));
+        const frac = fracFromAge(age);
+        return padL + ((1.0 - frac) * plotW);
       };
       const yAt = (v) => {
         const t = (v - minV) / (maxV - minV);
@@ -2725,7 +2833,6 @@ def _render_dashboard_html() -> str:
      * updates record highs, and sets model description.
      * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
-      cards.frame.textContent = fmtInt(now.frame_count);
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
@@ -2745,6 +2852,9 @@ def _render_dashboard_html() -> str:
         ? toFixedCharCells("-")
         : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
+      cards.agree.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
+        ? fmtFloat(now.agreement_1m * 100, 1) + "%"
+        : "00.0%";
 
       // ── Record highs ──────────────────────────────────────────────
       const recPairs = [
@@ -2790,6 +2900,7 @@ def _render_dashboard_html() -> str:
       drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
       drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
       drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
+      drawMiniChart(charts.agreeMini.canvas, history60m, charts.agreeMini.series);
     }
 
     let historyCache = [];
