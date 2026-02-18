@@ -216,6 +216,7 @@ class MetricsData:
     last_q_mean: float = 0.0
     last_bc_loss: float = 0.0
     last_priority_mean: float = 0.0
+    last_agreement: float = 0.0
 
     average_level: float = 0.0
     peak_level: int = 0

@@ -220,6 +220,7 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             pred = q_all.argmax(dim=1)
             agree = (pred == actions_t).float().mean().item()
             metrics.last_q_mean = float(q_all.mean().item())
+            metrics.last_agreement = agree
 
         if hasattr(metrics, "agree_sum_interval"):
             metrics.agree_sum_interval += agree
