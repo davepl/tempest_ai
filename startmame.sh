@@ -32,8 +32,7 @@ fi
 
 echo "Launching $COUNT MAME instance(s)..."
 for i in $(seq 1 "$COUNT"); do
-    SDL_VIDEODRIVER=dummy mame tempest1 -nothrottle $SOUND_FLAG \
-        -skip_gameinfo -autoboot_script "$LUA_SCRIPT" &
+    mame tempest1 -nothrottle $SOUND_FLAG -skip_gameinfo -autoboot_script "$LUA_SCRIPT" &
     echo "  Started instance $i (PID $!)"
 done
 echo "All instances launched."
