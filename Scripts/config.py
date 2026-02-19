@@ -121,6 +121,8 @@ class RLConfigData:
     expert_ratio_zoom_gamestate: int = 0x20
     # Suppress random exploration during tube zoom — any lane twitch kills on spikes.
     epsilon_zoom_multiplier: float = 0.2
+    # Probability of zap during epsilon exploration (default 0.5 = uniform).
+    epsilon_zap_prob: float = 0.05
 
     # Expert BC
     expert_bc_weight: float = 1.0
