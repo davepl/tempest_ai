@@ -1244,7 +1244,7 @@ def _render_dashboard_html() -> str:
           {
             key: "steps_per_sec_chart",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] },
+            axis: { side: "right", min: 0, group_keys: ["steps_per_sec_chart", "level_100k"] },
             smooth_alpha: 0.10,
           },
           {
@@ -1271,7 +1271,6 @@ def _render_dashboard_html() -> str:
               side: "left",
               min: 0,
               label_pad: 52,
-              round_max: 1000,
               group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
             }
           },
@@ -1307,7 +1306,7 @@ def _render_dashboard_html() -> str:
           {
             key: "reward_dqn",
             color: "#22c55e",
-            axis: { side: "left", min: 0, label_pad: 52, round_max: 100, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
+            axis: { side: "left", min: 0, label_pad: 52, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
           }
         ]
       },
@@ -1396,7 +1395,7 @@ def _render_dashboard_html() -> str:
       const m = Math.abs(v);
       if (m < 20) return "#39ff14";         // green – healthy
       if (m < 40) return "#b8ff14";         // yellow-green
-      if (m < 60) return "#ffe014";         // yellow – concerning
+      if (m < 60) return "#ff9900";         // amber – concerning
       if (m < 80) return "#ff8c14";         // orange – warning
       return "#ff2020";                      // red – exploding
     }
@@ -1985,8 +1984,8 @@ def _render_dashboard_html() -> str:
       }
 
       const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
-      badgeFill.addColorStop(0.0, "rgba(24, 27, 33, 0.92)");
-      badgeFill.addColorStop(1.0, "rgba(12, 15, 20, 0.96)");
+      badgeFill.addColorStop(0.0, "rgba(44, 10, 12, 0.95)");
+      badgeFill.addColorStop(1.0, "rgba(30, 6, 8, 0.98)");
       roundRectPath(ctx, badgeX, badgeY, badgeW, badgeH, Math.max(8, radius * 0.08));
       ctx.fillStyle = badgeFill;
       ctx.fill();
@@ -2062,6 +2061,20 @@ def _render_dashboard_html() -> str:
         sub_text: stepsText,
         sub_text_color: "orange",
       });
+    }
+
+    /* ═══════════════ Nice-tick interval (1-2-5 sequence) ═══════════════ */
+    function niceInterval(range, targetTicks) {
+      if (!Number.isFinite(range) || range <= 0) return 1;
+      const rawStep = range / Math.max(1, targetTicks);
+      const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const residual = rawStep / mag;
+      let nice;
+      if (residual < 1.5) nice = 1;
+      else if (residual < 3) nice = 2;
+      else if (residual < 7) nice = 5;
+      else nice = 10;
+      return nice * mag;
     }
 
     /* ══════════════════════════════════════════════════════════════
@@ -2272,33 +2285,17 @@ def _render_dashboard_html() -> str:
         if (!hasFixedMax && Number.isFinite(maxFloor)) {
           maxV = Math.max(maxV, maxFloor);
         }
-        const roundMax = Number(s.axis?.round_max);
-        let didRoundMax = false;
-        if (!hasFixedMax && roundMax > 0 && Number.isFinite(roundMax)) {
-          maxV = Math.ceil(maxV / roundMax) * roundMax;
-          didRoundMax = true;
-        }
-        if (maxV < minV) {
-          maxV = minV + 1.0;
-        }
+        if (maxV < minV) maxV = minV + 1.0;
         if (minV === maxV) {
-          if (hasFixedMin && !hasFixedMax) {
-            maxV = minV + 1.0;
-          } else if (!hasFixedMin && hasFixedMax) {
-            minV = maxV - 1.0;
-          } else {
-            minV -= 1.0;
-            maxV += 1.0;
-          }
-        } else {
-          const p = (maxV - minV) * 0.12;
-          if (!hasFixedMin) {
-            minV -= p;
-          }
-          if (!hasFixedMax && !didRoundMax) {
-            maxV += p;
-          }
+          if (hasFixedMin && !hasFixedMax) maxV = minV + 1.0;
+          else if (!hasFixedMin && hasFixedMax) minV = maxV - 1.0;
+          else { minV -= 1.0; maxV += 1.0; }
         }
+        // Nice-tick autoscaling: snap axis bounds to clean 1-2-5 intervals
+        const niceStep = niceInterval(maxV - minV, 4);
+        if (!hasFixedMin) minV = Math.floor(minV / niceStep) * niceStep;
+        if (!hasFixedMax) maxV = Math.ceil(maxV / niceStep) * niceStep;
+        if (maxV <= minV) maxV = minV + niceStep;
 
         const axisX = side === "left"
           ? (padL - 20 - leftAxisOffset)
@@ -2308,9 +2305,16 @@ def _render_dashboard_html() -> str:
         } else {
           rightAxisOffset += axisSlot;
         }
-        const ticks = Array.isArray(s.axis?.ticks) && s.axis.ticks.length
-          ? s.axis.ticks
-          : [minV, minV + (maxV - minV) * 0.25, minV + (maxV - minV) * 0.5, minV + (maxV - minV) * 0.75, maxV];
+        let ticks;
+        if (Array.isArray(s.axis?.ticks) && s.axis.ticks.length) {
+          ticks = s.axis.ticks;
+        } else {
+          ticks = [];
+          for (let t = minV; t <= maxV + niceStep * 0.001; t += niceStep) {
+            ticks.push(t);
+          }
+          if (!ticks.length) ticks = [minV, maxV];
+        }
 
         axes.push({
           key: s.key,
@@ -2320,7 +2324,9 @@ def _render_dashboard_html() -> str:
           min: minV,
           max: maxV,
           ticks,
-          tickDecimals: Number.isFinite(s.axis?.tick_decimals) ? Math.max(0, Number(s.axis.tick_decimals)) : null,
+          tickDecimals: Number.isFinite(s.axis?.tick_decimals)
+            ? Math.max(0, Number(s.axis.tick_decimals))
+            : Math.max(0, -Math.floor(Math.log10(niceStep))),
         });
       }
       if (!axes.length) return;
@@ -2561,13 +2567,12 @@ def _render_dashboard_html() -> str:
         ? Number(seriesDefs[0].axis.min_range) : 0;
       let minV = hasFixedMin ? Number(seriesDefs[0].axis.min) : Math.min(...values);
       let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
-      if (maxV <= minV) {
-        maxV = minV + 1.0;
-      } else {
-        const p = (maxV - minV) * 0.08;
-        if (!hasFixedMin) minV -= p;
-        if (!hasFixedMax) maxV += p;
-      }
+      if (maxV <= minV) maxV = minV + 1.0;
+      // Nice-tick autoscaling for mini charts
+      const miniNiceStep = niceInterval(maxV - minV, 3);
+      if (!hasFixedMin) minV = Math.floor(minV / miniNiceStep) * miniNiceStep;
+      if (!hasFixedMax) maxV = Math.ceil(maxV / miniNiceStep) * miniNiceStep;
+      if (maxV <= minV) maxV = minV + miniNiceStep;
       // Enforce minimum visible range (expand around midpoint, respecting fixed bounds)
       if (minRange > 0 && (maxV - minV) < minRange) {
         const mid = (minV + maxV) * 0.5;

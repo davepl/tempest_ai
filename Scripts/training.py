@@ -214,12 +214,24 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         metrics.last_bc_loss = bc_loss_val
         metrics.last_priority_mean = float(np.mean(td_errors))
 
-        # Agreement (Q-values for display)
+        # Directional agreement: spinner direction sign matches (-1, 0, +1)
         with torch.no_grad():
             q_all = agent.online_net.q_values(states_t)
             pred = q_all.argmax(dim=1)
-            agree = (pred == actions_t).float().mean().item()
             metrics.last_q_mean = float(q_all.mean().item())
+
+            # Extract spinner index from joint action (joint = fz * NUM_SPINNER + sp)
+            num_sp = RL_CONFIG.num_spinner_actions
+            sp_levels = RL_CONFIG.spinner_command_levels
+            pred_sp = pred % num_sp
+            actual_sp = actions_t % num_sp
+            # Map spinner index → direction sign via lookup
+            sign_lut = torch.tensor([1 if v > 0 else (-1 if v < 0 else 0)
+                                     for v in sp_levels],
+                                    device=device, dtype=torch.long)
+            pred_dir = sign_lut[pred_sp]
+            actual_dir = sign_lut[actual_sp]
+            agree = (pred_dir == actual_dir).float().mean().item()
             metrics.last_agreement = agree
 
         if hasattr(metrics, "agree_sum_interval"):

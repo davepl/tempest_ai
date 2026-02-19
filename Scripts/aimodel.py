@@ -105,6 +105,13 @@ def quantize_spinner_value(value: float) -> int:
             best, best_d = i, d
     return best
 
+def _random_firezap() -> int:
+    """Sample a random fire/zap index with reduced superzap probability."""
+    zap_p = float(getattr(RL_CONFIG, 'epsilon_zap_prob', 0.5))
+    fire = random.random() < 0.5
+    zap = random.random() < zap_p
+    return fire_zap_to_discrete(fire, zap)
+
 def combine_action_indices(fz: int, sp: int) -> int:
     return max(0, min(NUM_FIREZAP - 1, fz)) * NUM_SPINNER + max(0, min(NUM_SPINNER - 1, sp))
 
@@ -726,7 +733,7 @@ class RainbowAgent:
     def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int]:
         """Return (firezap_idx, spinner_idx)."""
         if random.random() < epsilon:
-            return random.randrange(NUM_FIREZAP), random.randrange(NUM_SPINNER)
+            return _random_firezap(), random.randrange(NUM_SPINNER)
 
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         q = self._infer_q_values(st)
@@ -755,7 +762,7 @@ class RainbowAgent:
         for i in range(n):
             eps = float(epsilons[i])
             if random.random() < eps:
-                actions[i] = (random.randrange(NUM_FIREZAP), random.randrange(NUM_SPINNER))
+                actions[i] = (_random_firezap(), random.randrange(NUM_SPINNER))
             else:
                 greedy_idx.append(i)
                 greedy_states.append(states[i])
