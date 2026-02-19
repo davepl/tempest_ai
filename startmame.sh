@@ -6,7 +6,13 @@ LUA_SCRIPT="$SCRIPT_DIR/Scripts/main.lua"
 
 if [[ "${1:-}" == "-kill" ]]; then
     echo "Killing all running MAME instances..."
-    pkill -f "mame.*tempest1" && echo "Done." || echo "No MAME instances found."
+    pids=$(ps ax | grep '[m]ame.*tempest1' | awk '{print $1}')
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -9
+        echo "Killed PIDs: $(echo $pids | tr '\n' ' ')"
+    else
+        echo "No MAME instances found."
+    fi
     exit 0
 fi
 
