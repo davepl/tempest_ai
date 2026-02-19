@@ -25,9 +25,14 @@ if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [[ "$COUNT" -lt 1 ]]; then
     exit 1
 fi
 
+SOUND_FLAG=""
+if [[ "$COUNT" -gt 1 ]]; then
+    SOUND_FLAG="-sound none"
+fi
+
 echo "Launching $COUNT MAME instance(s)..."
 for i in $(seq 1 "$COUNT"); do
-    SDL_VIDEODRIVER=dummy mame tempest1 -video none -sound none -nothrottle \
+    SDL_VIDEODRIVER=dummy mame tempest1 -nothrottle $SOUND_FLAG \
         -skip_gameinfo -autoboot_script "$LUA_SCRIPT" &
     echo "  Started instance $i (PID $!)"
 done
