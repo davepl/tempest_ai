@@ -167,7 +167,12 @@ def keyboard_handler(agent, kb):
             elif key == "e":
                 metrics.toggle_expert_mode(kb)
                 display_metrics_row(agent, kb)
-            elif key.lower() == "p":
+            elif key == "P":
+                metrics.toggle_epsilon_pulse(kb)
+                status = "ON" if metrics.epsilon_pulse_enabled else "OFF"
+                print_with_terminal_restore(kb, f"\nEpsilon pulse: {status}")
+                display_metrics_row(agent, kb)
+            elif key == "p":
                 metrics.toggle_epsilon_override(kb)
                 display_metrics_row(agent, kb)
             elif key.lower() == "v":

@@ -113,6 +113,12 @@ class _DashboardState:
         self._last_avg_inf_ms = 0.0
         self._web_clients: dict[str, float] = {}
         self._cached_now_body = b"{}"
+        self._model_desc: str | None = None
+        # Agreement 1M window (frame-weighted EMA)
+        self._agree_window: deque = deque()  # [(agreement, frame_delta), ...]
+        self._agree_window_frames: int = 0
+        self._agree_window_weighted: float = 0.0
+        self._last_agree_frame_count: int | None = None
 
     def _clear_level_windows(self):
         for win in self._level_windows.values():
@@ -191,14 +197,94 @@ class _DashboardState:
             _mean_or_level(self._level_windows["5m"]),
         )
 
+    def _update_agreement_window(self, frame_count: int, agreement: float) -> float:
+        """Track agreement over a 1M-frame sliding window, frame-weighted."""
+        agree = round(float(agreement), 6) if math.isfinite(float(agreement)) else 0.0
+        if self._last_agree_frame_count is None:
+            self._last_agree_frame_count = frame_count
+            return agree
+        if frame_count < self._last_agree_frame_count:
+            self._agree_window.clear()
+            self._agree_window_frames = 0
+            self._agree_window_weighted = 0.0
+            self._last_agree_frame_count = frame_count
+            return agree
+        frame_delta = max(0, int(frame_count - self._last_agree_frame_count))
+        self._last_agree_frame_count = frame_count
+        if frame_delta > 0:
+            samples = self._agree_window
+            if samples and abs(samples[-1][0] - agree) < 1e-9:
+                old_a, old_f = samples[-1]
+                samples[-1] = (old_a, old_f + frame_delta)
+            else:
+                samples.append((agree, frame_delta))
+            self._agree_window_frames += frame_delta
+            self._agree_window_weighted += (agree * frame_delta)
+            limit = LEVEL_1M_FRAMES
+            while samples and self._agree_window_frames > limit:
+                overflow = self._agree_window_frames - limit
+                oldest_a, oldest_f = samples[0]
+                if oldest_f <= overflow:
+                    samples.popleft()
+                    self._agree_window_frames -= oldest_f
+                    self._agree_window_weighted -= (oldest_a * oldest_f)
+                else:
+                    samples[0] = (oldest_a, oldest_f - overflow)
+                    self._agree_window_frames -= overflow
+                    self._agree_window_weighted -= (oldest_a * overflow)
+                    break
+        if self._agree_window_frames <= 0:
+            return agree
+        return self._agree_window_weighted / max(1, self._agree_window_frames)
+
+    def _get_model_desc(self) -> str:
+        if self._model_desc is not None:
+            return self._model_desc
+        cfg = RL_CONFIG
+        try:
+            if self.agent is not None and hasattr(self.agent, 'online_net'):
+                param_count = sum(p.numel() for p in self.agent.online_net.parameters())
+            else:
+                ad = cfg.attn_dim
+                th = cfg.trunk_hidden
+                tl = cfg.trunk_layers
+                ss = cfg.state_size
+                na = cfg.num_firezap_actions * len(cfg.spinner_command_levels)
+                n_atoms = cfg.num_atoms if cfg.use_distributional else 1
+                hm = th // 2
+                attn_p = (5 * ad + ad) + 2 * ad + (14 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
+                trunk_p = (ss + ad) * th + th + 2 * th
+                for _ in range(1, tl):
+                    trunk_p += th * th + th + 2 * th
+                heads_p = 2 * (th * hm + hm) + hm * n_atoms + n_atoms + hm * (na * n_atoms) + na * n_atoms
+                param_count = attn_p + trunk_p + heads_p
+        except Exception:
+            param_count = 0
+        trunk_in = cfg.state_size + (cfg.attn_dim if cfg.use_enemy_attention else 0)
+        layers = [str(trunk_in)]
+        for _ in range(cfg.trunk_layers):
+            layers.append(str(cfg.trunk_hidden))
+        layers.append(str(cfg.trunk_hidden // 2))
+        arch_str = " \u00bb ".join(layers)
+        if param_count >= 1_000_000:
+            p_str = f"{param_count / 1_000_000:.1f}M"
+        elif param_count >= 1_000:
+            p_str = f"{param_count / 1_000:.0f}K"
+        else:
+            p_str = str(param_count)
+        desc = f"Model: {arch_str} \u00b7 {p_str} params"
+        self._model_desc = desc
+        return desc
+
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
         inv_obj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "obj_reward_scale", 1.0)))
         inv_subj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "subj_reward_scale", 1.0)))
 
+        fps = self.metrics.get_fps()
+
         with self.metrics.lock:
             frame_count = int(self.metrics.frame_count)
-            fps = float(self.metrics.fps)
             epsilon_raw = float(self.metrics.epsilon)
             epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
             expert_ratio = float(self.metrics.expert_ratio)
@@ -219,6 +305,7 @@ class _DashboardState:
             override_epsilon = bool(self.metrics.override_epsilon)
             inference_requests = int(self.metrics.total_inference_requests)
             inference_time = float(self.metrics.total_inference_time)
+            last_agreement = float(self.metrics.last_agreement)
 
             reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
             reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
@@ -234,6 +321,7 @@ class _DashboardState:
         except Exception:
             total100k_raw = total1m_raw = total5m_raw = 0.0
         level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
+        agreement_1m = self._update_agreement_window(frame_count, last_agreement)
         if inference_requests > 0:
             self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
         avg_inf_ms = self._last_avg_inf_ms
@@ -306,6 +394,11 @@ class _DashboardState:
             "q_max": q_max,
             "eplen_1m": get_eplen_1m_average(),
             "eplen_100k": get_eplen_100k_average(),
+            "peak_level": float(self.metrics.peak_level + 1),
+            "peak_episode_reward": float(self.metrics.peak_episode_reward) * inv_obj,
+            "agreement": last_agreement,
+            "agreement_1m": agreement_1m,
+            "model_desc": self._get_model_desc(),
         }
 
     def sample(self):
@@ -337,6 +430,9 @@ def _render_dashboard_html() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tempest AI Metrics</title>
   <style>
+    /* ══════════════════════════════════════════════════════════════
+     * FONTS — Custom typefaces for VFD / LED readouts
+     * ══════════════════════════════════════════════════════════════ */
     @font-face {
       font-family: "LED Dot-Matrix";
       src: url("/api/font/LED%20Dot-Matrix.ttf") format("truetype");
@@ -347,6 +443,9 @@ def _render_dashboard_html() -> str:
       src: url("/api/font/DS-DIGI.TTF") format("truetype");
       font-display: swap;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * CSS VARIABLES — Theme colors and neon accents
+     * ══════════════════════════════════════════════════════════════ */
     :root {
       --bg0: #040510;
       --bg1: #0b1433;
@@ -367,6 +466,10 @@ def _render_dashboard_html() -> str:
     }
     * { box-sizing: border-box; }
     *::before, *::after { box-sizing: border-box; }
+    /* ══════════════════════════════════════════════════════════════
+     * BASE LAYOUT — Body background, pseudo-element overlays
+     * Animations intentionally removed for GPU performance.
+     * ══════════════════════════════════════════════════════════════ */
     html, body { margin: 0; padding: 0; color: var(--ink); background: var(--bg0); }
     body {
       font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
@@ -382,6 +485,7 @@ def _render_dashboard_html() -> str:
         linear-gradient(158deg, var(--bg0) 0%, var(--bg1) 58%, var(--bg2) 100%);
       background-attachment: fixed;
     }
+    /* Ambient orb pseudo-element (static — animations disabled for GPU perf) */
     body::before {
       content: "";
       position: fixed;
@@ -392,8 +496,8 @@ def _render_dashboard_html() -> str:
         radial-gradient(circle at 18% 24%, rgba(0, 229, 255, 0.24), transparent 30%),
         radial-gradient(circle at 78% 18%, rgba(255, 43, 214, 0.22), transparent 34%),
         radial-gradient(circle at 68% 78%, rgba(57, 255, 20, 0.18), transparent 36%);
-      animation: orbDrift 20s ease-in-out infinite alternate;
     }
+    /* Subtle color sweep overlay (static for GPU perf) */
     body::after {
       content: "";
       position: fixed;
@@ -401,29 +505,11 @@ def _render_dashboard_html() -> str:
       pointer-events: none;
       z-index: 1;
       background: linear-gradient(90deg, rgba(0, 229, 255, 0.045), transparent 36%, transparent 64%, rgba(255, 43, 214, 0.045));
-      mix-blend-mode: screen;
-      animation: rgbSweep 14s linear infinite;
+      mix-blend-mode: normal;
+      opacity: 0.10;
     }
-    @keyframes orbDrift {
-      0% { transform: translate3d(-2.5%, -2%, 0) scale(1.0); }
-      50% { transform: translate3d(2%, 1.5%, 0) scale(1.08); }
-      100% { transform: translate3d(3%, -1.5%, 0) scale(1.03); }
-    }
-    @keyframes rgbSweep {
-      0% { opacity: 0.15; transform: translateX(-5%); }
-      50% { opacity: 0.42; transform: translateX(5%); }
-      100% { opacity: 0.15; transform: translateX(-5%); }
-    }
-    @keyframes borderShift {
-      0% { background-position: 0% 50%; }
-      50% { background-position: 100% 50%; }
-      100% { background-position: 0% 50%; }
-    }
-    @keyframes ledPulse {
-      0% { transform: scale(0.95); filter: saturate(1.0); }
-      50% { transform: scale(1.10); filter: saturate(1.5); }
-      100% { transform: scale(0.95); filter: saturate(1.0); }
-    }
+    /* @keyframes removed — animations disabled for GPU perf.
+       orbDrift, rgbSweep, borderShift, ledPulse were here. */
     main {
       max-width: 1500px;
       margin: 0 auto;
@@ -433,6 +519,11 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * CARD & PANEL COMPONENTS — Metric cards, gauge cards, borders
+     * Each card gets --card-border and --card-glow via inline style.
+     * ══════════════════════════════════════════════════════════════ */
+    /* Shared base for header bar, metric cards, and chart panels */
     .top, .card, .panel {
       position: relative;
       overflow: hidden;
@@ -445,7 +536,6 @@ def _render_dashboard_html() -> str:
         inset 0 0 0 1px rgba(0, 229, 255, 0.06),
         0 0 26px var(--panelGlowA),
         0 0 36px var(--panelGlowB);
-      backdrop-filter: blur(10px) saturate(118%);
     }
     .card {
       --card-border: rgba(100, 180, 255, 0.45);
@@ -464,7 +554,6 @@ def _render_dashboard_html() -> str:
       padding: 1px;
       background: linear-gradient(110deg, rgba(0, 229, 255, 0.95), rgba(57, 255, 20, 0.9), rgba(255, 43, 214, 0.95), rgba(255, 230, 0, 0.9));
       background-size: 250% 250%;
-      animation: borderShift 7s linear infinite;
       opacity: 0.35;
       pointer-events: none;
       -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
@@ -488,6 +577,9 @@ def _render_dashboard_html() -> str:
       background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 36%);
       opacity: 0.35;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * HEADER BAR — Title, subtitle, status dot, display FPS, audio
+     * ══════════════════════════════════════════════════════════════ */
     .top {
       display: flex;
       justify-content: space-between;
@@ -582,13 +674,13 @@ def _render_dashboard_html() -> str:
       opacity: 0.55;
       cursor: default;
     }
+    /* Status LED dot (connection indicator) */
     .dot {
       width: 10px;
       height: 10px;
       border-radius: 50%;
       background: var(--accentC);
       box-shadow: 0 0 0 7px rgba(57, 255, 20, 0.2), 0 0 14px rgba(57, 255, 20, 0.5);
-      animation: ledPulse 1.8s ease-in-out infinite;
     }
     .cards {
       display: grid;
@@ -615,6 +707,10 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
+    /* ══════════════════════════════════════════════════════════════
+     * METRIC VALUES — VFD-style text, fixed-width char cells,
+     * record-high labels, mini-chart inline layout
+     * ══════════════════════════════════════════════════════════════ */
     .value {
       font-size: 28px;
       line-height: 1;
@@ -645,7 +741,7 @@ def _render_dashboard_html() -> str:
       align-items: center;
       gap: 10px;
     }
-    #mQ {
+    #mQ, #mLoss, #mGrad, #mRplF {
       display: inline-grid;
       grid-auto-flow: column;
       grid-auto-columns: 0.62em;
@@ -656,13 +752,17 @@ def _render_dashboard_html() -> str:
       font-kerning: none;
       letter-spacing: 0 !important;
       line-height: 1;
+      font-size: 144%;
     }
-    #mQ .qch {
+    #mQ .qch, #mLoss .qch, #mGrad .qch, #mRplF .qch {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 0.70em;
-      min-width: 0.70em;
+      width: 0.72em;
+      min-width: 0.72em;
+    }
+    #mRplF {
+      font-size: 100%;
     }
     .mini-metric-card .mini-inline {
       display: grid;
@@ -676,6 +776,32 @@ def _render_dashboard_html() -> str:
       min-width: 0;
       white-space: nowrap;
       font-size: 21px;
+    }
+    .record-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 2px;
+      position: relative;
+      z-index: 2;
+    }
+    .record-label {
+      font-size: 10px;
+      color: var(--muted);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .record-value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 11px;
+      color: #c8e8ff;
+      letter-spacing: 0.3px;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45);
+      filter:
+        drop-shadow(0 0 6px rgba(60, 130, 255, 0.5));
     }
     .mini-metric-card .mini-canvas {
       width: 100%;
@@ -692,6 +818,7 @@ def _render_dashboard_html() -> str:
       flex: 0 0 auto;
       justify-self: end;
     }
+    /* Per-metric status LED (colored via JS) */
     .metric-led {
       width: 10px;
       height: 10px;
@@ -699,7 +826,6 @@ def _render_dashboard_html() -> str:
       background: var(--neonRed);
       box-shadow: 0 0 0 4px rgba(255, 42, 85, 0.24), 0 0 12px rgba(255, 42, 85, 0.58);
       flex: 0 0 auto;
-      animation: ledPulse 1.4s ease-in-out infinite;
     }
     .gauge-card {
       grid-column: span 2;
@@ -739,13 +865,7 @@ def _render_dashboard_html() -> str:
       gap: 8px;
       padding: 0 4px;
     }
-    .gauge-readout {
-      display: none;
-    }
-    .gauge-canvas-wrap,
-    .gauge-foot {
-      display: none;
-    }
+    /* ── Chart panels ────────────────────────────────────────────── */
     .charts {
       display: grid;
       grid-template-columns: repeat(2, minmax(320px, 1fr));
@@ -803,23 +923,7 @@ def _render_dashboard_html() -> str:
       position: relative;
       z-index: 2;
     }
-    /* Low-GPU mode: disable continuous compositing-heavy effects. */
-    body::before,
-    body::after,
-    .top::before,
-    .card::before,
-    .panel::before,
-    .dot,
-    .metric-led {
-      animation: none !important;
-    }
-    .top, .card, .panel {
-      backdrop-filter: none;
-    }
-    body::after {
-      mix-blend-mode: normal;
-      opacity: 0.10;
-    }
+    /* ── Responsive breakpoints ───────────────────────────────────── */
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
       .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
@@ -833,6 +937,11 @@ def _render_dashboard_html() -> str:
     }
   </style>
 </head>
+<!-- ══════════════════════════════════════════════════════════════════
+     HTML MARKUP — Dashboard layout: cards grid, gauge canvases,
+     mini-metric cards with sparklines, time-series chart panels,
+     and the header bar (rendered last, positioned via CSS grid).
+     ══════════════════════════════════════════════════════════════════ -->
 <body>
   <main>
     <section class="cards">
@@ -854,6 +963,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mDqnRwrd">0</div>
           <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recDqnRwrd">—</span></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
         <div class="label">AVG REWARD 1M</div>
@@ -861,6 +971,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mRwrd">0</div>
           <canvas id="cRewardMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recRwrd">—</span></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
         <div class="label">Avg Level</div>
@@ -868,6 +979,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mLevel">0.0</div>
           <canvas id="cLevelMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recLevel">—</span></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(255,160,80,0.66);--card-glow:rgba(255,140,60,0.26)">
         <div class="label">EPISODE LENGTH</div>
@@ -875,6 +987,7 @@ def _render_dashboard_html() -> str:
           <div class="value" id="mEpLen">0</div>
           <canvas id="cEpLenMini" class="mini-canvas"></canvas>
         </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
       </article>
       <article class="card mini-metric-card card-half" style="--card-border:rgba(180,80,255,0.66);--card-glow:rgba(160,50,255,0.26)">
         <div class="label">Loss</div>
@@ -890,10 +1003,17 @@ def _render_dashboard_html() -> str:
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,235,0.26)">
+        <div class="label">AGREEMENT</div>
+        <div class="mini-inline">
+          <div class="value" id="mAgree">00.0%</div>
+          <canvas id="cAgreeMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
       <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
@@ -905,7 +1025,6 @@ def _render_dashboard_html() -> str:
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
-      <article class="card card-half" style="--card-border:rgba(0,220,200,0.66);--card-glow:rgba(0,200,180,0.26)"><div class="label">Frame</div><div class="value" id="mFrame">0</div></article>
     </section>
 
     <section class="charts">
@@ -956,7 +1075,7 @@ def _render_dashboard_html() -> str:
     <section class="top">
       <div class="title">
         <h1>Tempest AI Dashboard</h1>
-        <div class="subtitle">Primary training and runtime telemetry (live)</div>
+        <div class="subtitle" id="modelDesc">Loading model info…</div>
       </div>
       <div class="top-right">
         <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
@@ -968,6 +1087,9 @@ def _render_dashboard_html() -> str:
   <audio id="bgAudio" preload="auto" autoplay></audio>
 
   <script>
+    /* ══════════════════════════════════════════════════════════════
+     * CONSTANTS — Refresh rates, history depth, gauge ranges
+     * ══════════════════════════════════════════════════════════════ */
     const num = new Intl.NumberFormat("en-US");
     const DASH_MAX_FPS = 30;
     const DASH_DEFAULT_FPS = 2;
@@ -1022,6 +1144,9 @@ def _render_dashboard_html() -> str:
       } catch (_) {}
       return `c_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     })();
+    /* ══════════════════════════════════════════════════════════════
+     * AUDIO — Background music playlist with cookie-based preference
+     * ══════════════════════════════════════════════════════════════ */
     const bgAudio = document.getElementById("bgAudio");
     const audioToggle = document.getElementById("audioToggle");
     let audioPlaylist = [];
@@ -1029,10 +1154,10 @@ def _render_dashboard_html() -> str:
     let audioEnabled = false;
     let audioRetryTimer = null;
 
+    /* ══════════════════════════════════════════════════════════════
+     * DOM REFERENCES — Metric card elements, record labels, gauges
+     * ══════════════════════════════════════════════════════════════ */
     const cards = {
-      frame: document.getElementById("mFrame"),
-      fps: document.getElementById("mFps"),
-      steps: document.getElementById("mSteps"),
       clients: document.getElementById("mClients"),
       web: document.getElementById("mWeb"),
       level: document.getElementById("mLevel"),
@@ -1050,7 +1175,16 @@ def _render_dashboard_html() -> str:
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
+      agree: document.getElementById("mAgree"),
     };
+    const recEls = {
+      dqnRwrd: document.getElementById("recDqnRwrd"),
+      rwrd: document.getElementById("recRwrd"),
+      level: document.getElementById("recLevel"),
+      epLen: document.getElementById("recEpLen"),
+    };
+    const modelDescEl = document.getElementById("modelDesc");
+    const recordHighs = { dqnRwrd: -Infinity, rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
 
@@ -1092,6 +1226,9 @@ def _render_dashboard_html() -> str:
 
       requestAnimationFrame(gaugeAnimationLoop);
     }
+    // Draw gauges once at zero so they appear before any data arrives
+    drawFpsGauge(fpsGaugeCanvas, 0, null);
+    drawStepGauge(stepGaugeCanvas, 0, null);
     requestAnimationFrame(gaugeAnimationLoop);
 
     const charts = {
@@ -1107,7 +1244,7 @@ def _render_dashboard_html() -> str:
           {
             key: "steps_per_sec_chart",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max: 50, ticks: [0, 10, 20, 30, 40, 50] },
+            axis: { side: "right", min: 0, group_keys: ["steps_per_sec_chart", "level_100k"] },
             smooth_alpha: 0.10,
           },
           {
@@ -1134,7 +1271,6 @@ def _render_dashboard_html() -> str:
               side: "left",
               min: 0,
               label_pad: 52,
-              round_max: 1000,
               group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
             }
           },
@@ -1170,7 +1306,7 @@ def _render_dashboard_html() -> str:
           {
             key: "reward_dqn",
             color: "#22c55e",
-            axis: { side: "left", min: 0, label_pad: 52, round_max: 100, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
+            axis: { side: "left", min: 0, label_pad: 52, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
           }
         ]
       },
@@ -1190,14 +1326,14 @@ def _render_dashboard_html() -> str:
         canvas: document.getElementById("cRewardMini"),
         series: [
           { key: "total_5m", color: "#3b82f6" },
-          { key: "total_1m", color: "#22c55e" }
+          { key: "total_1m", color: "#22c55e", linearTime: true }
         ]
       },
       dqnRewardMini: {
         canvas: document.getElementById("cDqnRewardMini"),
         series: [
           { key: "dqn_5m", color: "#3b82f6" },
-          { key: "dqn_1m", color: "#f59e0b" }
+          { key: "dqn_1m", color: "#f59e0b", linearTime: true }
         ]
       },
       lossMini: {
@@ -1217,6 +1353,13 @@ def _render_dashboard_html() -> str:
         series: [
           { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
         ]
+      },
+      agreeMini: {
+        canvas: document.getElementById("cAgreeMini"),
+        series: [
+          { key: "agreement_1m", color: "#00c8ff", axis: { min: 0, min_range: 0.10 } },
+          { key: "agreement", color: "#0090cc55", axis: { min: 0, min_range: 0.10 } }
+        ]
       }
     };
 
@@ -1234,7 +1377,45 @@ def _render_dashboard_html() -> str:
       if (v === null || v === undefined || Number.isNaN(v)) return "+0";
       const n = Number(v);
       const mag = Math.abs(n).toFixed(d);
-      return (n < 0 ? "-" : "+") + mag;
+      // Pad integer part to 2 digits so display stays fixed-width
+      const [ip, fp] = mag.split(".");
+      const padded = ip.padStart(2, "0") + (fp !== undefined ? "." + fp : "");
+      return (n < 0 ? "-" : "+") + padded;
+    }
+
+    function fmtPaddedFloat(v, intDigits = 2, decDigits = 2, padChar = "0") {
+      if (v === null || v === undefined || Number.isNaN(v)) return "0";
+      const n = Math.abs(Number(v));
+      const [ip, fp] = n.toFixed(decDigits).split(".");
+      return ip.padStart(intDigits, padChar) + (fp !== undefined ? "." + fp : "");
+    }
+
+    function qColor(v) {
+      // Color by absolute magnitude relative to C51 support [-100,100]
+      const m = Math.abs(v);
+      if (m < 20) return "#39ff14";         // green – healthy
+      if (m < 40) return "#b8ff14";         // yellow-green
+      if (m < 60) return "#ff9900";         // amber – concerning
+      if (m < 80) return "#ff8c14";         // orange – warning
+      return "#ff2020";                      // red – exploding
+    }
+
+    function toColoredQRange(qMin, qMax) {
+      const minStr = fmtSignedFloat(qMin, 1);
+      const maxStr = fmtSignedFloat(qMax, 1);
+      const minColor = qColor(qMin);
+      const maxColor = qColor(qMax);
+      function coloredCells(text, color) {
+        return Array.from(String(text)).map((ch) => {
+          const html = (ch === " ") ? "&nbsp;" : ch
+            .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+          return `<span class="qch" style="color:${color};text-shadow:0 0 6px ${color}44">${html}</span>`;
+        }).join("");
+      }
+      return coloredCells(minStr, minColor) +
+             `<span class="qch">,</span>` +
+             coloredCells(maxStr, maxColor);
     }
 
     function toFixedCharCells(text) {
@@ -1394,6 +1575,10 @@ def _render_dashboard_html() -> str:
       if (audioEnabled) ensureAudioPlaying();
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * STATUS & LED INDICATORS — Connection dot, inference/replay LEDs
+     * Colors change based on metric thresholds (green/yellow/red).
+     * ══════════════════════════════════════════════════════════════ */
     function setConnected(connected) {
       const dot = document.getElementById("statusDot");
       const text = document.getElementById("statusText");
@@ -1463,6 +1648,58 @@ def _render_dashboard_html() -> str:
       ctx.closePath();
     }
 
+    /* ── VFD bloom text helper ───────────────────────────────────────
+     * Draws multi-layer glowing text simulating a vacuum fluorescent
+     * display (VFD).  Each layer is progressively brighter and tighter
+     * to create a realistic bloom/glow effect.
+     *
+     * @param {CanvasRenderingContext2D} ctx   Canvas context
+     * @param {string}  text    The text to render
+     * @param {number}  x, y   Position to draw at
+     * @param {Array}   layers  Array of {fill, shadow, blur} objects,
+     *                          ordered widest/faintest → tightest/brightest.
+     *                          Each layer is drawn twice for extra intensity.
+     * @param {object}  crisp   Final crisp layer: {fill, shadow, blur}
+     */
+    function drawBloomText(ctx, text, x, y, layers, crisp) {
+      for (const l of layers) {
+        ctx.fillStyle = l.fill;
+        ctx.shadowColor = l.shadow;
+        ctx.shadowBlur = l.blur;
+        ctx.fillText(text, x, y);
+        ctx.fillText(text, x, y);
+      }
+      ctx.fillStyle = crisp.fill;
+      ctx.shadowColor = crisp.shadow;
+      ctx.shadowBlur = crisp.blur;
+      ctx.fillText(text, x, y);
+      ctx.shadowBlur = 0;
+    }
+
+    /* VFD bloom color presets for gauge sub-text */
+    const VFD_BLOOM_ORANGE = {
+      layers: [
+        { fill: "rgba(180, 80, 0, 0.50)",  shadow: "rgba(255, 100, 0, 0.60)",  blur: 48 },
+        { fill: "rgba(220, 120, 10, 0.70)", shadow: "rgba(255, 130, 10, 0.70)", blur: 28 },
+        { fill: "rgba(240, 160, 30, 0.80)", shadow: "rgba(255, 160, 20, 0.80)", blur: 14 },
+        { fill: "rgba(255, 190, 60, 0.90)", shadow: "rgba(255, 180, 40, 0.90)", blur: 5 },
+      ],
+      crisp: { fill: "#ffaa33", shadow: "rgba(255, 140, 20, 0.60)", blur: 10 },
+    };
+    const VFD_BLOOM_BLUE = {
+      layers: [
+        { fill: "rgba(60, 120, 255, 0.50)",  shadow: "rgba(60, 130, 255, 0.80)",  blur: 52 },
+        { fill: "rgba(80, 140, 255, 0.65)",  shadow: "rgba(80, 150, 255, 0.85)",  blur: 30 },
+        { fill: "rgba(100, 160, 255, 0.75)", shadow: "rgba(100, 170, 255, 0.90)", blur: 16 },
+        { fill: "rgba(140, 190, 255, 0.85)", shadow: "rgba(120, 180, 255, 0.95)", blur: 6 },
+      ],
+      crisp: { fill: "#c8e8ff", shadow: "rgba(80, 160, 255, 0.70)", blur: 12 },
+    };
+
+    /* ══════════════════════════════════════════════════════════════
+     * GAUGE RENDERING — Analogue-style gauge with needle, color arc,
+     * VFD sub-text, and LED odometer badge.
+     * ══════════════════════════════════════════════════════════════ */
     function drawStyledGauge(canvas, valueRaw, cfg) {
       if (!canvas) return;
 
@@ -1502,29 +1739,6 @@ def _render_dashboard_html() -> str:
         const t = (clampVal(v) - minV) / spanV;
         return startRad + (t * (endRad - startRad));
       };
-
-      // Outer glow + bezel (metallic ring style). [TEMPORARILY HIDDEN]
-      /*
-      const glow = ctx.createRadialGradient(cx, cy, radius * 0.9, cx, cy, radius * 1.22);
-      glow.addColorStop(0.0, "rgba(0, 0, 0, 0.00)");
-      glow.addColorStop(1.0, "rgba(0, 0, 0, 0.55)");
-      ctx.fillStyle = glow;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius * 1.22, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.lineWidth = Math.max(10, radius * 0.14);
-      const bezel = ctx.createLinearGradient(cx - radius, cy - radius, cx + radius, cy + radius);
-      bezel.addColorStop(0.0, "#8f979f");
-      bezel.addColorStop(0.20, "#31373d");
-      bezel.addColorStop(0.55, "#14181d");
-      bezel.addColorStop(0.80, "#6f7881");
-      bezel.addColorStop(1.0, "#d8dde1");
-      ctx.strokeStyle = bezel;
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius * 1.15, 0, Math.PI * 2);
-      ctx.stroke();
-      */
 
       // Dial face.
       const face = ctx.createRadialGradient(cx, cy - radius * 0.5, radius * 0.2, cx, cy, radius * 1.02);
@@ -1735,16 +1949,16 @@ def _render_dashboard_html() -> str:
 
       // Sub-text above the badge (e.g. total training steps) — VFD odometer display
       if (cfg.sub_text) {
-        const subFont = `400 ${Math.max(12, Math.round(radius * 0.156))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+        const subFont = `400 ${Math.max(10, Math.round(radius * 0.125))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
         ctx.font = subFont;
         ctx.textAlign = "right";
         ctx.textBaseline = "middle";
         // Fixed width: measure max-width template so box never resizes
         const maxTemplate = "8,888,888,888";
         const tmMax = ctx.measureText(maxTemplate);
-        const odoPad = radius * 0.12;
+        const odoPad = radius * 0.05;
         const odoW = tmMax.width + odoPad * 2;
-        const odoH = Math.max(16, Math.round(radius * 0.20));
+        const odoH = Math.max(14, Math.round(radius * 0.16));
         const odoX = cx - odoW * 0.5;
         const odoY = badgeY - odoH - 3;
         const odoR = Math.max(3, radius * 0.035);
@@ -1765,66 +1979,13 @@ def _render_dashboard_html() -> str:
         ctx.restore();
         // Text centered in the VFD box
         const subTextY = odoY + odoH * 0.5;
-        if (odoColor === "orange") {
-          // 5-layer bloom in orange — doubled intensity
-          ctx.fillStyle = "rgba(180, 80, 0, 0.50)";
-          ctx.shadowColor = "rgba(255, 100, 0, 0.60)";
-          ctx.shadowBlur = 48;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(220, 120, 10, 0.70)";
-          ctx.shadowColor = "rgba(255, 130, 10, 0.70)";
-          ctx.shadowBlur = 28;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(240, 160, 30, 0.80)";
-          ctx.shadowColor = "rgba(255, 160, 20, 0.80)";
-          ctx.shadowBlur = 14;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(255, 190, 60, 0.90)";
-          ctx.shadowColor = "rgba(255, 180, 40, 0.90)";
-          ctx.shadowBlur = 5;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          // Crisp orange text on top with residual glow
-          ctx.fillStyle = "#ffaa33";
-          ctx.shadowColor = "rgba(255, 140, 20, 0.60)";
-          ctx.shadowBlur = 10;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.shadowBlur = 0;
-        } else {
-          // 5-layer bloom in blue — strong glow visible against dark housing
-          ctx.fillStyle = "rgba(60, 120, 255, 0.50)";
-          ctx.shadowColor = "rgba(60, 130, 255, 0.80)";
-          ctx.shadowBlur = 52;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(80, 140, 255, 0.65)";
-          ctx.shadowColor = "rgba(80, 150, 255, 0.85)";
-          ctx.shadowBlur = 30;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(100, 160, 255, 0.75)";
-          ctx.shadowColor = "rgba(100, 170, 255, 0.90)";
-          ctx.shadowBlur = 16;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.fillStyle = "rgba(140, 190, 255, 0.85)";
-          ctx.shadowColor = "rgba(120, 180, 255, 0.95)";
-          ctx.shadowBlur = 6;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          // Crisp blue-white text on top with residual glow
-          ctx.fillStyle = "#c8e8ff";
-          ctx.shadowColor = "rgba(80, 160, 255, 0.70)";
-          ctx.shadowBlur = 12;
-          ctx.fillText(cfg.sub_text, subX, subTextY);
-          ctx.shadowBlur = 0;
-        }
+        const bloom = (odoColor === "orange") ? VFD_BLOOM_ORANGE : VFD_BLOOM_BLUE;
+        drawBloomText(ctx, cfg.sub_text, subX, subTextY, bloom.layers, bloom.crisp);
       }
 
       const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
-      badgeFill.addColorStop(0.0, "rgba(24, 27, 33, 0.92)");
-      badgeFill.addColorStop(1.0, "rgba(12, 15, 20, 0.96)");
+      badgeFill.addColorStop(0.0, "rgba(44, 10, 12, 0.95)");
+      badgeFill.addColorStop(1.0, "rgba(30, 6, 8, 0.98)");
       roundRectPath(ctx, badgeX, badgeY, badgeW, badgeH, Math.max(8, radius * 0.08));
       ctx.fillStyle = badgeFill;
       ctx.fill();
@@ -1902,6 +2063,24 @@ def _render_dashboard_html() -> str:
       });
     }
 
+    /* ═══════════════ Nice-tick interval (1-2-5 sequence) ═══════════════ */
+    function niceInterval(range, targetTicks) {
+      if (!Number.isFinite(range) || range <= 0) return 1;
+      const rawStep = range / Math.max(1, targetTicks);
+      const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const residual = rawStep / mag;
+      let nice;
+      if (residual < 1.5) nice = 1;
+      else if (residual < 3) nice = 2;
+      else if (residual < 7) nice = 5;
+      else nice = 10;
+      return nice * mag;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * CHART RENDERING — Time-series line charts with gradient fill,
+     * smoothing, grid, axes, and auto-scaled Y range.
+     * ══════════════════════════════════════════════════════════════ */
     function drawChart(canvas, history, seriesDefs, maxLookbackSec = (5 * 60), useLinearTime = false) {
       const points = Array.isArray(history) ? history : [];
       const width = canvas.clientWidth || 320;
@@ -2106,33 +2285,17 @@ def _render_dashboard_html() -> str:
         if (!hasFixedMax && Number.isFinite(maxFloor)) {
           maxV = Math.max(maxV, maxFloor);
         }
-        const roundMax = Number(s.axis?.round_max);
-        let didRoundMax = false;
-        if (!hasFixedMax && roundMax > 0 && Number.isFinite(roundMax)) {
-          maxV = Math.ceil(maxV / roundMax) * roundMax;
-          didRoundMax = true;
-        }
-        if (maxV < minV) {
-          maxV = minV + 1.0;
-        }
+        if (maxV < minV) maxV = minV + 1.0;
         if (minV === maxV) {
-          if (hasFixedMin && !hasFixedMax) {
-            maxV = minV + 1.0;
-          } else if (!hasFixedMin && hasFixedMax) {
-            minV = maxV - 1.0;
-          } else {
-            minV -= 1.0;
-            maxV += 1.0;
-          }
-        } else {
-          const p = (maxV - minV) * 0.12;
-          if (!hasFixedMin) {
-            minV -= p;
-          }
-          if (!hasFixedMax && !didRoundMax) {
-            maxV += p;
-          }
+          if (hasFixedMin && !hasFixedMax) maxV = minV + 1.0;
+          else if (!hasFixedMin && hasFixedMax) minV = maxV - 1.0;
+          else { minV -= 1.0; maxV += 1.0; }
         }
+        // Nice-tick autoscaling: snap axis bounds to clean 1-2-5 intervals
+        const niceStep = niceInterval(maxV - minV, 4);
+        if (!hasFixedMin) minV = Math.floor(minV / niceStep) * niceStep;
+        if (!hasFixedMax) maxV = Math.ceil(maxV / niceStep) * niceStep;
+        if (maxV <= minV) maxV = minV + niceStep;
 
         const axisX = side === "left"
           ? (padL - 20 - leftAxisOffset)
@@ -2142,9 +2305,16 @@ def _render_dashboard_html() -> str:
         } else {
           rightAxisOffset += axisSlot;
         }
-        const ticks = Array.isArray(s.axis?.ticks) && s.axis.ticks.length
-          ? s.axis.ticks
-          : [minV, minV + (maxV - minV) * 0.25, minV + (maxV - minV) * 0.5, minV + (maxV - minV) * 0.75, maxV];
+        let ticks;
+        if (Array.isArray(s.axis?.ticks) && s.axis.ticks.length) {
+          ticks = s.axis.ticks;
+        } else {
+          ticks = [];
+          for (let t = minV; t <= maxV + niceStep * 0.001; t += niceStep) {
+            ticks.push(t);
+          }
+          if (!ticks.length) ticks = [minV, maxV];
+        }
 
         axes.push({
           key: s.key,
@@ -2154,7 +2324,9 @@ def _render_dashboard_html() -> str:
           min: minV,
           max: maxV,
           ticks,
-          tickDecimals: Number.isFinite(s.axis?.tick_decimals) ? Math.max(0, Number(s.axis.tick_decimals)) : null,
+          tickDecimals: Number.isFinite(s.axis?.tick_decimals)
+            ? Math.max(0, Number(s.axis.tick_decimals))
+            : Math.max(0, -Math.floor(Math.log10(niceStep))),
         });
       }
       if (!axes.length) return;
@@ -2353,6 +2525,7 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    /* ── Mini chart (sparkline) for inline card display ─────────── */
     function drawMiniChart(canvas, history, seriesDefs) {
       if (!canvas) return;
       const points = history.slice(-240);
@@ -2390,20 +2563,86 @@ def _render_dashboard_html() -> str:
 
       const hasFixedMin = Number.isFinite(seriesDefs?.[0]?.axis?.min);
       const hasFixedMax = Number.isFinite(seriesDefs?.[0]?.axis?.max);
+      const minRange = Number.isFinite(seriesDefs?.[0]?.axis?.min_range)
+        ? Number(seriesDefs[0].axis.min_range) : 0;
       let minV = hasFixedMin ? Number(seriesDefs[0].axis.min) : Math.min(...values);
       let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
-      if (maxV <= minV) {
-        maxV = minV + 1.0;
-      } else {
-        const p = (maxV - minV) * 0.08;
-        if (!hasFixedMin) minV -= p;
-        if (!hasFixedMax) maxV += p;
+      if (maxV <= minV) maxV = minV + 1.0;
+      // Nice-tick autoscaling for mini charts
+      const miniNiceStep = niceInterval(maxV - minV, 3);
+      if (!hasFixedMin) minV = Math.floor(minV / miniNiceStep) * miniNiceStep;
+      if (!hasFixedMax) maxV = Math.ceil(maxV / miniNiceStep) * miniNiceStep;
+      if (maxV <= minV) maxV = minV + miniNiceStep;
+      // Enforce minimum visible range (expand around midpoint, respecting fixed bounds)
+      if (minRange > 0 && (maxV - minV) < minRange) {
+        const mid = (minV + maxV) * 0.5;
+        minV = mid - minRange * 0.5;
+        maxV = mid + minRange * 0.5;
+        if (hasFixedMin && minV < Number(seriesDefs[0].axis.min)) {
+          minV = Number(seriesDefs[0].axis.min);
+          maxV = minV + minRange;
+        }
+        if (hasFixedMax && maxV > Number(seriesDefs[0].axis.max)) {
+          maxV = Number(seriesDefs[0].axis.max);
+          minV = maxV - minRange;
+        }
       }
 
-      const xAt = (i) => {
+      // Logarithmic time-compressed x-axis (same anchors as big charts)
+      const tsVals = points.map(p => Number(p.ts)).filter(v => Number.isFinite(v));
+      const hasTs = tsVals.length >= 2;
+      const newestTs = hasTs ? Math.max(...tsVals) : 0;
+      const oldestTs = hasTs ? Math.min(...tsVals) : 0;
+      const maxAge = hasTs ? Math.max(1e-6, newestTs - oldestTs) : 0;
+      const HARD_MAX = 60 * 60;
+      const axisMax = hasTs ? Math.min(HARD_MAX, maxAge) : HARD_MAX;
+      const sc = axisMax / HARD_MAX;
+      const FRAC_A = [0, 0.25, 0.50, 0.75, 1.0];
+      const AGE_A = [0, 10 * sc, 60 * sc, 600 * sc, axisMax];
+      const buildSpline = (xs, ys) => {
+        const n2 = xs.length;
+        if (n2 < 2) return () => ys[0] || 0;
+        const h2 = [], d2 = [];
+        for (let j = 0; j < n2 - 1; j++) {
+          h2[j] = Math.max(1e-9, xs[j+1] - xs[j]);
+          d2[j] = (ys[j+1] - ys[j]) / h2[j];
+        }
+        const m2 = [d2[0]];
+        for (let j = 1; j < n2 - 1; j++) m2[j] = 0.5 * (d2[j-1] + d2[j]);
+        m2[n2-1] = d2[n2-2];
+        for (let j = 0; j < n2 - 1; j++) {
+          if (Math.abs(d2[j]) <= 1e-12) { m2[j] = 0; m2[j+1] = 0; continue; }
+          const aa = m2[j]/d2[j], bb = m2[j+1]/d2[j];
+          const ss = aa*aa + bb*bb;
+          if (ss > 9) { const tt = 3/Math.sqrt(ss); m2[j]=tt*aa*d2[j]; m2[j+1]=tt*bb*d2[j]; }
+        }
+        return (xr) => {
+          const x2 = Math.max(xs[0], Math.min(xs[n2-1], xr));
+          let k2 = n2 - 2;
+          for (let j = 0; j < n2 - 1; j++) { if (x2 <= xs[j+1]) { k2 = j; break; } }
+          const hk = h2[k2], t2 = (x2 - xs[k2]) / hk;
+          const t22 = t2*t2, t23 = t22*t2;
+          return ((2*t23 - 3*t22 + 1)*ys[k2]) + ((t23 - 2*t22 + t2)*hk*m2[k2])
+               + ((-2*t23 + 3*t22)*ys[k2+1]) + ((t23 - t22)*hk*m2[k2+1]);
+        };
+      };
+      const fracFromAge = buildSpline(AGE_A, FRAC_A);
+      const xAtLog = (i) => {
+        if (!hasTs) {
+          const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+          return padL + (t * plotW);
+        }
+        const ts = Number(points[i].ts);
+        if (!Number.isFinite(ts)) return padL;
+        const age = Math.max(0, Math.min(axisMax, newestTs - ts));
+        const frac = fracFromAge(age);
+        return padL + ((1.0 - frac) * plotW);
+      };
+      const xAtLinear = (i) => {
         const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
         return padL + (t * plotW);
       };
+      const xAt = xAtLog;
       const yAt = (v) => {
         const t = (v - minV) / (maxV - minV);
         return padTop + ((1.0 - t) * plotH);
@@ -2459,6 +2698,7 @@ def _render_dashboard_html() -> str:
 
       const n = points.length;
       for (const s of seriesDefs) {
+        const xFn = s.linearTime ? xAtLinear : xAtLog;
         const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : MINI_CHART_VALUE_SMOOTH_ALPHA;
         ctx.strokeStyle = s.color;
         ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
@@ -2471,7 +2711,7 @@ def _render_dashboard_html() -> str:
           for (let i = n - 1; i >= 0; i--) {
             const val = Number(points[i][s.key]);
             if (!Number.isFinite(val)) continue;
-            const x = xAt(i);
+            const x = xFn(i);
             const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
             const b = bins.get(xPx);
             if (b) {
@@ -2504,7 +2744,7 @@ def _render_dashboard_html() -> str:
             smoothVal = (smoothVal === null)
               ? val
               : (smoothVal + ((val - smoothVal) * smoothAlpha));
-            const x = xAt(i);
+            const x = xFn(i);
             const y = yAt(smoothVal);
             if (!started) {
               ctx.moveTo(x, y);
@@ -2616,29 +2856,50 @@ def _render_dashboard_html() -> str:
       return out;
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * CARD UPDATER — Pushes latest snapshot values into DOM elements,
+     * updates record highs, and sets model description.
+     * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
-      cards.frame.textContent = fmtInt(now.frame_count);
-      if (cards.fps) cards.fps.textContent = fmtInt(now.fps);
-      if (cards.steps) cards.steps.textContent = fmtInt(smoothedSteps);
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
       cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)} ms`;
       setInfLed(now.avg_inf_ms);
-      cards.rplf.textContent = fmtFloat(now.rpl_per_frame, 2);
+      cards.rplf.innerHTML = toFixedCharCells(fmtPaddedFloat(now.rpl_per_frame, 2, 2, " "));
       setRplLed(now.rpl_per_frame);
       cards.eps.textContent = fmtPct(now.epsilon);
       cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.rwrd.textContent = fmtInt(now.total_1m);
       cards.dqnRwrd.textContent = fmtInt(now.dqn_1m);
-      cards.loss.textContent = fmtFloat(now.loss, 2);
-      cards.grad.textContent = fmtFloat(now.grad_norm, 3);
+      cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
+      cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
       cards.buf.textContent = fmtInt(now.memory_buffer_size);
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
       cards.q.innerHTML = (now.q_min === null || now.q_max === null)
         ? toFixedCharCells("-")
-        : toFixedCharCells(`${fmtSignedFloat(now.q_min, 1)},${fmtSignedFloat(now.q_max, 1)}`);
+        : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
+      cards.agree.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
+        ? fmtFloat(now.agreement_1m * 100, 1) + "%"
+        : "00.0%";
+
+      // ── Record highs ──────────────────────────────────────────────
+      const recPairs = [
+        ["dqnRwrd", now.dqn_1m, fmtInt],
+        ["rwrd", now.peak_episode_reward, fmtInt],
+        ["level", now.peak_level, v => "LEVEL " + Math.round(v)],
+        ["epLen", now.eplen_1m, fmtInt],
+      ];
+      for (const [k, v, fmt] of recPairs) {
+        if (v != null && isFinite(v) && v > recordHighs[k]) {
+          recordHighs[k] = v;
+          if (recEls[k]) recEls[k].textContent = fmt(v);
+        }
+      }
+
+      // ── Model description ─────────────────────────────────────────
+      if (now.model_desc && modelDescEl) modelDescEl.textContent = now.model_desc;
     }
 
     function render(payload) {
@@ -2667,6 +2928,7 @@ def _render_dashboard_html() -> str:
       drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
       drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
       drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
+      drawMiniChart(charts.agreeMini.canvas, history60m, charts.agreeMini.series);
     }
 
     let historyCache = [];
@@ -2698,22 +2960,23 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * DATA FETCH LOOP — Polls /api/now and /api/ping at intervals,
+     * maintains history cache, and triggers re-renders.
+     * ══════════════════════════════════════════════════════════════ */
     async function fetchNow() {
       try {
         const res = await fetch(`/api/now?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const now = await res.json();
-        const hadNow = !!latestNow;
         latestNow = now;
         const ts = Number(now && now.ts);
-        let hasNewSample = false;
         if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
           historyCache.push(now);
           if (historyCache.length > MAX_HISTORY_POINTS) {
             historyCache.shift();
           }
           lastTs = ts;
-          hasNewSample = true;
         }
         renderCurrent();
         setConnected(true);
@@ -2768,7 +3031,12 @@ def _render_dashboard_html() -> str:
     fetchHistory().then(() => fetchNow()).catch(() => {});
     setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
-    window.addEventListener("resize", () => renderCurrent());
+    window.addEventListener("resize", () => {
+      renderCurrent();
+      // Force gauge repaint since canvas dimensions changed
+      drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
+      drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+    });
   </script>
 </body>
 </html>

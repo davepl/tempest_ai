@@ -26,7 +26,7 @@ def _flushing_print(*args, **kwargs):
     return _original_print(*args, **kwargs)
 builtins.print = _flushing_print
 
-import os, sys, time, struct, random, math, warnings, threading, queue, traceback
+import os, sys, time, struct, random, math, warnings, threading, queue, traceback, shutil
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 from collections import deque
@@ -104,6 +104,13 @@ def quantize_spinner_value(value: float) -> int:
         if d < best_d:
             best, best_d = i, d
     return best
+
+def _random_firezap() -> int:
+    """Sample a random fire/zap index with reduced superzap probability."""
+    zap_p = float(getattr(RL_CONFIG, 'epsilon_zap_prob', 0.5))
+    fire = random.random() < 0.5
+    zap = random.random() < zap_p
+    return fire_zap_to_discrete(fire, zap)
 
 def combine_action_indices(fz: int, sp: int) -> int:
     return max(0, min(NUM_FIREZAP - 1, fz)) * NUM_SPINNER + max(0, min(NUM_SPINNER - 1, sp))
@@ -726,7 +733,7 @@ class RainbowAgent:
     def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int]:
         """Return (firezap_idx, spinner_idx)."""
         if random.random() < epsilon:
-            return random.randrange(NUM_FIREZAP), random.randrange(NUM_SPINNER)
+            return _random_firezap(), random.randrange(NUM_SPINNER)
 
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         q = self._infer_q_values(st)
@@ -755,7 +762,7 @@ class RainbowAgent:
         for i in range(n):
             eps = float(epsilons[i])
             if random.random() < eps:
-                actions[i] = (random.randrange(NUM_FIREZAP), random.randrange(NUM_SPINNER))
+                actions[i] = (_random_firezap(), random.randrange(NUM_SPINNER))
             else:
                 greedy_idx.append(i)
                 greedy_states.append(states[i])
@@ -903,9 +910,23 @@ class RainbowAgent:
             "epsilon": ep,
             "engine_version": 2,
         }
+        if hasattr(self, "grad_scaler") and self.grad_scaler is not None:
+            ckpt["grad_scaler_state_dict"] = self.grad_scaler.state_dict()
         if show_status:
             self._text_progress("  Model save", 0.0)
-        torch.save(ckpt, filepath)
+
+        # Backup existing checkpoint before overwriting
+        if os.path.exists(filepath):
+            try:
+                shutil.copy2(filepath, filepath + ".bak")
+            except Exception as e:
+                print(f"  [WARN] Backup copy failed: {e}")
+
+        # Atomic save: write to .tmp then rename
+        tmp_path = filepath + ".tmp"
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, filepath)
+
         if show_status:
             self._text_progress("  Model save", 1.0)
         if is_forced_save and show_status:
@@ -943,6 +964,13 @@ class RainbowAgent:
                     self.optimizer.load_state_dict(opt_sd)
                 except Exception as e:
                     print(f"Optimizer state skipped: {e}")
+
+            gs_sd = ckpt.get("grad_scaler_state_dict")
+            if gs_sd and hasattr(self, "grad_scaler") and self.grad_scaler is not None:
+                try:
+                    self.grad_scaler.load_state_dict(gs_sd)
+                except Exception as e:
+                    print(f"GradScaler state skipped: {e}")
 
             self.training_steps = ckpt.get("training_steps", 0)
             self.loaded_training_steps = self.training_steps

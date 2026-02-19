@@ -455,6 +455,9 @@ class SocketServer:
             with self.client_lock:
                 lvls = [s.get("level_number", 0) for s in self.client_states.values() if s.get("level_number", 0) >= 0]
                 metrics.average_level = sum(lvls) / len(lvls) if lvls else 0
+                for lv in lvls:
+                    if lv > metrics.peak_level:
+                        metrics.peak_level = lv
         except Exception:
             pass
 
