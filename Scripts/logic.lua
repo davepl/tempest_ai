@@ -47,6 +47,7 @@ local DEATH_PENALTY = 1000           -- Edge-triggered penalty when dying (same 
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
+local ZAP_CONSERVATION_BONUS = 0.3   -- Per-frame bonus per remaining superzapper charge
 
 local previous_score = 0
 local previous_level = 0
@@ -646,6 +647,12 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         -- Subjective shaping: lane safety/danger reward
         -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
         if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
+            -- Superzapper conservation: small bonus for each zap held in reserve
+            local zap_remaining = 2 - (player_state.superzapper_uses or 0)
+            if zap_remaining > 0 then
+                subj_reward = subj_reward + (zap_remaining * ZAP_CONSERVATION_BONUS)
+            end
+
             local player_abs_seg = player_state.position & 0x0F
             local prev_player_seg = math.floor(previous_player_position or 0) % 16
             local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open

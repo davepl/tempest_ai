@@ -105,15 +105,11 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 500_000
-    # Late-training exploration pulses to escape local optima.
-    epsilon_pulse_max: float = 0.25
-    epsilon_pulse_period_frames: int = 500_000
-    epsilon_pulse_start_frame: int = 3_000_000
     epsilon: float = 1.0
 
     # Expert guidance
     expert_ratio_start: float = 0.50
-    expert_ratio_end: float = 0.02
+    expert_ratio_end: float = 0.00
     expert_ratio_decay_frames: int = 5_000_000
     expert_ratio: float = 0.50
     # During tube zoom (gamestate 0x20), temporarily boost expert usage.
@@ -161,8 +157,156 @@ class RLConfigData:
 
     enable_amp: bool = True
 
+    # ── plateau pulse (auto-exploration) ────────────────────────────────
+    plateau_pulse_enabled: bool = True              # Master switch
+    plateau_pulse_epsilon: float = 0.15             # Epsilon during pulse
+    plateau_pulse_frames: int = 750_000             # Duration of a pulse (~5% of 15M buffer)
+    plateau_confirm_frames: int = 50_000            # How long 5M >= 1M must hold before declaring plateau
+    plateau_cooldown_frames: int = 1_000_000        # Min frames between end of pulse and next trigger (= 1M window)
+    plateau_min_frame: int = 5_000_000              # Don't trigger before this frame count
+
 
 RL_CONFIG = RLConfigData()
+
+
+# ---------------------------------------------------------------------------
+#  Plateau Pulser — automatic one-shot exploration when learning stalls
+# ---------------------------------------------------------------------------
+class PlateauPulser:
+    """
+    State machine that monitors DQN rolling averages and fires a single
+    exploration pulse when a plateau is detected.
+
+    States:
+      WATCHING   — monitoring DQN_5M vs DQN_1M for plateau
+      PULSING    — elevated epsilon for plateau_pulse_frames
+      RECOVERING — post-pulse cooldown for plateau_cooldown_frames
+    """
+    WATCHING   = "watching"
+    PULSING    = "pulsing"
+    RECOVERING = "recovering"
+
+    def __init__(self):
+        self.state: str = self.WATCHING
+        self.confirm_start_frame: int = 0           # frame when EMA first went positive
+        self.pulse_start_frame: int = 0             # frame when pulse began
+        self.pulse_end_frame: int = 0               # frame when pulse ended
+        self.pre_pulse_dqn_5m: float = 0.0          # DQN_5M before pulse, for outcome evaluation
+        self.cooldown_multiplier: float = 1.0       # doubles if a pulse hurt performance
+        self.total_pulses: int = 0
+        self._last_check_frame: int = 0
+        self._plateau_ema: float = 0.0              # EMA of (dqn_5m - dqn_1m), positive = stalled
+
+    def update(self, frame_count: int, dqn_100k: float, dqn_1m: float, dqn_5m: float,
+               metrics_obj) -> float | None:
+        """
+        Call periodically. Returns the epsilon override to use during a pulse,
+        or None if the pulser is not active (let normal epsilon logic run).
+        """
+        cfg = RL_CONFIG
+
+        # Don't do anything if disabled or too early
+        if not cfg.plateau_pulse_enabled:
+            if self.state == self.PULSING:
+                # Abort mid-pulse if user disables
+                self._end_pulse(frame_count, metrics_obj)
+            self.state = self.WATCHING
+            return None
+
+        if frame_count < cfg.plateau_min_frame:
+            return None
+
+        # Throttle checks to ~every 1000 frames
+        if frame_count - self._last_check_frame < 1000:
+            if self.state == self.PULSING:
+                return cfg.plateau_pulse_epsilon
+            return None
+        self._last_check_frame = frame_count
+
+        # ── State machine ───────────────────────────────────────────
+        if self.state == self.WATCHING:
+            # Smoothed plateau signal: EMA of (dqn_5m - dqn_1m)
+            # Positive EMA = 5M outperforming 1M = learning has stalled
+            if dqn_1m > 0:
+                diff = dqn_5m - dqn_1m
+                # EMA alpha ~0.02: each check blends 2% new, 98% old → very smooth
+                self._plateau_ema = self._plateau_ema * 0.98 + diff * 0.02
+
+            if self._plateau_ema > 0 and dqn_1m > 0:
+                if self.confirm_start_frame == 0:
+                    self.confirm_start_frame = frame_count
+                elif (frame_count - self.confirm_start_frame) >= cfg.plateau_confirm_frames:
+                    # Confirmed plateau — fire pulse
+                    self._start_pulse(frame_count, dqn_5m, metrics_obj)
+            else:
+                # Still improving — reset confirmation counter
+                self.confirm_start_frame = 0
+            return None
+
+        elif self.state == self.PULSING:
+            elapsed = frame_count - self.pulse_start_frame
+            if elapsed >= cfg.plateau_pulse_frames:
+                self._end_pulse(frame_count, metrics_obj)
+                return None
+            return cfg.plateau_pulse_epsilon
+
+        elif self.state == self.RECOVERING:
+            cooldown = int(cfg.plateau_cooldown_frames * self.cooldown_multiplier)
+            if (frame_count - self.pulse_end_frame) >= cooldown:
+                # Evaluate outcome
+                if dqn_1m > 0 and self.pre_pulse_dqn_5m > 0:
+                    if dqn_1m < self.pre_pulse_dqn_5m * 0.95:
+                        # Pulse hurt — double cooldown next time
+                        self.cooldown_multiplier = min(4.0, self.cooldown_multiplier * 2.0)
+                        print(f"[PlateauPulser] Pulse #{self.total_pulses} HURT performance "
+                              f"(DQN_1M {dqn_1m:.0f} < pre-pulse 5M {self.pre_pulse_dqn_5m:.0f}). "
+                              f"Cooldown multiplier → {self.cooldown_multiplier:.1f}x")
+                    elif dqn_1m > self.pre_pulse_dqn_5m * 1.05:
+                        # Pulse helped — reset cooldown multiplier
+                        self.cooldown_multiplier = max(1.0, self.cooldown_multiplier * 0.5)
+                        print(f"[PlateauPulser] Pulse #{self.total_pulses} HELPED "
+                              f"(DQN_1M {dqn_1m:.0f} > pre-pulse 5M {self.pre_pulse_dqn_5m:.0f}). "
+                              f"Cooldown multiplier → {self.cooldown_multiplier:.1f}x")
+                    else:
+                        print(f"[PlateauPulser] Pulse #{self.total_pulses} had neutral effect "
+                              f"(DQN_1M {dqn_1m:.0f} ≈ pre-pulse 5M {self.pre_pulse_dqn_5m:.0f}).")
+                self.state = self.WATCHING
+                self.confirm_start_frame = 0
+                print(f"[PlateauPulser] Recovery complete at frame {frame_count:,}. Re-armed.")
+
+        return None
+
+    def _start_pulse(self, frame_count: int, dqn_5m: float, metrics_obj):
+        self.state = self.PULSING
+        self.pulse_start_frame = frame_count
+        self.pre_pulse_dqn_5m = dqn_5m
+        self.total_pulses += 1
+        self.confirm_start_frame = 0
+        inv = 1.0 / max(1e-9, float(RL_CONFIG.obj_reward_scale))
+        print(f"\n{'='*80}")
+        print(f"[PlateauPulser] *** PULSE #{self.total_pulses} FIRED at frame {frame_count:,} ***")
+        print(f"  Epsilon → {RL_CONFIG.plateau_pulse_epsilon:.0%} for {RL_CONFIG.plateau_pulse_frames:,} frames")
+        print(f"  Pre-pulse DQN_5M = {dqn_5m * inv:.0f}")
+        print(f"{'='*80}\n")
+        import sys; sys.stdout.flush()
+
+    def _end_pulse(self, frame_count: int, metrics_obj):
+        self.state = self.RECOVERING
+        self.pulse_end_frame = frame_count
+        elapsed = frame_count - self.pulse_start_frame
+        cooldown = int(RL_CONFIG.plateau_cooldown_frames * self.cooldown_multiplier)
+        print(f"\n[PlateauPulser] Pulse #{self.total_pulses} ended at frame {frame_count:,} "
+              f"(ran {elapsed:,} frames). Recovering for {cooldown:,} frames.")
+        import sys; sys.stdout.flush()
+
+    @property
+    def is_pulsing(self) -> bool:
+        return self.state == self.PULSING
+
+
+# Global singleton
+plateau_pulser = PlateauPulser()
+
 
 # ---------------------------------------------------------------------------
 #  Metrics
@@ -223,6 +367,7 @@ class MetricsData:
     average_level: float = 0.0
     peak_level: int = 0
     peak_episode_reward: float = 0.0
+    peak_game_score: int = 0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
@@ -233,7 +378,7 @@ class MetricsData:
     manual_expert_override: bool = False
     override_epsilon: bool = False
     manual_epsilon_override: bool = False
-    epsilon_pulse_enabled: bool = True
+
     training_enabled: bool = True
     verbose_mode: bool = False
     saved_expert_ratio: float = 0.50
@@ -275,31 +420,15 @@ class MetricsData:
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
     @staticmethod
-    def _natural_epsilon_for_frame(frame_count: int, pulse_enabled: bool = True) -> float:
+    def _natural_epsilon_for_frame(frame_count: int) -> float:
         progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-        base = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
-
-        if not pulse_enabled:
-            return base
-
-        pulse_max = float(getattr(RL_CONFIG, "epsilon_pulse_max", base))
-        pulse_period = int(getattr(RL_CONFIG, "epsilon_pulse_period_frames", 0))
-        pulse_start = int(getattr(RL_CONFIG, "epsilon_pulse_start_frame", RL_CONFIG.epsilon_decay_frames))
-        if frame_count < pulse_start or pulse_period <= 0 or pulse_max <= base:
-            return base
-
-        phase = ((frame_count - pulse_start) % pulse_period) / float(pulse_period)
-        # Triangle wave: 0 → 1 → 0 over one period.
-        pulse = 1.0 - abs((2.0 * phase) - 1.0)
-        return base + (pulse_max - base) * pulse
+        return RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
 
     def update_epsilon(self):
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
-            self.epsilon = self._natural_epsilon_for_frame(
-                int(self.frame_count), pulse_enabled=self.epsilon_pulse_enabled
-            )
+            self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
             return self.epsilon
 
     def get_expert_ratio(self):
@@ -383,8 +512,13 @@ class MetricsData:
             self.verbose_mode = not self.verbose_mode
 
     def toggle_epsilon_pulse(self, kb=None):
-        with self.lock:
-            self.epsilon_pulse_enabled = not self.epsilon_pulse_enabled
+        RL_CONFIG.plateau_pulse_enabled = not RL_CONFIG.plateau_pulse_enabled
+        if not RL_CONFIG.plateau_pulse_enabled:
+            # If disabling mid-pulse, abort it
+            if plateau_pulser.state == PlateauPulser.PULSING:
+                plateau_pulser._end_pulse(int(self.frame_count), self)
+            plateau_pulser.state = PlateauPulser.WATCHING
+            plateau_pulser.confirm_start_frame = 0
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:

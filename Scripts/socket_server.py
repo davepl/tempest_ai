@@ -24,7 +24,7 @@ from aimodel import (
     split_joint_action,
     SafeMetrics,
 )
-from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
+from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH, plateau_pulser
 
 try:
     from nstep_buffer import NStepReplayBuffer
@@ -38,11 +38,13 @@ try:
         add_episode_to_dqn5m_window,
         add_episode_to_total_windows,
         add_episode_to_eplen_window,
+        get_dqn_window_averages,
     )
 except ImportError:
     add_episode_to_dqn100k_window = add_episode_to_dqn1m_window = add_episode_to_dqn5m_window = lambda *a: None
     add_episode_to_total_windows = lambda *a: None
     add_episode_to_eplen_window = lambda *a: None
+    get_dqn_window_averages = lambda: (0.0, 0.0, 0.0)
 
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
@@ -303,7 +305,19 @@ class SocketServer:
                     self.metrics.update_epsilon()
                     self.metrics.update_expert_ratio()
                     self._calc_avg_level()
+                    # Plateau-pulse auto-exploration
+                    try:
+                        d100k, d1m, d5m = get_dqn_window_averages()
+                        pulse_eps = plateau_pulser.update(
+                            self.metrics.frame_count, d100k, d1m, d5m, self.metrics)
+                        if pulse_eps is not None and not self.metrics.manual_epsilon_override:
+                            self.metrics.epsilon = pulse_eps
+                    except Exception:
+                        pass
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
+                is_real_game = (frame.game_mode & 0x80) != 0
+                if frame.gamestate == 0x04 and is_real_game and frame.score > self.metrics.peak_game_score:
+                    self.metrics.peak_game_score = frame.score
 
                 # ── Process previous step ───────────────────────────────
                 if cs.get("last_state") is not None and cs.get("last_action") is not None:
@@ -425,6 +439,8 @@ class SocketServer:
                 except Exception:
                     break
 
+        except ConnectionError:
+            print(f"Client {cid} disconnected.")
         except Exception as e:
             print(f"Client {cid} error: {e}")
             traceback.print_exc()

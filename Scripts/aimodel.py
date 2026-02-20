@@ -132,6 +132,7 @@ class FrameData:
     objreward: float
     action: Tuple[bool, bool, float]
     gamestate: int
+    game_mode: int
     done: bool
     save_signal: bool
     enemy_seg: int
@@ -140,6 +141,7 @@ class FrameData:
     expert_fire: bool
     expert_zap: bool
     level_number: int
+    score: int
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     try:
@@ -155,10 +157,12 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         return FrameData(
             state=state, subjreward=float(subj), objreward=float(obj),
             action=(bool(fire), bool(zap), spinner), gamestate=int(gs),
+            game_mode=int(mode),
             done=bool(done), save_signal=bool(save),
             enemy_seg=int(enemy), player_seg=int(player),
             open_level=bool(open_lvl), expert_fire=bool(exp_fire),
             expert_zap=bool(exp_zap), level_number=int(level),
+            score=int(score),
         )
     except Exception as e:
         print(f"Parse error: {e}")
@@ -622,6 +626,14 @@ class SafeMetrics:
     def update_game_state(self, e, o):
         pass
 
+    @property
+    def peak_game_score(self):
+        return self.metrics.peak_game_score
+
+    @peak_game_score.setter
+    def peak_game_score(self, v):
+        self.metrics.peak_game_score = v
+
 # ── Agent ───────────────────────────────────────────────────────────────────
 class RainbowAgent:
     """Rainbow-lite agent with factored actions, C51, PER, n-step, attention."""
@@ -999,10 +1011,12 @@ class RainbowAgent:
             print(f"Loaded v2 model from {filepath}")
 
             # Load replay buffer if present alongside the model
-            buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+            # Try new directory format first, fall back to legacy .npz
+            buf_base = filepath.rsplit(".", 1)[0] + "_replay"
+            buf_npz = buf_base + ".npz"
             try:
-                if os.path.exists(buf_path):
-                    self.memory.load(buf_path, verbose=bool(show_status))
+                if os.path.isdir(buf_base) or os.path.isfile(buf_npz):
+                    self.memory.load(buf_npz, verbose=bool(show_status))
                 else:
                     print("  No replay buffer file found — starting with empty buffer.")
             except Exception as e:

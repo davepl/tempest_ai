@@ -25,7 +25,12 @@ M.TOP_RAIL_ABSENT = TOP_RAIL_ABSENT
 local function bcd_to_decimal(bcd)
     -- Handle potential non-number inputs gracefully
     if type(bcd) ~= 'number' then return 0 end
-    return math.floor(((bcd / 16) % 16) * 10 + (bcd % 16))
+    local hi = math.floor(bcd / 16) % 16
+    local lo = bcd % 16
+    -- Clamp non-BCD nibbles (A-F) to 9 so we never produce > 99
+    if hi > 9 then hi = 9 end
+    if lo > 9 then lo = 9 end
+    return hi * 10 + lo
 end
 
 -- Forward declarations for helper functions used within classes/other helpers
@@ -538,7 +543,7 @@ end
 function M.LevelState:update(mem)
     self.level_number = mem:read_u8(0x009F)   -- Level number
     self.level_type = mem:read_u8(0x0111)     -- Level type raw flag at $0111 (00=closed, FF=open per assembly)
-    self.level_shape = self.level_number % 16 -- Calculate level shape
+    self.level_shape = mem:read_u8(0x0112)    -- Actual tube shape from curtube (correct even at level 99+ random)
 
     -- Read spike depths for all 16 segments and derive lane spike heights.
     -- Raw depth semantics: 0 = no spike, 0x10 = near top rail, 0xFF = very far.
@@ -569,7 +574,9 @@ function M.PlayerState:new()
     local self = setmetatable({}, M.PlayerState)
     self.position = 0           -- Raw position byte from $0200
     self.alive = 0              -- 1 if alive, 0 if dead
-    self.score = 0              -- Player score (decimal)
+    self.score = 0              -- Player score (cumulative, handles >999,999 wraps)
+    self._prev_bcd_score = 0    -- Previous frame raw BCD score for wrap detection
+    self._score_offset = 0      -- Accumulated 1,000,000 additions from wraps
     self.superzapper_uses = 0
     self.superzapper_active = 0
     self.player_depth = 0       -- Player depth along the tube ($0202)
@@ -609,7 +616,18 @@ function M.PlayerState:update(mem, abs_to_rel_func)
     local score_low = bcd_to_decimal(mem:read_u8(0x0040))
     local score_mid = bcd_to_decimal(mem:read_u8(0x0041))
     local score_high = bcd_to_decimal(mem:read_u8(0x0042))
-    self.score = score_high * 10000 + score_mid * 100 + score_low
+    local bcd_score = score_high * 10000 + score_mid * 100 + score_low
+
+    -- Detect score wrap past 999,999 (BCD rolls over to small number)
+    if bcd_score == 0 then
+        -- Score is zero — new game start, reset wrap tracking
+        self._score_offset = 0
+    elseif self._prev_bcd_score > 900000 and bcd_score < self._prev_bcd_score - 500000 then
+        -- Score was near 999,999 and suddenly dropped — wrap detected
+        self._score_offset = self._score_offset + 1000000
+    end
+    self._prev_bcd_score = bcd_score
+    self.score = bcd_score + self._score_offset
 
     self.superzapper_uses = mem:read_u8(0x03AA)   -- Superzapper availability
     self.superzapper_active = mem:read_u8(0x0125) -- Superzapper active status

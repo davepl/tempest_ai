@@ -56,19 +56,9 @@ def add_episode_to_dqn100k_window(dqn_reward: float, ep_len: int):
     with _dqn_windows_lock:
         _dqn100k.append((float(dqn_reward), int(ep_len)))
         _dqn100k_frames += ep_len
-        while _dqn100k and _dqn100k_frames > DQN100K_FRAMES:
+        while len(_dqn100k) > 1 and _dqn100k_frames > DQN100K_FRAMES:
             _, l = _dqn100k.popleft()
             _dqn100k_frames -= l
-
-
-def add_episode_to_dqn25k_window(dqn_reward: float, ep_len: int):
-    # Backward-compat alias for older callers.
-    add_episode_to_dqn100k_window(dqn_reward, ep_len)
-
-
-def add_episode_to_dqn1k_window(dqn_reward: float, ep_len: int):
-    # Backward-compat alias for very old callers.
-    add_episode_to_dqn100k_window(dqn_reward, ep_len)
 
 
 def add_episode_to_dqn1m_window(dqn_reward: float, ep_len: int):
@@ -121,7 +111,7 @@ def add_episode_to_total_windows(total_reward: float, ep_len: int):
         ):
             buf.append((r, l))
             cur = globals()[frames_ref] + l
-            while buf and cur > limit:
+            while len(buf) > 1 and cur > limit:
                 _, ol = buf.popleft()
                 cur -= ol
             globals()[frames_ref] = cur

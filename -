@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/dave/source/repos/tempest_ai/Scripts/main.py", line 10, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
