@@ -10,7 +10,7 @@ import socket
 import torch
 
 from aimodel import RainbowAgent, KeyboardHandler, print_with_terminal_restore
-from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
+from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG, plateau_pulser
 from metrics_dashboard import MetricsDashboard
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
@@ -219,6 +219,13 @@ def keyboard_handler(agent, kb):
                 display_metrics_row(agent, kb)
             elif key == "b":
                 print_buffer_stats(agent, kb)
+            elif key == "F":
+                if plateau_pulser.is_pulsing:
+                    print_with_terminal_restore(kb, "\nAlready pulsing.")
+                else:
+                    metrics.force_start_pulse(kb)
+                    print_with_terminal_restore(kb, "\nManual epsilon pulse started.")
+                display_metrics_row(agent, kb)
             elif key == "f":
                 print_with_terminal_restore(kb, "\nFlushing replay buffer...")
                 agent.flush_replay_buffer()
@@ -232,6 +239,44 @@ def keyboard_handler(agent, kb):
                 RL_CONFIG.lr = max(1e-6, RL_CONFIG.lr / 2.0)
                 print_with_terminal_restore(kb, f"LR decreased to {RL_CONFIG.lr:.2e}")
                 display_metrics_row(agent, kb)
+            elif key == "?":
+                help_text = (
+                    "\n"
+                    "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
+                    "\u2551            KEYBOARD SHORTCUTS               \u2551\n"
+                    "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+                    "\u2551  ?   \u2551 Show this help                       \u2551\n"
+                    "\u2551  q   \u2551 Quit                                 \u2551\n"
+                    "\u2551  s   \u2551 Save model                           \u2551\n"
+                    "\u2551  h   \u2551 Print metrics header                 \u2551\n"
+                    "\u2551  c   \u2551 Clear screen + header                \u2551\n"
+                    "\u2551 SPC  \u2551 Print metrics row                    \u2551\n"
+                    "\u2551  v   \u2551 Toggle verbose mode                  \u2551\n"
+                    "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+                    "\u2551  4   \u2551 Decrease epsilon                     \u2551\n"
+                    "\u2551  5   \u2551 Restore natural epsilon              \u2551\n"
+                    "\u2551  6   \u2551 Increase epsilon                     \u2551\n"
+                    "\u2551  p   \u2551 Toggle manual epsilon override       \u2551\n"
+                    "\u2551  P   \u2551 Toggle auto plateau pulse on/off     \u2551\n"
+                    "\u2551  F   \u2551 Fire manual epsilon pulse now        \u2551\n"
+                    "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+                    "\u2551  7   \u2551 Decrease expert ratio                \u2551\n"
+                    "\u2551  8   \u2551 Restore natural expert ratio         \u2551\n"
+                    "\u2551  9   \u2551 Increase expert ratio                \u2551\n"
+                    "\u2551  e   \u2551 Toggle expert-only mode              \u2551\n"
+                    "\u2551  o   \u2551 Toggle override mode                 \u2551\n"
+                    "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+                    "\u2551  t   \u2551 Toggle training on/off               \u2551\n"
+                    "\u2551  L   \u2551 Double learning rate                 \u2551\n"
+                    "\u2551  l   \u2551 Halve learning rate                  \u2551\n"
+                    "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+                    "\u2551  a   \u2551 Analyze attention patterns           \u2551\n"
+                    "\u2551  r   \u2551 Reset attention weights              \u2551\n"
+                    "\u2551  b   \u2551 Print replay buffer stats            \u2551\n"
+                    "\u2551  f   \u2551 Flush replay buffer                  \u2551\n"
+                    "\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"
+                )
+                print_with_terminal_restore(kb, help_text)
 
             time.sleep(0.1)
         except BlockingIOError:

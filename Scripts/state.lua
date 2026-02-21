@@ -400,7 +400,6 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
 
     -- If too close, find the nearest segment >= min_fuseball_dist away from ALL top fuseballs
     if too_close then
-        print("FUSEBALL AVOID: Target " .. final_target_seg_abs .. " too close. Finding alternative.")
         local best_safe_seg = -1
         local search_max_dist = is_open and 15 or 8
 
@@ -447,7 +446,6 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
         ::found_safe_segment::
 
         if best_safe_seg ~= -1 then
-            print("FUSEBALL AVOID: New target = " .. best_safe_seg)
             final_target_seg_abs = best_safe_seg
             target_depth = 0 -- Reset depth indication
             should_fire = false -- Don't fire when avoiding

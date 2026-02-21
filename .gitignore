@@ -9,3 +9,5 @@ venv/
 *.log
 *.pyc
 audio/*.mp3
+
+/html/Starfield.mov

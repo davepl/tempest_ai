@@ -282,6 +282,7 @@ class PlateauPulser:
         self.pre_pulse_dqn_5m = dqn_5m
         self.total_pulses += 1
         self.confirm_start_frame = 0
+        metrics_obj.epsilon = RL_CONFIG.plateau_pulse_epsilon
         inv = 1.0 / max(1e-9, float(RL_CONFIG.obj_reward_scale))
         print(f"\n{'='*80}")
         print(f"[PlateauPulser] *** PULSE #{self.total_pulses} FIRED at frame {frame_count:,} ***")
@@ -293,6 +294,9 @@ class PlateauPulser:
     def _end_pulse(self, frame_count: int, metrics_obj):
         self.state = self.RECOVERING
         self.pulse_end_frame = frame_count
+        # Restore epsilon to natural decay value
+        progress = min(1.0, int(metrics_obj.frame_count) / max(1, RL_CONFIG.epsilon_decay_frames))
+        metrics_obj.epsilon = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
         elapsed = frame_count - self.pulse_start_frame
         cooldown = int(RL_CONFIG.plateau_cooldown_frames * self.cooldown_multiplier)
         print(f"\n[PlateauPulser] Pulse #{self.total_pulses} ended at frame {frame_count:,} "
@@ -428,6 +432,8 @@ class MetricsData:
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
+            if plateau_pulser.is_pulsing:
+                return self.epsilon  # Don't overwrite — pulse logic sets epsilon separately
             self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
             return self.epsilon
 
@@ -519,6 +525,14 @@ class MetricsData:
                 plateau_pulser._end_pulse(int(self.frame_count), self)
             plateau_pulser.state = PlateauPulser.WATCHING
             plateau_pulser.confirm_start_frame = 0
+
+    def force_start_pulse(self, kb=None):
+        """Manually fire an epsilon pulse immediately, regardless of plateau detection."""
+        if plateau_pulser.state == PlateauPulser.PULSING:
+            return  # Already pulsing
+        RL_CONFIG.plateau_pulse_enabled = True
+        self.manual_epsilon_override = False  # Let pulse override take effect
+        plateau_pulser._start_pulse(int(self.frame_count), 0.0, self)
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:
