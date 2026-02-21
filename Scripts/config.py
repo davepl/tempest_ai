@@ -27,7 +27,7 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 195
+    params_count: int = 229
 
 SERVER_CONFIG = ServerConfigData()
 

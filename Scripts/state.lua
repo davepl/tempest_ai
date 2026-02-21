@@ -172,7 +172,6 @@ find_nearest_safe_segment = function(player_abs_seg, is_open, forbidden_segments
     end
 
     -- If no safe segment found (highly unlikely unless all are forbidden)
-    print("WARNING: No safe segment found to flee to! Staying put.")
     return player_abs_seg
 end
 
@@ -451,7 +450,6 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
             should_fire = false -- Don't fire when avoiding
             should_zap = false
         else
-             print("WARNING: Fuseball avoidance could not find any safe segment!")
              -- Keep original target if no safe alternative found (might be stuck)
         end
     end
@@ -696,7 +694,7 @@ function M.EnemiesState:new()
     self.active_tankers = 0
     self.active_spikers = 0
     self.active_fuseballs = 0
-    -- Available spawn slots
+    -- Available spawn slots -- DUBIOUS: not displayed to player
     self.spawn_slots_flippers = 0
     self.spawn_slots_pulsars = 0
     self.spawn_slots_tankers = 0
@@ -708,7 +706,7 @@ function M.EnemiesState:new()
     self.pulsar_fliprate = 0 -- Pulsar flip rate ($00B2)
     self.num_enemies_in_tube = 0 -- ($0108)
     self.num_enemies_on_top = 0  -- ($0109)
-    self.enemies_pending = 0 -- ($03AB)
+    self.enemies_pending = 0 -- ($03AB) -- DUBIOUS: not displayed to player
     self.flipper_move = 0       -- ($015D)
     self.fuse_move_prb = 0      -- ($015F)
     self.spd_flipper_lsb = 0    -- ($0160)
@@ -721,6 +719,11 @@ function M.EnemiesState:new()
     self.spd_tanker_msb = 0     -- ($0167)
     self.spd_spiker_msb = 0     -- ($0168)
     self.spd_fuseball_msb = 0   -- ($0169)
+    self.enm_shotspd_msb = 0    -- ($0118) Enemy shot speed MSB
+    self.enm_shotspd_lsb = 0    -- ($0120) Enemy shot speed LSB
+    self.shot_holdoff = 0       -- ($0119) Frames between enemy shots (global cooldown) -- DUBIOUS: internal timer
+    self.lethal_distance = 0    -- ($0157) Pulsar kill range depth threshold -- DUBIOUS: internal threshold
+    self.pulse_field_active = 0.0 -- Derived: 1.0 when pulsars are lethal (pulsing > 0 and bit7 clear)
 
     -- Enemy info arrays (Size 7, for enemy slots 1-7)
     self.enemy_type_info = {} -- Raw type byte ($0283 + i - 1)
@@ -735,7 +738,7 @@ function M.EnemiesState:new()
     self.enemy_direction_moving = {} -- Bit 6 from type byte (0/1)
     self.enemy_between_segments = {} -- Bit 7 from type byte (0/1)
     self.enemy_moving_away = {}    -- Bit 7 from state byte (0/1)
-    self.enemy_can_shoot = {}      -- Bit 6 from state byte (0/1)
+    self.enemy_can_shoot = {}      -- Bit 6 from state byte (0/1) -- DUBIOUS: internal flag
     self.enemy_split_behavior = {} -- Bits 0-1 from state byte
 
     -- Raw angle/progress per enemy (Size 7)
@@ -768,6 +771,23 @@ function M.EnemiesState:new()
     -- NEW: Fractional Enemy Segments By Slot (Size 7, indexed 1-7)
     -- Stores fractional segment position as 12-bit integer
     self.fractional_enemy_segments_by_slot = {}
+
+    -- Fuseball Phase (Size 7, one per enemy slot)
+    -- Encodes fuseball charge/bounce lifecycle:
+    --   0.0  = not a fuseball (or inactive)
+    --   1.0  = charging toward player (maximum danger)
+    --   0.5  = mid-flip (paused, transitioning between segments)
+    --  -1.0  = retreating from player (bouncing back)
+    self.enemy_fuseball_phase = {}
+
+    -- Per-enemy timing state (Size 7) -- DUBIOUS: all three are internal counters not visible to player
+    self.enemy_shot_delay = {}   -- Per-slot shot cooldown countdown ($02A6+i)
+    self.enemy_pcode_pc = {}     -- Per-slot P-code program counter ($0291+i)
+    self.enemy_pcode_storage = {} -- Per-slot P-code loop counter ($0298+i)
+
+    -- Soonest pending spawn (derived from pending_vid)
+    self.soonest_spawn_timer = 0.0  -- Normalised countdown [0..1], 0 = spawning now
+    self.soonest_spawn_lane = INVALID_SEGMENT -- Relative segment of imminent spawn
 
     -- Engineered Features for AI (Calculated in update)
     self.nearest_enemy_seg = INVALID_SEGMENT        -- Relative segment of nearest target enemy
@@ -810,6 +830,10 @@ function M.EnemiesState:new()
         self.active_pulsar_depths[i] = 0
         self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
         self.fractional_enemy_segments_by_slot[i] = 0
+        self.enemy_fuseball_phase[i] = 0.0
+        self.enemy_shot_delay[i] = 0
+        self.enemy_pcode_pc[i] = 0
+        self.enemy_pcode_storage[i] = 0
     end
 
     -- Velocity tracking (previous frame state for delta computation)
@@ -871,6 +895,19 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     self.spd_tanker_msb = mem:read_u8(0x0167)
     self.spd_spiker_msb = mem:read_u8(0x0168)
     self.spd_fuseball_msb = mem:read_u8(0x0169)
+    self.enm_shotspd_msb = mem:read_u8(0x0118)  -- enm_shotspd_msb
+    self.enm_shotspd_lsb = mem:read_u8(0x0120)  -- enm_shotspd_lsb
+    self.shot_holdoff = mem:read_u8(0x0119)      -- Frames between enemy shots (global cooldown)
+    self.lethal_distance = mem:read_u8(0x0157)   -- Pulsar kill range depth threshold
+
+    -- Derive pulse_field_active: 1.0 if pulsars are in lethal pulsing phase
+    -- Assembly: pulsing byte counts down while lane is electrically active;
+    -- when bit 7 is set ($80) the pulse is finished/inactive.
+    if self.pulsing > 0 and (self.pulsing & 0x80) == 0 then
+        self.pulse_field_active = 1.0
+    else
+        self.pulse_field_active = 0.0
+    end
 
     -- Read and process enemy slots (1-7)
     for i = 1, 7 do
@@ -920,6 +957,11 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
             -- Read raw more_enemy_info angle/progress byte ($02CC-$02D2)
             self.more_enemy_info[i] = mem:read_u8(0x02CC + i - 1)
 
+            -- Per-slot timing / P-code state
+            self.enemy_shot_delay[i] = mem:read_u8(0x02A6 + i - 1)   -- shot_delay countdown
+            self.enemy_pcode_pc[i] = mem:read_u8(0x0291 + i - 1)     -- current P-code instruction
+            self.enemy_pcode_storage[i] = mem:read_u8(0x0298 + i - 1) -- P-code loop counter
+
             -- Derive fractional segment for moving-between-segment enemies.
             -- For non-fuseballs this follows Tempest flip-angle progression.
             -- (Fuseballs use a special representation; keep integer lane there.)
@@ -954,12 +996,29 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
         self.active_pulsar[i] = INVALID_SEGMENT
         self.active_pulsar_depths[i] = 0
         self.active_top_rail_enemies[i] = TOP_RAIL_ABSENT
+        self.enemy_fuseball_phase[i] = 0.0
+        self.enemy_shot_delay[i] = 0
+        self.enemy_pcode_pc[i] = 0
+        self.enemy_pcode_storage[i] = 0
     end
     
     for i = 1, 7 do
         -- Check if it's an active Fuseball (type 4) moving towards player (bit 7 of state byte is clear)
         if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT and (self.active_enemy_info[i] & 0x80) == 0 then -- Correct type 4
             self.charging_fuseball[i] = self.enemy_segments_fractional[i]
+        end
+
+        -- Fuseball phase: encode charge/flip/retreat lifecycle
+        if self.enemy_core_type[i] == ENEMY_TYPE_FUSEBALL and self.enemy_abs_segments[i] ~= INVALID_SEGMENT then
+            local retreating = (self.active_enemy_info[i] & 0x80) ~= 0
+            local mid_flip   = (self.more_enemy_info[i] & 0x80) ~= 0  -- $81/$87 during flip
+            if mid_flip then
+                self.enemy_fuseball_phase[i] = 0.5   -- paused mid-flip
+            elseif retreating then
+                self.enemy_fuseball_phase[i] = -1.0   -- retreating (bouncing back)
+            else
+                self.enemy_fuseball_phase[i] = 1.0    -- charging (maximum danger)
+            end
         end
         
         -- Check if it's an active Pulsar (type 1)
@@ -1015,6 +1074,24 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     -- Read pending_vid (64 bytes starting at 0x0243)
     for i = 1, 64 do
         self.pending_vid[i] = mem:read_u8(0x0243 + i - 1)
+    end
+
+    -- Derive soonest pending spawn: find minimum non-zero pending_vid
+    local min_timer = 256
+    local min_lane  = INVALID_SEGMENT
+    for i = 1, 64 do
+        local vid = self.pending_vid[i]
+        if vid > 0 and vid < min_timer then
+            min_timer = vid
+            min_lane  = self.pending_seg[i]  -- already relative
+        end
+    end
+    if min_timer < 256 then
+        self.soonest_spawn_timer = min_timer / 255.0  -- normalise to [0..1]
+        self.soonest_spawn_lane  = min_lane
+    else
+        self.soonest_spawn_timer = 0.0
+        self.soonest_spawn_lane  = INVALID_SEGMENT
     end
     
     -- Calculate true between-segment progress per slot (scaled to 12-bit, 0..4095)

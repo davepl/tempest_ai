@@ -235,8 +235,10 @@ class LaneCrossAttentionEncoder(nn.Module):
     Lane-centric spatial encoder with cross-attention from 16 tube lanes to enemy slots.
 
     Architecture:
-      1. Lane tokens:  16 × [spike, angle, player_here, sin_pos, cos_pos] → Linear → embed
-      2. Enemy tokens:  7 × [decoded(6), seg, depth, top, toprail, Δseg, Δdepth, sin, cos] → Linear → embed
+      1. Lane tokens:  16 × [spike, angle, player_here, sin_pos, cos_pos,
+                              angle_delta_cw, angle_delta_ccw] → Linear → embed
+      2. Enemy tokens:  7 × [decoded(6), seg, depth, top, toprail, Δseg, Δdepth,
+                              sin, cos, fuseball_phase] → Linear → embed
       3. Cross-attention: lanes (Q) attend to enemies (K/V) with empty-slot masking
       4. Residual connection + LayerNorm on enriched lanes
       5. Mean-pool enriched lanes → fixed-size summary vector
@@ -313,8 +315,8 @@ class RainbowNet(nn.Module):
         self.use_attn = cfg.use_enemy_attention
         attn_out_dim = 0
         if self.use_attn:
-            self.lane_features = 5    # spike, angle, player_here, sin_pos, cos_pos
-            self.enemy_slot_features = 14  # 6 decoded + seg+depth+top+toprail + Δseg+Δdepth + sin+cos pos
+            self.lane_features = 7    # spike, angle, player_here, sin_pos, cos_pos, angle_delta_cw, angle_delta_ccw
+            self.enemy_slot_features = 18  # 6 decoded + seg+depth+top+toprail + Δseg+Δdepth + sin+cos pos + fuseball_phase + shot_delay + pcode_pc + pcode_storage
             self.num_lanes = 16
             self.num_enemy_slots = cfg.enemy_slots  # 7
 
@@ -377,14 +379,32 @@ class RainbowNet(nn.Module):
     def _build_lane_tokens(self, state: torch.Tensor):
         """Build 16 lane tokens from flat state vector.
 
-        Each lane gets: [spike_height, tube_angle, player_here, sin_pos, cos_pos]
-        Returns: (B, 16, 5)
+        Each lane gets: [spike_height, tube_angle, player_here, sin_pos, cos_pos,
+                         angle_delta_cw, angle_delta_ccw]
+        Returns: (B, 16, 7)
         """
         B = state.shape[0]
+        device = state.device
 
         # Static per-lane features
         spike_heights = state[:, 31:47]   # (B, 16)
         tube_angles   = state[:, 47:63]   # (B, 16)
+
+        # Angle deltas to adjacent segments
+        # tube_angles are normalised 0..1 (raw nibble / 15). Compute signed
+        # difference to clockwise and counter-clockwise neighbours.
+        # For open levels (state[:,29] > 0.5) the ends don't wrap;
+        # for closed levels they do.
+        is_open = (state[:, 29] > 0.5).unsqueeze(1)  # (B, 1)
+        # Clockwise neighbour = next index (wrapping mod 16 on closed)
+        angles_cw  = torch.roll(tube_angles, -1, dims=1)  # (B, 16)
+        angles_ccw = torch.roll(tube_angles,  1, dims=1)  # (B, 16)
+        delta_cw  = angles_cw - tube_angles     # (B, 16)
+        delta_ccw = angles_ccw - tube_angles     # (B, 16)
+        # On open levels, lane 15 has no CW neighbour and lane 0 has no CCW.
+        # Zero out those deltas to avoid wrap-around artifacts.
+        delta_cw  = torch.where(is_open, delta_cw.clone().scatter_(1, torch.full((B, 1), 15, device=device, dtype=torch.long), 0.0), delta_cw)
+        delta_ccw = torch.where(is_open, delta_ccw.clone().scatter_(1, torch.zeros(B, 1, device=device, dtype=torch.long), 0.0), delta_ccw)
 
         # Player lane indicator (one-hot)
         player_pos_norm = state[:, 5]                                    # (B,) normalized pos/15
@@ -395,21 +415,26 @@ class RainbowNet(nn.Module):
         lane_sin = self._lane_sin_pos.unsqueeze(0).expand(B, -1)  # (B, 16)
         lane_cos = self._lane_cos_pos.unsqueeze(0).expand(B, -1)  # (B, 16)
 
-        # Stack: (B, 16, 5)
-        tokens = torch.stack([spike_heights, tube_angles, player_here, lane_sin, lane_cos], dim=2)
+        # Stack: (B, 16, 7)
+        tokens = torch.stack([spike_heights, tube_angles, player_here,
+                              lane_sin, lane_cos, delta_cw, delta_ccw], dim=2)
         return tokens
 
     def _build_enemy_tokens(self, state: torch.Tensor):
         """Build 7 enemy tokens from flat state vector.
 
-        Each enemy gets 14 features:
+        Each enemy gets 18 features:
           [core_type, direction, between, moving_away, can_shoot, split,   (6 decoded)
            seg, depth, top_seg, toprail,                                   (4 spatial)
            Δseg, Δdepth,                                                   (2 velocity)
-           sin_pos, cos_pos]                                                (2 circular pos)
+           sin_pos, cos_pos,                                                (2 circular pos)
+           fuseball_phase,                                                  (1 fuseball lifecycle)
+           shot_delay,                                                      (1 per-slot shot cooldown) DUBIOUS
+           pcode_pc,                                                        (1 P-code program counter) DUBIOUS
+           pcode_storage]                                                   (1 P-code loop counter) DUBIOUS
 
         Returns:
-          tokens: (B, 7, 14) — sorted by depth (nearest first, empty last)
+          tokens: (B, 7, 18) — sorted by depth (nearest first, empty last)
           mask:   (B, 7) bool — True where slot is EMPTY
         """
         B = state.shape[0]
@@ -422,9 +447,17 @@ class RainbowNet(nn.Module):
         depths  = state[:, 135:142].unsqueeze(2)              # (B, 7, 1)
         tops    = state[:, 142:149].unsqueeze(2)              # (B, 7, 1)
         toprail = state[:, 171:178].unsqueeze(2)              # (B, 7, 1)
-        # Velocity per-slot (new state indices 181-194)
+        # Velocity per-slot (state indices 181-194)
         delta_seg   = state[:, 181:188].unsqueeze(2)          # (B, 7, 1)
         delta_depth = state[:, 188:195].unsqueeze(2)          # (B, 7, 1)
+        # Fuseball phase per-slot (state indices 195-201)
+        fuse_phase  = state[:, 195:202].unsqueeze(2)          # (B, 7, 1)
+        # Shot delay per-slot (state indices 203-209)
+        shot_delay  = state[:, 203:210].unsqueeze(2)          # (B, 7, 1)
+        # P-code PC per-slot (state indices 211-217)
+        pcode_pc    = state[:, 211:218].unsqueeze(2)          # (B, 7, 1)
+        # P-code storage per-slot (state indices 218-224)
+        pcode_stor  = state[:, 218:225].unsqueeze(2)          # (B, 7, 1)
 
         # Circular positional encoding for enemy absolute position
         player_pos_norm = state[:, 5]                          # (B,)
@@ -435,9 +468,10 @@ class RainbowNet(nn.Module):
         enemy_sin = torch.sin(2 * math.pi * enemy_abs_frac).unsqueeze(2)         # (B, 7, 1)
         enemy_cos = torch.cos(2 * math.pi * enemy_abs_frac).unsqueeze(2)         # (B, 7, 1)
 
-        # Concatenate all 14 features
+        # Concatenate all 18 features
         tokens = torch.cat([decoded, segs, depths, tops, toprail,
-                            delta_seg, delta_depth, enemy_sin, enemy_cos], dim=2)  # (B, 7, 14)
+                            delta_seg, delta_depth, enemy_sin, enemy_cos,
+                            fuse_phase, shot_delay, pcode_pc, pcode_stor], dim=2)  # (B, 7, 18)
 
         # Empty mask: depth ≈ 0 → inactive slot
         depth_vals = state[:, 135:142]                         # (B, 7)
@@ -466,7 +500,7 @@ class RainbowNet(nn.Module):
         # Lane-Cross-Attention
         if self.use_attn:
             lane_tokens = self._build_lane_tokens(state)                    # (B, 16, 5)
-            enemy_tokens, enemy_mask = self._build_enemy_tokens(state)      # (B, 7, 14), (B, 7)
+            enemy_tokens, enemy_mask = self._build_enemy_tokens(state)      # (B, 7, 18), (B, 7)
             attn_out = self.lane_cross_attn(lane_tokens, enemy_tokens, enemy_mask)  # (B, D)
             trunk_in = torch.cat([state, attn_out], dim=1)
         else:
@@ -961,9 +995,8 @@ class RainbowAgent:
             if show_status:
                 self._text_progress("  Model load", 1.0)
 
-            # Detect old engine (v1) checkpoints
             if "engine_version" not in ckpt:
-                print("⚠  Old engine checkpoint detected — starting fresh with new architecture.")
+                print("Incompatible checkpoint (no engine_version) — starting fresh.")
                 return False
 
             m1, u1 = self._load_compatible(self.online_net, ckpt.get("online_state_dict", {}))
@@ -1234,9 +1267,6 @@ class RainbowAgent:
         except queue.Full:
             pass
         self._train_thread.join(timeout=3.0)
-
-# Legacy alias
-DiscreteDQNAgent = RainbowAgent
 
 def setup_environment():
     os.makedirs(MODEL_DIR, exist_ok=True)

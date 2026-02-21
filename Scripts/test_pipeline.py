@@ -8,7 +8,7 @@ from nstep_buffer import NStepReplayBuffer
 from socket_server import AsyncReplayBuffer
 
 STATE_DIM = RL_CONFIG.state_size
-agent = RainbowAgent(STATE_DIM, RL_CONFIG)
+agent = RainbowAgent(STATE_DIM)
 abuf = AsyncReplayBuffer(agent)
 nstep = NStepReplayBuffer(n_step=RL_CONFIG.n_step, gamma=RL_CONFIG.gamma)
 

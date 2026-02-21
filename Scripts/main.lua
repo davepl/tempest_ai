@@ -356,14 +356,14 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_tankers, 7, "active_tankers")
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_spikers, 7, "active_spikers")
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.active_fuseballs, 7, "active_fuseballs")
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_flippers, 7, "spawn_flippers") -- 0-7 available slots
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_pulsars, 7, "spawn_pulsars")
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_tankers, 7, "spawn_tankers")
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_spikers, 7, "spawn_spikers")
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_fuseballs, 7, "spawn_fuseballs")
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_flippers, 7, "spawn_flippers") -- DUBIOUS: not displayed to player
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_pulsars, 7, "spawn_pulsars")    -- DUBIOUS
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_tankers, 7, "spawn_tankers")    -- DUBIOUS
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_spikers, 7, "spawn_spikers")    -- DUBIOUS
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.spawn_slots_fuseballs, 7, "spawn_fuseballs")-- DUBIOUS
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.num_enemies_in_tube, 7, "num_in_tube")
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.num_enemies_on_top, 7, "num_on_top")
-    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemies_pending, 63, "enemies_pending") -- capped at 63
+    num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemies_pending, 63, "enemies_pending") -- DUBIOUS: not displayed to player
     num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, math.min(es.pulsar_fliprate, 40), 40, "pulsar_fliprate") -- 10-40 active, clamp 255→40
     -- pulse_beat is now signed (-12..+12); use signed normalization
     num_values_packed = num_values_packed + push_signed_norm(binary_data_parts, es.pulse_beat, 12, "pulse_beat")
@@ -391,7 +391,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_direction_moving[i], 1, "enemy_direction_moving")
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_between_segments[i], 1, "enemy_between_segments")
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_moving_away[i], 1, "enemy_moving_away")
-        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_can_shoot[i], 1, "enemy_can_shoot")
+        num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_can_shoot[i], 1, "enemy_can_shoot") -- DUBIOUS: internal flag
         num_values_packed = num_values_packed + push_small_enum_norm(binary_data_parts, es.enemy_split_behavior[i], 3, "enemy_split_behavior")
     end
 
@@ -419,7 +419,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.enemy_shot_segments[i])
     end
     -- Pulsar depths table (7) - raw depth for active pulsars, 0 otherwise.
-    -- Reuses this 7-wide block so payload width stays fixed at 195.
+    -- Reuses this 7-wide block so payload width stays fixed.
     for i = 1, 7 do
         num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, es.active_pulsar_depths[i] or 0)
     end
@@ -490,7 +490,67 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
         num_values_packed = num_values_packed + push_signed_norm(binary_data_parts, es.enemy_delta_depth[i], 128, "enemy_delta_depth")
     end
 
-    -- Total main payload size: 195
+    -- ── Fuseball Phase Features (7) ──────────────────────────────────
+    -- Per-slot fuseball lifecycle phase:
+    --   0.0 = not a fuseball,  1.0 = charging,  0.5 = mid-flip,  -1.0 = retreating
+    for i = 1, 7 do
+        num_values_packed = num_values_packed + push_float32(binary_data_parts, es.enemy_fuseball_phase[i])
+    end
+
+    -- ── Enemy Shot Speed (1) ─────────────────────────────────────────
+    -- Global enemy shot velocity (all shots share one speed per level).
+    -- Combined 16-bit signed, same scale as other enemy speeds.
+    num_values_packed = num_values_packed + push_combined_speed(binary_data_parts, es.enm_shotspd_lsb, es.enm_shotspd_msb)
+
+    -- ── Per-slot Shot Delay (7) ──────────────────────────────────────
+    -- DUBIOUS: internal countdown not visible to player
+    -- Countdown timer until this enemy can fire; 0 = ready to shoot.
+    -- Normalised by shot_holdoff (global max) when > 0, else /255 fallback.
+    local holdoff = (es.shot_holdoff > 0) and es.shot_holdoff or 255
+    for i = 1, 7 do
+        local delay = es.enemy_shot_delay[i] or 0
+        num_values_packed = num_values_packed + push_float32(binary_data_parts, math.min(delay / holdoff, 1.0))
+    end
+
+    -- ── Shot Holdoff (1) ─────────────────────────────────────────────
+    -- DUBIOUS: internal cooldown ceiling not visible to player
+    -- Global cooldown ceiling for all enemy shots. Higher = slower firing.
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, es.shot_holdoff or 0)
+
+    -- ── Per-slot P-code Program Counter (7) ──────────────────────────
+    -- DUBIOUS: internal movement script state not visible to player
+    -- Current instruction index in the movement P-code interpreter.
+    -- Max observed is ~151 (ALVROM table size). Normalise /151.
+    for i = 1, 7 do
+        local pc = es.enemy_pcode_pc[i] or 0
+        num_values_packed = num_values_packed + push_float32(binary_data_parts, math.min(pc / 151.0, 1.0))
+    end
+
+    -- ── Per-slot P-code Storage / Loop Counter (7) ───────────────────
+    -- DUBIOUS: internal movement script state not visible to player
+    -- Loop iteration counter used by P-code repeat instructions.
+    -- Range 0-8 (max repeat count). Normalise /8.
+    for i = 1, 7 do
+        local stor = es.enemy_pcode_storage[i] or 0
+        num_values_packed = num_values_packed + push_float32(binary_data_parts, math.min(stor / 8.0, 1.0))
+    end
+
+    -- ── Lethal Distance (1) ──────────────────────────────────────────
+    -- DUBIOUS: internal threshold not visible to player
+    -- Depth threshold below which pulsars electrocute the player.
+    num_values_packed = num_values_packed + push_depth_norm(binary_data_parts, es.lethal_distance or 0)
+
+    -- ── Pulse Field Active (1) ───────────────────────────────────────
+    -- Binary: 1.0 if pulsar lanes are currently electrified, 0.0 otherwise.
+    num_values_packed = num_values_packed + push_float32(binary_data_parts, es.pulse_field_active)
+
+    -- ── Soonest Spawn (2) ────────────────────────────────────────────
+    -- Timer: normalised countdown [0..1] of nearest pending spawn (0 = imminent).
+    -- Lane: relative segment of that spawn (INVALID_SEGMENT → sentinel).
+    num_values_packed = num_values_packed + push_float32(binary_data_parts, es.soonest_spawn_timer)
+    num_values_packed = num_values_packed + push_relative_norm(binary_data_parts, es.soonest_spawn_lane)
+
+    -- Total main payload size: 229
 
     -- Serialize main data to binary string (float32 values)
     local binary_data = table.concat(binary_data_parts)
