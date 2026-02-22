@@ -1038,7 +1038,10 @@ function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_t
     for i = 1, 4 do
         -- Read integer depth/position and fractional LSB
         local pos_int = mem:read_u8(0x02DB + i - 1)  -- EnemyShotPositions ($02DB-$02DE)
-        local pos_lsb = mem:read_u8(0x02E6 + i - 1)  -- enm_shot_lsb ($02E6-$02E9)
+        -- NOTE: The label enm_shot_lsb sits at $02E6 but the assembly indexes
+        -- via X=8..11 (combined player+enemy array), so enemy LSBs are at
+        -- $02E6+8 = $02EE..$02F1.  Previously read $02E6+i which was wrong.
+        local pos_lsb = mem:read_u8(0x02EE + i - 1)  -- enm_shot_lsb ($02EE-$02F1)
 
         -- If integer position is 0, shot is inactive regardless of LSB
         if pos_int == 0 then

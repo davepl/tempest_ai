@@ -19,7 +19,8 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
 local SHOW_DISPLAY            = false
-local START_LEVEL_MIN         = 9      -- Desired 1-based starting level (1 = default, >1 = skip ahead)
+local START_ADVANCED          = false  -- true = start on highest available level from last game
+local START_LEVEL_MIN         = 9      -- Desired 1-based starting level (used when START_ADVANCED is false)
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubvmdell:9999"
 local SOCKET_READ_TIMEOUT_S   = 3.5  
@@ -794,17 +795,20 @@ local function determine_final_actions()
         final_fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
         -- Zap, Spinner, Start remain 0
     elseif game_state.gamestate == 0x16 then -- Level Select
-        -- Poke the desired start level directly into the selection cursor.
-        -- $0200 (player_seg) is the selection index during level select.
-        -- $0127 is max selectable index — ensure it allows our choice.
+        -- $0200 (player_seg) = selection cursor index during level select.
+        -- $0127 = max selectable index (set by game from highest completed level).
         if level_select_counter < 10 then
-            -- Wait a few frames for the level select screen to initialise,
-            -- then poke the desired index and max selectable each frame until we fire.
-            if START_LEVEL_MIN > 1 then
+            if START_ADVANCED then
+                -- Select the highest available level (max selectable from last game)
+                local max_idx = mem:read_u8(0x0127)
+                mem:write_u8(0x0200, max_idx)  -- scroll cursor to max
+            elseif START_LEVEL_MIN > 1 then
+                -- Select a specific level by poking the matching startlevtbl index
                 local desired_idx = level_to_select_index(START_LEVEL_MIN)
-                mem:write_u8(0x0200, desired_idx)           -- selection cursor
-                mem:write_u8(0x0127, math.max(desired_idx, mem:read_u8(0x0127))) -- ensure max allows it
+                mem:write_u8(0x0200, desired_idx)
+                mem:write_u8(0x0127, math.max(desired_idx, mem:read_u8(0x0127)))
             end
+            -- else START_LEVEL_MIN == 1 and not START_ADVANCED: leave cursor at 0 (Level 1)
             level_select_counter = level_select_counter + 1
         elseif level_select_counter == 10 then
             final_fire_cmd = 1  -- Press fire to confirm selection

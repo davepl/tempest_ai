@@ -109,8 +109,9 @@ class _DashboardState:
         self.lock = threading.Lock()
         self.last_steps: int | None = None
         self.last_steps_time: float | None = None
-        self._last_episode_count: int | None = None
-        self._last_episode_time: float | None = None
+        # Episode rate: 30-second sliding window of (timestamp, episode_count) samples
+        self._ep_rate_window: deque = deque()  # [(ts, episode_count), ...]
+        self._EP_RATE_WINDOW_SEC: float = 30.0
         self._level_windows = {
             "25k": {"limit": LEVEL_25K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
             "100k": {"limit": LEVEL_100K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
@@ -347,13 +348,19 @@ class _DashboardState:
         self.last_steps_time = now
         replay_per_frame = (steps_per_sec * float(getattr(RL_CONFIG, "batch_size", 1))) / max(1e-6, float(fps))
 
+        # Episode rate: 30-second sliding window
+        self._ep_rate_window.append((now, episode_count))
+        # Evict samples older than window
+        cutoff = now - self._EP_RATE_WINDOW_SEC
+        while len(self._ep_rate_window) > 1 and self._ep_rate_window[0][0] < cutoff:
+            self._ep_rate_window.popleft()
         episodes_per_sec = 0.0
-        if self._last_episode_count is not None and self._last_episode_time is not None:
-            dt = max(1e-6, now - self._last_episode_time)
-            de = max(0, episode_count - self._last_episode_count)
-            episodes_per_sec = de / dt
-        self._last_episode_count = episode_count
-        self._last_episode_time = now
+        if len(self._ep_rate_window) >= 2:
+            t0, c0 = self._ep_rate_window[0]
+            t1, c1 = self._ep_rate_window[-1]
+            dt = t1 - t0
+            if dt > 0.5:  # need at least 0.5s of data
+                episodes_per_sec = max(0, c1 - c0) / dt
 
         lr = None
         q_min = None
@@ -1348,16 +1355,16 @@ def _render_dashboard_html() -> str:
       rewards: {
         canvas: document.getElementById("cRewards"),
         series: [
-          { key: "total_5m", color: "#38bdf8", median_window: 3, map: v => Math.max(0, v || 0),
+          { key: "total_5m", color: "#38bdf8", median_window: 3,
             axis: {
               side: "left",
-              min: 0,
+              min_floor: 0,
               label_pad: 52,
               group_keys: ["total_100k", "total_1m", "total_5m"],
             },
           },
-          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
-          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) }
+          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m" },
+          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m" }
         ]
       },
       learning: {
@@ -1428,7 +1435,7 @@ def _render_dashboard_html() -> str:
         canvas: document.getElementById("cAgreement"),
         series: [
           { key: "agreement_1m", color: "#00c8ff", smooth_alpha: 0.35,
-            axis: { side: "left", min: 0, min_range: 0.10, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
+            axis: { side: "left", min_range: 0.25, max_range: 0.25, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
           },
           { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 }
         ]
@@ -2392,6 +2399,22 @@ def _render_dashboard_html() -> str:
         if (!hasFixedMin) minV = Math.floor(minV / niceStep) * niceStep;
         if (!hasFixedMax) maxV = Math.ceil(maxV / niceStep) * niceStep;
         if (maxV <= minV) maxV = minV + niceStep;
+        // Enforce minimum visible range (expand around midpoint, respecting fixed bounds)
+        const minRange = Number(s.axis?.min_range);
+        if (Number.isFinite(minRange) && minRange > 0 && (maxV - minV) < minRange) {
+          const mid = (minV + maxV) * 0.5;
+          minV = mid - minRange * 0.5;
+          maxV = mid + minRange * 0.5;
+          if (hasFixedMin && minV < Number(s.axis.min)) { minV = Number(s.axis.min); maxV = minV + minRange; }
+          if (hasFixedMax && maxV > Number(s.axis.max)) { maxV = Number(s.axis.max); minV = maxV - minRange; }
+        }
+        // Enforce maximum visible range (shrink around midpoint to lock zoom)
+        const maxRange = Number(s.axis?.max_range);
+        if (Number.isFinite(maxRange) && maxRange > 0 && (maxV - minV) > maxRange) {
+          const mid = (minV + maxV) * 0.5;
+          minV = mid - maxRange * 0.5;
+          maxV = mid + maxRange * 0.5;
+        }
 
         const axisX = side === "left"
           ? (padL - 20 - leftAxisOffset)
