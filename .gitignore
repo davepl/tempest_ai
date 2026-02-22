@@ -9,5 +9,6 @@ venv/
 *.log
 *.pyc
 audio/*.mp3
-
+log.txt
 /html/Starfield.mov
+Scripts/main.lua

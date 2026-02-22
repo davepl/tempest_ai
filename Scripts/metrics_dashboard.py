@@ -109,6 +109,8 @@ class _DashboardState:
         self.lock = threading.Lock()
         self.last_steps: int | None = None
         self.last_steps_time: float | None = None
+        self._last_episode_count: int | None = None
+        self._last_episode_time: float | None = None
         self._level_windows = {
             "25k": {"limit": LEVEL_25K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
             "100k": {"limit": LEVEL_100K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
@@ -315,6 +317,7 @@ class _DashboardState:
             inference_requests = int(self.metrics.total_inference_requests)
             inference_time = float(self.metrics.total_inference_time)
             last_agreement = float(self.metrics.last_agreement)
+            episode_count = int(self.metrics.episode_count)
 
             reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
             reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
@@ -343,6 +346,14 @@ class _DashboardState:
         self.last_steps = total_training_steps
         self.last_steps_time = now
         replay_per_frame = (steps_per_sec * float(getattr(RL_CONFIG, "batch_size", 1))) / max(1e-6, float(fps))
+
+        episodes_per_sec = 0.0
+        if self._last_episode_count is not None and self._last_episode_time is not None:
+            dt = max(1e-6, now - self._last_episode_time)
+            de = max(0, episode_count - self._last_episode_count)
+            episodes_per_sec = de / dt
+        self._last_episode_count = episode_count
+        self._last_episode_time = now
 
         lr = None
         q_min = None
@@ -414,6 +425,8 @@ class _DashboardState:
             "pulse_remaining": self._pulse_remaining(frame_count),
             "pulse_count": plateau_pulser.total_pulses,
             "pulse_enabled": RL_CONFIG.plateau_pulse_enabled,
+            "episode_count": episode_count,
+            "episodes_per_sec": episodes_per_sec,
         }
 
     @staticmethod
@@ -915,6 +928,12 @@ def _render_dashboard_html() -> str:
       padding: 6px 9px;
       gap: 2px;
     }
+    .card-quarter {
+      grid-column: span 1;
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
+    }
     .card-half.mini-metric-card .mini-inline {
       min-height: 0;
       flex: 1;
@@ -1074,8 +1093,9 @@ def _render_dashboard_html() -> str:
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div><div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div></article>
-      <article class="card card-half" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card card-quarter" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div><div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div></article>
+      <article class="card card-quarter" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,235,0.26)"><div class="label">EPISODES</div><div class="value" id="mEpCount">0</div><div style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;" id="mEpSec">0.00/s</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
@@ -1238,6 +1258,8 @@ def _render_dashboard_html() -> str:
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
+      epCount: document.getElementById("mEpCount"),
+      epSec: document.getElementById("mEpSec"),
       agreePanel: document.getElementById("mAgreePanel"),
     };
     const recEls = {
@@ -3061,6 +3083,8 @@ def _render_dashboard_html() -> str:
       }
 
       cards.xprt.textContent = fmtPct(now.expert_ratio);
+      cards.epCount.textContent = fmtInt(now.episode_count);
+      cards.epSec.textContent = fmtFloat(now.episodes_per_sec, 2) + "/s";
       cards.rwrd.textContent = fmtInt(Math.max(0, now.total_1m || 0));
       cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));

@@ -372,6 +372,7 @@ class MetricsData:
     peak_level: int = 0
     peak_episode_reward: float = 0.0
     peak_game_score: int = 0
+    episode_count: int = 0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
@@ -473,6 +474,7 @@ class MetricsData:
                 self.episode_length_count_interval += 1
             if float(total) > self.peak_episode_reward:
                 self.peak_episode_reward = float(total)
+            self.episode_count += 1
 
     def increment_total_controls(self):
         with self.lock:

@@ -19,8 +19,7 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
 local SHOW_DISPLAY            = false
-local START_ADVANCED          = false
-local START_LEVEL_MIN         = 9
+local START_LEVEL_MIN         = 9      -- Desired 1-based starting level (1 = default, >1 = skip ahead)
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubvmdell:9999"
 local SOCKET_READ_TIMEOUT_S   = 3.5  
@@ -36,6 +35,28 @@ local current_socket = nil
 local total_bytes_sent = 0
 local level_select_counter = 0
 local shutdown_requested = false
+
+-- Tempest startlevtbl: maps selection index (0-based) → 0-based level number.
+-- Mirrors the ROM table at startlevtbl in tempest.asm (standard table, !ALT_START_TABLE).
+local startlevtbl = {
+    [0]=0, 2, 4, 6, 8, 10, 12, 14, 16, 19, 21, 23, 25, 27, 30, 32,
+    35, 39, 43, 46, 48, 51, 55, 59, 62, 64, 72, 80
+}
+
+--- Find the startlevtbl index whose level is closest to (but not exceeding)
+--- the desired 1-based level.  Returns 0-based index.
+local function level_to_select_index(desired_level_1based)
+    local target = math.max(0, desired_level_1based - 1)  -- convert to 0-based
+    local best_idx = 0
+    for idx = 0, #startlevtbl do
+        if startlevtbl[idx] <= target then
+            best_idx = idx
+        else
+            break
+        end
+    end
+    return best_idx
+end
 local last_display_update = 0 -- Timestamp of last display update
 local last_connection_attempt_time = 0 -- Timestamp of last connection attempt
 
@@ -556,16 +577,16 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     local binary_data = table.concat(binary_data_parts)
 
     -- VALIDATION: Debug print to verify key segment encodings (first few frames only)
-    if gs.frame_counter < 5 then
-        print(string.format("[DEBUG] Frame %d: Nearest enemy seg=%.3f, Player shot segs=[%.3f,%.3f,%.3f,%.3f]",
-            gs.frame_counter,
-            (es.nearest_enemy_seg == INVALID_SEGMENT) and -1.0 or (es.nearest_enemy_seg / 15.0),
-            (ps.shot_segments[1] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[1] / 15.0),
-            (ps.shot_segments[2] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[2] / 15.0),
-            (ps.shot_segments[3] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[3] / 15.0),
-            (ps.shot_segments[4] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[4] / 15.0)
-        ))
-    end
+    -- if gs.frame_counter < 5 then
+    --     print(string.format("[DEBUG] Frame %d: Nearest enemy seg=%.3f, Player shot segs=[%.3f,%.3f,%.3f,%.3f]",
+    --         gs.frame_counter,
+    --         (es.nearest_enemy_seg == INVALID_SEGMENT) and -1.0 or (es.nearest_enemy_seg / 15.0),
+    --         (ps.shot_segments[1] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[1] / 15.0),
+    --         (ps.shot_segments[2] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[2] / 15.0),
+    --         (ps.shot_segments[3] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[3] / 15.0),
+    --         (ps.shot_segments[4] == INVALID_SEGMENT) and -1.0 or (ps.shot_segments[4] / 15.0)
+    --     ))
+    -- end
 
     -- --- OOB Data Packing ---
     -- Python expects OOB header format: >HddBBBHIBBBhhBBBBB (no total reward, no attract byte)
@@ -579,8 +600,7 @@ local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs,
     if shutdown_requested or current_time - gs.last_save_time >= gs.save_interval then
         save_signal = 1
         gs.last_save_time = current_time
-        if shutdown_requested then print("SHUTDOWN SAVE: Sending final save signal.")
-        else print("Periodic Save: Sending save signal.") end
+        if shutdown_requested then print("SHUTDOWN SAVE: Sending final save signal.") end
     end
 
     -- Pack OOB data matching Python (reward total not sent; only subj,obj). Attract not sent.
@@ -774,22 +794,23 @@ local function determine_final_actions()
         final_fire_cmd = (game_state.frame_counter % 10 == 0) and 1 or 0
         -- Zap, Spinner, Start remain 0
     elseif game_state.gamestate == 0x16 then -- Level Select
-        -- DEBUG: Log Level Select State
-        -- print(string.format("[DEBUG LevelSelect] Frame: %d, Timer: %d, Counter: %d", game_state.frame_counter, mem and mem:read_u8(0x0003) or -1, level_select_counter))
-
-        if level_select_counter < 60 then
-            if (START_ADVANCED) then
-                final_spinner_cmd = 18; -- Fire, Zap, Start remain 0
+        -- Poke the desired start level directly into the selection cursor.
+        -- $0200 (player_seg) is the selection index during level select.
+        -- $0127 is max selectable index — ensure it allows our choice.
+        if level_select_counter < 10 then
+            -- Wait a few frames for the level select screen to initialise,
+            -- then poke the desired index and max selectable each frame until we fire.
+            if START_LEVEL_MIN > 1 then
+                local desired_idx = level_to_select_index(START_LEVEL_MIN)
+                mem:write_u8(0x0200, desired_idx)           -- selection cursor
+                mem:write_u8(0x0127, math.max(desired_idx, mem:read_u8(0x0127))) -- ensure max allows it
             end
             level_select_counter = level_select_counter + 1
-            -- print("  -> Spinning knob (Counter now " .. level_select_counter .. ")")
-        elseif level_select_counter == 60 then
-            final_fire_cmd = 1; -- Spinner, Zap, Start remain 0
-            level_select_counter = level_select_counter + 1 -- Increment past 60 immediately
-            -- print("  -> Pressing Fire! (Counter now " .. level_select_counter .. ")")
-        else -- Counter is > 60, just do nothing, don't reset here
+        elseif level_select_counter == 10 then
+            final_fire_cmd = 1  -- Press fire to confirm selection
+            level_select_counter = level_select_counter + 1
+        else -- Counter is > 10, selection confirmed, wait for state transition
              -- All commands remain 0
-             -- print("  -> Level selected, doing nothing.")
         end
         -- Resetting the counter should ONLY happen in attract mode.
     elseif is_attract_mode then -- Attract Mode
