@@ -48,7 +48,7 @@ local DEATH_PENALTY = 2000           -- Edge-triggered penalty when dying (wider
 -- ── Subjective Shaping v2 constants ────────────────────────────────────
 local DANGER_DEPTH          = 0x80   -- Max depth for graduated threat proximity
 local TOP_RAIL_DEPTH        = 0x10   -- Depth at/below which enemies are on the rim
-local BASE_THREAT_PENALTY   = 2.0    -- Graduated per-enemy proximity penalty
+local BASE_THREAT_PENALTY   = 1.0    -- Graduated per-enemy proximity penalty
 local PULSAR_LANE_PENALTY   = 3.0    -- Standing in an active pulsar lane
 local CORNERED_PENALTY      = 2.0    -- Few escape routes available
 local SHOT_URGENCY_PENALTY  = 2.5    -- Incoming enemy shot near player lane

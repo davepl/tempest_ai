@@ -37,12 +37,14 @@ try:
         add_episode_to_dqn1m_window,
         add_episode_to_dqn5m_window,
         add_episode_to_total_windows,
+        add_episode_to_subj_obj_windows,
         add_episode_to_eplen_window,
         get_dqn_window_averages,
     )
 except ImportError:
     add_episode_to_dqn100k_window = add_episode_to_dqn1m_window = add_episode_to_dqn5m_window = lambda *a: None
     add_episode_to_total_windows = lambda *a: None
+    add_episode_to_subj_obj_windows = lambda *a, **kw: None
     add_episode_to_eplen_window = lambda *a: None
     get_dqn_window_averages = lambda: (0.0, 0.0, 0.0)
 
@@ -370,6 +372,9 @@ class SocketServer:
                             add_episode_to_dqn1m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
                             add_episode_to_dqn5m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
                             add_episode_to_total_windows(cs["total_reward"], cs.get("ep_frames", 0))
+                            add_episode_to_subj_obj_windows(
+                                cs.get("ep_subj_reward", 0), cs.get("ep_obj_reward", 0),
+                                cs.get("ep_frames", 0))
                             add_episode_to_eplen_window(cs.get("ep_frames", 0))
                         except Exception:
                             pass

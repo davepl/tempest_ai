@@ -32,15 +32,17 @@ except ImportError:
     from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser
 
 try:
-    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
+    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_subj_obj_1m_averages, get_eplen_1m_average, get_eplen_100k_average
 except ImportError:
     try:
-        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
+        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_subj_obj_1m_averages, get_eplen_1m_average, get_eplen_100k_average
     except ImportError:
         def get_dqn_window_averages():
             return 0.0, 0.0, 0.0
         def get_total_window_averages():
             return 0.0, 0.0, 0.0
+        def get_subj_obj_1m_averages():
+            return 0.0, 0.0
         def get_eplen_1m_average():
             return 0.0
         def get_eplen_100k_average():
@@ -333,6 +335,10 @@ class _DashboardState:
             total100k_raw, total1m_raw, total5m_raw = get_total_window_averages()
         except Exception:
             total100k_raw = total1m_raw = total5m_raw = 0.0
+        try:
+            subj1m_raw, obj1m_raw = get_subj_obj_1m_averages()
+        except Exception:
+            subj1m_raw = obj1m_raw = 0.0
         level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
         agreement_1m = self._update_agreement_window(frame_count, last_agreement)
         if inference_requests > 0:
@@ -410,6 +416,8 @@ class _DashboardState:
             "total_100k": float(total100k_raw) * inv_obj,
             "total_1m": float(total1m_raw) * inv_obj,
             "total_5m": float(total5m_raw) * inv_obj,
+            "subj_1m": float(subj1m_raw) * inv_subj,
+            "obj_1m": float(obj1m_raw) * inv_obj,
             "level_25k": float(level_25k),
             "level_100k": float(level_100k),
             "level_1m": float(level_1m),
@@ -1133,9 +1141,9 @@ def _render_dashboard_html() -> str:
       <article class="panel">
         <h2>Rewards</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#ef4444;"></span>100K</span>
-          <span><span class="sw" style="background:#22c55e;"></span>1M</span>
-          <span><span class="sw" style="background:#38bdf8;"></span>5M</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>Total (1M)</span>
+          <span><span class="sw" style="background:#ef4444;"></span>Subj (1M)</span>
+          <span><span class="sw" style="background:#22c55e;"></span>Obj (1M)</span>
         </div>
         <canvas id="cRewards"></canvas>
       </article>
@@ -1355,16 +1363,17 @@ def _render_dashboard_html() -> str:
       rewards: {
         canvas: document.getElementById("cRewards"),
         series: [
-          { key: "total_5m", color: "#38bdf8", median_window: 3,
+          { key: "total_1m", color: "#f59e0b", median_window: 3,
             axis: {
               side: "left",
-              min_floor: 0,
+              min: -1000,
+              max: 50000,
               label_pad: 52,
-              group_keys: ["total_100k", "total_1m", "total_5m"],
+              group_keys: ["total_1m", "subj_1m", "obj_1m"],
             },
           },
-          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m" },
-          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m" }
+          { key: "subj_1m", color: "#ef4444", median_window: 3, axis_ref: "total_1m" },
+          { key: "obj_1m", color: "#22c55e", median_window: 3, axis_ref: "total_1m" }
         ]
       },
       learning: {
@@ -1435,7 +1444,7 @@ def _render_dashboard_html() -> str:
         canvas: document.getElementById("cAgreement"),
         series: [
           { key: "agreement_1m", color: "#00c8ff", smooth_alpha: 0.35,
-            axis: { side: "left", min_range: 0.25, max_range: 0.25, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
+            axis: { side: "left", min: 0.0, max: 1.0, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
           },
           { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 }
         ]

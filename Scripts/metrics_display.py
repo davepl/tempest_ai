@@ -40,6 +40,12 @@ _total1m_frames = 0
 _total5m = deque()
 _total5m_frames = 0
 
+# Rolling subjective / objective 1M windows
+_subj1m = deque()
+_subj1m_frames = 0
+_obj1m = deque()
+_obj1m_frames = 0
+
 # Rolling episode-length windows
 EPLEN100K_FRAMES = 100_000
 _eplen100k = deque()
@@ -120,6 +126,31 @@ def add_episode_to_total_windows(total_reward: float, ep_len: int):
 def get_total_window_averages() -> tuple[float, float, float]:
     with _dqn_windows_lock:
         return _avg_window(_total100k), _avg_window(_total1m), _avg_window(_total5m)
+
+
+def add_episode_to_subj_obj_windows(subj_reward: float, obj_reward: float, ep_len: int):
+    """Add an episode's subjective and objective rewards to 1M rolling windows."""
+    global _subj1m_frames, _obj1m_frames
+    if ep_len <= 0:
+        return
+    l = int(ep_len)
+    with _dqn_windows_lock:
+        _subj1m.append((float(subj_reward), l))
+        _subj1m_frames += l
+        while len(_subj1m) > 1 and _subj1m_frames > DQN1M_FRAMES:
+            _, ol = _subj1m.popleft()
+            _subj1m_frames -= ol
+
+        _obj1m.append((float(obj_reward), l))
+        _obj1m_frames += l
+        while len(_obj1m) > 1 and _obj1m_frames > DQN1M_FRAMES:
+            _, ol = _obj1m.popleft()
+            _obj1m_frames -= ol
+
+
+def get_subj_obj_1m_averages() -> tuple[float, float]:
+    with _dqn_windows_lock:
+        return _avg_window(_subj1m), _avg_window(_obj1m)
 
 
 def add_episode_to_eplen_window(ep_len: int):
