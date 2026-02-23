@@ -632,21 +632,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
     local pending = enemies_state.enemies_pending or 0
 
-    -- Superzap heuristic:
-    --   1) Emergency: 3+ enemies on the top rail — zap immediately
-    --   2) End-of-level: enemies_pending == 0 means the game will spawn no more
-    --      enemies (the game itself uses this to trigger end-of-level behavior
-    --      like pulsars sticking to top, flippers rushing, spikers becoming
-    --      tankers).  Gate on active_enemy_count > 0 so we don't fire during
-    --      the brief level-transition window when both values are zero.
+    -- Superzap disabled: hardcoded false to confirm model is the one zapping
     local should_superzap = false
-    if superzapper_available then
-        if top_rail_count >= 3 then
-            should_superzap = true
-        elseif pending == 0 and active_enemy_count > 0 then
-            should_superzap = true
-        end
-    end
 
     return target_seg, 0, sample_expert_fire(), should_superzap
 end
