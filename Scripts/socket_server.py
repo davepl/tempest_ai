@@ -445,6 +445,11 @@ class SocketServer:
                             fz_idx, sp_idx = self.agent.act(frame.state, epsilon)
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
+                        # Gate model's superzap: only allow zap when expert also
+                        # recommends it (prevents wasteful early-level zaps).
+                        if zap and not frame.expert_zap:
+                            zap = False
+                            fz_idx = fire_zap_to_discrete(fire, zap)
                         spinner_val = spinner_index_to_value(sp_idx)
                         action_source = "dqn"
 

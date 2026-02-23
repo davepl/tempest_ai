@@ -634,11 +634,12 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
 
     -- Zap when:
     --   (a) 3+ enemies on the top rail (imminent danger), OR
-    --   (b) No more enemies pending AND there are active enemies on screen
-    --       (everything that will spawn already has — clean up now)
+    --   (b) No more enemies pending AND 3+ active enemies on screen
+    --       (everything that will spawn already has — clean up now).
+    --       Require 3+ to avoid wasting zap on stragglers the player can shoot.
     local should_superzap = superzapper_available and (
         top_rail_count >= 3 or
-        (pending == 0 and active_enemy_count > 0)
+        (pending == 0 and active_enemy_count >= 3)
     )
 
     return target_seg, 0, sample_expert_fire(), should_superzap
