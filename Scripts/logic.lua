@@ -632,8 +632,11 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
     local pending = enemies_state.enemies_pending or 0
 
-    -- Superzap disabled: hardcoded false to confirm model is the one zapping
+    -- Superzap: only emergency case enabled (3+ top-rail enemies)
     local should_superzap = false
+    if superzapper_available and top_rail_count >= 3 then
+        should_superzap = true
+    end
 
     return target_seg, 0, sample_expert_fire(), should_superzap
 end
