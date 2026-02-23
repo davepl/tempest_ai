@@ -632,10 +632,14 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
     local pending = enemies_state.enemies_pending or 0
 
-    -- Superzap: only end-of-level case enabled for testing
+    -- Superzap heuristic: both cases active
     local should_superzap = false
-    if superzapper_available and pending == 0 and active_enemy_count > 0 then
-        should_superzap = true
+    if superzapper_available then
+        if top_rail_count >= 3 then
+            should_superzap = true
+        elseif pending == 0 and active_enemy_count > 0 then
+            should_superzap = true
+        end
     end
 
     return target_seg, 0, sample_expert_fire(), should_superzap
