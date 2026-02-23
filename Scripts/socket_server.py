@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, sys, time, socket, select, struct, threading, traceback, random, queue
+import os, sys, time, socket, select, struct, threading, traceback, random, queue, collections
 import numpy as np
 
 from aimodel import (
@@ -56,6 +56,9 @@ class AsyncReplayBuffer:
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
+        # Pre-death tracking: rolling window of recent replay buffer indices
+        self._recent_indices = collections.deque(
+            maxlen=int(getattr(RL_CONFIG, 'pre_death_window', 100)))
         self._thread = threading.Thread(target=self._consume, daemon=True)
         self._thread.start()
 
@@ -66,6 +69,7 @@ class AsyncReplayBuffer:
             pass
 
     def _consume(self):
+        pre_death_boost = float(getattr(RL_CONFIG, 'pre_death_boost', 2.0))
         while self.running:
             try:
                 item = self.queue.get(timeout=0.01)
@@ -79,7 +83,18 @@ class AsyncReplayBuffer:
                     break
             for a, kw in batch:
                 try:
-                    self.agent.step(*a, **kw)
+                    idx = self.agent.step(*a, **kw)
+                    if idx is not None and idx >= 0:
+                        self._recent_indices.append(idx)
+                    # On death, boost priorities of recent transitions
+                    done = a[4] if len(a) > 4 else kw.get('done', False)
+                    if done and pre_death_boost > 1.0 and len(self._recent_indices) > 0:
+                        try:
+                            indices = list(self._recent_indices)
+                            self.agent.memory.boost_priorities(indices, pre_death_boost)
+                        except Exception:
+                            pass
+                        self._recent_indices.clear()
                 except Exception as e:
                     print(f"AsyncReplayBuffer error: {e}")
 

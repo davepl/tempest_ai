@@ -867,6 +867,11 @@ class RainbowAgent:
             if boost > 0:
                 pri = max(abs(pri), boost) * (-1.0 if pri < 0 else 1.0)
         self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri)
+        # Return the index of the just-written transition for pre-death tracking
+        try:
+            return int(self.memory.tree.data_ptr - 1) % self.memory.capacity
+        except AttributeError:
+            return -1
 
     # ── Background training ─────────────────────────────────────────────
     def _background_train(self):

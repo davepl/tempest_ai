@@ -226,6 +226,25 @@ class PrioritizedReplayBuffer:
             new_p = (np.abs(td_errors.astype(np.float64)) + 1e-6) ** self.alpha
             self.tree.batch_update(np.asarray(indices, dtype=np.int64), new_p)
 
+    def boost_priorities(self, indices, multiplier: float):
+        """Multiply existing priorities of given indices by a factor.
+
+        Used for pre-death emphasis: retroactively boost transitions that
+        led up to a death event so they are sampled more frequently.
+        """
+        if multiplier <= 1.0 or len(indices) == 0:
+            return
+        indices = np.asarray(indices, dtype=np.int64)
+        with self.lock:
+            # Only boost indices that are still within the live buffer
+            valid = indices[indices < self.size]
+            if len(valid) == 0:
+                return
+            tree_idx = valid + self.tree.capacity
+            current = self.tree.tree[tree_idx]
+            boosted = current * multiplier
+            self.tree.batch_update(valid, boosted)
+
     def __len__(self):
         return self.size
 

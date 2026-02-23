@@ -135,6 +135,8 @@ class RLConfigData:
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 3.0      # Lower terminal boost to reduce over-focusing on death tails
+    pre_death_window: int = 100            # How many transitions before death to priority-boost
+    pre_death_boost: float = 2.0           # Priority multiplier for pre-death transitions (1.0=off)
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
