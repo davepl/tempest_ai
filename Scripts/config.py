@@ -83,7 +83,7 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 8      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
     memory_size: int = 15_000_000
@@ -152,7 +152,7 @@ class RLConfigData:
     inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 4
+    training_steps_per_cycle: int = 16
     save_interval: int = 10_000
 
     enable_amp: bool = True
@@ -216,11 +216,15 @@ class PlateauPulser:
         if frame_count < cfg.plateau_min_frame and self.state == self.WATCHING:
             return None
 
-        # Throttle checks to ~every 1000 frames
+        # Throttle checks to ~every 1000 frames (but never delay pulse expiry)
         if frame_count - self._last_check_frame < 1000:
             if self.state == self.PULSING:
-                return cfg.plateau_pulse_epsilon
-            return None
+                if (frame_count - self.pulse_start_frame) >= cfg.plateau_pulse_frames:
+                    pass  # Pulse expired — fall through to state machine
+                else:
+                    return cfg.plateau_pulse_epsilon
+            else:
+                return None
         self._last_check_frame = frame_count
 
         # ── State machine ───────────────────────────────────────────

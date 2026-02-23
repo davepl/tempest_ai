@@ -1088,9 +1088,11 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(255,160,80,0.66);--card-glow:rgba(255,140,60,0.26)">
         <div class="label">EPISODE LENGTH</div>
-        <div class="mini-inline">
+        <div class="mini-inline" style="grid-template-rows:auto auto auto 1fr;">
           <div class="value" id="mEpLen">0</div>
-          <canvas id="cEpLenMini" class="mini-canvas"></canvas>
+          <canvas id="cEpLenMini" class="mini-canvas" style="grid-row:1/5;"></canvas>
+          <div class="label" style="font-size:0.62em;margin-top:4px;grid-column:1;">DURATION</div>
+          <div id="mEpDur" style="font-family:'DS-Digital',monospace;font-size:1.3em;color:rgba(255,52,52,0.98);letter-spacing:1px;text-shadow:0 0 8px rgba(255,30,30,0.8),0 0 20px rgba(255,20,20,0.5),0 0 40px rgba(255,20,20,0.3);grid-column:1;">—</div>
         </div>
         <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
       </article>
@@ -1144,6 +1146,7 @@ def _render_dashboard_html() -> str:
           <span><span class="sw" style="background:#f59e0b;"></span>Total (1M)</span>
           <span><span class="sw" style="background:#ef4444;"></span>Subj (1M)</span>
           <span><span class="sw" style="background:#22c55e;"></span>Obj (1M)</span>
+          <span><span class="sw" style="background:#3b82f6;"></span>Instant</span>
         </div>
         <canvas id="cRewards"></canvas>
       </article>
@@ -1337,7 +1340,7 @@ def _render_dashboard_html() -> str:
           {
             key: "fps",
             color: "#22c55e",
-            axis: { side: "left", min: 0, max: 3000, group_keys: ["fps", "eplen_100k"] },
+            axis: { side: "left", group_keys: ["fps", "eplen_100k"] },
             smooth_alpha: 0.14,
           },
           {
@@ -1366,14 +1369,19 @@ def _render_dashboard_html() -> str:
           { key: "total_1m", color: "#f59e0b", median_window: 3,
             axis: {
               side: "left",
-              min: -1000,
-              max: 50000,
               label_pad: 52,
-              group_keys: ["total_1m", "subj_1m", "obj_1m"],
+              group_keys: ["total_1m", "obj_1m", "reward_total"],
             },
           },
-          { key: "subj_1m", color: "#ef4444", median_window: 3, axis_ref: "total_1m" },
-          { key: "obj_1m", color: "#22c55e", median_window: 3, axis_ref: "total_1m" }
+          { key: "subj_1m", color: "#ef4444", median_window: 3,
+            axis: {
+              side: "right",
+              label_pad: 52,
+              group_keys: ["subj_1m"],
+            },
+          },
+          { key: "obj_1m", color: "#22c55e", median_window: 3, axis_ref: "total_1m" },
+          { key: "reward_total", color: "#3b82f6", median_window: 3, axis_ref: "total_1m" }
         ]
       },
       learning: {
@@ -1437,14 +1445,15 @@ def _render_dashboard_html() -> str:
       epLenMini: {
         canvas: document.getElementById("cEpLenMini"),
         series: [
-          { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
+          { key: "eplen_1m", color: "#22c55e", axis: { } },
+          { key: "eplen_100k", color: "#ef4444" }
         ]
       },
       agreement: {
         canvas: document.getElementById("cAgreement"),
         series: [
           { key: "agreement_1m", color: "#00c8ff", smooth_alpha: 0.35,
-            axis: { side: "left", min: 0.0, max: 1.0, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
+            axis: { side: "left", label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
           },
           { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 }
         ]
@@ -2381,8 +2390,17 @@ def _render_dashboard_html() -> str:
 
         const hasFixedMin = Number.isFinite(s.axis?.min);
         const hasFixedMax = Number.isFinite(s.axis?.max);
-        let minV = hasFixedMin ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
-        let maxV = hasFixedMax ? Number(s.axis.max) : (values.length ? Math.max(...values) : 1.0);
+        // Use robust percentile bounds (2nd–98th) to avoid axis jumps from outliers
+        let minV, maxV;
+        if (values.length) {
+          const sorted = values.slice().sort((a, b) => a - b);
+          const pctIdx = (p) => Math.min(sorted.length - 1, Math.max(0, Math.floor(p * sorted.length)));
+          minV = hasFixedMin ? Number(s.axis.min) : sorted[pctIdx(0.02)];
+          maxV = hasFixedMax ? Number(s.axis.max) : sorted[pctIdx(0.98)];
+        } else {
+          minV = hasFixedMin ? Number(s.axis.min) : 0.0;
+          maxV = hasFixedMax ? Number(s.axis.max) : 1.0;
+        }
         const minFloor = Number(s.axis?.min_floor);
         const maxFloor = Number(s.axis?.max_floor);
         if (!hasFixedMin && Number.isFinite(minFloor)) {
@@ -2402,6 +2420,16 @@ def _render_dashboard_html() -> str:
           else if (!hasFixedMin && hasFixedMax) minV = maxV - 1.0;
           else { minV -= 1.0; maxV += 1.0; }
         }
+        // Smooth raw axis bounds via EMA before tick snapping to prevent jumpy rescaling
+        const AXIS_EMA_ALPHA = 0.15;
+        if (!canvas._axisEma) canvas._axisEma = {};
+        const emaKey = s.key;
+        if (canvas._axisEma[emaKey]) {
+          const prev = canvas._axisEma[emaKey];
+          if (!hasFixedMin) minV = prev.min + AXIS_EMA_ALPHA * (minV - prev.min);
+          if (!hasFixedMax) maxV = prev.max + AXIS_EMA_ALPHA * (maxV - prev.max);
+        }
+        canvas._axisEma[emaKey] = { min: minV, max: maxV };
         // Nice-tick autoscaling: snap axis bounds to clean 1-2-5 intervals
         const targetTicks = Number.isFinite(s.axis?.target_ticks) ? Math.max(2, s.axis.target_ticks) : 4;
         const niceStep = niceInterval(maxV - minV, targetTicks);
@@ -3126,6 +3154,18 @@ def _render_dashboard_html() -> str:
         ? toFixedCharCells("-")
         : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
+      {
+        const epDurEl = document.getElementById("mEpDur");
+        const epLen = now.eplen_1m || 0;
+        if (epLen > 0) {
+          const secs = epLen / 30;
+          const m = Math.floor(secs / 60);
+          const s = Math.floor(secs % 60);
+          epDurEl.textContent = m + ":" + String(s).padStart(2, "0");
+        } else {
+          epDurEl.textContent = "\u2014";
+        }
+      }
       cards.agreePanel.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
         ? fmtFloat(now.agreement_1m * 100, 1) + "%"
         : "0.0%";
