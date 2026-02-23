@@ -624,7 +624,7 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         local seg = enemies_state.enemy_abs_segments[i]
         if depth > 0 and seg ~= INVALID_SEGMENT then
             active_enemy_count = active_enemy_count + 1
-            if depth <= TOP_RAIL_AVOID_DEPTH then
+            if depth <= 0x10 then  -- actual top of tunnel, not the avoidance zone
                 top_rail_count = top_rail_count + 1
             end
         end
