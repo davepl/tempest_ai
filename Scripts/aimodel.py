@@ -800,15 +800,16 @@ class RainbowAgent:
             if self._sync_event is not None:
                 self._sync_event.record()  # recorded on default stream
 
-    def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int]:
-        """Return (firezap_idx, spinner_idx)."""
+    def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int, bool]:
+        """Return (firezap_idx, spinner_idx, is_epsilon)."""
         if random.random() < epsilon:
-            return _random_firezap(), random.randrange(NUM_SPINNER)
+            return _random_firezap(), random.randrange(NUM_SPINNER), True
 
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         q = self._infer_q_values(st)
         joint = int(q.argmax(dim=1).item())
-        return split_joint_action(joint)
+        fz, sp = split_joint_action(joint)
+        return fz, sp, False
 
     def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
         net = self.infer_net if self.use_separate_inference else self.online_net
@@ -825,20 +826,21 @@ class RainbowAgent:
                     return net.q_values(states_t)
             return net.q_values(states_t)
 
-    def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int]]:
-        """Return batched actions for aligned state/epsilon lists."""
+    def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int, bool]]:
+        """Return batched actions for aligned state/epsilon lists.
+        Each element is (firezap_idx, spinner_idx, is_epsilon)."""
         n = min(len(states), len(epsilons))
         if n <= 0:
             return []
 
-        actions: list[Tuple[int, int] | None] = [None] * n
+        actions: list[Tuple[int, int, bool] | None] = [None] * n
         greedy_idx: list[int] = []
         greedy_states: list[np.ndarray] = []
 
         for i in range(n):
             eps = float(epsilons[i])
             if random.random() < eps:
-                actions[i] = (_random_firezap(), random.randrange(NUM_SPINNER))
+                actions[i] = (_random_firezap(), random.randrange(NUM_SPINNER), True)
             else:
                 greedy_idx.append(i)
                 greedy_states.append(states[i])
@@ -849,9 +851,10 @@ class RainbowAgent:
             q = self._infer_q_values(st)
             joints = q.argmax(dim=1).detach().cpu().tolist()
             for pos, joint in zip(greedy_idx, joints):
-                actions[pos] = split_joint_action(int(joint))
+                fz, sp = split_joint_action(int(joint))
+                actions[pos] = (fz, sp, False)
 
-        return [a if a is not None else (0, 0) for a in actions]
+        return [a if a is not None else (0, 0, False) for a in actions]
 
     # ── Step (add experience) ───────────────────────────────────────────
     def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None):
