@@ -49,7 +49,7 @@ local DEATH_PENALTY = 2000           -- Edge-triggered penalty when dying (wider
 local DANGER_DEPTH          = 0x80   -- Max depth for graduated threat proximity
 local TOP_RAIL_DEPTH        = 0x10   -- Depth at/below which enemies are on the rim
 local BASE_THREAT_PENALTY   = 1.0    -- Graduated per-enemy proximity penalty
-local PULSAR_LANE_PENALTY   = 3.0    -- Standing in an active pulsar lane
+local PULSAR_LANE_PENALTY   = 0.5    -- Standing in an active pulsar lane (kept small to avoid paralysis)
 local CORNERED_PENALTY      = 2.0    -- Few escape routes available
 local SHOT_URGENCY_PENALTY  = 2.5    -- Incoming enemy shot near player lane
 local SHOT_DANGER_DEPTH     = 0x40   -- Only penalize shots shallower than this
@@ -748,15 +748,11 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         local pulsar_seg = enemies_state.enemy_abs_segments[i]
                         if pulsar_seg ~= nil and pulsar_seg ~= INVALID_SEGMENT then
                             if pulsar_seg == player_abs_seg then
-                                -- In the pulsar lane while pulsing = acute danger
-                                subj_reward = subj_reward - (PULSAR_LANE_PENALTY * 3.0)
-                            else
-                                local rel = abs_to_rel_func(player_abs_seg, pulsar_seg, is_open)
-                                if math.abs(rel) == 1 then
-                                    -- Adjacent to pulsing pulsar = warning
-                                    subj_reward = subj_reward - PULSAR_LANE_PENALTY
-                                end
+                                -- In the pulsar lane while pulsing = danger
+                                subj_reward = subj_reward - PULSAR_LANE_PENALTY
                             end
+                            -- Adjacent-lane penalty removed: was causing paralysis
+                            -- on pulsar levels by penalizing all movement near pulsars.
                         end
                     end
                 end
