@@ -14,7 +14,7 @@ local TOP_RAIL_ABSENT = state_defs.TOP_RAIL_ABSENT or 255
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x10
 local TOP_RAIL_AVOID_DEPTH = 0x20
-local SAFE_DISTANCE = 2
+local SAFE_DISTANCE = 1              -- Only flee when enemy is in our lane (was 2, caused edge-camping)
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
 local FLIPPER_REACT_DISTANCE_L = 2.0 -- distance at which we move one segment and fire (left-side, float)
@@ -44,7 +44,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
 
 local DEATH_PENALTY = 2000           -- Edge-triggered penalty when dying (wider clip than normal rewards)
-local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
+local DANGER_DEPTH = 0x30            -- Depth threshold for nearby threats/safety shaping (was 0x80, too deep)
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
 local ZAP_CONSERVATION_REWARD = 1.0  -- Per-frame reward when superzapper is still unused
