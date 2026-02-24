@@ -12,7 +12,7 @@ local INVALID_SEGMENT = state_defs.INVALID_SEGMENT
 local TOP_RAIL_ABSENT = state_defs.TOP_RAIL_ABSENT or 255
 
 -- New constants for top rail logic
-local TOP_RAIL_DEPTH = 0x15
+local TOP_RAIL_DEPTH = 0x10
 local TOP_RAIL_AVOID_DEPTH = 0x20
 local SAFE_DISTANCE = 2
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
@@ -44,37 +44,11 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
 
 local DEATH_PENALTY = 2000           -- Edge-triggered penalty when dying (wider clip than normal rewards)
-<<<<<<< HEAD
-
--- ── Subjective Shaping v2 constants ────────────────────────────────────
-local DANGER_DEPTH          = 0x80   -- Max depth for graduated threat proximity
-local TOP_RAIL_DEPTH        = 0x10   -- Depth at/below which enemies are on the rim
-local BASE_THREAT_PENALTY   = 1.0    -- Graduated per-enemy proximity penalty
-local PULSAR_LANE_PENALTY   = 0.5    -- Standing in an active pulsar lane (kept small to avoid paralysis)
-local CORNERED_PENALTY      = 2.0    -- Few escape routes available
-local SHOT_URGENCY_PENALTY  = 2.5    -- Incoming enemy shot near player lane
-local SHOT_DANGER_DEPTH     = 0x40   -- Only penalize shots shallower than this
-local ZAP_GOOD_BONUS        = 5.0    -- Smart superzap (3+ enemies cleared)
-local ZAP_WASTE_PENALTY     = 3.0    -- Wasted superzap (0 enemies near)
-local SPIKE_PENALTY         = 1.5    -- In spiked lane during tube zoom
-local CLEAR_BONUS           = 0.5    -- Small per-frame bonus when no threats nearby
-
--- Type-specific threat multipliers
-local THREAT_TYPE_MULT = {
-    [ENEMY_TYPE_FUSEBALL] = 3.0,  -- instantly fatal, erratic
-    [ENEMY_TYPE_FLIPPER]  = 1.5,  -- grabs on top rail
-    [ENEMY_TYPE_PULSAR]   = 1.0,  -- dangerous when pulsing
-    [ENEMY_TYPE_TANKER]   = 0.8,  -- splits but less immediately lethal
-    [ENEMY_TYPE_SPIKER]   = 0.3,  -- mainly dangerous via spikes
-}
-local LANE_DIST_WEIGHT = {[0] = 1.0, [1] = 0.5, [2] = 0.2}
-=======
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
 local ZAP_CONSERVATION_REWARD = 1.0  -- Per-frame reward when superzapper is still unused
 local ZAP_USED_PENALTY = 1.0         -- Per-frame penalty when superzapper has been used
->>>>>>> parent of 9f9faff (New Reward Shaping)
 
 local previous_score = 0
 local previous_level = 0
@@ -273,7 +247,7 @@ function M.is_danger_lane(segment, enemies_state)
             local enemy_type = enemies_state.enemy_core_type[i]
             local depth = enemies_state.enemy_depths[i]
             -- Fuseballs are fatal on contact, so they're dangerous at greater distances on top rail
-            if enemy_type == ENEMY_TYPE_FUSEBALL and depth <= TOP_RAIL_DEPTH then return true end
+            if enemy_type == ENEMY_TYPE_FUSEBALL and depth <= TOP_RAIL_AVOID_DEPTH then return true end
             -- Other enemies are dangerous when close
             if depth <= 0x20 then return true end
         end
@@ -700,33 +674,9 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             local prev_player_seg = math.floor(previous_player_position or 0) % 16
             local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
 
-<<<<<<< HEAD
-            -- ── Signal 2: Pulsar Lane Warning ──────────────────────────
-            if enemies_state.pulse_field_active == 1.0 then
-                for i = 1, 7 do
-                    if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
-                       enemies_state.enemy_depths[i] > 0 then
-                        local pulsar_seg = enemies_state.enemy_abs_segments[i]
-                        if pulsar_seg ~= nil and pulsar_seg ~= INVALID_SEGMENT then
-                            if pulsar_seg == player_abs_seg then
-                                -- In the pulsar lane while pulsing = danger
-                                subj_reward = subj_reward - PULSAR_LANE_PENALTY
-                            end
-                            -- Adjacent-lane penalty removed: was causing paralysis
-                            -- on pulsar levels by penalizing all movement near pulsars.
-                        end
-                    end
-                end
-            end
-
-            -- ── Signal 3: Escape Route Count ───────────────────────────
-            -- Count how many of the 5 lanes (self ±2) are free of top-rail
-            -- threats. Penalize when cornered (≤1 exit).
-=======
             -- Apply safety shaping EVERY frame so the agent feels ongoing danger,
             -- not just on lane changes.  Scale slightly smaller when stationary
             -- to keep a lane-change incentive.
->>>>>>> parent of 9f9faff (New Reward Shaping)
             do
                 local shaping_scale = (player_abs_seg ~= prev_player_seg) and 1.0 or 0.5
                 -- First pass: map threats (enemies or shots) within DANGER_DEPTH by lane
