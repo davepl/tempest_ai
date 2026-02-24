@@ -44,6 +44,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
 
 local DEATH_PENALTY = 2000           -- Edge-triggered penalty when dying (wider clip than normal rewards)
+<<<<<<< HEAD
 
 -- ── Subjective Shaping v2 constants ────────────────────────────────────
 local DANGER_DEPTH          = 0x80   -- Max depth for graduated threat proximity
@@ -67,6 +68,13 @@ local THREAT_TYPE_MULT = {
     [ENEMY_TYPE_SPIKER]   = 0.3,  -- mainly dangerous via spikes
 }
 local LANE_DIST_WEIGHT = {[0] = 1.0, [1] = 0.5, [2] = 0.2}
+=======
+local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
+local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
+local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
+local ZAP_CONSERVATION_REWARD = 1.0  -- Per-frame reward when superzapper is still unused
+local ZAP_USED_PENALTY = 1.0         -- Per-frame penalty when superzapper has been used
+>>>>>>> parent of 9f9faff (New Reward Shaping)
 
 local previous_score = 0
 local previous_level = 0
@@ -75,7 +83,6 @@ local LastRewardState = 0
 local LastSubjRewardState = 0
 local LastObjRewardState = 0
 local previous_player_position = 0
-local previous_zap_active = 0  -- Edge detection for superzapper activation
 
 local function sample_expert_fire()
     return math.random() < EXPERT_FIRE_PROBABILITY
@@ -673,73 +680,27 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     else
         -- Primary dense signal: scaled/clipped score delta
         local score_delta = (player_state.score or 0) - (previous_score or 0)
-        if score_delta > 0 and score_delta < 1000 then
-            obj_reward = obj_reward + score_delta
+        if score_delta > 0 and score_delta < 1000 then                         -- Filter out large bonuses AND negative deltas
+            local r_score = score_delta 
+            obj_reward = obj_reward + r_score
         end
 
-        local player_abs_seg = player_state.position & 0x0F
-        local is_open = (level_state.level_type ~= 0x00)
-
-        -- Helper: compute lane from player + offset, respecting open/closed
-        local function offset_to_lane(offset)
-            if offset == 0 then return player_abs_seg end
-            if is_open then
-                local c = player_abs_seg + offset
-                return (c >= 0 and c <= 15) and c or nil
+        -- Subjective shaping: lane safety/danger reward
+        -- Only apply during active gameplay (not tube zoom, high score entry, etc.)
+        if game_state.gamestate == 0x04 or game_state.gamestate == 0x20 then
+            -- Superzapper conservation: reward for holding, penalty for having used
+            local zap_uses = player_state.superzapper_uses or 0
+            if zap_uses == 0 then
+                subj_reward = subj_reward + ZAP_CONSERVATION_REWARD
             else
-                return (player_abs_seg + offset + 16) % 16
-            end
-        end
-
-        -- ================================================================
-        --  SUBJECTIVE SHAPING v2 — active gameplay only
-        -- ================================================================
-        if game_state.gamestate == 0x04 then
-
-            -- ── Signal 1: Graduated Threat Proximity ───────────────────
-            local any_threat_nearby = false
-            for i = 1, 7 do
-                local depth = enemies_state.enemy_depths[i]
-                if depth and depth > 0 and depth <= DANGER_DEPTH then
-                    local seg = enemies_state.enemy_abs_segments[i]
-                    if seg ~= nil and seg ~= INVALID_SEGMENT then
-                        -- Lateral distance to player
-                        local rel = abs_to_rel_func(player_abs_seg, seg, is_open)
-                        local abs_dist = math.abs(rel)
-                        if abs_dist <= 2 then
-                            any_threat_nearby = true
-
-                            -- Depth urgency: 1.0 at top rail (0x10), ~0 at DANGER_DEPTH
-                            local urgency = 1.0 - math.max(0, (depth - TOP_RAIL_DEPTH)) / (DANGER_DEPTH - TOP_RAIL_DEPTH)
-                            urgency = math.max(0, math.min(1.0, urgency))
-
-                            -- Type multiplier
-                            local core_type = enemies_state.enemy_core_type[i]
-                            local type_mult = THREAT_TYPE_MULT[core_type] or 1.0
-
-                            -- Approach multiplier (delta_depth < 0 = approaching)
-                            local approach_mult = 1.0
-                            local dd = enemies_state.enemy_delta_depth[i]
-                            if dd and dd < 0 then
-                                approach_mult = 1.5  -- approaching = more dangerous
-                            elseif enemies_state.enemy_moving_away[i] == 1 then
-                                approach_mult = 0.3  -- retreating = low threat
-                            end
-
-                            -- Lane distance falloff
-                            local lane_w = LANE_DIST_WEIGHT[abs_dist] or 0.1
-
-                            subj_reward = subj_reward - (urgency * type_mult * approach_mult * lane_w * BASE_THREAT_PENALTY)
-                        end
-                    end
-                end
+                subj_reward = subj_reward - ZAP_USED_PENALTY
             end
 
-            -- Small bonus when surroundings are completely clear
-            if not any_threat_nearby then
-                subj_reward = subj_reward + CLEAR_BONUS
-            end
+            local player_abs_seg = player_state.position & 0x0F
+            local prev_player_seg = math.floor(previous_player_position or 0) % 16
+            local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
 
+<<<<<<< HEAD
             -- ── Signal 2: Pulsar Lane Warning ──────────────────────────
             if enemies_state.pulse_field_active == 1.0 then
                 for i = 1, 7 do
@@ -761,105 +722,83 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
             -- ── Signal 3: Escape Route Count ───────────────────────────
             -- Count how many of the 5 lanes (self ±2) are free of top-rail
             -- threats. Penalize when cornered (≤1 exit).
+=======
+            -- Apply safety shaping EVERY frame so the agent feels ongoing danger,
+            -- not just on lane changes.  Scale slightly smaller when stationary
+            -- to keep a lane-change incentive.
+>>>>>>> parent of 9f9faff (New Reward Shaping)
             do
-                local safe_exits = 0
-                for _, offset in ipairs({-2, -1, 0, 1, 2}) do
-                    local lane = offset_to_lane(offset)
-                    if lane ~= nil then
-                        local blocked = false
-                        -- Check enemies at top rail
-                        for i = 1, 7 do
-                            if enemies_state.enemy_abs_segments[i] == lane and
-                               enemies_state.enemy_depths[i] > 0 and
-                               enemies_state.enemy_depths[i] <= TOP_RAIL_DEPTH then
-                                blocked = true
-                                break
-                            end
-                        end
-                        -- Check shallow enemy shots
-                        if not blocked then
-                            for i = 1, 4 do
-                                if enemies_state.enemy_shot_abs_segments[i] == lane and
-                                   enemies_state.shot_positions[i] > 0 and
-                                   enemies_state.shot_positions[i] <= TOP_RAIL_DEPTH then
-                                    blocked = true
-                                    break
-                                end
-                            end
-                        end
-                        if not blocked then
-                            safe_exits = safe_exits + 1
-                        end
-                    end
+                local shaping_scale = (player_abs_seg ~= prev_player_seg) and 1.0 or 0.5
+                -- First pass: map threats (enemies or shots) within DANGER_DEPTH by lane
+                local lane_threat = {}
+                local function mark_threat(seg)
+                    if seg == nil or seg == INVALID_SEGMENT then return end
+                    if seg < 0 or seg > 15 then return end
+                    lane_threat[seg] = true
                 end
 
-                if safe_exits <= 1 then
-                    subj_reward = subj_reward - (CORNERED_PENALTY * 2.0)
-                elseif safe_exits == 2 then
-                    subj_reward = subj_reward - (CORNERED_PENALTY * 0.5)
-                end
-            end
-
-            -- ── Signal 4: Incoming Shot Urgency ────────────────────────
-            for i = 1, 4 do
-                local shot_depth = enemies_state.shot_positions[i]
-                if shot_depth and shot_depth > 0 and shot_depth <= SHOT_DANGER_DEPTH then
-                    local shot_seg = enemies_state.enemy_shot_abs_segments[i]
-                    if shot_seg ~= nil and shot_seg ~= INVALID_SEGMENT then
-                        local urgency = 1.0 - (shot_depth / SHOT_DANGER_DEPTH)
-                        if shot_seg == player_abs_seg then
-                            -- Shot in player's lane and close
-                            subj_reward = subj_reward - (SHOT_URGENCY_PENALTY * urgency * 2.0)
-                        else
-                            local rel = abs_to_rel_func(player_abs_seg, shot_seg, is_open)
-                            if math.abs(rel) == 1 then
-                                -- Shot in adjacent lane
-                                subj_reward = subj_reward - (SHOT_URGENCY_PENALTY * urgency * 0.3)
-                            end
-                        end
-                    end
-                end
-            end
-
-            -- ── Signal 5: Superzapper Edge Evaluation ──────────────────
-            -- Reward/penalize the ACT of using the zapper, not possession
-            local zap_active = player_state.superzapper_active or 0
-            if zap_active ~= 0 and previous_zap_active == 0 then
-                -- Zap just activated — evaluate quality
-                local top_enemies = 0
                 for i = 1, 7 do
-                    local d = enemies_state.enemy_depths[i]
-                    if d and d > 0 and d <= 0x60 then
-                        top_enemies = top_enemies + 1
+                    local depth = enemies_state.enemy_depths[i]
+                    local seg = enemies_state.enemy_abs_segments[i]
+                    if depth and depth > 0 and depth <= DANGER_DEPTH then
+                        mark_threat(seg)
                     end
                 end
-                if top_enemies >= 3 then
-                    subj_reward = subj_reward + ZAP_GOOD_BONUS
-                elseif top_enemies == 0 then
-                    subj_reward = subj_reward - ZAP_WASTE_PENALTY
-                end
-                -- 1-2 enemies: neutral (no bonus or penalty)
-            end
 
-        -- ================================================================
-        --  Tube zoom (gamestate 0x20): spike avoidance shaping
-        -- ================================================================
-        elseif game_state.gamestate == 0x20 then
-            local spike_h = level_state.spike_heights[player_abs_seg] or 0
-            if spike_h > 0 then
-                subj_reward = subj_reward - (SPIKE_PENALTY * (spike_h / 255.0))
-            else
-                subj_reward = subj_reward + (CLEAR_BONUS * 0.5)
+                for i = 1, 4 do
+                    local shot_depth = enemies_state.shot_positions[i]
+                    local seg = enemies_state.enemy_shot_abs_segments[i]
+                    if shot_depth and shot_depth > 0 and shot_depth <= DANGER_DEPTH then
+                        mark_threat(seg)
+                    end
+                end
+
+                local offsets = {0, 1, -1, 2, -2}
+                local seen = {}
+                local function offset_to_lane(offset)
+                    if offset == 0 then
+                        return player_abs_seg
+                    end
+                    if is_open then
+                        local candidate = player_abs_seg + offset
+                        if candidate < 0 or candidate > 15 then
+                            return nil -- Off the board on open levels
+                        end
+                        return candidate
+                    else
+                        return (player_abs_seg + offset + 16) % 16
+                    end
+                end
+
+                for _, offset in ipairs(offsets) do
+                    local lane = offset_to_lane(offset)
+                    if lane ~= nil and not seen[lane] then
+                        seen[lane] = true
+
+                        local distance = math.abs(offset)
+                        local weight = 1.0
+                        if distance == 1 then
+                            weight = 0.5
+                        elseif distance == 2 then
+                            weight = 0.25
+                        end
+
+                        if lane_threat[lane] then
+                            subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight * shaping_scale)
+                        else
+                            subj_reward = subj_reward + (SAFE_LANE_REWARD * weight * shaping_scale)
+                        end
+                    end
+                end
             end
         end
     end
-
+    
     -- State updates
     previous_score = player_state.score or 0
     previous_level = level_state.level_number or 0
     previous_alive_state = player_state.alive or 0
     previous_player_position = player_state.position or 0
-    previous_zap_active = player_state.superzapper_active or 0
 
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward
