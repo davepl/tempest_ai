@@ -5,8 +5,8 @@ import win32api
 import win32con
 import win32gui
 
-# Tempest/MAME is 4:3; use this when scoring layouts so tiles are as usable as possible.
-TARGET_CONTENT_ASPECT = 4.0 / 3.0
+# Tempest is a vertical (portrait) game; use 3:4 aspect for optimal tile sizing.
+TARGET_CONTENT_ASPECT = 3.0 / 4.0
 MAME_TITLE_RE = re.compile(r"\bmame\b", re.IGNORECASE)
 
 
