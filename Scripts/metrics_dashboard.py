@@ -320,11 +320,16 @@ class _DashboardState:
             inference_requests = int(self.metrics.total_inference_requests)
             inference_time = float(self.metrics.total_inference_time)
             last_agreement = float(self.metrics.last_agreement)
+            # Compute interval-averaged agreement (consumed & reset each poll)
+            if self.metrics.agree_count_interval > 0:
+                interval_agreement = self.metrics.agree_sum_interval / max(1, self.metrics.agree_count_interval)
+            else:
+                interval_agreement = last_agreement
             episode_count = int(self.metrics.episode_count)
 
             reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
             reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
-            reward_subj = _tail_mean(self.metrics.subj_rewards) * inv_subj
+            reward_subj = _tail_mean(self.metrics.subj_rewards) * inv_obj
             reward_obj = _tail_mean(self.metrics.obj_rewards) * inv_obj
 
         try:
@@ -340,7 +345,7 @@ class _DashboardState:
         except Exception:
             subj1m_raw = obj1m_raw = 0.0
         level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
-        agreement_1m = self._update_agreement_window(frame_count, last_agreement)
+        agreement_1m = self._update_agreement_window(frame_count, interval_agreement)
         if inference_requests > 0:
             self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
         avg_inf_ms = self._last_avg_inf_ms
@@ -416,7 +421,7 @@ class _DashboardState:
             "total_100k": float(total100k_raw) * inv_obj,
             "total_1m": float(total1m_raw) * inv_obj,
             "total_5m": float(total5m_raw) * inv_obj,
-            "subj_1m": float(subj1m_raw) * inv_subj,
+            "subj_1m": float(subj1m_raw) * inv_obj,
             "obj_1m": float(obj1m_raw) * inv_obj,
             "level_25k": float(level_25k),
             "level_100k": float(level_100k),

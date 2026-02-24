@@ -206,7 +206,7 @@ def display_metrics_header():
     row_counter = 0
     hdr = (
         f"{'Frame':>11} {'FPS':>7} {'Epsi':>7} {'Xprt':>7} "
-        f"{'Rwrd':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
+        f"{'Rwrd':>9} {'Subj':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
         f"{'Loss':>10} {'Agree%':>7} "
         f"{'EpLen':>8} {'BCLoss':>8} "
         f"{'Clnt':>4} {'Web':>4} {'Levl':>5} "
@@ -229,9 +229,12 @@ def display_metrics_row(agent, kb_handler):
 
     # ── Interval averages ───────────────────────────────────────────────
     mean_reward = 0.0
+    mean_subj = 0.0
     with metrics.lock:
         if metrics.reward_count_interval > 0:
             mean_reward = metrics.reward_sum_interval / max(1, metrics.reward_count_interval)
+        if metrics.reward_count_interval_subj > 0:
+            mean_subj = metrics.reward_sum_interval_subj / max(1, metrics.reward_count_interval_subj)
         # Reset
         metrics.reward_sum_interval = metrics.reward_count_interval = 0
         metrics.reward_sum_interval_dqn = metrics.reward_count_interval_dqn = 0
@@ -324,7 +327,7 @@ def display_metrics_row(agent, kb_handler):
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_pct} {xprt_pct} "
-        f"{_fr(mean_reward*inv)} {_fr(dqn100k*inv)} "
+        f"{_fr(mean_reward*inv)} {_fr(mean_subj*inv)} {_fr(dqn100k*inv)} "
         f"{_fr(dqn1m*inv)} {_fr(dqn5m*inv)} "
         f"{loss_avg:>10.6f} {agree_avg*100:>6.1f}% "
         f"{avg_ep_len:>8.1f} {metrics.last_bc_loss:>8.4f} "

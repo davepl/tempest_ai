@@ -129,7 +129,7 @@ class RLConfigData:
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
-    subj_reward_scale: float = 0.01
+    subj_reward_scale: float = 0.001
     reward_clip: float = 10.0
     death_reward_clip: float = 20.0        # 2x normal clip — stronger death-aversion signal via n-step
 

@@ -691,7 +691,17 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local depth = enemies_state.enemy_depths[i]
                     local seg = enemies_state.enemy_abs_segments[i]
                     if depth and depth > 0 and depth <= DANGER_DEPTH then
-                        mark_threat(seg)
+                        -- Skip pulsars: they are only dangerous during the active pulse phase
+                        -- and only in their exact lane.  Treating them as generic lane threats
+                        -- causes paralysis when multiple pulsars are on-screen.
+                        local etype = enemies_state.enemy_core_type[i]
+                        if etype ~= ENEMY_TYPE_PULSAR then
+                            mark_threat(seg)
+                        elseif enemies_state.pulsing > 0 and enemies_state.pulsing < 0x80
+                               and seg == player_abs_seg then
+                            -- Only penalise the player's own lane during an active pulse
+                            mark_threat(seg)
+                        end
                     end
                 end
 
