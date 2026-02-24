@@ -43,12 +43,12 @@ local M = {} -- Module table
 -- Global variables needed by calculate_reward (scoped within this module)
 -- Reward shaping parameters (tunable)
 
-local DEATH_PENALTY = 2000           -- Edge-triggered penalty when dying (wider clip than normal rewards)
-local DANGER_DEPTH = 0x30            -- Depth threshold for nearby threats/safety shaping (was 0x80, too deep)
+local DEATH_PENALTY = 1000           -- Edge-triggered penalty when dying (same clip as normal rewards)
+local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
-local ZAP_CONSERVATION_REWARD = 1.0  -- Per-frame reward when superzapper is still unused
-local ZAP_USED_PENALTY = 1.0         -- Per-frame penalty when superzapper has been used
+local ZAP_CONSERVATION_REWARD = 0.0  -- Per-frame reward when superzapper is still unused (disabled)
+local ZAP_USED_PENALTY = 0.0         -- Per-frame penalty when superzapper has been used (disabled)
 
 local previous_score = 0
 local previous_level = 0

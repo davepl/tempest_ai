@@ -131,7 +131,7 @@ class RLConfigData:
     obj_reward_scale: float = 0.01
     subj_reward_scale: float = 0.001
     reward_clip: float = 10.0
-    death_reward_clip: float = 20.0        # 2x normal clip — stronger death-aversion signal via n-step
+    death_reward_clip: float = 10.0        # Same as normal clip — no special death amplification
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 3.0      # Lower terminal boost to reduce over-focusing on death tails
