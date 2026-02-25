@@ -11,3 +11,4 @@ venv/
 audio/*.mp3
 
 /html/Starfield.mov
+log.txt
