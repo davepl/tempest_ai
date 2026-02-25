@@ -19,8 +19,8 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
 local SHOW_DISPLAY            = false
-local START_ADVANCED          = false   -- true = start on highest available level from last game
-local START_LEVEL_MIN         = 1      -- Desired 1-based starting level (used when START_ADVANCED is false)
+local START_ADVANCED          = true   -- true = start on highest available level from last game
+local START_LEVEL_MIN         = 13      -- Desired 1-based starting level (used when START_ADVANCED is false)
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubvmdell:9999"
 local SOCKET_READ_TIMEOUT_S   = 3.5  

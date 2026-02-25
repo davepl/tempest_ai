@@ -121,7 +121,14 @@ class RLConfigData:
     # Suppress random exploration during tube zoom — any lane twitch kills on spikes.
     epsilon_zoom_multiplier: float = 0.2
     # Probability of zap during epsilon exploration (default 0.5 = uniform).
-    epsilon_zap_prob: float = 0.05
+    epsilon_zap_prob: float = 0.000
+
+    # ── Superzap gate ───────────────────────────────────────────────
+    # Block DQN-initiated zaps unless the expert also recommends zap.
+    # Gate probability decays linearly: start → end over decay_frames.
+    superzap_gate_start: float = 1.0
+    superzap_gate_end: float = 0.0
+    superzap_gate_decay_frames: int = 10_000_000
 
     # Expert BC
     expert_bc_weight: float = 1.0
@@ -308,6 +315,13 @@ class MetricsData:
             progress = min(1.0, self.frame_count / max(1, RL_CONFIG.expert_ratio_decay_frames))
             self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
             return self.expert_ratio
+
+    def get_superzap_gate_ratio(self) -> float:
+        """Probability of blocking a DQN zap that the expert didn't approve."""
+        with self.lock:
+            decay = RL_CONFIG.superzap_gate_decay_frames
+            progress = min(1.0, self.frame_count / max(1, decay))
+            return RL_CONFIG.superzap_gate_start + progress * (RL_CONFIG.superzap_gate_end - RL_CONFIG.superzap_gate_start)
 
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:

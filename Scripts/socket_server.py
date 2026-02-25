@@ -290,6 +290,8 @@ class SocketServer:
                     cs = self.client_states[cid]
                     cs["frames"] += 1
                     cs["level_number"] = frame.level_number
+                    if frame.game_score > self.metrics.peak_game_score:
+                        self.metrics.peak_game_score = frame.game_score
                     now = time.time()
                     el = now - cs["last_time"]
                     if el >= 1.0:
@@ -412,6 +414,12 @@ class SocketServer:
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
                         spinner_val = spinner_index_to_value(sp_idx)
+                        # ── Superzap gate: block DQN zaps the expert wouldn't approve ──
+                        if zap and not frame.expert_zap:
+                            gate_p = self.metrics.get_superzap_gate_ratio()
+                            if random.random() < gate_p:
+                                zap = False
+                                fz_idx = fire_zap_to_discrete(fire, zap)
                         action_source = "dqn"
 
                 cs["last_state"] = frame.state

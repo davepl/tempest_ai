@@ -140,6 +140,7 @@ class FrameData:
     expert_fire: bool
     expert_zap: bool
     level_number: int
+    game_score: int = 0
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     try:
@@ -159,6 +160,7 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             enemy_seg=int(enemy), player_seg=int(player),
             open_level=bool(open_lvl), expert_fire=bool(exp_fire),
             expert_zap=bool(exp_zap), level_number=int(level),
+            game_score=int(score),
         )
     except Exception as e:
         print(f"Parse error: {e}")
@@ -621,6 +623,17 @@ class SafeMetrics:
 
     def update_game_state(self, e, o):
         pass
+
+    @property
+    def peak_game_score(self):
+        return self.metrics.peak_game_score
+
+    @peak_game_score.setter
+    def peak_game_score(self, v):
+        self.metrics.peak_game_score = v
+
+    def get_superzap_gate_ratio(self):
+        return self.metrics.get_superzap_gate_ratio()
 
 # ── Agent ───────────────────────────────────────────────────────────────────
 class RainbowAgent:

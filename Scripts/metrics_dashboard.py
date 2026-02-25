@@ -400,6 +400,12 @@ class _DashboardState:
             "override_expert": override_expert,
             "override_epsilon": override_epsilon,
             "lr": lr,
+            "training_steps": total_training_steps,
+            "lr_max": float(RL_CONFIG.lr),
+            "lr_min": float(RL_CONFIG.lr_min),
+            "lr_warmup_steps": int(RL_CONFIG.lr_warmup_steps),
+            "lr_cosine_period": int(RL_CONFIG.lr_cosine_period),
+            "lr_use_restarts": bool(getattr(RL_CONFIG, "lr_use_restarts", False)),
             "q_min": q_min,
             "q_max": q_max,
             "eplen_1m": get_eplen_1m_average(),
@@ -1052,6 +1058,7 @@ def _render_dashboard_html() -> str:
         <div class="mini-inline">
           <div class="value" id="mEpLen">0</div>
           <canvas id="cEpLenMini" class="mini-canvas"></canvas>
+          <div style="grid-column:1;"><div class="record-label" style="margin-bottom:1px;">Duration:</div><div class="record-value" id="mDuration">0:00</div></div>
         </div>
         <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
       </article>
@@ -1070,7 +1077,13 @@ def _render_dashboard_html() -> str:
         </div>
       </article>
       <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div><div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div></article>
-      <article class="card card-half" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)">
+        <div class="label">LEARNING RATE</div>
+        <div class="mini-inline" style="overflow:hidden;min-height:0;flex:1;">
+          <div class="value" id="mLr">-</div>
+          <canvas id="lrMiniChart" class="mini-canvas"></canvas>
+        </div>
+      </article>
       <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
@@ -1082,7 +1095,7 @@ def _render_dashboard_html() -> str:
         <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
+      <article class="card" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
     </section>
 
@@ -1119,11 +1132,12 @@ def _render_dashboard_html() -> str:
       </article>
 
       <article class="panel" style="position:relative;">
-        <h2>Agreement Rate 1M</h2>
-        <div class="value panel-vfd" id="mAgreePanel">0.0%</div>
+        <h2>Performance</h2>
+        <div style="display:flex;align-items:baseline;gap:6px;"><span style="font-size:11px;color:#a5bfde;letter-spacing:0.5px;text-transform:uppercase;">Agreement:</span><div class="value panel-vfd" id="mAgreePanel">0.0%</div></div>
         <div class="legend" style="position:absolute;top:12px;right:14px;justify-content:flex-end;">
-          <span><span class="sw" style="background:#00c8ff;"></span>1M EMA</span>
-          <span><span class="sw" style="background:#0090cc55;"></span>Raw</span>
+          <span><span class="sw" style="background:#00c8ff;"></span>Agreement 1M</span>
+          <span><span class="sw" style="background:#0090cc55;"></span>Agreement Raw</span>
+          <span><span class="sw" style="background:#ef4444;"></span>Avg Lvl</span>
         </div>
         <canvas id="cAgreement"></canvas>
       </article>
@@ -1233,6 +1247,7 @@ def _render_dashboard_html() -> str:
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
+      duration: document.getElementById("mDuration"),
       agreePanel: document.getElementById("mAgreePanel"),
     };
     const recEls = {
@@ -1301,14 +1316,8 @@ def _render_dashboard_html() -> str:
           {
             key: "steps_per_sec_chart",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max_floor: 50, max_snap: 25, group_keys: ["steps_per_sec_chart", "level_100k"] },
+            axis: { side: "right", min: 0, max_floor: 50, max_snap: 25, group_keys: ["steps_per_sec_chart"] },
             smooth_alpha: 0.10,
-          },
-          {
-            key: "level_100k",
-            color: "#22d3ee",
-            axis_ref: "steps_per_sec_chart",
-            smooth_alpha: 0.20,
           },
           {
             key: "eplen_100k",
@@ -1403,7 +1412,10 @@ def _render_dashboard_html() -> str:
           { key: "agreement_1m", color: "#00c8ff", smooth_alpha: 0.35,
             axis: { side: "left", min: 0, min_range: 0.10, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
           },
-          { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 }
+          { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 },
+          { key: "level_100k", color: "#ef4444", smooth_alpha: 0.20,
+            axis: { side: "right", min_range: 1.0, label_pad: 40, group_keys: ["level_100k"], tick_decimals: 1 }
+          }
         ]
       }
     };
@@ -3027,6 +3039,79 @@ def _render_dashboard_html() -> str:
     }
 
     /* ══════════════════════════════════════════════════════════════
+     * LR COSINE MINI CHART — Draws the cosine annealing curve with
+     * a dot showing current position in the cycle.
+     * ══════════════════════════════════════════════════════════════ */
+    const _lrCanvas = document.getElementById("lrMiniChart");
+    const _lrCtx = _lrCanvas ? _lrCanvas.getContext("2d") : null;
+
+    function drawLrMiniChart(now) {
+      if (!_lrCtx) return;
+      const width  = _lrCanvas.clientWidth  || 120;
+      const height = _lrCanvas.clientHeight || 104;
+      const dpr = window.devicePixelRatio || 1;
+      _lrCanvas.width  = Math.floor(width * dpr);
+      _lrCanvas.height = Math.floor(height * dpr);
+      const ctx = _lrCtx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const W = width, H = height;
+
+      const lrMax     = now.lr_max       || 5e-5;
+      const lrMin     = now.lr_min       || 2e-5;
+      const warmup    = now.lr_warmup_steps    || 5000;
+      const period    = now.lr_cosine_period   || 3000000;
+      const restarts  = !!now.lr_use_restarts;
+      const step      = now.training_steps     || 0;
+
+      // Draw area = full canvas with 1px margin
+      const pad = 1;
+      const gw = W - 2*pad, gh = H - 2*pad;
+
+      // Total steps we show: 2 full periods (or up to step + some if larger)
+      const totalShow = restarts ? Math.max(period * 2, step + period * 0.3) : Math.max(period + warmup, step * 1.2);
+
+      // Map step → x
+      const sx = (s) => pad + (s / totalShow) * gw;
+      // Map lr → y (top = lrMax, bottom = lrMin)
+      const lrRange = Math.max(1e-12, lrMax - lrMin);
+      const sy = (lr) => pad + (1.0 - (lr - lrMin) / lrRange) * gh;
+
+      // Compute lr at a given step (mirrors get_lr)
+      function lrAt(s) {
+        if (s < warmup) return lrMin + (lrMax - lrMin) * ((s + 1) / Math.max(1, warmup));
+        const dh = Math.max(1, period);
+        const t = restarts ? ((s - warmup) % dh) : Math.min(s - warmup, dh);
+        const cosine = 0.5 * (1.0 + Math.cos(Math.PI * t / dh));
+        return lrMin + (lrMax - lrMin) * cosine;
+      }
+
+      // Draw curve
+      const nPts = Math.min(280, gw);
+      ctx.beginPath();
+      for (let i = 0; i <= nPts; i++) {
+        const s = (i / nPts) * totalShow;
+        const x = sx(s), y = sy(lrAt(s));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "rgba(100,160,255,0.5)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      // Draw current position dot
+      if (step > 0) {
+        const cx = sx(step), cy = sy(lrAt(step));
+        ctx.beginPath();
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+        ctx.fillStyle = "#0f0";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.7)";
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+    }
+
+    /* ══════════════════════════════════════════════════════════════
      * CARD UPDATER — Pushes latest snapshot values into DOM elements,
      * updates record highs, and sets model description.
      * ══════════════════════════════════════════════════════════════ */
@@ -3062,10 +3147,12 @@ def _render_dashboard_html() -> str:
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
       cards.buf.textContent = fmtInt(now.memory_buffer_size);
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
+      drawLrMiniChart(now);
       cards.q.innerHTML = (now.q_min === null || now.q_max === null)
         ? toFixedCharCells("-")
         : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
+      { const secs = Math.round((now.eplen_1m || 0) / 30); const m = Math.floor(secs / 60); const s = secs % 60; cards.duration.textContent = m + ":" + String(s).padStart(2, "0"); }
       cards.agreePanel.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
         ? fmtFloat(now.agreement_1m * 100, 1) + "%"
         : "0.0%";

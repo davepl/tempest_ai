@@ -25,7 +25,12 @@ M.TOP_RAIL_ABSENT = TOP_RAIL_ABSENT
 local function bcd_to_decimal(bcd)
     -- Handle potential non-number inputs gracefully
     if type(bcd) ~= 'number' then return 0 end
-    return math.floor(((bcd / 16) % 16) * 10 + (bcd % 16))
+    local hi = (bcd >> 4) & 0x0F
+    local lo = bcd & 0x0F
+    -- Clamp invalid BCD nibbles (A-F) to 9
+    if hi > 9 then hi = 9 end
+    if lo > 9 then lo = 9 end
+    return hi * 10 + lo
 end
 
 -- Forward declarations for helper functions used within classes/other helpers
