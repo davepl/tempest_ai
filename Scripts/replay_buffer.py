@@ -5,7 +5,7 @@
 # ==================================================================================================================
 """Prioritized replay buffer using a sum-tree for O(log N) sampling."""
 
-import os, sys, time
+import os, sys, time, shutil
 import numpy as np
 import threading
 
@@ -246,7 +246,7 @@ class PrioritizedReplayBuffer:
     # ── Persistence ─────────────────────────────────────────────────────
 
     def save(self, filepath: str, verbose: bool = True):
-        """Save the full replay buffer (data + priorities) to disk with progress."""
+        """Save the full replay buffer as individual .npy files in a directory."""
         with self.lock:
             if self.size == 0:
                 if verbose:
@@ -258,65 +258,97 @@ class PrioritizedReplayBuffer:
                 print(f"  Saving replay buffer ({n:,} transitions)...")
             t0 = time.time()
             if verbose:
-                self._progress_bar("  Replay save", 0.10)
+                self._progress_bar("  Replay save", 0.05)
 
-            # Collect all arrays into a dict; only save filled portion
-            data = {
-                "states":      self.states[:n],
-                "next_states": self.next_states[:n],
-                "actions":     self.actions[:n],
-                "rewards":     self.rewards[:n],
-                "dones":       self.dones[:n],
-                "horizons":    self.horizons[:n],
-                "is_expert":   self.is_expert[:n],
+            # Snapshot arrays while holding the lock
+            arrays = {
+                "states":      self.states[:n].copy(),
+                "next_states": self.next_states[:n].copy(),
+                "actions":     self.actions[:n].copy(),
+                "rewards":     self.rewards[:n].copy(),
+                "dones":       self.dones[:n].copy(),
+                "horizons":    self.horizons[:n].copy(),
+                "is_expert":   self.is_expert[:n].copy(),
                 "priorities":  self.tree.tree[self.tree.capacity:self.tree.capacity + n].copy(),
-                "data_ptr":    np.int64(self.tree.data_ptr),
-                "max_priority": np.float64(self.tree.max_priority),
             }
+            meta = np.array([self.tree.data_ptr, n, self.tree.max_priority])
             if verbose:
-                self._progress_bar("  Replay save", 0.40)
+                self._progress_bar("  Replay save", 0.15)
 
         # Write outside the lock to minimise contention
-        tmp = filepath + ".tmp"
-        legacy_tmp_npz = tmp + ".npz"
-        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-        for stale in (tmp, legacy_tmp_npz):
-            if os.path.exists(stale):
-                try:
-                    os.remove(stale)
-                except Exception:
-                    pass
-        try:
-            # Use a file handle so numpy does not rewrite the path/extension.
-            with open(tmp, "wb") as f:
-                if verbose:
-                    self._progress_bar("  Replay save", 0.55)
-                np.savez(f, **data)
-                f.flush()
-                os.fsync(f.fileno())
-                if verbose:
-                    self._progress_bar("  Replay save", 0.85)
-            os.replace(tmp, filepath)
+        tmp_dir = filepath + ".tmp"
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        names = list(arrays.keys())
+        for i, name in enumerate(names):
+            np.save(os.path.join(tmp_dir, f"{name}.npy"), arrays[name])
             if verbose:
-                self._progress_bar("  Replay save", 1.0)
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+                frac = 0.15 + 0.70 * ((i + 1) / len(names))
+                self._progress_bar("  Replay save", frac)
+        np.save(os.path.join(tmp_dir, "_meta.npy"), meta)
+
+        # Atomic rename
+        if os.path.exists(filepath):
+            if os.path.isdir(filepath):
+                shutil.rmtree(filepath, ignore_errors=True)
+            else:
+                os.remove(filepath)
+        os.rename(tmp_dir, filepath)
+        if verbose:
+            self._progress_bar("  Replay save", 1.0)
+
         elapsed = time.time() - t0
-        mb = os.path.getsize(filepath) / (1024 * 1024)
+        total_bytes = sum(a.nbytes for a in arrays.values())
+        mb = total_bytes / (1024 * 1024)
         if verbose:
             print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")
 
-    def load(self, filepath: str, verbose: bool = True) -> bool:
-        """Load a replay buffer from disk with progress. Returns True on success."""
-        if not os.path.exists(filepath):
+    def _load_directory(self, dirpath: str, verbose: bool = True) -> bool:
+        """Load replay buffer from a directory of .npy files."""
+        meta_path = os.path.join(dirpath, "_meta.npy")
+        states_path = os.path.join(dirpath, "states.npy")
+        if not os.path.isfile(meta_path) or not os.path.isfile(states_path):
             return False
 
         if verbose:
-            print(f"  Loading replay buffer from {filepath}...")
+            print(f"  Loading replay buffer (directory format) from {dirpath}...")
+        t0 = time.time()
+        if verbose:
+            self._progress_bar("  Replay load", 0.05)
+
+        try:
+            meta = np.load(meta_path)
+            data_ptr = int(meta[0])
+            saved_n = int(meta[1])
+            max_priority = float(meta[2])
+        except Exception as e:
+            print(f"  Failed to read replay meta: {e}")
+            return False
+
+        # Load arrays
+        names = ["states", "next_states", "actions", "rewards", "dones", "horizons", "is_expert", "priorities"]
+        arch = {}
+        for i, name in enumerate(names):
+            fpath = os.path.join(dirpath, f"{name}.npy")
+            if not os.path.isfile(fpath):
+                print(f"  Missing array file: {name}.npy")
+                return False
+            arch[name] = np.load(fpath)
+            if verbose:
+                frac = 0.05 + 0.30 * ((i + 1) / len(names))
+                self._progress_bar("  Replay load", frac)
+
+        return self._restore_from_arrays(arch, data_ptr, max_priority, t0, dirpath, verbose)
+
+    def _load_npz(self, filepath: str, verbose: bool = True) -> bool:
+        """Load replay buffer from a legacy .npz file."""
+        if not os.path.isfile(filepath):
+            return False
+
+        if verbose:
+            print(f"  Loading replay buffer (legacy npz) from {filepath}...")
         t0 = time.time()
         if verbose:
             self._progress_bar("  Replay load", 0.05)
@@ -327,20 +359,25 @@ class PrioritizedReplayBuffer:
             print(f"  Failed to read replay buffer: {e}")
             return False
         if verbose:
-            self._progress_bar("  Replay load", 0.20)
+            self._progress_bar("  Replay load", 0.35)
 
+        data_ptr = int(arch["data_ptr"]) if "data_ptr" in arch else 0
+        max_priority = float(arch["max_priority"]) if "max_priority" in arch else 1.0
+        return self._restore_from_arrays(dict(arch), data_ptr, max_priority, t0, filepath, verbose)
+
+    def _restore_from_arrays(self, arch: dict, data_ptr: int, max_priority: float,
+                              t0: float, source_path: str, verbose: bool) -> bool:
+        """Common restore logic for both directory and npz formats."""
         n = len(arch["states"])
         if n == 0:
             print("  Replay buffer file is empty.")
             return False
 
-        # Validate state size compatibility
         saved_state_size = arch["states"].shape[1]
         if saved_state_size != self.state_size:
             print(f"  State size mismatch: saved={saved_state_size}, expected={self.state_size}")
             return False
 
-        # If saved data exceeds our capacity, take only the most recent entries
         if n > self.capacity:
             print(f"  Saved buffer ({n:,}) exceeds capacity ({self.capacity:,}), truncating to most recent.")
             offset = n - self.capacity
@@ -348,7 +385,7 @@ class PrioritizedReplayBuffer:
         else:
             offset = 0
         if verbose:
-            self._progress_bar("  Replay load", 0.35)
+            self._progress_bar("  Replay load", 0.40)
 
         with self.lock:
             if verbose:
@@ -364,19 +401,15 @@ class PrioritizedReplayBuffer:
             if verbose:
                 self._progress_bar("  Replay load", 0.62)
 
-            # Restore SumTree state
             priorities = arch["priorities"][offset:offset + n]
             self.tree.size = n
-            self.tree.data_ptr = int(arch["data_ptr"]) if offset == 0 else n % self.capacity
-            self.tree.max_priority = float(arch["max_priority"])
+            self.tree.data_ptr = data_ptr if offset == 0 else n % self.capacity
+            self.tree.max_priority = max_priority
 
-            # Write all leaf priorities and rebuild the tree
             self.tree.tree[self.tree.capacity:self.tree.capacity + n] = priorities.astype(np.float64)
-            # Zero out unused leaves
             if n < self.capacity:
                 self.tree.tree[self.tree.capacity + n:] = 0.0
 
-            # Rebuild internal nodes bottom-up
             total_nodes = max(1, self.tree.capacity - 1)
             update_every = max(1, total_nodes // 64)
             for i in range(self.tree.capacity - 1, 0, -1):
@@ -390,11 +423,29 @@ class PrioritizedReplayBuffer:
             self._n_expert = int(self.is_expert[:n].sum())
 
         elapsed = time.time() - t0
-        mb = os.path.getsize(filepath) / (1024 * 1024)
         if verbose:
             self._progress_bar("  Replay load", 1.0)
-            print(f"  Replay buffer loaded: {mb:.0f} MB in {elapsed:.1f}s")
+            print(f"  Replay buffer loaded: {n:,} transitions in {elapsed:.1f}s")
         return True
+
+    def load(self, filepath: str, verbose: bool = True) -> bool:
+        """Load replay buffer: tries directory format first, then falls back to legacy .npz."""
+        # Try directory format (new fast path)
+        if os.path.isdir(filepath):
+            return self._load_directory(filepath, verbose)
+        # Try .npz at the given path
+        if os.path.isfile(filepath):
+            return self._load_npz(filepath, verbose)
+        # Try deriving the directory path from a .npz path or vice versa
+        if filepath.endswith(".npz"):
+            dir_path = filepath[:-4]
+            if os.path.isdir(dir_path):
+                return self._load_directory(dir_path, verbose)
+        else:
+            npz_path = filepath + ".npz"
+            if os.path.isfile(npz_path):
+                return self._load_npz(npz_path, verbose)
+        return False
 
     def flush(self):
         """Clear the entire replay buffer."""

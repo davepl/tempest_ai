@@ -105,10 +105,9 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 500_000
-    # Late-training exploration pulses to escape local optima.
-    epsilon_pulse_max: float = 0.25
-    epsilon_pulse_period_frames: int = 500_000
-    epsilon_pulse_start_frame: int = 3_000_000
+    # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
+    manual_pulse_epsilon: float = 0.25
+    manual_pulse_duration_frames: int = 750_000
     epsilon: float = 1.0
 
     # Expert guidance
@@ -223,6 +222,7 @@ class MetricsData:
     average_level: float = 0.0
     peak_level: int = 0
     peak_episode_reward: float = 0.0
+    peak_game_score: int = 0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
@@ -233,7 +233,8 @@ class MetricsData:
     manual_expert_override: bool = False
     override_epsilon: bool = False
     manual_epsilon_override: bool = False
-    epsilon_pulse_enabled: bool = True
+    manual_pulse_active: bool = False
+    manual_pulse_frames_remaining: int = 0
     training_enabled: bool = True
     verbose_mode: bool = False
     saved_expert_ratio: float = 0.50
@@ -275,31 +276,25 @@ class MetricsData:
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
     @staticmethod
-    def _natural_epsilon_for_frame(frame_count: int, pulse_enabled: bool = True) -> float:
+    def _natural_epsilon_for_frame(frame_count: int) -> float:
         progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-        base = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
-
-        if not pulse_enabled:
-            return base
-
-        pulse_max = float(getattr(RL_CONFIG, "epsilon_pulse_max", base))
-        pulse_period = int(getattr(RL_CONFIG, "epsilon_pulse_period_frames", 0))
-        pulse_start = int(getattr(RL_CONFIG, "epsilon_pulse_start_frame", RL_CONFIG.epsilon_decay_frames))
-        if frame_count < pulse_start or pulse_period <= 0 or pulse_max <= base:
-            return base
-
-        phase = ((frame_count - pulse_start) % pulse_period) / float(pulse_period)
-        # Triangle wave: 0 → 1 → 0 over one period.
-        pulse = 1.0 - abs((2.0 * phase) - 1.0)
-        return base + (pulse_max - base) * pulse
+        return RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
 
     def update_epsilon(self):
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
-            self.epsilon = self._natural_epsilon_for_frame(
-                int(self.frame_count), pulse_enabled=self.epsilon_pulse_enabled
-            )
+            base = self._natural_epsilon_for_frame(int(self.frame_count))
+            if self.manual_pulse_active:
+                self.manual_pulse_frames_remaining -= 1
+                if self.manual_pulse_frames_remaining <= 0:
+                    self.manual_pulse_active = False
+                    self.manual_pulse_frames_remaining = 0
+                    self.epsilon = base
+                else:
+                    self.epsilon = max(base, float(RL_CONFIG.manual_pulse_epsilon))
+            else:
+                self.epsilon = base
             return self.epsilon
 
     def get_expert_ratio(self):
@@ -383,8 +378,16 @@ class MetricsData:
             self.verbose_mode = not self.verbose_mode
 
     def toggle_epsilon_pulse(self, kb=None):
+        """Fire or cancel the manual epsilon pulse."""
         with self.lock:
-            self.epsilon_pulse_enabled = not self.epsilon_pulse_enabled
+            if self.manual_pulse_active:
+                # Cancel the running pulse
+                self.manual_pulse_active = False
+                self.manual_pulse_frames_remaining = 0
+            else:
+                # Start a new pulse
+                self.manual_pulse_active = True
+                self.manual_pulse_frames_remaining = int(RL_CONFIG.manual_pulse_duration_frames)
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:
@@ -427,3 +430,26 @@ class MetricsData:
 
 
 metrics = MetricsData()
+
+
+# ── PlateauPulser stub ──────────────────────────────────────────────────────
+# Provides the interface expected by the dashboard, backed by our manual pulse.
+class PlateauPulser:
+    WATCHING   = "watching"
+    PULSING    = "pulsing"
+    RECOVERING = "recovering"
+
+    @property
+    def state(self) -> str:
+        return self.PULSING if metrics.manual_pulse_active else self.WATCHING
+
+    @property
+    def total_pulses(self) -> int:
+        return 0                       # manual pulse doesn't track lifetime count
+
+    pulse_start_frame: int = 0
+    pulse_end_frame: int = 0
+    cooldown_multiplier: float = 1.0
+
+
+plateau_pulser = PlateauPulser()

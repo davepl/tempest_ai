@@ -970,8 +970,8 @@ class RainbowAgent:
         if is_forced_save and show_status:
             print(f"Model saved to {filepath}")
 
-        # Save replay buffer alongside the model
-        buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+        # Save replay buffer alongside the model (directory format)
+        buf_path = filepath.rsplit(".", 1)[0] + "_replay"
         try:
             self.memory.save(buf_path, verbose=bool(show_status))
         except Exception as e:
@@ -1037,12 +1037,10 @@ class RainbowAgent:
             print(f"Loaded v2 model from {filepath}")
 
             # Load replay buffer if present alongside the model
-            buf_path = filepath.rsplit(".", 1)[0] + "_replay.npz"
+            buf_path = filepath.rsplit(".", 1)[0] + "_replay"
             try:
-                if os.path.exists(buf_path):
-                    self.memory.load(buf_path, verbose=bool(show_status))
-                else:
-                    print("  No replay buffer file found — starting with empty buffer.")
+                if not self.memory.load(buf_path, verbose=bool(show_status)):
+                    print("  No replay buffer found — starting with empty buffer.")
             except Exception as e:
                 print(f"  Replay buffer load failed: {e}")
 

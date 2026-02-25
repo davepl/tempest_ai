@@ -169,8 +169,11 @@ def keyboard_handler(agent, kb):
                 display_metrics_row(agent, kb)
             elif key == "P":
                 metrics.toggle_epsilon_pulse(kb)
-                status = "ON" if metrics.epsilon_pulse_enabled else "OFF"
-                print_with_terminal_restore(kb, f"\nEpsilon pulse: {status}")
+                if metrics.manual_pulse_active:
+                    frames = metrics.manual_pulse_frames_remaining
+                    print_with_terminal_restore(kb, f"\nManual pulse FIRED — {frames:,} frames at ε={RL_CONFIG.manual_pulse_epsilon}")
+                else:
+                    print_with_terminal_restore(kb, "\nManual pulse CANCELLED")
                 display_metrics_row(agent, kb)
             elif key == "p":
                 metrics.toggle_epsilon_override(kb)
