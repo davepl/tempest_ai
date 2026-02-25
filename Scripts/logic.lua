@@ -715,6 +715,8 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
 
                 local offsets = {0, 1, -1, 2, -2}
                 local seen = {}
+                local lanes_checked = 0
+                local raw_lane_shaping = 0
                 local function offset_to_lane(offset)
                     if offset == 0 then
                         return player_abs_seg
@@ -734,6 +736,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                     local lane = offset_to_lane(offset)
                     if lane ~= nil and not seen[lane] then
                         seen[lane] = true
+                        lanes_checked = lanes_checked + 1
 
                         local distance = math.abs(offset)
                         local weight = 1.0
@@ -744,11 +747,16 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
                         end
 
                         if lane_threat[lane] then
-                            subj_reward = subj_reward - (DANGER_LANE_PENALTY * weight * shaping_scale)
+                            raw_lane_shaping = raw_lane_shaping - (DANGER_LANE_PENALTY * weight * shaping_scale)
                         else
-                            subj_reward = subj_reward + (SAFE_LANE_REWARD * weight * shaping_scale)
+                            raw_lane_shaping = raw_lane_shaping + (SAFE_LANE_REWARD * weight * shaping_scale)
                         end
                     end
+                end
+                -- Normalise by lanes checked so edge positions on open levels
+                -- don't get a smaller magnitude than centre positions.
+                if lanes_checked > 0 then
+                    subj_reward = subj_reward + raw_lane_shaping * (5.0 / lanes_checked)
                 end
             end
         end
