@@ -126,7 +126,7 @@ class AsyncInferenceBatcher:
             return self.agent.act(state, epsilon)
         if not req.event.wait(timeout=self.request_timeout_s):
             return self.agent.act(state, epsilon)
-        return req.action if req.action is not None else (0, 0)
+        return req.action if req.action is not None else (0, 0, False)
 
     def _consume(self):
         while self.running or not self.queue.empty():
@@ -160,7 +160,7 @@ class AsyncInferenceBatcher:
                     try:
                         act = self.agent.act(req.state, req.epsilon)
                     except Exception:
-                        act = (0, 0)
+                        act = (0, 0, False)
                 req.action = act
                 req.event.set()
 
@@ -172,7 +172,7 @@ class AsyncInferenceBatcher:
                 req = self.queue.get_nowait()
             except queue.Empty:
                 break
-            req.action = (0, 0)
+            req.action = (0, 0, False)
             req.event.set()
 
 
@@ -406,9 +406,9 @@ class SocketServer:
                             epsilon *= float(getattr(RL_CONFIG, "epsilon_zoom_multiplier", 0.2))
                         t0 = time.perf_counter()
                         if self.inference_batcher is not None:
-                            fz_idx, sp_idx = self.inference_batcher.infer(frame.state, epsilon)
+                            fz_idx, sp_idx, is_epsilon = self.inference_batcher.infer(frame.state, epsilon)
                         else:
-                            fz_idx, sp_idx = self.agent.act(frame.state, epsilon)
+                            fz_idx, sp_idx, is_epsilon = self.agent.act(frame.state, epsilon)
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
                         spinner_val = spinner_index_to_value(sp_idx)

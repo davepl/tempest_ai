@@ -83,7 +83,7 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 12      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
     memory_size: int = 15_000_000
@@ -156,7 +156,7 @@ class RLConfigData:
     inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 4
+    training_steps_per_cycle: int = 16
     save_interval: int = 10_000
 
     enable_amp: bool = True

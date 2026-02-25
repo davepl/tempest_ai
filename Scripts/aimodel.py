@@ -655,15 +655,34 @@ class RainbowAgent:
         else:
             infer_dev = self.device
         self.inference_device = infer_dev
+
+        # ── CUDA streams for overlapping training & inference ───────
+        # Training uses the default stream; inference gets a dedicated
+        # stream so forward passes on infer_net can overlap with
+        # backprop on online_net.  A CUDA event gates weight sync so
+        # inference never reads a partially-copied state dict.
+        self._inference_stream: torch.cuda.Stream | None = None
+        self._sync_event: torch.cuda.Event | None = None
+        if (
+            self.use_separate_inference
+            and infer_dev.type == "cuda"
+            and self.device.type == "cuda"
+            and infer_dev.index == self.device.index
+        ):
+            self._inference_stream = torch.cuda.Stream(device=infer_dev)
+            self._sync_event = torch.cuda.Event()
+
         if self.use_separate_inference:
             self.infer_net = RainbowNet(state_size).to(infer_dev)
             self.infer_net.eval()
             self._sync_inference(force=True)
         else:
             self.infer_net = self.online_net
+
+        _stream_info = f", inference_stream={'yes' if self._inference_stream else 'no'}"
         print(
             f"Agent devices: train={self.device}, infer={self.inference_device}, "
-            f"separate_infer={self.use_separate_inference}"
+            f"separate_infer={self.use_separate_inference}{_stream_info}"
         )
 
         # Optimizer
@@ -723,46 +742,59 @@ class RainbowAgent:
             if self.inference_device.type == "cpu":
                 sd = {k: v.detach().cpu() for k, v in self.online_net.state_dict().items()}
             elif same_cuda_device:
+                # Copy weights on the default (training) stream, then record
+                # an event so the inference stream knows the copy is done.
                 sd = self.online_net.state_dict()
             else:
                 sd = {k: v.detach().to(self.inference_device) for k, v in self.online_net.state_dict().items()}
             self.infer_net.load_state_dict(sd, strict=False)
             self.infer_net.eval()
             self.last_inference_sync = self.training_steps
+            # Signal inference stream that new weights are ready
+            if self._sync_event is not None:
+                self._sync_event.record()  # recorded on default stream
 
-    def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int]:
-        """Return (firezap_idx, spinner_idx)."""
+    def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int, bool]:
+        """Return (firezap_idx, spinner_idx, is_epsilon)."""
         if random.random() < epsilon:
-            return _random_firezap(), random.randrange(NUM_SPINNER)
+            return _random_firezap(), random.randrange(NUM_SPINNER), True
 
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         q = self._infer_q_values(st)
         joint = int(q.argmax(dim=1).item())
-        return split_joint_action(joint)
+        fz, sp = split_joint_action(joint)
+        return fz, sp, False
 
     def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
         net = self.infer_net if self.use_separate_inference else self.online_net
         net.eval()
         with torch.no_grad():
-            if self.use_separate_inference:
+            if self._inference_stream is not None:
+                # Wait for any in-flight weight sync to finish, then run
+                # the forward pass on the dedicated inference stream.
+                self._inference_stream.wait_event(self._sync_event)
+                with torch.cuda.stream(self._inference_stream):
+                    return net.q_values(states_t)
+            elif self.use_separate_inference:
                 with self._sync_lock:
                     return net.q_values(states_t)
             return net.q_values(states_t)
 
-    def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int]]:
-        """Return batched actions for aligned state/epsilon lists."""
+    def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int, bool]]:
+        """Return batched actions for aligned state/epsilon lists.
+        Each element is (firezap_idx, spinner_idx, is_epsilon)."""
         n = min(len(states), len(epsilons))
         if n <= 0:
             return []
 
-        actions: list[Tuple[int, int] | None] = [None] * n
+        actions: list[Tuple[int, int, bool] | None] = [None] * n
         greedy_idx: list[int] = []
         greedy_states: list[np.ndarray] = []
 
         for i in range(n):
             eps = float(epsilons[i])
             if random.random() < eps:
-                actions[i] = (_random_firezap(), random.randrange(NUM_SPINNER))
+                actions[i] = (_random_firezap(), random.randrange(NUM_SPINNER), True)
             else:
                 greedy_idx.append(i)
                 greedy_states.append(states[i])
@@ -773,9 +805,10 @@ class RainbowAgent:
             q = self._infer_q_values(st)
             joints = q.argmax(dim=1).detach().cpu().tolist()
             for pos, joint in zip(greedy_idx, joints):
-                actions[pos] = split_joint_action(int(joint))
+                fz, sp = split_joint_action(int(joint))
+                actions[pos] = (fz, sp, False)
 
-        return [a if a is not None else (0, 0) for a in actions]
+        return [a if a is not None else (0, 0, False) for a in actions]
 
     # ── Step (add experience) ───────────────────────────────────────────
     def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None):
@@ -791,6 +824,11 @@ class RainbowAgent:
             if boost > 0:
                 pri = max(abs(pri), boost) * (-1.0 if pri < 0 else 1.0)
         self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri)
+        # Return the index of the just-written transition for pre-death tracking
+        try:
+            return int(self.memory.tree.data_ptr - 1) % self.memory.capacity
+        except AttributeError:
+            return -1
 
     # ── Background training ─────────────────────────────────────────────
     def _background_train(self):

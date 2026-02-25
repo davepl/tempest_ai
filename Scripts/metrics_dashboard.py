@@ -1718,6 +1718,7 @@ def _render_dashboard_html() -> str:
       const spanV = Math.max(1e-9, maxV - minV);
       const clampVal = (v) => Math.max(minV, Math.min(maxV, Number(v) || 0));
       const value = clampVal(valueRaw);
+      const displayVal = Math.max(minV, Math.min(9999, Number(valueRaw) || 0));
 
       const pad = 2;
       const outerExtent = 1.08;   // tight fit — faint glow may clip, bezel stays
@@ -1990,7 +1991,7 @@ def _render_dashboard_html() -> str:
       ctx.fillStyle = badgeFill;
       ctx.fill();
 
-      const valueText = Number(value).toFixed(cfg.decimals ?? 1);
+      const valueText = Number(displayVal).toFixed(cfg.decimals ?? 1);
       const ledX = cx;
       const ledY = badgeY + (badgeH * 0.5);
       const ledFont = `400 ${Math.max(16, Math.round(radius * 0.422))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
