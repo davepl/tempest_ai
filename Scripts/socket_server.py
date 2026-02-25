@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, sys, time, socket, select, struct, threading, traceback, random, queue
+import os, sys, time, socket, select, struct, threading, traceback, random, queue, collections
 import numpy as np
 
 from aimodel import (
@@ -54,6 +54,9 @@ class AsyncReplayBuffer:
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
+        # Pre-death tracking: rolling window of recent replay buffer indices
+        self._recent_indices = collections.deque(
+            maxlen=int(getattr(RL_CONFIG, 'pre_death_window', 100)))
         self._thread = threading.Thread(target=self._consume, daemon=True)
         self._thread.start()
 
@@ -64,6 +67,7 @@ class AsyncReplayBuffer:
             pass
 
     def _consume(self):
+        pre_death_boost = float(getattr(RL_CONFIG, 'pre_death_boost', 1.0))
         while self.running:
             try:
                 item = self.queue.get(timeout=0.01)
@@ -77,7 +81,18 @@ class AsyncReplayBuffer:
                     break
             for a, kw in batch:
                 try:
-                    self.agent.step(*a, **kw)
+                    idx = self.agent.step(*a, **kw)
+                    if idx is not None and idx >= 0:
+                        self._recent_indices.append(idx)
+                    # On death, boost priorities of recent transitions
+                    done = a[4] if len(a) > 4 else kw.get('done', False)
+                    if done and pre_death_boost > 1.0 and len(self._recent_indices) > 0:
+                        try:
+                            indices = list(self._recent_indices)
+                            self.agent.memory.boost_priorities(indices, pre_death_boost)
+                        except Exception as e:
+                            print(f"Pre-death boost error: {e}")
+                        self._recent_indices.clear()
                 except Exception as e:
                     print(f"AsyncReplayBuffer error: {e}")
 
@@ -119,6 +134,7 @@ class AsyncInferenceBatcher:
         self._thread.start()
 
     def infer(self, state, epsilon: float):
+        """Return (firezap_idx, spinner_idx, is_epsilon)."""
         if not self.running:
             return self.agent.act(state, epsilon)
         req = _InferenceRequest(state, epsilon)
@@ -128,7 +144,7 @@ class AsyncInferenceBatcher:
             return self.agent.act(state, epsilon)
         if not req.event.wait(timeout=self.request_timeout_s):
             return self.agent.act(state, epsilon)
-        return req.action if req.action is not None else (0, 0)
+        return req.action if req.action is not None else (0, 0, False)
 
     def _consume(self):
         while self.running or not self.queue.empty():
@@ -162,7 +178,7 @@ class AsyncInferenceBatcher:
                     try:
                         act = self.agent.act(req.state, req.epsilon)
                     except Exception:
-                        act = (0, 0)
+                        act = (0, 0, False)
                 req.action = act
                 req.event.set()
 
@@ -174,7 +190,7 @@ class AsyncInferenceBatcher:
                 req = self.queue.get_nowait()
             except queue.Empty:
                 break
-            req.action = (0, 0)
+            req.action = (0, 0, False)
             req.event.set()
 
 
@@ -420,11 +436,16 @@ class SocketServer:
                             epsilon *= float(getattr(RL_CONFIG, "epsilon_zoom_multiplier", 0.2))
                         t0 = time.perf_counter()
                         if self.inference_batcher is not None:
-                            fz_idx, sp_idx = self.inference_batcher.infer(frame.state, epsilon)
+                            fz_idx, sp_idx, is_epsilon = self.inference_batcher.infer(frame.state, epsilon)
                         else:
-                            fz_idx, sp_idx = self.agent.act(frame.state, epsilon)
+                            fz_idx, sp_idx, is_epsilon = self.agent.act(frame.state, epsilon)
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
+                        # Gate model's Q-network superzap: only allow when expert
+                        # agrees.  Epsilon exploration zaps pass through ungated.
+                        if zap and not is_epsilon and not frame.expert_zap:
+                            zap = False
+                            fz_idx = fire_zap_to_discrete(fire, zap)
                         spinner_val = spinner_index_to_value(sp_idx)
                         action_source = "dqn"
 

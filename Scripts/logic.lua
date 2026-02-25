@@ -597,17 +597,31 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         target_seg = player_abs_seg
     end
 
-    -- Superzap heuristic retained (3+ top-rail enemies)
+    -- Superzap heuristic: use the zapper strategically
     local top_rail_count = 0
+    local active_enemy_count = 0
     for i = 1, 7 do
         local depth = enemies_state.enemy_depths[i]
         local seg = enemies_state.enemy_abs_segments[i]
-        if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH and seg ~= INVALID_SEGMENT then
-            top_rail_count = top_rail_count + 1
+        if depth > 0 and seg ~= INVALID_SEGMENT then
+            active_enemy_count = active_enemy_count + 1
+            if depth <= 0x10 then  -- actual top of tunnel, not the avoidance zone
+                top_rail_count = top_rail_count + 1
+            end
         end
     end
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
-    local should_superzap = superzapper_available and (top_rail_count >= 3)
+    local pending = enemies_state.enemies_pending or 0
+
+    -- Superzap heuristic: both cases active
+    local should_superzap = false
+    if superzapper_available then
+        if top_rail_count >= 3 then
+            should_superzap = true
+        elseif pending == 0 and active_enemy_count > 0 then
+            should_superzap = true
+        end
+    end
 
     return target_seg, 0, sample_expert_fire(), should_superzap
 end

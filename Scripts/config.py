@@ -83,7 +83,7 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 8      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
     memory_size: int = 15_000_000
@@ -117,8 +117,8 @@ class RLConfigData:
     expert_ratio_zoom_gamestate: int = 0x20
     # Suppress random exploration during tube zoom — any lane twitch kills on spikes.
     epsilon_zoom_multiplier: float = 0.2
-    # Probability of zap during epsilon exploration (default 0.5 = uniform).
-    epsilon_zap_prob: float = 0.05
+    # Probability of zap during epsilon exploration (~50% chance of one zap per 2000 frames at eps=0.01).
+    epsilon_zap_prob: float = 0.07
 
     # Expert BC
     expert_bc_weight: float = 1.0
@@ -152,7 +152,7 @@ class RLConfigData:
     inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 4
+    training_steps_per_cycle: int = 16
     save_interval: int = 10_000
 
     enable_amp: bool = True
