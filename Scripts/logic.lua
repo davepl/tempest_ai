@@ -614,15 +614,28 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
+    local superzapper_used_once = (player_state.superzapper_uses or 0) == 1
     local pending = enemies_state.enemies_pending or 0
 
-    -- Superzap heuristic: both cases active
+    -- Superzap heuristic: allow both zap uses independently.
+    -- 1st zap (uses==0): kills ALL onscreen enemies — fire when 3+ at top rail, or pending==0 with enemies alive.
+    -- 2nd zap (uses==1): kills ONE enemy — fire when any enemy at top rail, or pending==0 with enemies alive.
     local should_superzap = false
-    if superzapper_available then
-        if top_rail_count >= 3 then
-            should_superzap = true
-        elseif pending == 0 and active_enemy_count > 0 then
-            should_superzap = true
+    if superzapper_available and active_enemy_count > 0 then
+        if superzapper_used_once then
+            -- Second zap: lower threshold — any top-rail enemy, or end-of-wave cleanup
+            if top_rail_count >= 1 then
+                should_superzap = true
+            elseif pending == 0 then
+                should_superzap = true
+            end
+        else
+            -- First zap: original thresholds
+            if top_rail_count >= 3 then
+                should_superzap = true
+            elseif pending == 0 then
+                should_superzap = true
+            end
         end
     end
 
