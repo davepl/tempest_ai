@@ -481,7 +481,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             local depth = enemies_state.enemy_depths[i]
             if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH then
                 local t = enemies_state.enemy_core_type[i]
-                if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
+                -- Pulsars bounce harmlessly until enemies_pending=0, then commit to top rail
+                if t == ENEMY_TYPE_FLIPPER or
+                   (t == ENEMY_TYPE_PULSAR and (enemies_state.enemies_pending or 0) == 0) then
                     local seg = enemies_state.enemy_abs_segments[i]
                     if seg ~= INVALID_SEGMENT then
                         local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
