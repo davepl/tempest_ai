@@ -24,7 +24,7 @@ from aimodel import (
     split_joint_action,
     SafeMetrics,
 )
-from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH
+from config import RL_CONFIG, SERVER_CONFIG, metrics, LATEST_MODEL_PATH, game_settings
 
 try:
     from nstep_buffer import NStepReplayBuffer
@@ -281,7 +281,10 @@ class SocketServer:
 
                 frame = parse_frame_data(data)
                 if not frame:
-                    sock.sendall(struct.pack("bbb", 0, 0, 0))
+                    _gs = game_settings.snapshot()
+                    sock.sendall(struct.pack("bbbBB", 0, 0, 0,
+                                             1 if _gs["start_advanced"] else 0,
+                                             _gs["start_level_min"]))
                     continue
 
                 with self.client_lock:
@@ -363,7 +366,10 @@ class SocketServer:
                             pass
                     cs["was_done"] = True
                     try:
-                        sock.sendall(struct.pack("bbb", 0, 0, 0))
+                        _gs = game_settings.snapshot()
+                        sock.sendall(struct.pack("bbbBB", 0, 0, 0,
+                                                 1 if _gs["start_advanced"] else 0,
+                                                 _gs["start_level_min"]))
                     except Exception:
                         break
                     cs["last_state"] = cs["last_action"] = None
@@ -429,7 +435,10 @@ class SocketServer:
 
                 gf, gz, gs = encode_action_to_game(fire, zap, spinner_val)
                 try:
-                    sock.sendall(struct.pack("bbb", gf, gz, gs))
+                    _gs = game_settings.snapshot()
+                    sock.sendall(struct.pack("bbbBB", gf, gz, gs,
+                                             1 if _gs["start_advanced"] else 0,
+                                             _gs["start_level_min"]))
                 except Exception:
                     break
 

@@ -75,9 +75,9 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 256
-    lr: float = 5e-5
-    lr_min: float = 2e-5                  # Higher floor keeps learning alive across restarts
+    batch_size: int = 512
+    lr: float = 1e-4                       # linear-scaled (2×) from 5e-5 for 256→512 batch increase
+    lr_min: float = 4e-5                   # linear-scaled (2×) from 2e-5 for 256→512 batch increase
     lr_warmup_steps: int = 5_000
     lr_cosine_period: int = 3_000_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
@@ -169,6 +169,52 @@ class RLConfigData:
 
 
 RL_CONFIG = RLConfigData()
+
+# ---------------------------------------------------------------------------
+#  Game Settings (shared between dashboard, socket server, and LUA clients)
+# ---------------------------------------------------------------------------
+# Tempest startlevtbl: selection index → 1-based level number.
+# Mirrors the ROM table at startlevtbl in tempest.asm.
+TEMPEST_SELECTABLE_LEVELS = [
+    1, 3, 5, 7, 9, 11, 13, 15, 17, 20, 22, 24, 26, 28, 31, 33,
+    36, 40, 44, 47, 49, 52, 56, 60, 63, 65, 73, 81,
+]
+
+class GameSettings:
+    """Thread-safe container for operator-adjustable game settings."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._start_advanced: bool = True
+        self._start_level_min: int = 13
+
+    @property
+    def start_advanced(self) -> bool:
+        with self._lock:
+            return self._start_advanced
+
+    @start_advanced.setter
+    def start_advanced(self, value: bool):
+        with self._lock:
+            self._start_advanced = bool(value)
+
+    @property
+    def start_level_min(self) -> int:
+        with self._lock:
+            return self._start_level_min
+
+    @start_level_min.setter
+    def start_level_min(self, value: int):
+        with self._lock:
+            self._start_level_min = max(1, min(81, int(value)))
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "start_advanced": self._start_advanced,
+                "start_level_min": self._start_level_min,
+            }
+
+game_settings = GameSettings()
 
 # ---------------------------------------------------------------------------
 #  Metrics

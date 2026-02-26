@@ -27,9 +27,9 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
-    from config import RL_CONFIG, plateau_pulser, PlateauPulser
+    from config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings, TEMPEST_SELECTABLE_LEVELS
 except ImportError:
-    from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser
+    from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings, TEMPEST_SELECTABLE_LEVELS
 
 try:
     from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
@@ -421,6 +421,7 @@ class _DashboardState:
             "pulse_remaining": int(self.metrics.manual_pulse_frames_remaining),
             "pulse_count": plateau_pulser.total_pulses,
             "pulse_enabled": True,  # manual pulse is always available
+            "game_settings": game_settings.snapshot(),
         }
 
     @staticmethod
@@ -880,7 +881,7 @@ def _render_dashboard_html() -> str:
     .mini-metric-card .mini-canvas {
       width: 100%;
       max-width: 100%;
-      height: 104px;
+      height: 116px;
       border-radius: 8px;
       border: none;
       background:
@@ -926,6 +927,40 @@ def _render_dashboard_html() -> str:
       min-height: 36px;
       flex: 1;
       border-radius: 4px;
+    }
+    /* Game-settings card controls */
+    .game-settings-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .game-settings-row label {
+      font-size: 11px;
+      color: #b0c8e8;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .game-settings-row select {
+      background: rgba(10, 20, 40, 0.85);
+      color: #c8e8ff;
+      border: 1px solid rgba(100, 180, 255, 0.35);
+      border-radius: 4px;
+      padding: 2px 4px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+    }
+    .game-settings-row select:focus {
+      border-color: rgba(100, 180, 255, 0.7);
+      box-shadow: 0 0 6px rgba(100, 180, 255, 0.3);
+    }
+    .game-settings-row input[type="checkbox"] {
+      accent-color: #00c8ff;
+      cursor: pointer;
     }
     .gauge-card canvas {
       border: none;
@@ -1044,7 +1079,7 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.66);--card-glow:rgba(255,120,20,0.26)">
         <div class="label">Q-VALUE RANGE</div>
-        <canvas id="cQRange" class="mini-canvas" style="height:auto;flex:1 1 auto;"></canvas>
+        <canvas id="cQRange" class="mini-canvas" style="flex:0 1 auto;"></canvas>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
         <div class="label">Avg Level</div>
@@ -1103,6 +1138,28 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
+        <div class="label">GAME SETTINGS</div>
+        <div class="game-settings-row">
+          <label><input type="checkbox" id="gsAdvanced" checked> Start Advanced</label>
+        </div>
+        <div class="game-settings-row">
+          <label>Level:
+            <select id="gsLevel">
+              <option value="1">1</option><option value="3">3</option><option value="5">5</option>
+              <option value="7">7</option><option value="9">9</option><option value="11">11</option>
+              <option value="13" selected>13</option><option value="15">15</option><option value="17">17</option>
+              <option value="20">20</option><option value="22">22</option><option value="24">24</option>
+              <option value="26">26</option><option value="28">28</option><option value="31">31</option>
+              <option value="33">33</option><option value="36">36</option><option value="40">40</option>
+              <option value="44">44</option><option value="47">47</option><option value="49">49</option>
+              <option value="52">52</option><option value="56">56</option><option value="60">60</option>
+              <option value="63">63</option><option value="65">65</option><option value="73">73</option>
+              <option value="81">81</option>
+            </select>
+          </label>
+        </div>
+      </article>
     </section>
 
     <section class="charts">
@@ -1123,6 +1180,7 @@ def _render_dashboard_html() -> str:
           <span><span class="sw" style="background:#ef4444;"></span>100K</span>
           <span><span class="sw" style="background:#22c55e;"></span>1M</span>
           <span><span class="sw" style="background:#38bdf8;"></span>5M</span>
+          <span><span class="sw" style="background:#facc15;"></span>Subj</span>
         </div>
         <canvas id="cRewards"></canvas>
       </article>
@@ -1138,9 +1196,11 @@ def _render_dashboard_html() -> str:
       </article>
 
       <article class="panel" style="position:relative;">
-        <h2>Performance</h2>
-        <div style="display:flex;align-items:baseline;gap:6px;"><span style="font-size:11px;color:#a5bfde;letter-spacing:0.5px;text-transform:uppercase;">Agreement:</span><div class="value panel-vfd" id="mAgreePanel">0.0%</div></div>
-        <div class="legend" style="position:absolute;top:12px;right:14px;justify-content:flex-end;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;">
+          <h2 style="margin:0;">Performance</h2>
+          <div style="display:flex;align-items:baseline;gap:6px;"><span style="font-size:11px;color:#a5bfde;letter-spacing:0.5px;text-transform:uppercase;">Agreement:</span><div class="value panel-vfd" id="mAgreePanel">0.0%</div></div>
+        </div>
+        <div class="legend">
           <span><span class="sw" style="background:#00c8ff;"></span>Agreement 1M</span>
           <span><span class="sw" style="background:#0090cc55;"></span>Agreement Raw</span>
           <span><span class="sw" style="background:#ef4444;"></span>Avg Lvl</span>
@@ -1258,6 +1318,28 @@ def _render_dashboard_html() -> str:
       epRate: document.getElementById("mEpRate"),
       agreePanel: document.getElementById("mAgreePanel"),
     };
+    /* Game-settings controls */
+    const gsAdvancedEl = document.getElementById("gsAdvanced");
+    const gsLevelEl = document.getElementById("gsLevel");
+    let _gsIgnoreSync = false;  /* suppress sync while user is changing */
+    async function _postGameSettings(obj) {
+      try {
+        _gsIgnoreSync = true;
+        await fetch("/api/game_settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(obj),
+        });
+      } catch (e) { /* ignore */ }
+      finally { setTimeout(() => { _gsIgnoreSync = false; }, 1500); }
+    }
+    gsAdvancedEl.addEventListener("change", () => {
+      _postGameSettings({ start_advanced: gsAdvancedEl.checked });
+    });
+    gsLevelEl.addEventListener("change", () => {
+      _postGameSettings({ start_level_min: parseInt(gsLevelEl.value, 10) });
+    });
+
     const recEls = {
       rwrd: document.getElementById("recRwrd"),
       level: document.getElementById("recLevel"),
@@ -1350,7 +1432,14 @@ def _render_dashboard_html() -> str:
             },
           },
           { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
-          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) }
+          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
+          { key: "reward_subj", color: "#facc15", median_window: 5, smooth_alpha: 0.15,
+            axis: {
+              side: "right",
+              label_pad: 40,
+              group_keys: ["reward_subj"],
+            },
+          }
         ]
       },
       learning: {
@@ -3236,6 +3325,13 @@ def _render_dashboard_html() -> str:
 
       // ── Model description ─────────────────────────────────────────
       if (now.model_desc && modelDescEl) modelDescEl.textContent = now.model_desc;
+
+      // ── Game settings sync ────────────────────────────────────────
+      if (!_gsIgnoreSync && now.game_settings) {
+        const gs = now.game_settings;
+        if (gsAdvancedEl.checked !== gs.start_advanced) gsAdvancedEl.checked = gs.start_advanced;
+        if (parseInt(gsLevelEl.value, 10) !== gs.start_level_min) gsLevelEl.value = String(gs.start_level_min);
+      }
     }
 
     function render(payload) {
@@ -3528,6 +3624,29 @@ def _make_handler(state: _DashboardState):
                     return
                 ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
                 self._send_file(safe_path, ctype)
+                return
+            if path == "/api/game_settings":
+                body = json.dumps(game_settings.snapshot()).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/api/game_settings":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    data = json.loads(raw)
+                    if "start_advanced" in data:
+                        game_settings.start_advanced = bool(data["start_advanced"])
+                    if "start_level_min" in data:
+                        game_settings.start_level_min = int(data["start_level_min"])
+                    body = json.dumps(game_settings.snapshot()).encode("utf-8")
+                    self._send(body, "application/json")
+                except Exception:
+                    self._send(b'{"error":"bad request"}', "application/json", status=400)
                 return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
 

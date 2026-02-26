@@ -19,8 +19,8 @@ local unpack = table.unpack or unpack -- Compatibility for unpack function
 
 -- Constants
 local SHOW_DISPLAY            = false
-local START_ADVANCED          = true   -- true = start on highest available level from last game
-local START_LEVEL_MIN         = 13      -- Desired 1-based starting level (used when START_ADVANCED is false)
+local START_ADVANCED          = true   -- true = start on highest available level from last game (updated by server)
+local START_LEVEL_MIN         = 13      -- Desired 1-based starting level (updated by server)
 local DISPLAY_UPDATE_INTERVAL = 0.02
 local SOCKET_ADDRESS          = "socket.ubvmdell:9999"
 local SOCKET_READ_TIMEOUT_S   = 3.5  
@@ -617,12 +617,18 @@ local function process_frame_via_socket(rawdata)
         local elapsed = 0
 
         while elapsed < SOCKET_READ_TIMEOUT_S do
-            -- Try reading 3 bytes for the action (b, b, b)
-            action_bytes = current_socket:read(3)
+            -- Try reading 5 bytes for the action (b, b, b, B, B)
+            action_bytes = current_socket:read(5)
 
-            if action_bytes and #action_bytes == 3 then
-                -- Successfully read 3 bytes
-                 return { string.unpack("bbb", action_bytes) } -- Return unpacked values
+            if action_bytes and #action_bytes == 5 then
+                -- Successfully read 5 bytes: fire, zap, spinner, start_advanced, start_level_min
+                local f, z, s, sa, sl = string.unpack("bbbBB", action_bytes)
+                -- Update game settings from server
+                START_ADVANCED = (sa ~= 0)
+                if sl >= 1 and sl <= 81 then
+                    START_LEVEL_MIN = sl
+                end
+                return { f, z, s }
             end
 
             -- If read failed or got partial data, just loop and rely on main timeout
@@ -630,8 +636,8 @@ local function process_frame_via_socket(rawdata)
             elapsed = os.clock() - read_start_time
         end
 
-        -- Loop finished without getting 3 bytes (Timeout)
-        print("Socket read timeout after " .. string.format("%.3f", elapsed) .. "s. Expected 3 bytes.")
+        -- Loop finished without getting 5 bytes (Timeout)
+        print("Socket read timeout after " .. string.format("%.3f", elapsed) .. "s. Expected 5 bytes.")
         if elapsed >= SOCKET_READ_TIMEOUT_S then
              print("Socket read timeout exceeded, attempting reconnect...")
              close_socket()

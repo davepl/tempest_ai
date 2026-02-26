@@ -172,7 +172,6 @@ find_nearest_safe_segment = function(player_abs_seg, is_open, forbidden_segments
     end
 
     -- If no safe segment found (highly unlikely unless all are forbidden)
-    print("WARNING: No safe segment found to flee to! Staying put.")
     return player_abs_seg
 end
 
@@ -400,7 +399,6 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
 
     -- If too close, find the nearest segment >= min_fuseball_dist away from ALL top fuseballs
     if too_close then
-        print("FUSEBALL AVOID: Target " .. final_target_seg_abs .. " too close. Finding alternative.")
         local best_safe_seg = -1
         local search_max_dist = is_open and 15 or 8
 
@@ -447,13 +445,11 @@ find_target_segment = function(game_state, player_state, level_state, enemies_st
         ::found_safe_segment::
 
         if best_safe_seg ~= -1 then
-            print("FUSEBALL AVOID: New target = " .. best_safe_seg)
             final_target_seg_abs = best_safe_seg
             target_depth = 0 -- Reset depth indication
             should_fire = false -- Don't fire when avoiding
             should_zap = false
         else
-             print("WARNING: Fuseball avoidance could not find any safe segment!")
              -- Keep original target if no safe alternative found (might be stuck)
         end
     end
