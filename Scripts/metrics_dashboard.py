@@ -413,6 +413,7 @@ class _DashboardState:
             "peak_level": float(self.metrics.peak_level + 1),
             "peak_episode_reward": float(self.metrics.peak_episode_reward) * inv_obj,
             "peak_game_score": int(self.metrics.peak_game_score),
+            "episodes_this_run": int(self.metrics.episodes_this_run),
             "agreement": last_agreement,
             "agreement_1m": agreement_1m,
             "model_desc": self._get_model_desc(),
@@ -1058,7 +1059,7 @@ def _render_dashboard_html() -> str:
         <div class="mini-inline">
           <div class="value" id="mEpLen">0</div>
           <canvas id="cEpLenMini" class="mini-canvas"></canvas>
-          <div style="grid-column:1;"><div class="record-label" style="margin-bottom:1px;">Duration:</div><div class="record-value" id="mDuration">0:00</div></div>
+          <div style="grid-column:1;"><div class="record-label" style="margin-bottom:1px;">Duration:</div><div class="record-value" id="mDuration">0:00</div><div class="record-label" style="margin-bottom:1px;margin-top:2px;">Count:</div><div class="record-value" id="mEpisodes">0</div><div class="record-label" style="margin-bottom:1px;margin-top:2px;">Rate:</div><div class="record-value" id="mEpRate">—</div></div>
         </div>
         <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
       </article>
@@ -1076,7 +1077,13 @@ def _render_dashboard_html() -> str:
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div><div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div></article>
+      <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></div>
+          <div style="text-align:right;"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></div>
+        </div>
+        <div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div>
+      </article>
       <article class="card mini-metric-card card-half" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)">
         <div class="label">LEARNING RATE</div>
         <div class="mini-inline" style="overflow:hidden;min-height:0;flex:1;">
@@ -1095,7 +1102,6 @@ def _render_dashboard_html() -> str:
         <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
     </section>
 
@@ -1248,6 +1254,8 @@ def _render_dashboard_html() -> str:
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
       duration: document.getElementById("mDuration"),
+      episodes: document.getElementById("mEpisodes"),
+      epRate: document.getElementById("mEpRate"),
       agreePanel: document.getElementById("mAgreePanel"),
     };
     const recEls = {
@@ -1257,6 +1265,9 @@ def _render_dashboard_html() -> str:
     };
     const modelDescEl = document.getElementById("modelDesc");
     const recordHighs = { rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
+    /* Episode rate: 30-second rolling window */
+    const epRateHistory = [];  /* {ts, episodes} */
+    const EP_RATE_WINDOW = 30; /* seconds */
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
 
@@ -3064,18 +3075,54 @@ def _render_dashboard_html() -> str:
       const restarts  = !!now.lr_use_restarts;
       const step      = now.training_steps     || 0;
 
-      // Draw area = full canvas with 1px margin
-      const pad = 1;
-      const gw = W - 2*pad, gh = H - 2*pad;
+      // Draw area with left axis padding
+      const axisPad = 38;
+      const padL = axisPad, padR = 2, padTop = 2, padBot = 2;
+      const gw = W - padL - padR, gh = H - padTop - padBot;
+      if (gw <= 4 || gh <= 4) return;
 
       // Total steps we show: 2 full periods (or up to step + some if larger)
       const totalShow = restarts ? Math.max(period * 2, step + period * 0.3) : Math.max(period + warmup, step * 1.2);
 
       // Map step → x
-      const sx = (s) => pad + (s / totalShow) * gw;
+      const sx = (s) => padL + (s / totalShow) * gw;
       // Map lr → y (top = lrMax, bottom = lrMin)
       const lrRange = Math.max(1e-12, lrMax - lrMin);
-      const sy = (lr) => pad + (1.0 - (lr - lrMin) / lrRange) * gh;
+      const sy = (lr) => padTop + (1.0 - (lr - lrMin) / lrRange) * gh;
+
+      // ── Vertical axis and ticks ──────────────────────────────────
+      const fmtLr = (v) => {
+        if (v === 0) return "0";
+        const exp = Math.floor(Math.log10(Math.abs(v)));
+        const mantissa = v / Math.pow(10, exp);
+        if (Math.abs(mantissa - Math.round(mantissa)) < 0.05)
+          return Math.round(mantissa) + "e" + exp;
+        return mantissa.toFixed(1) + "e" + exp;
+      };
+      const nTicks = 3;
+      const tickStep = niceInterval(lrRange, nTicks);
+      const axisX = padL - 1;
+      ctx.strokeStyle = "rgba(100,160,255,0.52)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(axisX, padTop);
+      ctx.lineTo(axisX, H - padBot);
+      ctx.stroke();
+
+      ctx.font = "7px 'DotGothic16', 'Courier New', monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let tv = Math.ceil(lrMin / tickStep) * tickStep; tv <= lrMax + tickStep * 0.001; tv += tickStep) {
+        const y = sy(tv);
+        ctx.strokeStyle = "rgba(100,160,255,0.70)";
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(axisX - 2, y);
+        ctx.lineTo(axisX + 2, y);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(165, 191, 222, 0.95)";
+        ctx.fillText(fmtLr(tv), axisX - 3, y);
+      }
 
       // Compute lr at a given step (mirrors get_lr)
       function lrAt(s) {
@@ -3153,6 +3200,23 @@ def _render_dashboard_html() -> str:
         : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
       { const secs = Math.round((now.eplen_1m || 0) / 30); const m = Math.floor(secs / 60); const s = secs % 60; cards.duration.textContent = m + ":" + String(s).padStart(2, "0"); }
+
+      /* Episodes count + 30-second rolling rate */
+      cards.episodes.textContent = fmtInt(now.episodes_this_run);
+      {
+        const t = now.ts || (Date.now() / 1000);
+        epRateHistory.push({ts: t, episodes: now.episodes_this_run});
+        while (epRateHistory.length > 1 && epRateHistory[0].ts < t - EP_RATE_WINDOW) epRateHistory.shift();
+        if (epRateHistory.length >= 2) {
+          const first = epRateHistory[0], last = epRateHistory[epRateHistory.length - 1];
+          const dt = last.ts - first.ts;
+          if (dt > 0.5) {
+            const rate = (last.episodes - first.episodes) / dt;
+            cards.epRate.textContent = fmtFloat(rate, 1) + "/s";
+          }
+        }
+      }
+
       cards.agreePanel.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
         ? fmtFloat(now.agreement_1m * 100, 1) + "%"
         : "0.0%";

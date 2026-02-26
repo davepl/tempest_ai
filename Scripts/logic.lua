@@ -44,6 +44,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
 
 local DEATH_PENALTY = 1000           -- Edge-triggered penalty when dying (same clip as normal rewards)
+local SUPERZAP_PENALTY = 1000        -- Max penalty for early superzap use (game-points equivalent)
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
@@ -54,6 +55,8 @@ local previous_alive_state = 1 -- Track previous alive state, initialize as aliv
 local LastRewardState = 0
 local LastSubjRewardState = 0
 local LastObjRewardState = 0
+local previous_superzapper_uses = 0
+local enemy_start_count = 0          -- enemies_pending captured at level start
 local previous_player_position = 0
 
 local function sample_expert_fire()
@@ -645,6 +648,13 @@ end
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local reward, subj_reward, obj_reward, bDone = 0.0, 0.0, 0.0, false
 
+    -- Capture enemies_pending at level start for superzap penalty scaling
+    local current_level = level_state.level_number or 0
+    if current_level ~= previous_level then
+        enemy_start_count = enemies_state.enemies_pending or 0
+        previous_superzapper_uses = player_state.superzapper_uses or 0
+    end
+
     -- Terminal: death (edge-triggered) - Penalty applied to objective reward
     if player_state.alive == 0 and previous_alive_state == 1 then
         obj_reward = obj_reward - DEATH_PENALTY
@@ -655,6 +665,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         if score_delta > 0 and score_delta < 1000 then                         -- Filter out large bonuses AND negative deltas
             local r_score = score_delta 
             obj_reward = obj_reward + r_score
+        end
+
+        -- Superzap penalty: linear scale from full penalty at level start to free when enemies_pending=0
+        local current_zap_uses = player_state.superzapper_uses or 0
+        if current_zap_uses > previous_superzapper_uses and enemy_start_count > 0 then
+            local pending = enemies_state.enemies_pending or 0
+            local ratio = pending / enemy_start_count
+            obj_reward = obj_reward - (SUPERZAP_PENALTY * ratio)
         end
 
         -- Subjective shaping: lane safety/danger reward
@@ -739,6 +757,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     previous_level = level_state.level_number or 0
     previous_alive_state = player_state.alive or 0
     previous_player_position = player_state.position or 0
+    previous_superzapper_uses = player_state.superzapper_uses or 0
 
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward

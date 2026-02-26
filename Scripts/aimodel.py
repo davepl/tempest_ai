@@ -632,6 +632,10 @@ class SafeMetrics:
     def peak_game_score(self, v):
         self.metrics.peak_game_score = v
 
+    @property
+    def episodes_this_run(self):
+        return self.metrics.episodes_this_run
+
     def get_superzap_gate_ratio(self):
         return self.metrics.get_superzap_gate_ratio()
 

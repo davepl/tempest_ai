@@ -230,6 +230,7 @@ class MetricsData:
     peak_level: int = 0
     peak_episode_reward: float = 0.0
     peak_game_score: int = 0
+    episodes_this_run: int = 0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
@@ -325,6 +326,7 @@ class MetricsData:
 
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
+            self.episodes_this_run += 1
             self.episode_rewards.append(float(total))
             self.dqn_rewards.append(float(dqn))
             self.expert_rewards.append(float(expert))
