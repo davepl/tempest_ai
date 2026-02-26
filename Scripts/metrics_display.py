@@ -13,7 +13,7 @@ import sys, time, math, threading
 import numpy as np
 from collections import deque
 
-from config import metrics, IS_INTERACTIVE, RL_CONFIG
+from config import metrics, IS_INTERACTIVE, RL_CONFIG, game_settings
 
 row_counter = 0
 
@@ -185,7 +185,7 @@ def display_metrics_header():
     row_counter = 0
     hdr = (
         f"{'Frame':>11} {'FPS':>7} {'Epsi':>7} {'Xprt':>7} "
-        f"{'Rwrd':>9} {'Subj':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
+        f"{'Rwrd':>9} {'Obj':>9} {'Subj':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
         f"{'Loss':>10} {'Agree%':>7} "
         f"{'EpLen':>8} {'BCLoss':>8} "
         f"{'Clnt':>4} {'Web':>4} {'Levl':>5} "
@@ -209,11 +209,14 @@ def display_metrics_row(agent, kb_handler):
     # ── Interval averages ───────────────────────────────────────────────
     mean_reward = 0.0
     mean_subj = 0.0
+    mean_obj = 0.0
     with metrics.lock:
         if metrics.reward_count_interval > 0:
             mean_reward = metrics.reward_sum_interval / max(1, metrics.reward_count_interval)
         if metrics.reward_count_interval_subj > 0:
             mean_subj = metrics.reward_sum_interval_subj / max(1, metrics.reward_count_interval_subj)
+        if metrics.reward_count_interval_obj > 0:
+            mean_obj = metrics.reward_sum_interval_obj / max(1, metrics.reward_count_interval_obj)
         # Reset
         metrics.reward_sum_interval = metrics.reward_count_interval = 0
         metrics.reward_sum_interval_dqn = metrics.reward_count_interval_dqn = 0
@@ -291,24 +294,27 @@ def display_metrics_row(agent, kb_handler):
         except Exception:
             lr_str = "?"
 
-    # ── Reward scaling for display ──────────────────────────────────────
-    inv = 1.0 / max(1e-9, RL_CONFIG.obj_reward_scale)
-    inv_subj = 1.0 / max(1e-9, RL_CONFIG.subj_reward_scale)
+    # ── Reward display — scale up by point_reward_scale for readability ──
+    _prs = float(RL_CONFIG.point_reward_scale)
 
     def _fr(v, w=9):
         try:
-            return f"{float(v):.0f}".rjust(w)
+            return f"{float(v):.1f}".rjust(w)
         except Exception:
-            return "0".rjust(w)
+            return "0.0".rjust(w)
 
-    eps_pct = f"{metrics.get_effective_epsilon()*100:.0f}%".rjust(7)
-    xprt_pct = f"{metrics.get_expert_ratio()*100:.0f}%".rjust(7)
+    eps_val = metrics.get_effective_epsilon()*100
+    xprt_val = metrics.get_expert_ratio()*100
+    eps_mark = "*" if game_settings.epsilon_pct >= 0 else ""
+    xprt_mark = "*" if game_settings.expert_pct >= 0 else ""
+    eps_pct = f"{eps_val:.0f}%{eps_mark}".rjust(7)
+    xprt_pct = f"{xprt_val:.0f}%{xprt_mark}".rjust(7)
     replay_ratio = (steps_per_sec * float(RL_CONFIG.batch_size)) / max(1e-6, float(metrics.fps))
 
     row = (
         f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_pct} {xprt_pct} "
-        f"{_fr(mean_reward*inv)} {_fr(mean_subj*inv_subj)} {_fr(dqn100k*inv)} "
-        f"{_fr(dqn1m*inv)} {_fr(dqn5m*inv)} "
+        f"{_fr(mean_reward*_prs)} {_fr(mean_obj*_prs)} {_fr(mean_subj*_prs)} {_fr(dqn100k*_prs)} "
+        f"{_fr(dqn1m*_prs)} {_fr(dqn5m*_prs)} "
         f"{loss_avg:>10.6f} {agree_avg*100:>6.1f}% "
         f"{avg_ep_len:>8.1f} {metrics.last_bc_loss:>8.4f} "
         f"{metrics.client_count:>4} {metrics.web_client_count:>4} {display_level:>5.1f} "

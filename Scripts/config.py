@@ -83,7 +83,7 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 12      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 20      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
     memory_size: int = 15_000_000
@@ -139,7 +139,8 @@ class RLConfigData:
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
-    subj_reward_scale: float = 0.01
+    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
+    subj_reward_scale: float = 0.005
     reward_clip: float = 10.0
     death_reward_clip: float = 10.0        # Same as normal reward_clip — no special death amplification
 
@@ -186,6 +187,8 @@ class GameSettings:
         self._lock = threading.Lock()
         self._start_advanced: bool = True
         self._start_level_min: int = 13
+        self._epsilon_pct: int = -1   # -1 = auto (follow decay), 0-100 = manual override %
+        self._expert_pct: int = -1    # -1 = auto (follow decay), 0-100 = manual override %
 
     @property
     def start_advanced(self) -> bool:
@@ -207,11 +210,33 @@ class GameSettings:
         with self._lock:
             self._start_level_min = max(1, min(81, int(value)))
 
+    @property
+    def epsilon_pct(self) -> int:
+        with self._lock:
+            return self._epsilon_pct
+
+    @epsilon_pct.setter
+    def epsilon_pct(self, value: int):
+        with self._lock:
+            self._epsilon_pct = max(-1, min(100, int(value)))
+
+    @property
+    def expert_pct(self) -> int:
+        with self._lock:
+            return self._expert_pct
+
+    @expert_pct.setter
+    def expert_pct(self, value: int):
+        with self._lock:
+            self._expert_pct = max(-1, min(100, int(value)))
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
                 "start_advanced": self._start_advanced,
                 "start_level_min": self._start_level_min,
+                "epsilon_pct": self._epsilon_pct,
+                "expert_pct": self._expert_pct,
             }
 
 game_settings = GameSettings()
@@ -327,6 +352,9 @@ class MetricsData:
 
     def get_effective_epsilon(self) -> float:
         with self.lock:
+            ep = game_settings.epsilon_pct
+            if ep >= 0:
+                return ep / 100.0
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
     @staticmethod
@@ -353,6 +381,9 @@ class MetricsData:
 
     def get_expert_ratio(self):
         with self.lock:
+            xp = game_settings.expert_pct
+            if xp >= 0:
+                return xp / 100.0
             return float(self.expert_ratio)
 
     def update_expert_ratio(self):

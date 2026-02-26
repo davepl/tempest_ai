@@ -287,16 +287,20 @@ class _DashboardState:
 
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
-        inv_obj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "obj_reward_scale", 1.0)))
-        inv_subj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "subj_reward_scale", 1.0)))
+        _prs = float(RL_CONFIG.point_reward_scale)  # display-only multiplier
 
         fps = self.metrics.get_fps()
 
         with self.metrics.lock:
             frame_count = int(self.metrics.frame_count)
             epsilon_raw = float(self.metrics.epsilon)
-            epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
-            expert_ratio = float(self.metrics.expert_ratio)
+            _eps_ov = game_settings.epsilon_pct
+            if _eps_ov >= 0:
+                epsilon_effective = _eps_ov / 100.0
+            else:
+                epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
+            _xprt_ov = game_settings.expert_pct
+            expert_ratio = (_xprt_ov / 100.0) if _xprt_ov >= 0 else float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
             web_client_count = int(self.metrics.web_client_count)
             average_level = float(self.metrics.average_level + 1.0)
@@ -316,10 +320,10 @@ class _DashboardState:
             inference_time = float(self.metrics.total_inference_time)
             last_agreement = float(self.metrics.last_agreement)
 
-            reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
-            reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
-            reward_subj = _tail_mean(self.metrics.subj_rewards) * inv_subj
-            reward_obj = _tail_mean(self.metrics.obj_rewards) * inv_obj
+            reward_total = _tail_mean(self.metrics.episode_rewards) * _prs
+            reward_dqn = _tail_mean(self.metrics.dqn_rewards) * _prs
+            reward_subj = _tail_mean(self.metrics.subj_rewards) * _prs
+            reward_obj = _tail_mean(self.metrics.obj_rewards) * _prs
 
         try:
             dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
@@ -386,12 +390,12 @@ class _DashboardState:
             "reward_dqn": reward_dqn,
             "reward_subj": reward_subj,
             "reward_obj": reward_obj,
-            "dqn_100k": float(dqn100k_raw) * inv_obj,
-            "dqn_1m": float(dqn1m_raw) * inv_obj,
-            "dqn_5m": float(dqn5m_raw) * inv_obj,
-            "total_100k": float(total100k_raw) * inv_obj,
-            "total_1m": float(total1m_raw) * inv_obj,
-            "total_5m": float(total5m_raw) * inv_obj,
+            "dqn_100k": float(dqn100k_raw) * _prs,
+            "dqn_1m": float(dqn1m_raw) * _prs,
+            "dqn_5m": float(dqn5m_raw) * _prs,
+            "total_100k": float(total100k_raw) * _prs,
+            "total_1m": float(total1m_raw) * _prs,
+            "total_5m": float(total5m_raw) * _prs,
             "level_25k": float(level_25k),
             "level_100k": float(level_100k),
             "level_1m": float(level_1m),
@@ -411,7 +415,7 @@ class _DashboardState:
             "eplen_1m": get_eplen_1m_average(),
             "eplen_100k": get_eplen_100k_average(),
             "peak_level": float(self.metrics.peak_level + 1),
-            "peak_episode_reward": float(self.metrics.peak_episode_reward) * inv_obj,
+            "peak_episode_reward": float(self.metrics.peak_episode_reward) * _prs,
             "peak_game_score": int(self.metrics.peak_game_score),
             "episodes_this_run": int(self.metrics.episodes_this_run),
             "agreement": last_agreement,
@@ -932,6 +936,7 @@ def _render_dashboard_html() -> str:
     .game-settings-row {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 8px;
       margin-top: 4px;
     }
@@ -958,10 +963,30 @@ def _render_dashboard_html() -> str:
       border-color: rgba(100, 180, 255, 0.7);
       box-shadow: 0 0 6px rgba(100, 180, 255, 0.3);
     }
-    .game-settings-row input[type="checkbox"] {
-      accent-color: #00c8ff;
-      cursor: pointer;
+    /* Dark toggle switch */
+    .toggle-switch { position: relative; display: inline-block; width: 28px; height: 14px; flex-shrink: 0; }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-switch .slider {
+      position: absolute; inset: 0; border-radius: 7px; cursor: pointer;
+      background: rgba(60, 80, 110, 0.7); transition: background 0.2s;
     }
+    .toggle-switch .slider::before {
+      content: ""; position: absolute; left: 2px; top: 2px;
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #8899aa; transition: transform 0.2s, background 0.2s;
+    }
+    .toggle-switch input:checked + .slider { background: rgba(0, 200, 255, 0.45); }
+    .toggle-switch input:checked + .slider::before { transform: translateX(14px); background: #00c8ff; }
+    .toggle-switch input:disabled + .slider { opacity: 0.4; cursor: default; }
+    /* Up/down override controls for Epsilon / Expert */
+    .ud-col { display:flex; flex-direction:column; gap:0; line-height:1; }
+    .ud-btn {
+      background:none; border:none; color:#556; cursor:pointer;
+      font-size:9px; padding:0 2px; line-height:1; user-select:none;
+      transition: color 0.15s;
+    }
+    .ud-btn:hover { color:#0ff; }
+    .ud-btn:disabled { opacity:0.25; cursor:default; color:#556; }
     .gauge-card canvas {
       border: none;
       background: transparent;
@@ -1114,8 +1139,26 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)">
         <div style="display:flex;justify-content:space-between;align-items:baseline;">
-          <div><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></div>
-          <div style="text-align:right;"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></div>
+          <div>
+            <div class="label">Epsilon</div>
+            <div style="display:flex;align-items:center;gap:2px;">
+              <div class="ud-col" id="epsUD">
+                <button class="ud-btn" data-field="epsilon_pct" data-dir="1" title="Increase epsilon">&#9650;</button>
+                <button class="ud-btn" data-field="epsilon_pct" data-dir="-1" title="Decrease epsilon">&#9660;</button>
+              </div>
+              <div class="value" id="mEps">0%</div>
+            </div>
+          </div>
+          <div style="text-align:right;">
+            <div class="label">Expert</div>
+            <div style="display:flex;align-items:center;gap:2px;justify-content:flex-end;">
+              <div class="ud-col" id="xprtUD">
+                <button class="ud-btn" data-field="expert_pct" data-dir="1" title="Increase expert">&#9650;</button>
+                <button class="ud-btn" data-field="expert_pct" data-dir="-1" title="Decrease expert">&#9660;</button>
+              </div>
+              <div class="value" id="mXprt">0%</div>
+            </div>
+          </div>
         </div>
         <div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div>
       </article>
@@ -1141,9 +1184,6 @@ def _render_dashboard_html() -> str:
       <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
         <div class="label">GAME SETTINGS</div>
         <div class="game-settings-row">
-          <label><input type="checkbox" id="gsAdvanced" checked> Start Advanced</label>
-        </div>
-        <div class="game-settings-row">
           <label>Level:
             <select id="gsLevel">
               <option value="1">1</option><option value="3">3</option><option value="5">5</option>
@@ -1158,6 +1198,7 @@ def _render_dashboard_html() -> str:
               <option value="81">81</option>
             </select>
           </label>
+          <label style="gap:6px;">Advanced <span class="toggle-switch"><input type="checkbox" id="gsAdvanced" checked><span class="slider"></span></span></label>
         </div>
       </article>
     </section>
@@ -1321,6 +1362,25 @@ def _render_dashboard_html() -> str:
     /* Game-settings controls */
     const gsAdvancedEl = document.getElementById("gsAdvanced");
     const gsLevelEl = document.getElementById("gsLevel");
+    const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
+    if (!_gsAdmin) { gsAdvancedEl.disabled = true; gsLevelEl.disabled = true; }
+    /* Epsilon / Expert up-down buttons — admin gate */
+    document.querySelectorAll('#epsUD .ud-btn, #xprtUD .ud-btn').forEach(btn => {
+      if (!_gsAdmin) { btn.disabled = true; return; }
+      btn.addEventListener('click', () => {
+        const field = btn.dataset.field; /* epsilon_pct or expert_pct */
+        const dir   = parseInt(btn.dataset.dir, 10); /* +1 or -1 */
+        const cur   = field === 'epsilon_pct'
+          ? Math.round((_lastNow?.epsilon ?? 0) * 100)
+          : Math.round((_lastNow?.expert_ratio ?? 0) * 100);
+        const next  = Math.max(0, Math.min(100, cur + dir));
+        _postGameSettings({ [field]: next });
+        /* Optimistic UI update */
+        if (field === 'epsilon_pct') cards.eps.textContent = fmtPct(next / 100);
+        else cards.xprt.textContent = fmtPct(next / 100);
+      });
+    });
+    let _lastNow = null;  /* stash latest snapshot for up/down reference */
     let _gsIgnoreSync = false;  /* suppress sync while user is changing */
     async function _postGameSettings(obj) {
       try {
@@ -1333,12 +1393,14 @@ def _render_dashboard_html() -> str:
       } catch (e) { /* ignore */ }
       finally { setTimeout(() => { _gsIgnoreSync = false; }, 1500); }
     }
-    gsAdvancedEl.addEventListener("change", () => {
-      _postGameSettings({ start_advanced: gsAdvancedEl.checked });
-    });
-    gsLevelEl.addEventListener("change", () => {
-      _postGameSettings({ start_level_min: parseInt(gsLevelEl.value, 10) });
-    });
+    if (_gsAdmin) {
+      gsAdvancedEl.addEventListener("change", () => {
+        _postGameSettings({ start_advanced: gsAdvancedEl.checked });
+      });
+      gsLevelEl.addEventListener("change", () => {
+        _postGameSettings({ start_level_min: parseInt(gsLevelEl.value, 10) });
+      });
+    }
 
     const recEls = {
       rwrd: document.getElementById("recRwrd"),
@@ -3252,6 +3314,7 @@ def _render_dashboard_html() -> str:
      * updates record highs, and sets model description.
      * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
+      _lastNow = now;
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
@@ -3259,7 +3322,7 @@ def _render_dashboard_html() -> str:
       setInfLed(now.avg_inf_ms);
       cards.rplf.innerHTML = toFixedCharCells(fmtPaddedFloat(now.rpl_per_frame, 2, 2, " "));
       setRplLed(now.rpl_per_frame);
-      cards.eps.textContent = fmtPct(now.epsilon);
+      if (!_gsIgnoreSync) cards.eps.textContent = fmtPct(now.epsilon);
 
       // Pulse status indicator (SVG bolt prefix)
       const bolt = (fill) => `<svg width="10" height="14" viewBox="0 0 16 22" style="vertical-align:-2px;margin-right:2px"><path d="M10 0L3 12h5l-2 10 7-14H8z" fill="${fill}"/></svg>`;
@@ -3277,7 +3340,7 @@ def _render_dashboard_html() -> str:
         cards.pulseStatus.style.color = "#888";
       }
 
-      cards.xprt.textContent = fmtPct(now.expert_ratio);
+      if (!_gsIgnoreSync) cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.rwrd.textContent = fmtInt(Math.max(0, now.total_1m || 0));
       cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
@@ -3643,6 +3706,10 @@ def _make_handler(state: _DashboardState):
                         game_settings.start_advanced = bool(data["start_advanced"])
                     if "start_level_min" in data:
                         game_settings.start_level_min = int(data["start_level_min"])
+                    if "epsilon_pct" in data:
+                        game_settings.epsilon_pct = int(data["epsilon_pct"])
+                    if "expert_pct" in data:
+                        game_settings.expert_pct = int(data["expert_pct"])
                     body = json.dumps(game_settings.snapshot()).encode("utf-8")
                     self._send(body, "application/json")
                 except Exception:
