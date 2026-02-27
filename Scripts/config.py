@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, sys, time, threading, math
+import os, sys, time, threading, math, json
 from dataclasses import dataclass, field
 from typing import Deque
 from collections import deque
@@ -20,6 +20,7 @@ FORCE_FRESH_MODEL = False
 
 MODEL_DIR = "models"
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
+SETTINGS_PATH = f"{MODEL_DIR}/game_settings.json"
 
 # ---------------------------------------------------------------------------
 @dataclass
@@ -145,7 +146,7 @@ class RLConfigData:
     death_reward_clip: float = 10.0        # Same as normal reward_clip — no special death amplification
 
     # ── death attribution ───────────────────────────────────────────────
-    death_priority_boost: float = 3.0      # Lower terminal boost to reduce over-focusing on death tails
+    death_priority_boost: float = 1.5      # Lower terminal boost to reduce over-focusing on death tails
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
@@ -189,6 +190,7 @@ class GameSettings:
         self._start_level_min: int = 13
         self._epsilon_pct: int = -1   # -1 = auto (follow decay), 0-100 = manual override %
         self._expert_pct: int = -1    # -1 = auto (follow decay), 0-100 = manual override %
+        self._auto_curriculum: bool = False
 
     @property
     def start_advanced(self) -> bool:
@@ -230,6 +232,16 @@ class GameSettings:
         with self._lock:
             self._expert_pct = max(-1, min(100, int(value)))
 
+    @property
+    def auto_curriculum(self) -> bool:
+        with self._lock:
+            return self._auto_curriculum
+
+    @auto_curriculum.setter
+    def auto_curriculum(self, value: bool):
+        with self._lock:
+            self._auto_curriculum = bool(value)
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -237,9 +249,55 @@ class GameSettings:
                 "start_level_min": self._start_level_min,
                 "epsilon_pct": self._epsilon_pct,
                 "expert_pct": self._expert_pct,
+                "auto_curriculum": self._auto_curriculum,
             }
 
+    def reset(self) -> None:
+        """Restore all settings to initial defaults (fresh-start)."""
+        with self._lock:
+            self._start_advanced = True
+            self._start_level_min = 13
+            self._epsilon_pct = -1
+            self._expert_pct = -1
+            self._auto_curriculum = False
+
+    # ── Persistence ───────────────────────────────────────────────
+
+    def save(self, path: str = SETTINGS_PATH) -> None:
+        """Write current settings to a JSON file."""
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            data = self.snapshot()
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            pass  # best-effort; don't crash the server
+
+    def load(self, path: str = SETTINGS_PATH) -> None:
+        """Restore settings from a JSON file if it exists."""
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            with self._lock:
+                if "start_advanced" in data:
+                    self._start_advanced = bool(data["start_advanced"])
+                if "start_level_min" in data:
+                    self._start_level_min = max(1, min(81, int(data["start_level_min"])))
+                if "epsilon_pct" in data:
+                    self._epsilon_pct = max(-1, min(100, int(data["epsilon_pct"])))
+                if "expert_pct" in data:
+                    self._expert_pct = max(-1, min(100, int(data["expert_pct"])))
+                if "auto_curriculum" in data:
+                    self._auto_curriculum = bool(data["auto_curriculum"])
+        except FileNotFoundError:
+            pass  # first run — use defaults
+        except Exception:
+            pass  # corrupted file — use defaults
+
 game_settings = GameSettings()
+game_settings.load()
 
 # ---------------------------------------------------------------------------
 #  Metrics

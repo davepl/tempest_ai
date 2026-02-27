@@ -1182,7 +1182,7 @@ def _render_dashboard_html() -> str:
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
       <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
-        <div class="label">GAME SETTINGS</div>
+        <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
         <div class="game-settings-row">
           <label>Level:
             <select id="gsLevel">
@@ -1362,8 +1362,9 @@ def _render_dashboard_html() -> str:
     /* Game-settings controls */
     const gsAdvancedEl = document.getElementById("gsAdvanced");
     const gsLevelEl = document.getElementById("gsLevel");
+    const gsAutoCurrEl = document.getElementById("gsAutoCurriculum");
     const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
-    if (!_gsAdmin) { gsAdvancedEl.disabled = true; gsLevelEl.disabled = true; }
+    if (!_gsAdmin) { gsAdvancedEl.disabled = true; gsLevelEl.disabled = true; gsAutoCurrEl.disabled = true; }
     /* Epsilon / Expert up-down buttons — admin gate */
     document.querySelectorAll('#epsUD .ud-btn, #xprtUD .ud-btn').forEach(btn => {
       if (!_gsAdmin) { btn.disabled = true; return; }
@@ -1400,6 +1401,32 @@ def _render_dashboard_html() -> str:
       gsLevelEl.addEventListener("change", () => {
         _postGameSettings({ start_level_min: parseInt(gsLevelEl.value, 10) });
       });
+      gsAutoCurrEl.addEventListener("change", () => {
+        _postGameSettings({ auto_curriculum: gsAutoCurrEl.checked });
+        _applyAutoCurriculum(gsAutoCurrEl.checked);
+      });
+    }
+    const _selectableLevels = [1,3,5,7,9,11,13,15,17,20,22,24,26,28,31,33,36,40,44,47,49,52,56,60,63,65,73,81];
+    function _computeAutoLevel(avgLevel) {
+      const target = Math.floor(avgLevel) - 4;
+      let best = _selectableLevels[0];
+      for (const lv of _selectableLevels) { if (lv <= target) best = lv; else break; }
+      return best;
+    }
+    function _applyAutoCurriculum(on) {
+      gsAdvancedEl.disabled = on || !_gsAdmin;
+      gsLevelEl.disabled    = on || !_gsAdmin;
+      if (on) {
+        if (gsAdvancedEl.checked) {
+          gsAdvancedEl.checked = false;
+          _postGameSettings({ start_advanced: false });
+        }
+        if (_lastNow) {
+          const lv = _computeAutoLevel(_lastNow.average_level || 1);
+          gsLevelEl.value = String(lv);
+          _postGameSettings({ start_level_min: lv });
+        }
+      }
     }
 
     const recEls = {
@@ -3392,8 +3419,20 @@ def _render_dashboard_html() -> str:
       // ── Game settings sync ────────────────────────────────────────
       if (!_gsIgnoreSync && now.game_settings) {
         const gs = now.game_settings;
+        if (gsAutoCurrEl.checked !== gs.auto_curriculum) {
+          gsAutoCurrEl.checked = gs.auto_curriculum;
+          _applyAutoCurriculum(gs.auto_curriculum);
+        }
         if (gsAdvancedEl.checked !== gs.start_advanced) gsAdvancedEl.checked = gs.start_advanced;
         if (parseInt(gsLevelEl.value, 10) !== gs.start_level_min) gsLevelEl.value = String(gs.start_level_min);
+      }
+      // ── Auto-curriculum: continuously recompute level each tick ──
+      if (gsAutoCurrEl.checked && now.average_level != null) {
+        const lv = _computeAutoLevel(now.average_level);
+        if (parseInt(gsLevelEl.value, 10) !== lv) {
+          gsLevelEl.value = String(lv);
+          _postGameSettings({ start_level_min: lv });
+        }
       }
     }
 
@@ -3710,6 +3749,9 @@ def _make_handler(state: _DashboardState):
                         game_settings.epsilon_pct = int(data["epsilon_pct"])
                     if "expert_pct" in data:
                         game_settings.expert_pct = int(data["expert_pct"])
+                    if "auto_curriculum" in data:
+                        game_settings.auto_curriculum = bool(data["auto_curriculum"])
+                    game_settings.save()
                     body = json.dumps(game_settings.snapshot()).encode("utf-8")
                     self._send(body, "application/json")
                 except Exception:

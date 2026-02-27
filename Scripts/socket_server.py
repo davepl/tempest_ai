@@ -250,9 +250,8 @@ class SocketServer:
             local_accum = 0
 
             while self.running and not self.shutdown_event.is_set():
-                ready = select.select([sock], [], [], 0.0)
+                ready = select.select([sock], [], [], 0.002)
                 if not ready[0]:
-                    time.sleep(0.0005)
                     continue
 
                 # Read length header

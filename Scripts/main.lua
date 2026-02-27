@@ -594,12 +594,11 @@ local function process_frame_via_socket(rawdata)
         end
     end
 
-    -- Attempt to write data with length header
+    -- Attempt to write data with length header (single write to avoid extra TCP segments)
     local write_success, write_err = pcall(function()
         local data_length = #rawdata
         local length_header = string.pack(">H", data_length) -- Unsigned short, big-endian length
-        current_socket:write(length_header)
-        current_socket:write(rawdata)
+        current_socket:write(length_header .. rawdata)
     end)
 
     if not write_success then
