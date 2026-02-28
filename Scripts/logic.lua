@@ -56,6 +56,8 @@ local LastRewardState = 0
 local LastSubjRewardState = 0
 local LastObjRewardState = 0
 local previous_superzapper_uses = 0
+local superzap_cooldown = 0              -- frames remaining before next zap allowed
+local SUPERZAP_COOLDOWN_FRAMES = 60     -- ~2 seconds at 30 fps
 local enemy_start_count = 0          -- enemies_pending captured at level start
 local previous_player_position = 0
 
@@ -621,7 +623,10 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     -- 1st zap (uses==0): kills ALL onscreen enemies — fire when 3+ at top rail, or pending==0 with enemies alive.
     -- 2nd zap (uses==1): kills ONE enemy — fire when any enemy at top rail, or pending==0 with enemies alive.
     local should_superzap = false
-    if superzapper_available and active_enemy_count > 0 then
+    if superzap_cooldown > 0 then
+        superzap_cooldown = superzap_cooldown - 1
+    end
+    if superzapper_available and active_enemy_count > 0 and superzap_cooldown == 0 then
         if superzapper_used_once then
             -- Second zap: lower threshold — any top-rail enemy, or end-of-wave cleanup
             if top_rail_count >= 1 then
@@ -637,6 +642,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
                 should_superzap = true
             end
         end
+    end
+    if should_superzap then
+        superzap_cooldown = SUPERZAP_COOLDOWN_FRAMES
     end
 
     return target_seg, 0, sample_expert_fire(), should_superzap

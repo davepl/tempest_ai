@@ -11,6 +11,7 @@ if __name__ == "__main__":
 
 import os, sys, time, socket, select, struct, threading, traceback, random, queue
 import numpy as np
+from collections import deque
 
 from aimodel import (
     parse_frame_data,
@@ -52,12 +53,22 @@ class AsyncReplayBuffer:
         self.batch_size = batch_size
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
+        # Per-client rolling window of buffer indices for pre-death boosting
+        self._lookback = int(getattr(RL_CONFIG, 'pre_death_lookback', 120))
+        self._client_indices = {}          # client_id -> deque(maxlen=lookback)
         self._thread = threading.Thread(target=self._consume, daemon=True)
         self._thread.start()
 
-    def step_async(self, *args, **kwargs):
+    def step_async(self, *args, client_id=None, **kwargs):
         try:
-            self.queue.put((args, kwargs), timeout=0.05)
+            self.queue.put(("step", client_id, args, kwargs), timeout=0.05)
+        except queue.Full:
+            pass
+
+    def boost_pre_death(self, client_id):
+        """Queue a pre-death priority boost for recent indices of *client_id*."""
+        try:
+            self.queue.put(("boost", client_id, None, None), timeout=0.05)
         except queue.Full:
             pass
 
@@ -73,19 +84,48 @@ class AsyncReplayBuffer:
                     batch.append(self.queue.get_nowait())
                 except queue.Empty:
                     break
-            for a, kw in batch:
+            for cmd, cid, a, kw in batch:
                 try:
-                    self.agent.step(*a, **kw)
+                    if cmd == "step":
+                        idx = self.agent.step(*a, **kw)
+                        if cid is not None and idx is not None and idx >= 0:
+                            if cid not in self._client_indices:
+                                self._client_indices[cid] = deque(maxlen=self._lookback)
+                            self._client_indices[cid].append(idx)
+                    elif cmd == "boost":
+                        self._do_boost(cid)
                 except Exception as e:
                     print(f"AsyncReplayBuffer error: {e}")
+
+    def _do_boost(self, client_id):
+        """Boost priorities of recent buffer indices for *client_id*."""
+        indices = self._client_indices.get(client_id)
+        if not indices:
+            return
+        boost = float(getattr(RL_CONFIG, 'pre_death_priority_boost', 2.0))
+        if boost <= 1.0:
+            indices.clear()
+            return
+        try:
+            self.agent.memory.boost_priorities(list(indices), boost)
+        except Exception as e:
+            print(f"  Pre-death boost error: {e}")
+        indices.clear()
+
+    def remove_client(self, client_id):
+        """Clean up index tracking when a client disconnects."""
+        self._client_indices.pop(client_id, None)
 
     def stop(self):
         self.running = False
         # Drain remaining
         while True:
             try:
-                a, kw = self.queue.get_nowait()
-                self.agent.step(*a, **kw)
+                cmd, cid, a, kw = self.queue.get_nowait()
+                if cmd == "step" and a is not None:
+                    self.agent.step(*a, **kw)
+                elif cmd == "boost":
+                    self._do_boost(cid)
             except queue.Empty:
                 break
             except Exception:
@@ -331,11 +371,11 @@ class SocketServer:
                                 fz_n, sp_n = split_joint_action(a)
                                 self.async_buffer.step_async(
                                     s0, (fz_n, sp_n), Rn, sn, bool(dn),
-                                    actor=act, horizon=int(h), priority_reward=pR)
+                                    client_id=cid, actor=act, horizon=int(h), priority_reward=pR)
                         else:
                             self.async_buffer.step_async(
                                 cs["last_state"], (fz_i, sp_i), total_r,
-                                frame.state, bool(frame.done), actor=tag, horizon=1,
+                                frame.state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
                                 priority_reward=total_r)
 
                     cs["total_reward"] += total_r
@@ -350,6 +390,9 @@ class SocketServer:
 
                 # ── Terminal ────────────────────────────────────────────
                 if frame.done:
+                    # Boost priorities of the last N frames for this client
+                    if self.async_buffer is not None:
+                        self.async_buffer.boost_pre_death(cid)
                     if not cs.get("was_done", False):
                         self.metrics.add_episode_reward(
                             cs["total_reward"], cs["ep_dqn_reward"], cs["ep_expert_reward"],
@@ -457,6 +500,8 @@ class SocketServer:
                 self.client_states.pop(cid, None)
                 self.clients[cid] = None
                 metrics.client_count = sum(1 for v in self.clients.values() if v is not None)
+            if self.async_buffer is not None:
+                self.async_buffer.remove_client(cid)
             threading.Timer(1.0, self._cleanup).start()
 
     def _cleanup(self):

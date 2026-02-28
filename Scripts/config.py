@@ -76,7 +76,7 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 512
+    batch_size: int = 768
     lr: float = 1e-4                       # linear-scaled (2×) from 5e-5 for 256→512 batch increase
     lr_min: float = 4e-5                   # linear-scaled (2×) from 2e-5 for 256→512 batch increase
     lr_warmup_steps: int = 5_000
@@ -87,7 +87,7 @@ class RLConfigData:
     max_samples_per_frame: float = 20      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 15_000_000
+    memory_size: int = 25_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -146,7 +146,9 @@ class RLConfigData:
     death_reward_clip: float = 10.0        # Same as normal reward_clip — no special death amplification
 
     # ── death attribution ───────────────────────────────────────────────
-    death_priority_boost: float = 1.5      # Lower terminal boost to reduce over-focusing on death tails
+    death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
+    pre_death_lookback: int = 120          # Boost priorities of N frames before each death
+    pre_death_priority_boost: float = 2.0  # Multiplicative boost for pre-death frames
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True

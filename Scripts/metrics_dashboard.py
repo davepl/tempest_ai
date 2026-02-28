@@ -1290,11 +1290,11 @@ def _render_dashboard_html() -> str:
     const MAX_CHART_POINTS = 1400;
     const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
-    const GAUGE_MAX_FPS = 5000;
-    const GAUGE_FPS_RED_MAX = 1000;
-    const GAUGE_FPS_YELLOW_MAX = 1500;
+    const GAUGE_MAX_FPS = 15000;
+    const GAUGE_FPS_RED_MAX = 3000;
+    const GAUGE_FPS_YELLOW_MAX = 6000;
     const GAUGE_MIN_STEPS = 0;
-    const GAUGE_MAX_STEPS = 50;
+    const GAUGE_MAX_STEPS = 120;
     const AUDIO_PREF_COOKIE = "tempest_dashboard_audio_enabled";
     const AUDIO_START_RETRY_MS = 800;
 
@@ -1408,7 +1408,7 @@ def _render_dashboard_html() -> str:
     }
     const _selectableLevels = [1,3,5,7,9,11,13,15,17,20,22,24,26,28,31,33,36,40,44,47,49,52,56,60,63,65,73,81];
     function _computeAutoLevel(avgLevel) {
-      const target = Math.floor(avgLevel) - 4;
+      const target = Math.floor(avgLevel) - 2;
       let best = _selectableLevels[0];
       for (const lv of _selectableLevels) { if (lv <= target) best = lv; else break; }
       return best;
@@ -1964,7 +1964,7 @@ def _render_dashboard_html() -> str:
       const spanV = Math.max(1e-9, maxV - minV);
       const clampVal = (v) => Math.max(minV, Math.min(maxV, Number(v) || 0));
       const value = clampVal(valueRaw);
-      const displayVal = Math.max(minV, Math.min(9999, Number(valueRaw) || 0));
+      const displayVal = Math.max(minV, Math.min(199999, Number(valueRaw) || 0));
 
       const pad = 2;
       const outerExtent = 1.08;   // tight fit — faint glow may clip, bezel stays
@@ -2189,7 +2189,7 @@ def _render_dashboard_html() -> str:
       ctx.fillText(cfg.title || "", cx, cy - radius * 0.36);
 
       // Bottom value badge.
-      const badgeW = radius * 0.86;
+      const badgeW = radius * 1.0;
       const badgeH = radius * 0.48;
       const badgeX = cx - (badgeW * 0.5);
       const badgeY = cy + radius * 0.44;
@@ -2240,7 +2240,8 @@ def _render_dashboard_html() -> str:
       const valueText = Number(displayVal).toFixed(cfg.decimals ?? 1);
       const ledX = cx;
       const ledY = badgeY + (badgeH * 0.5);
-      const ledFont = `400 ${Math.max(16, Math.round(radius * 0.422))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      const ledScale = valueText.length > 5 ? 0.282 : 0.338;
+      const ledFont = `400 ${Math.max(13, Math.round(radius * ledScale))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
       ctx.font = ledFont;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -2276,15 +2277,15 @@ def _render_dashboard_html() -> str:
         max: GAUGE_MAX_FPS,
         red_max: GAUGE_FPS_RED_MAX,
         yellow_max: GAUGE_FPS_YELLOW_MAX,
-        minor_step: 250,
-        major_step: 500,
+        minor_step: 1000,
+        major_step: 3000,
         title: "FPS",
         unit: "FPS",
         decimals: 0,
         label_inset: 4,
         label_lateral: 8,
         label_font_scale: 0.088,
-        label_every: 2,
+        label_every: 1,
         label_radial_offset: -16,
         sub_text: framesText,
         sub_text_color: "blue",
@@ -2296,10 +2297,10 @@ def _render_dashboard_html() -> str:
       drawStyledGauge(canvas, stepsPerSec, {
         min: GAUGE_MIN_STEPS,
         max: GAUGE_MAX_STEPS,
-        red_max: 10,
-        yellow_max: 20,
-        minor_step: 2.5,
-        major_step: 5,
+        red_max: 20,
+        yellow_max: 40,
+        minor_step: 5,
+        major_step: 10,
         title: "STEPS/s",
         unit: "S/S",
         decimals: 0,
