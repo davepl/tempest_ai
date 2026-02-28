@@ -14,7 +14,7 @@ local TOP_RAIL_ABSENT = state_defs.TOP_RAIL_ABSENT or 255
 -- New constants for top rail logic
 local TOP_RAIL_DEPTH = 0x15
 local TOP_RAIL_AVOID_DEPTH = 0x60
-local SAFE_DISTANCE = 2
+local SAFE_DISTANCE = 1
 local FLIPPER_WAIT_DISTANCE = 5 -- segments within which we prefer to wait and conserve shots on top rail
 local FLIPPER_REACT_DISTANCE_R = 2.0 -- distance at which we move one segment and fire (right-side, float)
 local FLIPPER_REACT_DISTANCE_L = 2.0 -- distance at which we move one segment and fire (left-side, float)
@@ -44,6 +44,7 @@ local M = {} -- Module table
 -- Reward shaping parameters (tunable)
 
 local DEATH_PENALTY = 1000           -- Edge-triggered penalty when dying (same clip as normal rewards)
+local SUPERZAP_PENALTY = 1000        -- Max penalty for early superzap use (game-points equivalent)
 local DANGER_DEPTH = 0x80            -- Depth threshold for nearby threats/safety shaping
 local SAFE_LANE_REWARD = 2.0         -- Base reward when a lane is clear of nearby threats
 local DANGER_LANE_PENALTY = 2.0      -- Base penalty when a lane contains nearby threats
@@ -54,6 +55,10 @@ local previous_alive_state = 1 -- Track previous alive state, initialize as aliv
 local LastRewardState = 0
 local LastSubjRewardState = 0
 local LastObjRewardState = 0
+local previous_superzapper_uses = 0
+local superzap_cooldown = 0              -- frames remaining before next zap allowed
+local SUPERZAP_COOLDOWN_FRAMES = 60     -- ~2 seconds at 30 fps
+local enemy_start_count = 0          -- enemies_pending captured at level start
 local previous_player_position = 0
 
 local function sample_expert_fire()
@@ -478,7 +483,9 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
             local depth = enemies_state.enemy_depths[i]
             if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH then
                 local t = enemies_state.enemy_core_type[i]
-                if t == ENEMY_TYPE_FLIPPER or t == ENEMY_TYPE_PULSAR then
+                -- Pulsars bounce harmlessly until enemies_pending=0, then commit to top rail
+                if t == ENEMY_TYPE_FLIPPER or
+                   (t == ENEMY_TYPE_PULSAR and (enemies_state.enemies_pending or 0) == 0) then
                     local seg = enemies_state.enemy_abs_segments[i]
                     if seg ~= INVALID_SEGMENT then
                         local rel_int = abs_to_rel_func(player_abs_seg, seg, is_open)
@@ -595,17 +602,50 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         target_seg = player_abs_seg
     end
 
-    -- Superzap heuristic retained (3+ top-rail enemies)
+    -- Superzap heuristic: use the zapper strategically
     local top_rail_count = 0
+    local active_enemy_count = 0
     for i = 1, 7 do
         local depth = enemies_state.enemy_depths[i]
         local seg = enemies_state.enemy_abs_segments[i]
-        if depth > 0 and depth <= TOP_RAIL_AVOID_DEPTH and seg ~= INVALID_SEGMENT then
-            top_rail_count = top_rail_count + 1
+        if depth > 0 and seg ~= INVALID_SEGMENT then
+            active_enemy_count = active_enemy_count + 1
+            if depth <= 0x10 then  -- actual top of tunnel, not the avoidance zone
+                top_rail_count = top_rail_count + 1
+            end
         end
     end
     local superzapper_available = (player_state.superzapper_uses or 0) < 2
-    local should_superzap = superzapper_available and (top_rail_count >= 3)
+    local superzapper_used_once = (player_state.superzapper_uses or 0) == 1
+    local pending = enemies_state.enemies_pending or 0
+
+    -- Superzap heuristic: allow both zap uses independently.
+    -- 1st zap (uses==0): kills ALL onscreen enemies — fire when 3+ at top rail, or pending==0 with enemies alive.
+    -- 2nd zap (uses==1): kills ONE enemy — fire when any enemy at top rail, or pending==0 with enemies alive.
+    local should_superzap = false
+    if superzap_cooldown > 0 then
+        superzap_cooldown = superzap_cooldown - 1
+    end
+    if superzapper_available and active_enemy_count > 0 and superzap_cooldown == 0 then
+        if superzapper_used_once then
+            -- Second zap: lower threshold — any top-rail enemy, or end-of-wave cleanup
+            if top_rail_count >= 1 then
+                should_superzap = true
+            elseif pending == 0 then
+                should_superzap = true
+            end
+        else
+            -- First zap: original thresholds
+            if top_rail_count >= 3 then
+                should_superzap = true
+            elseif pending == 0 then
+                should_superzap = true
+            end
+        end
+    end
+    if should_superzap then
+        superzap_cooldown = SUPERZAP_COOLDOWN_FRAMES
+    end
 
     return target_seg, 0, sample_expert_fire(), should_superzap
 end
@@ -631,6 +671,13 @@ end
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local reward, subj_reward, obj_reward, bDone = 0.0, 0.0, 0.0, false
 
+    -- Capture enemies_pending at level start for superzap penalty scaling
+    local current_level = level_state.level_number or 0
+    if current_level ~= previous_level then
+        enemy_start_count = enemies_state.enemies_pending or 0
+        previous_superzapper_uses = player_state.superzapper_uses or 0
+    end
+
     -- Terminal: death (edge-triggered) - Penalty applied to objective reward
     if player_state.alive == 0 and previous_alive_state == 1 then
         obj_reward = obj_reward - DEATH_PENALTY
@@ -641,6 +688,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
         if score_delta > 0 and score_delta < 1000 then                         -- Filter out large bonuses AND negative deltas
             local r_score = score_delta 
             obj_reward = obj_reward + r_score
+        end
+
+        -- Superzap penalty: linear scale from full penalty at level start to free when enemies_pending=0
+        local current_zap_uses = player_state.superzapper_uses or 0
+        if current_zap_uses > previous_superzapper_uses and enemy_start_count > 0 then
+            local pending = enemies_state.enemies_pending or 0
+            local ratio = pending / enemy_start_count
+            obj_reward = obj_reward - (SUPERZAP_PENALTY * ratio)
         end
 
         -- Subjective shaping: lane safety/danger reward
@@ -725,6 +780,7 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     previous_level = level_state.level_number or 0
     previous_alive_state = player_state.alive or 0
     previous_player_position = player_state.position or 0
+    previous_superzapper_uses = player_state.superzapper_uses or 0
 
     -- Calculate total reward as sum of subjective and objective components
     reward = subj_reward + obj_reward

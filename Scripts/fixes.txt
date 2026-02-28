@@ -1,0 +1,117 @@
+Training & Hyperparameters (config.py)
+* max_samples_per_frame 3.2 → 12 — Increased replay pressure (training samples per game frame). Was 8 on temporal; post-temporal went higher.
+
+* training_steps_per_cycle 4 → 16 — More gradient steps per training cycle (throughput boost).
+
+epsilon_zap_prob 0.05 → 0.07 — Slightly higher zap probability during random exploration.
+
+expert_ratio_end 0.02 → 0.00 — Expert ratio decays to zero instead of maintaining 2% floor.
+
+Remove old epsilon pulse (triangle wave) — Deletes epsilon_pulse_max, epsilon_pulse_period_frames, epsilon_pulse_start_frame and corresponding sine-wave logic from _natural_epsilon_for_frame() and update_epsilon().
+
+Add PlateauPulser system — New state machine (WATCHING → PULSING → RECOVERING) that detects learning plateaus via DQN rolling-average stall, fires temporary epsilon bursts, evaluates outcome, and adjusts cooldown. Replaces the old periodic triangle pulse. Includes:
+
+New config fields: plateau_pulse_enabled, plateau_pulse_epsilon, plateau_pulse_frames, plateau_confirm_frames, plateau_cooldown_frames, plateau_min_frame
+PlateauPulser class + plateau_pulser global singleton
+force_start_pulse() method for manual pulse firing
+Updated toggle_epsilon_pulse() to control PlateauPulser
+peak_game_score metric — New field on MetricsData for tracking all-time high game score.
+
+AI Model (aimodel.py)
+* CUDA inference streams — Dedicated torch.cuda.Stream for inference overlapping with training backprop on the same GPU. Includes _sync_event gating to prevent reading partially-copied weights.
+
+* act() / act_batch() return 3-tuple — Changed from (fz_idx, sp_idx) to (fz_idx, sp_idx, is_epsilon) so downstream code knows whether an action was random.
+
+* step() returns buffer index — Returns the replay buffer write position for pre-death priority boosting.
+
+FrameData gains game_mode and score fields — Parsed from the Lua→Python frame packet.
+
+Replay buffer load: directory format fallback — load_model() tries directory-based replay format first, then falls back to legacy .npz.
+
+Socket Server (socket_server.py)
+Pre-death priority boosting — AsyncReplayBuffer tracks a rolling window of recent replay indices; on death, boosts their priorities by pre_death_boost multiplier. (Currently default 1.0 = disabled.)
+
+Superzap gating — Model's Q-network zap is suppressed unless the expert also recommends zapping. Epsilon-exploration zaps pass through ungated.
+
+PlateauPulser integration — Calls plateau_pulser.update() each frame with DQN window averages; applies pulse epsilon when active.
+
+Peak game score tracking — Updates metrics.peak_game_score from frame data during real gameplay.
+
+3-tuple action plumbing — AsyncInferenceBatcher propagates (fz, sp, is_epsilon) throughout all paths.
+
+ConnectionError catch — Cleaner "Client disconnected" message instead of full traceback.
+
+Expert Logic (logic.lua)
+SAFE_DISTANCE 2 → 1 — Tighter safe-distance threshold for expert movement decisions.
+
+* Strategic superzap heuristic — Replaces simple "3+ top-rail enemies" with: (a) 3+ enemies at depth ≤ 0x10, OR (b) pending == 0 and any active enemies remain.
+
+Zap conservation reward — Per-frame +1 when superzapper is still unused, −1 when already used. Constants ZAP_CONSERVATION_REWARD and ZAP_USED_PENALTY added (both = 1.0).
+
+Pulsar paralysis fix — Pulsars no longer count as generic lane threats. Only penalizes player's own lane during the active pulse phase (pulsing > 0 and < 0x80).
+
+Open-level edge-camping fix — Lane shaping is normalized by 5.0 / lanes_checked so fewer checkable lanes at tube edges don't create a reward bias toward edge positions.
+
+Level Select (main.lua)
+* START_LEVEL_MIN 9 → 17 — Higher starting level. (Was 1 on temporal at one point; post-temporal uses 17.)
+
+* startlevtbl + level_to_select_index() — ROM lookup table mapping selection index to level number, with function to convert desired level to cursor index.
+
+* Direct memory-poke level selection — Writes cursor index directly to $0200 instead of simulating spinner turns. Much faster and more reliable (10 frames vs 60).
+
+State Reading (state.lua)
+BCD nibble clamping — bcd_to_decimal() clamps non-BCD nibbles (A–F) to 9, preventing garbage values.
+
+* Score wrap detection — Detects when BCD score rolls past 999,999 and accumulates a _score_offset so the AI sees monotonically increasing scores.
+
+* level_shape from memory — Reads actual tube shape from $0112 (curtube) instead of computing level_number % 16. Correct even on random levels past 99.
+
+Remove fuseball-avoid debug prints — Two noisy print() calls removed.
+
+Replay Buffer (replay_buffer.py)
+Directory-based save format — Saves each array as individual .npy files instead of a single .npz archive. ~3× faster save/load. Includes atomic rename, legacy .npz load fallback.
+
+boost_priorities() support — Used by pre-death tracking to raise priorities of recent transitions (called from socket_server).
+
+Dashboard (metrics_dashboard.py)
+Starfield video background — Background replaced with <video> element playing /api/html/Starfield.mov + gradient overlay.
+
+* Panel/card opacity increase — Card backgrounds from 50% → 80% opacity for readability over video.
+
+* Rewards panel → 100K/1M/5M rolling windows — Replaced Total/DQN/Obj/Subj series with three rolling-window series (100K red, 1M green, 5M blue). total_100k added to snapshot.
+
+* DQN Rolling panel → Q-Value Range — Replaced DQN rolling-average chart with min/max Q-value fill-between chart.
+
+* DQN Reward mini card → removed — Replaced by Q-Value Range card.
+
+* Agreement mini card → full Agreement Rate panel — Promoted from card to panel with VFD-style text display.
+
+* Median-window chart smoothing — New median_window option on series definitions for less noisy chart lines.
+
+* Record row: HIGH SCORE — Record display shows peak_game_score (in-game score) instead of peak episode reward.
+
+* Pulse status indicator — SVG lightning bolt under epsilon card showing ARMED/PULSE/RECOVER/DISABLED state and frames remaining.
+
+* Gauge LED shows up to 9999 — FPS/STEPS gauge LED displays show actual values up to 9999 while needle stays clamped.
+
+* Initial sample skip — Skips first 10 samples / 2 seconds to let values stabilize before populating chart history.
+
+* 1px series vertical offset — Overlapping chart lines get a 1px Y offset per series so they're all visible.
+
+* FPS axis capped at 3000 — max: 3000 on FPS axis, step axis gets max_floor: 50, max_snap: 25.
+
+* Mini-legend on reward card — Inline colored legend dots for 100K/1M/5M.
+
+* Deque drain bug-fix — len(buf) > 1 guard in windowed deques so at least one sample is always retained.
+
+Keyboard / UX (main.py)
+* ? help screen — Prints a formatted table of all keyboard shortcuts.
+
+F key: manual pulse fire — Triggers PlateauPulser immediately regardless of plateau detection.
+
+P key updated — Now toggles RL_CONFIG.plateau_pulse_enabled instead of old epsilon_pulse_enabled.
+
+Misc
+.gitignore additions — /html/Starfield.mov and log.txt.
+
+Accidental - file — A file literally named - containing a torch import traceback. Junk, do not bring over.

@@ -27,9 +27,9 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
-    from config import RL_CONFIG
+    from config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings, TEMPEST_SELECTABLE_LEVELS
 except ImportError:
-    from Scripts.config import RL_CONFIG
+    from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings, TEMPEST_SELECTABLE_LEVELS
 
 try:
     from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
@@ -64,6 +64,7 @@ WEB_CLIENT_TIMEOUT_S = 5.0
 DASH_HISTORY_LIMIT = 40_000
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
+VIDEO_EXTENSIONS = {".mov", ".mp4", ".webm", ".ogv"}
 
 
 def _audio_dir() -> str:
@@ -74,6 +75,11 @@ def _audio_dir() -> str:
 def _fonts_dir() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(os.path.dirname(script_dir), "fonts")
+
+
+def _html_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "html")
 
 
 def _list_audio_files() -> list[str]:
@@ -119,6 +125,9 @@ class _DashboardState:
         self._agree_window_frames: int = 0
         self._agree_window_weighted: float = 0.0
         self._last_agree_frame_count: int | None = None
+        # Skip initial samples to let values stabilize
+        self._sample_count: int = 0
+        self._first_sample_time: float | None = None
 
     def _clear_level_windows(self):
         for win in self._level_windows.values():
@@ -278,16 +287,20 @@ class _DashboardState:
 
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
-        inv_obj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "obj_reward_scale", 1.0)))
-        inv_subj = 1.0 / max(1e-9, float(getattr(RL_CONFIG, "subj_reward_scale", 1.0)))
+        _prs = float(RL_CONFIG.point_reward_scale)  # display-only multiplier
 
         fps = self.metrics.get_fps()
 
         with self.metrics.lock:
             frame_count = int(self.metrics.frame_count)
             epsilon_raw = float(self.metrics.epsilon)
-            epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
-            expert_ratio = float(self.metrics.expert_ratio)
+            _eps_ov = game_settings.epsilon_pct
+            if _eps_ov >= 0:
+                epsilon_effective = _eps_ov / 100.0
+            else:
+                epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
+            _xprt_ov = game_settings.expert_pct
+            expert_ratio = (_xprt_ov / 100.0) if _xprt_ov >= 0 else float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
             web_client_count = int(self.metrics.web_client_count)
             average_level = float(self.metrics.average_level + 1.0)
@@ -307,10 +320,10 @@ class _DashboardState:
             inference_time = float(self.metrics.total_inference_time)
             last_agreement = float(self.metrics.last_agreement)
 
-            reward_total = _tail_mean(self.metrics.episode_rewards) * inv_obj
-            reward_dqn = _tail_mean(self.metrics.dqn_rewards) * inv_obj
-            reward_subj = _tail_mean(self.metrics.subj_rewards) * inv_subj
-            reward_obj = _tail_mean(self.metrics.obj_rewards) * inv_obj
+            reward_total = _tail_mean(self.metrics.episode_rewards) * _prs
+            reward_dqn = _tail_mean(self.metrics.dqn_rewards) * _prs
+            reward_subj = _tail_mean(self.metrics.subj_rewards) * _prs
+            reward_obj = _tail_mean(self.metrics.obj_rewards) * _prs
 
         try:
             dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
@@ -377,11 +390,12 @@ class _DashboardState:
             "reward_dqn": reward_dqn,
             "reward_subj": reward_subj,
             "reward_obj": reward_obj,
-            "dqn_100k": float(dqn100k_raw) * inv_obj,
-            "dqn_1m": float(dqn1m_raw) * inv_obj,
-            "dqn_5m": float(dqn5m_raw) * inv_obj,
-            "total_1m": float(total1m_raw) * inv_obj,
-            "total_5m": float(total5m_raw) * inv_obj,
+            "dqn_100k": float(dqn100k_raw) * _prs,
+            "dqn_1m": float(dqn1m_raw) * _prs,
+            "dqn_5m": float(dqn5m_raw) * _prs,
+            "total_100k": float(total100k_raw) * _prs,
+            "total_1m": float(total1m_raw) * _prs,
+            "total_5m": float(total5m_raw) * _prs,
             "level_25k": float(level_25k),
             "level_100k": float(level_100k),
             "level_1m": float(level_1m),
@@ -390,22 +404,50 @@ class _DashboardState:
             "override_expert": override_expert,
             "override_epsilon": override_epsilon,
             "lr": lr,
+            "training_steps": total_training_steps,
+            "lr_max": float(RL_CONFIG.lr),
+            "lr_min": float(RL_CONFIG.lr_min),
+            "lr_warmup_steps": int(RL_CONFIG.lr_warmup_steps),
+            "lr_cosine_period": int(RL_CONFIG.lr_cosine_period),
+            "lr_use_restarts": bool(getattr(RL_CONFIG, "lr_use_restarts", False)),
             "q_min": q_min,
             "q_max": q_max,
             "eplen_1m": get_eplen_1m_average(),
             "eplen_100k": get_eplen_100k_average(),
             "peak_level": float(self.metrics.peak_level + 1),
-            "peak_episode_reward": float(self.metrics.peak_episode_reward) * inv_obj,
+            "peak_episode_reward": float(self.metrics.peak_episode_reward) * _prs,
+            "peak_game_score": int(self.metrics.peak_game_score),
+            "episodes_this_run": int(self.metrics.episodes_this_run),
             "agreement": last_agreement,
             "agreement_1m": agreement_1m,
             "model_desc": self._get_model_desc(),
+            "pulse_state": plateau_pulser.state,
+            "pulse_remaining": int(self.metrics.manual_pulse_frames_remaining),
+            "pulse_count": plateau_pulser.total_pulses,
+            "pulse_enabled": True,  # manual pulse is always available
+            "game_settings": game_settings.snapshot(),
         }
+
+    @staticmethod
+    def _pulse_remaining(frame_count: int) -> int:
+        """Frames remaining in current manual pulse, 0 if idle."""
+        from config import metrics as _m
+        return int(_m.manual_pulse_frames_remaining)
 
     def sample(self):
         with self.lock:
             self._update_web_client_count_locked()
         snap = self._build_snapshot()
         with self.lock:
+            now = time.time()
+            if self._first_sample_time is None:
+                self._first_sample_time = now
+            self._sample_count += 1
+            # Skip the first 10 samples or 2 seconds, whichever comes first
+            if self._sample_count <= 10 and (now - self._first_sample_time) < 2.0:
+                self.latest = snap
+                self._cached_now_body = json.dumps(snap).encode("utf-8")
+                return
             self.latest = snap
             self.history.append(snap)
             self._cached_now_body = json.dumps(snap).encode("utf-8")
@@ -477,39 +519,30 @@ def _render_dashboard_html() -> str:
       position: relative;
       isolation: isolate;
       overflow-x: hidden;
-      background:
-        radial-gradient(1300px 650px at 6% -8%, rgba(0, 229, 255, 0.24), transparent 58%),
-        radial-gradient(950px 540px at 102% -4%, rgba(255, 43, 214, 0.22), transparent 56%),
-        radial-gradient(900px 500px at 52% 112%, rgba(57, 255, 20, 0.12), transparent 62%),
-        repeating-linear-gradient(0deg, rgba(130, 168, 224, 0.03) 0px, rgba(130, 168, 224, 0.03) 1px, transparent 1px, transparent 4px),
-        linear-gradient(158deg, var(--bg0) 0%, var(--bg1) 58%, var(--bg2) 100%);
-      background-attachment: fixed;
+      background: var(--bg0);
     }
-    /* Ambient orb pseudo-element (static — animations disabled for GPU perf) */
-    body::before {
-      content: "";
+    /* ── Starfield background video ─────────────────────────────── */
+    #bgVideo {
       position: fixed;
-      inset: -35vh -20vw;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover;
+      z-index: -2;
       pointer-events: none;
-      z-index: 0;
-      background:
-        radial-gradient(circle at 18% 24%, rgba(0, 229, 255, 0.24), transparent 30%),
-        radial-gradient(circle at 78% 18%, rgba(255, 43, 214, 0.22), transparent 34%),
-        radial-gradient(circle at 68% 78%, rgba(57, 255, 20, 0.18), transparent 36%);
+      opacity: 0.55;
     }
-    /* Subtle color sweep overlay (static for GPU perf) */
-    body::after {
-      content: "";
+    /* Gradient overlay on top of video for readability */
+    #bgOverlay {
       position: fixed;
-      inset: 0;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: -1;
       pointer-events: none;
-      z-index: 1;
-      background: linear-gradient(90deg, rgba(0, 229, 255, 0.045), transparent 36%, transparent 64%, rgba(255, 43, 214, 0.045));
-      mix-blend-mode: normal;
-      opacity: 0.10;
+      background:
+        radial-gradient(1300px 650px at 6% -8%, rgba(0, 229, 255, 0.18), transparent 58%),
+        radial-gradient(950px 540px at 102% -4%, rgba(255, 43, 214, 0.16), transparent 56%),
+        radial-gradient(900px 500px at 52% 112%, rgba(57, 255, 20, 0.10), transparent 62%);
     }
-    /* @keyframes removed — animations disabled for GPU perf.
-       orbDrift, rgbSweep, borderShift, ledPulse were here. */
     main {
       max-width: 1500px;
       margin: 0 auto;
@@ -530,7 +563,7 @@ def _render_dashboard_html() -> str:
       background:
         radial-gradient(120% 160% at 0% 0%, rgba(0, 229, 255, 0.10), transparent 58%),
         radial-gradient(140% 150% at 100% 0%, rgba(255, 43, 214, 0.10), transparent 58%),
-        linear-gradient(155deg, rgba(7, 12, 30, 0.86) 0%, rgba(7, 10, 27, 0.74) 100%);
+        linear-gradient(155deg, rgba(7, 12, 30, 0.93) 0%, rgba(7, 10, 27, 0.87) 100%);
       border: 1px solid var(--line);
       box-shadow:
         inset 0 0 0 1px rgba(0, 229, 255, 0.06),
@@ -616,7 +649,7 @@ def _render_dashboard_html() -> str:
       border: 1px solid rgba(0, 229, 255, 0.33);
       padding: 8px 12px;
       border-radius: 999px;
-      background: rgba(2, 6, 23, 0.50);
+      background: rgba(2, 6, 23, 0.80);
       box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.18), 0 0 16px rgba(0, 229, 255, 0.16);
       position: relative;
       z-index: 2;
@@ -636,7 +669,7 @@ def _render_dashboard_html() -> str:
       border: 1px solid rgba(0, 229, 255, 0.33);
       padding: 4px 12px;
       border-radius: 999px;
-      background: rgba(2, 6, 23, 0.50);
+      background: rgba(2, 6, 23, 0.80);
       box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
     }
     .display-fps-label {
@@ -654,7 +687,7 @@ def _render_dashboard_html() -> str:
     }
     .audio-toggle {
       border: 1px solid rgba(0, 229, 255, 0.33);
-      background: rgba(2, 6, 23, 0.50);
+      background: rgba(2, 6, 23, 0.80);
       color: var(--ink);
       border-radius: 999px;
       padding: 8px 12px;
@@ -736,6 +769,25 @@ def _render_dashboard_html() -> str:
         drop-shadow(0 0 8px rgba(60, 130, 255, 0.5))
         drop-shadow(0 0 18px rgba(40, 80, 255, 0.35));
     }
+    .panel-vfd {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 21px;
+      font-weight: 400;
+      color: #c8e8ff;
+      letter-spacing: normal;
+      font-variant-numeric: normal;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45),
+        0 0 48px rgba(30, 60, 220, 0.3);
+      filter:
+        drop-shadow(0 0 8px rgba(60, 130, 255, 0.5))
+        drop-shadow(0 0 18px rgba(40, 80, 255, 0.35));
+      margin: -4px 0 2px;
+      position: relative;
+      z-index: 2;
+    }
     .value-inline {
       display: inline-flex;
       align-items: center;
@@ -767,9 +819,36 @@ def _render_dashboard_html() -> str:
     .mini-metric-card .mini-inline {
       display: grid;
       grid-template-columns: minmax(0, 23fr) minmax(0, 37fr);
-      align-items: stretch;
+      grid-template-rows: auto 1fr;
+      align-items: start;
       column-gap: 8px;
       min-height: 18px;
+    }
+    .mini-metric-card .mini-inline .mini-canvas {
+      grid-column: 2;
+      grid-row: 1 / 3;
+    }
+    .mini-metric-card .mini-legend {
+      display: flex;
+      flex-direction: column;
+      align-self: stretch;
+      justify-content: center;
+      gap: 0px;
+      font-size: 9px;
+      color: #adc4df;
+      z-index: 2;
+      margin-top: 0;
+      padding-left: 8px;
+    }
+    .mini-metric-card .mini-legend .sw {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      display: inline-block;
+      margin-right: 3px;
+      position: relative;
+      top: 1px;
+      box-shadow: 0 0 6px currentColor;
     }
     .mini-metric-card .mini-inline .value {
       justify-self: start;
@@ -806,11 +885,11 @@ def _render_dashboard_html() -> str:
     .mini-metric-card .mini-canvas {
       width: 100%;
       max-width: 100%;
-      height: 104px;
+      height: 116px;
       border-radius: 8px;
       border: none;
       background:
-        linear-gradient(180deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.30)),
+        linear-gradient(180deg, rgba(2, 6, 23, 0.40), rgba(2, 6, 23, 0.55)),
         repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.035) 0px, rgba(120, 150, 210, 0.035) 1px, transparent 1px, transparent 4px);
       box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.10), 0 0 12px rgba(0, 229, 255, 0.09);
       position: relative;
@@ -853,6 +932,61 @@ def _render_dashboard_html() -> str:
       flex: 1;
       border-radius: 4px;
     }
+    /* Game-settings card controls */
+    .game-settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .game-settings-row label {
+      font-size: 11px;
+      color: #b0c8e8;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .game-settings-row select {
+      background: rgba(10, 20, 40, 0.85);
+      color: #c8e8ff;
+      border: 1px solid rgba(100, 180, 255, 0.35);
+      border-radius: 4px;
+      padding: 2px 4px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+    }
+    .game-settings-row select:focus {
+      border-color: rgba(100, 180, 255, 0.7);
+      box-shadow: 0 0 6px rgba(100, 180, 255, 0.3);
+    }
+    /* Dark toggle switch */
+    .toggle-switch { position: relative; display: inline-block; width: 28px; height: 14px; flex-shrink: 0; }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-switch .slider {
+      position: absolute; inset: 0; border-radius: 7px; cursor: pointer;
+      background: rgba(60, 80, 110, 0.7); transition: background 0.2s;
+    }
+    .toggle-switch .slider::before {
+      content: ""; position: absolute; left: 2px; top: 2px;
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #8899aa; transition: transform 0.2s, background 0.2s;
+    }
+    .toggle-switch input:checked + .slider { background: rgba(0, 200, 255, 0.45); }
+    .toggle-switch input:checked + .slider::before { transform: translateX(14px); background: #00c8ff; }
+    .toggle-switch input:disabled + .slider { opacity: 0.4; cursor: default; }
+    /* Up/down override controls for Epsilon / Expert */
+    .ud-col { display:flex; flex-direction:column; gap:0; line-height:1; }
+    .ud-btn {
+      background:none; border:none; color:#556; cursor:pointer;
+      font-size:9px; padding:0 2px; line-height:1; user-select:none;
+      transition: color 0.15s;
+    }
+    .ud-btn:hover { color:#0ff; }
+    .ud-btn:disabled { opacity:0.25; cursor:default; color:#556; }
     .gauge-card canvas {
       border: none;
       background: transparent;
@@ -876,8 +1010,8 @@ def _render_dashboard_html() -> str:
       padding: 12px;
       min-height: 224px;
       display: grid;
-      grid-template-rows: auto auto 1fr;
-      gap: 8px;
+      grid-template-rows: auto auto auto 1fr;
+      gap: 4px;
       overflow: hidden;
     }
     .panel h2 {
@@ -917,7 +1051,7 @@ def _render_dashboard_html() -> str:
       border-radius: 10px;
       border: 1px solid rgba(0, 229, 255, 0.26);
       background:
-        linear-gradient(180deg, rgba(2, 6, 23, 0.28), rgba(2, 6, 23, 0.36)),
+        linear-gradient(180deg, rgba(2, 6, 23, 0.55), rgba(2, 6, 23, 0.65)),
         repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.04) 0px, rgba(120, 150, 210, 0.04) 1px, transparent 1px, transparent 5px);
       box-shadow: inset 0 0 28px rgba(0, 229, 255, 0.10), 0 0 20px rgba(0, 229, 255, 0.12);
       position: relative;
@@ -943,6 +1077,8 @@ def _render_dashboard_html() -> str:
      and the header bar (rendered last, positioned via CSS grid).
      ══════════════════════════════════════════════════════════════════ -->
 <body>
+  <video id="bgVideo" autoplay loop muted playsinline src="/api/html/Starfield.mov"></video>
+  <div id="bgOverlay"></div>
   <main>
     <section class="cards">
       <article class="card gauge-card" style="--card-border:rgba(255,60,60,0.66);--card-glow:rgba(255,40,40,0.26)">
@@ -957,21 +1093,18 @@ def _render_dashboard_html() -> str:
         </div>
         <canvas id="cStepGauge"></canvas>
       </article>
-      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.66);--card-glow:rgba(255,120,20,0.26)">
-        <div class="label">DQN REWARD 1M</div>
-        <div class="mini-inline">
-          <div class="value" id="mDqnRwrd">0</div>
-          <canvas id="cDqnRewardMini" class="mini-canvas"></canvas>
-        </div>
-        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recDqnRwrd">—</span></div>
-      </article>
       <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
         <div class="label">AVG REWARD 1M</div>
         <div class="mini-inline">
           <div class="value" id="mRwrd">0</div>
           <canvas id="cRewardMini" class="mini-canvas"></canvas>
+          <div class="mini-legend"><span><span class="sw" style="background:#ef4444;"></span>100K</span><span><span class="sw" style="background:#22c55e;"></span>1M</span><span><span class="sw" style="background:#38bdf8;"></span>5M</span></div>
         </div>
-        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recRwrd">—</span></div>
+        <div class="record-row"><span class="record-label">HIGH SCORE:</span><span class="record-value" id="recRwrd">—</span></div>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.66);--card-glow:rgba(255,120,20,0.26)">
+        <div class="label">Q-VALUE RANGE</div>
+        <canvas id="cQRange" class="mini-canvas" style="flex:0 1 auto;"></canvas>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
         <div class="label">Avg Level</div>
@@ -986,6 +1119,7 @@ def _render_dashboard_html() -> str:
         <div class="mini-inline">
           <div class="value" id="mEpLen">0</div>
           <canvas id="cEpLenMini" class="mini-canvas"></canvas>
+          <div style="grid-column:1;"><div class="record-label" style="margin-bottom:1px;">Duration:</div><div class="record-value" id="mDuration">0:00</div><div class="record-label" style="margin-bottom:1px;margin-top:2px;">Count:</div><div class="record-value" id="mEpisodes">0</div><div class="record-label" style="margin-bottom:1px;margin-top:2px;">Rate:</div><div class="record-value" id="mEpRate">—</div></div>
         </div>
         <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
       </article>
@@ -1003,15 +1137,38 @@ def _render_dashboard_html() -> str:
           <canvas id="cGradMini" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card mini-metric-card card-half" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,235,0.26)">
-        <div class="label">AGREEMENT</div>
-        <div class="mini-inline">
-          <div class="value" id="mAgree">00.0%</div>
-          <canvas id="cAgreeMini" class="mini-canvas"></canvas>
+      <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div>
+            <div class="label">Epsilon</div>
+            <div style="display:flex;align-items:center;gap:2px;">
+              <div class="ud-col" id="epsUD">
+                <button class="ud-btn" data-field="epsilon_pct" data-dir="1" title="Increase epsilon">&#9650;</button>
+                <button class="ud-btn" data-field="epsilon_pct" data-dir="-1" title="Decrease epsilon">&#9660;</button>
+              </div>
+              <div class="value" id="mEps">0%</div>
+            </div>
+          </div>
+          <div style="text-align:right;">
+            <div class="label">Expert</div>
+            <div style="display:flex;align-items:center;gap:2px;justify-content:flex-end;">
+              <div class="ud-col" id="xprtUD">
+                <button class="ud-btn" data-field="expert_pct" data-dir="1" title="Increase expert">&#9650;</button>
+                <button class="ud-btn" data-field="expert_pct" data-dir="-1" title="Decrease expert">&#9660;</button>
+              </div>
+              <div class="value" id="mXprt">0%</div>
+            </div>
+          </div>
+        </div>
+        <div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)">
+        <div class="label">LEARNING RATE</div>
+        <div class="mini-inline" style="overflow:hidden;min-height:0;flex:1;">
+          <div class="value" id="mLr">-</div>
+          <canvas id="lrMiniChart" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)"><div class="label">Epsilon</div><div class="value" id="mEps">0%</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(80,255,180,0.66);--card-glow:rgba(60,235,160,0.26)"><div class="label">Expert</div><div class="value" id="mXprt">0%</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
       <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
@@ -1023,8 +1180,27 @@ def _render_dashboard_html() -> str:
         <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)"><div class="label">LEARNING RATE</div><div class="value" id="mLr">-</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
+        <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
+        <div class="game-settings-row">
+          <label>Level:
+            <select id="gsLevel">
+              <option value="1">1</option><option value="3">3</option><option value="5">5</option>
+              <option value="7">7</option><option value="9">9</option><option value="11">11</option>
+              <option value="13" selected>13</option><option value="15">15</option><option value="17">17</option>
+              <option value="20">20</option><option value="22">22</option><option value="24">24</option>
+              <option value="26">26</option><option value="28">28</option><option value="31">31</option>
+              <option value="33">33</option><option value="36">36</option><option value="40">40</option>
+              <option value="44">44</option><option value="47">47</option><option value="49">49</option>
+              <option value="52">52</option><option value="56">56</option><option value="60">60</option>
+              <option value="63">63</option><option value="65">65</option><option value="73">73</option>
+              <option value="81">81</option>
+            </select>
+          </label>
+          <label style="gap:6px;">Advanced <span class="toggle-switch"><input type="checkbox" id="gsAdvanced" checked><span class="slider"></span></span></label>
+        </div>
+      </article>
     </section>
 
     <section class="charts">
@@ -1042,10 +1218,10 @@ def _render_dashboard_html() -> str:
       <article class="panel">
         <h2>Rewards</h2>
         <div class="legend">
-          <span><span class="sw" style="background:#22c55e;"></span>Total</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>DQN</span>
-          <span><span class="sw" style="background:#22d3ee;"></span>Objective</span>
-          <span><span class="sw" style="background:#f43f5e;"></span>Subjective</span>
+          <span><span class="sw" style="background:#ef4444;"></span>100K</span>
+          <span><span class="sw" style="background:#22c55e;"></span>1M</span>
+          <span><span class="sw" style="background:#38bdf8;"></span>5M</span>
+          <span><span class="sw" style="background:#facc15;"></span>Subj</span>
         </div>
         <canvas id="cRewards"></canvas>
       </article>
@@ -1060,15 +1236,17 @@ def _render_dashboard_html() -> str:
         <canvas id="cLearning"></canvas>
       </article>
 
-      <article class="panel">
-        <h2>DQN Rolling</h2>
-        <div class="legend">
-          <span><span class="sw" style="background:#22c55e;"></span>DQN Inst</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>DQN100K</span>
-          <span><span class="sw" style="background:#22d3ee;"></span>DQN1M</span>
-          <span><span class="sw" style="background:#f43f5e;"></span>DQN5M</span>
+      <article class="panel" style="position:relative;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;">
+          <h2 style="margin:0;">Performance</h2>
+          <div style="display:flex;align-items:baseline;gap:6px;"><span style="font-size:11px;color:#a5bfde;letter-spacing:0.5px;text-transform:uppercase;">Agreement:</span><div class="value panel-vfd" id="mAgreePanel">0.0%</div></div>
         </div>
-        <canvas id="cDqn"></canvas>
+        <div class="legend">
+          <span><span class="sw" style="background:#00c8ff;"></span>Agreement 1M</span>
+          <span><span class="sw" style="background:#0090cc55;"></span>Agreement Raw</span>
+          <span><span class="sw" style="background:#ef4444;"></span>Avg Lvl</span>
+        </div>
+        <canvas id="cAgreement"></canvas>
       </article>
 
     </section>
@@ -1112,11 +1290,11 @@ def _render_dashboard_html() -> str:
     const MAX_CHART_POINTS = 1400;
     const STEP_GAUGE_AVG_WINDOW = 10;
     const GAUGE_MIN_FPS = 0;
-    const GAUGE_MAX_FPS = 5000;
-    const GAUGE_FPS_RED_MAX = 1000;
-    const GAUGE_FPS_YELLOW_MAX = 1500;
+    const GAUGE_MAX_FPS = 15000;
+    const GAUGE_FPS_RED_MAX = 3000;
+    const GAUGE_FPS_YELLOW_MAX = 6000;
     const GAUGE_MIN_STEPS = 0;
-    const GAUGE_MAX_STEPS = 50;
+    const GAUGE_MAX_STEPS = 120;
     const AUDIO_PREF_COOKIE = "tempest_dashboard_audio_enabled";
     const AUDIO_START_RETRY_MS = 800;
 
@@ -1166,25 +1344,101 @@ def _render_dashboard_html() -> str:
       rplf: document.getElementById("mRplF"),
       rplLed: document.getElementById("mRplLed"),
       eps: document.getElementById("mEps"),
+      pulseStatus: document.getElementById("mPulseStatus"),
       xprt: document.getElementById("mXprt"),
       rwrd: document.getElementById("mRwrd"),
-      dqnRwrd: document.getElementById("mDqnRwrd"),
+      dqnRwrd: null,
       loss: document.getElementById("mLoss"),
       grad: document.getElementById("mGrad"),
       buf: document.getElementById("mBuf"),
       lr: document.getElementById("mLr"),
       q: document.getElementById("mQ"),
       epLen: document.getElementById("mEpLen"),
-      agree: document.getElementById("mAgree"),
+      duration: document.getElementById("mDuration"),
+      episodes: document.getElementById("mEpisodes"),
+      epRate: document.getElementById("mEpRate"),
+      agreePanel: document.getElementById("mAgreePanel"),
     };
+    /* Game-settings controls */
+    const gsAdvancedEl = document.getElementById("gsAdvanced");
+    const gsLevelEl = document.getElementById("gsLevel");
+    const gsAutoCurrEl = document.getElementById("gsAutoCurriculum");
+    const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
+    if (!_gsAdmin) { gsAdvancedEl.disabled = true; gsLevelEl.disabled = true; gsAutoCurrEl.disabled = true; }
+    /* Epsilon / Expert up-down buttons — admin gate */
+    document.querySelectorAll('#epsUD .ud-btn, #xprtUD .ud-btn').forEach(btn => {
+      if (!_gsAdmin) { btn.disabled = true; return; }
+      btn.addEventListener('click', () => {
+        const field = btn.dataset.field; /* epsilon_pct or expert_pct */
+        const dir   = parseInt(btn.dataset.dir, 10); /* +1 or -1 */
+        const cur   = field === 'epsilon_pct'
+          ? Math.round((_lastNow?.epsilon ?? 0) * 100)
+          : Math.round((_lastNow?.expert_ratio ?? 0) * 100);
+        const next  = Math.max(0, Math.min(100, cur + dir));
+        _postGameSettings({ [field]: next });
+        /* Optimistic UI update */
+        if (field === 'epsilon_pct') cards.eps.textContent = fmtPct(next / 100);
+        else cards.xprt.textContent = fmtPct(next / 100);
+      });
+    });
+    let _lastNow = null;  /* stash latest snapshot for up/down reference */
+    let _gsIgnoreSync = false;  /* suppress sync while user is changing */
+    async function _postGameSettings(obj) {
+      try {
+        _gsIgnoreSync = true;
+        await fetch("/api/game_settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(obj),
+        });
+      } catch (e) { /* ignore */ }
+      finally { setTimeout(() => { _gsIgnoreSync = false; }, 1500); }
+    }
+    if (_gsAdmin) {
+      gsAdvancedEl.addEventListener("change", () => {
+        _postGameSettings({ start_advanced: gsAdvancedEl.checked });
+      });
+      gsLevelEl.addEventListener("change", () => {
+        _postGameSettings({ start_level_min: parseInt(gsLevelEl.value, 10) });
+      });
+      gsAutoCurrEl.addEventListener("change", () => {
+        _postGameSettings({ auto_curriculum: gsAutoCurrEl.checked });
+        _applyAutoCurriculum(gsAutoCurrEl.checked);
+      });
+    }
+    const _selectableLevels = [1,3,5,7,9,11,13,15,17,20,22,24,26,28,31,33,36,40,44,47,49,52,56,60,63,65,73,81];
+    function _computeAutoLevel(avgLevel) {
+      const target = Math.floor(avgLevel) - 2;
+      let best = _selectableLevels[0];
+      for (const lv of _selectableLevels) { if (lv <= target) best = lv; else break; }
+      return best;
+    }
+    function _applyAutoCurriculum(on) {
+      gsAdvancedEl.disabled = on || !_gsAdmin;
+      gsLevelEl.disabled    = on || !_gsAdmin;
+      if (on) {
+        if (gsAdvancedEl.checked) {
+          gsAdvancedEl.checked = false;
+          _postGameSettings({ start_advanced: false });
+        }
+        if (_lastNow) {
+          const lv = _computeAutoLevel(_lastNow.average_level || 1);
+          gsLevelEl.value = String(lv);
+          _postGameSettings({ start_level_min: lv });
+        }
+      }
+    }
+
     const recEls = {
-      dqnRwrd: document.getElementById("recDqnRwrd"),
       rwrd: document.getElementById("recRwrd"),
       level: document.getElementById("recLevel"),
       epLen: document.getElementById("recEpLen"),
     };
     const modelDescEl = document.getElementById("modelDesc");
-    const recordHighs = { dqnRwrd: -Infinity, rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
+    const recordHighs = { rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
+    /* Episode rate: 30-second rolling window */
+    const epRateHistory = [];  /* {ts, episodes} */
+    const EP_RATE_WINDOW = 30; /* seconds */
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
 
@@ -1238,20 +1492,14 @@ def _render_dashboard_html() -> str:
           {
             key: "fps",
             color: "#22c55e",
-            axis: { side: "left", min: 0 },
+            axis: { side: "left", min: 0, max: 3000, group_keys: ["fps", "eplen_100k"] },
             smooth_alpha: 0.14,
           },
           {
             key: "steps_per_sec_chart",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, group_keys: ["steps_per_sec_chart", "level_100k"] },
+            axis: { side: "right", min: 0, max_floor: 50, max_snap: 25, group_keys: ["steps_per_sec_chart"] },
             smooth_alpha: 0.10,
-          },
-          {
-            key: "level_100k",
-            color: "#22d3ee",
-            axis_ref: "steps_per_sec_chart",
-            smooth_alpha: 0.20,
           },
           {
             key: "eplen_100k",
@@ -1264,19 +1512,23 @@ def _render_dashboard_html() -> str:
       rewards: {
         canvas: document.getElementById("cRewards"),
         series: [
-          {
-            key: "reward_total",
-            color: "#22c55e",
+          { key: "total_5m", color: "#38bdf8", median_window: 3, map: v => Math.max(0, v || 0),
             axis: {
               side: "left",
               min: 0,
               label_pad: 52,
-              group_keys: ["reward_total", "reward_dqn", "reward_obj", "reward_subj"],
-            }
+              group_keys: ["total_100k", "total_1m", "total_5m"],
+            },
           },
-          { key: "reward_dqn", color: "#f59e0b", axis_ref: "reward_total" },
-          { key: "reward_obj", color: "#22d3ee", axis_ref: "reward_total" },
-          { key: "reward_subj", color: "#f43f5e", axis_ref: "reward_total" }
+          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
+          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
+          { key: "reward_subj", color: "#facc15", median_window: 5, smooth_alpha: 0.15,
+            axis: {
+              side: "right",
+              label_pad: 40,
+              group_keys: ["reward_subj"],
+            },
+          }
         ]
       },
       learning: {
@@ -1297,17 +1549,12 @@ def _render_dashboard_html() -> str:
           }
         ]
       },
-      dqn: {
-        canvas: document.getElementById("cDqn"),
+      qRange: {
+        canvas: document.getElementById("cQRange"),
+        fill_between: ["q_max", "q_min", "#22c55e", "#38bdf8"],
         series: [
-          { key: "dqn_100k", color: "#f59e0b", axis_ref: "reward_dqn" },
-          { key: "dqn_1m", color: "#22d3ee", axis_ref: "reward_dqn" },
-          { key: "dqn_5m", color: "#f43f5e", axis_ref: "reward_dqn" },
-          {
-            key: "reward_dqn",
-            color: "#22c55e",
-            axis: { side: "left", min: 0, label_pad: 52, group_keys: ["dqn_100k", "dqn_1m", "dqn_5m", "reward_dqn"] },
-          }
+          { key: "q_max", color: "#22c55e", axis: { target_ticks: 4, group_keys: ["q_max", "q_min"] } },
+          { key: "q_min", color: "#38bdf8", axis_ref: "q_max" }
         ]
       },
       level1m: {
@@ -1325,15 +1572,9 @@ def _render_dashboard_html() -> str:
       rewardMini: {
         canvas: document.getElementById("cRewardMini"),
         series: [
-          { key: "total_5m", color: "#3b82f6" },
-          { key: "total_1m", color: "#22c55e", linearTime: true }
-        ]
-      },
-      dqnRewardMini: {
-        canvas: document.getElementById("cDqnRewardMini"),
-        series: [
-          { key: "dqn_5m", color: "#3b82f6" },
-          { key: "dqn_1m", color: "#f59e0b", linearTime: true }
+          { key: "total_5m", color: "#38bdf8", median_window: 3, axis: { target_ticks: 3 }, map: v => Math.max(0, v || 0) },
+          { key: "total_1m", color: "#22c55e", median_window: 3, map: v => Math.max(0, v || 0) },
+          { key: "total_100k", color: "#ef4444", median_window: 3, linearTime: true, map: v => Math.max(0, v || 0) }
         ]
       },
       lossMini: {
@@ -1354,11 +1595,16 @@ def _render_dashboard_html() -> str:
           { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
         ]
       },
-      agreeMini: {
-        canvas: document.getElementById("cAgreeMini"),
+      agreement: {
+        canvas: document.getElementById("cAgreement"),
         series: [
-          { key: "agreement_1m", color: "#00c8ff", axis: { min: 0, min_range: 0.10 } },
-          { key: "agreement", color: "#0090cc55", axis: { min: 0, min_range: 0.10 } }
+          { key: "agreement_1m", color: "#00c8ff", smooth_alpha: 0.35,
+            axis: { side: "left", min: 0, min_range: 0.10, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
+          },
+          { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 },
+          { key: "level_100k", color: "#ef4444", smooth_alpha: 0.20,
+            axis: { side: "right", min_range: 1.0, label_pad: 40, group_keys: ["level_100k"], tick_decimals: 1 }
+          }
         ]
       }
     };
@@ -1394,8 +1640,8 @@ def _render_dashboard_html() -> str:
       // Color by absolute magnitude relative to C51 support [-100,100]
       const m = Math.abs(v);
       if (m < 20) return "#39ff14";         // green – healthy
-      if (m < 40) return "#b8ff14";         // yellow-green
-      if (m < 60) return "#ff9900";         // amber – concerning
+      if (m < 40) return "#ffaa33";         // amber – caution
+      if (m < 60) return "#ff9900";         // dark amber – concerning
       if (m < 80) return "#ff8c14";         // orange – warning
       return "#ff2020";                      // red – exploding
     }
@@ -1718,6 +1964,7 @@ def _render_dashboard_html() -> str:
       const spanV = Math.max(1e-9, maxV - minV);
       const clampVal = (v) => Math.max(minV, Math.min(maxV, Number(v) || 0));
       const value = clampVal(valueRaw);
+      const displayVal = Math.max(minV, Math.min(199999, Number(valueRaw) || 0));
 
       const pad = 2;
       const outerExtent = 1.08;   // tight fit — faint glow may clip, bezel stays
@@ -1942,7 +2189,7 @@ def _render_dashboard_html() -> str:
       ctx.fillText(cfg.title || "", cx, cy - radius * 0.36);
 
       // Bottom value badge.
-      const badgeW = radius * 0.86;
+      const badgeW = radius * 1.0;
       const badgeH = radius * 0.48;
       const badgeX = cx - (badgeW * 0.5);
       const badgeY = cy + radius * 0.44;
@@ -1990,10 +2237,11 @@ def _render_dashboard_html() -> str:
       ctx.fillStyle = badgeFill;
       ctx.fill();
 
-      const valueText = Number(value).toFixed(cfg.decimals ?? 1);
+      const valueText = Number(displayVal).toFixed(cfg.decimals ?? 1);
       const ledX = cx;
       const ledY = badgeY + (badgeH * 0.5);
-      const ledFont = `400 ${Math.max(16, Math.round(radius * 0.422))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      const ledScale = valueText.length > 5 ? 0.282 : 0.338;
+      const ledFont = `400 ${Math.max(13, Math.round(radius * ledScale))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
       ctx.font = ledFont;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -2029,15 +2277,15 @@ def _render_dashboard_html() -> str:
         max: GAUGE_MAX_FPS,
         red_max: GAUGE_FPS_RED_MAX,
         yellow_max: GAUGE_FPS_YELLOW_MAX,
-        minor_step: 250,
-        major_step: 500,
+        minor_step: 1000,
+        major_step: 3000,
         title: "FPS",
         unit: "FPS",
         decimals: 0,
         label_inset: 4,
         label_lateral: 8,
         label_font_scale: 0.088,
-        label_every: 2,
+        label_every: 1,
         label_radial_offset: -16,
         sub_text: framesText,
         sub_text_color: "blue",
@@ -2049,10 +2297,10 @@ def _render_dashboard_html() -> str:
       drawStyledGauge(canvas, stepsPerSec, {
         min: GAUGE_MIN_STEPS,
         max: GAUGE_MAX_STEPS,
-        red_max: 10,
-        yellow_max: 20,
-        minor_step: 2.5,
-        major_step: 5,
+        red_max: 20,
+        yellow_max: 40,
+        minor_step: 5,
+        major_step: 10,
         title: "STEPS/s",
         unit: "S/S",
         decimals: 0,
@@ -2061,6 +2309,24 @@ def _render_dashboard_html() -> str:
         sub_text: stepsText,
         sub_text_color: "orange",
       });
+    }
+
+    /* ═══════════════ Median-of-N filter (spike rejection) ════════════ */
+    // Returns the median of up to `w` values centered on index `i`.
+    // `valueFn(j)` should return Number or NaN for index j.
+    function medianNeighbors(i, n, w, valueFn) {
+      const half = (w - 1) >> 1;
+      const lo = Math.max(0, i - half);
+      const hi = Math.min(n - 1, i + half);
+      const vals = [];
+      for (let j = lo; j <= hi; j++) {
+        const v = valueFn(j);
+        if (Number.isFinite(v)) vals.push(v);
+      }
+      if (!vals.length) return NaN;
+      vals.sort((a, b) => a - b);
+      const mid = vals.length >> 1;
+      return (vals.length & 1) ? vals[mid] : (vals[mid - 1] + vals[mid]) * 0.5;
     }
 
     /* ═══════════════ Nice-tick interval (1-2-5 sequence) ═══════════════ */
@@ -2109,10 +2375,10 @@ def _render_dashboard_html() -> str:
         : axisSlotDefault;
       const rightAxisPad = rightAxisSeries.length
         ? rightAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
-        : axisSlotDefault;
+        : 0;
       const padL = 26 + leftAxisPad;
-      const padR = 26 + rightAxisPad;
-      const padT = 10, padB = 30;
+      const padR = rightAxisSeries.length ? (26 + rightAxisPad) : 12;
+      const padT = 14, padB = 30;
       const plotW = width - padL - padR;
       const plotH = height - padT - padB;
       if (plotW <= 20 || plotH <= 20) return;
@@ -2285,6 +2551,11 @@ def _render_dashboard_html() -> str:
         if (!hasFixedMax && Number.isFinite(maxFloor)) {
           maxV = Math.max(maxV, maxFloor);
         }
+        // Snap max to a fixed multiple (e.g. multiples of 25)
+        const maxSnap = Number(s.axis?.max_snap);
+        if (!hasFixedMax && Number.isFinite(maxSnap) && maxSnap > 0) {
+          maxV = Math.ceil(maxV / maxSnap) * maxSnap;
+        }
         if (maxV < minV) maxV = minV + 1.0;
         if (minV === maxV) {
           if (hasFixedMin && !hasFixedMax) maxV = minV + 1.0;
@@ -2292,7 +2563,8 @@ def _render_dashboard_html() -> str:
           else { minV -= 1.0; maxV += 1.0; }
         }
         // Nice-tick autoscaling: snap axis bounds to clean 1-2-5 intervals
-        const niceStep = niceInterval(maxV - minV, 4);
+        const targetTicks = Number.isFinite(s.axis?.target_ticks) ? Math.max(2, s.axis.target_ticks) : 4;
+        const niceStep = niceInterval(maxV - minV, targetTicks);
         if (!hasFixedMin) minV = Math.floor(minV / niceStep) * niceStep;
         if (!hasFixedMax) maxV = Math.ceil(maxV / niceStep) * niceStep;
         if (maxV <= minV) maxV = minV + niceStep;
@@ -2309,9 +2581,18 @@ def _render_dashboard_html() -> str:
         if (Array.isArray(s.axis?.ticks) && s.axis.ticks.length) {
           ticks = s.axis.ticks;
         } else {
-          ticks = [];
-          for (let t = minV; t <= maxV + niceStep * 0.001; t += niceStep) {
-            ticks.push(t);
+          // If the nice step produces too many ticks, coarsen until it fits
+          let step = niceStep;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            ticks = [];
+            for (let t = minV; t <= maxV + step * 0.001; t += step) {
+              ticks.push(t);
+            }
+            if (ticks.length <= targetTicks + 1) break;
+            step = niceInterval(maxV - minV, Math.max(2, Math.floor(targetTicks * 0.6)));
+            if (!hasFixedMin) minV = Math.floor(minV / step) * step;
+            if (!hasFixedMax) maxV = Math.ceil(maxV / step) * step;
+            if (maxV <= minV) maxV = minV + step;
           }
           if (!ticks.length) ticks = [minV, maxV];
         }
@@ -2326,12 +2607,23 @@ def _render_dashboard_html() -> str:
           ticks,
           tickDecimals: Number.isFinite(s.axis?.tick_decimals)
             ? Math.max(0, Number(s.axis.tick_decimals))
-            : Math.max(0, -Math.floor(Math.log10(niceStep))),
+            : Math.max(0, -Math.floor(Math.log10(ticks.length > 1 ? (ticks[1] - ticks[0]) : niceStep))),
         });
       }
       if (!axes.length) return;
 
       const axisByKey = new Map(axes.map((a) => [a.key, a]));
+
+      // Build map of extra series colors sharing each axis (via axis_ref)
+      const axisExtraColors = new Map();
+      for (const s of seriesDefs) {
+        if (s.axis_ref) {
+          const colors = axisExtraColors.get(s.axis_ref) || [];
+          colors.push(s.color);
+          axisExtraColors.set(s.axis_ref, colors);
+        }
+      }
+
       const yAt = (axis, value) => {
         const t = (value - axis.min) / (axis.max - axis.min);
         return padT + (1.0 - t) * plotH;
@@ -2364,6 +2656,21 @@ def _render_dashboard_html() -> str:
         const isLeft = axis.side === "left";
         const tickDir = isLeft ? 1 : -1;
 
+        // Draw extra color indicator lines for series sharing this axis
+        const extraColors = axisExtraColors.get(axis.key) || [];
+        for (let ec = extraColors.length - 1; ec >= 0; ec--) {
+          const offset = ((ec + 1) * 2 + 2) * (isLeft ? -1 : 1);
+          ctx.strokeStyle = extraColors[ec];
+          ctx.globalAlpha = 0.65;
+          ctx.lineWidth = 2.0;
+          ctx.beginPath();
+          ctx.moveTo(axis.x + offset, padT);
+          ctx.lineTo(axis.x + offset, height - padB);
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+        }
+
+        // Main axis line with tick marks
         ctx.strokeStyle = axis.color;
         ctx.globalAlpha = 0.65;
         ctx.lineWidth = 2.0;
@@ -2462,12 +2769,18 @@ def _render_dashboard_html() -> str:
       }
 
       const n = points.length;
-      for (const s of seriesDefs) {
+      for (let si = 0; si < seriesDefs.length; si++) {
+        const s = seriesDefs[si];
+        const yOff = si;  // 1px vertical offset per series so overlapping lines stay visible
         const axis = s.axis_ref
           ? axisByKey.get(s.axis_ref)
           : (axisByKey.get(s.key) || axes[0]);
         if (!axis) continue;
         const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : CHART_VALUE_SMOOTH_ALPHA;
+        const mw = Number.isFinite(s.median_window) ? s.median_window : 0;
+        const readVal = mw >= 3
+          ? (i) => medianNeighbors(i, n, mw, (j) => seriesValue(points[j], s.key))
+          : (i) => seriesValue(points[i], s.key);
         ctx.strokeStyle = s.color;
         ctx.lineWidth = 2.0;
         ctx.beginPath();
@@ -2476,7 +2789,7 @@ def _render_dashboard_html() -> str:
         if (s.pixel_bin_avg) {
           const bins = new Map();
           for (let i = n - 1; i >= 0; i--) {
-            const val = seriesValue(points[i], s.key);
+            const val = readVal(i);
             if (!Number.isFinite(val)) continue;
             const x = xAt(i);
             const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
@@ -2496,7 +2809,7 @@ def _render_dashboard_html() -> str:
             smoothVal = (smoothVal === null)
               ? vAvg
               : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
-            const y = yAt(axis, smoothVal);
+            const y = yAt(axis, smoothVal) + yOff;
             if (!started) {
               ctx.moveTo(xPx, y);
               started = true;
@@ -2506,13 +2819,13 @@ def _render_dashboard_html() -> str:
           }
         } else {
           for (let i = n - 1; i >= 0; i--) {
-            const val = seriesValue(points[i], s.key);
+            const val = readVal(i);
             if (!Number.isFinite(val)) continue;
             smoothVal = (smoothVal === null)
               ? Number(val)
               : (smoothVal + ((Number(val) - smoothVal) * smoothAlpha));
             const x = xAt(i);
-            const y = yAt(axis, smoothVal);
+            const y = yAt(axis, smoothVal) + yOff;
             if (!started) {
               ctx.moveTo(x, y);
               started = true;
@@ -2526,7 +2839,7 @@ def _render_dashboard_html() -> str:
     }
 
     /* ── Mini chart (sparkline) for inline card display ─────────── */
-    function drawMiniChart(canvas, history, seriesDefs) {
+    function drawMiniChart(canvas, history, seriesDefs, fillBetween) {
       if (!canvas) return;
       const points = history.slice(-240);
       const width = canvas.clientWidth || 120;
@@ -2569,7 +2882,9 @@ def _render_dashboard_html() -> str:
       let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
       if (maxV <= minV) maxV = minV + 1.0;
       // Nice-tick autoscaling for mini charts
-      const miniNiceStep = niceInterval(maxV - minV, 3);
+      const miniTargetTicks = Number.isFinite(seriesDefs?.[0]?.axis?.target_ticks)
+        ? Math.max(2, seriesDefs[0].axis.target_ticks) : 2;
+      const miniNiceStep = niceInterval(maxV - minV, miniTargetTicks);
       if (!hasFixedMin) minV = Math.floor(minV / miniNiceStep) * miniNiceStep;
       if (!hasFixedMax) maxV = Math.ceil(maxV / miniNiceStep) * miniNiceStep;
       if (maxV <= minV) maxV = minV + miniNiceStep;
@@ -2660,7 +2975,12 @@ def _render_dashboard_html() -> str:
 
       const axisColor = seriesDefs?.[seriesDefs.length - 1]?.color || "#22c55e";
       const axisX = padL - 1;
-      const yTicks = [minV, minV + ((maxV - minV) * 0.5), maxV];
+      // Generate ticks from the nice step so target_ticks controls density
+      const yTicks = [];
+      for (let tv = minV; tv <= maxV + miniNiceStep * 0.001; tv += miniNiceStep) {
+        yTicks.push(tv);
+      }
+      if (!yTicks.length) yTicks.push(minV, maxV);
       ctx.strokeStyle = axisColor;
       ctx.globalAlpha = 0.52;
       ctx.lineWidth = 1.0;
@@ -2697,9 +3017,61 @@ def _render_dashboard_html() -> str:
       ctx.stroke();
 
       const n = points.length;
-      for (const s of seriesDefs) {
+
+      // ── Fill-between gradient (e.g. q_max → q_min) ────────────
+      if (fillBetween && fillBetween.length >= 4) {
+        const [topKey, botKey, topColor, botColor] = fillBetween;
+        const topSDef = seriesDefs.find(s => s.key === topKey);
+        const botSDef = seriesDefs.find(s => s.key === botKey);
+        if (topSDef && botSDef) {
+          const smA_top = Number.isFinite(topSDef.smooth_alpha) ? topSDef.smooth_alpha : MINI_CHART_VALUE_SMOOTH_ALPHA;
+          const smA_bot = Number.isFinite(botSDef.smooth_alpha) ? botSDef.smooth_alpha : MINI_CHART_VALUE_SMOOTH_ALPHA;
+          const mwT = Number.isFinite(topSDef.median_window) ? topSDef.median_window : 0;
+          const mwB = Number.isFinite(botSDef.median_window) ? botSDef.median_window : 0;
+          const readT = mwT >= 3
+            ? (i) => medianNeighbors(i, n, mwT, (j) => Number(points[j][topKey]))
+            : (i) => Number(points[i][topKey]);
+          const readB = mwB >= 3
+            ? (i) => medianNeighbors(i, n, mwB, (j) => Number(points[j][botKey]))
+            : (i) => Number(points[i][botKey]);
+          const topPts = [], botPts = [];
+          let svT = null, svB = null;
+          for (let i = n - 1; i >= 0; i--) {
+            const vT = readT(i), vB = readB(i);
+            if (!Number.isFinite(vT) || !Number.isFinite(vB)) continue;
+            svT = svT === null ? vT : svT + (vT - svT) * smA_top;
+            svB = svB === null ? vB : svB + (vB - svB) * smA_bot;
+            const x = xAtLog(i);
+            topPts.push({ x, y: yAt(svT) });
+            botPts.push({ x, y: yAt(svB) });
+          }
+          if (topPts.length >= 2) {
+            const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+            grad.addColorStop(0, topColor + "60");
+            grad.addColorStop(0.5, botColor + "40");
+            grad.addColorStop(1, botColor + "60");
+            ctx.beginPath();
+            ctx.moveTo(topPts[0].x, topPts[0].y);
+            for (let i = 1; i < topPts.length; i++) ctx.lineTo(topPts[i].x, topPts[i].y);
+            for (let i = botPts.length - 1; i >= 0; i--) ctx.lineTo(botPts[i].x, botPts[i].y);
+            ctx.closePath();
+            ctx.fillStyle = grad;
+            ctx.globalAlpha = 0.5;
+            ctx.fill();
+            ctx.globalAlpha = 1.0;
+          }
+        }
+      }
+
+      for (let si = 0; si < seriesDefs.length; si++) {
+        const s = seriesDefs[si];
+        const yOff = si;  // 1px vertical offset per series so overlapping lines stay visible
         const xFn = s.linearTime ? xAtLinear : xAtLog;
         const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : MINI_CHART_VALUE_SMOOTH_ALPHA;
+        const mw = Number.isFinite(s.median_window) ? s.median_window : 0;
+        const readVal = mw >= 3
+          ? (i) => medianNeighbors(i, n, mw, (j) => Number(points[j][s.key]))
+          : (i) => Number(points[i][s.key]);
         ctx.strokeStyle = s.color;
         ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
         ctx.lineWidth = (s.key === "level_1m") ? 2.0 : 1.6;
@@ -2709,7 +3081,7 @@ def _render_dashboard_html() -> str:
         if (s.pixel_bin_avg) {
           const bins = new Map();
           for (let i = n - 1; i >= 0; i--) {
-            const val = Number(points[i][s.key]);
+            const val = readVal(i);
             if (!Number.isFinite(val)) continue;
             const x = xFn(i);
             const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
@@ -2729,7 +3101,7 @@ def _render_dashboard_html() -> str:
             smoothVal = (smoothVal === null)
               ? vAvg
               : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
-            const y = yAt(smoothVal);
+            const y = yAt(smoothVal) + yOff;
             if (!started) {
               ctx.moveTo(xPx, y);
               started = true;
@@ -2739,13 +3111,13 @@ def _render_dashboard_html() -> str:
           }
         } else {
           for (let i = n - 1; i >= 0; i--) {
-            const val = Number(points[i][s.key]);
+            const val = readVal(i);
             if (!Number.isFinite(val)) continue;
             smoothVal = (smoothVal === null)
               ? val
               : (smoothVal + ((val - smoothVal) * smoothAlpha));
             const x = xFn(i);
-            const y = yAt(smoothVal);
+            const y = yAt(smoothVal) + yOff;
             if (!started) {
               ctx.moveTo(x, y);
               started = true;
@@ -2857,10 +3229,120 @@ def _render_dashboard_html() -> str:
     }
 
     /* ══════════════════════════════════════════════════════════════
+     * LR COSINE MINI CHART — Draws the cosine annealing curve with
+     * a dot showing current position in the cycle.
+     * ══════════════════════════════════════════════════════════════ */
+    const _lrCanvas = document.getElementById("lrMiniChart");
+    const _lrCtx = _lrCanvas ? _lrCanvas.getContext("2d") : null;
+
+    function drawLrMiniChart(now) {
+      if (!_lrCtx) return;
+      const width  = _lrCanvas.clientWidth  || 120;
+      const height = _lrCanvas.clientHeight || 104;
+      const dpr = window.devicePixelRatio || 1;
+      _lrCanvas.width  = Math.floor(width * dpr);
+      _lrCanvas.height = Math.floor(height * dpr);
+      const ctx = _lrCtx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const W = width, H = height;
+
+      const lrMax     = now.lr_max       || 5e-5;
+      const lrMin     = now.lr_min       || 2e-5;
+      const warmup    = now.lr_warmup_steps    || 5000;
+      const period    = now.lr_cosine_period   || 3000000;
+      const restarts  = !!now.lr_use_restarts;
+      const step      = now.training_steps     || 0;
+
+      // Draw area with left axis padding
+      const axisPad = 38;
+      const padL = axisPad, padR = 2, padTop = 2, padBot = 2;
+      const gw = W - padL - padR, gh = H - padTop - padBot;
+      if (gw <= 4 || gh <= 4) return;
+
+      // Total steps we show: 2 full periods (or up to step + some if larger)
+      const totalShow = restarts ? Math.max(period * 2, step + period * 0.3) : Math.max(period + warmup, step * 1.2);
+
+      // Map step → x
+      const sx = (s) => padL + (s / totalShow) * gw;
+      // Map lr → y (top = lrMax, bottom = lrMin)
+      const lrRange = Math.max(1e-12, lrMax - lrMin);
+      const sy = (lr) => padTop + (1.0 - (lr - lrMin) / lrRange) * gh;
+
+      // ── Vertical axis and ticks ──────────────────────────────────
+      const fmtLr = (v) => {
+        if (v === 0) return "0";
+        const exp = Math.floor(Math.log10(Math.abs(v)));
+        const mantissa = v / Math.pow(10, exp);
+        if (Math.abs(mantissa - Math.round(mantissa)) < 0.05)
+          return Math.round(mantissa) + "e" + exp;
+        return mantissa.toFixed(1) + "e" + exp;
+      };
+      const nTicks = 3;
+      const tickStep = niceInterval(lrRange, nTicks);
+      const axisX = padL - 1;
+      ctx.strokeStyle = "rgba(100,160,255,0.52)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(axisX, padTop);
+      ctx.lineTo(axisX, H - padBot);
+      ctx.stroke();
+
+      ctx.font = "7px 'DotGothic16', 'Courier New', monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let tv = Math.ceil(lrMin / tickStep) * tickStep; tv <= lrMax + tickStep * 0.001; tv += tickStep) {
+        const y = sy(tv);
+        ctx.strokeStyle = "rgba(100,160,255,0.70)";
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(axisX - 2, y);
+        ctx.lineTo(axisX + 2, y);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(165, 191, 222, 0.95)";
+        ctx.fillText(fmtLr(tv), axisX - 3, y);
+      }
+
+      // Compute lr at a given step (mirrors get_lr)
+      function lrAt(s) {
+        if (s < warmup) return lrMin + (lrMax - lrMin) * ((s + 1) / Math.max(1, warmup));
+        const dh = Math.max(1, period);
+        const t = restarts ? ((s - warmup) % dh) : Math.min(s - warmup, dh);
+        const cosine = 0.5 * (1.0 + Math.cos(Math.PI * t / dh));
+        return lrMin + (lrMax - lrMin) * cosine;
+      }
+
+      // Draw curve
+      const nPts = Math.min(280, gw);
+      ctx.beginPath();
+      for (let i = 0; i <= nPts; i++) {
+        const s = (i / nPts) * totalShow;
+        const x = sx(s), y = sy(lrAt(s));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "rgba(100,160,255,0.5)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      // Draw current position dot
+      if (step > 0) {
+        const cx = sx(step), cy = sy(lrAt(step));
+        ctx.beginPath();
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+        ctx.fillStyle = "#0f0";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.7)";
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+    }
+
+    /* ══════════════════════════════════════════════════════════════
      * CARD UPDATER — Pushes latest snapshot values into DOM elements,
      * updates record highs, and sets model description.
      * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
+      _lastNow = now;
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
@@ -2868,26 +3350,60 @@ def _render_dashboard_html() -> str:
       setInfLed(now.avg_inf_ms);
       cards.rplf.innerHTML = toFixedCharCells(fmtPaddedFloat(now.rpl_per_frame, 2, 2, " "));
       setRplLed(now.rpl_per_frame);
-      cards.eps.textContent = fmtPct(now.epsilon);
-      cards.xprt.textContent = fmtPct(now.expert_ratio);
-      cards.rwrd.textContent = fmtInt(now.total_1m);
-      cards.dqnRwrd.textContent = fmtInt(now.dqn_1m);
+      if (!_gsIgnoreSync) cards.eps.textContent = fmtPct(now.epsilon);
+
+      // Pulse status indicator (SVG bolt prefix)
+      const bolt = (fill) => `<svg width="10" height="14" viewBox="0 0 16 22" style="vertical-align:-2px;margin-right:2px"><path d="M10 0L3 12h5l-2 10 7-14H8z" fill="${fill}"/></svg>`;
+      if (now.pulse_state === "pulsing") {
+        cards.pulseStatus.innerHTML = bolt("#facc15") + 'PULSE ' + fmtInt(now.pulse_remaining) + " left";
+        cards.pulseStatus.style.color = "#ef4444";
+      } else if (now.pulse_state === "recovering") {
+        cards.pulseStatus.innerHTML = bolt("#facc15") + 'RECOVER ' + fmtInt(now.pulse_remaining) + " left";
+        cards.pulseStatus.style.color = "#f59e0b";
+      } else if (!now.pulse_enabled) {
+        cards.pulseStatus.innerHTML = bolt("#777") + 'DISABLED';
+        cards.pulseStatus.style.color = "#555";
+      } else {
+        cards.pulseStatus.innerHTML = bolt("#7dd3fc") + 'PULSE ARMED';
+        cards.pulseStatus.style.color = "#888";
+      }
+
+      if (!_gsIgnoreSync) cards.xprt.textContent = fmtPct(now.expert_ratio);
+      cards.rwrd.textContent = fmtInt(Math.max(0, now.total_1m || 0));
       cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
       cards.buf.textContent = fmtInt(now.memory_buffer_size);
       cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
+      drawLrMiniChart(now);
       cards.q.innerHTML = (now.q_min === null || now.q_max === null)
         ? toFixedCharCells("-")
         : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
-      cards.agree.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
+      { const secs = Math.round((now.eplen_1m || 0) / 30); const m = Math.floor(secs / 60); const s = secs % 60; cards.duration.textContent = m + ":" + String(s).padStart(2, "0"); }
+
+      /* Episodes count + 30-second rolling rate */
+      cards.episodes.textContent = fmtInt(now.episodes_this_run);
+      {
+        const t = now.ts || (Date.now() / 1000);
+        epRateHistory.push({ts: t, episodes: now.episodes_this_run});
+        while (epRateHistory.length > 1 && epRateHistory[0].ts < t - EP_RATE_WINDOW) epRateHistory.shift();
+        if (epRateHistory.length >= 2) {
+          const first = epRateHistory[0], last = epRateHistory[epRateHistory.length - 1];
+          const dt = last.ts - first.ts;
+          if (dt > 0.5) {
+            const rate = (last.episodes - first.episodes) / dt;
+            cards.epRate.textContent = fmtFloat(rate, 1) + "/s";
+          }
+        }
+      }
+
+      cards.agreePanel.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
         ? fmtFloat(now.agreement_1m * 100, 1) + "%"
-        : "00.0%";
+        : "0.0%";
 
       // ── Record highs ──────────────────────────────────────────────
       const recPairs = [
-        ["dqnRwrd", now.dqn_1m, fmtInt],
-        ["rwrd", now.peak_episode_reward, fmtInt],
+        ["rwrd", now.peak_game_score, fmtInt],
         ["level", now.peak_level, v => "LEVEL " + Math.round(v)],
         ["epLen", now.eplen_1m, fmtInt],
       ];
@@ -2900,6 +3416,25 @@ def _render_dashboard_html() -> str:
 
       // ── Model description ─────────────────────────────────────────
       if (now.model_desc && modelDescEl) modelDescEl.textContent = now.model_desc;
+
+      // ── Game settings sync ────────────────────────────────────────
+      if (!_gsIgnoreSync && now.game_settings) {
+        const gs = now.game_settings;
+        if (gsAutoCurrEl.checked !== gs.auto_curriculum) {
+          gsAutoCurrEl.checked = gs.auto_curriculum;
+          _applyAutoCurriculum(gs.auto_curriculum);
+        }
+        if (gsAdvancedEl.checked !== gs.start_advanced) gsAdvancedEl.checked = gs.start_advanced;
+        if (parseInt(gsLevelEl.value, 10) !== gs.start_level_min) gsLevelEl.value = String(gs.start_level_min);
+      }
+      // ── Auto-curriculum: continuously recompute level each tick ──
+      if (gsAutoCurrEl.checked && now.average_level != null) {
+        const lv = _computeAutoLevel(now.average_level);
+        if (parseInt(gsLevelEl.value, 10) !== lv) {
+          gsLevelEl.value = String(lv);
+          _postGameSettings({ start_level_min: lv });
+        }
+      }
     }
 
     function render(payload) {
@@ -2921,14 +3456,13 @@ def _render_dashboard_html() -> str:
       drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 60 * 60);
       drawChart(charts.rewards.canvas, chartHistory60m, charts.rewards.series, 60 * 60);
       drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 60, true);
-      drawChart(charts.dqn.canvas, chartHistory60m, charts.dqn.series, 60 * 60);
-      drawMiniChart(charts.dqnRewardMini.canvas, history60m, charts.dqnRewardMini.series);
+      drawChart(charts.agreement.canvas, chartHistory60m, charts.agreement.series, 60 * 60);
+      drawMiniChart(charts.qRange.canvas, history60m, charts.qRange.series, charts.qRange.fill_between);
       drawMiniChart(charts.rewardMini.canvas, history60m, charts.rewardMini.series);
       drawMiniChart(charts.level1m.canvas, history60m, charts.level1m.series);
       drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
       drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
       drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
-      drawMiniChart(charts.agreeMini.canvas, history60m, charts.agreeMini.series);
     }
 
     let historyCache = [];
@@ -3047,6 +3581,7 @@ def _make_handler(state: _DashboardState):
     page = _render_dashboard_html().encode("utf-8")
     audio_root = os.path.abspath(_audio_dir())
     fonts_root = os.path.abspath(_fonts_dir())
+    html_root = os.path.abspath(_html_dir())
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def _send(
@@ -3122,6 +3657,22 @@ def _make_handler(state: _DashboardState):
                 return None
             return candidate
 
+        @staticmethod
+        def _safe_html_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(html_root, name))
+            try:
+                if os.path.commonpath([html_root, candidate]) != html_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            return candidate
+
         def do_GET(self):
             parsed = urlparse(self.path)
             path = parsed.path
@@ -3167,6 +3718,45 @@ def _make_handler(state: _DashboardState):
                     return
                 ctype = mimetypes.guess_type(safe_path)[0] or "font/ttf"
                 self._send_file(safe_path, ctype)
+                return
+            if path.startswith("/api/html/"):
+                raw_name = unquote(path[len("/api/html/"):])
+                safe_path = self._safe_html_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+                self._send_file(safe_path, ctype)
+                return
+            if path == "/api/game_settings":
+                body = json.dumps(game_settings.snapshot()).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/api/game_settings":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    data = json.loads(raw)
+                    if "start_advanced" in data:
+                        game_settings.start_advanced = bool(data["start_advanced"])
+                    if "start_level_min" in data:
+                        game_settings.start_level_min = int(data["start_level_min"])
+                    if "epsilon_pct" in data:
+                        game_settings.epsilon_pct = int(data["epsilon_pct"])
+                    if "expert_pct" in data:
+                        game_settings.expert_pct = int(data["expert_pct"])
+                    if "auto_curriculum" in data:
+                        game_settings.auto_curriculum = bool(data["auto_curriculum"])
+                    game_settings.save()
+                    body = json.dumps(game_settings.snapshot()).encode("utf-8")
+                    self._send(body, "application/json")
+                except Exception:
+                    self._send(b'{"error":"bad request"}', "application/json", status=400)
                 return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
 

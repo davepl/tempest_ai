@@ -10,7 +10,7 @@ import socket
 import torch
 
 from aimodel import RainbowAgent, KeyboardHandler, print_with_terminal_restore
-from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG
+from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG, game_settings
 from metrics_dashboard import MetricsDashboard
 from metrics_display import display_metrics_header, display_metrics_row
 from socket_server import SocketServer
@@ -169,8 +169,11 @@ def keyboard_handler(agent, kb):
                 display_metrics_row(agent, kb)
             elif key == "P":
                 metrics.toggle_epsilon_pulse(kb)
-                status = "ON" if metrics.epsilon_pulse_enabled else "OFF"
-                print_with_terminal_restore(kb, f"\nEpsilon pulse: {status}")
+                if metrics.manual_pulse_active:
+                    frames = metrics.manual_pulse_frames_remaining
+                    print_with_terminal_restore(kb, f"\nManual pulse FIRED — {frames:,} frames at ε={RL_CONFIG.manual_pulse_epsilon}")
+                else:
+                    print_with_terminal_restore(kb, "\nManual pulse CANCELLED")
                 display_metrics_row(agent, kb)
             elif key == "p":
                 metrics.toggle_epsilon_override(kb)
@@ -299,8 +302,12 @@ def main():
             print(f"✓ Loaded model from: {LATEST_MODEL_PATH}\n")
         else:
             print("⚠ Model load failed/incompatible, starting fresh\n")
+            game_settings.reset()
+            game_settings.save()
     else:
         print("⚠ No model found, starting fresh\n")
+        game_settings.reset()
+        game_settings.save()
 
     dashboard_enabled = _env_enabled("TEMPEST_DASHBOARD", True)
     dashboard_host = _resolve_dashboard_host()
@@ -359,7 +366,8 @@ def main():
         print("\nKeyboard interrupt, shutting down...")
     finally:
         agent.save(LATEST_MODEL_PATH)
-        print("Final model saved")
+        game_settings.save()
+        print("Final model & settings saved")
         if IS_INTERACTIVE and kb:
             kb.restore_terminal()
         try:

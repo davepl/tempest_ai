@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, sys, time, threading, math
+import os, sys, time, threading, math, json
 from dataclasses import dataclass, field
 from typing import Deque
 from collections import deque
@@ -20,6 +20,7 @@ FORCE_FRESH_MODEL = False
 
 MODEL_DIR = "models"
 LATEST_MODEL_PATH = f"{MODEL_DIR}/tempest_model_latest.pt"
+SETTINGS_PATH = f"{MODEL_DIR}/game_settings.json"
 
 # ---------------------------------------------------------------------------
 @dataclass
@@ -75,18 +76,18 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 256
-    lr: float = 5e-5
-    lr_min: float = 2e-5                  # Higher floor keeps learning alive across restarts
+    batch_size: int = 768
+    lr: float = 1e-4                       # linear-scaled (2×) from 5e-5 for 256→512 batch increase
+    lr_min: float = 4e-5                   # linear-scaled (2×) from 2e-5 for 256→512 batch increase
     lr_warmup_steps: int = 5_000
     lr_cosine_period: int = 3_000_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 3.2      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 20      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 15_000_000
+    memory_size: int = 25_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -105,10 +106,9 @@ class RLConfigData:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
     epsilon_decay_frames: int = 500_000
-    # Late-training exploration pulses to escape local optima.
-    epsilon_pulse_max: float = 0.25
-    epsilon_pulse_period_frames: int = 500_000
-    epsilon_pulse_start_frame: int = 3_000_000
+    # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
+    manual_pulse_epsilon: float = 0.25
+    manual_pulse_duration_frames: int = 750_000
     epsilon: float = 1.0
 
     # Expert guidance
@@ -122,7 +122,14 @@ class RLConfigData:
     # Suppress random exploration during tube zoom — any lane twitch kills on spikes.
     epsilon_zoom_multiplier: float = 0.2
     # Probability of zap during epsilon exploration (default 0.5 = uniform).
-    epsilon_zap_prob: float = 0.05
+    epsilon_zap_prob: float = 0.000
+
+    # ── Superzap gate ───────────────────────────────────────────────
+    # Block DQN-initiated zaps unless the expert also recommends zap.
+    # Gate probability decays linearly: start → end over decay_frames.
+    superzap_gate_start: float = 1.0
+    superzap_gate_end: float = 0.0
+    superzap_gate_decay_frames: int = 10_000_000
 
     # Expert BC
     expert_bc_weight: float = 1.0
@@ -133,12 +140,15 @@ class RLConfigData:
 
     # ── reward ──────────────────────────────────────────────────────────
     obj_reward_scale: float = 0.01
-    subj_reward_scale: float = 0.01
+    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
+    subj_reward_scale: float = 0.005
     reward_clip: float = 10.0
     death_reward_clip: float = 10.0        # Same as normal reward_clip — no special death amplification
 
     # ── death attribution ───────────────────────────────────────────────
-    death_priority_boost: float = 3.0      # Lower terminal boost to reduce over-focusing on death tails
+    death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
+    pre_death_lookback: int = 120          # Boost priorities of N frames before each death
+    pre_death_priority_boost: float = 2.0  # Multiplicative boost for pre-death frames
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
@@ -156,13 +166,140 @@ class RLConfigData:
     inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
-    training_steps_per_cycle: int = 4
+    training_steps_per_cycle: int = 16
     save_interval: int = 10_000
 
     enable_amp: bool = True
 
 
 RL_CONFIG = RLConfigData()
+
+# ---------------------------------------------------------------------------
+#  Game Settings (shared between dashboard, socket server, and LUA clients)
+# ---------------------------------------------------------------------------
+# Tempest startlevtbl: selection index → 1-based level number.
+# Mirrors the ROM table at startlevtbl in tempest.asm.
+TEMPEST_SELECTABLE_LEVELS = [
+    1, 3, 5, 7, 9, 11, 13, 15, 17, 20, 22, 24, 26, 28, 31, 33,
+    36, 40, 44, 47, 49, 52, 56, 60, 63, 65, 73, 81,
+]
+
+class GameSettings:
+    """Thread-safe container for operator-adjustable game settings."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._start_advanced: bool = True
+        self._start_level_min: int = 13
+        self._epsilon_pct: int = -1   # -1 = auto (follow decay), 0-100 = manual override %
+        self._expert_pct: int = -1    # -1 = auto (follow decay), 0-100 = manual override %
+        self._auto_curriculum: bool = False
+
+    @property
+    def start_advanced(self) -> bool:
+        with self._lock:
+            return self._start_advanced
+
+    @start_advanced.setter
+    def start_advanced(self, value: bool):
+        with self._lock:
+            self._start_advanced = bool(value)
+
+    @property
+    def start_level_min(self) -> int:
+        with self._lock:
+            return self._start_level_min
+
+    @start_level_min.setter
+    def start_level_min(self, value: int):
+        with self._lock:
+            self._start_level_min = max(1, min(81, int(value)))
+
+    @property
+    def epsilon_pct(self) -> int:
+        with self._lock:
+            return self._epsilon_pct
+
+    @epsilon_pct.setter
+    def epsilon_pct(self, value: int):
+        with self._lock:
+            self._epsilon_pct = max(-1, min(100, int(value)))
+
+    @property
+    def expert_pct(self) -> int:
+        with self._lock:
+            return self._expert_pct
+
+    @expert_pct.setter
+    def expert_pct(self, value: int):
+        with self._lock:
+            self._expert_pct = max(-1, min(100, int(value)))
+
+    @property
+    def auto_curriculum(self) -> bool:
+        with self._lock:
+            return self._auto_curriculum
+
+    @auto_curriculum.setter
+    def auto_curriculum(self, value: bool):
+        with self._lock:
+            self._auto_curriculum = bool(value)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "start_advanced": self._start_advanced,
+                "start_level_min": self._start_level_min,
+                "epsilon_pct": self._epsilon_pct,
+                "expert_pct": self._expert_pct,
+                "auto_curriculum": self._auto_curriculum,
+            }
+
+    def reset(self) -> None:
+        """Restore all settings to initial defaults (fresh-start)."""
+        with self._lock:
+            self._start_advanced = True
+            self._start_level_min = 13
+            self._epsilon_pct = -1
+            self._expert_pct = -1
+            self._auto_curriculum = False
+
+    # ── Persistence ───────────────────────────────────────────────
+
+    def save(self, path: str = SETTINGS_PATH) -> None:
+        """Write current settings to a JSON file."""
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            data = self.snapshot()
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            pass  # best-effort; don't crash the server
+
+    def load(self, path: str = SETTINGS_PATH) -> None:
+        """Restore settings from a JSON file if it exists."""
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            with self._lock:
+                if "start_advanced" in data:
+                    self._start_advanced = bool(data["start_advanced"])
+                if "start_level_min" in data:
+                    self._start_level_min = max(1, min(81, int(data["start_level_min"])))
+                if "epsilon_pct" in data:
+                    self._epsilon_pct = max(-1, min(100, int(data["epsilon_pct"])))
+                if "expert_pct" in data:
+                    self._expert_pct = max(-1, min(100, int(data["expert_pct"])))
+                if "auto_curriculum" in data:
+                    self._auto_curriculum = bool(data["auto_curriculum"])
+        except FileNotFoundError:
+            pass  # first run — use defaults
+        except Exception:
+            pass  # corrupted file — use defaults
+
+game_settings = GameSettings()
+game_settings.load()
 
 # ---------------------------------------------------------------------------
 #  Metrics
@@ -223,6 +360,8 @@ class MetricsData:
     average_level: float = 0.0
     peak_level: int = 0
     peak_episode_reward: float = 0.0
+    peak_game_score: int = 0
+    episodes_this_run: int = 0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
@@ -233,7 +372,8 @@ class MetricsData:
     manual_expert_override: bool = False
     override_epsilon: bool = False
     manual_epsilon_override: bool = False
-    epsilon_pulse_enabled: bool = True
+    manual_pulse_active: bool = False
+    manual_pulse_frames_remaining: int = 0
     training_enabled: bool = True
     verbose_mode: bool = False
     saved_expert_ratio: float = 0.50
@@ -272,38 +412,38 @@ class MetricsData:
 
     def get_effective_epsilon(self) -> float:
         with self.lock:
+            ep = game_settings.epsilon_pct
+            if ep >= 0:
+                return ep / 100.0
             return 0.0 if self.override_epsilon else float(self.epsilon)
 
     @staticmethod
-    def _natural_epsilon_for_frame(frame_count: int, pulse_enabled: bool = True) -> float:
+    def _natural_epsilon_for_frame(frame_count: int) -> float:
         progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
-        base = RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
-
-        if not pulse_enabled:
-            return base
-
-        pulse_max = float(getattr(RL_CONFIG, "epsilon_pulse_max", base))
-        pulse_period = int(getattr(RL_CONFIG, "epsilon_pulse_period_frames", 0))
-        pulse_start = int(getattr(RL_CONFIG, "epsilon_pulse_start_frame", RL_CONFIG.epsilon_decay_frames))
-        if frame_count < pulse_start or pulse_period <= 0 or pulse_max <= base:
-            return base
-
-        phase = ((frame_count - pulse_start) % pulse_period) / float(pulse_period)
-        # Triangle wave: 0 → 1 → 0 over one period.
-        pulse = 1.0 - abs((2.0 * phase) - 1.0)
-        return base + (pulse_max - base) * pulse
+        return RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
 
     def update_epsilon(self):
         with self.lock:
             if self.manual_epsilon_override:
                 return self.epsilon
-            self.epsilon = self._natural_epsilon_for_frame(
-                int(self.frame_count), pulse_enabled=self.epsilon_pulse_enabled
-            )
+            base = self._natural_epsilon_for_frame(int(self.frame_count))
+            if self.manual_pulse_active:
+                self.manual_pulse_frames_remaining -= 1
+                if self.manual_pulse_frames_remaining <= 0:
+                    self.manual_pulse_active = False
+                    self.manual_pulse_frames_remaining = 0
+                    self.epsilon = base
+                else:
+                    self.epsilon = max(base, float(RL_CONFIG.manual_pulse_epsilon))
+            else:
+                self.epsilon = base
             return self.epsilon
 
     def get_expert_ratio(self):
         with self.lock:
+            xp = game_settings.expert_pct
+            if xp >= 0:
+                return xp / 100.0
             return float(self.expert_ratio)
 
     def update_expert_ratio(self):
@@ -314,8 +454,16 @@ class MetricsData:
             self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
             return self.expert_ratio
 
+    def get_superzap_gate_ratio(self) -> float:
+        """Probability of blocking a DQN zap that the expert didn't approve."""
+        with self.lock:
+            decay = RL_CONFIG.superzap_gate_decay_frames
+            progress = min(1.0, self.frame_count / max(1, decay))
+            return RL_CONFIG.superzap_gate_start + progress * (RL_CONFIG.superzap_gate_end - RL_CONFIG.superzap_gate_start)
+
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
+            self.episodes_this_run += 1
             self.episode_rewards.append(float(total))
             self.dqn_rewards.append(float(dqn))
             self.expert_rewards.append(float(expert))
@@ -383,8 +531,16 @@ class MetricsData:
             self.verbose_mode = not self.verbose_mode
 
     def toggle_epsilon_pulse(self, kb=None):
+        """Fire or cancel the manual epsilon pulse."""
         with self.lock:
-            self.epsilon_pulse_enabled = not self.epsilon_pulse_enabled
+            if self.manual_pulse_active:
+                # Cancel the running pulse
+                self.manual_pulse_active = False
+                self.manual_pulse_frames_remaining = 0
+            else:
+                # Start a new pulse
+                self.manual_pulse_active = True
+                self.manual_pulse_frames_remaining = int(RL_CONFIG.manual_pulse_duration_frames)
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:
@@ -427,3 +583,26 @@ class MetricsData:
 
 
 metrics = MetricsData()
+
+
+# ── PlateauPulser stub ──────────────────────────────────────────────────────
+# Provides the interface expected by the dashboard, backed by our manual pulse.
+class PlateauPulser:
+    WATCHING   = "watching"
+    PULSING    = "pulsing"
+    RECOVERING = "recovering"
+
+    @property
+    def state(self) -> str:
+        return self.PULSING if metrics.manual_pulse_active else self.WATCHING
+
+    @property
+    def total_pulses(self) -> int:
+        return 0                       # manual pulse doesn't track lifetime count
+
+    pulse_start_frame: int = 0
+    pulse_end_frame: int = 0
+    cooldown_multiplier: float = 1.0
+
+
+plateau_pulser = PlateauPulser()
