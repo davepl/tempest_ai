@@ -23,6 +23,8 @@ def _env_enabled(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "off", "no"}
 
 
+# Detect whether this process likely has a local desktop session.
+# We keep this in one helper because dashboard binding/browser defaults depend on it.
 def _has_desktop_session() -> bool:
     # Respect explicit SSH sessions as non-local by default.
     if any(os.getenv(k) for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
@@ -55,6 +57,8 @@ def _resolve_dashboard_host() -> str:
     return "127.0.0.1" if _has_desktop_session() else "0.0.0.0"
 
 
+# Best-effort lookup for the machine's outward-facing LAN IP.
+# This lives here so dashboard URL generation can stay consistent when binding to 0.0.0.0.
 def _best_lan_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:

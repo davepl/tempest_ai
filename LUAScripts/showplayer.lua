@@ -35,7 +35,8 @@ local active_fuseballs  = 0x0146        -- Number of active fuseballs
 
 local pulse_beat        = 0x0147        -- Pulse beat counter
 
--- Function to read and print player information
+-- Read a handful of player/game bytes and print a compact status line each frame.
+-- This script exists as a quick memory-inspection tool while tuning addresses and flags.
 local function print_player_info()
     -- Read values from memory
     local gamestate = mem:read_u8(gamestate_addr)

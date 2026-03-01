@@ -52,7 +52,8 @@ local function format_segment_wide(value, width)
     end
 end
 
--- Function to format section for display
+-- Render one titled metrics section with stable key/value alignment.
+-- Keeping this helper separate makes the large update() formatter easier to maintain.
 local function format_section(title, metrics)
     local width = 80 -- Adjusted width for standard terminal
     local title_padding = math.floor((width - #title - 4) / 2)
@@ -81,12 +82,14 @@ local function format_section(title, metrics)
 end
 
 
--- Function to move the cursor to a specific row (using ANSI escape code)
+-- Move the terminal cursor so each refresh repaints in-place.
+-- This avoids terminal scroll spam during long training runs.
 local function move_cursor_to_row(row)
     io.write(string.format("\027[%d;1H", row)) -- Use 1H for column 1
 end
 
--- Main display update function (exported as M.update)
+-- Build and print one full debug frame (game, player, level, and enemy telemetry).
+-- This function exists so presentation logic stays decoupled from the gameplay/state modules.
 -- Signature matches the call in the original main.lua frame_callback
 function M.update(status_message, game_state, level_state, player_state, enemies_state, num_values, last_reward) -- Note: Original didn't pass total_bytes_sent
 

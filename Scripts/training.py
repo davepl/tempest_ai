@@ -44,6 +44,8 @@ def _bc_weight_schedule(frame_count: int) -> float:
     return cfg.expert_bc_weight + progress * (cfg.expert_bc_min_weight - cfg.expert_bc_weight)
 
 
+# Run one full optimization step: sampling, C51 target projection, BC mix-in, and PER updates.
+# This is intentionally centralized so numeric guards, target sync rules, and metrics stay aligned.
 def train_step(agent, prefetched_batch=None) -> float | None:
     """Run one C51 distributional training step.
 

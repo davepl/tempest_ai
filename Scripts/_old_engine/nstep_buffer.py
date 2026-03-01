@@ -39,6 +39,8 @@ class NStepReplayBuffer:
     def reset(self):
         self._deque.clear()
 
+    # Implements the make experience from start path for NStepReplayBuffer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _make_experience_from_start(self):
         R = 0.0
         priority_R = 0.0
@@ -71,6 +73,8 @@ class NStepReplayBuffer:
         assert last_next_state is not None
         return (s0, a0, R, priority_R, last_next_state, done_flag, steps_used, start_actor)
 
+    # Implements the should emit path for NStepReplayBuffer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _should_emit(self) -> bool:
         if not self._deque:
             return False
@@ -88,6 +92,8 @@ class NStepReplayBuffer:
                 return True
         return False
 
+    # Ingests a new record into NStepReplayBuffer while updating all bookkeeping fields.
+    # The insert path is centralized so capacity rollover and counters stay correct.
     def add(
         self,
         state,

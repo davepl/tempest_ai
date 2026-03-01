@@ -4,7 +4,8 @@ local start_frame = 100  -- Start inserting coins at frame 100
 local interval = 50      -- Insert a coin every 50 frames
 local press_duration = 10 -- Hold coin input active for 10 frames
 
--- Function to manage coin input
+-- Simulate periodic Coin 1 presses on a frame schedule.
+-- This exists as a tiny automation harness for attract-mode and boot flow testing.
 local function manageCoinInput()
     -- Access the input port ":IN0" and the "Coin 1" field
     local port = manager.machine.ioport.ports[":IN0"]

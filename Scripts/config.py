@@ -422,6 +422,8 @@ class MetricsData:
         progress = min(1.0, frame_count / max(1, RL_CONFIG.epsilon_decay_frames))
         return RL_CONFIG.epsilon_start + progress * (RL_CONFIG.epsilon_end - RL_CONFIG.epsilon_start)
 
+    # Recomputes derived state for MetricsData after new inputs arrive.
+    # Keeping update math in one routine avoids drift between callers.
     def update_epsilon(self):
         with self.lock:
             if self.manual_epsilon_override:
@@ -461,6 +463,8 @@ class MetricsData:
             progress = min(1.0, self.frame_count / max(1, decay))
             return RL_CONFIG.superzap_gate_start + progress * (RL_CONFIG.superzap_gate_end - RL_CONFIG.superzap_gate_start)
 
+    # Ingests a new record into MetricsData while updating all bookkeeping fields.
+    # The insert path is centralized so capacity rollover and counters stay correct.
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
             self.episodes_this_run += 1

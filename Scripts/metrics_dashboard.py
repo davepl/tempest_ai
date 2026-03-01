@@ -82,6 +82,8 @@ def _html_dir() -> str:
     return os.path.join(os.path.dirname(script_dir), "html")
 
 
+# Implements the list audio files path for dashboard telemetry.
+# Keeping it isolated keeps call sites small while containing side effects in one place.
 def _list_audio_files() -> list[str]:
     root = _audio_dir()
     try:
@@ -101,6 +103,8 @@ def _list_audio_files() -> list[str]:
 
 
 class _DashboardState:
+    # Builds the initial state for  DashboardState and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, metrics_obj, agent_obj=None, history_limit: int = DASH_HISTORY_LIMIT):
         self.metrics = metrics_obj
         self.agent = agent_obj
@@ -135,6 +139,8 @@ class _DashboardState:
             win["frames"] = 0
             win["weighted"] = 0.0
 
+    # Recomputes derived state for  DashboardState after new inputs arrive.
+    # Keeping update math in one routine avoids drift between callers.
     def _update_web_client_count_locked(self, now_ts: float | None = None) -> int:
         now = float(now_ts if now_ts is not None else time.time())
         stale_before = now - WEB_CLIENT_TIMEOUT_S
@@ -154,6 +160,8 @@ class _DashboardState:
             self._web_clients[client_id] = now
             self._update_web_client_count_locked(now)
 
+    # Recomputes derived state for  DashboardState after new inputs arrive.
+    # Keeping update math in one routine avoids drift between callers.
     def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float, float]:
         raw_level = float(average_level)
         level = round(raw_level, 4) if math.isfinite(raw_level) else 0.0
@@ -246,6 +254,8 @@ class _DashboardState:
             return agree
         return self._agree_window_weighted / max(1, self._agree_window_frames)
 
+    # Implements the get model desc path for  DashboardState.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _get_model_desc(self) -> str:
         if self._model_desc is not None:
             return self._model_desc
@@ -285,6 +295,8 @@ class _DashboardState:
         self._model_desc = desc
         return desc
 
+    # Implements the build snapshot path for  DashboardState.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
         _prs = float(RL_CONFIG.point_reward_scale)  # display-only multiplier
@@ -434,6 +446,8 @@ class _DashboardState:
         from config import metrics as _m
         return int(_m.manual_pulse_frames_remaining)
 
+    # Samples data from  DashboardState using its weighting rules.
+    # Sampling policy is isolated here so callers always get correctly weighted batches.
     def sample(self):
         with self.lock:
             self._update_web_client_count_locked()
@@ -464,6 +478,8 @@ class _DashboardState:
             return self._cached_now_body
 
 
+# Implements the render dashboard html path for dashboard telemetry.
+# Keeping it isolated keeps call sites small while containing side effects in one place.
 def _render_dashboard_html() -> str:
     return """<!doctype html>
 <html lang="en">
@@ -3577,6 +3593,8 @@ def _render_dashboard_html() -> str:
 """
 
 
+# Implements the make handler path for dashboard telemetry.
+# Keeping it isolated keeps call sites small while containing side effects in one place.
 def _make_handler(state: _DashboardState):
     page = _render_dashboard_html().encode("utf-8")
     audio_root = os.path.abspath(_audio_dir())
@@ -3584,6 +3602,8 @@ def _make_handler(state: _DashboardState):
     html_root = os.path.abspath(_html_dir())
 
     class DashboardHandler(BaseHTTPRequestHandler):
+        # Implements the send path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         def _send(
             self,
             payload: bytes,
@@ -3601,6 +3621,8 @@ def _make_handler(state: _DashboardState):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        # Implements the send file path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         def _send_file(self, filepath: str, content_type: str):
             try:
                 size = os.path.getsize(filepath)
@@ -3619,6 +3641,8 @@ def _make_handler(state: _DashboardState):
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
 
+        # Implements the safe audio file path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         @staticmethod
         def _safe_audio_file(name: str) -> str | None:
             if not name or name.startswith("."):
@@ -3638,6 +3662,8 @@ def _make_handler(state: _DashboardState):
                 return None
             return candidate
 
+        # Implements the safe font file path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         @staticmethod
         def _safe_font_file(name: str) -> str | None:
             if not name or name.startswith("."):
@@ -3657,6 +3683,8 @@ def _make_handler(state: _DashboardState):
                 return None
             return candidate
 
+        # Implements the safe html file path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         @staticmethod
         def _safe_html_file(name: str) -> str | None:
             if not name or name.startswith("."):
@@ -3673,6 +3701,8 @@ def _make_handler(state: _DashboardState):
                 return None
             return candidate
 
+        # Implements the do GET path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         def do_GET(self):
             parsed = urlparse(self.path)
             path = parsed.path
@@ -3734,6 +3764,8 @@ def _make_handler(state: _DashboardState):
                 return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
 
+        # Implements the do POST path for DashboardHandler.
+        # Keeping it isolated keeps call sites small while containing side effects in one place.
         def do_POST(self):
             parsed = urlparse(self.path)
             path = parsed.path
@@ -3775,6 +3807,8 @@ def _make_handler(state: _DashboardState):
 class MetricsDashboard:
     """Managed dashboard server + browser window."""
 
+    # Builds the initial state for MetricsDashboard and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(
         self,
         metrics_obj,
@@ -3805,6 +3839,8 @@ class MetricsDashboard:
         self._lock = threading.Lock()
         atexit.register(self.stop)
 
+    # Implements the sampling loop path for MetricsDashboard.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _sampling_loop(self):
         while not self.stop_event.is_set():
             try:
@@ -3822,6 +3858,8 @@ class MetricsDashboard:
                     pass
             self.stop_event.wait(self.sample_interval)
 
+    # Implements the bind server path for MetricsDashboard.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _bind_server(self):
         handler_cls = _make_handler(self.state)
         last_err = None
@@ -3842,6 +3880,8 @@ class MetricsDashboard:
             return candidate if os.path.exists(candidate) else None
         return shutil.which(candidate)
 
+    # Implements the launch browser path for MetricsDashboard.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _launch_browser(self, url: str):
         candidates = [
             ("google-chrome", True),
@@ -3898,6 +3938,8 @@ class MetricsDashboard:
         except Exception:
             pass
 
+    # Owns the start lifecycle for MetricsDashboard, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def start(self) -> str:
         self.state.sample()
         self._bind_server()
@@ -3913,6 +3955,8 @@ class MetricsDashboard:
             self._launch_browser(self.url)
         return self.url
 
+    # Owns the stop lifecycle for MetricsDashboard, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         with self._lock:
             if self._closed:

@@ -37,6 +37,8 @@ DEBUG_MODE = False
 import builtins
 _original_print = builtins.print
 
+# Implements the flushing print path for the agent runtime.
+# Keeping it isolated keeps call sites small while containing side effects in one place.
 def _flushing_print(*args, **kwargs):
     new_args = []
     for arg in args:
@@ -75,6 +77,8 @@ import traceback
 
 class NoisyLinear(nn.Module):
     """Factorized NoisyNet layer for exploration without epsilon."""
+    # Builds the initial state for NoisyLinear and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, in_features: int, out_features: int, std_init: float = 0.5):
         super().__init__()
         self.in_features = int(in_features)
@@ -198,6 +202,8 @@ def spinner_index_to_value(index: int) -> float:
         return 0.0
     return SPINNER_BUCKET_VALUES[_clamp_spinner_index(index)]
 
+# Implements the quantize spinner value path for the agent runtime.
+# Keeping it isolated keeps call sites small while containing side effects in one place.
 def quantize_spinner_value(spinner_value: float) -> int:
     if not SPINNER_BUCKET_VALUES:
         return 0
@@ -284,6 +290,8 @@ class FrameData:
     expert_zap: bool
     level_number: int
     
+    # Implements the from dict path for FrameData.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     @classmethod
     def from_dict(cls, data: Dict) -> 'FrameData':
         return cls(
@@ -330,6 +338,8 @@ metrics.global_server = None
 class DiscreteDQN(nn.Module):
     """Joint-action Double DQN: one head over 4x64=256 actions."""
 
+    # Builds the initial state for DiscreteDQN and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, state_size: int, hidden_size: int | None = None, num_layers: int | None = None):
         super(DiscreteDQN, self).__init__()
 
@@ -397,6 +407,8 @@ class DiscreteDQN(nn.Module):
                 torch.nn.init.uniform_(out.weight, -0.003, 0.003)
                 torch.nn.init.constant_(out.bias, 0.0)
 
+    # Runs the core forward pass for DiscreteDQN and shapes outputs for downstream consumers.
+    # The model topology is centralized here so training and inference stay consistent.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shared = x
         for i, layer in enumerate(self.shared_layers):
@@ -428,6 +440,8 @@ class DiscreteDQN(nn.Module):
 class _ReplayPartition:
     """Fixed-size ring buffer for one actor partition."""
 
+    # Builds the initial state for  ReplayPartition and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, capacity: int, state_size: int):
         self.capacity = int(max(1, capacity))
         self.state_size = int(max(1, state_size))
@@ -440,6 +454,8 @@ class _ReplayPartition:
         self.size = 0
         self.pos = 0
 
+    # Ingests a new record into  ReplayPartition while updating all bookkeeping fields.
+    # The insert path is centralized so capacity rollover and counters stay correct.
     def add(self, state, action_idx: int, reward: float, next_state, done: bool, horizon: int):
         i = self.pos
         self.states[i] = np.asarray(state, dtype=np.float32)
@@ -453,6 +469,8 @@ class _ReplayPartition:
         if self.size < self.capacity:
             self.size += 1
 
+    # Samples data from  ReplayPartition using its weighting rules.
+    # Sampling policy is isolated here so callers always get correctly weighted batches.
     def sample(self, n: int):
         if self.size <= 0 or n <= 0:
             return None
@@ -470,6 +488,8 @@ class _ReplayPartition:
 class StratifiedReplayBuffer:
     """Replay with separate DQN/Expert partitions and vectorized sampling."""
 
+    # Builds the initial state for StratifiedReplayBuffer and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, capacity: int, state_size: int):
         self.capacity = int(max(1, capacity))
         self.state_size = int(max(1, state_size))
@@ -498,6 +518,8 @@ class StratifiedReplayBuffer:
                 self.buffer_agent.add(state, action, reward, next_state, done, h)
             self.total_added += 1
 
+    # Samples data from StratifiedReplayBuffer using its weighting rules.
+    # Sampling policy is isolated here so callers always get correctly weighted batches.
     def sample(self, batch_size: int, expert_ratio: float):
         with self.lock:
             bsz = int(max(1, batch_size))
@@ -568,6 +590,8 @@ class StratifiedReplayBuffer:
         with self.lock:
             return int(self.buffer_agent.size + self.buffer_expert.size)
 
+    # Aggregates and emits telemetry for StratifiedReplayBuffer.
+    # Metrics formatting and cadence are grouped here so observability stays predictable.
     def get_partition_stats(self):
         with self.lock:
             n_agent = int(self.buffer_agent.size)
@@ -587,6 +611,8 @@ class StratifiedReplayBuffer:
 
 class KeyboardHandler:
     """Cross-platform non-blocking keyboard input handler."""
+    # Builds the initial state for KeyboardHandler and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self):
         self.platform = sys.platform
         self.msvcrt = msvcrt 
@@ -624,6 +650,8 @@ class KeyboardHandler:
     def __exit__(self, *args):
         self.restore_terminal()
         
+    # Handles interactive keyboard events and maps them to runtime control actions.
+    # Input handling stays here so terminal edge cases do not leak into training code.
     def check_key(self):
         if not IS_INTERACTIVE: return None
         try:
@@ -659,6 +687,8 @@ def setup_environment():
 class DiscreteDQNAgent:
     """Agent using joint-action DiscreteDQN and stratified replay."""
 
+    # Builds the initial state for DiscreteDQNAgent and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, state_size, discrete_actions=None, learning_rate=RL_CONFIG.lr, 
                  gamma=RL_CONFIG.gamma, epsilon=RL_CONFIG.epsilon, memory_size=RL_CONFIG.memory_size, 
                  batch_size=RL_CONFIG.batch_size):
@@ -723,6 +753,8 @@ class DiscreteDQNAgent:
         worker.start()
         self.training_threads.append(worker)
 
+    # Synchronizes model state for DiscreteDQNAgent between training and inference copies.
+    # Doing syncs in one place prevents stale weights from silently serving actions.
     def sync_inference_model(self, force: bool = False):
         if not self.use_separate_inference_model:
             return
@@ -827,6 +859,8 @@ class DiscreteDQNAgent:
                 print(f"Training error: {e}")
                 traceback.print_exc()
 
+    # Persists DiscreteDQNAgent state to disk with the metadata needed for a clean resume.
+    # Checkpoint details are concentrated here so format/version changes stay localized.
     def save(self, filepath, now=None, is_forced_save=False):
         # Persist lightweight training progress so restarts keep long-run counters (Frame/Steps).
         try:
@@ -858,6 +892,8 @@ class DiscreteDQNAgent:
         if is_forced_save:
             print(f"Model saved to {filepath}")
 
+    # Loads persisted data into DiscreteDQNAgent and normalizes compatibility edge cases.
+    # Resume logic is centralized here so partial or legacy checkpoints are handled consistently.
     def load(self, filepath):
         if not os.path.exists(filepath): return False
         try:
@@ -940,6 +976,8 @@ class DiscreteDQNAgent:
         
         return min_q, max_q
 
+    # Owns the stop lifecycle for DiscreteDQNAgent, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         self.running = False
             
@@ -954,6 +992,8 @@ class DiscreteDQNAgent:
 # Alias for compatibility
 HybridDQNAgent = DiscreteDQNAgent
 
+# Parses raw input into the structured representation expected by the agent runtime.
+# Protocol decoding is isolated here so validation and field assumptions are easy to audit.
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     try:
         if not data or len(data) < 10: return None
@@ -1074,6 +1114,8 @@ class SafeMetrics:
         else:
             with self.lock: self.metrics.frame_count += delta
     
+    # Ingests a new record into SafeMetrics while updating all bookkeeping fields.
+    # The insert path is centralized so capacity rollover and counters stay correct.
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
             self.metrics.episode_rewards.append(total)

@@ -49,6 +49,8 @@ _eplen1m = deque()
 _eplen1m_frames = 0
 
 
+# Ingests a new record into terminal metrics output while updating all bookkeeping fields.
+# The insert path is centralized so capacity rollover and counters stay correct.
 def add_episode_to_dqn100k_window(dqn_reward: float, ep_len: int):
     global _dqn100k_frames
     if ep_len <= 0:
@@ -71,6 +73,8 @@ def add_episode_to_dqn1k_window(dqn_reward: float, ep_len: int):
     add_episode_to_dqn100k_window(dqn_reward, ep_len)
 
 
+# Ingests a new record into terminal metrics output while updating all bookkeeping fields.
+# The insert path is centralized so capacity rollover and counters stay correct.
 def add_episode_to_dqn1m_window(dqn_reward: float, ep_len: int):
     global _dqn1m_frames
     if ep_len <= 0:
@@ -83,6 +87,8 @@ def add_episode_to_dqn1m_window(dqn_reward: float, ep_len: int):
             _dqn1m_frames -= l
 
 
+# Ingests a new record into terminal metrics output while updating all bookkeeping fields.
+# The insert path is centralized so capacity rollover and counters stay correct.
 def add_episode_to_dqn5m_window(dqn_reward: float, ep_len: int):
     global _dqn5m_frames
     if ep_len <= 0:
@@ -168,6 +174,8 @@ def clear_screen():
         sys.stdout.flush()
 
 
+# Implements the print line path for terminal metrics output.
+# Keeping it isolated keeps call sites small while containing side effects in one place.
 def _print_line(msg, is_header=False):
     global row_counter
     if is_header:
@@ -180,6 +188,8 @@ def _print_line(msg, is_header=False):
     sys.stdout.flush()
 
 
+# Aggregates and emits telemetry for terminal metrics output.
+# Metrics formatting and cadence are grouped here so observability stays predictable.
 def display_metrics_header():
     global row_counter
     row_counter = 0
@@ -201,6 +211,8 @@ def display_metrics_header():
         pass
 
 
+# Aggregates and emits telemetry for terminal metrics output.
+# Metrics formatting and cadence are grouped here so observability stays predictable.
 def display_metrics_row(agent, kb_handler):
     global row_counter
     if row_counter > 0 and row_counter % 30 == 0:

@@ -142,6 +142,8 @@ class FrameData:
     level_number: int
     game_score: int = 0
 
+# Parses raw input into the structured representation expected by the agent runtime.
+# Protocol decoding is isolated here so validation and field assumptions are easy to audit.
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     try:
         fmt = ">HddBBBHIBBBhhBBBBB"
@@ -240,6 +242,8 @@ class LaneCrossAttentionEncoder(nn.Module):
       5. Mean-pool enriched lanes → fixed-size summary vector
     """
 
+    # Builds the initial state for LaneCrossAttentionEncoder and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, lane_features: int, enemy_features: int, embed_dim: int, num_heads: int):
         super().__init__()
         self.embed_dim = embed_dim
@@ -296,6 +300,8 @@ class RainbowNet(nn.Module):
       - Factored action heads (fire/zap × spinner)
     """
 
+    # Builds the initial state for RainbowNet and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, state_size: int):
         super().__init__()
         cfg = RL_CONFIG
@@ -514,6 +520,8 @@ elif sys.platform in ("linux", "darwin"):
 import select as _select
 
 class KeyboardHandler:
+    # Builds the initial state for KeyboardHandler and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self):
         self.platform = sys.platform
         self.fd = None
@@ -543,6 +551,8 @@ class KeyboardHandler:
     def __exit__(self, *a):
         self.restore_terminal()
 
+    # Handles interactive keyboard events and maps them to runtime control actions.
+    # Input handling stays here so terminal edge cases do not leak into training code.
     def check_key(self):
         if not IS_INTERACTIVE:
             return None
@@ -571,6 +581,8 @@ class KeyboardHandler:
             except Exception:
                 pass
 
+# Temporarily restore cooked terminal mode, print safely, then re-enter raw mode.
+# This avoids garbled interactive input when we need to emit multi-line diagnostics.
 def print_with_terminal_restore(kb, *args, **kwargs):
     if IS_INTERACTIVE and kb and kb.platform in ("linux", "darwin"):
         kb.restore_terminal()
@@ -643,6 +655,8 @@ class SafeMetrics:
 class RainbowAgent:
     """Rainbow-lite agent with factored actions, C51, PER, n-step, attention."""
 
+    # Builds the initial state for RainbowAgent and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, state_size: int):
         self.state_size = state_size
         self.device = device
@@ -782,6 +796,8 @@ class RainbowAgent:
         fz, sp = split_joint_action(joint)
         return fz, sp, False
 
+    # Implements the infer q values path for RainbowAgent.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
         net = self.infer_net if self.use_separate_inference else self.online_net
         net.eval()
@@ -944,6 +960,8 @@ class RainbowAgent:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
+    # Persists RainbowAgent state to disk with the metadata needed for a clean resume.
+    # Checkpoint details are concentrated here so format/version changes stay localized.
     def save(self, filepath, is_forced_save=False, show_status=True):
         try:
             with metrics.lock:
@@ -994,6 +1012,8 @@ class RainbowAgent:
         except Exception as e:
             print(f"  Replay buffer save failed: {e}")
 
+    # Loads persisted data into RainbowAgent and normalizes compatibility edge cases.
+    # Resume logic is centralized here so partial or legacy checkpoints are handled consistently.
     def load(self, filepath, show_status=True) -> bool:
         if not os.path.exists(filepath):
             return False
@@ -1251,6 +1271,8 @@ class RainbowAgent:
         lines.append("\n" + "=" * 70)
         return "\n".join(lines)
 
+    # Implements the get q value range path for RainbowAgent.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def get_q_value_range(self):
         if len(self.memory) < 32:
             return float("nan"), float("nan")

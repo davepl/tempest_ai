@@ -61,12 +61,14 @@ local SUPERZAP_COOLDOWN_FRAMES = 60     -- ~2 seconds at 30 fps
 local enemy_start_count = 0          -- enemies_pending captured at level start
 local previous_player_position = 0
 
+-- Draw a Bernoulli sample for expert-fire decisions.
+-- This is kept as a helper so all policy branches share one fire-probability knob.
 local function sample_expert_fire()
     return math.random() < EXPERT_FIRE_PROBABILITY
 end
 
--- Helper function to find nearest enemy of a specific type (copied from state.lua for locality within logic)
--- NOTE: Duplicated from state.lua for now to keep logic self-contained. Consider unifying later.
+-- Find the nearest active enemy of a given type and return both lane and depth.
+-- We keep this local to policy code so targeting can evolve without coupling to state decoding.
 local function find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_open, enemy_type, abs_to_rel_func)
     local nearest_seg_abs = -1
     local min_dist = 255
@@ -95,7 +97,8 @@ local function find_nearest_enemy_of_type(enemies_state, player_abs_segment, is_
 end
 
 
--- Function to get the relative distance to a target segment
+-- Convert absolute lane indices into a signed relative offset from the player.
+-- This exists because every steering/avoidance path depends on one consistent wrap rule.
 function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment, is_open_level)
     current_abs_segment = tonumber(current_abs_segment) or 0
     target_abs_segment = tonumber(target_abs_segment) or 0
@@ -120,7 +123,8 @@ function M.absolute_to_relative_segment(current_abs_segment, target_abs_segment,
     end
 end
 
--- Helper function to hunt enemies in preference order
+-- Pick the next hunt target using the hand-tuned enemy priority ordering.
+-- Centralizing this prevents each caller from drifting to a different "best target" policy.
 function M.hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
     local hunt_order = {
         ENEMY_TYPE_FUSEBALL, ENEMY_TYPE_FLIPPER, ENEMY_TYPE_TANKER, ENEMY_TYPE_SPIKER
@@ -136,7 +140,8 @@ function M.hunt_enemies(enemies_state, player_abs_segment, is_open, abs_to_rel_f
     return -1, 255, false
 end
 
--- Function to handle tube zoom state (0x20)
+-- Choose the safest nearby lane while the camera is in tube-zoom mode.
+-- We do this separately from normal combat targeting because spikes are the only threat here.
 function M.zoom_down_tube(player_abs_seg, level_state, is_open)
     -- Use adjusted spike heights (0 = no spike, low = shorter/safer, high = longer/more dangerous).
     -- Pick the globally best *near* lane:
@@ -176,7 +181,8 @@ function M.zoom_down_tube(player_abs_seg, level_state, is_open)
     return best_seg, 0, true, false
 end
 
--- Function to check for fuseball threats
+-- Detect immediate fuseball danger near the top rail and suggest an escape lane.
+-- This fast path exists so lethal fuseball cases preempt slower general target selection.
 function M.fuseball_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func)
     local fuseball_threat_nearby = false
     local escape_target_seg = -1
@@ -196,7 +202,8 @@ function M.fuseball_check(player_abs_seg, enemies_state, is_open, abs_to_rel_fun
     return fuseball_threat_nearby, escape_target_seg
 end
 
--- Function to check for pulsar threats
+-- Detect whether the player is currently sitting in an actively dangerous pulsar lane.
+-- This check lives on its own because pulsar timing rules differ from other enemy hazards.
 function M.pulsar_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func, forbidden_segments)
     -- Assembly: pulsing bit 7 CLEAR ($01-$7F) = dangerous, bit 7 SET or 0 = safe
     if enemies_state.pulsing == 0 or enemies_state.pulsing >= 0x80 then return false, player_abs_seg, 0, false, false end
@@ -223,7 +230,8 @@ function M.pulsar_check(player_abs_seg, enemies_state, is_open, abs_to_rel_func,
     return true, adj, 0, false, false
 end
 
--- Function to check for immediate threats in a segment
+-- Return whether a lane has any near-term hazard (shots, enemies, or pulsars).
+-- Keeping this primitive shared avoids duplicating close-range threat thresholds.
 function M.check_segment_threat(segment, enemies_state)
     for i = 1, 4 do -- Check shots
         if enemies_state.enemy_shot_abs_segments[i] == segment and enemies_state.shot_positions[i] > 0 and enemies_state.shot_positions[i] <= TOP_RAIL_AVOID_DEPTH then return true end
@@ -237,7 +245,8 @@ function M.check_segment_threat(segment, enemies_state)
     return false
 end
 
--- Returns true if the segment is a danger lane (more specific criteria for immediate action)
+-- Classify lanes that are unsafe for immediate movement decisions.
+-- This exists so flee logic can use one stricter danger definition than general targeting.
 function M.is_danger_lane(segment, enemies_state)
     -- Assembly: pulsing bit 7 CLEAR ($01-$7F) = dangerous
     if enemies_state.pulsing > 0 and enemies_state.pulsing < 0x80 then -- Check dangerous pulsars first
@@ -261,7 +270,8 @@ function M.is_danger_lane(segment, enemies_state)
     return false
 end
 
--- Helper function to find the segment of the nearest enemy at depth 0x10
+-- Find the closest enemy currently on the top rail.
+-- This supports top-rail specific behaviors where depth-0x10 enemies need special handling.
 function M.find_nearest_top_rail_enemy_seg(player_abs_seg, enemies_state, abs_to_rel_func, is_open)
     local nearest_enemy_seg, min_dist = -1, 255
     for i = 1, 7 do
@@ -276,7 +286,8 @@ function M.find_nearest_top_rail_enemy_seg(player_abs_seg, enemies_state, abs_to
     return nearest_enemy_seg
 end
 
--- Returns the highest priority enemy type and its priority value in a segment
+-- Rank enemy occupants in a lane by tactical priority.
+-- Keeping this as a helper lets avoid/fire logic ask "what is worst in this lane?" consistently.
 function M.get_enemy_priority(segment, enemies_state)
     local best_priority = 100
     local best_type = nil
@@ -291,7 +302,8 @@ function M.get_enemy_priority(segment, enemies_state)
     return best_type, best_priority
 end
 
--- Public API: configure conserve fire mode
+-- Enable or tune "conserve fire" behavior for expert policy decisions.
+-- This setter exists so experiments can adjust reaction timing without editing core logic.
 function M.set_conserve_fire_mode(enabled, react_distance)
     CONSERVE_FIRE_MODE = not not enabled
     if type(react_distance) == "number" and react_distance >= 0.5 then
@@ -299,10 +311,14 @@ function M.set_conserve_fire_mode(enabled, react_distance)
     end
 end
 
+-- Read back the active conserve-fire policy settings.
+-- Exposed for dashboards/tests so policy toggles can be verified at runtime.
 function M.get_conserve_fire_mode()
     return CONSERVE_FIRE_MODE, CONSERVE_REACT_DISTANCE
 end
 
+-- Set global probability used by sample_expert_fire().
+-- This indirection keeps fire aggressiveness tunable without touching target-selection code.
 function M.set_expert_fire_probability(probability)
     if type(probability) ~= "number" then
         return
@@ -315,11 +331,14 @@ function M.set_expert_fire_probability(probability)
     EXPERT_FIRE_PROBABILITY = probability
 end
 
+-- Return the current expert fire probability.
+-- Used by tooling to report the real policy value currently in effect.
 function M.get_expert_fire_probability()
     return EXPERT_FIRE_PROBABILITY
 end
 
--- Helper to find the nearest safe segment (not a danger lane)
+-- Find the nearest lane that is not currently flagged as dangerous.
+-- This powers flee behavior so panic moves prefer a nearby survivable lane.
 local function find_nearest_safe_segment(start_seg, enemies_state, is_open)
     if not M.is_danger_lane(start_seg, enemies_state) then return start_seg end
 
@@ -333,7 +352,8 @@ local function find_nearest_safe_segment(start_seg, enemies_state, is_open)
     return start_seg -- Fallback: stay put if no safe found nearby
 end
 
--- NEW Helper: Check if a segment contains an active Pulsar
+-- Return whether a lane currently hosts an active pulsar.
+-- This is factored out because pulsar-aware routing uses this check in multiple places.
 local function is_pulsar_lane(segment, enemies_state)
     for i = 1, 7 do
         if enemies_state.enemy_core_type[i] == ENEMY_TYPE_PULSAR and
@@ -345,17 +365,21 @@ local function is_pulsar_lane(segment, enemies_state)
     return false
 end
 
--- Public API: configure pulsar hunting preferences
+-- Configure preferred stand-off distance when hunting/holding around pulsars.
+-- This keeps pulsar behavior tunable independently from other enemy logic.
 function M.set_pulsar_preference(distance, tolerance)
     if type(distance) == "number" and distance >= 1 then PULSAR_PREF_DISTANCE = distance end
     if type(tolerance) == "number" and tolerance >= 0 then PULSAR_PREF_TOLERANCE = tolerance end
 end
 
+-- Return pulsar preference tuning values currently in use.
+-- Exposed for telemetry and hot-reload style configuration checks.
 function M.get_pulsar_preference()
     return PULSAR_PREF_DISTANCE, PULSAR_PREF_TOLERANCE
 end
 
--- Helper: Get the lane adjacent to a given pulsar that's closest to the player
+-- Choose the adjacent pulsar lane that is closest to the player's current lane.
+-- This exists so pulsar-escape decisions remain local and deterministic.
 local function adjacent_to_pulsar_closest_to_player(pulsar_seg, player_seg, is_open, abs_to_rel_func)
     local left_adj = (pulsar_seg - 1 + 16) % 16
     local right_adj = (pulsar_seg + 1) % 16
@@ -377,7 +401,8 @@ local function adjacent_to_pulsar_closest_to_player(pulsar_seg, player_seg, is_o
     return best
 end
 
--- Helper: Find nearest segment that is NOT a pulsar lane (ignores other dangers by design)
+-- Find the nearest lane that is not occupied by an active pulsar.
+-- This is intentionally narrow so pulsar-only escape logic stays independent from other hazards.
 local function find_nearest_non_pulsar_segment(start_seg, enemies_state, is_open)
     if not is_pulsar_lane(start_seg, enemies_state) then return start_seg end
     for d = 1, 8 do
@@ -389,7 +414,8 @@ local function find_nearest_non_pulsar_segment(start_seg, enemies_state, is_open
     return start_seg -- fallback (should be rare)
 end
 
--- NEW Helper: Find nearest safe segment that also respects distance from a constraint segment
+-- Find a safe lane that also keeps minimum distance from a constrained lane.
+-- We keep this separate for composite safety checks where plain "nearest safe" is not enough.
 local function find_nearest_constrained_safe_segment(start_seg, enemies_state, is_open, constraint_seg, abs_to_rel_func)
     -- Search outwards from the start segment
     for d = 0, 8 do -- Check current segment first (d=0), then outwards
@@ -417,7 +443,8 @@ local function find_nearest_constrained_safe_segment(start_seg, enemies_state, i
     return start_seg -- NEW FALLBACK: Prefer original unsafe target over potentially worse simple safe target
 end
 
--- Function to find the target segment and recommended action (expert policy)
+-- Main expert-policy routine: choose lane target plus fire/zap recommendations for this frame.
+-- This function exists so all tactical heuristics are evaluated in one ordered decision pipeline.
 function M.find_target_segment(game_state, player_state, level_state, enemies_state, abs_to_rel_func)
     -- Simplified targeting logic per spec
     local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
@@ -443,6 +470,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
         end
     end
 
+    -- Scan nearby top-rail enemies/shots and return the best immediate flee direction.
+    -- This inner helper keeps threat collation readable without splitting policy state across functions.
     local function scan_top_threats()
         local flee_rel = nil
         local flee_abs = nil
@@ -650,7 +679,8 @@ function M.find_target_segment(game_state, player_state, level_state, enemies_st
     return target_seg, 0, sample_expert_fire(), should_superzap
 end
 
--- Function to calculate desired spinner direction and distance to target enemy
+-- Convert a chosen target into spinner command direction and movement intensity.
+-- Isolated here so downstream code can treat targeting and control encoding as separate concerns.
 function M.direction_to_nearest_enemy(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local player_abs_seg = math.floor(player_state.position) % 16
     local is_open = (level_state.level_type ~= 0x00) -- Assembly: $00=closed, $FF=open
@@ -667,7 +697,8 @@ function M.direction_to_nearest_enemy(game_state, level_state, player_state, ene
     return spinner, distance, 255 -- Misaligned (depth 255 indicates not aligned)
 end
 
--- Function to calculate reward for the current frame
+-- Compute dense per-frame reward plus terminal handling and reward components.
+-- Keeping objective and shaping math together prevents training/evaluation reward drift.
 function M.calculate_reward(game_state, level_state, player_state, enemies_state, abs_to_rel_func)
     local reward, subj_reward, obj_reward, bDone = 0.0, 0.0, 0.0, false
 
@@ -792,12 +823,14 @@ function M.calculate_reward(game_state, level_state, player_state, enemies_state
     return reward, subj_reward, obj_reward, bDone
 end
 
--- Function to retrieve the last calculated reward (for display)
+-- Return the last total reward emitted by calculate_reward().
+-- Display code uses this so rendering does not need to recompute reward logic.
 function M.getLastReward()
     return LastRewardState
 end
 
--- Function to retrieve the last calculated reward components
+-- Return the most recent subjective/objective reward components.
+-- This exists for observability so tuning can inspect reward composition directly.
 function M.getLastRewardComponents()
     return LastSubjRewardState, LastObjRewardState
 end

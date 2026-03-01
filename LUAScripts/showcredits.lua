@@ -15,7 +15,8 @@ end
 -- Define the memory address where credits are stored
 local credit_address = 0x0006
 
--- Function to read and print the current number of credits
+-- Poll and print the credit counter straight from emulated memory.
+-- Useful as a focused sanity check when validating address maps.
 local function print_credits()
     local credits = mem:read_u8(credit_address)
     print("Credits: " .. credits)

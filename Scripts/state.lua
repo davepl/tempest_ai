@@ -21,7 +21,8 @@ local TOP_RAIL_AVOID_DEPTH = 0x60
 local TOP_RAIL_ABSENT = 255
 M.TOP_RAIL_ABSENT = TOP_RAIL_ABSENT
 
--- Helper function for BCD conversion (local to this module)
+-- Convert Tempest BCD score bytes into decimal integers safely.
+-- We keep this local so all score decoding follows the same nibble validation rules.
 local function bcd_to_decimal(bcd)
     -- Handle potential non-number inputs gracefully
     if type(bcd) ~= 'number' then return 0 end
@@ -41,6 +42,8 @@ local find_target_segment
 local find_forbidden_segments
 local find_nearest_safe_segment
 
+-- Mirror Tempest's lane-angle lookup used while enemies move between lanes.
+-- This helper exists to keep Lua-side fractional lane math aligned with ROM behavior.
 -- Tempest segment-angle helper mirroring get_angle ($9ee6):
 -- - direction bit set   (segment increasing): angle = tube_angle[(seg-1)&0x0f] + 8
 -- - direction bit clear (segment decreasing): angle = tube_angle[seg]
@@ -56,7 +59,8 @@ local function get_tempest_segment_angle_nibble(level_angles, seg_abs, seg_incre
     return lane_angle & 0x0F
 end
 
--- Convert more_enemy_info low nibble into 0..1 progress along a between-segment move.
+-- Convert enemy flip-angle nibble into normalized 0..1 lane-transition progress.
+-- This exists so between-segment enemy positions match game code instead of naive linear interpolation.
 -- This follows PC_ContFinishFlip ($9d8a) semantics instead of treating nibble as linear /16.
 local function compute_between_progress(level_angles, seg_abs, seg_increasing, angle_nibble)
     local start_angle = get_tempest_segment_angle_nibble(level_angles, seg_abs, seg_increasing)
@@ -87,6 +91,8 @@ local function compute_between_progress(level_angles, seg_abs, seg_increasing, a
     return progress
 end
 
+-- Wrap signed relative lane offsets into the closed-level [-8,+8] domain.
+-- Keeping wrap behavior centralized prevents subtle disagreements between feature builders.
 local function wrap_closed_relative_segment(rel_float)
     local v = rel_float
     while v > 8.0 do v = v - 16.0 end
@@ -98,7 +104,8 @@ end
 -- Helper Functions (Internal to this State Module)
 -- ====================
 
--- NEW Helper: Identify forbidden segments
+-- Build the set of lanes that are unsafe to move into this frame.
+-- This helper exists so flee and hunt paths share one notion of "forbidden" lanes.
 find_forbidden_segments = function(enemies_state, level_state, player_state)
     local forbidden = {} -- Use a table as a set (keys are forbidden segments 0-15)
     -- Assembly: pulsing bit 7 CLEAR ($01-$7F) = dangerous, bit 7 SET ($80-$FF) = safe, 0 = inactive
@@ -141,7 +148,8 @@ find_forbidden_segments = function(enemies_state, level_state, player_state)
     return forbidden
 end
 
--- NEW Helper: Find nearest safe segment if current is forbidden
+-- Search outward for the nearest lane not marked as forbidden.
+-- Centralized here so escape behavior remains topology-aware for open/closed levels.
 find_nearest_safe_segment = function(player_abs_seg, is_open, forbidden_segments, abs_to_rel_func)
     -- Search outwards from the current segment
     local max_dist = is_open and 15 or 8
@@ -175,7 +183,8 @@ find_nearest_safe_segment = function(player_abs_seg, is_open, forbidden_segments
     return player_abs_seg
 end
 
--- Helper function to find nearest enemy of a specific type
+-- Find the nearest active enemy of the requested type that is not in a forbidden lane.
+-- This is split out so hunt-order logic can reuse one consistent distance/tie-break implementation.
 -- Needs abs_to_rel_func, is_open, and forbidden_segments passed in
 find_nearest_enemy_of_type = function(enemies_state, player_abs_segment, is_open, type_id, abs_to_rel_func, forbidden_segments)
     local nearest_seg_abs = -1
@@ -227,7 +236,8 @@ find_nearest_enemy_of_type = function(enemies_state, player_abs_segment, is_open
     return nearest_seg_abs, nearest_depth
 end
 
--- Helper function to hunt enemies in preference order
+-- Choose a hunt target using this module's enemy-priority order and top-rail safety rules.
+-- We keep this policy helper separate so state extraction and tactical choices stay decoupled.
 -- Needs abs_to_rel_func, is_open, and forbidden_segments passed in
 hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_func, forbidden_segments)
     -- Corrected Hunt Order (based on assembly types): Fuseball(4), Pulsar(1), Tanker(2), Flipper(0), Spiker(3)
@@ -274,7 +284,8 @@ hunt_enemies = function(enemies_state, player_abs_segment, is_open, abs_to_rel_f
     return -1, 255, false
 end
 
--- Function to determine target segment, depth, and firing decision
+-- Derive a telemetry target lane/depth/fire hint from current decoded state.
+-- This exists for feature shaping/debug visibility; gameplay steering lives in logic.lua.
 find_target_segment = function(game_state, player_state, level_state, enemies_state, abs_to_rel_func, is_open)
     local player_abs_seg = player_state.position & 0x0F
 
@@ -487,6 +498,8 @@ end
 M.GameState = {}
 M.GameState.__index = M.GameState
 
+-- Construct the per-run game-state container with stable defaults.
+-- This keeps all session-level counters initialized before the first memory read.
 function M.GameState:new()
     local self = setmetatable({}, M.GameState)
     self.credits = 0
@@ -503,6 +516,8 @@ function M.GameState:new()
     return self
 end
 
+-- Pull high-level game/session bytes from memory each frame.
+-- This exists so all downstream systems read one normalized snapshot.
 function M.GameState:update(mem)
     self.gamestate = mem:read_u8(0x0000)        -- Game state at address 0
     self.game_mode = mem:read_u8(0x0005)        -- Game mode at address 5
@@ -519,6 +534,8 @@ end
 M.LevelState = {}
 M.LevelState.__index = M.LevelState
 
+-- Construct level-state storage, including pre-sized spike/angle tables.
+-- We preinitialize arrays so downstream code can index lanes without nil checks.
 function M.LevelState:new()
     local self = setmetatable({}, M.LevelState)
     self.level_number = 0
@@ -536,6 +553,8 @@ function M.LevelState:new()
     return self
 end
 
+-- Read level topology (type, spikes, angles) and derive lane-friendly features.
+-- Keeping these transforms here prevents every caller from repeating raw memory math.
 function M.LevelState:update(mem)
     self.level_number = mem:read_u8(0x009F)   -- Level number
     self.level_type = mem:read_u8(0x0111)     -- Level type raw flag at $0111 (00=closed, FF=open per assembly)
@@ -566,6 +585,8 @@ end
 M.PlayerState = {}
 M.PlayerState.__index = M.PlayerState
 
+-- Construct player-state storage for controls, score, and projectile tracking.
+-- Keeping defaults here avoids stale values carrying across resets.
 function M.PlayerState:new()
     local self = setmetatable({}, M.PlayerState)
     self.position = 0           -- Raw position byte from $0200
@@ -598,6 +619,8 @@ function M.PlayerState:new()
 end
 
 -- PlayerState update needs the absolute_to_relative_segment function passed in
+-- Decode player memory fields, including shots and inferred input deltas.
+-- This lives here so control, reward, and feature code all consume one player snapshot.
 function M.PlayerState:update(mem, abs_to_rel_func)
     self.position = mem:read_u8(0x0200) -- Player position byte
     self.player_state = mem:read_u8(0x0201) -- Player state value at $201
@@ -673,6 +696,8 @@ end
 M.EnemiesState = {}
 M.EnemiesState.__index = M.EnemiesState
 
+-- Construct enemy-state storage, including decoded arrays and engineered feature buffers.
+-- This central initializer exists so update() can stay focused on per-frame decoding work.
 function M.EnemiesState:new()
     local self = setmetatable({}, M.EnemiesState)
     -- Active enemy counts
@@ -815,6 +840,8 @@ function M.EnemiesState:new()
 end
 
 -- EnemiesState update needs game_state, player_state, level_state, and abs_to_rel_func
+-- Decode enemy slots/shots, engineer derived features, and compute tactical hint fields.
+-- This function exists so feature generation stays synchronized with raw memory decoding.
 function M.EnemiesState:update(mem, game_state, player_state, level_state, abs_to_rel_func)
     -- Get player position and level type for relative calculations
     local player_abs_segment = player_state.position & 0x0F -- Get current player absolute segment
@@ -1100,6 +1127,8 @@ end
 
 
 -- Helper functions for display (can be called on an instance)
+-- Format packed type bits into a compact human-readable display token.
+-- Kept as a method so debug views do not duplicate bit-decoding rules.
 function M.EnemiesState:decode_enemy_type(type_byte)
     local enemy_type = type_byte & ENEMY_TYPE_MASK -- Use the mask
     local between_segments = (type_byte & 0x80) ~= 0
@@ -1111,6 +1140,8 @@ function M.EnemiesState:decode_enemy_type(type_byte)
     )
 end
 
+-- Format packed state bits for display/debug output.
+-- This keeps visual diagnostics consistent with decoded runtime semantics.
 function M.EnemiesState:decode_enemy_state(state_byte)
     local split_behavior = state_byte & 0x03
     local can_shoot = (state_byte & 0x40) ~= 0
@@ -1122,6 +1153,8 @@ function M.EnemiesState:decode_enemy_state(state_byte)
     )
 end
 
+-- Return aggregate active-enemy count across all enemy classes.
+-- Exposed as a helper so UI/reward code can query one canonical total.
 function M.EnemiesState:get_total_active()
     return self.active_flippers + self.active_pulsars + self.active_tankers +
         self.active_spikers + self.active_fuseballs

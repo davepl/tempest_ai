@@ -38,6 +38,8 @@ class NStepReplayBuffer:
     def reset(self):
         self._deque.clear()
 
+    # Implements the make experience path for NStepReplayBuffer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _make_experience(self):
         R = 0.0
         priority_R = 0.0
@@ -69,6 +71,8 @@ class NStepReplayBuffer:
                 return True
         return False
 
+    # Ingests a new record into NStepReplayBuffer while updating all bookkeeping fields.
+    # The insert path is centralized so capacity rollover and counters stay correct.
     def add(self, state, action, reward, next_state, done,
             actor: Optional[str] = None, priority_reward: Optional[float] = None):
         pr = priority_reward if priority_reward is not None else reward

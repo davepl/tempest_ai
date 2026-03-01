@@ -66,6 +66,8 @@ class AsyncReplayBuffer:
     Non-blocking async wrapper for agent.step() calls.
     Queues experiences and inserts them in batches on a background thread.
     """
+    # Builds the initial state for AsyncReplayBuffer and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, agent, batch_size=1000, max_queue_size=10000):
         self.agent = agent
         self.batch_size = batch_size
@@ -88,6 +90,8 @@ class AsyncReplayBuffer:
             self.items_dropped += 1
             return False
     
+    # Implements the consume queue path for AsyncReplayBuffer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _consume_queue(self):
         batch = []
         while self.running:
@@ -114,6 +118,8 @@ class AsyncReplayBuffer:
                 print(f"AsyncReplayBuffer worker error: {e}")
                 time.sleep(0.01)
                 
+    # Owns the stop lifecycle for AsyncReplayBuffer, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         self.running = False
         remaining = []
@@ -142,6 +148,8 @@ class AsyncReplayBuffer:
 
 
 class SocketServer:
+    # Builds the initial state for SocketServer and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, host, port, agent, metrics_wrapper):
         self.host = host
         self.port = port
@@ -165,6 +173,8 @@ class SocketServer:
                 cid += 1
             return cid
 
+    # Implements the init client state path for SocketServer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _init_client_state(self, client_id):
         n_step = int(max(1, int(getattr(RL_CONFIG, "n_step", 1) or 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99) or 0.99)
@@ -191,6 +201,8 @@ class SocketServer:
             }
             metrics.client_count = len(self.client_states)
 
+    # Runs the full per-client socket loop: decode frame, train on previous step, and reply with an action.
+    # Keeping protocol flow in one function makes the Lua bridge state machine easier to reason about.
     def handle_client(self, client_socket, client_id):
         try:
             client_socket.setblocking(False)
@@ -479,6 +491,8 @@ class SocketServer:
             if cleaned:
                 metrics.client_count = len(self.clients)
 
+    # Implements the calculate average level path for SocketServer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def calculate_average_level(self):
         with self.client_lock:
             valid = [s.get('level_number', 0) for s in self.client_states.values() if s.get('level_number', 0) >= 0]
@@ -490,6 +504,8 @@ class SocketServer:
                 metrics.average_level = 0
                 return 0
 
+    # Owns the start lifecycle for SocketServer, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -550,6 +566,8 @@ class SocketServer:
         finally:
             self.stop()
 
+    # Owns the stop lifecycle for SocketServer, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         # Idempotent stop: avoid duplicate shutdown/flush when called from multiple places.
         if self.shutdown_event.is_set() and not self.running:

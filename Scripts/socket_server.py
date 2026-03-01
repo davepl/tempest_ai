@@ -48,6 +48,8 @@ except ImportError:
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
 class AsyncReplayBuffer:
+    # Builds the initial state for AsyncReplayBuffer and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, agent, batch_size=100, max_queue_size=10000):
         self.agent = agent
         self.batch_size = batch_size
@@ -72,6 +74,8 @@ class AsyncReplayBuffer:
         except queue.Full:
             pass
 
+    # Implements the consume path for AsyncReplayBuffer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _consume(self):
         while self.running:
             try:
@@ -116,6 +120,8 @@ class AsyncReplayBuffer:
         """Clean up index tracking when a client disconnects."""
         self._client_indices.pop(client_id, None)
 
+    # Owns the stop lifecycle for AsyncReplayBuffer, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         self.running = False
         # Drain remaining
@@ -156,6 +162,8 @@ class AsyncInferenceBatcher:
         self._thread = threading.Thread(target=self._consume, daemon=True, name="InferBatchWorker")
         self._thread.start()
 
+    # Implements the infer path for AsyncInferenceBatcher.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def infer(self, state, epsilon: float):
         if not self.running:
             return self.agent.act(state, epsilon)
@@ -168,6 +176,8 @@ class AsyncInferenceBatcher:
             return self.agent.act(state, epsilon)
         return req.action if req.action is not None else (0, 0, False)
 
+    # Implements the consume path for AsyncInferenceBatcher.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _consume(self):
         while self.running or not self.queue.empty():
             try:
@@ -204,6 +214,8 @@ class AsyncInferenceBatcher:
                 req.action = act
                 req.event.set()
 
+    # Owns the stop lifecycle for AsyncInferenceBatcher, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         self.running = False
         self._thread.join(timeout=5.0)
@@ -218,6 +230,8 @@ class AsyncInferenceBatcher:
 
 # ── Socket Server ───────────────────────────────────────────────────────────
 class SocketServer:
+    # Builds the initial state for SocketServer and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, host, port, agent, metrics_wrapper):
         self.host = host
         self.port = port
@@ -253,6 +267,8 @@ class SocketServer:
                 cid += 1
             return cid
 
+    # Implements the init client path for SocketServer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _init_client(self, cid):
         n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
@@ -268,6 +284,8 @@ class SocketServer:
             }
             metrics.client_count = len(self.client_states)
 
+    # Runs the full per-client socket loop: decode frame, train on previous step, and reply with an action.
+    # Keeping protocol flow in one function makes the Lua bridge state machine easier to reason about.
     def handle_client(self, sock, cid):
         try:
             sock.setblocking(False)
@@ -511,6 +529,8 @@ class SocketServer:
                 del self.clients[k]
             metrics.client_count = len(self.clients)
 
+    # Implements the calc avg level path for SocketServer.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _calc_avg_level(self):
         try:
             with self.client_lock:
@@ -522,6 +542,8 @@ class SocketServer:
         except Exception:
             pass
 
+    # Owns the start lifecycle for SocketServer, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -574,6 +596,8 @@ class SocketServer:
         finally:
             self.stop()
 
+    # Owns the stop lifecycle for SocketServer, including thread/socket coordination.
+    # Explicit lifecycle boundaries prevent background workers from leaking across runs.
     def stop(self):
         if self.shutdown_event.is_set() and not self.running:
             return

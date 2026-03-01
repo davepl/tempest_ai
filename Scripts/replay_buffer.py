@@ -120,6 +120,8 @@ class PrioritizedReplayBuffer:
     Thread-safe via a reentrant lock.
     """
 
+    # Builds the initial state for PrioritizedReplayBuffer and wires the dependencies it needs.
+    # Keeping setup in one place avoids partially initialized objects in hot paths.
     def __init__(self, capacity: int, state_size: int, alpha: float = 0.6):
         self.capacity = int(capacity)
         self.state_size = int(state_size)
@@ -150,6 +152,8 @@ class PrioritizedReplayBuffer:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
+    # Ingests a new record into PrioritizedReplayBuffer while updating all bookkeeping fields.
+    # The insert path is centralized so capacity rollover and counters stay correct.
     def add(self, state, action: int, reward: float, next_state, done: bool,
             horizon: int = 1, expert: int = 0, priority_hint: float = 0.0):
         with self.lock:

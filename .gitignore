@@ -3,9 +3,11 @@ Scripts/models
 Scripts/__pycache__
 cfg
 nvram
+models
 .venv/
 venv/
 *.log
 *.pyc
 audio/*.mp3
 log.txt
+models/tempest_model_latest.pt

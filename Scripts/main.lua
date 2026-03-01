@@ -46,6 +46,7 @@ local startlevtbl = {
 
 --- Find the startlevtbl index whose level is closest to (but not exceeding)
 --- the desired 1-based level.  Returns 0-based index.
+-- This helper exists so server-driven start-level requests map to the exact ROM table index.
 local function level_to_select_index(desired_level_1based)
     local target = math.max(0, desired_level_1based - 1)  -- convert to 0-based
     local best_idx = 0
@@ -70,7 +71,8 @@ local frames_waited = 0
 local last_fps_time = os.time()
 local last_frame_counter_for_fps = 0
 
--- Initialize MAME Interface (CPU and Memory)
+-- Resolve the MAME CPU/memory handles used by the frame loop.
+-- We keep fallback probing here so the rest of the script can assume `mem` is valid.
 local function initialize_mame_interface()
     local success, err = pcall(function()
         if not manager or not manager.machine then error("MAME manager.machine not available") end
@@ -102,6 +104,8 @@ local function initialize_mame_interface()
 end
 
 -- Socket Management
+-- Close and clear the active socket handle safely.
+-- Centralized cleanup prevents reconnect paths from leaking stale file handles.
 local function close_socket()
     if current_socket then
         current_socket:close()
@@ -110,6 +114,8 @@ local function close_socket()
     end
 end
 
+-- Open the Lua-to-Python socket and send the protocol handshake.
+-- This exists so reconnect logic can reuse one connection bootstrap path.
 local function open_socket()
     close_socket() -- Ensure any existing socket is closed first
 
@@ -143,6 +149,8 @@ end
 local Controls = {}
 Controls.__index = Controls
 
+-- Resolve and cache MAME input fields used by AI control output.
+-- This setup function exists so per-frame action application avoids repeated port lookups.
 function Controls:new(mame_manager)
     local self = setmetatable({}, Controls)
     local ioport = mame_manager.machine.ioport
@@ -167,6 +175,8 @@ function Controls:new(mame_manager)
 end
 
 -- Apply received AI action and overrides to game controls
+-- Write fire/zap/start inputs and spinner movement into MAME.
+-- Keeping hardware writes in one place avoids input desync across code paths.
 function Controls:apply_action(fire, zap, spinner, p1_start, memory)
     -- Debug values just before setting (simplified)
     -- print(string.format("[DEBUG apply_action] p1_start_val=%s, p1_start_field_valid=%s",
@@ -197,6 +207,8 @@ local enemies_state = state_defs.EnemiesState:new()
 local controls = nil -- Initialized after MAME interface confirmed
 
 -- Flatten game state to binary format for sending over socket
+-- Serialize the full frame payload (normalized features + OOB header) for Python.
+-- This function exists to keep protocol layout and feature normalization tightly coupled.
 local function flatten_game_state_to_binary(reward, subj_reward, obj_reward, gs, ls, ps, es, bDone, expert_target_seg, expert_fire_packed, expert_zap_packed)
     local insert = table.insert -- Local alias for performance
 
@@ -586,6 +598,8 @@ end
 
 
 -- Send state and receive action via socket
+-- Execute one round-trip with the Python server: send frame bytes, read action bytes.
+-- We isolate transport details here so frame logic can treat network I/O as a single call.
 local function process_frame_via_socket(rawdata)
     -- Ensure socket connection
     if not current_socket then
@@ -659,6 +673,8 @@ local function process_frame_via_socket(rawdata)
 end
 
 -- Update all game state objects
+-- Refresh all decoded state snapshots from current MAME memory values.
+-- This keeps frame processing deterministic by updating every state object in one step.
 local function update_game_states(memory)
     game_state:update(memory)
     level_state:update(memory)
@@ -669,6 +685,8 @@ local function update_game_states(memory)
 end
 
 -- Perform AI interaction (calculate reward, expert advice, send state, receive action)
+-- Run reward calculation, expert hint generation, and optional socket inference for one frame.
+-- This exists so frame_callback() stays readable while policy/transport sequencing stays consistent.
 local function handle_ai_interaction()
     -- Calculate reward based on current state and detected actions
     local r1, r2, r3, r4 = logic.calculate_reward(game_state, level_state, player_state, enemies_state, logic.absolute_to_relative_segment)
@@ -728,6 +746,8 @@ local function handle_ai_interaction()
 end
 
 -- Determine the final action based on game state and AI commands (Returns: fire, zap, spinner, start)
+-- Resolve final control outputs after applying game-state-specific overrides.
+-- Keeping this as a single decision gate prevents override rules from scattering across the frame loop.
 local function determine_final_actions()
     -- Initialize all commands to 0, apply overrides below
     local final_fire_cmd = 0
@@ -789,6 +809,8 @@ local function determine_final_actions()
 end
 
 -- Update the console display if enabled and interval has passed
+-- Throttle and render the debug/status display.
+-- This helper prevents expensive terminal updates from running every frame.
 local function update_display_if_needed(num_values_packed)
     local current_time_high_res = os.clock()
     if SHOW_DISPLAY and (current_time_high_res - last_display_update) >= DISPLAY_UPDATE_INTERVAL then
@@ -798,6 +820,8 @@ local function update_display_if_needed(num_values_packed)
 end
 
 -- Apply cheats/overrides
+-- Apply memory tweaks required for credits/start-level behavior and copy-protection bypass.
+-- We isolate these writes so they are easy to audit or disable as a group.
 local function apply_overrides(memory)
     memory:write_u8(0x0006, 2) -- Credits
     memory:write_direct_u8(0xA591, 0xEA) -- NOP Copy Prot
@@ -814,6 +838,8 @@ end
 
 
 -- Main frame callback for MAME
+-- Per-frame orchestrator: update state, talk to the agent, apply controls, and render telemetry.
+-- This is the single callback MAME drives, so it owns the order of all frame-side effects.
 local function frame_callback()
     -- Frame skipping logic
     local currentTimer = mem:read_u8(0x0003)
@@ -857,6 +883,8 @@ local function frame_callback()
 end
 
 -- Function called when MAME is shutting down
+-- Best-effort shutdown hook that emits a final save-signaled frame and closes resources.
+-- Keeping shutdown handling explicit prevents dropped checkpoints on emulator exit.
 local function on_mame_exit()
     print("MAME is shutting down...")
     shutdown_requested = true -- Signal for final save

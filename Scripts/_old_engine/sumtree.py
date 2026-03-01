@@ -58,6 +58,8 @@ class SumTree:
         dataIdx = idx - self.capacity + 1
         return (idx, self.tree[idx], dataIdx)
 
+    # Implements the retrieve path for SumTree.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _retrieve(self, idx, s):
         left = 2 * idx + 1
         right = left + 1

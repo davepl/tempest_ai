@@ -496,6 +496,8 @@ def display_metrics_row(agent, kb_handler):
     except Exception:
         pass
 
+    # Implements the format reward path for terminal metrics output.
+    # Keeping it isolated keeps call sites small while containing side effects in one place.
     def _format_reward(value, width=9, marker=""):
         try:
             val = float(value)

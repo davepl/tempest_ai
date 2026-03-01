@@ -4,12 +4,12 @@
 # ||                                   TEMPEST AI • APPLICATION ENTRY POINT                                       ||
 # ||                                                                                                              ||
 # ||  FILE: Scripts/main.py                                                                                       ||
-# ||  ROLE: Boots the socket server, spawns keyboard and stats threads, and coordinates graceful shutdown.         ||
+# ||  ROLE: Boots the socket server, spawns keyboard and stats threads, and coordinates graceful shutdown.        ||
 # ||                                                                                                              ||
 # ||  NEED TO KNOW:                                                                                               ||
 # ||   - Creates model dir; instantiates DiscreteDQNAgent; loads latest model if present.                         ||
 # ||   - Starts SocketServer (Lua <-> Python bridge) and metrics display loop.                                    ||
-# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t,v), LR adjust (l/L), bucket stats (b).          ||
+# ||   - Keyboard controls: save (s), quit (q), toggles (o,e,p,t,v), LR adjust (l/L), bucket stats (b).           ||
 # ||                                                                                                              ||
 # ||  CONSUMES: RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, SERVER_CONFIG, metrics                                   ||
 # ||  PRODUCES: running server, periodic metrics rows, on-exit model save                                         ||
