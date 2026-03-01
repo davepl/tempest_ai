@@ -3,7 +3,6 @@ Scripts/models
 Scripts/__pycache__
 cfg
 nvram
-models
 .venv/
 venv/
 *.log
