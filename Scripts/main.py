@@ -262,7 +262,7 @@ def print_network_info(agent):
     tr = sum(p.numel() for p in net.parameters() if p.requires_grad)
 
     print(f"\n📐 Architecture:")
-    print(f"   State size:       {agent.state_size}")
+    print(f"   State size:       {agent.state_size} ({RL_CONFIG.state_size} × {RL_CONFIG.frame_stack} frames)")
     print(f"   Actions:          {RL_CONFIG.num_firezap_actions} fire/zap × {RL_CONFIG.num_spinner_actions} spinner = {RL_CONFIG.num_joint_actions}")
     print(f"   Trunk:            {RL_CONFIG.trunk_layers} layers × {RL_CONFIG.trunk_hidden} hidden")
     print(f"   Enemy attention:  {'ON' if RL_CONFIG.use_enemy_attention else 'OFF'} ({RL_CONFIG.attn_heads} heads, dim={RL_CONFIG.attn_dim})")
@@ -292,7 +292,8 @@ def print_network_info(agent):
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    agent = RainbowAgent(state_size=RL_CONFIG.state_size)
+    stacked_size = RL_CONFIG.state_size * max(1, RL_CONFIG.frame_stack)
+    agent = RainbowAgent(state_size=stacked_size)
     dev = getattr(agent.device, "type", "unknown")
     print(f"🧮 Device: {dev.upper()}")
 

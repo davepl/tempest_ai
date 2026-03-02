@@ -267,11 +267,11 @@ class _DashboardState:
                 ad = cfg.attn_dim
                 th = cfg.trunk_hidden
                 tl = cfg.trunk_layers
-                ss = cfg.state_size
+                ss = cfg.state_size * max(1, getattr(cfg, 'frame_stack', 1))
                 na = cfg.num_firezap_actions * len(cfg.spinner_command_levels)
                 n_atoms = cfg.num_atoms if cfg.use_distributional else 1
                 hm = th // 2
-                attn_p = (5 * ad + ad) + 2 * ad + (14 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
+                attn_p = (5 * ad + ad) + 2 * ad + (15 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
                 trunk_p = (ss + ad) * th + th + 2 * th
                 for _ in range(1, tl):
                     trunk_p += th * th + th + 2 * th
@@ -279,7 +279,7 @@ class _DashboardState:
                 param_count = attn_p + trunk_p + heads_p
         except Exception:
             param_count = 0
-        trunk_in = cfg.state_size + (cfg.attn_dim if cfg.use_enemy_attention else 0)
+        trunk_in = cfg.state_size * max(1, getattr(cfg, 'frame_stack', 1)) + (cfg.attn_dim if cfg.use_enemy_attention else 0)
         layers = [str(trunk_in)]
         for _ in range(cfg.trunk_layers):
             layers.append(str(cfg.trunk_hidden))

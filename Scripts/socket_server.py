@@ -273,6 +273,11 @@ class SocketServer:
         n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
         nstep = NStepReplayBuffer(n_step=n, gamma=gamma) if n > 1 else None
+        fs = max(1, int(getattr(RL_CONFIG, "frame_stack", 1)))
+        fs_skip = max(1, int(getattr(RL_CONFIG, "frame_stack_skip", 1)))
+        raw_size = int(SERVER_CONFIG.params_count)
+        # History must hold enough frames to reach back (fs-1)*skip frames
+        hist_len = 1 + (fs - 1) * fs_skip if fs > 1 else 1
         with self.client_lock:
             self.client_states[cid] = {
                 "frames": 0, "last_time": time.time(), "fps": 0.0,
@@ -281,8 +286,37 @@ class SocketServer:
                 "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
+                "frame_history": deque(maxlen=hist_len),
+                "frame_stack": fs, "frame_stack_skip": fs_skip,
+                "raw_state_size": raw_size,
             }
             metrics.client_count = len(self.client_states)
+
+    @staticmethod
+    def _build_stacked_state(raw_state: np.ndarray, cs: dict) -> np.ndarray:
+        """Build a frame-stacked state: [current, t-skip, t-2*skip, ...].
+
+        The current frame occupies indices 0..raw_size-1 so that attention
+        modules (which use hardcoded offsets) work without changes.
+        With skip=3 and stack=4, the stack spans frames at t, t-3, t-6, t-9.
+        """
+        history = cs["frame_history"]
+        fs = cs["frame_stack"]
+        skip = cs.get("frame_stack_skip", 1)
+        raw_size = cs["raw_state_size"]
+        # Push current frame into history
+        history.append(raw_state.copy())
+        if fs <= 1:
+            return raw_state
+        # Build stack: current first, then every skip-th older frame
+        parts = [raw_state]
+        for i in range(1, fs):
+            idx = len(history) - 1 - i * skip
+            if idx >= 0:
+                parts.append(history[idx])
+            else:
+                parts.append(np.zeros(raw_size, dtype=np.float32))
+        return np.concatenate(parts)
 
     # Runs the full per-client socket loop: decode frame, train on previous step, and reply with an action.
     # Keeping protocol flow in one function makes the Lua bridge state machine easier to reason about.
@@ -290,8 +324,13 @@ class SocketServer:
         try:
             sock.setblocking(False)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+            # Disable delayed ACKs for lower latency in request-response IPC.
+            # The kernel can reset this flag, so we also re-apply after each recv.
+            _has_quickack = hasattr(socket, "TCP_QUICKACK")
+            if _has_quickack:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
 
             # Handshake
             try:
@@ -327,6 +366,10 @@ class SocketServer:
                         raise ConnectionError("Broken")
                     data += chunk
                     rem -= len(chunk)
+
+                # Re-arm TCP_QUICKACK after each message (kernel resets it)
+                if _has_quickack:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
 
                 if len(data) >= 2:
                     n = struct.unpack(">H", data[:2])[0]
@@ -367,6 +410,9 @@ class SocketServer:
                     self._calc_avg_level()
                 self.metrics.update_game_state(frame.enemy_seg, frame.open_level)
 
+                # ── Frame stacking ───────────────────────────────────────
+                stacked_state = self._build_stacked_state(frame.state, cs)
+
                 # ── Process previous step ───────────────────────────────
                 if cs.get("last_state") is not None and cs.get("last_action") is not None:
                     fz_i, sp_i = cs["last_action"]
@@ -383,7 +429,7 @@ class SocketServer:
                         if nstep is not None:
                             joint = combine_action_indices(fz_i, sp_i)
                             matured = nstep.add(cs["last_state"], joint, total_r,
-                                                frame.state, bool(frame.done),
+                                                stacked_state, bool(frame.done),
                                                 actor=tag, priority_reward=total_r)
                             for s0, a, Rn, pR, sn, dn, h, act in matured:
                                 fz_n, sp_n = split_joint_action(a)
@@ -393,7 +439,7 @@ class SocketServer:
                         else:
                             self.async_buffer.step_async(
                                 cs["last_state"], (fz_i, sp_i), total_r,
-                                frame.state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
+                                stacked_state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
                                 priority_reward=total_r)
 
                     cs["total_reward"] += total_r
@@ -437,6 +483,7 @@ class SocketServer:
                     cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
                     cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
                     cs["ep_frames"] = 0
+                    cs["frame_history"].clear()
                     continue
 
                 if cs.get("was_done"):
@@ -474,9 +521,9 @@ class SocketServer:
                             epsilon *= float(getattr(RL_CONFIG, "epsilon_zoom_multiplier", 0.2))
                         t0 = time.perf_counter()
                         if self.inference_batcher is not None:
-                            fz_idx, sp_idx, is_epsilon = self.inference_batcher.infer(frame.state, epsilon)
+                            fz_idx, sp_idx, is_epsilon = self.inference_batcher.infer(stacked_state, epsilon)
                         else:
-                            fz_idx, sp_idx, is_epsilon = self.agent.act(frame.state, epsilon)
+                            fz_idx, sp_idx, is_epsilon = self.agent.act(stacked_state, epsilon)
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         fire, zap = discrete_to_fire_zap(fz_idx)
                         spinner_val = spinner_index_to_value(sp_idx)
@@ -488,7 +535,7 @@ class SocketServer:
                                 fz_idx = fire_zap_to_discrete(fire, zap)
                         action_source = "dqn"
 
-                cs["last_state"] = frame.state
+                cs["last_state"] = stacked_state
                 cs["last_action"] = (fz_idx, sp_idx)
                 cs["prev_action_source"] = action_source
                 cs["last_action_source"] = action_source

@@ -37,6 +37,8 @@ SERVER_CONFIG = ServerConfigData()
 class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     state_size: int = SERVER_CONFIG.params_count
+    frame_stack: int = 4                   # Number of frames to concatenate
+    frame_stack_skip: int = 3               # Sample every N-th frame (1=consecutive, 3=every 3rd)
 
     # Factored action space  (4 fire/zap × 11 spinner = 44 actions)
     num_firezap_actions: int = 4
@@ -52,7 +54,7 @@ class RLConfigData:
 
     # ── network architecture ────────────────────────────────────────────
     trunk_hidden: int = 384
-    trunk_layers: int = 2
+    trunk_layers: int = 3
     use_layer_norm: bool = True
     dropout: float = 0.0
 
@@ -77,17 +79,17 @@ class RLConfigData:
 
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 768
-    lr: float = 1e-4                       # linear-scaled (2×) from 5e-5 for 256→512 batch increase
+    lr: float = 4e-4                       # linear-scaled (2×) from 5e-5 for 256→512 batch increase
     lr_min: float = 4e-5                   # linear-scaled (2×) from 2e-5 for 256→512 batch increase
     lr_warmup_steps: int = 5_000
     lr_cosine_period: int = 3_000_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 20      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 50      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 25_000_000
+    memory_size: int = 30_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -157,11 +159,11 @@ class RLConfigData:
     inference_on_cpu: bool = False
     # Device placement (CUDA only): useful on multi-GPU hosts.
     train_cuda_device_index: int = 0
-    inference_cuda_device_index: int = 0
+    inference_cuda_device_index: int = 1
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True
-    inference_batch_max_size: int = 128
+    inference_batch_max_size: int = 255
     inference_batch_wait_ms: float = 1.0
     inference_request_timeout_ms: float = 50.0
 

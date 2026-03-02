@@ -263,47 +263,54 @@ class PrioritizedReplayBuffer:
     # ── Persistence ─────────────────────────────────────────────────────
 
     def save(self, filepath: str, verbose: bool = True):
-        """Save the full replay buffer as individual .npy files in a directory."""
+        """Save the full replay buffer as individual .npy files in a directory.
+
+        To avoid doubling resident memory (states + next_states alone can be
+        ~200 GB), we copy and write ONE array at a time, freeing the copy
+        before moving to the next.  Peak overhead ≈ size of the single
+        largest array (~101 GB for states at 30M×908) instead of all eight.
+        """
         with self.lock:
             if self.size == 0:
                 if verbose:
                     print("  Replay buffer is empty — nothing to save.")
                 return
-
             n = self.size
-            if verbose:
-                print(f"  Saving replay buffer ({n:,} transitions)...")
-            t0 = time.time()
-            if verbose:
-                self._progress_bar("  Replay save", 0.05)
-
-            # Snapshot arrays while holding the lock
-            arrays = {
-                "states":      self.states[:n].copy(),
-                "next_states": self.next_states[:n].copy(),
-                "actions":     self.actions[:n].copy(),
-                "rewards":     self.rewards[:n].copy(),
-                "dones":       self.dones[:n].copy(),
-                "horizons":    self.horizons[:n].copy(),
-                "is_expert":   self.is_expert[:n].copy(),
-                "priorities":  self.tree.tree[self.tree.capacity:self.tree.capacity + n].copy(),
-            }
             meta = np.array([self.tree.data_ptr, n, self.tree.max_priority])
-            if verbose:
-                self._progress_bar("  Replay save", 0.15)
 
-        # Write outside the lock to minimise contention
+        if verbose:
+            print(f"  Saving replay buffer ({n:,} transitions)...")
+        t0 = time.time()
+
         tmp_dir = filepath + ".tmp"
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         os.makedirs(tmp_dir, exist_ok=True)
 
-        names = list(arrays.keys())
-        for i, name in enumerate(names):
-            np.save(os.path.join(tmp_dir, f"{name}.npy"), arrays[name])
+        # (name, source_array) — order doesn't matter for correctness.
+        array_specs = [
+            ("states",      lambda: self.states[:n]),
+            ("next_states", lambda: self.next_states[:n]),
+            ("actions",     lambda: self.actions[:n]),
+            ("rewards",     lambda: self.rewards[:n]),
+            ("dones",       lambda: self.dones[:n]),
+            ("horizons",    lambda: self.horizons[:n]),
+            ("is_expert",   lambda: self.is_expert[:n]),
+            ("priorities",  lambda: self.tree.tree[self.tree.capacity:self.tree.capacity + n]),
+        ]
+
+        total_bytes = 0
+        for i, (name, src_fn) in enumerate(array_specs):
+            # Brief lock: snapshot one array, release, write, free.
+            with self.lock:
+                arr = src_fn().copy()
+            total_bytes += arr.nbytes
+            np.save(os.path.join(tmp_dir, f"{name}.npy"), arr)
+            del arr                       # free before copying the next
             if verbose:
-                frac = 0.15 + 0.70 * ((i + 1) / len(names))
-                self._progress_bar("  Replay save", frac)
+                frac = (i + 1) / len(array_specs)
+                self._progress_bar("  Replay save", frac * 0.95)
+
         np.save(os.path.join(tmp_dir, "_meta.npy"), meta)
 
         # Atomic rename
@@ -317,7 +324,6 @@ class PrioritizedReplayBuffer:
             self._progress_bar("  Replay save", 1.0)
 
         elapsed = time.time() - t0
-        total_bytes = sum(a.nbytes for a in arrays.values())
         mb = total_bytes / (1024 * 1024)
         if verbose:
             print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")

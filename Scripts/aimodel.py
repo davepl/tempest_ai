@@ -236,7 +236,9 @@ class LaneCrossAttentionEncoder(nn.Module):
 
     Architecture:
       1. Lane tokens:  16 × [spike, angle, player_here, sin_pos, cos_pos] → Linear → embed
-      2. Enemy tokens:  7 × [decoded(6), seg, depth, top, toprail, Δseg, Δdepth, sin, cos] → Linear → embed
+      2. Enemy tokens:  (7 × frame_stack) × [decoded(6), seg, depth, top, toprail,
+                         Δseg, Δdepth, sin, cos, temporal_idx] → Linear → embed
+         Temporal tokens let lanes attend to enemy trajectories across time.
       3. Cross-attention: lanes (Q) attend to enemies (K/V) with empty-slot masking
       4. Residual connection + LayerNorm on enriched lanes
       5. Mean-pool enriched lanes → fixed-size summary vector
@@ -316,11 +318,14 @@ class RainbowNet(nn.Module):
         # ── Lane-Cross-Attention Encoder ───────────────────────────────
         self.use_attn = cfg.use_enemy_attention
         attn_out_dim = 0
+        # Store frame-stacking geometry for temporal enemy tokens
+        self.frame_stack = max(1, int(getattr(cfg, 'frame_stack', 1)))
+        self.raw_state_size = int(cfg.state_size)  # single-frame width (195)
         if self.use_attn:
             self.lane_features = 5    # spike, angle, player_here, sin_pos, cos_pos
-            self.enemy_slot_features = 14  # 6 decoded + seg+depth+top+toprail + Δseg+Δdepth + sin+cos pos
+            self.enemy_slot_features = 15  # 14 spatial/decoded + 1 temporal index
             self.num_lanes = 16
-            self.num_enemy_slots = cfg.enemy_slots  # 7
+            self.num_enemy_slots = cfg.enemy_slots * self.frame_stack  # 7 * frame_stack
 
             self.lane_cross_attn = LaneCrossAttentionEncoder(
                 lane_features=self.lane_features,
@@ -334,6 +339,12 @@ class RainbowNet(nn.Module):
             lane_idx = torch.arange(16, dtype=torch.float32)
             self.register_buffer('_lane_sin_pos', torch.sin(2 * math.pi * lane_idx / 16))
             self.register_buffer('_lane_cos_pos', torch.cos(2 * math.pi * lane_idx / 16))
+            # Pre-compute temporal index values: 0.0 = current, 1.0 = oldest
+            if self.frame_stack > 1:
+                self.register_buffer('_temporal_idx',
+                    torch.linspace(0.0, 1.0, self.frame_stack))  # (frame_stack,)
+            else:
+                self.register_buffer('_temporal_idx', torch.zeros(1))
 
         # ── Trunk ──────────────────────────────────────────────────────
         # Input: full state concatenated with attention output
@@ -403,8 +414,8 @@ class RainbowNet(nn.Module):
         tokens = torch.stack([spike_heights, tube_angles, player_here, lane_sin, lane_cos], dim=2)
         return tokens
 
-    def _build_enemy_tokens(self, state: torch.Tensor):
-        """Build 7 enemy tokens from flat state vector.
+    def _build_enemy_tokens_single(self, frame: torch.Tensor):
+        """Build 7 enemy tokens from a single-frame state slice.
 
         Each enemy gets 14 features:
           [core_type, direction, between, moving_away, can_shoot, split,   (6 decoded)
@@ -413,27 +424,25 @@ class RainbowNet(nn.Module):
            sin_pos, cos_pos]                                                (2 circular pos)
 
         Returns:
-          tokens: (B, 7, 14) — sorted by depth (nearest first, empty last)
-          mask:   (B, 7) bool — True where slot is EMPTY
+          tokens: (B, 7, 14)
+          empty:  (B, 7) bool — True where slot is EMPTY
         """
-        B = state.shape[0]
-        device = state.device
+        B = frame.shape[0]
 
         # Decoded info: 7 slots × 6 features at indices 86..127
-        decoded = state[:, 86:128].reshape(B, 7, 6)          # (B, 7, 6)
+        decoded = frame[:, 86:128].reshape(B, 7, 6)           # (B, 7, 6)
         # Spatial per-slot
-        segs    = state[:, 128:135].unsqueeze(2)              # (B, 7, 1)
-        depths  = state[:, 135:142].unsqueeze(2)              # (B, 7, 1)
-        tops    = state[:, 142:149].unsqueeze(2)              # (B, 7, 1)
-        toprail = state[:, 171:178].unsqueeze(2)              # (B, 7, 1)
-        # Velocity per-slot (new state indices 181-194)
-        delta_seg   = state[:, 181:188].unsqueeze(2)          # (B, 7, 1)
-        delta_depth = state[:, 188:195].unsqueeze(2)          # (B, 7, 1)
+        segs    = frame[:, 128:135].unsqueeze(2)              # (B, 7, 1)
+        depths  = frame[:, 135:142].unsqueeze(2)              # (B, 7, 1)
+        tops    = frame[:, 142:149].unsqueeze(2)              # (B, 7, 1)
+        toprail = frame[:, 171:178].unsqueeze(2)              # (B, 7, 1)
+        # Velocity per-slot (state indices 181-194)
+        delta_seg   = frame[:, 181:188].unsqueeze(2)          # (B, 7, 1)
+        delta_depth = frame[:, 188:195].unsqueeze(2)          # (B, 7, 1)
 
         # Circular positional encoding for enemy absolute position
-        player_pos_norm = state[:, 5]                          # (B,)
-        enemy_rel_seg   = state[:, 128:135]                    # (B, 7) normalised [-1, 1]
-        # enemy_abs ≈ (player * 15 + enemy_rel * 15) mod 16 → fraction around circle
+        player_pos_norm = frame[:, 5]                          # (B,)
+        enemy_rel_seg   = frame[:, 128:135]                    # (B, 7) normalised [-1, 1]
         enemy_abs_raw  = player_pos_norm.unsqueeze(1) * 15 + enemy_rel_seg * 15  # (B, 7)
         enemy_abs_frac = torch.remainder(enemy_abs_raw, 16.0) / 16.0             # (B, 7) ∈ [0, 1)
         enemy_sin = torch.sin(2 * math.pi * enemy_abs_frac).unsqueeze(2)         # (B, 7, 1)
@@ -444,19 +453,61 @@ class RainbowNet(nn.Module):
                             delta_seg, delta_depth, enemy_sin, enemy_cos], dim=2)  # (B, 7, 14)
 
         # Empty mask: depth ≈ 0 → inactive slot
-        depth_vals = state[:, 135:142]                         # (B, 7)
+        depth_vals = frame[:, 135:142]                         # (B, 7)
         empty = (depth_vals < 1e-6)                            # (B, 7) True = empty
+        return tokens, empty
 
-        # Sort by depth: nearest first, empty slots last
-        sort_key = torch.where(empty, torch.tensor(2.0, device=device), depth_vals)
-        order = sort_key.argsort(dim=1)
-        order_exp = order.unsqueeze(2).expand_as(tokens)
-        tokens = torch.gather(tokens, 1, order_exp)
-        empty  = torch.gather(empty,  1, order)
+    def _build_enemy_tokens(self, state: torch.Tensor):
+        """Build temporal enemy tokens from ALL stacked frames.
 
-        # If ALL empty (e.g. between rounds), unmask all to avoid NaN
-        all_empty = empty.all(dim=1, keepdim=True)
-        empty = empty & ~all_empty
+        Each enemy gets 15 features: the 14 spatial/decoded features plus a
+        temporal index (0 = current, 1 = oldest).  With frame_stack=4 and
+        7 enemy slots, this produces 28 tokens total.
+
+        Tokens are sorted by depth within each frame (nearest first, empty
+        last), then concatenated across frames: [frame0(7), frame1(7), ...].
+
+        Returns:
+          tokens: (B, 7*frame_stack, 15) — sorted by depth per frame
+          mask:   (B, 7*frame_stack) bool — True where slot is EMPTY
+        """
+        B = state.shape[0]
+        device = state.device
+        fs = self.frame_stack
+        raw = self.raw_state_size
+
+        all_tokens = []
+        all_empty = []
+
+        for f in range(fs):
+            # Extract single-frame slice from stacked state
+            offset = f * raw
+            frame = state[:, offset:offset + raw]  # (B, raw_state_size)
+
+            tokens_f, empty_f = self._build_enemy_tokens_single(frame)  # (B, 7, 14), (B, 7)
+
+            # Sort by depth within this frame: nearest first, empty last
+            depth_vals = frame[:, 135:142]  # (B, 7)
+            sort_key = torch.where(empty_f, torch.tensor(2.0, device=device), depth_vals)
+            order = sort_key.argsort(dim=1)
+            order_exp = order.unsqueeze(2).expand_as(tokens_f)
+            tokens_f = torch.gather(tokens_f, 1, order_exp)
+            empty_f  = torch.gather(empty_f,  1, order)
+
+            # Append temporal index as 15th feature
+            t_idx = self._temporal_idx[f].expand(B, 7, 1)  # (B, 7, 1)
+            tokens_f = torch.cat([tokens_f, t_idx], dim=2)  # (B, 7, 15)
+
+            all_tokens.append(tokens_f)
+            all_empty.append(empty_f)
+
+        # Concatenate across frames: (B, 7*fs, 15), (B, 7*fs)
+        tokens = torch.cat(all_tokens, dim=1)
+        empty = torch.cat(all_empty, dim=1)
+
+        # If ALL empty across all frames, unmask all to avoid NaN
+        all_empty_mask = empty.all(dim=1, keepdim=True)
+        empty = empty & ~all_empty_mask
         return tokens, empty
 
     def forward(self, state: torch.Tensor, log: bool = False):
@@ -467,10 +518,10 @@ class RainbowNet(nn.Module):
         """
         B = state.shape[0]
 
-        # Lane-Cross-Attention
+        # Lane-Cross-Attention (temporal: lanes attend to enemies across all stacked frames)
         if self.use_attn:
             lane_tokens = self._build_lane_tokens(state)                    # (B, 16, 5)
-            enemy_tokens, enemy_mask = self._build_enemy_tokens(state)      # (B, 7, 14), (B, 7)
+            enemy_tokens, enemy_mask = self._build_enemy_tokens(state)      # (B, 7*fs, 15), (B, 7*fs)
             attn_out = self.lane_cross_attn(lane_tokens, enemy_tokens, enemy_mask)  # (B, D)
             trunk_in = torch.cat([state, attn_out], dim=1)
         else:
@@ -688,17 +739,15 @@ class RainbowAgent:
         self.inference_device = infer_dev
 
         # ── CUDA streams for overlapping training & inference ───────
-        # Training uses the default stream; inference gets a dedicated
-        # stream so forward passes on infer_net can overlap with
-        # backprop on online_net.  A CUDA event gates weight sync so
-        # inference never reads a partially-copied state dict.
+        # Inference gets a dedicated stream so forward passes on infer_net
+        # can overlap with backprop on online_net.  A CUDA event recorded
+        # after weight sync gates inference so it never reads a partially-
+        # copied state dict.  This works for both same-GPU and cross-GPU.
         self._inference_stream: torch.cuda.Stream | None = None
         self._sync_event: torch.cuda.Event | None = None
         if (
             self.use_separate_inference
             and infer_dev.type == "cuda"
-            and self.device.type == "cuda"
-            and infer_dev.index == self.device.index
         ):
             self._inference_stream = torch.cuda.Stream(device=infer_dev)
             self._sync_event = torch.cuda.Event()
@@ -764,26 +813,39 @@ class RainbowAgent:
             return
         if not force and (self.training_steps - self.last_inference_sync < RL_CONFIG.inference_sync_steps):
             return
+
+        same_cuda_device = (
+            self.device.type == "cuda"
+            and self.inference_device.type == "cuda"
+            and self.device.index == self.inference_device.index
+        )
+
+        # ── Build the state dict OUTSIDE the lock ──────────────────────
+        # Cross-device .to() can force a CUDA sync + PCIe DMA; doing it
+        # under the lock would block every inference request for the
+        # duration of the transfer.  Use non_blocking=True to overlap
+        # with GPU work and avoid implicit device syncs.
+        if self.inference_device.type == "cpu":
+            sd = {k: v.detach().cpu() for k, v in self.online_net.state_dict().items()}
+        elif same_cuda_device:
+            sd = self.online_net.state_dict()
+        else:
+            sd = {k: v.detach().to(self.inference_device, non_blocking=True)
+                  for k, v in self.online_net.state_dict().items()}
+
+        # ── Short critical section: swap weights + mark ready ──────────
         with self._sync_lock:
-            same_cuda_device = (
-                self.device.type == "cuda"
-                and self.inference_device.type == "cuda"
-                and self.device.index == self.inference_device.index
-            )
-            if self.inference_device.type == "cpu":
-                sd = {k: v.detach().cpu() for k, v in self.online_net.state_dict().items()}
-            elif same_cuda_device:
-                # Copy weights on the default (training) stream, then record
-                # an event so the inference stream knows the copy is done.
-                sd = self.online_net.state_dict()
-            else:
-                sd = {k: v.detach().to(self.inference_device) for k, v in self.online_net.state_dict().items()}
             self.infer_net.load_state_dict(sd, strict=False)
             self.infer_net.eval()
             self.last_inference_sync = self.training_steps
-            # Signal inference stream that new weights are ready
+            # Record event on inference device's default stream so the
+            # inference stream knows the load_state_dict writes have landed.
             if self._sync_event is not None:
-                self._sync_event.record()  # recorded on default stream
+                if not same_cuda_device:
+                    # For cross-GPU: ensure inference device finishes the
+                    # non-blocking copies before recording the event.
+                    torch.cuda.current_stream(self.inference_device).synchronize()
+                self._sync_event.record(torch.cuda.current_stream(self.inference_device))
 
     def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int, bool]:
         """Return (firezap_idx, spinner_idx, is_epsilon)."""
@@ -1133,13 +1195,15 @@ class RainbowAgent:
             enemy_tokens, enemy_mask = self.online_net._build_enemy_tokens(states)
             _, attn_w = self.online_net.lane_cross_attn(
                 lane_tokens, enemy_tokens, enemy_mask, return_weights=True
-            )  # (B, H, 16, 7)
+            )  # (B, H, 16, 7*fs)
         self.online_net.train()
 
-        # attn_w: (B, num_heads, 16_lanes, 7_enemies)
+        fs = self.online_net.frame_stack
+        slots_per_frame = 7
+        # attn_w: (B, num_heads, 16_lanes, 7*fs_enemies)
         B, H, L, S = attn_w.shape
         aw = attn_w.cpu().numpy()
-        em = enemy_mask.cpu().numpy()  # (B, 7) bool — True = empty
+        em = enemy_mask.cpu().numpy()  # (B, 7*fs) bool — True = empty
 
         import numpy as np
         eps = 1e-8
@@ -1147,17 +1211,20 @@ class RainbowAgent:
         lines.append("\n" + "=" * 70)
         lines.append("  LANE-CROSS-ATTENTION DIAGNOSTICS".center(70))
         lines.append("=" * 70)
-        lines.append(f"  Shape: {B} samples × {H} heads × {L} lanes → {S} enemy slots")
+        lines.append(f"  Shape: {B} samples × {H} heads × {L} lanes → {S} enemy tokens ({slots_per_frame}×{fs} frames)")
 
-        # Enemy slot occupancy
-        occ_rate = 1.0 - em.mean(axis=0)  # (7,)
-        lines.append(f"\n  Enemy slot occupancy:")
-        for s in range(S):
-            bar = "█" * int(occ_rate[s] * 20) + "░" * (20 - int(occ_rate[s] * 20))
-            lines.append(f"    Slot {s}: {occ_rate[s]:.1%}  {bar}")
-        lines.append(f"    Avg active: {occ_rate.sum():.1f} / {S}")
+        # Enemy slot occupancy (report per-frame)
+        occ_rate = 1.0 - em.mean(axis=0)  # (S,) = (7*fs,)
+        lines.append(f"\n  Enemy slot occupancy (per frame):")
+        for f in range(fs):
+            f_start = f * slots_per_frame
+            f_occ = occ_rate[f_start:f_start + slots_per_frame]
+            f_avg = f_occ.mean()
+            label = "current" if f == 0 else f"t-{f}"
+            lines.append(f"    Frame {label}: avg {f_avg:.1%} ({f_occ.sum():.1f}/{slots_per_frame} active)")
+        lines.append(f"    Total active: {occ_rate.sum():.1f} / {S}")
 
-        # 1. Entropy per head (max = ln(7) ≈ 1.946 for 7 enemy keys)
+        # 1. Entropy per head (max = ln(S) for S enemy keys)
         max_entropy = np.log(S)
         entropy = -(aw * np.log(aw + eps)).sum(axis=-1)  # (B, H, L)
         mean_entropy_per_head = entropy.mean(axis=(0, 2))  # (H,)
@@ -1206,7 +1273,13 @@ class RainbowAgent:
         # 3. Spatial coherence: do lanes attend more to nearby enemies?
         #    For each (lane, enemy) pair, compute angular distance on the tube circle.
         #    Check if attention weight correlates with proximity.
-        enemy_segs = states[:, 128:135].cpu().numpy()  # (B, 7) normalised rel segs
+        #    Use the sorted token data directly (feature 6 = rel seg) to stay
+        #    consistent with the per-frame depth sort in _build_enemy_tokens().
+        raw = self.online_net.raw_state_size
+        et_np = enemy_tokens.cpu().numpy()  # (B, S, 15) — already sorted
+        all_player_pos = []  # (B,) per frame
+        for f in range(fs):
+            all_player_pos.append(states[:, f * raw + 5].cpu().numpy())
         spatial_close_attn = []
         spatial_far_attn = []
         for b in range(B):
@@ -1214,8 +1287,12 @@ class RainbowAgent:
                 for s_idx in range(S):
                     if em[b, s_idx]:
                         continue
-                    # Enemy lane on circle
-                    e_abs = (player_lanes[b] + enemy_segs[b, s_idx] * 15) % 16
+                    f_idx = s_idx // slots_per_frame
+                    # Read relative seg from the sorted token (feature index 6)
+                    rel_seg = et_np[b, s_idx, 6]
+                    p_lane = int(round(all_player_pos[f_idx][b] * 15))
+                    p_lane = max(0, min(15, p_lane))
+                    e_abs = (p_lane + rel_seg * 15) % 16
                     dist = min(abs(l - e_abs), 16 - abs(l - e_abs))
                     w = aw[b, :, l, s_idx].mean()
                     if dist <= 2:
@@ -1267,6 +1344,28 @@ class RainbowAgent:
             lines.append("    → 🟡 Mild specialization")
         else:
             lines.append("    → ⚠️  Heads are redundant")
+
+        # 6. Temporal attention distribution (how much attention goes to each frame?)
+        if fs > 1:
+            lines.append(f"\n  Temporal attention distribution ({fs} frames):")
+            # Sum attention per frame across its 7 slots
+            frame_attn = np.zeros((B, H, L, fs))
+            for f in range(fs):
+                s0 = f * slots_per_frame
+                s1 = s0 + slots_per_frame
+                frame_attn[:, :, :, f] = aw[:, :, :, s0:s1].sum(axis=-1)
+            avg_frame_attn = frame_attn.mean(axis=(0, 1, 2))  # (fs,)
+            for f in range(fs):
+                label = "current" if f == 0 else f"t-{f}"
+                pct = avg_frame_attn[f] * 100
+                bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+                lines.append(f"    Frame {label}: {pct:.1f}%  {bar}")
+            if avg_frame_attn[0] > 0.5:
+                lines.append("    → Current frame dominates (expected early in training)")
+            elif max(avg_frame_attn) - min(avg_frame_attn) < 0.1:
+                lines.append("    → ⚪ Near-uniform across time (not yet temporally selective)")
+            else:
+                lines.append("    → 🟢 Temporal differentiation learned")
 
         lines.append("\n" + "=" * 70)
         return "\n".join(lines)
