@@ -1,0 +1,1970 @@
+                      (m/src/RRTESTB.ASM):00001         *        OPT    NOL       
+                      (m/src/RRTESTB.ASM):00002          INCLUDE "RRFRED.ASM"
+                      (       RRFRED.ASM):00001         *        OPT    PAG
+                      (       RRFRED.ASM):00002         
+                      (       RRFRED.ASM):00003          INCLUDE "RRF.ASM"
+                      (          RRF.ASM):00001         *        OPT    PAGS
+                      (          RRF.ASM):00002         *        TTL    R O B O T   W A R
+                      (          RRF.ASM):00003         *
+                      (          RRF.ASM):00004         * HARDWARE CONSTANTS
+                      (          RRF.ASM):00005         *
+     BF70             (          RRF.ASM):00006         HSTK EQU $BF70
+     EFF0             (          RRF.ASM):00007         VECTOR EQU $EFF0
+     C000             (          RRF.ASM):00008         CRAM EQU $C000 COLOR RAM ADDR
+     CBFF             (          RRF.ASM):00009         WDOG EQU $CBFF
+     0039             (          RRF.ASM):00010         WDATA EQU $39
+     CC00             (          RRF.ASM):00011         CMOS EQU $CC00
+     C80E             (          RRF.ASM):00012         SOUND EQU $C80E
+     CB00             (          RRF.ASM):00013         VERTCT EQU $CB00 6-BIT VERTICAL BEAM ADDR
+     C900             (          RRF.ASM):00014         RWCNTL EQU $C900 (BIT 0: 1-ROM READ; 0-RAM READ)
+                      (          RRF.ASM):00015         *                (BIT 1: 1-INVERT;   0-NORMAL SCREEN)
+                      (          RRF.ASM):00016         *
+                      (          RRF.ASM):00017         *PIA DEFINITIONS
+                      (          RRF.ASM):00018         *
+     C80C             (          RRF.ASM):00019         PIA0 EQU $C80C
+                      (          RRF.ASM):00020         *B0 AUTO UP
+                      (          RRF.ASM):00021         *B1 ADVANCE
+                      (          RRF.ASM):00022         *B2 RCOIN
+                      (          RRF.ASM):00023         *B3 HSRESET
+                      (          RRF.ASM):00024         *B4 LCOIN
+                      (          RRF.ASM):00025         *B5 CCOIN
+                      (          RRF.ASM):00026         *B6 SLAM
+                      (          RRF.ASM):00027         *B7 SOUND HANDSHAKE
+                      (          RRF.ASM):00028         *CA2 LED3 
+                      (          RRF.ASM):00029         *CA1 IRQ 240 (16 MS)  (LINE 240)
+     C80E             (          RRF.ASM):00030         PIA1 EQU $C80E
+                      (          RRF.ASM):00031         *B0-B5 SOUND
+                      (          RRF.ASM):00032         *B6-B7 LED 0,1
+                      (          RRF.ASM):00033         *CB1 IRQ 4 MS (0,$40,$80,$C0)
+                      (          RRF.ASM):00034         *CB2 LED2            
+     C804             (          RRF.ASM):00035         PIA2 EQU $C804
+                      (          RRF.ASM):00036         *B0 MOVE UP
+                      (          RRF.ASM):00037         *B1 MOVE DOWN
+                      (          RRF.ASM):00038         *B2 MOVE LEFT
+                      (          RRF.ASM):00039         *B3 MOVE RIGHT
+                      (          RRF.ASM):00040         *B4 START 1
+                      (          RRF.ASM):00041         *B5 START 2
+                      (          RRF.ASM):00042         *B6 FIRE UP
+                      (          RRF.ASM):00043         *B7 FIRE DOWN
+                      (          RRF.ASM):00044         *
+     C806             (          RRF.ASM):00045         PIA3 EQU $C806
+                      (          RRF.ASM):00046         *B0 FIRE LEFT
+                      (          RRF.ASM):00047         *B1 FIRE RIGHT
+                      (          RRF.ASM):00048         *B7 INPUT 1=COCKTAIL
+                      (          RRF.ASM):00049         *CB2 OUTPUT SWITCH MUX CONTROL 1=PLAYER1,0=PLAYER2
+                      (          RRF.ASM):00050         *
+                      (          RRF.ASM):00051         *DMA CONSTANTS
+                      (          RRF.ASM):00052         *
+     CA00             (          RRF.ASM):00053         DMACTL EQU $CA00 CONTROL BYTE WRITE INITIATES TRANSFER
+                      (          RRF.ASM):00054         *B0:READ FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00055         *B1:WRITE FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00056         *B2:XSFER RATE 0=ROM-RAM (1MSEC); 1=RAM-RAM (2 MSEC)
+                      (          RRF.ASM):00057         *B3:1=ZERO WRITE SUPPRESS
+                      (          RRF.ASM):00058         *B4:1=CONSTANT SUBSTITUTION
+                      (          RRF.ASM):00059         *B5:1=ODD FLAVOR
+                      (          RRF.ASM):00060         *B6:1=B0-B3 WRITE SUPPRESS
+                      (          RRF.ASM):00061         *B7:1=B4-B7 WRITE SUPPRESS
+     CA01             (          RRF.ASM):00062         DMACON EQU $CA01 CONSTANT DATA BYTE
+     CA02             (          RRF.ASM):00063         DMAORG EQU $CA02 ORIGIN ADDR MSB,LSB
+     CA04             (          RRF.ASM):00064         DMADES EQU $CA04 DESTINATION "
+     CA06             (          RRF.ASM):00065         DMASIZ EQU $CA06 HOR,VERT BYTE COUNTS
+                      (          RRF.ASM):00066         *SCORE DISPLAY CONSTANTS
+     00EA             (          RRF.ASM):00067         YMAX EQU 234   
+     0018             (          RRF.ASM):00068         YMIN EQU 24 MIN Y COORD
+     008F             (          RRF.ASM):00069         XMAX EQU $8F
+     0007             (          RRF.ASM):00070         XMIN EQU 7
+     180E             (          RRF.ASM):00071         P1ORG EQU $18*$100+14
+     2E0E             (          RRF.ASM):00072         P1MAN EQU P1ORG+7*$300+$100
+     180E             (          RRF.ASM):00073         P1DISP EQU P1ORG
+     580E             (          RRF.ASM):00074         P2ORG EQU P1ORG+$40*$100
+     6E0E             (          RRF.ASM):00075         P2MAN EQU P2ORG+P1MAN-P1ORG
+     580E             (          RRF.ASM):00076         P2DISP EQU P2ORG
+     0300             (          RRF.ASM):00077         DIGLTH EQU $300
+     4A7C             (          RRF.ASM):00078         PCOORD EQU $4A7C INIT PLAYER COORD
+     0066             (          RRF.ASM):00079         FONCOL EQU $66 PHONY STARTUP COLOR
+                      (          RRF.ASM):00080         *
+                      (          RRF.ASM):00081         *MODULE  VECTORS + STORAGE ALLOCATION
+                      (          RRF.ASM):00082         *
+                      (          RRF.ASM):00083         ***OPSYS**..... R O S ..........
+                      (          RRF.ASM):00084         *
+     D000             (          RRF.ASM):00085         ROSORG EQU $D000
+                      (          RRF.ASM):00086          ORG ROSORG
+D000                  (          RRF.ASM):00087         INIT RMB 3
+D003                  (          RRF.ASM):00088         ASCAN RMB 3
+D006                  (          RRF.ASM):00089         SDOUT RMB 3
+D009                  (          RRF.ASM):00090         SCRTRN RMB 3
+D00C                  (          RRF.ASM):00091         SCORE RMB 3
+D00F                  (          RRF.ASM):00092         SCRTR0 RMB 3
+D012                  (          RRF.ASM):00093         SCRCLR RMB 3
+D015                  (          RRF.ASM):00094         DMAOFF RMB 3
+D018                  (          RRF.ASM):00095         DMAON RMB 3
+D01B                  (          RRF.ASM):00096         BLKCLR RMB 3
+D01E                  (          RRF.ASM):00097         PCTOFF RMB 3
+D021                  (          RRF.ASM):00098         PCTON RMB 3
+D024                  (          RRF.ASM):00099         COLST RMB 3
+D027                  (          RRF.ASM):00100         COL0 RMB 3
+D02A                  (          RRF.ASM):00101         HEXBCD RMB 3
+D02D                  (          RRF.ASM):00102         BCDHEX RMB 3
+D030                  (          RRF.ASM):00103         OINIT RMB 3
+D033                  (          RRF.ASM):00104         CRINIT RMB 3
+D036                  (          RRF.ASM):00105         PINIT RMB 3
+D039                  (          RRF.ASM):00106         RAND RMB 3
+D03C                  (          RRF.ASM):00107         RAND16 RMB 3
+D03F                  (          RRF.ASM):00108         RMAX RMB 3
+D042                  (          RRF.ASM):00109         RANDU RMB 3
+D045                  (          RRF.ASM):00110         PLINDX RMB 3
+D048                  (          RRF.ASM):00111         PLDX RMB 3
+D04B                  (          RRF.ASM):00112         SNDLD RMB 3
+D04E                  (          RRF.ASM):00113         KILO1 RMB 3
+D051                  (          RRF.ASM):00114         GETOBJ RMB 3
+D054                  (          RRF.ASM):00115         MAKEP RMB 3
+D057                  (          RRF.ASM):00116         MKPROC RMB 3
+D05A                  (          RRF.ASM):00117         MSPROC RMB 3
+D05D                  (          RRF.ASM):00118         KILL RMB 3
+D060                  (          RRF.ASM):00119         GNCIDE RMB 3
+D063                  (          RRF.ASM):00120         SUCIDE RMB 3
+D066                  (          RRF.ASM):00121         SLEEP RMB 3
+D069                  (          RRF.ASM):00122         RIPV RMB 3
+D06C                  (          RRF.ASM):00123         MPROB RMB 3
+D06F                  (          RRF.ASM):00124         GETOB RMB 3
+D072                  (          RRF.ASM):00125         KILLOB RMB 3
+D075                  (          RRF.ASM):00126         KILLOF RMB 3
+D078                  (          RRF.ASM):00127         KILOFP RMB 3
+D07B                  (          RRF.ASM):00128         GETROB RMB 3
+D07E                  (          RRF.ASM):00129         KILROB RMB 3
+D081                  (          RRF.ASM):00130         GETPST RMB 3
+D084                  (          RRF.ASM):00131         KILPST RMB 3
+D087                  (          RRF.ASM):00132         GETHUM RMB 3
+D08A                  (          RRF.ASM):00133         KILHUM RMB 3
+D08D                  (          RRF.ASM):00134         DMAOFN RMB 3
+D090                  (          RRF.ASM):00135         MPCTON RMB 3
+D093                  (          RRF.ASM):00136         BLKON RMB 3
+D096                  (          RRF.ASM):00137         EXECV RMB 3
+D099                  (          RRF.ASM):00138         P1SW   RMB    3
+D09C                  (          RRF.ASM):00139         P2SW   RMB    3
+D09F                  (          RRF.ASM):00140         DIVAB  RMB    3
+D0A2                  (          RRF.ASM):00141         RCMOSA RMB    3
+D0A5                  (          RRF.ASM):00142         RCMOSB RMB    3
+D0A8                  (          RRF.ASM):00143         RCMOSD RMB    3
+D0AB                  (          RRF.ASM):00144         WCMOSA RMB    3
+D0AE                  (          RRF.ASM):00145         WCMOSB RMB    3
+D0B1                  (          RRF.ASM):00146         WCMOSD RMB    3
+D0B4                  (          RRF.ASM):00147         BCDBIN RMB    3
+D0B7                  (          RRF.ASM):00148         RWMOVE RMB    3
+D0BA                  (          RRF.ASM):00149         AUD    RMB    3
+D0BD                  (          RRF.ASM):00150         AUD1   RMB    3
+D0C0                  (          RRF.ASM):00151         INT20V RMB    3
+D0C3                  (          RRF.ASM):00152         LFV    RMB    3
+D0C6                  (          RRF.ASM):00153         NEWBCH RMB    3        BCDHEX THAT USES A!!
+                      (          RRF.ASM):00154         *
+                      (          RRF.ASM):00155         *PLAYER DEATH
+                      (          RRF.ASM):00156         *
+     DD00             (          RRF.ASM):00157         RDORG EQU $DD00
+                      (          RRF.ASM):00158          ORG RDORG
+DD00                  (          RRF.ASM):00159         RDTHV RMB 3
+                      (          RRF.ASM):00160         *
+                      (          RRF.ASM):00161         *HUMANS+HULKS
+                      (          RRF.ASM):00162         *
+     0000             (          RRF.ASM):00163         RHORG EQU $0000
+                      (          RRF.ASM):00164          ORG RHORG
+0000                  (          RRF.ASM):00165         HULKST RMB 3
+0003                  (          RRF.ASM):00166         HUMST RMB 3
+0006                  (          RRF.ASM):00167         CKLIM RMB 3
+0009                  (          RRF.ASM):00168         SKULL RMB 3
+000C                  (          RRF.ASM):00169         P1KD RMB 2
+000E                  (          RRF.ASM):00170         MOMPIC RMB 2
+0010                  (          RRF.ASM):00171         DADPIC RMB 2
+0012                  (          RRF.ASM):00172         KIDPIC RMB 2
+0014                  (          RRF.ASM):00173         HLKPIC RMB 2
+0016                  (          RRF.ASM):00174         HLKANA RMB 2
+0018                  (          RRF.ASM):00175         HUMANA RMB 2
+001A                  (          RRF.ASM):00176         SKLPIC RMB 2
+                      (          RRF.ASM):00177         *
+                      (          RRF.ASM):00178         ***CIRCLES,ENFORCERS,SPARX
+                      (          RRF.ASM):00179         *
+     1140             (          RRF.ASM):00180         RCORG EQU $1140
+                      (          RRF.ASM):00181          ORG RCORG
+1140                  (          RRF.ASM):00182         CIRCST RMB 3 START CIRCLES
+1143                  (          RRF.ASM):00183         CIRKV RMB 3
+1146                  (          RRF.ASM):00184         CIRPIC RMB 2
+1148                  (          RRF.ASM):00185         ENGPIC RMB 2
+114A                  (          RRF.ASM):00186         ENFPIC RMB 2
+                      (          RRF.ASM):00187         *
+                      (          RRF.ASM):00188         *BRAINS & CO.
+                      (          RRF.ASM):00189         *
+     1AC0             (          RRF.ASM):00190         BRNORG EQU $1AC0
+                      (          RRF.ASM):00191          ORG BRNORG
+1AC0                  (          RRF.ASM):00192         BRNST RMB 3
+1AC3                  (          RRF.ASM):00193         BRNPIC RMB 2
+1AC5                  (          RRF.ASM):00194         BRONV  RMB    3
+1AC8                  (          RRF.ASM):00195         HUMONV RMB    3
+1ACB                  (          RRF.ASM):00196         PRGPIC RMB 2
+                      (          RRF.ASM):00197         *
+                      (          RRF.ASM):00198         *******ROBOT GAME...... R G .......
+                      (          RRF.ASM):00199         *
+     26C0             (          RRF.ASM):00200         RGORG EQU $26C0
+                      (          RRF.ASM):00201          ORG RGORG
+26C0                  (          RRF.ASM):00202         PLAYER RMB 3
+26C3                  (          RRF.ASM):00203         RANDXY RMB 3
+26C6                  (          RRF.ASM):00204         CKOBS RMB 3
+26C9                  (          RRF.ASM):00205         MANDSP RMB 3
+26CC                  (          RRF.ASM):00206         STRT1 RMB 3
+26CF                  (          RRF.ASM):00207         STRT2 RMB 3
+26D2                  (          RRF.ASM):00208         TDISPV RMB 3
+26D5                  (          RRF.ASM):00209         MANPIC RMB 2
+26D7                  (          RRF.ASM):00210         LASPIC RMB 2
+                      (          RRF.ASM):00211         *
+                      (          RRF.ASM):00212         *ROBOTS&POSTS
+                      (          RRF.ASM):00213         *
+     3880             (          RRF.ASM):00214         RPORG EQU $3880
+                      (          RRF.ASM):00215          ORG RPORG
+3880                  (          RRF.ASM):00216         RINIT RMB 3
+3883                  (          RRF.ASM):00217         PSINIT RMB 3
+3886                  (          RRF.ASM):00218         PSTP1 RMB 2
+3888                  (          RRF.ASM):00219         OPON RMB 3
+388B                  (          RRF.ASM):00220         OPON1 RMB 3
+388E                  (          RRF.ASM):00221         SAFTY RMB 3
+3891                  (          RRF.ASM):00222         ROBPIC RMB 2
+3893                  (          RRF.ASM):00223         PSTPIC RMB 2
+3895                  (          RRF.ASM):00224         PKPRCV RMB 3
+                      (          RRF.ASM):00225         *
+                      (          RRF.ASM):00226         *TRANSPORTER
+                      (          RRF.ASM):00227         *
+     4140             (          RRF.ASM):00228         RTORG EQU $4140
+                      (          RRF.ASM):00229          ORG RTORG
+4140                  (          RRF.ASM):00230         TRANST RMB 3
+                      (          RRF.ASM):00231         *
+                      (          RRF.ASM):00232         *DIAGONAL EXPLOSIONS
+                      (          RRF.ASM):00233         *
+     4680             (          RRF.ASM):00234         RDXORG EQU $4680
+                      (          RRF.ASM):00235          ORG RDXORG
+4680                  (          RRF.ASM):00236         DXINIT RMB 3
+4683                  (          RRF.ASM):00237         DXST RMB 3
+4686                  (          RRF.ASM):00238         DAPST RMB 3
+4689                  (          RRF.ASM):00239         DXUPD RMB 3
+                      (          RRF.ASM):00240         *
+                      (          RRF.ASM):00241         *TANKS
+                      (          RRF.ASM):00242         *
+     4B00             (          RRF.ASM):00243         RTKORG EQU $4B00
+                      (          RRF.ASM):00244          ORG RTKORG
+4B00                  (          RRF.ASM):00245         TANKST RMB 3
+4B03                  (          RRF.ASM):00246         SQST RMB 3
+4B06                  (          RRF.ASM):00247         SQPIC RMB 2
+4B08                  (          RRF.ASM):00248         TNGPIC RMB 2
+4B0A                  (          RRF.ASM):00249         TNKPIC RMB 2
+                      (          RRF.ASM):00250         *
+                      (          RRF.ASM):00251         *MARQUEE
+                      (          RRF.ASM):00252         *
+     5700             (          RRF.ASM):00253         RMORG EQU $5700
+                      (          RRF.ASM):00254          ORG RMORG
+5700                  (          RRF.ASM):00255         RMST RMB 3
+                      (          RRF.ASM):00256         *
+                      (          RRF.ASM):00257         *EXPLOSIONS
+                      (          RRF.ASM):00258         *
+     5B40             (          RRF.ASM):00259         RXORG EQU $5B40
+                      (          RRF.ASM):00260          ORG RXORG
+5B40                  (          RRF.ASM):00261         EXINIT RMB 3
+5B43                  (          RRF.ASM):00262         EXST RMB 3
+5B46                  (          RRF.ASM):00263         APST RMB 3
+5B49                  (          RRF.ASM):00264         EXUPD RMB 3
+5B4C                  (          RRF.ASM):00265         PDEATH RMB 3
+5B4F                  (          RRF.ASM):00266         HVEXST RMB 3
+5B52                  (          RRF.ASM):00267         DDEXST RMB 3 DUAL DIAGONALS
+5B55                  (          RRF.ASM):00268         AMAP   RMB    3        ATTRACT MODE APPEAR
+5B58                  (          RRF.ASM):00269         HAPST  RMB    3        HORIZONTAL APPEAR
+5B5B                  (          RRF.ASM):00270         HEXST  RMB    3        HORIZONTAL EXPLODE
+                      (          RRF.ASM):00271         
+                      (          RRF.ASM):00272         *             STINKY LINKY VINCKYS
+                      (          RRF.ASM):00273         
+     77A0             (          RRF.ASM):00274         LOGORG EQU    $77A0          PLACE FOR PROGRAM
+     77A0             (          RRF.ASM):00275         GOV    EQU    LOGORG
+     77A3             (          RRF.ASM):00276         CCV    EQU    GOV+3
+                      (          RRF.ASM):00277         
+     E3D0             (          RRF.ASM):00278         TSCORG EQU $E3D0   HIGH SCORE BULLSHIT
+     E3D0             (          RRF.ASM):00279         PUPHSC EQU TSCORG  POWER UP HIGH SCORE CHECK
+     E3D3             (          RRF.ASM):00280         ENDPRC EQU PUPHSC+3 END OF GAME PROCESSING
+     E3D6             (          RRF.ASM):00281         GODSET EQU ENDPRC+3 ENTER GODS NAME BY OPERATOR
+     E3D9             (          RRF.ASM):00282         HIGHRS EQU GODSET+3 RESET HIGH SCORE TABLE BY OPERATOR
+     E3DC             (          RRF.ASM):00283         HSCHKV EQU HIGHRS+3 CHECK IF HS TABLE LOOKS BASHED
+     E3DF             (          RRF.ASM):00284         HSBUTV EQU HSCHKV+3 HIGH SCORE RESET BUTTON
+                      (          RRF.ASM):00285         
+     DF40             (          RRF.ASM):00286         TABORG EQU    $DF40
+     DF40             (          RRF.ASM):00287         TABLEV EQU    TABORG
+                      (          RRF.ASM):00288         
+     F000             (          RRF.ASM):00289         TSTORG EQU $F000
+     F000             (          RRF.ASM):00290         PWRUPV EQU TSTORG    
+     F003             (          RRF.ASM):00291         ADVSW EQU PWRUPV+3
+     F006             (          RRF.ASM):00292         AUTOCY EQU ADVSW+3
+     F009             (          RRF.ASM):00293         HXINIT EQU AUTOCY+3
+     F00C             (          RRF.ASM):00294         HEXSTX EQU HXINIT+3
+     F00F             (          RRF.ASM):00295         HAPSTX EQU HEXSTX+3
+     F012             (          RRF.ASM):00296         HXUPD EQU HAPSTX+3
+     F015             (          RRF.ASM):00297         WLOOPV EQU HXUPD+3
+     F017             (          RRF.ASM):00298         ELOOPV EQU WLOOPV+2
+     F019             (          RRF.ASM):00299         L2     EQU    ELOOPV+2
+     F01B             (          RRF.ASM):00300         L0     EQU    L2+2
+                      (          RRF.ASM):00301         
+     6F00             (          RRF.ASM):00302         TSBORG EQU $6F00 ADJUST PART OF TEST MODE
+     6F00             (          RRF.ASM):00303         ADJV   EQU TSBORG
+     6F03             (          RRF.ASM):00304         CMINIT EQU ADJV+3
+     6F06             (          RRF.ASM):00305         ATMCK  EQU CMINIT+3
+     6F09             (          RRF.ASM):00306         GETLT  EQU ATMCK+3     ROUTINE TO GET LETTERS FROM CONTROL PANEL
+     6F0C             (          RRF.ASM):00307         CMSMVV EQU GETLT+3
+     6F0F             (          RRF.ASM):00308         DOPMES EQU    CMSMVV+3   2 BYTER
+                      (          RRF.ASM):00309         
+     5F90             (          RRF.ASM):00310         TXORG  EQU    $5F90    PLACE FOR TEXT PROGRAM
+     5F90             (          RRF.ASM):00311         PR35V  EQU    TXORG
+     5F93             (          RRF.ASM):00312         PR57V  EQU    PR35V+3
+     5F96             (          RRF.ASM):00313         WRD5V  EQU    PR57V+3
+     5F99             (          RRF.ASM):00314         WRD7V  EQU    WRD5V+3
+     5F9C             (          RRF.ASM):00315         PRINV  EQU    WRD7V+3
+     5F9F             (          RRF.ASM):00316         PRSCR  EQU    PRINV+3
+                      (          RRF.ASM):00317         
+     5F96             (          RRF.ASM):00318         WRD5FV EQU    WRD5V
+     5F99             (          RRF.ASM):00319         WRD7FV EQU    WRD7V
+     5F90             (          RRF.ASM):00320         PRN5FV EQU    PR35V
+     5F93             (          RRF.ASM):00321         PRN7FV EQU    PR57V
+                      (          RRF.ASM):00322         
+     E9C8             (          RRF.ASM):00323         SETORG EQU    $E9C8    CHARACTER SET
+     E9C8             (          RRF.ASM):00324         TAB35  EQU    SETORG
+     E9CA             (          RRF.ASM):00325         TAB57  EQU    TAB35+2
+     E9CA             (          RRF.ASM):00326         N0V    EQU    TAB57  
+                      (          RRF.ASM):00327         
+                      (          RRF.ASM):00328         *
+                      (          RRF.ASM):00329         *BASE PAGE RAM AREA
+                      (          RRF.ASM):00330         *
+                      (          RRF.ASM):00331          ORG $9800
+     9800             (          RRF.ASM):00332         RAM EQU *
+     98               (          RRF.ASM):00333          SETDP $98
+                      (          RRF.ASM):00334         
+9800                  (          RRF.ASM):00335         PCRAM RMB 16 PSEUDO COLOR RAM
+9810                  (          RRF.ASM):00336         TIMER RMB 1  IRQ TIMER
+9811                  (          RRF.ASM):00337         ACTIVE RMB    2        POINTER TO LIST OF CURRENTLY ACTIVE (SLEEPING) PROCS.
+9813                  (          RRF.ASM):00338         FREE   RMB    2        POINTER TO LIST OF UNALLOCATED PROCESS SLEEP SPACE.
+9815                  (          RRF.ASM):00339         CRPROC RMB    2        POINTER TO SLEEP AREA OF CURRENTLY EXECUTING PROCESS.
+9817                  (          RRF.ASM):00340         OPTR RMB 2 MOTION OBJECT LIST POINTER
+9819                  (          RRF.ASM):00341         OBPTR RMB 2 OBSTACLE LIST POINTER
+981B                  (          RRF.ASM):00342         OFREE RMB 2 FREE LIST POINTER
+981D                  (          RRF.ASM):00343         SPFREE RMB 2 SUPER PROCESS FREE LIST
+981F                  (          RRF.ASM):00344         HPTR RMB 2 HUMAN PTR
+9821                  (          RRF.ASM):00345         RPTR RMB 2 ROBOT LIST
+9823                  (          RRF.ASM):00346         PPTR RMB 2 PHATAL OBJECT LIST
+9825                  (          RRF.ASM):00347         ITEMP RMB 2 INTERUPT TEMP
+9827                  (          RRF.ASM):00348         PSTIN RMB 2
+9829                  (          RRF.ASM):00349         ITEMP2 RMB 2
+982B                  (          RRF.ASM):00350         XTEMP  RMB 2 SAVE AREA FOR QUICK TEMPORARY
+982D                  (          RRF.ASM):00351         XTEMP2 RMB 2
+982F                  (          RRF.ASM):00352         PIA01 RMB 1 N-1 PIA0
+9830                  (          RRF.ASM):00353         PIA02 RMB 1 N-2 PIA0
+9831                  (          RRF.ASM):00354         PIA21 RMB 1 N-1 PIA2
+9832                  (          RRF.ASM):00355         PIA22 RMB 1 N-2 PIA2
+9833                  (          RRF.ASM):00356         SWPROC RMB 12 SWITCH SCAN TEMP
+983F                  (          RRF.ASM):00357         CURPLR RMB 1 CURRENT
+9840                  (          RRF.ASM):00358         PLRCNT RMB 1 NUMBER OF PLAYERS
+9841                  (          RRF.ASM):00359         XXX2 RMB 1 '80' IRQ LINE
+9842                  (          RRF.ASM):00360         OVCNT RMB 1 OVERFLOW COUNT
+9843                  (          RRF.ASM):00361         IFLG RMB 1 IRQ FLAG
+9844                  (          RRF.ASM):00362         FRAME RMB 1 IRQ COUNT
+9845                  (          RRF.ASM):00363         RWCTMP RMB 1 SCREEN READ CONTROL BYTE
+9846                  (          RRF.ASM):00364         REPLA RMB 2 REPLAY LEVEL
+9848                  (          RRF.ASM):00365         PCFLG RMB 1 PLAYER COLLISION
+9849                  (          RRF.ASM):00366         HTABX RMB 2 HUMAN TABLE INDEX
+                      (          RRF.ASM):00367         *COIN BUSINESS
+984B                  (          RRF.ASM):00368         SLMCNT RMB 1
+984C                  (          RRF.ASM):00369         LCCNT RMB 1
+984D                  (          RRF.ASM):00370         RCCNT RMB 1
+984E                  (          RRF.ASM):00371         CCCNT RMB 1
+984F                  (          RRF.ASM):00372         BUNITS RMB 1
+9850                  (          RRF.ASM):00373         CUNITS RMB 1
+9851                  (          RRF.ASM):00374         CREDIT RMB 1
+                      (          RRF.ASM):00375         *ATTRACT SWITCHES: FONY PRAYAH CONTLOHL
+9852                  (          RRF.ASM):00376         ATRSW2 RMB 1
+9853                  (          RRF.ASM):00377         ATRSW3 RMB 1
+                      (          RRF.ASM):00378         *SOUND RAM
+9854                  (          RRF.ASM):00379         SNDX RMB 2 TABLE INDEX
+9856                  (          RRF.ASM):00380         SNDPRI RMB 1 PRIORITY
+9857                  (          RRF.ASM):00381         SNDTMR RMB 1
+9858                  (          RRF.ASM):00382         SNDREP RMB 1
+                      (          RRF.ASM):00383         *
+                      (          RRF.ASM):00384         *STATUS FLAG
+                      (          RRF.ASM):00385         *B7=GAME OVER
+                      (          RRF.ASM):00386         *B6=
+                      (          RRF.ASM):00387         *B5=
+                      (          RRF.ASM):00388         *B4=PLAYER OUTPUT
+                      (          RRF.ASM):00389         *B3=MOTION OBJS VEL +ENEMIES
+                      (          RRF.ASM):00390         *B2=EXPLOSION UPDATE
+                      (          RRF.ASM):00391         *B1=POST ,MOT OBJ REFRESH
+                      (          RRF.ASM):00392         *B0=PLAYER MOTION,COLLISION,FIRE
+9859                  (          RRF.ASM):00393         STATUS RMB 1
+                      (          RRF.ASM):00394         *
+                      (          RRF.ASM):00395         *PLAYER OBJECT STRUCTURE
+                      (          RRF.ASM):00396         *
+     985A             (          RRF.ASM):00397         PLOBJ EQU *
+985A                  (          RRF.ASM):00398          RMB 2 OLINK
+985C                  (          RRF.ASM):00399         PPICT RMB 2 OPICT
+985E                  (          RRF.ASM):00400         PX RMB 2 OBJX
+9860                  (          RRF.ASM):00401          RMB 2 OBJID
+9862                  (          RRF.ASM):00402          RMB 2 OCVECT
+9864                  (          RRF.ASM):00403         PX16 RMB 2  OX16
+9866                  (          RRF.ASM):00404         PY16 RMB 2  OY16
+9868                  (          RRF.ASM):00405         PXV RMB 2   OXV
+986A                  (          RRF.ASM):00406         PYV RMB 2   OYV
+986C                  (          RRF.ASM):00407          RMB 1 OFLAV
+986D                  (          RRF.ASM):00408         PODATA RMB 1 ODATA
+986E                  (          RRF.ASM):00409         POLDPC RMB 2 OLDPIC
+9870                  (          RRF.ASM):00410         PLAIMC RMB 1 PLAYER ANIMATION RATE
+9871                  (          RRF.ASM):00411         PLAIMN RMB 1 PLAYER ANIMATION NUMBER
+9872                  (          RRF.ASM):00412         PLAIMB RMB 2 PLAYER ANIMATION BASE ADDR
+                      (          RRF.ASM):00413         *
+                      (          RRF.ASM):00414         *COLLISION ROUTINE PARAMETERS
+                      (          RRF.ASM):00415         *
+9874                  (          RRF.ASM):00416         XCNT RMB 1 SCAN COUNTS
+9875                  (          RRF.ASM):00417         YCNT RMB 1
+9876                  (          RRF.ASM):00418         OX1 RMB 1 OFFSETS
+9877                  (          RRF.ASM):00419         OY1 RMB 1
+9878                  (          RRF.ASM):00420         PX1 RMB 1
+9879                  (          RRF.ASM):00421         PY1 RMB 1
+987A                  (          RRF.ASM):00422         OBW RMB 1 HT TEMPS
+987B                  (          RRF.ASM):00423         PLW RMB 1
+987C                  (          RRF.ASM):00424         ULX RMB 1 UPPER LEFT COORD
+987D                  (          RRF.ASM):00425         ULY RMB 1 "
+987E                  (          RRF.ASM):00426         LRX RMB 1
+987F                  (          RRF.ASM):00427         LRY RMB 1
+9880                  (          RRF.ASM):00428         CTEMP RMB 2 INDEX TEMP
+9882                  (          RRF.ASM):00429         CTEMP2 RMB 2
+                      (          RRF.ASM):00430         *RANDOM VARIABLES
+9884                  (          RRF.ASM):00431         SEED   RMB    1
+9885                  (          RRF.ASM):00432         HSEED  RMB    1 
+9886                  (          RRF.ASM):00433         LSEED  RMB    1
+                      (          RRF.ASM):00434         *LASER
+9887                  (          RRF.ASM):00435         LCNT RMB 1
+9888                  (          RRF.ASM):00436         LASDIR RMB 2
+                      (          RRF.ASM):00437         *SPARKS
+988A                  (          RRF.ASM):00438         SPKCNT RMB 1
+988B                  (          RRF.ASM):00439         ROBST RMB 2 PTR TO ROBOT LIST
+988D                  (          RRF.ASM):00440         SAVCNT RMB 1 HUMAN COUNT SAVED
+988E                  (          RRF.ASM):00441         BCMCNT RMB 1 BRAIN CRUISE MISSILES
+                      (          RRF.ASM):00442         *POST ANIMATION+WALL COLOR
+988F                  (          RRF.ASM):00443         WALCOL RMB 1 WALL+POST BG
+9890                  (          RRF.ASM):00444         PSTCOL RMB 1 POST COLOR
+9891                  (          RRF.ASM):00445         LASCOL RMB 1 LASER WALL COLLIDE COLOR
+9892                  (          RRF.ASM):00446         PSTREF RMB 1 POST REFRESH RATE
+9893                  (          RRF.ASM):00447         PSTANI RMB 2 CURR POST ANIMATION
+9895                  (          RRF.ASM):00448         BRNFLG RMB 1 BRAIN HUMAN KILL FLAG
+                      (          RRF.ASM):00449         *
+                      (          RRF.ASM):00450         *EXPLOSION STUFF
+9896                  (          RRF.ASM):00451         EXPRAM RMB $10
+98A6                  (          RRF.ASM):00452         CENTMP RMB 2 CENTER OF BLOW
+98A8                  (          RRF.ASM):00453         HXRAM RMB $10
+98B8                  (          RRF.ASM):00454         DXRAM RMB $10
+98C8                  (          RRF.ASM):00455         RMRAM RMB 6 MARQUEE RAM
+                      (          RRF.ASM):00456         
+                      (          RRF.ASM):00457         ************************ LINKYS STINKYS
+                      (          RRF.ASM):00458         
+98CE                  (          RRF.ASM):00459         INDIAG RMB    1
+                      (          RRF.ASM):00460         
+                      (          RRF.ASM):00461         *
+                      (          RRF.ASM):00462         *      TEXT VARIABLES
+                      (          RRF.ASM):00463         *
+                      (          RRF.ASM):00464         
+98CF                  (          RRF.ASM):00465         TEXCOL RMB    1 (TEXCOL)  PRINTING COLOR (NIBBLES REPRESENT FLAVOR COLO
+98D0                  (          RRF.ASM):00466         TXFLAV RMB    1 (TXFLAV) FLAVOR OF CURRENT CURSOR (0=EVEN, 1=ODD)
+98D1                  (          RRF.ASM):00467         TXLEAD RMB    1 (TXLEAD) LEAD ZERO BLANKING ON/OFF (0=OFF, 1=ON)
+98D2                  (          RRF.ASM):00468         TXFONT RMB    1 (TXFONT) FONT HEIGHT (5 OR 7) PIXELS
+98D3                  (          RRF.ASM):00469         TEXMAR RMB    2        CURRENT LEFT MARGIN CURSOR POINTER
+98D5                  (          RRF.ASM):00470         TEXMFL RMB    1        CURRENT LEFT MARGIN FLAVOR
+98D6                  (          RRF.ASM):00471         TEXTP3 RMB    1
+98D7                  (          RRF.ASM):00472         TXCLIP RMB    1
+                      (          RRF.ASM):00473         
+                      (          RRF.ASM):00474         *
+                      (          RRF.ASM):00475         ***    GET LETTER ROUTINE RAM
+                      (          RRF.ASM):00476         *
+                      (          RRF.ASM):00477         
+98D8                  (          RRF.ASM):00478         GETLRM RMB    2
+98DA                  (          RRF.ASM):00479         GETLST RMB    3
+                      (          RRF.ASM):00480         
+                      (          RRF.ASM):00481         ********************* LOGO RAM
+                      (          RRF.ASM):00482         
+98DD                  (          RRF.ASM):00483         LOGX   RMB    2
+98DF                  (          RRF.ASM):00484         LOGCOL RMB    1
+98E0                  (          RRF.ASM):00485         LOGCL2 RMB    1
+98E1                  (          RRF.ASM):00486         LOGCNT RMB    1
+98E2                  (          RRF.ASM):00487         LOGSAV RMB    2
+98E4                  (          RRF.ASM):00488         LOGCST RMB    2
+                      (          RRF.ASM):00489         
+98E6                  (          RRF.ASM):00490         LASTX  RMB    2
+98E8                  (          RRF.ASM):00491         SIDE   RMB    1
+98E9                  (          RRF.ASM):00492         BALCOL RMB    1
+98EA                  (          RRF.ASM):00493         SLIDER RMB    1
+98EB                  (          RRF.ASM):00494         ERPTR  RMB    2
+                      (          RRF.ASM):00495         *MOVE THIS SOMEDAY
+98ED                  (          RRF.ASM):00496         ENFCNT RMB 1
+98EE                  (          RRF.ASM):00497         GAMTIM RMB 1 GAME TIMER
+98EF                  (          RRF.ASM):00498         TNKSPD RMB 1 TANK SPEED PARAMETER
+98F0                  (          RRF.ASM):00499         SCRFLG RMB 1 SCORE FLAG
+98F1                  (          RRF.ASM):00500         SHLCNT RMB 1 SHELL COUNTER
+98F2                  (          RRF.ASM):00501         RIPFLG RMB 1                            
+98F3                  (          RRF.ASM):00502         HCK1   RMB 1
+98F4                  (          RRF.ASM):00503         ATFLAG RMB 1  INDICATE WHAT PAGE AND HOW
+                      (          RRF.ASM):00504         
+                      (          RRF.ASM):00505         *
+                      (          RRF.ASM):00506         *TABLE DATA
+                      (          RRF.ASM):00507         *
+                      (          RRF.ASM):00508          ORG RAM+$100 PAST BASE PAGE
+                      (          RRF.ASM):00509         *
+                      (          RRF.ASM):00510         *MASTER OBJECT LIST
+                      (          RRF.ASM):00511         *
+     9900             (          RRF.ASM):00512         OLIST EQU * 
+     0018             (          RRF.ASM):00513         OSIZE EQU $18
+                      (          RRF.ASM):00514         *
+                      (          RRF.ASM):00515         *INDEX OFFSETS
+                      (          RRF.ASM):00516         *
+     0000             (          RRF.ASM):00517         OLINK EQU 0 LINK TO NEXT
+     0002             (          RRF.ASM):00518         OPICT EQU 2 PICTURE DESCRIPTOR ADDR
+     0004             (          RRF.ASM):00519         OBJX EQU 4 UPPER LEFT SCREEN X
+     0005             (          RRF.ASM):00520         OBJY EQU 5 UPPER LEFT SCREEN Y
+     0006             (          RRF.ASM):00521         OBJID EQU 6 ASSOCIATED PROCESS ID (IF ANY)
+     0008             (          RRF.ASM):00522         OCVECT EQU 8 COLLISION ROUTINE ADDR
+     000A             (          RRF.ASM):00523         OX16 EQU $A 16 BIT X WORLD COORD
+     000C             (          RRF.ASM):00524         OY16 EQU $C 16 BIT Y WORLD COORD
+     000E             (          RRF.ASM):00525         OXV EQU $E X VELOCITY
+     0010             (          RRF.ASM):00526         OYV EQU $10 Y VELOCITY
+     0012             (          RRF.ASM):00527         OFLAV EQU $12 OLD FLAVOR
+     0013             (          RRF.ASM):00528         ODATA EQU $13 MISC. DATA
+     0014             (          RRF.ASM):00529         OLDPIC EQU $14 OLD PICTURE TO ERASE
+     0016             (          RRF.ASM):00530         FONIPC EQU $16 FONY PICT FOR COLLISION PURPOSES
+                      (          RRF.ASM):00531         *RESERVE AREA
+9900                  (          RRF.ASM):00532          RMB (180)*OSIZE
+     A9E0             (          RRF.ASM):00533         OLEND EQU *
+                      (          RRF.ASM):00534         *
+                      (          RRF.ASM):00535         *USER DEFINED PROCESS TYPES
+                      (          RRF.ASM):00536         *
+     0000             (          RRF.ASM):00537         STYPE EQU 0 SYSTEM PROCESS
+     0001             (          RRF.ASM):00538         CTYPE EQU 1 COIN
+                      (          RRF.ASM):00539         *
+                      (          RRF.ASM):00540         *SLEEPING PROCESS TABLE
+                      (          RRF.ASM):00541         *
+     A9E0             (          RRF.ASM):00542         PTAB EQU *
+                      (          RRF.ASM):00543         *
+                      (          RRF.ASM):00544         *OFFSET CONSTANTS 
+                      (          RRF.ASM):00545         *
+     0000             (          RRF.ASM):00546         PLINK EQU 0
+     0002             (          RRF.ASM):00547         PADDR EQU 2
+     0004             (          RRF.ASM):00548         PTIME EQU 4
+     0005             (          RRF.ASM):00549         PTYPE EQU 5
+     0006             (          RRF.ASM):00550         PCOD EQU 6
+     0007             (          RRF.ASM):00551         PDATA EQU 7
+     0007             (          RRF.ASM):00552         PD EQU 7
+     0008             (          RRF.ASM):00553         PD1 EQU 8
+     0009             (          RRF.ASM):00554         PD2 EQU 9
+     000A             (          RRF.ASM):00555         PD3 EQU 10
+     000B             (          RRF.ASM):00556         PD4 EQU 11
+     000C             (          RRF.ASM):00557         PD5 EQU 12
+     000D             (          RRF.ASM):00558         PD6 EQU 13
+     000E             (          RRF.ASM):00559         PD7 EQU 14
+     000F             (          RRF.ASM):00560         PSIZE EQU 15
+A9E0                  (          RRF.ASM):00561          RMB 15*(120)
+     B0E8             (          RRF.ASM):00562         TABEND EQU *
+                      (          RRF.ASM):00563         *
+                      (          RRF.ASM):00564         *SUPER PROCESSES
+                      (          RRF.ASM):00565         *
+     001F             (          RRF.ASM):00566         SPSIZE EQU PSIZE+16
+B0E8                  (          RRF.ASM):00567         SPTAB RMB SPSIZE*20
+     B354             (          RRF.ASM):00568         SPTEND EQU *
+                      (          RRF.ASM):00569         *
+                      (          RRF.ASM):00570         *OBJECT PICTURE STRUCTURE
+                      (          RRF.ASM):00571         *
+     0000             (          RRF.ASM):00572         OBJW EQU 0
+     0001             (          RRF.ASM):00573         OBJH EQU 1
+     0002             (          RRF.ASM):00574         OBJDAT EQU 2
+     0004             (          RRF.ASM):00575         OBJL EQU 4
+                      (          RRF.ASM):00576         *
+                      (          RRF.ASM):00577         *HUMAN TABLE
+                      (          RRF.ASM):00578         *
+B354                  (          RRF.ASM):00579         HTAB RMB 80
+     B3A4             (          RRF.ASM):00580         HTBEND EQU *
+                      (          RRF.ASM):00581         *
+                      (          RRF.ASM):00582         *POST REFRESH LIST
+                      (          RRF.ASM):00583         *
+B3A4                  (          RRF.ASM):00584         PSLIST RMB 64 POST LIST
+     B3E4             (          RRF.ASM):00585         PSLEND EQU *
+                      (          RRF.ASM):00586         *
+                      (          RRF.ASM):00587         *HORIZONTAL EXPLOSION TABLES
+                      (          RRF.ASM):00588         *
+B3E4                  (          RRF.ASM):00589         HXTAB RMB $800
+                      (          RRF.ASM):00590         
+                      (          RRF.ASM):00591         *
+                      (          RRF.ASM):00592         *DIAGONAL XPLOSION TABLES
+                      (          RRF.ASM):00593         *
+BBE4                  (          RRF.ASM):00594         DXTAB RMB $200
+                      (          RRF.ASM):00595         *
+                      (          RRF.ASM):00596         *PLAYER DATA TABLE
+                      (          RRF.ASM):00597         *
+     BDE4             (          RRF.ASM):00598         PLDATA EQU *
+BDE4                  (          RRF.ASM):00599         ZP1SCR RMB 4 SCORE MSB 1ST
+BDE8                  (          RRF.ASM):00600         ZP1RP RMB 4 NEXT REPLAY LEVEL
+BDEC                  (          RRF.ASM):00601         ZP1LAS RMB 1 #OF LASERS 
+BDED                  (          RRF.ASM):00602         ZP1WAV RMB 1 WAVE # IN HEX
+BDEE                  (          RRF.ASM):00603         ZP1ENM RMB 50 ENEMY STATE
+     BE20             (          RRF.ASM):00604         ZP1END EQU *
+BE20                  (          RRF.ASM):00605         ZP2SCR RMB 4
+BE24                  (          RRF.ASM):00606         ZP2RP RMB 4
+BE28                  (          RRF.ASM):00607         ZP2LAS RMB 1
+BE29                  (          RRF.ASM):00608         ZP2WAV RMB 1
+BE2A                  (          RRF.ASM):00609         ZP2ENM RMB 50
+     BE5C             (          RRF.ASM):00610         PLDEND EQU * END OF PLAYER DATA
+     003C             (          RRF.ASM):00611         PLDLEN EQU ZP1END-PLDATA
+     0000             (          RRF.ASM):00612         PSCOR EQU ZP1SCR-PLDATA
+     0004             (          RRF.ASM):00613         PRPLA EQU ZP1RP-PLDATA
+     0008             (          RRF.ASM):00614         PLAS EQU ZP1LAS-PLDATA
+     0009             (          RRF.ASM):00615         PWAV EQU ZP1WAV-PLDATA
+     000A             (          RRF.ASM):00616         PENEMY EQU ZP1ENM-PLDATA
+                      (          RRF.ASM):00617         *
+                      (          RRF.ASM):00618         *ENEMIES LIST
+                      (          RRF.ASM):00619         *WARNING DO NOT CHANGE ORDER OF COUNTS
+     BE5C             (          RRF.ASM):00620         ELIST EQU *
+BE5C                  (          RRF.ASM):00621         ROBSPD RMB 1  SPEED
+BE5D                  (          RRF.ASM):00622         RMXSPD RMB 1 MAX ROBOT SPEED
+BE5E                  (          RRF.ASM):00623         ENFNUM RMB 1 # OF ENFORCERS/CIRCLE X2
+BE5F                  (          RRF.ASM):00624         ENSTIM RMB 1 ENF SHOT TIMER
+BE60                  (          RRF.ASM):00625         CDPTIM RMB 1 CIRCLE DROP TIMER
+BE61                  (          RRF.ASM):00626         HLKSPD RMB 1 HULK SPEED
+BE62                  (          RRF.ASM):00627         BSHTIM RMB 1 BRAIN SHOT TIMER
+BE63                  (          RRF.ASM):00628         BRNSPD RMB 1 BRAIN SPEED
+BE64                  (          RRF.ASM):00629         TNKSHT RMB 1  TANK SHOT RATE
+BE65                  (          RRF.ASM):00630         SHLSPD RMB 1  SHELL SPEED
+BE66                  (          RRF.ASM):00631         TDPTIM RMB 1  TANK DROP TIMR
+BE67                  (          RRF.ASM):00632         SQSPD RMB 1   SQUARE SPEED
+     BE68             (          RRF.ASM):00633         ECNTS EQU * START COUNTS
+BE68                  (          RRF.ASM):00634         ROBCNT RMB 1 # ROBOTS
+BE69                  (          RRF.ASM):00635         PSTCNT RMB 1 # POSTS
+BE6A                  (          RRF.ASM):00636         MOMCNT RMB 1 # MOM UNITS
+BE6B                  (          RRF.ASM):00637         DADCNT RMB 1 # DAD UNITS
+BE6C                  (          RRF.ASM):00638         KIDCNT RMB 1 # KIDS
+BE6D                  (          RRF.ASM):00639         HLKCNT RMB 1 # HULKS
+BE6E                  (          RRF.ASM):00640         BRNCNT RMB 1 # BRAINS
+BE6F                  (          RRF.ASM):00641         CIRCNT RMB 1 # CIRCLES
+BE70                  (          RRF.ASM):00642         SQCNT RMB 1 # SQUARES
+BE71                  (          RRF.ASM):00643         TNKCNT RMB 1 # TANKS
+     BE72             (          RRF.ASM):00644         ELEND EQU *
+BE72                  (          RRF.ASM):00645         HCK2 RMB 1
+                      (          RRF.ASM):00646         *
+                      (          RRF.ASM):00647         * CMOS RAM ALLOCATION
+                      (          RRF.ASM):00648         *
+                      (          RRF.ASM):00649          ORG CMOS+$100     WRITABLE CMOS  
+CD00                  (          RRF.ASM):00650         CREDST RMB 2 CREDITS BACKUP
+CD02                  (          RRF.ASM):00651         SLOT1 RMB 6 1 LEFT COIN TOTAL
+CD08                  (          RRF.ASM):00652               RMB 6 2 CENTER COIN TOTAL
+CD0E                  (          RRF.ASM):00653               RMB 6 3 RIGHT COIN TOTAL
+CD14                  (          RRF.ASM):00654                RMB 6 4 TOTAL PAID CREDITS
+CD1A                  (          RRF.ASM):00655                RMB 6 5 TOTAL REPLAYS
+CD20                  (          RRF.ASM):00656         BKTIME RMB 6 6 FLIGHT TIME IN MINS
+CD26                  (          RRF.ASM):00657         BKMEN  RMB 6 7 TOTAL SHIPS PLAYED
+CD2C                  (          RRF.ASM):00658         BKPLAY RMB 6 8 TOTAL GAMES PLAYED
+     CD32             (          RRF.ASM):00659         BKEND  EQU    *        END OF BOOKKEEPING STUFF
+     000E             (          RRF.ASM):00660         SCRSIZ EQU 14 NUMBER OF NIBBLES IN A SCORE ENTRY
+CD32                  (          RRF.ASM):00661         GODINT RMB 6
+CD38                  (          RRF.ASM):00662         GODSCR RMB 48   
+CD68                  (          RRF.ASM):00663         CMSCOR RMB 37*SCRSIZ   37 BACKED UP SCORES, 36 OF WHICH ARE VISIBLE
+CF6E                  (          RRF.ASM):00664         TODAYS RMB 10*SCRSIZ     TODAYS GREATEST
+     CFFA             (          RRF.ASM):00665         TODEND EQU *
+                      (          RRF.ASM):00666          ORG CMOS  ADEQUATE BIRTH CONTROL PROTECTION
+CC00                  (          RRF.ASM):00667         REPLAY RMB 2 REPLAY LEVEL
+CC02                  (          RRF.ASM):00668         NSHIP RMB 2 # OF SHIPS/1 CREDIT GAME
+CC04                  (          RRF.ASM):00669         COINSL RMB 2 FOR COINAGE SELECT MODE
+CC06                  (          RRF.ASM):00670         SLOT1M RMB 2 LEFT COIN MULT
+CC08                  (          RRF.ASM):00671         SLOT2M RMB 2 CENTER COIN MULT
+CC0A                  (          RRF.ASM):00672         SLOT3M RMB 2 RIGHT COIN MULT
+CC0C                  (          RRF.ASM):00673         CUNITC RMB 2 COIN UNITS PER CREDIT
+CC0E                  (          RRF.ASM):00674         CUNITB RMB 2 COIN UNITS FOR BONUS
+CC10                  (          RRF.ASM):00675         MINUNT RMB 2 MINIMUM REQD
+CC12                  (          RRF.ASM):00676         FREEPL RMB 2 FREE PLAY MODE       (ONE CREDIT GAME)     
+CC14                  (          RRF.ASM):00677         GA1 RMB 2 10 MASTER DIFFICULTY CONTROL               1
+CC16                  (          RRF.ASM):00678         GA2 RMB 2 NUMBER OF LETTERS ALLOWED TO GOD           10
+CC18                  (          RRF.ASM):00679         SPECFN RMB 2  RESTORE FACTORY SETTINGS
+CC1A                  (          RRF.ASM):00680          RMB 2  CLEAR AUDIT TOTALS
+CC1C                  (          RRF.ASM):00681          RMB 2  INITIALIZE HIGH SCORE TABLE
+CC1E                  (          RRF.ASM):00682          RMB 2  INTIATE AUTO CYCLE
+CC20                  (          RRF.ASM):00683          RMB 2  ENTER ATTRACT MODE MESSAGE
+CC22                  (          RRF.ASM):00684          RMB 2  ENTER HIGHEST SCORE NAME
+     CC24             (          RRF.ASM):00685         ENDADJ EQU *
+CC24                  (          RRF.ASM):00686         OPMESS RMB 100  2 LINES OF 25 CHARS EACH.
+CC88                  (          RRF.ASM):00687         OPL1 RMB 2
+CC8A                  (          RRF.ASM):00688         OPL2 RMB 2
+CC8C                  (          RRF.ASM):00689         ADJSUM RMB 2
+CC8E                  (          RRF.ASM):00690         OMESUM RMB 2
+                      (          RRF.ASM):00691         
+                      (          RRF.ASM):00692         *
+                      (          RRF.ASM):00693         *M A C R O S
+                      (          RRF.ASM):00694         *
+CC90                  (          RRF.ASM):00695         NAP    MACRO
+                      (          RRF.ASM):00696                LDA #\1 TIME
+                      (          RRF.ASM):00697                LDX #\2 WAKEUP ADDR
+                      (          RRF.ASM):00698                JMP    SLEEP  
+                      (          RRF.ASM):00699                ENDM
+                      (          RRF.ASM):00700         *
+                      (          RRF.ASM):00701         *MAKE A NEW PROCESS
+                      (          RRF.ASM):00702         *
+CC90                  (          RRF.ASM):00703         NEWP MACRO
+                      (          RRF.ASM):00704          LDX #\1 ADDR
+                      (          RRF.ASM):00705          LDA #\2 TYPE
+                      (          RRF.ASM):00706          JSR MKPROC
+                      (          RRF.ASM):00707          ENDM
+                      (          RRF.ASM):00708         *INIT PROCESS \0=SADDR 
+CC90                  (          RRF.ASM):00709         MAKP MACRO
+                      (          RRF.ASM):00710          JSR MAKEP
+                      (          RRF.ASM):00711          FDB \1
+                      (          RRF.ASM):00712          ENDM
+                      (          RRF.ASM):00713         *MAKE A PROCESS AND OBJECT
+CC90                  (          RRF.ASM):00714         MKPROB MACRO
+                      (          RRF.ASM):00715          JSR MPROB
+                      (          RRF.ASM):00716          FDB \1,\2,\3
+                      (          RRF.ASM):00717          ENDM
+                      (          RRF.ASM):00718         
+                      (       RRFRED.ASM):00004         
+     CA06             (       RRFRED.ASM):00005         HORIZ  EQU    $CA06
+     CA04             (       RRFRED.ASM):00006         DEST   EQU    $CA04
+     CA02             (       RRFRED.ASM):00007         ORIG   EQU    $CA02
+     CA01             (       RRFRED.ASM):00008         CONST  EQU    $CA01
+     CA00             (       RRFRED.ASM):00009         CONTRL EQU    $CA00
+                      (       RRFRED.ASM):00010         
+                      (       RRFRED.ASM):00011         *   MESSAGE NUMBER EQUATES
+                      (       RRFRED.ASM):00012         
+     0000             (       RRFRED.ASM):00013         DMFAIL EQU    0           DMA FAILURE
+     0001             (       RRFRED.ASM):00014         OKM    EQU    1           INTITIAL TESTS SAY OK
+     0002             (       RRFRED.ASM):00015         RERRM  EQU    2           TESTS SAY RAM ERROR.
+     0003             (       RRFRED.ASM):00016         ROMERM EQU    3           TESTS SAY ROM ERROR.
+     0004             (       RRFRED.ASM):00017         ROMOK  EQU    4 
+     0005             (       RRFRED.ASM):00018         RAMOK  EQU    5 
+     0006             (       RRFRED.ASM):00019         CMOK   EQU    6 
+     0007             (       RRFRED.ASM):00020         CMERR  EQU    7 
+     0008             (       RRFRED.ASM):00021         CMDOOR EQU    8 
+     0009             (       RRFRED.ASM):00022         SNDTEX EQU    9 
+     000A             (       RRFRED.ASM):00023         FDROMM EQU    10
+     000B             (       RRFRED.ASM):00024         FDRAMM EQU    11
+     000C             (       RRFRED.ASM):00025         SWTESM EQU    12           MESSAGE SAYING "SWITCH TEST"
+     000D             (       RRFRED.ASM):00026         SWMES1 EQU    13           34-50 ARE SWITCH TEST MESSAGES  
+     001E             (       RRFRED.ASM):00027         CMTSTM EQU    30           COLOR MATRIX TEST ETC.
+     001F             (       RRFRED.ASM):00028         BOOKM  EQU    31
+     0020             (       RRFRED.ASM):00029         AUDMES EQU    32           53-61 ARE AUDIT MESSAGES
+                      (       RRFRED.ASM):00030         *                            40 IS GAME OVER
+     0029             (       RRFRED.ASM):00031         AUDM1  EQU    41           FIRST PART OF 6 DIGIT 
+     002A             (       RRFRED.ASM):00032         AUDM2  EQU    42           SECOND PART OF 6 DIGIT
+     002B             (       RRFRED.ASM):00033         AUDM3  EQU    43           4 DIGIT AUDIT
+     002C             (       RRFRED.ASM):00034         FROBM  EQU    44           DIPLAY OF FROB MESSAGE
+     002D             (       RRFRED.ASM):00035         CONTMS EQU    45           EXTRA MESSAGES FOR FIRST PAGE OF ADJUSTMENTS
+     002E             (       RRFRED.ASM):00036         ADJMES EQU    46           ACTUAL MESSAGE FOR FIRST ADJUSTMENT (REPLAY)-63
+     0040             (       RRFRED.ASM):00037         REPMM1 EQU    64
+     0041             (       RRFRED.ASM):00038         REPMM2 EQU    65
+     0042             (       RRFRED.ASM):00039         NOMESS EQU    66
+     0043             (       RRFRED.ASM):00040         HIVOL  EQU    67
+     0044             (       RRFRED.ASM):00041         RECOM  EQU    68
+     0045             (       RRFRED.ASM):00042         POORP  EQU    69
+     0046             (       RRFRED.ASM):00043         CUSTM  EQU    70 
+     0047             (       RRFRED.ASM):00044         YESM   EQU    71 
+     0048             (       RRFRED.ASM):00045         NOM    EQU    72 
+     0049             (       RRFRED.ASM):00046         EXLIB  EQU    73 
+     004A             (       RRFRED.ASM):00047         LIB    EQU    74 
+                      (       RRFRED.ASM):00048         *                  PLAYER X GAME OVER
+     004C             (       RRFRED.ASM):00049         CONS   EQU    76 
+     004D             (       RRFRED.ASM):00050         EXCON  EQU    77 
+     004E             (       RRFRED.ASM):00051         REPMM3 EQU    78 
+     004F             (       RRFRED.ASM):00052         CMIMES EQU    79 
+     0050             (       RRFRED.ASM):00053         RESMES EQU    80 
+     0051             (       RRFRED.ASM):00054         YES1M  EQU    81 
+     0052             (       RRFRED.ASM):00055         COINM1 EQU    82    82-89   
+     005A             (       RRFRED.ASM):00056         NOREPM EQU    90 
+     005B             (       RRFRED.ASM):00057         BOOKRS EQU    91 
+     005C             (       RRFRED.ASM):00058         OMESM EQU     92 
+     005D             (       RRFRED.ASM):00059         HSRESM EQU    93  
+     005E             (       RRFRED.ASM):00060         GODMES EQU    94 
+     005F             (       RRFRED.ASM):00061         CONG EQU      95 
+     0060             (       RRFRED.ASM):00062         NOWMES EQU    96 
+     0061             (       RRFRED.ASM):00063         HSINDX EQU    97 
+     0062             (       RRFRED.ASM):00064         HIGH1 EQU     98 
+     0063             (       RRFRED.ASM):00065         HIGH3 EQU     99 
+     0064             (       RRFRED.ASM):00066         ONLY5M EQU    100
+     0065             (       RRFRED.ASM):00067         OPCNTM EQU    101
+     0066             (       RRFRED.ASM):00068         REPMM4 EQU    102
+                      (       RRFRED.ASM):00069         *                      PLAYER X  UP        
+                      (       RRFRED.ASM):00070         *                      WAVE X        
+     0069             (       RRFRED.ASM):00071         INDMF  EQU    105
+     006A             (       RRFRED.ASM):00072         AVTIM  EQU    106
+     006B             (       RRFRED.ASM):00073         AVTEND EQU    107
+     006C             (       RRFRED.ASM):00074         AVPLA  EQU    108
+     006D             (       RRFRED.ASM):00075         AVPLEN EQU    109
+     006E             (       RRFRED.ASM):00076         SCRMES EQU    110
+     006F             (       RRFRED.ASM):00077         INDMES EQU    111
+     0070             (       RRFRED.ASM):00078         CPM1   EQU    112
+                      (       RRFRED.ASM):00079         *      BOTTOM COPYRITE MESSAGE   113
+                      (       RRFRED.ASM):00080         *      SECOND HALF OF WAVE MESSAGE 114
+     0073             (       RRFRED.ASM):00081         MMOM   EQU    115
+     0074             (       RRFRED.ASM):00082         MDAD   EQU    116
+     0075             (       RRFRED.ASM):00083         MKID   EQU    117
+     0076             (       RRFRED.ASM):00084         MGRUNT EQU    118
+     0077             (       RRFRED.ASM):00085         MHULK  EQU    119
+     0078             (       RRFRED.ASM):00086         MSPCU  EQU    120
+     0079             (       RRFRED.ASM):00087         MENTK  EQU    121
+     007A             (       RRFRED.ASM):00088         MBRAIN EQU    122
+     007B             (       RRFRED.ASM):00089         COINMF EQU    123
+     007C             (       RRFRED.ASM):00090         MPROG  EQU    124
+     007D             (       RRFRED.ASM):00091         EXTMES EQU    125
+     007E             (       RRFRED.ASM):00092         NULMES EQU    126
+     007F             (       RRFRED.ASM):00093         ACRM   EQU    127
+     0080             (       RRFRED.ASM):00094         TITLEM EQU    128
+     0081             (       RRFRED.ASM):00095         FAMMM  EQU    129
+                      (       RRFRED.ASM):00096         
+     C000             (       RRFRED.ASM):00097         RAMTOP EQU    $C000          TOP OF RAM FOR RAM TEST
+                      (       RRFRED.ASM):00098         
+                      (       RRFRED.ASM):00099                ORG    HXTAB
+B3E4                  (       RRFRED.ASM):00100         EGRAM  RMB    2
+B3E6                  (       RRFRED.ASM):00101         EGRAM2 RMB    2
+B3E8                  (       RRFRED.ASM):00102         PLRX   RMB    2
+B3EA                  (       RRFRED.ASM):00103         ALTBL  RMB    20             PLACE FOR 20 CHAR HIGH SCORE SAVE
+                      (       RRFRED.ASM):00104         
+     B3EA             (       RRFRED.ASM):00105         MESOUT EQU    ALTBL          OPERATOR MESSAGE BUFFER
+     B3EA             (       RRFRED.ASM):00106         RAMALS EQU    ALTBL          DIAGNOSTIC/HIGH SCORE SCRATCH REF.
+     B3EA             (       RRFRED.ASM):00107         CRDRAM EQU    ALTBL   
+                      (       RRFRED.ASM):00108         
+                      (       RRFRED.ASM):00109                ORG    ALTBL+60       DO THE BALL PAST THE OPERATOR MESS AREA
+B426                  (       RRFRED.ASM):00110         ARAM1  RMB    392            WILLI PAGE A-MODE STUFF
+B5AE                  (       RRFRED.ASM):00111         ERLIST RMB    28*2
+     B5E6             (       RRFRED.ASM):00112         EREND  EQU    *
+                      (m/src/RRTESTB.ASM):00003         *        OPT    LIS
+                      (m/src/RRTESTB.ASM):00004         
+                      (m/src/RRTESTB.ASM):00005                ORG    RAMALS         USE SAM RAM FOR STORAGE
+B3EA                  (m/src/RRTESTB.ASM):00006         XSTOR  RMB    2
+B3EC                  (m/src/RRTESTB.ASM):00007         YSTOR  RMB    2
+B3EE                  (m/src/RRTESTB.ASM):00008         ASTOR  RMB    1
+B3EF                  (m/src/RRTESTB.ASM):00009         USTOR  RMB    2
+                      (m/src/RRTESTB.ASM):00010         
+     000C             (m/src/RRTESTB.ASM):00011         FROBX  EQU    $C 
+     0011             (m/src/RRTESTB.ASM):00012         ADJX   EQU    $11
+     0059             (m/src/RRTESTB.ASM):00013         ADVALX EQU    $59
+                      (m/src/RRTESTB.ASM):00014         
+                      (m/src/RRTESTB.ASM):00015          ORG TSBORG
+6F00 7E70FD           (m/src/RRTESTB.ASM):00016          JMP ADJUST
+6F03 7E74B8           (m/src/RRTESTB.ASM):00017          JMP CKCMOS
+6F06 7E752C           (m/src/RRTESTB.ASM):00018          JMP OPTSTZ
+6F09 7E753A           (m/src/RRTESTB.ASM):00019          JMP GETLET
+6F0C 7E6F11           (m/src/RRTESTB.ASM):00020          JMP CMOSMV
+6F0F 6F65             (m/src/RRTESTB.ASM):00021                FDB    OPD1
+                      (m/src/RRTESTB.ASM):00022         *
+                      (m/src/RRTESTB.ASM):00023         * CMOS MOVE: DESTINATION=Y, SOURCE=X, COUNT=B
+                      (m/src/RRTESTB.ASM):00024         *
+6F11 3402             (m/src/RRTESTB.ASM):00025         CMOSMV PSHS A NEED A
+6F13 A680             (m/src/RRTESTB.ASM):00026         CMMV1 LDA ,X+ GET SOURCE
+6F15 1E12             (m/src/RRTESTB.ASM):00027          EXG X,Y SWAP
+6F17 BDD0AB           (m/src/RRTESTB.ASM):00028          JSR WCMOSA RITE IT
+6F1A 1E12             (m/src/RRTESTB.ASM):00029          EXG X,Y SWAP BACK
+6F1C 5A               (m/src/RRTESTB.ASM):00030          DECB DONE?
+6F1D 26F4             (m/src/RRTESTB.ASM):00031          BNE CMMV1 NO,LOOP
+6F1F 3582             (m/src/RRTESTB.ASM):00032          PULS A,PC RETURN CLEAN
+                      (m/src/RRTESTB.ASM):00033         *
+                      (m/src/RRTESTB.ASM):00034         * CLEAR CMOS: CRASHES A,B,X
+                      (m/src/RRTESTB.ASM):00035         *
+6F21 8ECC00           (m/src/RRTESTB.ASM):00036         CLRALL LDX #CMOS POINT TO START
+6F24 6F80             (m/src/RRTESTB.ASM):00037         CLRA1  CLR ,X+
+6F26 8CD000           (m/src/RRTESTB.ASM):00038          CMPX #CMOS+$400
+6F29 26F9             (m/src/RRTESTB.ASM):00039          BNE CLRA1  NO, LOOP
+6F2B 39               (m/src/RRTESTB.ASM):00040          RTS BYE
+                      (m/src/RRTESTB.ASM):00041         *
+                      (m/src/RRTESTB.ASM):00042         * INIT CMOS: SAVES STATE
+                      (m/src/RRTESTB.ASM):00043         *
+6F2C 3436             (m/src/RRTESTB.ASM):00044         CMINIZ PSHS X,Y,D SAVE STATE
+6F2E 8E6F53           (m/src/RRTESTB.ASM):00045          LDX #DEFALT POINT TO ROM
+6F31 108ECC00         (m/src/RRTESTB.ASM):00046          LDY #CMOS POINT TO DESTINATION
+6F35 C612             (m/src/RRTESTB.ASM):00047          LDB #DEFSIZ LENGTH
+6F37 8DD8             (m/src/RRTESTB.ASM):00048          BSR CMOSMV MOVE THEM ALL
+6F39 35B6             (m/src/RRTESTB.ASM):00049          PULS X,Y,D,PC ALL DONE
+                      (m/src/RRTESTB.ASM):00050         
+6F3B 3436             (m/src/RRTESTB.ASM):00051         OPSET PSHS X,Y,D
+6F3D 8E6F65           (m/src/RRTESTB.ASM):00052          LDX #OPD1
+6F40 108ECC24         (m/src/RRTESTB.ASM):00053          LDY #OPMESS
+6F44 C634             (m/src/RRTESTB.ASM):00054          LDB #52      50 BYTES WORTH
+6F46 8DC9             (m/src/RRTESTB.ASM):00055          BSR CMOSMV   DO THE XFER
+6F48 BD7491           (m/src/RRTESTB.ASM):00056          JSR OPCHK FIND THE CHECK BYTE
+6F4B 8ECC8E           (m/src/RRTESTB.ASM):00057          LDX #OMESUM  PLACE TO STORE IT
+6F4E BDD0AB           (m/src/RRTESTB.ASM):00058          JSR   WCMOSA WRITE IT
+6F51 35B6             (m/src/RRTESTB.ASM):00059          PULS X,Y,D,PC
+                      (m/src/RRTESTB.ASM):00060         *
+                      (m/src/RRTESTB.ASM):00061         *
+                      (m/src/RRTESTB.ASM):00062         * DEFAULT HERE FOR NOW
+                      (m/src/RRTESTB.ASM):00063         *
+6F53 25               (m/src/RRTESTB.ASM):00064         DEFALT FCB $25 REPLAY @10,000
+6F54 03               (m/src/RRTESTB.ASM):00065          FCB $3 NSHIP
+6F55 03               (m/src/RRTESTB.ASM):00066          FCB $03 CSELCT
+6F56 01               (m/src/RRTESTB.ASM):00067          FCB $01 SLOT1M
+6F57 04               (m/src/RRTESTB.ASM):00068          FCB $04 SLOT2M
+6F58 01               (m/src/RRTESTB.ASM):00069          FCB $01 SLOT3M
+6F59 01               (m/src/RRTESTB.ASM):00070          FCB $01 CUNITC
+6F5A 00               (m/src/RRTESTB.ASM):00071          FCB $00 CUNITB
+6F5B 00               (m/src/RRTESTB.ASM):00072          FCB $00 MINUNT
+6F5C 01               (m/src/RRTESTB.ASM):00073          FCB $01 "GAME WORKS = 0" ADJUSTMENT
+6F5D 03               (m/src/RRTESTB.ASM):00074          FCB $03 GA1   MASTER DIFFICULTY
+6F5E 03               (m/src/RRTESTB.ASM):00075          FCB $03 GA2  NUMBER OF LETTERS FOR GOD
+6F5F 00               (m/src/RRTESTB.ASM):00076          FCB 0   FACTORY SETTINGS
+6F60 00               (m/src/RRTESTB.ASM):00077          FCB 0 CLEAR AUDIT TOTALS
+6F61 00               (m/src/RRTESTB.ASM):00078          FCB 0 CLEAR HSTD 
+6F62 00               (m/src/RRTESTB.ASM):00079          FCB 0 AUTOCYCLE
+6F63 00               (m/src/RRTESTB.ASM):00080          FCB 0 ENTER OPERATOR MESSAGE
+6F64 00               (m/src/RRTESTB.ASM):00081          FCB 0 ENTER HSTD
+     0012             (m/src/RRTESTB.ASM):00082         DEFSIZ EQU *-DEFALT
+6F65 202020202048454C (m/src/RRTESTB.ASM):00083         OPD1 FCC '     HELLO WORLD!'             
+     4C4F20574F524C44
+     21
+6F76 2020202020202020 (m/src/RRTESTB.ASM):00084          FCC '        ' SPACES AFTER PRESENTED BY
+6F7E 57494C4C49414D53 (m/src/RRTESTB.ASM):00085         OPD2 FCC 'WILLIAMS ELECTRONICS INC'
+     20454C454354524F
+     4E49435320494E43
+6F96 3D               (m/src/RRTESTB.ASM):00086          FCB $3D PERIOD
+6F97 2F28             (m/src/RRTESTB.ASM):00087          FCB $2F,$28
+                      (m/src/RRTESTB.ASM):00088         *
+                      (m/src/RRTESTB.ASM):00089         * COINAGE SELECT TABLE
+                      (m/src/RRTESTB.ASM):00090         *
+6F99 010401010000     (m/src/RRTESTB.ASM):00091         CSELCT FCB $01,$04,$01,$01,$0,$0 FACTORY USE FOR CUSTOM START
+6F9F 010401020400     (m/src/RRTESTB.ASM):00092          FCB $01,$04,$01,$02,$04,$00 50C..3/$1.00
+6FA5 060001010000     (m/src/RRTESTB.ASM):00093          FCB $06,$00,$01,$01,$00,$00 NEWNEW GERMAN
+6FAB 010401010000     (m/src/RRTESTB.ASM):00094          FCB $01,$04,$01,$01,$00,$00 25C
+6FB1 011606020000     (m/src/RRTESTB.ASM):00095          FCB $01,$16,$06,$02,$00,$00 NEW FRENCH
+6FB7 010401020000     (m/src/RRTESTB.ASM):00096          FCB $01,$04,$01,$02,$00,$00 50C
+6FBD 010004010000     (m/src/RRTESTB.ASM):00097          FCB $01,$00,$04,$01,$00,$00
+6FC3 010002010000     (m/src/RRTESTB.ASM):00098          FCB $01,$00,$02,$01,$00,$00
+6FC9 010002020000     (m/src/RRTESTB.ASM):00099          FCB $01,$00,$02,$02,$00,$00
+6FCF 010401010000     (m/src/RRTESTB.ASM):00100          FCB $01,$04,$01,$01,$00,$00 FREE PLAY
+                      (m/src/RRTESTB.ASM):00101         *
+     001E             (m/src/RRTESTB.ASM):00102         ADJH   EQU    30
+                      (m/src/RRTESTB.ASM):00103         
+6FD5 0050             (m/src/RRTESTB.ASM):00104         ADJTBL FCB    0,$50    REPLAY LEVEL 
+6FD7 7041             (m/src/RRTESTB.ASM):00105                FDB    REPTTT
+6FD9 001E             (m/src/RRTESTB.ASM):00106                FCB    0,ADJH
+                      (m/src/RRTESTB.ASM):00107         *
+6FDB 0120             (m/src/RRTESTB.ASM):00108                FCB    1,$20    SHIPS FOR 1 CREDIT
+6FDD 704C             (m/src/RRTESTB.ASM):00109                FDB    CRED1T
+6FDF 0027             (m/src/RRTESTB.ASM):00110                FCB    0,ADJH+9 
+                      (m/src/RRTESTB.ASM):00111         *
+6FE1 0009             (m/src/RRTESTB.ASM):00112                FCB    0,9      CSELECT
+6FE3 705A             (m/src/RRTESTB.ASM):00113                FDB    CONSLT
+6FE5 0032             (m/src/RRTESTB.ASM):00114                FCB    0,ADJH+20
+                      (m/src/RRTESTB.ASM):00115         *
+6FE7 0099             (m/src/RRTESTB.ASM):00116                FCB    0,$99    LEFT MULT
+6FE9 7057             (m/src/RRTESTB.ASM):00117                FDB    NOWORD
+6FEB 013B             (m/src/RRTESTB.ASM):00118                FCB    1,ADJH+29
+                      (m/src/RRTESTB.ASM):00119         *
+6FED 0099             (m/src/RRTESTB.ASM):00120                FCB    0,$99    CENTER
+6FEF 7057             (m/src/RRTESTB.ASM):00121                FDB    NOWORD
+6FF1 0144             (m/src/RRTESTB.ASM):00122                FCB    1,ADJH+38
+                      (m/src/RRTESTB.ASM):00123         *
+6FF3 0099             (m/src/RRTESTB.ASM):00124                FCB    0,$99     RIGHT
+6FF5 7057             (m/src/RRTESTB.ASM):00125                FDB    NOWORD
+6FF7 014D             (m/src/RRTESTB.ASM):00126                FCB    1,ADJH+47
+                      (m/src/RRTESTB.ASM):00127         *
+6FF9 0199             (m/src/RRTESTB.ASM):00128                FCB    1,$99     COIN UNITS FOR CREDIT
+6FFB 7057             (m/src/RRTESTB.ASM):00129                FDB    NOWORD
+6FFD 0156             (m/src/RRTESTB.ASM):00130                FCB    1,ADJH+56
+                      (m/src/RRTESTB.ASM):00131         *
+6FFF 0099             (m/src/RRTESTB.ASM):00132                FCB    0,$99     COIN UNITS FOR BONUS
+7001 7057             (m/src/RRTESTB.ASM):00133                FDB    NOWORD
+7003 015F             (m/src/RRTESTB.ASM):00134                FCB    1,ADJH+65
+                      (m/src/RRTESTB.ASM):00135         *
+7005 0099             (m/src/RRTESTB.ASM):00136                FCB    0,$99     MINIMUM COINAGE NEEDED
+7007 7057             (m/src/RRTESTB.ASM):00137                FDB    NOWORD
+7009 0168             (m/src/RRTESTB.ASM):00138                FCB    1,ADJH+74 
+                      (m/src/RRTESTB.ASM):00139         *
+700B 0001             (m/src/RRTESTB.ASM):00140                FCB    0,1      FREE PLAY
+700D 706F             (m/src/RRTESTB.ASM):00141                FDB    YESNO
+700F 0073             (m/src/RRTESTB.ASM):00142                FCB    0,ADJH+85 
+                      (m/src/RRTESTB.ASM):00143         *
+7011 0010             (m/src/RRTESTB.ASM):00144                FCB    0,$10    MASTER DIFFICULTY
+7013 7079             (m/src/RRTESTB.ASM):00145                FDB    MASTT
+7015 007C             (m/src/RRTESTB.ASM):00146                FCB    0,ADJH+94
+                      (m/src/RRTESTB.ASM):00147         *
+7017 0320             (m/src/RRTESTB.ASM):00148                FCB    3,$20     LETTERS IN GODS NAME
+7019 7084             (m/src/RRTESTB.ASM):00149                FDB    GODLT
+701B 0085             (m/src/RRTESTB.ASM):00150                FCB    0,ADJH+103
+                      (m/src/RRTESTB.ASM):00151         *
+701D 0001             (m/src/RRTESTB.ASM):00152                FCB    0,1
+701F 7074             (m/src/RRTESTB.ASM):00153                FDB    YESNO1
+7021 0090             (m/src/RRTESTB.ASM):00154                FCB    0,ADJH+114
+                      (m/src/RRTESTB.ASM):00155         *
+7023 0001             (m/src/RRTESTB.ASM):00156                FCB    0,1
+7025 7074             (m/src/RRTESTB.ASM):00157                FDB    YESNO1
+7027 0099             (m/src/RRTESTB.ASM):00158                FCB    0,ADJH+123
+                      (m/src/RRTESTB.ASM):00159         *
+7029 0001             (m/src/RRTESTB.ASM):00160                FCB    0,1
+702B 7074             (m/src/RRTESTB.ASM):00161                FDB    YESNO1
+702D 00A2             (m/src/RRTESTB.ASM):00162                FCB    0,ADJH+132
+                      (m/src/RRTESTB.ASM):00163         *
+702F 0001             (m/src/RRTESTB.ASM):00164                FCB    0,1
+7031 7074             (m/src/RRTESTB.ASM):00165                FDB    YESNO1
+7033 00AB             (m/src/RRTESTB.ASM):00166                FCB    0,ADJH+141
+                      (m/src/RRTESTB.ASM):00167         *
+7035 0001             (m/src/RRTESTB.ASM):00168                FCB    0,1
+7037 7074             (m/src/RRTESTB.ASM):00169                FDB    YESNO1
+7039 00B4             (m/src/RRTESTB.ASM):00170                FCB    0,ADJH+150
+                      (m/src/RRTESTB.ASM):00171         *
+703B 0001             (m/src/RRTESTB.ASM):00172                FCB    0,1
+703D 7074             (m/src/RRTESTB.ASM):00173                FDB    YESNO1
+703F 00BD             (m/src/RRTESTB.ASM):00174                FCB    0,ADJH+159
+                      (m/src/RRTESTB.ASM):00175         
+7041 005A             (m/src/RRTESTB.ASM):00176         REPTTT FCB    0,NOREPM
+7043 2040             (m/src/RRTESTB.ASM):00177                FCB    $20,REPMM1
+7045 2541             (m/src/RRTESTB.ASM):00178                FCB    $25,REPMM2
+7047 304E             (m/src/RRTESTB.ASM):00179                FCB    $30,REPMM3
+7049 5066             (m/src/RRTESTB.ASM):00180                FCB    $50,REPMM4
+704B FF               (m/src/RRTESTB.ASM):00181                FCB    $FF
+                      (m/src/RRTESTB.ASM):00182         
+704C 0042             (m/src/RRTESTB.ASM):00183         CRED1T FCB    0,NOMESS
+704E 0243             (m/src/RRTESTB.ASM):00184                FCB    2,HIVOL
+7050 0344             (m/src/RRTESTB.ASM):00185                FCB    3,RECOM
+7052 0445             (m/src/RRTESTB.ASM):00186                FCB    4,POORP
+7054 0542             (m/src/RRTESTB.ASM):00187                FCB    5,NOMESS
+7056 FF               (m/src/RRTESTB.ASM):00188                FCB    $FF
+                      (m/src/RRTESTB.ASM):00189         
+7057 0042             (m/src/RRTESTB.ASM):00190         NOWORD FCB    0,NOMESS
+7059 FF               (m/src/RRTESTB.ASM):00191                FCB    $FF
+                      (m/src/RRTESTB.ASM):00192         
+705A 0046             (m/src/RRTESTB.ASM):00193         CONSLT FCB    0,CUSTM
+705C 0152             (m/src/RRTESTB.ASM):00194                FCB    1,COINM1
+705E 0253             (m/src/RRTESTB.ASM):00195                FCB    2,COINM1+1
+7060 0354             (m/src/RRTESTB.ASM):00196                FCB    3,COINM1+2
+7062 0455             (m/src/RRTESTB.ASM):00197                FCB    4,COINM1+3
+7064 0556             (m/src/RRTESTB.ASM):00198                FCB    5,COINM1+4
+7066 0657             (m/src/RRTESTB.ASM):00199                FCB    6,COINM1+5
+7068 0758             (m/src/RRTESTB.ASM):00200                FCB    7,COINM1+6
+706A 0859             (m/src/RRTESTB.ASM):00201                FCB    8,COINM1+7
+706C 097B             (m/src/RRTESTB.ASM):00202                FCB    9,COINMF
+706E FF               (m/src/RRTESTB.ASM):00203                FCB    $FF
+                      (m/src/RRTESTB.ASM):00204         
+706F 0048             (m/src/RRTESTB.ASM):00205         YESNO  FCB    0,NOM 
+7071 0147             (m/src/RRTESTB.ASM):00206                FCB    1,YESM
+7073 FF               (m/src/RRTESTB.ASM):00207                FCB    $FF
+                      (m/src/RRTESTB.ASM):00208         
+7074 0048             (m/src/RRTESTB.ASM):00209         YESNO1 FCB    0,NOM
+7076 0151             (m/src/RRTESTB.ASM):00210                FCB    1,YES1M
+7078 FF               (m/src/RRTESTB.ASM):00211                FCB    $FF
+                      (m/src/RRTESTB.ASM):00212         
+7079 0049             (m/src/RRTESTB.ASM):00213         MASTT  FCB    0,EXLIB
+707B 034A             (m/src/RRTESTB.ASM):00214                FCB    3,LIB  
+707D 0544             (m/src/RRTESTB.ASM):00215                FCB    5,RECOM
+707F 064C             (m/src/RRTESTB.ASM):00216                FCB    6,CONS 
+7081 084D             (m/src/RRTESTB.ASM):00217                FCB    8,EXCON
+7083 FF               (m/src/RRTESTB.ASM):00218                FCB    $FF
+                      (m/src/RRTESTB.ASM):00219         
+7084 0044             (m/src/RRTESTB.ASM):00220         GODLT  FCB    0,RECOM 
+7086 0442             (m/src/RRTESTB.ASM):00221                FCB    $4,NOMESS
+7088 FF               (m/src/RRTESTB.ASM):00222                FCB    $FF
+                      (m/src/RRTESTB.ASM):00223         
+                      (m/src/RRTESTB.ASM):00224         *
+                      (m/src/RRTESTB.ASM):00225         ***    DISPLAY FULL TEXT FOR A LINE.
+                      (m/src/RRTESTB.ASM):00226         *
+                      (m/src/RRTESTB.ASM):00227         *      Y = CMOS LOCATION
+                      (m/src/RRTESTB.ASM):00228         *      U = POINTER TO TABLE ENTRY FOR THIS LOCATION.
+                      (m/src/RRTESTB.ASM):00229         *      A = TEXT MESSAGE FOR LOCATION
+                      (m/src/RRTESTB.ASM):00230         
+7089 3422             (m/src/RRTESTB.ASM):00231         DISADJ PSHS   A,Y            SAVE TEXT
+708B 8611             (m/src/RRTESTB.ASM):00232                LDA    #ADJX          ADJUSTMENT X
+708D 6D44             (m/src/RRTESTB.ASM):00233                TST    4,U            PROTECTED??
+708F 2702             (m/src/RRTESTB.ASM):00234                BEQ    DSADJ1
+7091 8616             (m/src/RRTESTB.ASM):00235                LDA    #ADJX+5        THEN INDENT.
+7093 E645             (m/src/RRTESTB.ASM):00236         DSADJ1 LDB    5,U            GET Y FOR THIS GUY
+7095 1F01             (m/src/RRTESTB.ASM):00237                TFR    D,X            AND MAKE IT CURSOR
+7097 A6E4             (m/src/RRTESTB.ASM):00238                LDA    ,S             RESTORE A
+7099 BD5F96           (m/src/RRTESTB.ASM):00239                JSR    WRD5FV         PRINT THE NAME OF THE ADJUSTMENT
+709C 8D02             (m/src/RRTESTB.ASM):00240                BSR    PRVAL          PRINT THE VALUE APPROPRIATELY  (AND MESSAGE)
+709E 35A2             (m/src/RRTESTB.ASM):00241                PULS   A,Y,PC         AND RETURN
+                      (m/src/RRTESTB.ASM):00242         
+70A0 3436             (m/src/RRTESTB.ASM):00243         PRVAL  PSHS   Y,D,X
+70A2 1E12             (m/src/RRTESTB.ASM):00244                EXG    X,Y
+70A4 BDD0A5           (m/src/RRTESTB.ASM):00245                JSR    RCMOSB         GET THE VALUE
+70A7 C1FF             (m/src/RRTESTB.ASM):00246                CMPB   #$FF
+70A9 2602             (m/src/RRTESTB.ASM):00247                BNE    PRVALZ         STUPID FIX
+70AB C6EE             (m/src/RRTESTB.ASM):00248                LDB    #$EE
+70AD 1E12             (m/src/RRTESTB.ASM):00249         PRVALZ EXG    X,Y            CHANGE BACK
+70AF 1E10             (m/src/RRTESTB.ASM):00250                EXG    X,D      
+70B1 8659             (m/src/RRTESTB.ASM):00251                LDA    #ADVALX
+70B3 E645             (m/src/RRTESTB.ASM):00252                LDB    5,U            HEIGHT
+70B5 1E10             (m/src/RRTESTB.ASM):00253                EXG    X,D
+70B7 3406             (m/src/RRTESTB.ASM):00254                PSHS   D
+70B9 CC3C05           (m/src/RRTESTB.ASM):00255                LDD    #$3C05  
+70BC BDD01B           (m/src/RRTESTB.ASM):00256                JSR    BLKCLR
+70BF 3506             (m/src/RRTESTB.ASM):00257                PULS   D
+70C1 8D05             (m/src/RRTESTB.ASM):00258                BSR    GETMES         GET THE ACCOMANYING MESSAGE
+70C3 BD5F96           (m/src/RRTESTB.ASM):00259                JSR    WRD5FV         AND PRINT
+70C6 35B6             (m/src/RRTESTB.ASM):00260                PULS   Y,D,PC,X       AND RETURN
+                      (m/src/RRTESTB.ASM):00261         
+70C8 3420             (m/src/RRTESTB.ASM):00262         GETMES PSHS   Y
+70CA 10AE42           (m/src/RRTESTB.ASM):00263                LDY    2,U            GET TO AREA TO PARSE
+70CD E1A1             (m/src/RRTESTB.ASM):00264         GETMS1 CMPB   ,Y++           DO WE RATE OVER THIS ONE
+70CF 24FC             (m/src/RRTESTB.ASM):00265                BHS    GETMS1
+70D1 A63D             (m/src/RRTESTB.ASM):00266                LDA    -3,Y           GRAB THE APPROPRIATE MESSAGE POINTER
+70D3 35A0             (m/src/RRTESTB.ASM):00267                PULS   Y,PC           AND RETURN
+                      (m/src/RRTESTB.ASM):00268         
+70D5 BDD012           (m/src/RRTESTB.ASM):00269         PAGE1  JSR    SCRCLR
+70D8 8666             (m/src/RRTESTB.ASM):00270                LDA    #$66
+70DA 97CF             (m/src/RRTESTB.ASM):00271                STA    TEXCOL         GREEN FOR WALLY!
+70DC CE6FD5           (m/src/RRTESTB.ASM):00272                LDU    #ADJTBL
+70DF 108ECC00         (m/src/RRTESTB.ASM):00273                LDY    #CMOS
+70E3 862E             (m/src/RRTESTB.ASM):00274                LDA    #ADJMES
+70E5 8ECC24           (m/src/RRTESTB.ASM):00275                LDX    #ENDADJ        PLACE TO FINISH
+                      (m/src/RRTESTB.ASM):00276         
+70E8 3410             (m/src/RRTESTB.ASM):00277                PSHS   X              ARCHAIC PUSH
+70EA 8D9D             (m/src/RRTESTB.ASM):00278         PRNPG1 BSR    DISADJ         PRINT OUT THE CURRENT LINE
+70EC 3346             (m/src/RRTESTB.ASM):00279                LEAU   6,U            PUSH TO NEXT ENTRY
+70EE 3122             (m/src/RRTESTB.ASM):00280                LEAY   2,Y
+70F0 4C               (m/src/RRTESTB.ASM):00281                INCA
+70F1 10ACE4           (m/src/RRTESTB.ASM):00282                CMPY   ,S            SEE IF DONE
+70F4 26F4             (m/src/RRTESTB.ASM):00283                BNE    PRNPG1
+70F6 862D             (m/src/RRTESTB.ASM):00284                LDA    #CONTMS        TITLES AND STUFF
+70F8 BD5F96           (m/src/RRTESTB.ASM):00285                JSR    WRD5V          PUT THEM IN
+70FB 3590             (m/src/RRTESTB.ASM):00286                PULS   X,PC
+                      (m/src/RRTESTB.ASM):00287         
+70FD BD74AB           (m/src/RRTESTB.ASM):00288         ADJUST JSR    CKADJ          SEE IF OUT OF WHACK TO BEGIN WITH
+7100 2703             (m/src/RRTESTB.ASM):00289                BEQ    ADJJJJ         LOOKS OK TO ME
+7102 BD6F2C           (m/src/RRTESTB.ASM):00290                JSR    CMINIZ         INITIALIZE THE SETTINGS
+7105 8ECC18           (m/src/RRTESTB.ASM):00291         ADJJJJ LDX    #SPECFN        ZERO OUT THE SPECIAL FUNCTION BYTES
+7108 6F80             (m/src/RRTESTB.ASM):00292         ADJS11 CLR    ,X+
+710A 8CCC24           (m/src/RRTESTB.ASM):00293                CMPX   #ENDADJ
+710D 25F9             (m/src/RRTESTB.ASM):00294                BLO    ADJS11
+710F BD7478           (m/src/RRTESTB.ASM):00295                JSR    MAKCHK         PUT DOWN THE APPROPRIATE CHECKSUM
+7112 8DC1             (m/src/RRTESTB.ASM):00296                BSR    PAGE1          PUT THE FIRST PAGE UP
+7114 CE6FD5           (m/src/RRTESTB.ASM):00297                LDU    #ADJTBL        START OF TABLE
+7117 108ECC00         (m/src/RRTESTB.ASM):00298                LDY    #CMOS          START OF MEMORY
+711B 862E             (m/src/RRTESTB.ASM):00299                LDA    #ADJMES
+711D BD7433           (m/src/RRTESTB.ASM):00300                JSR    SSTATE         STORE THE STATE
+7120 BD71FE           (m/src/RRTESTB.ASM):00301                JSR    FROBON         PUT FROB IN PLACE.
+                      (m/src/RRTESTB.ASM):00302                MAKP   ADVSCN         PROCESS TO SCAN ADVANCE AND TERMINATE IF HIT.
+7123 BDD054           (             MAKP):00001          JSR MAKEP
+7126 729F             (             MAKP):00002          FDB ADVSCN
+                      (m/src/RRTESTB.ASM):00303         *      
+                      (m/src/RRTESTB.ASM):00304         *      BEGIN STEADY STATE MODE.
+                      (m/src/RRTESTB.ASM):00305         *
+7128 BD721D           (m/src/RRTESTB.ASM):00306         ADJST0 JSR    UPDOWN         CHECK FOR UP/DOWN
+712B 8D08             (m/src/RRTESTB.ASM):00307                BSR    INCDEC         CHECK FOR THRUST/FIRE
+                      (m/src/RRTESTB.ASM):00308                NAP    1,ADJST0
+712D 8601             (              NAP):00001                LDA #1 TIME
+712F 8E7128           (              NAP):00002                LDX #ADJST0 WAKEUP ADDR
+7132 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (m/src/RRTESTB.ASM):00309         
+7135 3506             (m/src/RRTESTB.ASM):00310         INCDEC PULS   D
+7137 DE15             (m/src/RRTESTB.ASM):00311                LDU    CRPROC
+7139 ED4D             (m/src/RRTESTB.ASM):00312                STD    PD+6,U
+713B 8620             (m/src/RRTESTB.ASM):00313                LDA    #$20
+713D A747             (m/src/RRTESTB.ASM):00314                STA    PD,U
+713F B6C804           (m/src/RRTESTB.ASM):00315                LDA    PIA2  CHECK FOR FIRE UP, FIRE DOWN
+7142 2B22             (m/src/RRTESTB.ASM):00316                BMI    DECME    FIRE DOWN...DECREMENT
+7144 8540             (m/src/RRTESTB.ASM):00317                BITA   #$40
+7146 2603             (m/src/RRTESTB.ASM):00318                BNE    INCME    FIRE UP...
+7148 6ED80D           (m/src/RRTESTB.ASM):00319         IDRET  JMP    [PD+6,U]
+                      (m/src/RRTESTB.ASM):00320         
+714B 8D32             (m/src/RRTESTB.ASM):00321         INCME  BSR    INC1          ONE INCREMENT
+714D                  (m/src/RRTESTB.ASM):00322         INCME0 NAP    1,INCME1
+714D 8601             (              NAP):00001                LDA #1 TIME
+714F 8E7155           (              NAP):00002                LDX #INCME1 WAKEUP ADDR
+7152 7ED066           (              NAP):00003                JMP    SLEEP  
+7155 B6C804           (m/src/RRTESTB.ASM):00323         INCME1 LDA    PIA2
+7158 8540             (m/src/RRTESTB.ASM):00324                BITA   #$40
+715A 27EC             (m/src/RRTESTB.ASM):00325                BEQ    IDRET          LET GO
+715C 6A47             (m/src/RRTESTB.ASM):00326                DEC    PD,U           DELAY
+715E 26ED             (m/src/RRTESTB.ASM):00327                BNE    INCME0
+7160 8605             (m/src/RRTESTB.ASM):00328                LDA    #5
+7162 A747             (m/src/RRTESTB.ASM):00329                STA    PD,U
+7164 20E5             (m/src/RRTESTB.ASM):00330                BRA    INCME
+                      (m/src/RRTESTB.ASM):00331         
+7166 8D3D             (m/src/RRTESTB.ASM):00332         DECME  BSR    DEC1
+7168                  (m/src/RRTESTB.ASM):00333         DECME0 NAP    1,DECME1
+7168 8601             (              NAP):00001                LDA #1 TIME
+716A 8E7170           (              NAP):00002                LDX #DECME1 WAKEUP ADDR
+716D 7ED066           (              NAP):00003                JMP    SLEEP  
+7170 B6C804           (m/src/RRTESTB.ASM):00334         DECME1 LDA    PIA2
+7173 2AD3             (m/src/RRTESTB.ASM):00335                BPL    IDRET    HE LET GO
+7175 6A47             (m/src/RRTESTB.ASM):00336                DEC    PD,U
+7177 26EF             (m/src/RRTESTB.ASM):00337                BNE    DECME0
+7179 8605             (m/src/RRTESTB.ASM):00338                LDA    #5
+717B A747             (m/src/RRTESTB.ASM):00339                STA    PD,U
+717D 20E7             (m/src/RRTESTB.ASM):00340                BRA    DECME
+                      (m/src/RRTESTB.ASM):00341         
+717F BD743E           (m/src/RRTESTB.ASM):00342         INC1   JSR    LSTATE         GET THE STATE LOADED
+7182 1F21             (m/src/RRTESTB.ASM):00343                TFR    Y,X            COPY POINTER
+7184 BDD0A2           (m/src/RRTESTB.ASM):00344                JSR    RCMOSA         GET THE CURRENT VALUE
+7187 108CCC00         (m/src/RRTESTB.ASM):00345                CMPY   #REPLAY        IS THIS THE REPLAY LEVEL??
+718B 2732             (m/src/RRTESTB.ASM):00346                BEQ    INC22
+718D 8B01             (m/src/RRTESTB.ASM):00347                ADDA   #1
+718F 19               (m/src/RRTESTB.ASM):00348                DAA                   FORM NEW VALUE
+7190 2512             (m/src/RRTESTB.ASM):00349                BCS    INC11          NO WRAP AROUND
+7192 A141             (m/src/RRTESTB.ASM):00350                CMPA   1,U            COMPARE TO HIGHEST ALLOWED.
+7194 220E             (m/src/RRTESTB.ASM):00351                BHI    INC11          TOO HIGH....GET OUT OF HERE
+7196 1F21             (m/src/RRTESTB.ASM):00352         DEC11  TFR    Y,X            RESTORE POINTER
+7198 BDD0AB           (m/src/RRTESTB.ASM):00353                JSR    WCMOSA         PUT THE NUMBER BACK IN MEMORY
+719B BD7478           (m/src/RRTESTB.ASM):00354                JSR    MAKCHK         REFORM THE CHECK BYTE
+719E BD70A0           (m/src/RRTESTB.ASM):00355                JSR    PRVAL          PRINT OUT THE NEW VALUE AND INFORMATION.
+71A1 BD7449           (m/src/RRTESTB.ASM):00356                JSR    SPCASE         CHECK FOR SPECIAL CASES.
+71A4 39               (m/src/RRTESTB.ASM):00357         INC11  RTS                   AND RETURN
+                      (m/src/RRTESTB.ASM):00358         
+71A5 BD743E           (m/src/RRTESTB.ASM):00359         DEC1   JSR    LSTATE
+71A8 1F21             (m/src/RRTESTB.ASM):00360                TFR    Y,X
+71AA BDD0A2           (m/src/RRTESTB.ASM):00361                JSR    RCMOSA
+71AD 4D               (m/src/RRTESTB.ASM):00362                TSTA
+71AE 27F4             (m/src/RRTESTB.ASM):00363                BEQ    INC11          ALL THE WAY DOWN
+71B0 108CCC00         (m/src/RRTESTB.ASM):00364                CMPY   #REPLAY        IS THIS THE REPLAY ADJUSTMENT??
+71B4 270F             (m/src/RRTESTB.ASM):00365                BEQ    DEC22
+71B6 8B99             (m/src/RRTESTB.ASM):00366                ADDA   #$99
+71B8 19               (m/src/RRTESTB.ASM):00367                DAA
+71B9 A1C4             (m/src/RRTESTB.ASM):00368                CMPA   ,U            SEE IF TOO LOW
+71BB 25E7             (m/src/RRTESTB.ASM):00369                BLO    INC11          TOO LOW...BYE
+71BD 20D7             (m/src/RRTESTB.ASM):00370                BRA    DEC11          DO THE REST    
+                      (m/src/RRTESTB.ASM):00371         
+71BF 8D0A             (m/src/RRTESTB.ASM):00372         INC22  BSR    FINDME
+71C1 A601             (m/src/RRTESTB.ASM):00373                LDA    1,X
+71C3 20D1             (m/src/RRTESTB.ASM):00374                BRA    DEC11          AND FINISH
+                      (m/src/RRTESTB.ASM):00375         
+71C5 8D04             (m/src/RRTESTB.ASM):00376         DEC22  BSR    FINDME         MAKE X POINT TO CLOSEST APPROX
+71C7 A61F             (m/src/RRTESTB.ASM):00377                LDA    -1,X           FETCH THE VALUE BEFORE
+71C9 20CB             (m/src/RRTESTB.ASM):00378                BRA    DEC11
+                      (m/src/RRTESTB.ASM):00379         
+71CB 8E71DB           (m/src/RRTESTB.ASM):00380         FINDME LDX    #RVTAB
+71CE A184             (m/src/RRTESTB.ASM):00381         FINDM1 CMPA   ,X             ARE WE NEAR??
+71D0 2307             (m/src/RRTESTB.ASM):00382                BLS    FMBYE          YEP
+71D2 3001             (m/src/RRTESTB.ASM):00383                LEAX   1,X
+71D4 8C71DF           (m/src/RRTESTB.ASM):00384                CMPX   #RVEND
+71D7 25F5             (m/src/RRTESTB.ASM):00385                BLO    FINDM1
+71D9 39               (m/src/RRTESTB.ASM):00386         FMBYE  RTS
+                      (m/src/RRTESTB.ASM):00387         
+                      (m/src/RRTESTB.ASM):00388         *      REPLAY ADJUSTMENT TABLE
+                      (m/src/RRTESTB.ASM):00389         
+71DA 00               (m/src/RRTESTB.ASM):00390                FCB    0
+71DB 00               (m/src/RRTESTB.ASM):00391         RVTAB  FCB    0
+71DC 20               (m/src/RRTESTB.ASM):00392                FCB    $20
+71DD 25               (m/src/RRTESTB.ASM):00393                FCB    $25
+71DE 30               (m/src/RRTESTB.ASM):00394                FCB    $30
+71DF 50               (m/src/RRTESTB.ASM):00395         RVEND  FCB    $50
+71E0 50               (m/src/RRTESTB.ASM):00396                FCB    $50
+                      (m/src/RRTESTB.ASM):00397         
+71E1 3412             (m/src/RRTESTB.ASM):00398         PROTCK PSHS   A,X
+71E3 A644             (m/src/RRTESTB.ASM):00399                LDA    4,U            CHECK PROTECTION CODE
+71E5 2713             (m/src/RRTESTB.ASM):00400                BEQ    PROTOK
+71E7 8ECC04           (m/src/RRTESTB.ASM):00401                LDX    #COINSL        COIN PROTECTED
+71EA 4A               (m/src/RRTESTB.ASM):00402                DECA                  1??
+71EB 2703             (m/src/RRTESTB.ASM):00403                BEQ    PROTC1
+71ED 8ECC14           (m/src/RRTESTB.ASM):00404                LDX    #GA1
+71F0 BDD0A2           (m/src/RRTESTB.ASM):00405         PROTC1 JSR    RCMOSA
+71F3 4D               (m/src/RRTESTB.ASM):00406                TSTA
+71F4 2704             (m/src/RRTESTB.ASM):00407                BEQ    PROTOK
+71F6 1A01             (m/src/RRTESTB.ASM):00408                SEC
+71F8 3592             (m/src/RRTESTB.ASM):00409                PULS   A,X,PC
+71FA 1CFE             (m/src/RRTESTB.ASM):00410         PROTOK CLC    
+71FC 3592             (m/src/RRTESTB.ASM):00411                PULS   A,X,PC
+                      (m/src/RRTESTB.ASM):00412         
+71FE 3416             (m/src/RRTESTB.ASM):00413         FROBON PSHS   X,D
+7200 E645             (m/src/RRTESTB.ASM):00414                LDB    5,U      Y COORD OF FROB 
+7202 860C             (m/src/RRTESTB.ASM):00415                LDA    #FROBX
+7204 1F01             (m/src/RRTESTB.ASM):00416                TFR    D,X
+7206 862C             (m/src/RRTESTB.ASM):00417                LDA    #FROBM
+7208 BD5F96           (m/src/RRTESTB.ASM):00418                JSR    WRD5FV
+720B 3596             (m/src/RRTESTB.ASM):00419                PULS   X,D,PC
+                      (m/src/RRTESTB.ASM):00420         
+720D 3416             (m/src/RRTESTB.ASM):00421         FROBOF PSHS   X,D
+720F E645             (m/src/RRTESTB.ASM):00422                LDB    5,U
+7211 860C             (m/src/RRTESTB.ASM):00423                LDA    #FROBX
+7213 1F01             (m/src/RRTESTB.ASM):00424                TFR    D,X
+7215 CC0305           (m/src/RRTESTB.ASM):00425                LDD    #$0305   WIDTH,HEIGHT
+7218 BDD01B           (m/src/RRTESTB.ASM):00426                JSR    BLKCLR
+721B 3596             (m/src/RRTESTB.ASM):00427                PULS   X,D,PC
+                      (m/src/RRTESTB.ASM):00428         
+721D 3506             (m/src/RRTESTB.ASM):00429         UPDOWN PULS   D
+721F DE15             (m/src/RRTESTB.ASM):00430                LDU    CRPROC
+7221 ED4D             (m/src/RRTESTB.ASM):00431                STD    PD+6,U         SAVE RETURN ADDRESS
+7223 8630             (m/src/RRTESTB.ASM):00432                LDA    #$30           TYPOMATIC FIRST DELAY
+7225 A747             (m/src/RRTESTB.ASM):00433                STA    PD,U           INDICATE VIRGIN SCAN
+7227 B6C804           (m/src/RRTESTB.ASM):00434                LDA    PIA2           CHECK FOR DOWN
+722A 46               (m/src/RRTESTB.ASM):00435                RORA                  MOVE UP??
+722B 2521             (m/src/RRTESTB.ASM):00436                BCS    UPPER
+722D 46               (m/src/RRTESTB.ASM):00437                RORA
+722E 2503             (m/src/RRTESTB.ASM):00438                BCS    DOWNER
+7230 6ED80D           (m/src/RRTESTB.ASM):00439         UDRET  JMP    [PD+6,U]       NO ACTION...RETURN
+                      (m/src/RRTESTB.ASM):00440         
+7233 8D33             (m/src/RRTESTB.ASM):00441         DOWNER BSR    DOWN1          GO DOWN ONE (WHATEVER THAT MEANS)
+7235                  (m/src/RRTESTB.ASM):00442         DOWN2  NAP    1,DOWN3
+7235 8601             (              NAP):00001                LDA #1 TIME
+7237 8E723D           (              NAP):00002                LDX #DOWN3 WAKEUP ADDR
+723A 7ED066           (              NAP):00003                JMP    SLEEP  
+723D B6C804           (m/src/RRTESTB.ASM):00443         DOWN3  LDA    PIA2           CHECK IF STILL PRESSED
+7240 8502             (m/src/RRTESTB.ASM):00444                BITA   #$2            WELL??
+7242 27EC             (m/src/RRTESTB.ASM):00445                BEQ    UDRET          DONE WITH THIS PASS...NO LONGER PRESSED
+7244 6A47             (m/src/RRTESTB.ASM):00446                DEC    PD,U           TIME ME
+7246 26ED             (m/src/RRTESTB.ASM):00447                BNE    DOWN2          SLEEP ANOTHER FRAME BABE 
+7248 8608             (m/src/RRTESTB.ASM):00448                LDA    #8             FAST RATE
+724A A747             (m/src/RRTESTB.ASM):00449                STA    PD,U
+724C 20E5             (m/src/RRTESTB.ASM):00450                BRA    DOWNER         NOW DO ANOTHER STEP.
+                      (m/src/RRTESTB.ASM):00451         
+724E 8D34             (m/src/RRTESTB.ASM):00452         UPPER  BSR    UP1
+7250                  (m/src/RRTESTB.ASM):00453         UPPER1 NAP    1,UPPER2
+7250 8601             (              NAP):00001                LDA #1 TIME
+7252 8E7258           (              NAP):00002                LDX #UPPER2 WAKEUP ADDR
+7255 7ED066           (              NAP):00003                JMP    SLEEP  
+7258 B6C804           (m/src/RRTESTB.ASM):00454         UPPER2 LDA    PIA2
+725B 46               (m/src/RRTESTB.ASM):00455                RORA
+725C 24D2             (m/src/RRTESTB.ASM):00456                BCC    UDRET          LET GO
+725E 6A47             (m/src/RRTESTB.ASM):00457                DEC    PD,U
+7260 26EE             (m/src/RRTESTB.ASM):00458                BNE    UPPER1
+7262 8608             (m/src/RRTESTB.ASM):00459                LDA    #8
+7264 A747             (m/src/RRTESTB.ASM):00460                STA    PD,U
+7266 20E6             (m/src/RRTESTB.ASM):00461                BRA    UPPER
+                      (m/src/RRTESTB.ASM):00462         
+7268 BD743E           (m/src/RRTESTB.ASM):00463         DOWN1  JSR    LSTATE   GET US OUR STATE
+726B 8DA0             (m/src/RRTESTB.ASM):00464                BSR    FROBOF   CAN THE FROB
+726D 108CCC22         (m/src/RRTESTB.ASM):00465         DOWN11 CMPY   #ENDADJ-2   ARE WE ON LAST ENTRY??
+7271 270D             (m/src/RRTESTB.ASM):00466                BEQ    DOWNRT         THEN RETURN
+7273 3122             (m/src/RRTESTB.ASM):00467                LEAY   2,Y            MOVE TO NEXT
+7275 4C               (m/src/RRTESTB.ASM):00468                INCA
+7276 3346             (m/src/RRTESTB.ASM):00469                LEAU   6,U
+7278 BD71E1           (m/src/RRTESTB.ASM):00470                JSR    PROTCK         CHECK PROTECTION
+727B 25F0             (m/src/RRTESTB.ASM):00471                BCS    DOWN11
+727D BD7433           (m/src/RRTESTB.ASM):00472                JSR    SSTATE
+7280 BD71FE           (m/src/RRTESTB.ASM):00473         DOWNRT JSR    FROBON         NOW TURN THE FROB ON.
+7283 39               (m/src/RRTESTB.ASM):00474                RTS
+                      (m/src/RRTESTB.ASM):00475         
+7284 BD743E           (m/src/RRTESTB.ASM):00476         UP1    JSR    LSTATE
+7287 8D84             (m/src/RRTESTB.ASM):00477                BSR    FROBOF   CAN THE FROB
+7289 108CCC00         (m/src/RRTESTB.ASM):00478         UP11   CMPY   #CMOS    FIRST ENTRY
+728D 27F1             (m/src/RRTESTB.ASM):00479                BEQ    DOWNRT   YEP...BYE
+728F 313E             (m/src/RRTESTB.ASM):00480                LEAY   -2,Y
+7291 4A               (m/src/RRTESTB.ASM):00481                DECA
+7292 335A             (m/src/RRTESTB.ASM):00482                LEAU   -6,U
+7294 BD71E1           (m/src/RRTESTB.ASM):00483                JSR    PROTCK
+7297 25F0             (m/src/RRTESTB.ASM):00484                BCS    UP11     PROTECTED...PUSH TO NEXT ONE.
+7299 BD7433           (m/src/RRTESTB.ASM):00485                JSR    SSTATE
+729C 7E71FE           (m/src/RRTESTB.ASM):00486                JMP    FROBON   TURN THE FROB ON AND RETURN.
+                      (m/src/RRTESTB.ASM):00487         
+729F                  (m/src/RRTESTB.ASM):00488         ADVSCN NAP    1,ADVSC1                
+729F 8601             (              NAP):00001                LDA #1 TIME
+72A1 8E72A7           (              NAP):00002                LDX #ADVSC1 WAKEUP ADDR
+72A4 7ED066           (              NAP):00003                JMP    SLEEP  
+72A7 B6C80C           (m/src/RRTESTB.ASM):00489         ADVSC1 LDA    PIA0     SCAN FOR ADVANCE
+72AA 8502             (m/src/RRTESTB.ASM):00490                BITA   #2
+72AC 27F1             (m/src/RRTESTB.ASM):00491                BEQ    ADVSCN   JUST KEEP ON SCANNING
+72AE BDD060           (m/src/RRTESTB.ASM):00492                JSR    GNCIDE   KILL THE TEST PROCESS
+72B1 BDD012           (m/src/RRTESTB.ASM):00493                JSR    SCRCLR
+72B4 B6C80C           (m/src/RRTESTB.ASM):00494         ADVSC2 LDA    PIA0
+72B7 8502             (m/src/RRTESTB.ASM):00495                BITA   #2
+72B9 26F9             (m/src/RRTESTB.ASM):00496                BNE    ADVSC2   WAIT FOR RELEASE
+72BB B6CC1B           (m/src/RRTESTB.ASM):00497         ADVSC3 LDA    SPECFN+3 CLEAR AUDITS??
+72BE 840F             (m/src/RRTESTB.ASM):00498                ANDA   #$F
+72C0 2714             (m/src/RRTESTB.ASM):00499                BEQ    ADVSC4   
+72C2 7FCC1B           (m/src/RRTESTB.ASM):00500                CLR    SPECFN+3
+72C5 BD7478           (m/src/RRTESTB.ASM):00501                JSR    MAKCHK
+72C8 BDD012           (m/src/RRTESTB.ASM):00502                JSR    SCRCLR
+72CB BD7515           (m/src/RRTESTB.ASM):00503                JSR    AUDCK4   CLEAR THE AUDIT TOTALS AND PRINT THE MESSAGE.
+                      (m/src/RRTESTB.ASM):00504                NAP    $40,ADVSC4
+72CE 8640             (              NAP):00001                LDA #$40 TIME
+72D0 8E72D6           (              NAP):00002                LDX #ADVSC4 WAKEUP ADDR
+72D3 7ED066           (              NAP):00003                JMP    SLEEP  
+72D6 B6CC1D           (m/src/RRTESTB.ASM):00505         ADVSC4 LDA    SPECFN+5      CHECK AUDIT MESSAGE
+72D9 840F             (m/src/RRTESTB.ASM):00506                ANDA   #$F
+72DB 2711             (m/src/RRTESTB.ASM):00507                BEQ    ADVSC6        NOT THERE
+72DD 7FCC1D           (m/src/RRTESTB.ASM):00508                CLR    SPECFN+5
+72E0 BD7478           (m/src/RRTESTB.ASM):00509                JSR    MAKCHK
+72E3 BDE3D9           (m/src/RRTESTB.ASM):00510                JSR    HIGHRS        GO AND DO IT
+                      (m/src/RRTESTB.ASM):00511                NAP    $40,ADVSC6
+72E6 8640             (              NAP):00001                LDA #$40 TIME
+72E8 8E72EE           (              NAP):00002                LDX #ADVSC6 WAKEUP ADDR
+72EB 7ED066           (              NAP):00003                JMP    SLEEP  
+72EE B6CC21           (m/src/RRTESTB.ASM):00512         ADVSC6 LDA    SPECFN+9      OPERATOR MESSAGE
+72F1 840F             (m/src/RRTESTB.ASM):00513                ANDA   #$F           LOOK AT RELEVANCE
+72F3 275D             (m/src/RRTESTB.ASM):00514                BEQ    ADVSC5
+72F5 7FCC21           (m/src/RRTESTB.ASM):00515                CLR    SPECFN+9
+72F8 BD7478           (m/src/RRTESTB.ASM):00516                JSR    MAKCHK
+72FB 863A             (m/src/RRTESTB.ASM):00517                LDA    #$3A           FILL WITH SPACES
+72FD 8ECC24           (m/src/RRTESTB.ASM):00518                LDX    #OPMESS
+7300 C632             (m/src/RRTESTB.ASM):00519                LDB    #50            50 CHARACTERS
+7302 BDD0AB           (m/src/RRTESTB.ASM):00520         ADV6ZZ JSR    WCMOSA
+7305 5A               (m/src/RRTESTB.ASM):00521                DECB
+7306 26FA             (m/src/RRTESTB.ASM):00522                BNE    ADV6ZZ
+7308 BDD012           (m/src/RRTESTB.ASM):00523                JSR    SCRCLR         CLEAR THE SCREEN
+730B 865C             (m/src/RRTESTB.ASM):00524                LDA    #OMESM
+730D BD5F99           (m/src/RRTESTB.ASM):00525                JSR    WRD7V          PRINT A PROMPTING MESSAGE
+7310 108ECC24         (m/src/RRTESTB.ASM):00526                LDY    #OPMESS        POINT AT CMOS AREA
+7314 8E2530           (m/src/RRTESTB.ASM):00527                LDX    #$2530         SCREEN ECHO
+7317 CC1980           (m/src/RRTESTB.ASM):00528                LDD    #$1980         25 CHARS, SPECIALS ALLOWED
+731A BD753A           (m/src/RRTESTB.ASM):00529                JSR    GETLET         GET THE MESSAGE
+731D C630             (m/src/RRTESTB.ASM):00530                LDB    #$30           DISPLAY HEIGHT
+731F 8ECC88           (m/src/RRTESTB.ASM):00531                LDX    #OPL1          PLACE TO STORE RESULT
+7322 108ECC24         (m/src/RRTESTB.ASM):00532                LDY    #OPMESS        CMOS
+7326 BD738A           (m/src/RRTESTB.ASM):00533                JSR    SLIDE
+7329 865C             (m/src/RRTESTB.ASM):00534                LDA    #OMESM
+732B BD5F99           (m/src/RRTESTB.ASM):00535                JSR    WRD7V
+732E BD740D           (m/src/RRTESTB.ASM):00536                JSR    REDISP         DISPLAY CENTERED TOP LINE
+7331 108ECC56         (m/src/RRTESTB.ASM):00537                LDY    #OPMESS+50
+7335 8E2540           (m/src/RRTESTB.ASM):00538                LDX    #$2540
+7338 CC1980           (m/src/RRTESTB.ASM):00539                LDD    #$1980
+733B BD753A           (m/src/RRTESTB.ASM):00540                JSR    GETLET
+733E C640             (m/src/RRTESTB.ASM):00541                LDB    #$40
+7340 8ECC8A           (m/src/RRTESTB.ASM):00542                LDX    #OPL2
+7343 108ECC56         (m/src/RRTESTB.ASM):00543                LDY    #OPMESS+50
+7347 8D41             (m/src/RRTESTB.ASM):00544                BSR    SLIDE
+7349 BD7491           (m/src/RRTESTB.ASM):00545                JSR    OPCHK          FORM THE CHECK BYTE
+734C 8ECC8E           (m/src/RRTESTB.ASM):00546                LDX    #OMESUM        POINT
+734F BDD0AB           (m/src/RRTESTB.ASM):00547                JSR    WCMOSA         AND STORE IT.
+7352 B6CC23           (m/src/RRTESTB.ASM):00548         ADVSC5 LDA    SPECFN+11      ENTER GOD'S NAME??
+7355 840F             (m/src/RRTESTB.ASM):00549                ANDA   #$F
+7357 2709             (m/src/RRTESTB.ASM):00550                BEQ    ADVSC8
+7359 7FCC23           (m/src/RRTESTB.ASM):00551                CLR    SPECFN+11
+735C BD7478           (m/src/RRTESTB.ASM):00552                JSR    MAKCHK
+735F BDE3D6           (m/src/RRTESTB.ASM):00553                JSR    GODSET        GO AND DO IT
+7362 B6CC1F           (m/src/RRTESTB.ASM):00554         ADVSC8 LDA    SPECFN+7      AUTO CYCLE
+7365 840F             (m/src/RRTESTB.ASM):00555                ANDA   #$F
+7367 270B             (m/src/RRTESTB.ASM):00556                BEQ    NOAUTZ
+7369 7FCC1F           (m/src/RRTESTB.ASM):00557                CLR    SPECFN+7
+736C BD7478           (m/src/RRTESTB.ASM):00558                JSR    MAKCHK
+736F 8D08             (m/src/RRTESTB.ASM):00559                BSR    FSCHK
+7371 7EF006           (m/src/RRTESTB.ASM):00560                JMP    AUTOCY
+7374 8D03             (m/src/RRTESTB.ASM):00561         NOAUTZ BSR    FSCHK
+                      (m/src/RRTESTB.ASM):00562         ****************************************************
+                      (m/src/RRTESTB.ASM):00563         *
+                      (m/src/RRTESTB.ASM):00564         *      INHIBIT SWITCHES (ADVANCE IN PARTIC)
+                      (m/src/RRTESTB.ASM):00565         *
+                      (m/src/RRTESTB.ASM):00566         *      LDD    #0
+                      (m/src/RRTESTB.ASM):00567         *      STD    SWPROC
+                      (m/src/RRTESTB.ASM):00568         *      STD    SWPROC+4
+                      (m/src/RRTESTB.ASM):00569         *
+                      (m/src/RRTESTB.ASM):00570         *
+                      (m/src/RRTESTB.ASM):00571         *****************************************************
+7376 7ED000           (m/src/RRTESTB.ASM):00572                JMP    INIT     NOW GO INTO GAME OVER.
+                      (m/src/RRTESTB.ASM):00573         
+7379 B6CC19           (m/src/RRTESTB.ASM):00574         FSCHK  LDA    SPECFN+1
+737C 840F             (m/src/RRTESTB.ASM):00575                ANDA   #$F      FACTORY SETTINGS??
+737E 2709             (m/src/RRTESTB.ASM):00576                BEQ    ADVS33
+7380 7CCC8C           (m/src/RRTESTB.ASM):00577                INC    ADJSUM
+7383 7CCC8C           (m/src/RRTESTB.ASM):00578                INC    ADJSUM   BASH THE CHECK BYTE...THIS WILL RESTORE.
+7386 7FCC19           (m/src/RRTESTB.ASM):00579                CLR    SPECFN+1 AND UNDO IT
+7389 39               (m/src/RRTESTB.ASM):00580         ADVS33 RTS
+                      (m/src/RRTESTB.ASM):00581         
+                      (m/src/RRTESTB.ASM):00582         *      PD = ECHO PTR
+                      (m/src/RRTESTB.ASM):00583         *      PD+2 = CMOS OF 25 CHARS
+                      (m/src/RRTESTB.ASM):00584         *      PD+4 = CMOS OF STORED OFFSET
+                      (m/src/RRTESTB.ASM):00585         *      PD+6 = RETURN
+                      (m/src/RRTESTB.ASM):00586         
+738A DE15             (m/src/RRTESTB.ASM):00587         SLIDE  LDU    CRPROC
+738C 8625             (m/src/RRTESTB.ASM):00588                LDA    #$25     START X
+738E ED47             (m/src/RRTESTB.ASM):00589                STD    PD,U     SAVE ECHO POINTER
+7390 3506             (m/src/RRTESTB.ASM):00590                PULS   D
+7392 ED4D             (m/src/RRTESTB.ASM):00591                STD    PD+6,U
+7394 AF4B             (m/src/RRTESTB.ASM):00592                STX    PD+4,U
+7396 10AF49           (m/src/RRTESTB.ASM):00593                STY    PD+2,U
+7399 8625             (m/src/RRTESTB.ASM):00594                LDA    #$25
+739B BDD0AB           (m/src/RRTESTB.ASM):00595                JSR    WCMOSA 
+739E 8665             (m/src/RRTESTB.ASM):00596                LDA    #OPCNTM
+73A0 BD5F99           (m/src/RRTESTB.ASM):00597                JSR    WRD7V
+73A3                  (m/src/RRTESTB.ASM):00598         SLIDE0 NAP    4,SLIDE1
+73A3 8604             (              NAP):00001                LDA #4 TIME
+73A5 8E73AB           (              NAP):00002                LDX #SLIDE1 WAKEUP ADDR
+73A8 7ED066           (              NAP):00003                JMP    SLEEP  
+73AB B6C80C           (m/src/RRTESTB.ASM):00599         SLIDE1 LDA    PIA0
+73AE 8502             (m/src/RRTESTB.ASM):00600                BITA   #2       DEBOUNCE ADV.
+73B0 26F1             (m/src/RRTESTB.ASM):00601                BNE    SLIDE0
+73B2 B6C806           (m/src/RRTESTB.ASM):00602         SLIDE5 LDA    PIA3     CHECK FOR THRUST OF FIRE RIGHT
+73B5 8502             (m/src/RRTESTB.ASM):00603                BITA   #2       FIRE??
+73B7 2710             (m/src/RRTESTB.ASM):00604                BEQ    SLIDE3   NOPE
+73B9 AE4B             (m/src/RRTESTB.ASM):00605                LDX    PD+4,U   GET MEMORY POINTER
+73BB BDD0A2           (m/src/RRTESTB.ASM):00606                JSR    RCMOSA   FETCH THE BYTE
+73BE AE4B             (m/src/RRTESTB.ASM):00607                LDX    PD+4,U   RESTORE POINTER
+73C0 4C               (m/src/RRTESTB.ASM):00608                INCA            ADD ONE
+73C1 813A             (m/src/RRTESTB.ASM):00609                CMPA   #$3A     NO FARTHER RIGHT THAN 38
+73C3 2315             (m/src/RRTESTB.ASM):00610                BLS    SLIDE4
+73C5 863A             (m/src/RRTESTB.ASM):00611                LDA    #$3A
+73C7 2011             (m/src/RRTESTB.ASM):00612                BRA    SLIDE4
+73C9 46               (m/src/RRTESTB.ASM):00613         SLIDE3 RORA            FIRE LEFT??
+73CA 241D             (m/src/RRTESTB.ASM):00614                BCC    SLIDE6   NOTHING PRESSED...LOOP
+73CC AE4B             (m/src/RRTESTB.ASM):00615                LDX    PD+4,U
+73CE BDD0A2           (m/src/RRTESTB.ASM):00616                JSR    RCMOSA
+73D1 AE4B             (m/src/RRTESTB.ASM):00617                LDX    PD+4,U
+73D3 4A               (m/src/RRTESTB.ASM):00618                DECA
+73D4 8113             (m/src/RRTESTB.ASM):00619                CMPA   #$13
+73D6 2402             (m/src/RRTESTB.ASM):00620                BHS    SLIDE4
+73D8 8613             (m/src/RRTESTB.ASM):00621                LDA    #$13
+73DA BDD0AB           (m/src/RRTESTB.ASM):00622         SLIDE4 JSR    WCMOSA
+73DD A747             (m/src/RRTESTB.ASM):00623                STA    PD,U           ALSO MAKE X OF ECHO POINTER
+73DF 8D2C             (m/src/RRTESTB.ASM):00624                BSR    REDISP
+                      (m/src/RRTESTB.ASM):00625                NAP    $10,SLIDE5
+73E1 8610             (              NAP):00001                LDA #$10 TIME
+73E3 8E73B2           (              NAP):00002                LDX #SLIDE5 WAKEUP ADDR
+73E6 7ED066           (              NAP):00003                JMP    SLEEP  
+73E9 B6C80C           (m/src/RRTESTB.ASM):00626         SLIDE6 LDA    PIA0           CHECK FOR ADVANCE
+73EC 8502             (m/src/RRTESTB.ASM):00627                BITA   #2
+73EE 2608             (m/src/RRTESTB.ASM):00628                BNE    SLIDE7         TIME TO LEAVE
+                      (m/src/RRTESTB.ASM):00629                NAP    4,SLIDE5
+73F0 8604             (              NAP):00001                LDA #4 TIME
+73F2 8E73B2           (              NAP):00002                LDX #SLIDE5 WAKEUP ADDR
+73F5 7ED066           (              NAP):00003                JMP    SLEEP  
+73F8 BDD012           (m/src/RRTESTB.ASM):00630         SLIDE7 JSR    SCRCLR
+73FB                  (m/src/RRTESTB.ASM):00631         SLIDE8 NAP    4,SLIDE9
+73FB 8604             (              NAP):00001                LDA #4 TIME
+73FD 8E7403           (              NAP):00002                LDX #SLIDE9 WAKEUP ADDR
+7400 7ED066           (              NAP):00003                JMP    SLEEP  
+7403 B6C80C           (m/src/RRTESTB.ASM):00632         SLIDE9 LDA    PIA0
+7406 8502             (m/src/RRTESTB.ASM):00633                BITA   #2
+7408 26F1             (m/src/RRTESTB.ASM):00634                BNE    SLIDE8
+740A 6ED80D           (m/src/RRTESTB.ASM):00635                JMP    [PD+6,U]
+                      (m/src/RRTESTB.ASM):00636         
+740D 0FD0             (m/src/RRTESTB.ASM):00637         REDISP CLR    TXFLAV
+740F AE47             (m/src/RRTESTB.ASM):00638                LDX    PD,U           UPPER LEFT TO ECHO
+7411 3089FF00         (m/src/RRTESTB.ASM):00639                LEAX   -$100,X
+7415 865A             (m/src/RRTESTB.ASM):00640                LDA    #90
+7417 C609             (m/src/RRTESTB.ASM):00641                LDB    #9
+7419 BDD01B           (m/src/RRTESTB.ASM):00642                JSR    BLKCLR         CLEAR THE BLOCK
+741C AE47             (m/src/RRTESTB.ASM):00643                LDX    PD,U           CURSOR
+741E 0FD0             (m/src/RRTESTB.ASM):00644                CLR    TXFLAV
+7420 10AE49           (m/src/RRTESTB.ASM):00645                LDY    PD+2,U         DATA POINTER
+7423 C619             (m/src/RRTESTB.ASM):00646                LDB    #25
+7425 1E12             (m/src/RRTESTB.ASM):00647         RDSP1  EXG    X,Y
+7427 BDD0A2           (m/src/RRTESTB.ASM):00648                JSR    RCMOSA
+742A 1E12             (m/src/RRTESTB.ASM):00649                EXG    X,Y
+742C BD5F93           (m/src/RRTESTB.ASM):00650                JSR    PR57V
+742F 5A               (m/src/RRTESTB.ASM):00651                DECB
+7430 26F3             (m/src/RRTESTB.ASM):00652                BNE    RDSP1
+7432 39               (m/src/RRTESTB.ASM):00653                RTS                   DONE!
+                      (m/src/RRTESTB.ASM):00654         
+7433 10BFB3EC         (m/src/RRTESTB.ASM):00655         SSTATE STY    YSTOR
+7437 FFB3EF           (m/src/RRTESTB.ASM):00656                STU    USTOR
+743A B7B3EE           (m/src/RRTESTB.ASM):00657                STA    ASTOR
+743D 39               (m/src/RRTESTB.ASM):00658                RTS
+                      (m/src/RRTESTB.ASM):00659         
+743E 10BEB3EC         (m/src/RRTESTB.ASM):00660         LSTATE LDY    YSTOR
+7442 FEB3EF           (m/src/RRTESTB.ASM):00661                LDU    USTOR
+7445 B6B3EE           (m/src/RRTESTB.ASM):00662                LDA    ASTOR
+7448 39               (m/src/RRTESTB.ASM):00663                RTS
+                      (m/src/RRTESTB.ASM):00664         
+7449 108CCC04         (m/src/RRTESTB.ASM):00665         SPCASE CMPY   #COINSL  COIN SELECT
+744D 2701             (m/src/RRTESTB.ASM):00666                BEQ    INCOIN
+744F 39               (m/src/RRTESTB.ASM):00667                RTS
+7450 1F21             (m/src/RRTESTB.ASM):00668         INCOIN TFR    Y,X
+7452 BDD0A2           (m/src/RRTESTB.ASM):00669                JSR    RCMOSA   GET THE INDEX
+7455 48               (m/src/RRTESTB.ASM):00670                ASLA
+7456 3402             (m/src/RRTESTB.ASM):00671                PSHS   A
+7458 48               (m/src/RRTESTB.ASM):00672                ASLA
+7459 ABE0             (m/src/RRTESTB.ASM):00673                ADDA   ,S+      6X
+745B 8E6F99           (m/src/RRTESTB.ASM):00674                LDX    #CSELCT
+745E 3086             (m/src/RRTESTB.ASM):00675                LEAX   A,X      SLIDE DOWN
+7460 3346             (m/src/RRTESTB.ASM):00676         INCON1 LEAU   6,U
+7462 3122             (m/src/RRTESTB.ASM):00677                LEAY   2,Y
+7464 A680             (m/src/RRTESTB.ASM):00678                LDA    ,X+
+7466 3410             (m/src/RRTESTB.ASM):00679                PSHS   X
+7468 1F21             (m/src/RRTESTB.ASM):00680                TFR    Y,X
+746A BDD0AB           (m/src/RRTESTB.ASM):00681                JSR    WCMOSA
+746D 3510             (m/src/RRTESTB.ASM):00682                PULS   X
+746F BD70A0           (m/src/RRTESTB.ASM):00683                JSR    PRVAL
+7472 108CCC10         (m/src/RRTESTB.ASM):00684                CMPY   #MINUNT
+7476 25E8             (m/src/RRTESTB.ASM):00685                BLO    INCON1
+                      (m/src/RRTESTB.ASM):00686         
+7478 3412             (m/src/RRTESTB.ASM):00687         MAKCHK PSHS   X,A
+747A 8D08             (m/src/RRTESTB.ASM):00688                BSR    FCHK     FIND THE NEW CHECKSUM.
+747C 8ECC8C           (m/src/RRTESTB.ASM):00689                LDX    #ADJSUM
+747F BDD0AB           (m/src/RRTESTB.ASM):00690                JSR    WCMOSA
+7482 3592             (m/src/RRTESTB.ASM):00691                PULS   X,A,PC
+                      (m/src/RRTESTB.ASM):00692         
+7484 3434             (m/src/RRTESTB.ASM):00693         FCHK   PSHS   B,X,Y
+7486 8ECC00           (m/src/RRTESTB.ASM):00694                LDX    #CMOS
+7489 108ECC24         (m/src/RRTESTB.ASM):00695                LDY    #ENDADJ
+748D 8D09             (m/src/RRTESTB.ASM):00696                BSR    FCHKZ
+748F 35B4             (m/src/RRTESTB.ASM):00697                PULS   B,X,Y,PC
+                      (m/src/RRTESTB.ASM):00698         
+7491 8ECC24           (m/src/RRTESTB.ASM):00699         OPCHK  LDX    #OPMESS
+7494 108ECC8C         (m/src/RRTESTB.ASM):00700                LDY    #OPMESS+104
+                      (m/src/RRTESTB.ASM):00701         *
+7498 109F2B           (m/src/RRTESTB.ASM):00702         FCHKZ  STY    XTEMP
+749B 4F               (m/src/RRTESTB.ASM):00703                CLRA
+749C E680             (m/src/RRTESTB.ASM):00704         FCHK1  LDB    ,X+
+749E C40F             (m/src/RRTESTB.ASM):00705                ANDB   #$F
+74A0 3404             (m/src/RRTESTB.ASM):00706                PSHS   B
+74A2 ABE0             (m/src/RRTESTB.ASM):00707                ADDA   ,S+
+74A4 9C2B             (m/src/RRTESTB.ASM):00708                CMPX   XTEMP   
+74A6 26F4             (m/src/RRTESTB.ASM):00709                BNE    FCHK1
+74A8 8B37             (m/src/RRTESTB.ASM):00710                ADDA   #$37     FUDGE FACTOR
+74AA 39               (m/src/RRTESTB.ASM):00711                RTS            
+                      (m/src/RRTESTB.ASM):00712         
+74AB 8DD7             (m/src/RRTESTB.ASM):00713         CKADJ  BSR    FCHK
+74AD 3402             (m/src/RRTESTB.ASM):00714                PSHS   A
+74AF 8ECC8C           (m/src/RRTESTB.ASM):00715                LDX    #ADJSUM
+74B2 BDD0A2           (m/src/RRTESTB.ASM):00716                JSR    RCMOSA
+74B5 A1E0             (m/src/RRTESTB.ASM):00717                CMPA   ,S+
+74B7 39               (m/src/RRTESTB.ASM):00718                RTS
+                      (m/src/RRTESTB.ASM):00719         
+74B8 8D6B             (m/src/RRTESTB.ASM):00720         CKCMOS BSR    OPTST    CHECK OPERATOR MESSAGE
+74BA 8DEF             (m/src/RRTESTB.ASM):00721                BSR    CKADJ    CHECK ADJ 
+74BC 273A             (m/src/RRTESTB.ASM):00722                BEQ    CKSRT0
+74BE 8639             (m/src/RRTESTB.ASM):00723                LDA    #WDATA
+74C0 B7CBFF           (m/src/RRTESTB.ASM):00724                STA    WDOG
+74C3 BD6F2C           (m/src/RRTESTB.ASM):00725                JSR    CMINIZ
+74C6 8639             (m/src/RRTESTB.ASM):00726                LDA    #WDATA
+74C8 B7CBFF           (m/src/RRTESTB.ASM):00727                STA    WDOG
+74CB 8DAB             (m/src/RRTESTB.ASM):00728                BSR    MAKCHK
+74CD 8639             (m/src/RRTESTB.ASM):00729                LDA    #WDATA
+74CF B7CBFF           (m/src/RRTESTB.ASM):00730                STA    WDOG
+74D2 BDD012           (m/src/RRTESTB.ASM):00731                JSR    SCRCLR    CLEAR THE SCREEN
+74D5 8639             (m/src/RRTESTB.ASM):00732                LDA    #WDATA
+74D7 B7CBFF           (m/src/RRTESTB.ASM):00733                STA    WDOG
+74DA 8D23             (m/src/RRTESTB.ASM):00734                BSR    AUDCHK    CHECK FOR FAULTY AUDITS
+74DC BDE3DC           (m/src/RRTESTB.ASM):00735                JSR    HSCHKV    CHECK FOR FAULTY HIGH SCORES
+74DF BDE3D0           (m/src/RRTESTB.ASM):00736                JSR    PUPHSC    NOW VALIDATE
+74E2 8DC7             (m/src/RRTESTB.ASM):00737                BSR    CKADJ
+74E4 2715             (m/src/RRTESTB.ASM):00738                BEQ    CKSNOR
+74E6 864F             (m/src/RRTESTB.ASM):00739                LDA    #CMIMES   TELL THE OPERATOR WHAT IS GOING ON.
+74E8 BD5F99           (m/src/RRTESTB.ASM):00740         CMLOP0 JSR    WRD7V
+74EB 8639             (m/src/RRTESTB.ASM):00741         CMLOP  LDA    #WDATA
+74ED B7CBFF           (m/src/RRTESTB.ASM):00742                STA    WDOG
+74F0 B6C80C           (m/src/RRTESTB.ASM):00743                LDA    PIA0      CHECK
+74F3 8502             (m/src/RRTESTB.ASM):00744                BITA   #2
+74F5 27F4             (m/src/RRTESTB.ASM):00745                BEQ    CMLOP     NOT PRESSED CONTINUE TO HANG
+74F7 39               (m/src/RRTESTB.ASM):00746         CKSMRT RTS     
+74F8 7EE3D0           (m/src/RRTESTB.ASM):00747         CKSRT0 JMP    PUPHSC   FIX UP THE HIGH SCORE AREA AND RETURN
+74FB 8650             (m/src/RRTESTB.ASM):00748         CKSNOR LDA    #RESMES
+74FD 20E9             (m/src/RRTESTB.ASM):00749                BRA    CMLOP0
+                      (m/src/RRTESTB.ASM):00750         
+74FF 8ECD02           (m/src/RRTESTB.ASM):00751         AUDCHK LDX    #SLOT1
+7502 C604             (m/src/RRTESTB.ASM):00752                LDB   #4       FOUR BAD BYTES IN AUDIT AREA AFTER RESET IS ENOUGH.
+7504 A680             (m/src/RRTESTB.ASM):00753         AUDCK2 LDA    ,X+      GET A BYTE
+7506 840F             (m/src/RRTESTB.ASM):00754                ANDA   #$F
+7508 8109             (m/src/RRTESTB.ASM):00755                CMPA   #9       HEX???
+750A 2303             (m/src/RRTESTB.ASM):00756                BLS    AUDCK1   NOPE
+750C 5A               (m/src/RRTESTB.ASM):00757                DECB            ONE MORE
+750D 2706             (m/src/RRTESTB.ASM):00758                BEQ    AUDCK4
+750F 8CCD32           (m/src/RRTESTB.ASM):00759         AUDCK1 CMPX   #BKEND   DONE??
+7512 26F0             (m/src/RRTESTB.ASM):00760                BNE    AUDCK2 
+7514 39               (m/src/RRTESTB.ASM):00761                RTS
+7515 865B             (m/src/RRTESTB.ASM):00762         AUDCK4 LDA    #BOOKRS
+7517 BD5F99           (m/src/RRTESTB.ASM):00763                JSR    WRD7V    PRINT IT
+751A 8ECD02           (m/src/RRTESTB.ASM):00764                LDX    #SLOT1
+751D 6F80             (m/src/RRTESTB.ASM):00765         AUDCK5 CLR    ,X+      AND CLEAR EM.
+751F 8CCD32           (m/src/RRTESTB.ASM):00766                CMPX   #BKEND   
+7522 26F9             (m/src/RRTESTB.ASM):00767                BNE    AUDCK5
+7524 39               (m/src/RRTESTB.ASM):00768         OPTRTS RTS
+                      (m/src/RRTESTB.ASM):00769         
+7525 8D05             (m/src/RRTESTB.ASM):00770         OPTST  BSR    OPTSTZ   CHECK THE BYTE
+7527 27FB             (m/src/RRTESTB.ASM):00771                BEQ    OPTRTS   ITS OK
+7529 7E6F3B           (m/src/RRTESTB.ASM):00772                JMP    OPSET    NO GOOD DEFAULT IT.
+                      (m/src/RRTESTB.ASM):00773         
+                      (m/src/RRTESTB.ASM):00774         *
+                      (m/src/RRTESTB.ASM):00775         *      COMPARE FOR OPERATOR MESSAGE CHECK BYTE
+                      (m/src/RRTESTB.ASM):00776         *      BEQ FOR OK
+                      (m/src/RRTESTB.ASM):00777         *
+                      (m/src/RRTESTB.ASM):00778         
+752C BD7491           (m/src/RRTESTB.ASM):00779         OPTSTZ JSR    OPCHK    FORM CHECK BYTE
+752F 3402             (m/src/RRTESTB.ASM):00780                PSHS   A        SAVE
+7531 8ECC8E           (m/src/RRTESTB.ASM):00781                LDX    #OMESUM  GET THE SUM
+7534 BDD0A2           (m/src/RRTESTB.ASM):00782                JSR    RCMOSA
+7537 A1E0             (m/src/RRTESTB.ASM):00783                CMPA   ,S+
+7539 39               (m/src/RRTESTB.ASM):00784                RTS
+                      (m/src/RRTESTB.ASM):00785         *
+                      (m/src/RRTESTB.ASM):00786         ***    GETLET    GET A STRING OF LETTERS FROM THE USER
+                      (m/src/RRTESTB.ASM):00787         *
+                      (m/src/RRTESTB.ASM):00788         *      A = NUMBER OF LETTERS TO FETCH
+                      (m/src/RRTESTB.ASM):00789         *      B = $80 FOR ALL, 00 FOR ALPHA ONLY.
+                      (m/src/RRTESTB.ASM):00790         *      X = UPPER LEFT OF REGION TO ECHO IN
+                      (m/src/RRTESTB.ASM):00791         *      Y = ADDRESS TO STORE IN (RAM OR CMOS)
+                      (m/src/RRTESTB.ASM):00792         *
+                      (m/src/RRTESTB.ASM):00793         *      PD = NUMBER OF LETTERS LEFT TO GET
+                      (m/src/RRTESTB.ASM):00794         *      PD+1 = 0 FOR SPECIALS ALLOWED, $80 FOR ALPHA ONLY
+                      (m/src/RRTESTB.ASM):00795         *      PD+2 = ECHO ADDR
+                      (m/src/RRTESTB.ASM):00796         *      PD+4 = ADDRESS TO STORE LETTER
+                      (m/src/RRTESTB.ASM):00797         *      PD+6 = RETURN
+753A DE15             (m/src/RRTESTB.ASM):00798         GETLET LDU    CRPROC
+753C ED47             (m/src/RRTESTB.ASM):00799                STD    PD,U     SAVE COUNT
+753E AF49             (m/src/RRTESTB.ASM):00800                STX    PD+2,U
+7540 10AF4B           (m/src/RRTESTB.ASM):00801                STY    PD+4,U
+7543 3506             (m/src/RRTESTB.ASM):00802                PULS   D        GET RETURN ADDRESS
+7545 ED4D             (m/src/RRTESTB.ASM):00803                STD    PD+6,U
+7547                  (m/src/RRTESTB.ASM):00804         GETLZZ NAP    4,GETLZ1
+7547 8604             (              NAP):00001                LDA #4 TIME
+7549 8E754F           (              NAP):00002                LDX #GETLZ1 WAKEUP ADDR
+754C 7ED066           (              NAP):00003                JMP    SLEEP  
+754F 8D34             (m/src/RRTESTB.ASM):00805         GETLZ1 BSR    GETFIR
+7551 26F4             (m/src/RRTESTB.ASM):00806                BNE    GETLZZ   IT IS PRESSED!
+                      (m/src/RRTESTB.ASM):00807                MAKP   TIMPRC
+7553 BDD054           (             MAKP):00001          JSR MAKEP
+7556 7749             (             MAKP):00002          FDB TIMPRC
+7558 EC4D             (m/src/RRTESTB.ASM):00808                LDD    PD+6,U
+755A ED0D             (m/src/RRTESTB.ASM):00809                STD    PD+6,X   PASS RETURN ADDRESS
+755C EC47             (m/src/RRTESTB.ASM):00810                LDD    PD,U
+755E ED07             (m/src/RRTESTB.ASM):00811                STD    PD,X
+7560 EF09             (m/src/RRTESTB.ASM):00812                STU    PD+2,X   PASS US TO KILL
+7562 9FD8             (m/src/RRTESTB.ASM):00813                STX    GETLRM   SAVE HIS ID
+7564 8699             (m/src/RRTESTB.ASM):00814                LDA    #$99     SET COLOR TO WHITE
+7566 97CF             (m/src/RRTESTB.ASM):00815                STA    TEXCOL   
+7568 0FD0             (m/src/RRTESTB.ASM):00816                CLR    TXFLAV   MAKE ZERO FLAVOR
+756A 0FDA             (m/src/RRTESTB.ASM):00817         GETLLL CLR    GETLST  MAKE LAST NOT AVAILABLE.
+756C 0FDB             (m/src/RRTESTB.ASM):00818                CLR    GETLST+1
+756E 0FDC             (m/src/RRTESTB.ASM):00819                CLR    GETLST+2
+7570 8D08             (m/src/RRTESTB.ASM):00820         GETLT0 BSR    G0SUB    CLEAR THE REGION
+7572                  (m/src/RRTESTB.ASM):00821         GETLT1 NAP    2,GETLT2
+7572 8602             (              NAP):00001                LDA #2 TIME
+7574 8E758B           (              NAP):00002                LDX #GETLT2 WAKEUP ADDR
+7577 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (m/src/RRTESTB.ASM):00822         
+757A BD762A           (m/src/RRTESTB.ASM):00823         G0SUB  JSR    CLRREG
+757D BD7636           (m/src/RRTESTB.ASM):00824                JSR    PRFROB
+7580 863A             (m/src/RRTESTB.ASM):00825                LDA    #$3A
+7582 7E765D           (m/src/RRTESTB.ASM):00826                JMP    LSTY
+                      (m/src/RRTESTB.ASM):00827         
+7585 B6C804           (m/src/RRTESTB.ASM):00828         GETFIR LDA    PIA2
+7588 8540             (m/src/RRTESTB.ASM):00829                BITA   #$40     FIRE UP?   
+758A 39               (m/src/RRTESTB.ASM):00830         GETFR  RTS             RETURN PROPER CC
+                      (m/src/RRTESTB.ASM):00831         
+758B B6C804           (m/src/RRTESTB.ASM):00832         GETLT2 LDA    PIA2     SCAN FOR DOWN
+758E 46               (m/src/RRTESTB.ASM):00833                RORA            CHECK FOR MOVE UP
+758F 10250116         (m/src/RRTESTB.ASM):00834                LBCS   LUP
+7593 46               (m/src/RRTESTB.ASM):00835                RORA
+7594 102500F3         (m/src/RRTESTB.ASM):00836                LBCS   LDOWN
+                      (m/src/RRTESTB.ASM):00837         
+7598 8DEB             (m/src/RRTESTB.ASM):00838         GETRET BSR    GETFIR   CHECK FOR FIRE UP
+759A 27D6             (m/src/RRTESTB.ASM):00839                BEQ    GETLT1   NOT PRESSED..LOOP
+                      (m/src/RRTESTB.ASM):00840         
+759C A648             (m/src/RRTESTB.ASM):00841                LDA    PD+1,U   GET ALPHA 'BIT'
+759E 8480             (m/src/RRTESTB.ASM):00842                ANDA   #$80
+75A0 8B20             (m/src/RRTESTB.ASM):00843                ADDA   #$20     TIME FOR CHASE = 1/4
+                      (m/src/RRTESTB.ASM):00844         
+75A2 A748             (m/src/RRTESTB.ASM):00845         G1LET  STA    PD+1,U
+75A4 BD7648           (m/src/RRTESTB.ASM):00846                JSR    LLDY     GET THE CURRENT LETTER
+75A7 815E             (m/src/RRTESTB.ASM):00847                CMPA   #$5E     IS IT A RUB
+75A9 274D             (m/src/RRTESTB.ASM):00848                BEQ    GETRUB
+75AB 96D0             (m/src/RRTESTB.ASM):00849                LDA    TXFLAV
+75AD 97DC             (m/src/RRTESTB.ASM):00850                STA    GETLST+2
+75AF BD7645           (m/src/RRTESTB.ASM):00851                JSR    NOFROB   TAKE THE FROB AWAY
+75B2 BD7648           (m/src/RRTESTB.ASM):00852                JSR    LLDY     GET CURRENT LETTER
+75B5 AE49             (m/src/RRTESTB.ASM):00853                LDX    PD+2,U   GET POINTER
+75B7 9FDA             (m/src/RRTESTB.ASM):00854                STX    GETLST   SAVE CURRENT ECHO POINTER
+75B9 BD5F93           (m/src/RRTESTB.ASM):00855                JSR    PR57V    PUT THE LETTER OUT
+75BC AF49             (m/src/RRTESTB.ASM):00856                STX    PD+2,U   THIS MAKES NEW POINTER
+75BE BD7672           (m/src/RRTESTB.ASM):00857                JSR    PUSHY    PUSH THE Y POINTER TO NEXT
+75C1 6A47             (m/src/RRTESTB.ASM):00858                DEC    PD,U     1 LESS
+75C3 272B             (m/src/RRTESTB.ASM):00859                BEQ    G2LET
+75C5 BD757A           (m/src/RRTESTB.ASM):00860                JSR    G0SUB    MAKE IT LOOK LIKE WE'RE GETTING NEXT
+                      (m/src/RRTESTB.ASM):00861         
+75C8                  (m/src/RRTESTB.ASM):00862         GETLT3 NAP    2,GETLT4
+75C8 8602             (              NAP):00001                LDA #2 TIME
+75CA 8E75D0           (              NAP):00002                LDX #GETLT4 WAKEUP ADDR
+75CD 7ED066           (              NAP):00003                JMP    SLEEP  
+75D0 8DB3             (m/src/RRTESTB.ASM):00863         GETLT4 BSR    GETFIR   STILL DOWN??
+75D2 270F             (m/src/RRTESTB.ASM):00864                BEQ    GETLT5   NOPE
+                      (m/src/RRTESTB.ASM):00865         
+75D4 A647             (m/src/RRTESTB.ASM):00866                LDA    PD,U     GET LETTERS LEFT
+75D6 4A               (m/src/RRTESTB.ASM):00867                DECA            1???
+75D7 27EF             (m/src/RRTESTB.ASM):00868                BEQ    GETLT3   NO TYPOMATIC OF LAST LETTER
+75D9 6A48             (m/src/RRTESTB.ASM):00869                DEC    PD+1,U   ONE LESS COUNT
+75DB 2706             (m/src/RRTESTB.ASM):00870                BEQ    GETLT5
+75DD A648             (m/src/RRTESTB.ASM):00871                LDA    PD+1,U   CHECK FOR 80
+75DF 8180             (m/src/RRTESTB.ASM):00872                CMPA   #$80
+75E1 26E5             (m/src/RRTESTB.ASM):00873                BNE    GETLT3
+75E3 BD7585           (m/src/RRTESTB.ASM):00874         GETLT5 JSR    GETFIR
+75E6 278A             (m/src/RRTESTB.ASM):00875                BEQ    GETLT1   NOT PRESSED...BACK TO MAIN LOOP
+75E8 A648             (m/src/RRTESTB.ASM):00876                LDA    PD+1,U   GET COUNTER
+75EA 8480             (m/src/RRTESTB.ASM):00877                ANDA   #$80
+75EC 8B04             (m/src/RRTESTB.ASM):00878                ADDA   #4
+75EE 20B2             (m/src/RRTESTB.ASM):00879                BRA    G1LET 
+75F0 9ED8             (m/src/RRTESTB.ASM):00880         G2LET  LDX    GETLRM   KILL THE TIMER PROCESS
+75F2 BDD05D           (m/src/RRTESTB.ASM):00881                JSR    KILL
+75F5 6ED80D           (m/src/RRTESTB.ASM):00882                JMP    [PD+6,U]
+                      (m/src/RRTESTB.ASM):00883         
+75F8 8D4B             (m/src/RRTESTB.ASM):00884         GETRUB BSR    NOFROB    MAKE LIKE WE'RE NOT HERE.
+75FA 8D2E             (m/src/RRTESTB.ASM):00885                BSR    CLRREG
+75FC 863A             (m/src/RRTESTB.ASM):00886                LDA    #$3A
+75FE 8D5D             (m/src/RRTESTB.ASM):00887                BSR    LSTY     STORE A SPACE AT THE CURRENT SPOT
+7600 9EDA             (m/src/RRTESTB.ASM):00888                LDX    GETLST
+7602 AF49             (m/src/RRTESTB.ASM):00889                STX    PD+2,U
+7604 D6DC             (m/src/RRTESTB.ASM):00890                LDB    GETLST+2
+7606 D7D0             (m/src/RRTESTB.ASM):00891                STB    TXFLAV
+7608 6C47             (m/src/RRTESTB.ASM):00892                INC    PD,U     ONE MORE CHARACTER TO GET.
+760A 10AE4B           (m/src/RRTESTB.ASM):00893                LDY    PD+4,U   GET THE Y
+760D 313F             (m/src/RRTESTB.ASM):00894                LEAY   -1,Y     MOVE BACK ONE ASSUMING RAM
+760F 108CC000         (m/src/RRTESTB.ASM):00895                CMPY   #$C000   CMOS??
+7613 2502             (m/src/RRTESTB.ASM):00896                BLO    GETRB1   NOPE
+7615 313F             (m/src/RRTESTB.ASM):00897                LEAY   -1,Y
+7617 10AF4B           (m/src/RRTESTB.ASM):00898         GETRB1 STY    PD+4,U
+761A                  (m/src/RRTESTB.ASM):00899         GETRB6 NAP    1,GETRB5
+761A 8601             (              NAP):00001                LDA #1 TIME
+761C 8E7622           (              NAP):00002                LDX #GETRB5 WAKEUP ADDR
+761F 7ED066           (              NAP):00003                JMP    SLEEP  
+7622 BD7585           (m/src/RRTESTB.ASM):00900         GETRB5 JSR    GETFIR
+7625 26F3             (m/src/RRTESTB.ASM):00901                BNE    GETRB6
+7627 7E756A           (m/src/RRTESTB.ASM):00902                JMP    GETLLL   NOW GO AND GET THE LAST CHARACTER AGAIN.
+                      (m/src/RRTESTB.ASM):00903         
+762A 3406             (m/src/RRTESTB.ASM):00904         CLRREG PSHS   D
+762C AE49             (m/src/RRTESTB.ASM):00905                LDX    PD+2,U   GET POINTER TO REGION
+762E CC0407           (m/src/RRTESTB.ASM):00906                LDD    #$407    WIDTH,HEIGHT
+7631 BDD01B           (m/src/RRTESTB.ASM):00907                JSR    BLKCLR   CLEAR THE BLOCK
+7634 3586             (m/src/RRTESTB.ASM):00908                PULS   D,PC
+                      (m/src/RRTESTB.ASM):00909         
+7636 8699             (m/src/RRTESTB.ASM):00910         PRFROB LDA    #$99     
+7638 AE49             (m/src/RRTESTB.ASM):00911         PRFRB1 LDX    PD+2,U   GET POINTER
+763A A708             (m/src/RRTESTB.ASM):00912                STA    8,X 
+763C A7890108         (m/src/RRTESTB.ASM):00913                STA    $108,X
+7640 A7890208         (m/src/RRTESTB.ASM):00914                STA    $208,X
+7644 39               (m/src/RRTESTB.ASM):00915                RTS
+                      (m/src/RRTESTB.ASM):00916         
+7645 4F               (m/src/RRTESTB.ASM):00917         NOFROB CLRA
+7646 20F0             (m/src/RRTESTB.ASM):00918                BRA    PRFRB1
+                      (m/src/RRTESTB.ASM):00919         
+7648 10AE4B           (m/src/RRTESTB.ASM):00920         LLDY   LDY    PD+4,U   GET Y POINTER
+764B 108CC000         (m/src/RRTESTB.ASM):00921                CMPY   #$C000
+764F 2403             (m/src/RRTESTB.ASM):00922                BHS    LDCMOS   CMOS
+7651 A6A4             (m/src/RRTESTB.ASM):00923                LDA    ,Y       ELSE LOAD THE NUMBER
+7653 39               (m/src/RRTESTB.ASM):00924                RTS
+7654 3410             (m/src/RRTESTB.ASM):00925         LDCMOS PSHS   X
+7656 AE4B             (m/src/RRTESTB.ASM):00926                LDX    PD+4,U   LOAD INTO X
+7658 BDD0A2           (m/src/RRTESTB.ASM):00927                JSR    RCMOSA   LOAD IT
+765B 3590             (m/src/RRTESTB.ASM):00928                PULS   X,PC     AND RETURN
+                      (m/src/RRTESTB.ASM):00929         
+765D 10AE4B           (m/src/RRTESTB.ASM):00930         LSTY   LDY    PD+4,U   GET POINTER
+7660 108CC000         (m/src/RRTESTB.ASM):00931                CMPY   #$C000   CMOS??
+7664 2403             (m/src/RRTESTB.ASM):00932                BHS    LSCMOS
+7666 A7A4             (m/src/RRTESTB.ASM):00933                STA    ,Y
+7668 39               (m/src/RRTESTB.ASM):00934                RTS
+7669 3410             (m/src/RRTESTB.ASM):00935         LSCMOS PSHS   X
+766B AE4B             (m/src/RRTESTB.ASM):00936                LDX    PD+4,U
+766D BDD0AB           (m/src/RRTESTB.ASM):00937                JSR    WCMOSA
+7670 3590             (m/src/RRTESTB.ASM):00938                PULS   X,PC
+                      (m/src/RRTESTB.ASM):00939         
+7672 10AE4B           (m/src/RRTESTB.ASM):00940         PUSHY  LDY    PD+4,U
+7675 3121             (m/src/RRTESTB.ASM):00941                LEAY   1,Y
+7677 108CC000         (m/src/RRTESTB.ASM):00942                CMPY   #$C000
+767B 2502             (m/src/RRTESTB.ASM):00943                BLO    PUSHY1   NOT CMOS..DONE
+767D 3121             (m/src/RRTESTB.ASM):00944                LEAY   1,Y
+767F 10AF4B           (m/src/RRTESTB.ASM):00945         PUSHY1 STY    PD+4,U
+7682 39               (m/src/RRTESTB.ASM):00946         LDRET  RTS
+                      (m/src/RRTESTB.ASM):00947         
+7683 8E2000           (m/src/RRTESTB.ASM):00948         DELAY1 LDX    #$2000
+7686 301F             (m/src/RRTESTB.ASM):00949         DELAY2 LEAX   -1,X
+7688 26FC             (m/src/RRTESTB.ASM):00950                BNE    DELAY2
+768A 39               (m/src/RRTESTB.ASM):00951                RTS
+                      (m/src/RRTESTB.ASM):00952         
+768B 860A             (m/src/RRTESTB.ASM):00953         LDOWN  LDA    #10      1 DOWN ITERATION
+768D 8D7F             (m/src/RRTESTB.ASM):00954         LDOWN0 BSR    LDN1     1 SHOT
+768F 8DF2             (m/src/RRTESTB.ASM):00955         LDOWN1 BSR    DELAY1   SHORT DELAY
+7691 F6C804           (m/src/RRTESTB.ASM):00956                LDB    PIA2     SCAN
+7694 C502             (m/src/RRTESTB.ASM):00957                BITB   #$2
+7696 1027FEFE         (m/src/RRTESTB.ASM):00958                LBEQ   GETRET   GONE
+769A 4A               (m/src/RRTESTB.ASM):00959                DECA
+769B 26F2             (m/src/RRTESTB.ASM):00960                BNE    LDOWN1
+                      (m/src/RRTESTB.ASM):00961                NAP    1,LDOWN3
+769D 8601             (              NAP):00001                LDA #1 TIME
+769F 8E76A5           (              NAP):00002                LDX #LDOWN3 WAKEUP ADDR
+76A2 7ED066           (              NAP):00003                JMP    SLEEP  
+76A5 8601             (m/src/RRTESTB.ASM):00962         LDOWN3 LDA    #1
+76A7 20E4             (m/src/RRTESTB.ASM):00963                BRA    LDOWN0
+                      (m/src/RRTESTB.ASM):00964         
+76A9 860A             (m/src/RRTESTB.ASM):00965         LUP    LDA    #10
+76AB 8D19             (m/src/RRTESTB.ASM):00966         LUP0   BSR    LUPP1
+76AD 8DD4             (m/src/RRTESTB.ASM):00967         LUP1   BSR    DELAY1  
+76AF F6C804           (m/src/RRTESTB.ASM):00968                LDB    PIA2
+76B2 56               (m/src/RRTESTB.ASM):00969                RORB
+76B3 1024FEE1         (m/src/RRTESTB.ASM):00970                LBCC   GETRET
+76B7 4A               (m/src/RRTESTB.ASM):00971                DECA
+76B8 26F3             (m/src/RRTESTB.ASM):00972                BNE    LUP1
+                      (m/src/RRTESTB.ASM):00973                NAP    1,LUP3
+76BA 8601             (              NAP):00001                LDA #1 TIME
+76BC 8E76C2           (              NAP):00002                LDX #LUP3 WAKEUP ADDR
+76BF 7ED066           (              NAP):00003                JMP    SLEEP  
+76C2 8601             (m/src/RRTESTB.ASM):00974         LUP3   LDA    #1
+76C4 20E5             (m/src/RRTESTB.ASM):00975                BRA    LUP0
+                      (m/src/RRTESTB.ASM):00976         
+76C6 3402             (m/src/RRTESTB.ASM):00977         LUPP1  PSHS   A        SAVE A PLEASE
+76C8 BD7648           (m/src/RRTESTB.ASM):00978                JSR    LLDY     GET THE CURRENT VALUE
+76CB 4C               (m/src/RRTESTB.ASM):00979                INCA            PUSH TO NEXT
+76CC 6D48             (m/src/RRTESTB.ASM):00980                TST    PD+1,U   SEE IF ALPHA ONLY
+76CE 2A15             (m/src/RRTESTB.ASM):00981                BPL    LUPP2    YES
+76D0 0DDA             (m/src/RRTESTB.ASM):00982                TST    GETLST   RUB ALLOWED??
+76D2 2704             (m/src/RRTESTB.ASM):00983                BEQ    LUP1ZZ   NOPE.
+76D4 815E             (m/src/RRTESTB.ASM):00984                CMPA   #$5E
+76D6 2306             (m/src/RRTESTB.ASM):00985                BLS    LUPP1Z   IN RANGE.
+76D8 815D             (m/src/RRTESTB.ASM):00986         LUP1ZZ CMPA   #$5D     HIGHER THAN SLASH              
+76DA 2302             (m/src/RRTESTB.ASM):00987                BLS    LUPP1Z
+76DC 8630             (m/src/RRTESTB.ASM):00988                LDA    #$30     THEN MAKE 0
+76DE 813E             (m/src/RRTESTB.ASM):00989         LUPP1Z CMPA   #$3E     UNUSED PLACE??
+76E0 261B             (m/src/RRTESTB.ASM):00990                BNE    LUPP3
+76E2 4C               (m/src/RRTESTB.ASM):00991                INCA
+76E3 2018             (m/src/RRTESTB.ASM):00992                BRA    LUPP3    PRINT TIME
+76E5 815A             (m/src/RRTESTB.ASM):00993         LUPP2  CMPA   #$5A     HIGHER THAN Z??
+76E7 230E             (m/src/RRTESTB.ASM):00994                BLS    LUPP2Z
+76E9 0DDA             (m/src/RRTESTB.ASM):00995                TST    GETLST   RUB ALLOWED??
+76EB 2708             (m/src/RRTESTB.ASM):00996                BEQ    LUP2ZZ   NO...MOVE TO SPACE
+76ED 815E             (m/src/RRTESTB.ASM):00997                CMPA   #$5E     PAST BACK FRBO
+76EF 2204             (m/src/RRTESTB.ASM):00998                BHI    LUP2ZZ   YEP
+76F1 865E             (m/src/RRTESTB.ASM):00999                LDA    #$5E     MAKE US THE BACK FROB
+76F3 2002             (m/src/RRTESTB.ASM):01000                BRA    LUPP2Z
+76F5 863A             (m/src/RRTESTB.ASM):01001         LUP2ZZ LDA    #$3A     THEN MAKE SPACE
+76F7 813B             (m/src/RRTESTB.ASM):01002         LUPP2Z CMPA   #$3B     1 AFTER SPACE (ALPHA)
+76F9 2602             (m/src/RRTESTB.ASM):01003                BNE    LUPP3
+76FB 8641             (m/src/RRTESTB.ASM):01004                LDA    #$41     PUSH TO A.
+76FD BD765D           (m/src/RRTESTB.ASM):01005         LUPP3  JSR    LSTY     STORE THE NEW ONE.
+7700 BD762A           (m/src/RRTESTB.ASM):01006                JSR    CLRREG   CUT CLEAR OUT THE REGION
+7703 D6D0             (m/src/RRTESTB.ASM):01007                LDB    TXFLAV   SAVE THE FLAVOR
+7705 AE49             (m/src/RRTESTB.ASM):01008                LDX    PD+2,U   GET CURSOR
+7707 BD5F93           (m/src/RRTESTB.ASM):01009                JSR    PR57V
+770A D7D0             (m/src/RRTESTB.ASM):01010                STB    TXFLAV   RESTORE FLAVOR
+770C 3582             (m/src/RRTESTB.ASM):01011         LUPBYE PULS   A,PC     AND RETURN
+                      (m/src/RRTESTB.ASM):01012         
+770E 3402             (m/src/RRTESTB.ASM):01013         LDN1   PSHS   A
+7710 BD7648           (m/src/RRTESTB.ASM):01014                JSR    LLDY     GET THE CURRENT VALUE
+7713 4A               (m/src/RRTESTB.ASM):01015                DECA
+7714 6D48             (m/src/RRTESTB.ASM):01016                TST    PD+1,U   ALPHA ONLY??
+7716 2A15             (m/src/RRTESTB.ASM):01017                BPL    LDN2
+7718 8130             (m/src/RRTESTB.ASM):01018                CMPA   #$30     COMPARE TO ZERO
+771A 240A             (m/src/RRTESTB.ASM):01019                BHS    LDN1Z  
+771C 0DDA             (m/src/RRTESTB.ASM):01020                TST    GETLST
+771E 2704             (m/src/RRTESTB.ASM):01021                BEQ    LDN1ZZ   NO RUB...SET TO SLASH
+7720 865E             (m/src/RRTESTB.ASM):01022                LDA    #$5E     RUB
+7722 2002             (m/src/RRTESTB.ASM):01023                BRA    LDN1Z
+7724 865D             (m/src/RRTESTB.ASM):01024         LDN1ZZ LDA    #$5D     SET TO SLASH       
+7726 813E             (m/src/RRTESTB.ASM):01025         LDN1Z  CMPA   #$3E     UNUSED ONE??
+7728 261D             (m/src/RRTESTB.ASM):01026                BNE    LDN3ZZ
+772A 4A               (m/src/RRTESTB.ASM):01027                DECA
+772B 201A             (m/src/RRTESTB.ASM):01028                BRA    LDN3ZZ
+772D 8139             (m/src/RRTESTB.ASM):01029         LDN2   CMPA   #$39     BEFORE SPACE
+772F 260A             (m/src/RRTESTB.ASM):01030                BNE    LDN2Z    THEN EXIT
+7731 0DDA             (m/src/RRTESTB.ASM):01031                TST    GETLST   RUB??
+7733 2704             (m/src/RRTESTB.ASM):01032                BEQ    LDN2ZZ   NO...LOAD Z
+7735 865E             (m/src/RRTESTB.ASM):01033                LDA    #$5E
+7737 2002             (m/src/RRTESTB.ASM):01034                BRA    LDN2Z
+7739 865A             (m/src/RRTESTB.ASM):01035         LDN2ZZ LDA    #$5A     THEN LOAD Z
+773B 8140             (m/src/RRTESTB.ASM):01036         LDN2Z  CMPA   #$40     BEFORE A     
+773D 2602             (m/src/RRTESTB.ASM):01037                BNE    LDN3     NOPE
+773F 863A             (m/src/RRTESTB.ASM):01038                LDA    #$3A     MAKE SPACE
+7741 815D             (m/src/RRTESTB.ASM):01039         LDN3   CMPA   #$5D     BELOW RUB
+7743 2602             (m/src/RRTESTB.ASM):01040                BNE    LDN3ZZ
+7745 865A             (m/src/RRTESTB.ASM):01041                LDA    #$5A     THEN LOAD Z
+7747 20B4             (m/src/RRTESTB.ASM):01042         LDN3ZZ BRA    LUPP3  
+                      (m/src/RRTESTB.ASM):01043         
+7749 6D48             (m/src/RRTESTB.ASM):01044         TIMPRC TST    PD+1,U      DIAGNOSTIC CALL??
+774B 2B34             (m/src/RRTESTB.ASM):01045                BMI    TIMADV
+774D                  (m/src/RRTESTB.ASM):01046         TIMPR0 NAP    $FF,TIMPR1  4 SECONDS OF SLEEP
+774D 86FF             (              NAP):00001                LDA #$FF TIME
+774F 8E7755           (              NAP):00002                LDX #TIMPR1 WAKEUP ADDR
+7752 7ED066           (              NAP):00003                JMP    SLEEP  
+7755                  (m/src/RRTESTB.ASM):01047         TIMPR1 NAP    $FF,TIMPR6
+7755 86FF             (              NAP):00001                LDA #$FF TIME
+7757 8E775D           (              NAP):00002                LDX #TIMPR6 WAKEUP ADDR
+775A 7ED066           (              NAP):00003                JMP    SLEEP  
+775D                  (m/src/RRTESTB.ASM):01048         TIMPR6 NAP    $82,TIMPR7
+775D 8682             (              NAP):00001                LDA #$82 TIME
+775F 8E7765           (              NAP):00002                LDX #TIMPR7 WAKEUP ADDR
+7762 7ED066           (              NAP):00003                JMP    SLEEP  
+7765 6A47             (m/src/RRTESTB.ASM):01049         TIMPR7 DEC    PD,U
+7767 26E4             (m/src/RRTESTB.ASM):01050                BNE    TIMPR0      8 SECONDS PER LETTER
+7769 AE49             (m/src/RRTESTB.ASM):01051         TIMPR2 LDX    PD+2,U
+776B 3384             (m/src/RRTESTB.ASM):01052                LEAU   ,X          PUT IN U PLEASE
+776D BD7648           (m/src/RRTESTB.ASM):01053                JSR    LLDY        LOAD THE CURRENT CHARACTER
+7770 815E             (m/src/RRTESTB.ASM):01054                CMPA   #$5E        RUB???
+7772 2605             (m/src/RRTESTB.ASM):01055                BNE    TIMAZZ
+7774 863A             (m/src/RRTESTB.ASM):01056                LDA    #$3A
+7776 BD765D           (m/src/RRTESTB.ASM):01057                JSR    LSTY        AND STORE IT
+7779 DE15             (m/src/RRTESTB.ASM):01058         TIMAZZ LDU    CRPROC
+777B BDD05D           (m/src/RRTESTB.ASM):01059                JSR    KILL
+777E 6ED80D           (m/src/RRTESTB.ASM):01060                JMP    [PD+6,U]
+7781 B6C80C           (m/src/RRTESTB.ASM):01061         TIMADV LDA    PIA0
+7784 8502             (m/src/RRTESTB.ASM):01062                BITA   #2
+7786 26E1             (m/src/RRTESTB.ASM):01063                BNE    TIMPR2       CAN IT ON ADVANCE
+                      (m/src/RRTESTB.ASM):01064                NAP    1,TIMADV
+7788 8601             (              NAP):00001                LDA #1 TIME
+778A 8E7781           (              NAP):00002                LDX #TIMADV WAKEUP ADDR
+778D 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (m/src/RRTESTB.ASM):01065         
+                      (m/src/RRTESTB.ASM):01066                END

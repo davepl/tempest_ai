@@ -1,0 +1,1210 @@
+                      (wasm/src/RRX7.ASM):00001         *  OPT NOL
+                      (wasm/src/RRX7.ASM):00002          INCLUDE "RRF.ASM"
+                      (          RRF.ASM):00001         *        OPT    PAGS
+                      (          RRF.ASM):00002         *        TTL    R O B O T   W A R
+                      (          RRF.ASM):00003         *
+                      (          RRF.ASM):00004         * HARDWARE CONSTANTS
+                      (          RRF.ASM):00005         *
+     BF70             (          RRF.ASM):00006         HSTK EQU $BF70
+     EFF0             (          RRF.ASM):00007         VECTOR EQU $EFF0
+     C000             (          RRF.ASM):00008         CRAM EQU $C000 COLOR RAM ADDR
+     CBFF             (          RRF.ASM):00009         WDOG EQU $CBFF
+     0039             (          RRF.ASM):00010         WDATA EQU $39
+     CC00             (          RRF.ASM):00011         CMOS EQU $CC00
+     C80E             (          RRF.ASM):00012         SOUND EQU $C80E
+     CB00             (          RRF.ASM):00013         VERTCT EQU $CB00 6-BIT VERTICAL BEAM ADDR
+     C900             (          RRF.ASM):00014         RWCNTL EQU $C900 (BIT 0: 1-ROM READ; 0-RAM READ)
+                      (          RRF.ASM):00015         *                (BIT 1: 1-INVERT;   0-NORMAL SCREEN)
+                      (          RRF.ASM):00016         *
+                      (          RRF.ASM):00017         *PIA DEFINITIONS
+                      (          RRF.ASM):00018         *
+     C80C             (          RRF.ASM):00019         PIA0 EQU $C80C
+                      (          RRF.ASM):00020         *B0 AUTO UP
+                      (          RRF.ASM):00021         *B1 ADVANCE
+                      (          RRF.ASM):00022         *B2 RCOIN
+                      (          RRF.ASM):00023         *B3 HSRESET
+                      (          RRF.ASM):00024         *B4 LCOIN
+                      (          RRF.ASM):00025         *B5 CCOIN
+                      (          RRF.ASM):00026         *B6 SLAM
+                      (          RRF.ASM):00027         *B7 SOUND HANDSHAKE
+                      (          RRF.ASM):00028         *CA2 LED3 
+                      (          RRF.ASM):00029         *CA1 IRQ 240 (16 MS)  (LINE 240)
+     C80E             (          RRF.ASM):00030         PIA1 EQU $C80E
+                      (          RRF.ASM):00031         *B0-B5 SOUND
+                      (          RRF.ASM):00032         *B6-B7 LED 0,1
+                      (          RRF.ASM):00033         *CB1 IRQ 4 MS (0,$40,$80,$C0)
+                      (          RRF.ASM):00034         *CB2 LED2            
+     C804             (          RRF.ASM):00035         PIA2 EQU $C804
+                      (          RRF.ASM):00036         *B0 MOVE UP
+                      (          RRF.ASM):00037         *B1 MOVE DOWN
+                      (          RRF.ASM):00038         *B2 MOVE LEFT
+                      (          RRF.ASM):00039         *B3 MOVE RIGHT
+                      (          RRF.ASM):00040         *B4 START 1
+                      (          RRF.ASM):00041         *B5 START 2
+                      (          RRF.ASM):00042         *B6 FIRE UP
+                      (          RRF.ASM):00043         *B7 FIRE DOWN
+                      (          RRF.ASM):00044         *
+     C806             (          RRF.ASM):00045         PIA3 EQU $C806
+                      (          RRF.ASM):00046         *B0 FIRE LEFT
+                      (          RRF.ASM):00047         *B1 FIRE RIGHT
+                      (          RRF.ASM):00048         *B7 INPUT 1=COCKTAIL
+                      (          RRF.ASM):00049         *CB2 OUTPUT SWITCH MUX CONTROL 1=PLAYER1,0=PLAYER2
+                      (          RRF.ASM):00050         *
+                      (          RRF.ASM):00051         *DMA CONSTANTS
+                      (          RRF.ASM):00052         *
+     CA00             (          RRF.ASM):00053         DMACTL EQU $CA00 CONTROL BYTE WRITE INITIATES TRANSFER
+                      (          RRF.ASM):00054         *B0:READ FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00055         *B1:WRITE FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00056         *B2:XSFER RATE 0=ROM-RAM (1MSEC); 1=RAM-RAM (2 MSEC)
+                      (          RRF.ASM):00057         *B3:1=ZERO WRITE SUPPRESS
+                      (          RRF.ASM):00058         *B4:1=CONSTANT SUBSTITUTION
+                      (          RRF.ASM):00059         *B5:1=ODD FLAVOR
+                      (          RRF.ASM):00060         *B6:1=B0-B3 WRITE SUPPRESS
+                      (          RRF.ASM):00061         *B7:1=B4-B7 WRITE SUPPRESS
+     CA01             (          RRF.ASM):00062         DMACON EQU $CA01 CONSTANT DATA BYTE
+     CA02             (          RRF.ASM):00063         DMAORG EQU $CA02 ORIGIN ADDR MSB,LSB
+     CA04             (          RRF.ASM):00064         DMADES EQU $CA04 DESTINATION "
+     CA06             (          RRF.ASM):00065         DMASIZ EQU $CA06 HOR,VERT BYTE COUNTS
+                      (          RRF.ASM):00066         *SCORE DISPLAY CONSTANTS
+     00EA             (          RRF.ASM):00067         YMAX EQU 234   
+     0018             (          RRF.ASM):00068         YMIN EQU 24 MIN Y COORD
+     008F             (          RRF.ASM):00069         XMAX EQU $8F
+     0007             (          RRF.ASM):00070         XMIN EQU 7
+     180E             (          RRF.ASM):00071         P1ORG EQU $18*$100+14
+     2E0E             (          RRF.ASM):00072         P1MAN EQU P1ORG+7*$300+$100
+     180E             (          RRF.ASM):00073         P1DISP EQU P1ORG
+     580E             (          RRF.ASM):00074         P2ORG EQU P1ORG+$40*$100
+     6E0E             (          RRF.ASM):00075         P2MAN EQU P2ORG+P1MAN-P1ORG
+     580E             (          RRF.ASM):00076         P2DISP EQU P2ORG
+     0300             (          RRF.ASM):00077         DIGLTH EQU $300
+     4A7C             (          RRF.ASM):00078         PCOORD EQU $4A7C INIT PLAYER COORD
+     0066             (          RRF.ASM):00079         FONCOL EQU $66 PHONY STARTUP COLOR
+                      (          RRF.ASM):00080         *
+                      (          RRF.ASM):00081         *MODULE  VECTORS + STORAGE ALLOCATION
+                      (          RRF.ASM):00082         *
+                      (          RRF.ASM):00083         ***OPSYS**..... R O S ..........
+                      (          RRF.ASM):00084         *
+     D000             (          RRF.ASM):00085         ROSORG EQU $D000
+                      (          RRF.ASM):00086          ORG ROSORG
+D000                  (          RRF.ASM):00087         INIT RMB 3
+D003                  (          RRF.ASM):00088         ASCAN RMB 3
+D006                  (          RRF.ASM):00089         SDOUT RMB 3
+D009                  (          RRF.ASM):00090         SCRTRN RMB 3
+D00C                  (          RRF.ASM):00091         SCORE RMB 3
+D00F                  (          RRF.ASM):00092         SCRTR0 RMB 3
+D012                  (          RRF.ASM):00093         SCRCLR RMB 3
+D015                  (          RRF.ASM):00094         DMAOFF RMB 3
+D018                  (          RRF.ASM):00095         DMAON RMB 3
+D01B                  (          RRF.ASM):00096         BLKCLR RMB 3
+D01E                  (          RRF.ASM):00097         PCTOFF RMB 3
+D021                  (          RRF.ASM):00098         PCTON RMB 3
+D024                  (          RRF.ASM):00099         COLST RMB 3
+D027                  (          RRF.ASM):00100         COL0 RMB 3
+D02A                  (          RRF.ASM):00101         HEXBCD RMB 3
+D02D                  (          RRF.ASM):00102         BCDHEX RMB 3
+D030                  (          RRF.ASM):00103         OINIT RMB 3
+D033                  (          RRF.ASM):00104         CRINIT RMB 3
+D036                  (          RRF.ASM):00105         PINIT RMB 3
+D039                  (          RRF.ASM):00106         RAND RMB 3
+D03C                  (          RRF.ASM):00107         RAND16 RMB 3
+D03F                  (          RRF.ASM):00108         RMAX RMB 3
+D042                  (          RRF.ASM):00109         RANDU RMB 3
+D045                  (          RRF.ASM):00110         PLINDX RMB 3
+D048                  (          RRF.ASM):00111         PLDX RMB 3
+D04B                  (          RRF.ASM):00112         SNDLD RMB 3
+D04E                  (          RRF.ASM):00113         KILO1 RMB 3
+D051                  (          RRF.ASM):00114         GETOBJ RMB 3
+D054                  (          RRF.ASM):00115         MAKEP RMB 3
+D057                  (          RRF.ASM):00116         MKPROC RMB 3
+D05A                  (          RRF.ASM):00117         MSPROC RMB 3
+D05D                  (          RRF.ASM):00118         KILL RMB 3
+D060                  (          RRF.ASM):00119         GNCIDE RMB 3
+D063                  (          RRF.ASM):00120         SUCIDE RMB 3
+D066                  (          RRF.ASM):00121         SLEEP RMB 3
+D069                  (          RRF.ASM):00122         RIPV RMB 3
+D06C                  (          RRF.ASM):00123         MPROB RMB 3
+D06F                  (          RRF.ASM):00124         GETOB RMB 3
+D072                  (          RRF.ASM):00125         KILLOB RMB 3
+D075                  (          RRF.ASM):00126         KILLOF RMB 3
+D078                  (          RRF.ASM):00127         KILOFP RMB 3
+D07B                  (          RRF.ASM):00128         GETROB RMB 3
+D07E                  (          RRF.ASM):00129         KILROB RMB 3
+D081                  (          RRF.ASM):00130         GETPST RMB 3
+D084                  (          RRF.ASM):00131         KILPST RMB 3
+D087                  (          RRF.ASM):00132         GETHUM RMB 3
+D08A                  (          RRF.ASM):00133         KILHUM RMB 3
+D08D                  (          RRF.ASM):00134         DMAOFN RMB 3
+D090                  (          RRF.ASM):00135         MPCTON RMB 3
+D093                  (          RRF.ASM):00136         BLKON RMB 3
+D096                  (          RRF.ASM):00137         EXECV RMB 3
+D099                  (          RRF.ASM):00138         P1SW   RMB    3
+D09C                  (          RRF.ASM):00139         P2SW   RMB    3
+D09F                  (          RRF.ASM):00140         DIVAB  RMB    3
+D0A2                  (          RRF.ASM):00141         RCMOSA RMB    3
+D0A5                  (          RRF.ASM):00142         RCMOSB RMB    3
+D0A8                  (          RRF.ASM):00143         RCMOSD RMB    3
+D0AB                  (          RRF.ASM):00144         WCMOSA RMB    3
+D0AE                  (          RRF.ASM):00145         WCMOSB RMB    3
+D0B1                  (          RRF.ASM):00146         WCMOSD RMB    3
+D0B4                  (          RRF.ASM):00147         BCDBIN RMB    3
+D0B7                  (          RRF.ASM):00148         RWMOVE RMB    3
+D0BA                  (          RRF.ASM):00149         AUD    RMB    3
+D0BD                  (          RRF.ASM):00150         AUD1   RMB    3
+D0C0                  (          RRF.ASM):00151         INT20V RMB    3
+D0C3                  (          RRF.ASM):00152         LFV    RMB    3
+D0C6                  (          RRF.ASM):00153         NEWBCH RMB    3        BCDHEX THAT USES A!!
+                      (          RRF.ASM):00154         *
+                      (          RRF.ASM):00155         *PLAYER DEATH
+                      (          RRF.ASM):00156         *
+     DD00             (          RRF.ASM):00157         RDORG EQU $DD00
+                      (          RRF.ASM):00158          ORG RDORG
+DD00                  (          RRF.ASM):00159         RDTHV RMB 3
+                      (          RRF.ASM):00160         *
+                      (          RRF.ASM):00161         *HUMANS+HULKS
+                      (          RRF.ASM):00162         *
+     0000             (          RRF.ASM):00163         RHORG EQU $0000
+                      (          RRF.ASM):00164          ORG RHORG
+0000                  (          RRF.ASM):00165         HULKST RMB 3
+0003                  (          RRF.ASM):00166         HUMST RMB 3
+0006                  (          RRF.ASM):00167         CKLIM RMB 3
+0009                  (          RRF.ASM):00168         SKULL RMB 3
+000C                  (          RRF.ASM):00169         P1KD RMB 2
+000E                  (          RRF.ASM):00170         MOMPIC RMB 2
+0010                  (          RRF.ASM):00171         DADPIC RMB 2
+0012                  (          RRF.ASM):00172         KIDPIC RMB 2
+0014                  (          RRF.ASM):00173         HLKPIC RMB 2
+0016                  (          RRF.ASM):00174         HLKANA RMB 2
+0018                  (          RRF.ASM):00175         HUMANA RMB 2
+001A                  (          RRF.ASM):00176         SKLPIC RMB 2
+                      (          RRF.ASM):00177         *
+                      (          RRF.ASM):00178         ***CIRCLES,ENFORCERS,SPARX
+                      (          RRF.ASM):00179         *
+     1140             (          RRF.ASM):00180         RCORG EQU $1140
+                      (          RRF.ASM):00181          ORG RCORG
+1140                  (          RRF.ASM):00182         CIRCST RMB 3 START CIRCLES
+1143                  (          RRF.ASM):00183         CIRKV RMB 3
+1146                  (          RRF.ASM):00184         CIRPIC RMB 2
+1148                  (          RRF.ASM):00185         ENGPIC RMB 2
+114A                  (          RRF.ASM):00186         ENFPIC RMB 2
+                      (          RRF.ASM):00187         *
+                      (          RRF.ASM):00188         *BRAINS & CO.
+                      (          RRF.ASM):00189         *
+     1AC0             (          RRF.ASM):00190         BRNORG EQU $1AC0
+                      (          RRF.ASM):00191          ORG BRNORG
+1AC0                  (          RRF.ASM):00192         BRNST RMB 3
+1AC3                  (          RRF.ASM):00193         BRNPIC RMB 2
+1AC5                  (          RRF.ASM):00194         BRONV  RMB    3
+1AC8                  (          RRF.ASM):00195         HUMONV RMB    3
+1ACB                  (          RRF.ASM):00196         PRGPIC RMB 2
+                      (          RRF.ASM):00197         *
+                      (          RRF.ASM):00198         *******ROBOT GAME...... R G .......
+                      (          RRF.ASM):00199         *
+     26C0             (          RRF.ASM):00200         RGORG EQU $26C0
+                      (          RRF.ASM):00201          ORG RGORG
+26C0                  (          RRF.ASM):00202         PLAYER RMB 3
+26C3                  (          RRF.ASM):00203         RANDXY RMB 3
+26C6                  (          RRF.ASM):00204         CKOBS RMB 3
+26C9                  (          RRF.ASM):00205         MANDSP RMB 3
+26CC                  (          RRF.ASM):00206         STRT1 RMB 3
+26CF                  (          RRF.ASM):00207         STRT2 RMB 3
+26D2                  (          RRF.ASM):00208         TDISPV RMB 3
+26D5                  (          RRF.ASM):00209         MANPIC RMB 2
+26D7                  (          RRF.ASM):00210         LASPIC RMB 2
+                      (          RRF.ASM):00211         *
+                      (          RRF.ASM):00212         *ROBOTS&POSTS
+                      (          RRF.ASM):00213         *
+     3880             (          RRF.ASM):00214         RPORG EQU $3880
+                      (          RRF.ASM):00215          ORG RPORG
+3880                  (          RRF.ASM):00216         RINIT RMB 3
+3883                  (          RRF.ASM):00217         PSINIT RMB 3
+3886                  (          RRF.ASM):00218         PSTP1 RMB 2
+3888                  (          RRF.ASM):00219         OPON RMB 3
+388B                  (          RRF.ASM):00220         OPON1 RMB 3
+388E                  (          RRF.ASM):00221         SAFTY RMB 3
+3891                  (          RRF.ASM):00222         ROBPIC RMB 2
+3893                  (          RRF.ASM):00223         PSTPIC RMB 2
+3895                  (          RRF.ASM):00224         PKPRCV RMB 3
+                      (          RRF.ASM):00225         *
+                      (          RRF.ASM):00226         *TRANSPORTER
+                      (          RRF.ASM):00227         *
+     4140             (          RRF.ASM):00228         RTORG EQU $4140
+                      (          RRF.ASM):00229          ORG RTORG
+4140                  (          RRF.ASM):00230         TRANST RMB 3
+                      (          RRF.ASM):00231         *
+                      (          RRF.ASM):00232         *DIAGONAL EXPLOSIONS
+                      (          RRF.ASM):00233         *
+     4680             (          RRF.ASM):00234         RDXORG EQU $4680
+                      (          RRF.ASM):00235          ORG RDXORG
+4680                  (          RRF.ASM):00236         DXINIT RMB 3
+4683                  (          RRF.ASM):00237         DXST RMB 3
+4686                  (          RRF.ASM):00238         DAPST RMB 3
+4689                  (          RRF.ASM):00239         DXUPD RMB 3
+                      (          RRF.ASM):00240         *
+                      (          RRF.ASM):00241         *TANKS
+                      (          RRF.ASM):00242         *
+     4B00             (          RRF.ASM):00243         RTKORG EQU $4B00
+                      (          RRF.ASM):00244          ORG RTKORG
+4B00                  (          RRF.ASM):00245         TANKST RMB 3
+4B03                  (          RRF.ASM):00246         SQST RMB 3
+4B06                  (          RRF.ASM):00247         SQPIC RMB 2
+4B08                  (          RRF.ASM):00248         TNGPIC RMB 2
+4B0A                  (          RRF.ASM):00249         TNKPIC RMB 2
+                      (          RRF.ASM):00250         *
+                      (          RRF.ASM):00251         *MARQUEE
+                      (          RRF.ASM):00252         *
+     5700             (          RRF.ASM):00253         RMORG EQU $5700
+                      (          RRF.ASM):00254          ORG RMORG
+5700                  (          RRF.ASM):00255         RMST RMB 3
+                      (          RRF.ASM):00256         *
+                      (          RRF.ASM):00257         *EXPLOSIONS
+                      (          RRF.ASM):00258         *
+     5B40             (          RRF.ASM):00259         RXORG EQU $5B40
+                      (          RRF.ASM):00260          ORG RXORG
+5B40                  (          RRF.ASM):00261         EXINIT RMB 3
+5B43                  (          RRF.ASM):00262         EXST RMB 3
+5B46                  (          RRF.ASM):00263         APST RMB 3
+5B49                  (          RRF.ASM):00264         EXUPD RMB 3
+5B4C                  (          RRF.ASM):00265         PDEATH RMB 3
+5B4F                  (          RRF.ASM):00266         HVEXST RMB 3
+5B52                  (          RRF.ASM):00267         DDEXST RMB 3 DUAL DIAGONALS
+5B55                  (          RRF.ASM):00268         AMAP   RMB    3        ATTRACT MODE APPEAR
+5B58                  (          RRF.ASM):00269         HAPST  RMB    3        HORIZONTAL APPEAR
+5B5B                  (          RRF.ASM):00270         HEXST  RMB    3        HORIZONTAL EXPLODE
+                      (          RRF.ASM):00271         
+                      (          RRF.ASM):00272         *             STINKY LINKY VINCKYS
+                      (          RRF.ASM):00273         
+     77A0             (          RRF.ASM):00274         LOGORG EQU    $77A0          PLACE FOR PROGRAM
+     77A0             (          RRF.ASM):00275         GOV    EQU    LOGORG
+     77A3             (          RRF.ASM):00276         CCV    EQU    GOV+3
+                      (          RRF.ASM):00277         
+     E3D0             (          RRF.ASM):00278         TSCORG EQU $E3D0   HIGH SCORE BULLSHIT
+     E3D0             (          RRF.ASM):00279         PUPHSC EQU TSCORG  POWER UP HIGH SCORE CHECK
+     E3D3             (          RRF.ASM):00280         ENDPRC EQU PUPHSC+3 END OF GAME PROCESSING
+     E3D6             (          RRF.ASM):00281         GODSET EQU ENDPRC+3 ENTER GODS NAME BY OPERATOR
+     E3D9             (          RRF.ASM):00282         HIGHRS EQU GODSET+3 RESET HIGH SCORE TABLE BY OPERATOR
+     E3DC             (          RRF.ASM):00283         HSCHKV EQU HIGHRS+3 CHECK IF HS TABLE LOOKS BASHED
+     E3DF             (          RRF.ASM):00284         HSBUTV EQU HSCHKV+3 HIGH SCORE RESET BUTTON
+                      (          RRF.ASM):00285         
+     DF40             (          RRF.ASM):00286         TABORG EQU    $DF40
+     DF40             (          RRF.ASM):00287         TABLEV EQU    TABORG
+                      (          RRF.ASM):00288         
+     F000             (          RRF.ASM):00289         TSTORG EQU $F000
+     F000             (          RRF.ASM):00290         PWRUPV EQU TSTORG    
+     F003             (          RRF.ASM):00291         ADVSW EQU PWRUPV+3
+     F006             (          RRF.ASM):00292         AUTOCY EQU ADVSW+3
+     F009             (          RRF.ASM):00293         HXINIT EQU AUTOCY+3
+     F00C             (          RRF.ASM):00294         HEXSTX EQU HXINIT+3
+     F00F             (          RRF.ASM):00295         HAPSTX EQU HEXSTX+3
+     F012             (          RRF.ASM):00296         HXUPD EQU HAPSTX+3
+     F015             (          RRF.ASM):00297         WLOOPV EQU HXUPD+3
+     F017             (          RRF.ASM):00298         ELOOPV EQU WLOOPV+2
+     F019             (          RRF.ASM):00299         L2     EQU    ELOOPV+2
+     F01B             (          RRF.ASM):00300         L0     EQU    L2+2
+                      (          RRF.ASM):00301         
+     6F00             (          RRF.ASM):00302         TSBORG EQU $6F00 ADJUST PART OF TEST MODE
+     6F00             (          RRF.ASM):00303         ADJV   EQU TSBORG
+     6F03             (          RRF.ASM):00304         CMINIT EQU ADJV+3
+     6F06             (          RRF.ASM):00305         ATMCK  EQU CMINIT+3
+     6F09             (          RRF.ASM):00306         GETLT  EQU ATMCK+3     ROUTINE TO GET LETTERS FROM CONTROL PANEL
+     6F0C             (          RRF.ASM):00307         CMSMVV EQU GETLT+3
+     6F0F             (          RRF.ASM):00308         DOPMES EQU    CMSMVV+3   2 BYTER
+                      (          RRF.ASM):00309         
+     5F90             (          RRF.ASM):00310         TXORG  EQU    $5F90    PLACE FOR TEXT PROGRAM
+     5F90             (          RRF.ASM):00311         PR35V  EQU    TXORG
+     5F93             (          RRF.ASM):00312         PR57V  EQU    PR35V+3
+     5F96             (          RRF.ASM):00313         WRD5V  EQU    PR57V+3
+     5F99             (          RRF.ASM):00314         WRD7V  EQU    WRD5V+3
+     5F9C             (          RRF.ASM):00315         PRINV  EQU    WRD7V+3
+     5F9F             (          RRF.ASM):00316         PRSCR  EQU    PRINV+3
+                      (          RRF.ASM):00317         
+     5F96             (          RRF.ASM):00318         WRD5FV EQU    WRD5V
+     5F99             (          RRF.ASM):00319         WRD7FV EQU    WRD7V
+     5F90             (          RRF.ASM):00320         PRN5FV EQU    PR35V
+     5F93             (          RRF.ASM):00321         PRN7FV EQU    PR57V
+                      (          RRF.ASM):00322         
+     E9C8             (          RRF.ASM):00323         SETORG EQU    $E9C8    CHARACTER SET
+     E9C8             (          RRF.ASM):00324         TAB35  EQU    SETORG
+     E9CA             (          RRF.ASM):00325         TAB57  EQU    TAB35+2
+     E9CA             (          RRF.ASM):00326         N0V    EQU    TAB57  
+                      (          RRF.ASM):00327         
+                      (          RRF.ASM):00328         *
+                      (          RRF.ASM):00329         *BASE PAGE RAM AREA
+                      (          RRF.ASM):00330         *
+                      (          RRF.ASM):00331          ORG $9800
+     9800             (          RRF.ASM):00332         RAM EQU *
+     98               (          RRF.ASM):00333          SETDP $98
+                      (          RRF.ASM):00334         
+9800                  (          RRF.ASM):00335         PCRAM RMB 16 PSEUDO COLOR RAM
+9810                  (          RRF.ASM):00336         TIMER RMB 1  IRQ TIMER
+9811                  (          RRF.ASM):00337         ACTIVE RMB    2        POINTER TO LIST OF CURRENTLY ACTIVE (SLEEPING) PROCS.
+9813                  (          RRF.ASM):00338         FREE   RMB    2        POINTER TO LIST OF UNALLOCATED PROCESS SLEEP SPACE.
+9815                  (          RRF.ASM):00339         CRPROC RMB    2        POINTER TO SLEEP AREA OF CURRENTLY EXECUTING PROCESS.
+9817                  (          RRF.ASM):00340         OPTR RMB 2 MOTION OBJECT LIST POINTER
+9819                  (          RRF.ASM):00341         OBPTR RMB 2 OBSTACLE LIST POINTER
+981B                  (          RRF.ASM):00342         OFREE RMB 2 FREE LIST POINTER
+981D                  (          RRF.ASM):00343         SPFREE RMB 2 SUPER PROCESS FREE LIST
+981F                  (          RRF.ASM):00344         HPTR RMB 2 HUMAN PTR
+9821                  (          RRF.ASM):00345         RPTR RMB 2 ROBOT LIST
+9823                  (          RRF.ASM):00346         PPTR RMB 2 PHATAL OBJECT LIST
+9825                  (          RRF.ASM):00347         ITEMP RMB 2 INTERUPT TEMP
+9827                  (          RRF.ASM):00348         PSTIN RMB 2
+9829                  (          RRF.ASM):00349         ITEMP2 RMB 2
+982B                  (          RRF.ASM):00350         XTEMP  RMB 2 SAVE AREA FOR QUICK TEMPORARY
+982D                  (          RRF.ASM):00351         XTEMP2 RMB 2
+982F                  (          RRF.ASM):00352         PIA01 RMB 1 N-1 PIA0
+9830                  (          RRF.ASM):00353         PIA02 RMB 1 N-2 PIA0
+9831                  (          RRF.ASM):00354         PIA21 RMB 1 N-1 PIA2
+9832                  (          RRF.ASM):00355         PIA22 RMB 1 N-2 PIA2
+9833                  (          RRF.ASM):00356         SWPROC RMB 12 SWITCH SCAN TEMP
+983F                  (          RRF.ASM):00357         CURPLR RMB 1 CURRENT
+9840                  (          RRF.ASM):00358         PLRCNT RMB 1 NUMBER OF PLAYERS
+9841                  (          RRF.ASM):00359         XXX2 RMB 1 '80' IRQ LINE
+9842                  (          RRF.ASM):00360         OVCNT RMB 1 OVERFLOW COUNT
+9843                  (          RRF.ASM):00361         IFLG RMB 1 IRQ FLAG
+9844                  (          RRF.ASM):00362         FRAME RMB 1 IRQ COUNT
+9845                  (          RRF.ASM):00363         RWCTMP RMB 1 SCREEN READ CONTROL BYTE
+9846                  (          RRF.ASM):00364         REPLA RMB 2 REPLAY LEVEL
+9848                  (          RRF.ASM):00365         PCFLG RMB 1 PLAYER COLLISION
+9849                  (          RRF.ASM):00366         HTABX RMB 2 HUMAN TABLE INDEX
+                      (          RRF.ASM):00367         *COIN BUSINESS
+984B                  (          RRF.ASM):00368         SLMCNT RMB 1
+984C                  (          RRF.ASM):00369         LCCNT RMB 1
+984D                  (          RRF.ASM):00370         RCCNT RMB 1
+984E                  (          RRF.ASM):00371         CCCNT RMB 1
+984F                  (          RRF.ASM):00372         BUNITS RMB 1
+9850                  (          RRF.ASM):00373         CUNITS RMB 1
+9851                  (          RRF.ASM):00374         CREDIT RMB 1
+                      (          RRF.ASM):00375         *ATTRACT SWITCHES: FONY PRAYAH CONTLOHL
+9852                  (          RRF.ASM):00376         ATRSW2 RMB 1
+9853                  (          RRF.ASM):00377         ATRSW3 RMB 1
+                      (          RRF.ASM):00378         *SOUND RAM
+9854                  (          RRF.ASM):00379         SNDX RMB 2 TABLE INDEX
+9856                  (          RRF.ASM):00380         SNDPRI RMB 1 PRIORITY
+9857                  (          RRF.ASM):00381         SNDTMR RMB 1
+9858                  (          RRF.ASM):00382         SNDREP RMB 1
+                      (          RRF.ASM):00383         *
+                      (          RRF.ASM):00384         *STATUS FLAG
+                      (          RRF.ASM):00385         *B7=GAME OVER
+                      (          RRF.ASM):00386         *B6=
+                      (          RRF.ASM):00387         *B5=
+                      (          RRF.ASM):00388         *B4=PLAYER OUTPUT
+                      (          RRF.ASM):00389         *B3=MOTION OBJS VEL +ENEMIES
+                      (          RRF.ASM):00390         *B2=EXPLOSION UPDATE
+                      (          RRF.ASM):00391         *B1=POST ,MOT OBJ REFRESH
+                      (          RRF.ASM):00392         *B0=PLAYER MOTION,COLLISION,FIRE
+9859                  (          RRF.ASM):00393         STATUS RMB 1
+                      (          RRF.ASM):00394         *
+                      (          RRF.ASM):00395         *PLAYER OBJECT STRUCTURE
+                      (          RRF.ASM):00396         *
+     985A             (          RRF.ASM):00397         PLOBJ EQU *
+985A                  (          RRF.ASM):00398          RMB 2 OLINK
+985C                  (          RRF.ASM):00399         PPICT RMB 2 OPICT
+985E                  (          RRF.ASM):00400         PX RMB 2 OBJX
+9860                  (          RRF.ASM):00401          RMB 2 OBJID
+9862                  (          RRF.ASM):00402          RMB 2 OCVECT
+9864                  (          RRF.ASM):00403         PX16 RMB 2  OX16
+9866                  (          RRF.ASM):00404         PY16 RMB 2  OY16
+9868                  (          RRF.ASM):00405         PXV RMB 2   OXV
+986A                  (          RRF.ASM):00406         PYV RMB 2   OYV
+986C                  (          RRF.ASM):00407          RMB 1 OFLAV
+986D                  (          RRF.ASM):00408         PODATA RMB 1 ODATA
+986E                  (          RRF.ASM):00409         POLDPC RMB 2 OLDPIC
+9870                  (          RRF.ASM):00410         PLAIMC RMB 1 PLAYER ANIMATION RATE
+9871                  (          RRF.ASM):00411         PLAIMN RMB 1 PLAYER ANIMATION NUMBER
+9872                  (          RRF.ASM):00412         PLAIMB RMB 2 PLAYER ANIMATION BASE ADDR
+                      (          RRF.ASM):00413         *
+                      (          RRF.ASM):00414         *COLLISION ROUTINE PARAMETERS
+                      (          RRF.ASM):00415         *
+9874                  (          RRF.ASM):00416         XCNT RMB 1 SCAN COUNTS
+9875                  (          RRF.ASM):00417         YCNT RMB 1
+9876                  (          RRF.ASM):00418         OX1 RMB 1 OFFSETS
+9877                  (          RRF.ASM):00419         OY1 RMB 1
+9878                  (          RRF.ASM):00420         PX1 RMB 1
+9879                  (          RRF.ASM):00421         PY1 RMB 1
+987A                  (          RRF.ASM):00422         OBW RMB 1 HT TEMPS
+987B                  (          RRF.ASM):00423         PLW RMB 1
+987C                  (          RRF.ASM):00424         ULX RMB 1 UPPER LEFT COORD
+987D                  (          RRF.ASM):00425         ULY RMB 1 "
+987E                  (          RRF.ASM):00426         LRX RMB 1
+987F                  (          RRF.ASM):00427         LRY RMB 1
+9880                  (          RRF.ASM):00428         CTEMP RMB 2 INDEX TEMP
+9882                  (          RRF.ASM):00429         CTEMP2 RMB 2
+                      (          RRF.ASM):00430         *RANDOM VARIABLES
+9884                  (          RRF.ASM):00431         SEED   RMB    1
+9885                  (          RRF.ASM):00432         HSEED  RMB    1 
+9886                  (          RRF.ASM):00433         LSEED  RMB    1
+                      (          RRF.ASM):00434         *LASER
+9887                  (          RRF.ASM):00435         LCNT RMB 1
+9888                  (          RRF.ASM):00436         LASDIR RMB 2
+                      (          RRF.ASM):00437         *SPARKS
+988A                  (          RRF.ASM):00438         SPKCNT RMB 1
+988B                  (          RRF.ASM):00439         ROBST RMB 2 PTR TO ROBOT LIST
+988D                  (          RRF.ASM):00440         SAVCNT RMB 1 HUMAN COUNT SAVED
+988E                  (          RRF.ASM):00441         BCMCNT RMB 1 BRAIN CRUISE MISSILES
+                      (          RRF.ASM):00442         *POST ANIMATION+WALL COLOR
+988F                  (          RRF.ASM):00443         WALCOL RMB 1 WALL+POST BG
+9890                  (          RRF.ASM):00444         PSTCOL RMB 1 POST COLOR
+9891                  (          RRF.ASM):00445         LASCOL RMB 1 LASER WALL COLLIDE COLOR
+9892                  (          RRF.ASM):00446         PSTREF RMB 1 POST REFRESH RATE
+9893                  (          RRF.ASM):00447         PSTANI RMB 2 CURR POST ANIMATION
+9895                  (          RRF.ASM):00448         BRNFLG RMB 1 BRAIN HUMAN KILL FLAG
+                      (          RRF.ASM):00449         *
+                      (          RRF.ASM):00450         *EXPLOSION STUFF
+9896                  (          RRF.ASM):00451         EXPRAM RMB $10
+98A6                  (          RRF.ASM):00452         CENTMP RMB 2 CENTER OF BLOW
+98A8                  (          RRF.ASM):00453         HXRAM RMB $10
+98B8                  (          RRF.ASM):00454         DXRAM RMB $10
+98C8                  (          RRF.ASM):00455         RMRAM RMB 6 MARQUEE RAM
+                      (          RRF.ASM):00456         
+                      (          RRF.ASM):00457         ************************ LINKYS STINKYS
+                      (          RRF.ASM):00458         
+98CE                  (          RRF.ASM):00459         INDIAG RMB    1
+                      (          RRF.ASM):00460         
+                      (          RRF.ASM):00461         *
+                      (          RRF.ASM):00462         *      TEXT VARIABLES
+                      (          RRF.ASM):00463         *
+                      (          RRF.ASM):00464         
+98CF                  (          RRF.ASM):00465         TEXCOL RMB    1 (TEXCOL)  PRINTING COLOR (NIBBLES REPRESENT FLAVOR COLO
+98D0                  (          RRF.ASM):00466         TXFLAV RMB    1 (TXFLAV) FLAVOR OF CURRENT CURSOR (0=EVEN, 1=ODD)
+98D1                  (          RRF.ASM):00467         TXLEAD RMB    1 (TXLEAD) LEAD ZERO BLANKING ON/OFF (0=OFF, 1=ON)
+98D2                  (          RRF.ASM):00468         TXFONT RMB    1 (TXFONT) FONT HEIGHT (5 OR 7) PIXELS
+98D3                  (          RRF.ASM):00469         TEXMAR RMB    2        CURRENT LEFT MARGIN CURSOR POINTER
+98D5                  (          RRF.ASM):00470         TEXMFL RMB    1        CURRENT LEFT MARGIN FLAVOR
+98D6                  (          RRF.ASM):00471         TEXTP3 RMB    1
+98D7                  (          RRF.ASM):00472         TXCLIP RMB    1
+                      (          RRF.ASM):00473         
+                      (          RRF.ASM):00474         *
+                      (          RRF.ASM):00475         ***    GET LETTER ROUTINE RAM
+                      (          RRF.ASM):00476         *
+                      (          RRF.ASM):00477         
+98D8                  (          RRF.ASM):00478         GETLRM RMB    2
+98DA                  (          RRF.ASM):00479         GETLST RMB    3
+                      (          RRF.ASM):00480         
+                      (          RRF.ASM):00481         ********************* LOGO RAM
+                      (          RRF.ASM):00482         
+98DD                  (          RRF.ASM):00483         LOGX   RMB    2
+98DF                  (          RRF.ASM):00484         LOGCOL RMB    1
+98E0                  (          RRF.ASM):00485         LOGCL2 RMB    1
+98E1                  (          RRF.ASM):00486         LOGCNT RMB    1
+98E2                  (          RRF.ASM):00487         LOGSAV RMB    2
+98E4                  (          RRF.ASM):00488         LOGCST RMB    2
+                      (          RRF.ASM):00489         
+98E6                  (          RRF.ASM):00490         LASTX  RMB    2
+98E8                  (          RRF.ASM):00491         SIDE   RMB    1
+98E9                  (          RRF.ASM):00492         BALCOL RMB    1
+98EA                  (          RRF.ASM):00493         SLIDER RMB    1
+98EB                  (          RRF.ASM):00494         ERPTR  RMB    2
+                      (          RRF.ASM):00495         *MOVE THIS SOMEDAY
+98ED                  (          RRF.ASM):00496         ENFCNT RMB 1
+98EE                  (          RRF.ASM):00497         GAMTIM RMB 1 GAME TIMER
+98EF                  (          RRF.ASM):00498         TNKSPD RMB 1 TANK SPEED PARAMETER
+98F0                  (          RRF.ASM):00499         SCRFLG RMB 1 SCORE FLAG
+98F1                  (          RRF.ASM):00500         SHLCNT RMB 1 SHELL COUNTER
+98F2                  (          RRF.ASM):00501         RIPFLG RMB 1                            
+98F3                  (          RRF.ASM):00502         HCK1   RMB 1
+98F4                  (          RRF.ASM):00503         ATFLAG RMB 1  INDICATE WHAT PAGE AND HOW
+                      (          RRF.ASM):00504         
+                      (          RRF.ASM):00505         *
+                      (          RRF.ASM):00506         *TABLE DATA
+                      (          RRF.ASM):00507         *
+                      (          RRF.ASM):00508          ORG RAM+$100 PAST BASE PAGE
+                      (          RRF.ASM):00509         *
+                      (          RRF.ASM):00510         *MASTER OBJECT LIST
+                      (          RRF.ASM):00511         *
+     9900             (          RRF.ASM):00512         OLIST EQU * 
+     0018             (          RRF.ASM):00513         OSIZE EQU $18
+                      (          RRF.ASM):00514         *
+                      (          RRF.ASM):00515         *INDEX OFFSETS
+                      (          RRF.ASM):00516         *
+     0000             (          RRF.ASM):00517         OLINK EQU 0 LINK TO NEXT
+     0002             (          RRF.ASM):00518         OPICT EQU 2 PICTURE DESCRIPTOR ADDR
+     0004             (          RRF.ASM):00519         OBJX EQU 4 UPPER LEFT SCREEN X
+     0005             (          RRF.ASM):00520         OBJY EQU 5 UPPER LEFT SCREEN Y
+     0006             (          RRF.ASM):00521         OBJID EQU 6 ASSOCIATED PROCESS ID (IF ANY)
+     0008             (          RRF.ASM):00522         OCVECT EQU 8 COLLISION ROUTINE ADDR
+     000A             (          RRF.ASM):00523         OX16 EQU $A 16 BIT X WORLD COORD
+     000C             (          RRF.ASM):00524         OY16 EQU $C 16 BIT Y WORLD COORD
+     000E             (          RRF.ASM):00525         OXV EQU $E X VELOCITY
+     0010             (          RRF.ASM):00526         OYV EQU $10 Y VELOCITY
+     0012             (          RRF.ASM):00527         OFLAV EQU $12 OLD FLAVOR
+     0013             (          RRF.ASM):00528         ODATA EQU $13 MISC. DATA
+     0014             (          RRF.ASM):00529         OLDPIC EQU $14 OLD PICTURE TO ERASE
+     0016             (          RRF.ASM):00530         FONIPC EQU $16 FONY PICT FOR COLLISION PURPOSES
+                      (          RRF.ASM):00531         *RESERVE AREA
+9900                  (          RRF.ASM):00532          RMB (180)*OSIZE
+     A9E0             (          RRF.ASM):00533         OLEND EQU *
+                      (          RRF.ASM):00534         *
+                      (          RRF.ASM):00535         *USER DEFINED PROCESS TYPES
+                      (          RRF.ASM):00536         *
+     0000             (          RRF.ASM):00537         STYPE EQU 0 SYSTEM PROCESS
+     0001             (          RRF.ASM):00538         CTYPE EQU 1 COIN
+                      (          RRF.ASM):00539         *
+                      (          RRF.ASM):00540         *SLEEPING PROCESS TABLE
+                      (          RRF.ASM):00541         *
+     A9E0             (          RRF.ASM):00542         PTAB EQU *
+                      (          RRF.ASM):00543         *
+                      (          RRF.ASM):00544         *OFFSET CONSTANTS 
+                      (          RRF.ASM):00545         *
+     0000             (          RRF.ASM):00546         PLINK EQU 0
+     0002             (          RRF.ASM):00547         PADDR EQU 2
+     0004             (          RRF.ASM):00548         PTIME EQU 4
+     0005             (          RRF.ASM):00549         PTYPE EQU 5
+     0006             (          RRF.ASM):00550         PCOD EQU 6
+     0007             (          RRF.ASM):00551         PDATA EQU 7
+     0007             (          RRF.ASM):00552         PD EQU 7
+     0008             (          RRF.ASM):00553         PD1 EQU 8
+     0009             (          RRF.ASM):00554         PD2 EQU 9
+     000A             (          RRF.ASM):00555         PD3 EQU 10
+     000B             (          RRF.ASM):00556         PD4 EQU 11
+     000C             (          RRF.ASM):00557         PD5 EQU 12
+     000D             (          RRF.ASM):00558         PD6 EQU 13
+     000E             (          RRF.ASM):00559         PD7 EQU 14
+     000F             (          RRF.ASM):00560         PSIZE EQU 15
+A9E0                  (          RRF.ASM):00561          RMB 15*(120)
+     B0E8             (          RRF.ASM):00562         TABEND EQU *
+                      (          RRF.ASM):00563         *
+                      (          RRF.ASM):00564         *SUPER PROCESSES
+                      (          RRF.ASM):00565         *
+     001F             (          RRF.ASM):00566         SPSIZE EQU PSIZE+16
+B0E8                  (          RRF.ASM):00567         SPTAB RMB SPSIZE*20
+     B354             (          RRF.ASM):00568         SPTEND EQU *
+                      (          RRF.ASM):00569         *
+                      (          RRF.ASM):00570         *OBJECT PICTURE STRUCTURE
+                      (          RRF.ASM):00571         *
+     0000             (          RRF.ASM):00572         OBJW EQU 0
+     0001             (          RRF.ASM):00573         OBJH EQU 1
+     0002             (          RRF.ASM):00574         OBJDAT EQU 2
+     0004             (          RRF.ASM):00575         OBJL EQU 4
+                      (          RRF.ASM):00576         *
+                      (          RRF.ASM):00577         *HUMAN TABLE
+                      (          RRF.ASM):00578         *
+B354                  (          RRF.ASM):00579         HTAB RMB 80
+     B3A4             (          RRF.ASM):00580         HTBEND EQU *
+                      (          RRF.ASM):00581         *
+                      (          RRF.ASM):00582         *POST REFRESH LIST
+                      (          RRF.ASM):00583         *
+B3A4                  (          RRF.ASM):00584         PSLIST RMB 64 POST LIST
+     B3E4             (          RRF.ASM):00585         PSLEND EQU *
+                      (          RRF.ASM):00586         *
+                      (          RRF.ASM):00587         *HORIZONTAL EXPLOSION TABLES
+                      (          RRF.ASM):00588         *
+B3E4                  (          RRF.ASM):00589         HXTAB RMB $800
+                      (          RRF.ASM):00590         
+                      (          RRF.ASM):00591         *
+                      (          RRF.ASM):00592         *DIAGONAL XPLOSION TABLES
+                      (          RRF.ASM):00593         *
+BBE4                  (          RRF.ASM):00594         DXTAB RMB $200
+                      (          RRF.ASM):00595         *
+                      (          RRF.ASM):00596         *PLAYER DATA TABLE
+                      (          RRF.ASM):00597         *
+     BDE4             (          RRF.ASM):00598         PLDATA EQU *
+BDE4                  (          RRF.ASM):00599         ZP1SCR RMB 4 SCORE MSB 1ST
+BDE8                  (          RRF.ASM):00600         ZP1RP RMB 4 NEXT REPLAY LEVEL
+BDEC                  (          RRF.ASM):00601         ZP1LAS RMB 1 #OF LASERS 
+BDED                  (          RRF.ASM):00602         ZP1WAV RMB 1 WAVE # IN HEX
+BDEE                  (          RRF.ASM):00603         ZP1ENM RMB 50 ENEMY STATE
+     BE20             (          RRF.ASM):00604         ZP1END EQU *
+BE20                  (          RRF.ASM):00605         ZP2SCR RMB 4
+BE24                  (          RRF.ASM):00606         ZP2RP RMB 4
+BE28                  (          RRF.ASM):00607         ZP2LAS RMB 1
+BE29                  (          RRF.ASM):00608         ZP2WAV RMB 1
+BE2A                  (          RRF.ASM):00609         ZP2ENM RMB 50
+     BE5C             (          RRF.ASM):00610         PLDEND EQU * END OF PLAYER DATA
+     003C             (          RRF.ASM):00611         PLDLEN EQU ZP1END-PLDATA
+     0000             (          RRF.ASM):00612         PSCOR EQU ZP1SCR-PLDATA
+     0004             (          RRF.ASM):00613         PRPLA EQU ZP1RP-PLDATA
+     0008             (          RRF.ASM):00614         PLAS EQU ZP1LAS-PLDATA
+     0009             (          RRF.ASM):00615         PWAV EQU ZP1WAV-PLDATA
+     000A             (          RRF.ASM):00616         PENEMY EQU ZP1ENM-PLDATA
+                      (          RRF.ASM):00617         *
+                      (          RRF.ASM):00618         *ENEMIES LIST
+                      (          RRF.ASM):00619         *WARNING DO NOT CHANGE ORDER OF COUNTS
+     BE5C             (          RRF.ASM):00620         ELIST EQU *
+BE5C                  (          RRF.ASM):00621         ROBSPD RMB 1  SPEED
+BE5D                  (          RRF.ASM):00622         RMXSPD RMB 1 MAX ROBOT SPEED
+BE5E                  (          RRF.ASM):00623         ENFNUM RMB 1 # OF ENFORCERS/CIRCLE X2
+BE5F                  (          RRF.ASM):00624         ENSTIM RMB 1 ENF SHOT TIMER
+BE60                  (          RRF.ASM):00625         CDPTIM RMB 1 CIRCLE DROP TIMER
+BE61                  (          RRF.ASM):00626         HLKSPD RMB 1 HULK SPEED
+BE62                  (          RRF.ASM):00627         BSHTIM RMB 1 BRAIN SHOT TIMER
+BE63                  (          RRF.ASM):00628         BRNSPD RMB 1 BRAIN SPEED
+BE64                  (          RRF.ASM):00629         TNKSHT RMB 1  TANK SHOT RATE
+BE65                  (          RRF.ASM):00630         SHLSPD RMB 1  SHELL SPEED
+BE66                  (          RRF.ASM):00631         TDPTIM RMB 1  TANK DROP TIMR
+BE67                  (          RRF.ASM):00632         SQSPD RMB 1   SQUARE SPEED
+     BE68             (          RRF.ASM):00633         ECNTS EQU * START COUNTS
+BE68                  (          RRF.ASM):00634         ROBCNT RMB 1 # ROBOTS
+BE69                  (          RRF.ASM):00635         PSTCNT RMB 1 # POSTS
+BE6A                  (          RRF.ASM):00636         MOMCNT RMB 1 # MOM UNITS
+BE6B                  (          RRF.ASM):00637         DADCNT RMB 1 # DAD UNITS
+BE6C                  (          RRF.ASM):00638         KIDCNT RMB 1 # KIDS
+BE6D                  (          RRF.ASM):00639         HLKCNT RMB 1 # HULKS
+BE6E                  (          RRF.ASM):00640         BRNCNT RMB 1 # BRAINS
+BE6F                  (          RRF.ASM):00641         CIRCNT RMB 1 # CIRCLES
+BE70                  (          RRF.ASM):00642         SQCNT RMB 1 # SQUARES
+BE71                  (          RRF.ASM):00643         TNKCNT RMB 1 # TANKS
+     BE72             (          RRF.ASM):00644         ELEND EQU *
+BE72                  (          RRF.ASM):00645         HCK2 RMB 1
+                      (          RRF.ASM):00646         *
+                      (          RRF.ASM):00647         * CMOS RAM ALLOCATION
+                      (          RRF.ASM):00648         *
+                      (          RRF.ASM):00649          ORG CMOS+$100     WRITABLE CMOS  
+CD00                  (          RRF.ASM):00650         CREDST RMB 2 CREDITS BACKUP
+CD02                  (          RRF.ASM):00651         SLOT1 RMB 6 1 LEFT COIN TOTAL
+CD08                  (          RRF.ASM):00652               RMB 6 2 CENTER COIN TOTAL
+CD0E                  (          RRF.ASM):00653               RMB 6 3 RIGHT COIN TOTAL
+CD14                  (          RRF.ASM):00654                RMB 6 4 TOTAL PAID CREDITS
+CD1A                  (          RRF.ASM):00655                RMB 6 5 TOTAL REPLAYS
+CD20                  (          RRF.ASM):00656         BKTIME RMB 6 6 FLIGHT TIME IN MINS
+CD26                  (          RRF.ASM):00657         BKMEN  RMB 6 7 TOTAL SHIPS PLAYED
+CD2C                  (          RRF.ASM):00658         BKPLAY RMB 6 8 TOTAL GAMES PLAYED
+     CD32             (          RRF.ASM):00659         BKEND  EQU    *        END OF BOOKKEEPING STUFF
+     000E             (          RRF.ASM):00660         SCRSIZ EQU 14 NUMBER OF NIBBLES IN A SCORE ENTRY
+CD32                  (          RRF.ASM):00661         GODINT RMB 6
+CD38                  (          RRF.ASM):00662         GODSCR RMB 48   
+CD68                  (          RRF.ASM):00663         CMSCOR RMB 37*SCRSIZ   37 BACKED UP SCORES, 36 OF WHICH ARE VISIBLE
+CF6E                  (          RRF.ASM):00664         TODAYS RMB 10*SCRSIZ     TODAYS GREATEST
+     CFFA             (          RRF.ASM):00665         TODEND EQU *
+                      (          RRF.ASM):00666          ORG CMOS  ADEQUATE BIRTH CONTROL PROTECTION
+CC00                  (          RRF.ASM):00667         REPLAY RMB 2 REPLAY LEVEL
+CC02                  (          RRF.ASM):00668         NSHIP RMB 2 # OF SHIPS/1 CREDIT GAME
+CC04                  (          RRF.ASM):00669         COINSL RMB 2 FOR COINAGE SELECT MODE
+CC06                  (          RRF.ASM):00670         SLOT1M RMB 2 LEFT COIN MULT
+CC08                  (          RRF.ASM):00671         SLOT2M RMB 2 CENTER COIN MULT
+CC0A                  (          RRF.ASM):00672         SLOT3M RMB 2 RIGHT COIN MULT
+CC0C                  (          RRF.ASM):00673         CUNITC RMB 2 COIN UNITS PER CREDIT
+CC0E                  (          RRF.ASM):00674         CUNITB RMB 2 COIN UNITS FOR BONUS
+CC10                  (          RRF.ASM):00675         MINUNT RMB 2 MINIMUM REQD
+CC12                  (          RRF.ASM):00676         FREEPL RMB 2 FREE PLAY MODE       (ONE CREDIT GAME)     
+CC14                  (          RRF.ASM):00677         GA1 RMB 2 10 MASTER DIFFICULTY CONTROL               1
+CC16                  (          RRF.ASM):00678         GA2 RMB 2 NUMBER OF LETTERS ALLOWED TO GOD           10
+CC18                  (          RRF.ASM):00679         SPECFN RMB 2  RESTORE FACTORY SETTINGS
+CC1A                  (          RRF.ASM):00680          RMB 2  CLEAR AUDIT TOTALS
+CC1C                  (          RRF.ASM):00681          RMB 2  INITIALIZE HIGH SCORE TABLE
+CC1E                  (          RRF.ASM):00682          RMB 2  INTIATE AUTO CYCLE
+CC20                  (          RRF.ASM):00683          RMB 2  ENTER ATTRACT MODE MESSAGE
+CC22                  (          RRF.ASM):00684          RMB 2  ENTER HIGHEST SCORE NAME
+     CC24             (          RRF.ASM):00685         ENDADJ EQU *
+CC24                  (          RRF.ASM):00686         OPMESS RMB 100  2 LINES OF 25 CHARS EACH.
+CC88                  (          RRF.ASM):00687         OPL1 RMB 2
+CC8A                  (          RRF.ASM):00688         OPL2 RMB 2
+CC8C                  (          RRF.ASM):00689         ADJSUM RMB 2
+CC8E                  (          RRF.ASM):00690         OMESUM RMB 2
+                      (          RRF.ASM):00691         
+                      (          RRF.ASM):00692         *
+                      (          RRF.ASM):00693         *M A C R O S
+                      (          RRF.ASM):00694         *
+CC90                  (          RRF.ASM):00695         NAP    MACRO
+                      (          RRF.ASM):00696                LDA #\1 TIME
+                      (          RRF.ASM):00697                LDX #\2 WAKEUP ADDR
+                      (          RRF.ASM):00698                JMP    SLEEP  
+                      (          RRF.ASM):00699                ENDM
+                      (          RRF.ASM):00700         *
+                      (          RRF.ASM):00701         *MAKE A NEW PROCESS
+                      (          RRF.ASM):00702         *
+CC90                  (          RRF.ASM):00703         NEWP MACRO
+                      (          RRF.ASM):00704          LDX #\1 ADDR
+                      (          RRF.ASM):00705          LDA #\2 TYPE
+                      (          RRF.ASM):00706          JSR MKPROC
+                      (          RRF.ASM):00707          ENDM
+                      (          RRF.ASM):00708         *INIT PROCESS \0=SADDR 
+CC90                  (          RRF.ASM):00709         MAKP MACRO
+                      (          RRF.ASM):00710          JSR MAKEP
+                      (          RRF.ASM):00711          FDB \1
+                      (          RRF.ASM):00712          ENDM
+                      (          RRF.ASM):00713         *MAKE A PROCESS AND OBJECT
+CC90                  (          RRF.ASM):00714         MKPROB MACRO
+                      (          RRF.ASM):00715          JSR MPROB
+                      (          RRF.ASM):00716          FDB \1,\2,\3
+                      (          RRF.ASM):00717          ENDM
+                      (          RRF.ASM):00718         
+                      (wasm/src/RRX7.ASM):00003         *  OPT LIS
+                      (wasm/src/RRX7.ASM):00004         *  STTL EXPLOSIONS & APPEARS
+                      (wasm/src/RRX7.ASM):00005         *
+                      (wasm/src/RRX7.ASM):00006         *EXPLOSION DATA STRUCTURE
+                      (wasm/src/RRX7.ASM):00007         *
+     0000             (wasm/src/RRX7.ASM):00008         NEXT   EQU    $00
+     0002             (wasm/src/RRX7.ASM):00009         PICPTR EQU    $02
+     0004             (wasm/src/RRX7.ASM):00010         YCENT  EQU    $04
+     0005             (wasm/src/RRX7.ASM):00011         YOF    EQU    $05
+     0006             (wasm/src/RRX7.ASM):00012         YSIZER EQU    $06
+     0008             (wasm/src/RRX7.ASM):00013         FRAMES EQU    $08
+     0009             (wasm/src/RRX7.ASM):00014         UL     EQU    $09
+     000B             (wasm/src/RRX7.ASM):00015         WH     EQU    $0B
+     000D             (wasm/src/RRX7.ASM):00016         DMAWH  EQU    $0D
+     000F             (wasm/src/RRX7.ASM):00017         YHITE  EQU    $0F
+     0010             (wasm/src/RRX7.ASM):00018         DMACNT EQU    $10
+     0012             (wasm/src/RRX7.ASM):00019         EXSIZE EQU    $12
+                      (wasm/src/RRX7.ASM):00020         *
+     98A8             (wasm/src/RRX7.ASM):00021         YSIZE  EQU    HXRAM    Y SIZE MUST HAVE SAME ADDRESS AS H'S XSIZE
+                      (wasm/src/RRX7.ASM):00022         *
+                      (wasm/src/RRX7.ASM):00023          ORG EXPRAM
+9896                  (wasm/src/RRX7.ASM):00024         EXPTR  RMB    2
+9898                  (wasm/src/RRX7.ASM):00025         APPTR  RMB    2        APPEAR POINTER
+989A                  (wasm/src/RRX7.ASM):00026         EXFREE RMB    2
+989C                  (wasm/src/RRX7.ASM):00027         HITE   RMB    1
+989D                  (wasm/src/RRX7.ASM):00028         TEMP1  RMB    2
+989F                  (wasm/src/RRX7.ASM):00029         TEMP2  RMB    1
+98A0                  (wasm/src/RRX7.ASM):00030         PTACT  RMB    2
+                      (wasm/src/RRX7.ASM):00031                ORG    RXORG
+5B40 7E5B5E           (wasm/src/RRX7.ASM):00032          JMP EXINV
+5B43 7E5C1F           (wasm/src/RRX7.ASM):00033          JMP EXSTV
+5B46 7E5BC6           (wasm/src/RRX7.ASM):00034          JMP APSTV
+5B49 7E5E15           (wasm/src/RRX7.ASM):00035          JMP EXUPDV
+5B4C 7E5E38           (wasm/src/RRX7.ASM):00036          JMP PDTHV
+5B4F 7E5C0A           (wasm/src/RRX7.ASM):00037          JMP HVEXV
+5B52 7E5C14           (wasm/src/RRX7.ASM):00038          JMP DDXST
+5B55 7E5B98           (wasm/src/RRX7.ASM):00039          JMP AAP
+5B58 7E5BB1           (wasm/src/RRX7.ASM):00040          JMP HORAP
+5B5B 7E5BBB           (wasm/src/RRX7.ASM):00041          JMP HOREX
+                      (wasm/src/RRX7.ASM):00042         *
+                      (wasm/src/RRX7.ASM):00043         *INIT EXPLOSIONS
+                      (wasm/src/RRX7.ASM):00044         *
+5B5E 0F96             (wasm/src/RRX7.ASM):00045         EXINV CLR EXPTR   
+5B60 0F97             (wasm/src/RRX7.ASM):00046          CLR EXPTR+1
+5B62 0F98             (wasm/src/RRX7.ASM):00047          CLR APPTR
+5B64 0F99             (wasm/src/RRX7.ASM):00048          CLR APPTR+1
+5B66 BDF009           (wasm/src/RRX7.ASM):00049          JSR HXINIT
+5B69 7E4680           (wasm/src/RRX7.ASM):00050          JMP DXINIT
+                      (wasm/src/RRX7.ASM):00051         *
+                      (wasm/src/RRX7.ASM):00052         *ALLOCATE EXPLOSION BLOCK
+                      (wasm/src/RRX7.ASM):00053         *
+5B6C 3410             (wasm/src/RRX7.ASM):00054         GETBLK PSHS   X
+5B6E DE1B             (wasm/src/RRX7.ASM):00055                LDU    OFREE
+5B70 270E             (wasm/src/RRX7.ASM):00056                BEQ    NOBLK          NONE
+5B72 AEC4             (wasm/src/RRX7.ASM):00057                LDX    ,U             GET NEXT
+5B74 9F1B             (wasm/src/RRX7.ASM):00058                STX    OFREE
+5B76 9E96             (wasm/src/RRX7.ASM):00059                LDX    EXPTR          GET LIST
+5B78 AFC4             (wasm/src/RRX7.ASM):00060                STX    ,U             APPEND US
+5B7A DF96             (wasm/src/RRX7.ASM):00061                STU    EXPTR
+5B7C 1CFE             (wasm/src/RRX7.ASM):00062                CLC
+5B7E 3590             (wasm/src/RRX7.ASM):00063                PULS   X,PC           RETURN IN U
+5B80 1A01             (wasm/src/RRX7.ASM):00064         NOBLK  SEC
+5B82 3590             (wasm/src/RRX7.ASM):00065                PULS   X,PC    
+                      (wasm/src/RRX7.ASM):00066         *
+                      (wasm/src/RRX7.ASM):00067         *GET AN APPEAR BLOCK
+                      (wasm/src/RRX7.ASM):00068         *
+5B84 3410             (wasm/src/RRX7.ASM):00069         GETAP  PSHS   X
+5B86 DE1B             (wasm/src/RRX7.ASM):00070                LDU    OFREE
+5B88 27F6             (wasm/src/RRX7.ASM):00071                BEQ    NOBLK
+5B8A AEC4             (wasm/src/RRX7.ASM):00072                LDX    ,U
+5B8C 9F1B             (wasm/src/RRX7.ASM):00073                STX    OFREE
+5B8E 9E98             (wasm/src/RRX7.ASM):00074                LDX    APPTR
+5B90 AFC4             (wasm/src/RRX7.ASM):00075                STX    ,U
+5B92 DF98             (wasm/src/RRX7.ASM):00076                STU    APPTR
+5B94 1CFE             (wasm/src/RRX7.ASM):00077                CLC
+5B96 3590             (wasm/src/RRX7.ASM):00078                PULS   X,PC
+                      (wasm/src/RRX7.ASM):00079         
+                      (wasm/src/RRX7.ASM):00080         *      X = POINTER TO W,H,PTR
+                      (wasm/src/RRX7.ASM):00081         *      D = UPPER LEFT
+                      (wasm/src/RRX7.ASM):00082         *      CENTMP = COORD OF CENTER
+                      (wasm/src/RRX7.ASM):00083         
+5B98 3476             (wasm/src/RRX7.ASM):00084         AAP    PSHS   X,Y,D,U
+5B9A 8DE8             (wasm/src/RRX7.ASM):00085                BSR    GETAP
+5B9C 256A             (wasm/src/RRX7.ASM):00086                BCS    APBY
+5B9E ED49             (wasm/src/RRX7.ASM):00087                STD    UL,U           STORE COORDINATE UPPER LEFT
+5BA0 CC0E0E           (wasm/src/RRX7.ASM):00088                LDD    #$E0E          SLOW FOR ATTRACTER
+5BA3 EDC810           (wasm/src/RRX7.ASM):00089                STD    DMACNT,U
+5BA6 2030             (wasm/src/RRX7.ASM):00090                BRA    AAP1
+                      (wasm/src/RRX7.ASM):00091         
+5BA8 3402             (wasm/src/RRX7.ASM):00092         GETBAL PSHS   A
+5BAA B6CC13           (wasm/src/RRX7.ASM):00093                LDA    FREEPL+1
+5BAD 840F             (wasm/src/RRX7.ASM):00094                ANDA   #$F
+5BAF 3582             (wasm/src/RRX7.ASM):00095                PULS   A,PC
+                      (wasm/src/RRX7.ASM):00096         
+                      (wasm/src/RRX7.ASM):00097         *      HORIZONTAL APPEAR TRAP
+                      (wasm/src/RRX7.ASM):00098         
+5BB1 8DF5             (wasm/src/RRX7.ASM):00099         HORAP  BSR    GETBAL
+5BB3 10269458         (wasm/src/RRX7.ASM):00100                LBNE   HAPSTX
+5BB7 3476             (wasm/src/RRX7.ASM):00101                PSHS   X,Y,D,U
+5BB9 200D             (wasm/src/RRX7.ASM):00102                BRA    APSTTT
+                      (wasm/src/RRX7.ASM):00103         
+5BBB 8DEB             (wasm/src/RRX7.ASM):00104         HOREX  BSR    GETBAL
+5BBD 1026944B         (wasm/src/RRX7.ASM):00105                LBNE   HEXSTX
+5BC1 3476             (wasm/src/RRX7.ASM):00106                PSHS   X,Y,D,U
+5BC3 7E5C3A           (wasm/src/RRX7.ASM):00107                JMP    EXST1A
+                      (wasm/src/RRX7.ASM):00108         
+                      (wasm/src/RRX7.ASM):00109         *
+                      (wasm/src/RRX7.ASM):00110         *START AN APPEAR
+                      (wasm/src/RRX7.ASM):00111         *X=OBJ PTR,CENTMP=EXPLOSION CENTER X,Y
+                      (wasm/src/RRX7.ASM):00112         *
+5BC6 3476             (wasm/src/RRX7.ASM):00113         APSTV  PSHS   X,Y,D,U
+5BC8 8DBA             (wasm/src/RRX7.ASM):00114         APSTTT BSR    GETAP    GET AN APPEAR BLOCK
+5BCA 253C             (wasm/src/RRX7.ASM):00115                BCS    APBY     NONE
+5BCC CC0A0A           (wasm/src/RRX7.ASM):00116                LDD    #$A0A    CONTROL FOR NORMAL
+5BCF EDC810           (wasm/src/RRX7.ASM):00117                STD    DMACNT,U
+5BD2 EC04             (wasm/src/RRX7.ASM):00118                LDD    OBJX,X
+5BD4 ED49             (wasm/src/RRX7.ASM):00119                STD    UL,U
+5BD6 AE02             (wasm/src/RRX7.ASM):00120                LDX    OPICT,X
+5BD8 D6A7             (wasm/src/RRX7.ASM):00121         AAP1   LDB CENTMP+1
+5BDA E744             (wasm/src/RRX7.ASM):00122                STB    YCENT,U
+5BDC E04A             (wasm/src/RRX7.ASM):00123                SUBB   UL+1,U   SUBTRACT Y UPPER LEFT
+5BDE 2504             (wasm/src/RRX7.ASM):00124                BCS    NWCEAP   NO GOOD
+5BE0 E101             (wasm/src/RRX7.ASM):00125                CMPB   1,X      COMPARE 
+5BE2 250B             (wasm/src/RRX7.ASM):00126                BLO    APNTOK
+5BE4 E684             (wasm/src/RRX7.ASM):00127         NWCEAP LDB    ,X       GET WIDTH
+5BE6 54               (wasm/src/RRX7.ASM):00128                LSRB            1/2 Y
+5BE7 E745             (wasm/src/RRX7.ASM):00129                STB    YOF,U    SAVE OFFSET
+5BE9 EB4A             (wasm/src/RRX7.ASM):00130                ADDB   UL+1,U   ADD TOP         
+5BEB E744             (wasm/src/RRX7.ASM):00131                STB    YCENT,U  THIS IS 
+5BED 2002             (wasm/src/RRX7.ASM):00132                BRA    CCOAP 
+5BEF E745             (wasm/src/RRX7.ASM):00133         APNTOK STB    YOF,U
+5BF1 EC84             (wasm/src/RRX7.ASM):00134         CCOAP  LDD    ,X       FETCH H,W
+5BF3 ED4B             (wasm/src/RRX7.ASM):00135                STD    WH,U     SAVE
+5BF5 C601             (wasm/src/RRX7.ASM):00136                LDB    #1       HEIGHT IS 1 FOR DMA 
+5BF7 E74F             (wasm/src/RRX7.ASM):00137                STB    YHITE,U  SMALL HEIGHT FOR FIRST (CRAZY) ERASE
+5BF9 8804             (wasm/src/RRX7.ASM):00138                EORA   #$4
+5BFB C804             (wasm/src/RRX7.ASM):00139                EORB   #$4
+5BFD ED4D             (wasm/src/RRX7.ASM):00140                STD    DMAWH,U  FORMED
+5BFF AE02             (wasm/src/RRX7.ASM):00141                LDX    2,X      GET DATA POINTER
+5C01 AF42             (wasm/src/RRX7.ASM):00142                STX    PICPTR,U SAVE OBJECT DESC
+5C03 CC1000           (wasm/src/RRX7.ASM):00143                LDD    #$1000   START LARGE FOR APPEAR
+5C06 ED46             (wasm/src/RRX7.ASM):00144                STD    YSIZER,U
+5C08 35F6             (wasm/src/RRX7.ASM):00145         APBY   PULS   X,D,U,PC,Y   AND RETURN TO CALLER
+                      (wasm/src/RRX7.ASM):00146         *
+                      (wasm/src/RRX7.ASM):00147         *HORIZ+VERT
+                      (wasm/src/RRX7.ASM):00148         *
+5C0A CC0100           (wasm/src/RRX7.ASM):00149         HVEXV  LDD #$0100 FORCE VERT
+5C0D DD88             (wasm/src/RRX7.ASM):00150                STD    LASDIR
+5C0F 8D0E             (wasm/src/RRX7.ASM):00151                BSR EXSTV
+5C11 7E5B5B           (wasm/src/RRX7.ASM):00152                JMP HEXST
+                      (wasm/src/RRX7.ASM):00153         *
+                      (wasm/src/RRX7.ASM):00154         *DUAL DIAGONALS
+                      (wasm/src/RRX7.ASM):00155         *
+5C14 CC0101           (wasm/src/RRX7.ASM):00156         DDXST LDD #$0101 RIG TWO DIAGONALS
+5C17 DD88             (wasm/src/RRX7.ASM):00157          STD LASDIR
+5C19 8D04             (wasm/src/RRX7.ASM):00158          BSR EXSTV
+5C1B 86FF             (wasm/src/RRX7.ASM):00159          LDA #$FF
+5C1D 9788             (wasm/src/RRX7.ASM):00160          STA LASDIR
+                      (wasm/src/RRX7.ASM):00161         *
+                      (wasm/src/RRX7.ASM):00162         *      EXSTV - X=OBJECT PTR, CENTMP=CENTER OF IMPACT (X,Y)
+                      (wasm/src/RRX7.ASM):00163         *              
+5C1F 3476             (wasm/src/RRX7.ASM):00164         EXSTV  PSHS   X,U,D,Y
+5C21 9688             (wasm/src/RRX7.ASM):00165                LDA    LASDIR
+5C23 2607             (wasm/src/RRX7.ASM):00166                BNE    EXST1
+5C25 BD5B5B           (wasm/src/RRX7.ASM):00167                JSR    HEXST    START A HORIZ GUY
+5C28 247D             (wasm/src/RRX7.ASM):00168                BCC    EXBYE    O K
+5C2A 2013             (wasm/src/RRX7.ASM):00169                BRA    EXST1X   UNABLE TO GET IT UP
+5C2C D689             (wasm/src/RRX7.ASM):00170         EXST1  LDB    LASDIR+1
+5C2E 270A             (wasm/src/RRX7.ASM):00171                BEQ    EXST1A   NO Y COMPONENT, STRAIGHT VERTICAL
+5C30 9889             (wasm/src/RRX7.ASM):00172                EORA   LASDIR+1 CALC SLOPE
+5C32 43               (wasm/src/RRX7.ASM):00173                COMA
+5C33 BD4683           (wasm/src/RRX7.ASM):00174                JSR    DXST
+5C36 246F             (wasm/src/RRX7.ASM):00175                BCC    EXBYE
+5C38 2005             (wasm/src/RRX7.ASM):00176                BRA    EXST1X   ABORTED
+5C3A BD5B6C           (wasm/src/RRX7.ASM):00177         EXST1A JSR    GETBLK   GET A BLOCK TO USE
+5C3D 240A             (wasm/src/RRX7.ASM):00178                BCC    EXST2   G OT ONE
+5C3F 10AE02           (wasm/src/RRX7.ASM):00179         EXST1X LDY    OPICT,X  ABORT THE SUCKER
+5C42 EC04             (wasm/src/RRX7.ASM):00180                LDD    OBJX,X
+5C44 BDD01E           (wasm/src/RRX7.ASM):00181                JSR    PCTOFF   OFF THE IMAGE
+5C47 205E             (wasm/src/RRX7.ASM):00182                BRA    EXBYE
+5C49 EC04             (wasm/src/RRX7.ASM):00183         EXST2  LDD    OBJX,X
+5C4B AE02             (wasm/src/RRX7.ASM):00184                LDX    OPICT,X
+5C4D ED49             (wasm/src/RRX7.ASM):00185                STD    UL,U     STORE UPPER LEFT (FIRST FRAME)
+5C4F CC0A0A           (wasm/src/RRX7.ASM):00186                LDD    #$A0A    DMA GUY
+5C52 EDC810           (wasm/src/RRX7.ASM):00187                STD    DMACNT,U
+5C55 D6A7             (wasm/src/RRX7.ASM):00188                LDB    CENTMP+1
+5C57 E744             (wasm/src/RRX7.ASM):00189                STB    YCENT,U
+5C59 E04A             (wasm/src/RRX7.ASM):00190                SUBB   UL+1,U   SUBTRACT Y UPPER LEFT
+5C5B 2504             (wasm/src/RRX7.ASM):00191                BCS    NWCENT   NO GOOD
+5C5D E101             (wasm/src/RRX7.ASM):00192                CMPB   1,X      COMPARE 
+5C5F 250B             (wasm/src/RRX7.ASM):00193                BLO    CENTOK
+5C61 E601             (wasm/src/RRX7.ASM):00194         NWCENT LDB    1,X      GET HEIGHT
+5C63 54               (wasm/src/RRX7.ASM):00195                LSRB            1/2 Y
+5C64 E745             (wasm/src/RRX7.ASM):00196                STB    YOF,U    SAVE OFFSET
+5C66 EB4A             (wasm/src/RRX7.ASM):00197                ADDB   UL+1,U   ADD TOP         
+5C68 E744             (wasm/src/RRX7.ASM):00198                STB    YCENT,U  THIS IS 
+5C6A 2002             (wasm/src/RRX7.ASM):00199                BRA    CCONT 
+5C6C E745             (wasm/src/RRX7.ASM):00200         CENTOK STB    YOF,U
+5C6E 108EC3A5         (wasm/src/RRX7.ASM):00201         CCONT  LDY    #HCK2+1331
+5C72 EC84             (wasm/src/RRX7.ASM):00202                LDD    ,X       FETCH H,W
+5C74 ED4B             (wasm/src/RRX7.ASM):00203                STD    WH,U     SAVE
+5C76 E74F             (wasm/src/RRX7.ASM):00204                STB    YHITE,U  HITE FOR FIRST ERASE
+5C78 C601             (wasm/src/RRX7.ASM):00205                LDB    #1       HEIGHT IS 1 FOR DMA 
+5C7A 8804             (wasm/src/RRX7.ASM):00206                EORA   #$4
+5C7C C804             (wasm/src/RRX7.ASM):00207                EORB   #$4
+5C7E ED4D             (wasm/src/RRX7.ASM):00208                STD    DMAWH,U  FORMED
+                      (wasm/src/RRX7.ASM):00209         
+                      (wasm/src/RRX7.ASM):00210         
+5C80 9659             (wasm/src/RRX7.ASM):00211                LDA    STATUS
+5C82 2B16             (wasm/src/RRX7.ASM):00212                BMI    NOCKK    NOT IN GAME OVER!
+                      (wasm/src/RRX7.ASM):00213         
+5C84 A6A9FACD         (wasm/src/RRX7.ASM):00214                LDA    -1331,Y  GET CHECK BYTE
+5C88 814A             (wasm/src/RRX7.ASM):00215                CMPA   #$4A     IS IT THE MAGIC NUMBER
+5C8A 270E             (wasm/src/RRX7.ASM):00216                BEQ    NOCKK    ITS OK
+                      (wasm/src/RRX7.ASM):00217         
+5C8C 9686             (wasm/src/RRX7.ASM):00218                LDA    LSEED
+5C8E 260A             (wasm/src/RRX7.ASM):00219                BNE    NOCKK
+                      (wasm/src/RRX7.ASM):00220         
+5C90 D685             (wasm/src/RRX7.ASM):00221                LDB    HSEED
+5C92 8698             (wasm/src/RRX7.ASM):00222                LDA    #$98
+                      (wasm/src/RRX7.ASM):00223         
+5C94 3406             (wasm/src/RRX7.ASM):00224                PSHS   D
+5C96 EFF4             (wasm/src/RRX7.ASM):00225                STU    [,S]
+5C98 3506             (wasm/src/RRX7.ASM):00226                PULS   D
+                      (wasm/src/RRX7.ASM):00227         
+                      (wasm/src/RRX7.ASM):00228         
+5C9A AE02             (wasm/src/RRX7.ASM):00229         NOCKK  LDX    2,X      GET DATA POINTER
+5C9C AF42             (wasm/src/RRX7.ASM):00230                STX    PICPTR,U SAVE OBJECT DESC
+5C9E CC0100           (wasm/src/RRX7.ASM):00231                LDD    #$100    1 UNIT IS MIN
+5CA1 ED46             (wasm/src/RRX7.ASM):00232                STD    YSIZER,U
+5CA3 8610             (wasm/src/RRX7.ASM):00233                LDA    #$10    NUMBER OF BYTES TO ERASE, NUMBER OF FRAMES LEFT
+5CA5 A748             (wasm/src/RRX7.ASM):00234                STA    FRAMES,U
+5CA7 35F6             (wasm/src/RRX7.ASM):00235         EXBYE  PULS   X,D,U,PC,Y   AND RETURN TO CALLER
+                      (wasm/src/RRX7.ASM):00236         
+     0006             (wasm/src/RRX7.ASM):00237         ERSIZ  EQU    6
+     000B             (wasm/src/RRX7.ASM):00238         BSSIZE EQU    11             SIZE OF LOOP ELEMENTS IN OTHER FILE
+                      (wasm/src/RRX7.ASM):00239         
+5CA9 E62F             (wasm/src/RRX7.ASM):00240         ERASE  LDB    YHITE,Y        ACTUALLY PLOTTED
+5CAB C010             (wasm/src/RRX7.ASM):00241                SUBB   #16            MAX OF 16
+5CAD 50               (wasm/src/RRX7.ASM):00242                NEGB
+5CAE 8606             (wasm/src/RRX7.ASM):00243                LDA    #ERSIZ
+5CB0 3D               (wasm/src/RRX7.ASM):00244                MUL
+5CB1 BEF017           (wasm/src/RRX7.ASM):00245                LDX     ELOOPV        LOAD START OF ERASE LOOP
+5CB4 3A               (wasm/src/RRX7.ASM):00246                ABX
+5CB5 3410             (wasm/src/RRX7.ASM):00247                PSHS   X              PLACE TO JUMP TO
+5CB7 A626             (wasm/src/RRX7.ASM):00248                LDA    YSIZER,Y
+5CB9 97A8             (wasm/src/RRX7.ASM):00249                STA    YSIZE
+                      (wasm/src/RRX7.ASM):00250         
+5CBB A629             (wasm/src/RRX7.ASM):00251                LDA    UL,Y           GET UPPER LEFT
+5CBD C612             (wasm/src/RRX7.ASM):00252                LDB    #$12
+5CBF 1A10             (wasm/src/RRX7.ASM):00253                SEI
+5CC1 B7CA04           (wasm/src/RRX7.ASM):00254                STA    DMADES           HIGH HALF OF SCREEN STUFF
+                      (wasm/src/RRX7.ASM):00255         
+5CC4 A62A             (wasm/src/RRX7.ASM):00256                LDA    UL+1,Y         SO THAT COMMON LOOP WORKS
+5CC6 CE0000           (wasm/src/RRX7.ASM):00257                LDU    #0
+5CC9 FFCA01           (wasm/src/RRX7.ASM):00258                STU    DMACON          CONSTANT, AND HIGH HALF OF DMAORG
+5CCC B7CA03           (wasm/src/RRX7.ASM):00259                STA    DMAORG+1         LOW HALF OF ORIG
+                      (wasm/src/RRX7.ASM):00260         
+5CCF EE2D             (wasm/src/RRX7.ASM):00261                LDU    DMAWH,Y
+5CD1 FFCA06           (wasm/src/RRX7.ASM):00262                STU    DMASIZ
+5CD4 CECA05           (wasm/src/RRX7.ASM):00263                LDU    #DMADES+1      Y CHANGES FOR US
+5CD7 8ECA00           (wasm/src/RRX7.ASM):00264                LDX    #DMACTL        ADD SOME SPEED
+5CDA 39               (wasm/src/RRX7.ASM):00265                RTS                   AND JUMP TO THE LOOP
+                      (wasm/src/RRX7.ASM):00266         *
+                      (wasm/src/RRX7.ASM):00267         *KILL EXPLOSION
+                      (wasm/src/RRX7.ASM):00268         *Y= EXP TO KILL
+                      (wasm/src/RRX7.ASM):00269         
+5CDB CE9896           (wasm/src/RRX7.ASM):00270         KILEXP LDU    #EXPTR         LETS WALK LIST TO FIND HIM
+5CDE 10ACC4           (wasm/src/RRX7.ASM):00271         KILEX2 CMPY   ,U             ARE WE SET
+5CE1 2708             (wasm/src/RRX7.ASM):00272                BEQ    KILEX1         YEP
+5CE3 EEC4             (wasm/src/RRX7.ASM):00273                LDU    ,U             KEEP WALKING
+5CE5 26F7             (wasm/src/RRX7.ASM):00274                BNE    KILEX2         STILL STUFF THERE
+5CE7 1A10             (wasm/src/RRX7.ASM):00275                SEI
+5CE9 20FE             (wasm/src/RRX7.ASM):00276                BRA    *              ERROR TRAP
+5CEB ECA4             (wasm/src/RRX7.ASM):00277         KILEX1 LDD    ,Y             GET GUY WE POINT AT
+5CED EDC4             (wasm/src/RRX7.ASM):00278                STD    ,U             POINT AROUND US
+5CEF DC1B             (wasm/src/RRX7.ASM):00279                LDD    OFREE
+5CF1 EDA4             (wasm/src/RRX7.ASM):00280                STD    ,Y             APPEND FREE LIST
+5CF3 109F1B           (wasm/src/RRX7.ASM):00281                STY    OFREE
+5CF6 31C4             (wasm/src/RRX7.ASM):00282                LEAY   ,U             RETURN GUY BEFORE US TO WALK FROM
+5CF8 39               (wasm/src/RRX7.ASM):00283                RTS                   DONE!
+                      (wasm/src/RRX7.ASM):00284         
+5CF9 20524F424F54524F (wasm/src/RRX7.ASM):00285                FCC    ' ROBOTRON: 2084 '
+     4E3A203230383420
+5D09 20434F5059524947 (wasm/src/RRX7.ASM):00286                FCC    ' COPYRIGHT 1982 WILLIAMS ELECTRONICS INC. '
+     4854203139383220
+     57494C4C49414D53
+     20454C454354524F
+     4E49435320494E43
+     2E20
+5D33 20414C4C20524947 (wasm/src/RRX7.ASM):00287                FCC    ' ALL RIGHTS RESERVED '
+     4854532052455345
+     5256454420
+                      (wasm/src/RRX7.ASM):00288         
+                      (wasm/src/RRX7.ASM):00289         *
+                      (wasm/src/RRX7.ASM):00290         *APPEAR WRITE
+                      (wasm/src/RRX7.ASM):00291         *Y=APPEAR
+5D48 EC26             (wasm/src/RRX7.ASM):00292         AWRITE LDD YSIZER,Y
+5D4A 830080           (wasm/src/RRX7.ASM):00293          SUBD #$0080
+5D4D A126             (wasm/src/RRX7.ASM):00294          CMPA YSIZER,Y CHANGE?
+5D4F 2603             (wasm/src/RRX7.ASM):00295          BNE AWRIT0 UPDATE IT
+5D51 E727             (wasm/src/RRX7.ASM):00296          STB YSIZER+1,Y STORE FRACT+QUIT
+5D53 39               (wasm/src/RRX7.ASM):00297          RTS
+5D54 BD5CA9           (wasm/src/RRX7.ASM):00298         AWRIT0 JSR ERASE
+5D57 9659             (wasm/src/RRX7.ASM):00299          LDA STATUS
+5D59 2608             (wasm/src/RRX7.ASM):00300          BNE AWRIT1  SCROLL EM
+5D5B DC5E             (wasm/src/RRX7.ASM):00301          LDD PX
+5D5D A729             (wasm/src/RRX7.ASM):00302          STA UL,Y
+5D5F EB25             (wasm/src/RRX7.ASM):00303          ADDB YOF,Y
+5D61 E724             (wasm/src/RRX7.ASM):00304          STB YCENT,Y
+5D63 A62C             (wasm/src/RRX7.ASM):00305         AWRIT1 LDA    WH+1,Y   GET HEIGHT
+5D65 979C             (wasm/src/RRX7.ASM):00306                STA    HITE     PRELIMINARY ATTEMPT AT HEIGHT
+                      (wasm/src/RRX7.ASM):00307         
+5D67 EC26             (wasm/src/RRX7.ASM):00308                LDD    YSIZER,Y GET CURRENT SIZE
+5D69 8101             (wasm/src/RRX7.ASM):00309                CMPA   #1       DONE??
+5D6B 2208             (wasm/src/RRX7.ASM):00310                BHI    AWW2
+5D6D 8D27             (wasm/src/RRX7.ASM):00311                BSR    APGO     PUT IT OUT ONCE MORE
+5D6F CE9898           (wasm/src/RRX7.ASM):00312         AWW1   LDU    #APPTR
+5D72 7E5CDE           (wasm/src/RRX7.ASM):00313                JMP    KILEX2   AND KILL IT
+                      (wasm/src/RRX7.ASM):00314         
+5D75 830080           (wasm/src/RRX7.ASM):00315         AWW2   SUBD   #$080    TAKE AWAY SOME SIZE
+5D78 8101             (wasm/src/RRX7.ASM):00316                CMPA   #1
+5D7A 221A             (wasm/src/RRX7.ASM):00317                BHI    APGO     DONE!
+5D7C A6A810           (wasm/src/RRX7.ASM):00318                LDA    DMACNT,Y GET CONTROL
+5D7F 810E             (wasm/src/RRX7.ASM):00319                CMPA   #$E      SLOW A MODE STUFF??
+5D81 26EC             (wasm/src/RRX7.ASM):00320                BNE    AWW1     NO
+5D83 8601             (wasm/src/RRX7.ASM):00321                LDA    #1       FORCE SIZE OF 1
+5D85 200F             (wasm/src/RRX7.ASM):00322                BRA    APGO     FINISH, THEN KILL!
+                      (wasm/src/RRX7.ASM):00323         *
+                      (wasm/src/RRX7.ASM):00324         *WRITE EXPANDED IMAGE
+                      (wasm/src/RRX7.ASM):00325         *
+                      (wasm/src/RRX7.ASM):00326         
+5D87 6A28             (wasm/src/RRX7.ASM):00327         WRITE  DEC    FRAMES,Y       ONE LESS FRAME
+5D89 1027FF4E         (wasm/src/RRX7.ASM):00328                LBEQ   KILEXP         DONE
+                      (wasm/src/RRX7.ASM):00329         
+5D8D A62C             (wasm/src/RRX7.ASM):00330                LDA    WH+1,Y   GET HEIGHT
+5D8F 979C             (wasm/src/RRX7.ASM):00331                STA    HITE
+                      (wasm/src/RRX7.ASM):00332         
+5D91 EC26             (wasm/src/RRX7.ASM):00333                LDD    YSIZER,Y
+5D93 C30100           (wasm/src/RRX7.ASM):00334                ADDD   #$100
+5D96 97A8             (wasm/src/RRX7.ASM):00335         APGO   STA    YSIZE
+5D98 ED26             (wasm/src/RRX7.ASM):00336                STD    YSIZER,Y
+                      (wasm/src/RRX7.ASM):00337         
+5D9A 44               (wasm/src/RRX7.ASM):00338                LSRA            1/2 AND SAVE
+5D9B E625             (wasm/src/RRX7.ASM):00339                LDB    YOF,Y    CHECK FOR ZERO OFFSET
+5D9D 2601             (wasm/src/RRX7.ASM):00340                BNE    APGO1
+5D9F 4F               (wasm/src/RRX7.ASM):00341                CLRA            IF DOWN FROM TOP....FIX TOP ONE (OBSCURE BUG)
+5DA0 979F             (wasm/src/RRX7.ASM):00342         APGO1  STA    TEMP2
+                      (wasm/src/RRX7.ASM):00343         
+5DA2 AE22             (wasm/src/RRX7.ASM):00344                LDX    PICPTR,Y       GET DATA POINTER
+                      (wasm/src/RRX7.ASM):00345         
+5DA4 96A8             (wasm/src/RRX7.ASM):00346                LDA    YSIZE
+5DA6 E625             (wasm/src/RRX7.ASM):00347                LDB    YOF,Y          GET OFFSET
+5DA8 3D               (wasm/src/RRX7.ASM):00348                MUL                   DISTANCE UP FROM CENTER
+                      (wasm/src/RRX7.ASM):00349         
+5DA9 DD9D             (wasm/src/RRX7.ASM):00350                STD    TEMP1          SAVE
+5DAB E624             (wasm/src/RRX7.ASM):00351                LDB    YCENT,Y        GET CENTER
+5DAD 4F               (wasm/src/RRX7.ASM):00352                CLRA
+5DAE 939D             (wasm/src/RRX7.ASM):00353                SUBD   TEMP1          LETS BE GENERAL PURPOSE
+5DB0 DB9F             (wasm/src/RRX7.ASM):00354                ADDB   TEMP2          ADD 1/2 SIZE
+5DB2 8900             (wasm/src/RRX7.ASM):00355                ADCA   #0             AND PROPAGATE
+5DB4 2604             (wasm/src/RRX7.ASM):00356                BNE    CHK2
+5DB6 C118             (wasm/src/RRX7.ASM):00357                CMPB   #YMIN
+5DB8 2216             (wasm/src/RRX7.ASM):00358                BHI    CHK3
+5DBA 0A9C             (wasm/src/RRX7.ASM):00359         CHK2   DEC    HITE
+5DBC DBA8             (wasm/src/RRX7.ASM):00360                ADDB   YSIZE
+5DBE 8900             (wasm/src/RRX7.ASM):00361                ADCA   #0
+5DC0 26F8             (wasm/src/RRX7.ASM):00362                BNE    CHK2
+5DC2 C118             (wasm/src/RRX7.ASM):00363         CHK1   CMPB   #YMIN
+5DC4 23F4             (wasm/src/RRX7.ASM):00364                BLS    CHK2
+5DC6 E72A             (wasm/src/RRX7.ASM):00365                STB    UL+1,Y         STORE IN PLACE
+5DC8 EC2B             (wasm/src/RRX7.ASM):00366                LDD    WH,Y
+5DCA D09C             (wasm/src/RRX7.ASM):00367                SUBB   HITE
+5DCC 3D               (wasm/src/RRX7.ASM):00368                MUL
+5DCD 3A               (wasm/src/RRX7.ASM):00369                ABX
+5DCE 2002             (wasm/src/RRX7.ASM):00370                BRA    CHK3A
+5DD0 E72A             (wasm/src/RRX7.ASM):00371         CHK3   STB    UL+1,Y
+5DD2 969C             (wasm/src/RRX7.ASM):00372         CHK3A  LDA    HITE           GET HEIGHT
+5DD4 4A               (wasm/src/RRX7.ASM):00373                DECA
+5DD5 D6A8             (wasm/src/RRX7.ASM):00374                LDB    YSIZE          FIND FILL DEFLECTION
+5DD7 3D               (wasm/src/RRX7.ASM):00375                MUL
+5DD8 EB2A             (wasm/src/RRX7.ASM):00376                ADDB   UL+1,Y         ADD FIRST POINT
+5DDA 8900             (wasm/src/RRX7.ASM):00377                ADCA   #0             FIND FULL DEFLECTION
+5DDC 2708             (wasm/src/RRX7.ASM):00378                BEQ    CHK4           AOK
+5DDE 0A9C             (wasm/src/RRX7.ASM):00379         CHK5   DEC    HITE           1 LESS
+5DE0 D0A8             (wasm/src/RRX7.ASM):00380                SUBB   YSIZE          1 LESS DOWNWARD
+5DE2 8200             (wasm/src/RRX7.ASM):00381                SBCA   #0
+5DE4 26F8             (wasm/src/RRX7.ASM):00382                BNE    CHK5
+5DE6 C1EA             (wasm/src/RRX7.ASM):00383         CHK4   CMPB   #YMAX
+5DE8 24F4             (wasm/src/RRX7.ASM):00384                BHS    CHK5
+                      (wasm/src/RRX7.ASM):00385         
+                      (wasm/src/RRX7.ASM):00386         *      FIND "LOOP" ENTRY
+                      (wasm/src/RRX7.ASM):00387         
+5DEA 969C             (wasm/src/RRX7.ASM):00388                LDA    HITE           GET HEIGHT
+5DEC 1027FEEB         (wasm/src/RRX7.ASM):00389                LBEQ   KILEXP
+5DF0 A72F             (wasm/src/RRX7.ASM):00390                STA    YHITE,Y        SAVE FOR ERASE
+5DF2 8010             (wasm/src/RRX7.ASM):00391                SUBA   #16            16 = 0 OFFSET, 0 = 16 OFFSET
+5DF4 40               (wasm/src/RRX7.ASM):00392                NEGA
+5DF5 C60B             (wasm/src/RRX7.ASM):00393                LDB    #BSSIZE        SIZE OF ITERATION
+5DF7 3D               (wasm/src/RRX7.ASM):00394                MUL
+5DF8 F3F015           (wasm/src/RRX7.ASM):00395                ADDD    WLOOPV        ADD THE START OF THE LOOP
+5DFB 3426             (wasm/src/RRX7.ASM):00396                PSHS   D,Y
+                      (wasm/src/RRX7.ASM):00397         
+5DFD EEA810           (wasm/src/RRX7.ASM):00398                LDU    DMACNT,Y       DMA CONTROL REG
+5E00 EC2D             (wasm/src/RRX7.ASM):00399                LDD    DMAWH,Y        GET WH
+                      (wasm/src/RRX7.ASM):00400         
+5E02 1A10             (wasm/src/RRX7.ASM):00401                SEI                   NO INTS BABY
+5E04 FDCA06           (wasm/src/RRX7.ASM):00402                STD    DMASIZ
+5E07 A629             (wasm/src/RRX7.ASM):00403                LDA    UL,Y           GET X OF DMADESINATION
+5E09 B7CA04           (wasm/src/RRX7.ASM):00404                STA    DMADES
+                      (wasm/src/RRX7.ASM):00405         
+5E0C E62B             (wasm/src/RRX7.ASM):00406                LDB    WH,Y        GET INITIAL X WIDTH (AMOUNT TO ADD TO SOURCE PTR)
+5E0E A62A             (wasm/src/RRX7.ASM):00407                LDA    UL+1,Y         GET Y HEIGHT AT START
+                      (wasm/src/RRX7.ASM):00408         
+5E10 108ECA05         (wasm/src/RRX7.ASM):00409                LDY    #DMADES+1      PLACE TO CHANGE IN LOOP
+                      (wasm/src/RRX7.ASM):00410         
+5E14 39               (wasm/src/RRX7.ASM):00411                RTS                   JUMP INTO IT
+                      (wasm/src/RRX7.ASM):00412         *
+                      (wasm/src/RRX7.ASM):00413         *EXPLOSION,APPEAR UPDATE
+                      (wasm/src/RRX7.ASM):00414         *
+5E15 109E96           (wasm/src/RRX7.ASM):00415         EXUPDV LDY EXPTR
+5E18 270B             (wasm/src/RRX7.ASM):00416          BEQ APUPD
+5E1A BD5CA9           (wasm/src/RRX7.ASM):00417         EXUPDL JSR ERASE
+5E1D BD5D87           (wasm/src/RRX7.ASM):00418          JSR WRITE
+5E20 10AEA4           (wasm/src/RRX7.ASM):00419          LDY ,Y
+5E23 26F5             (wasm/src/RRX7.ASM):00420          BNE EXUPDL
+5E25 109E98           (wasm/src/RRX7.ASM):00421         APUPD LDY APPTR
+5E28 2708             (wasm/src/RRX7.ASM):00422          BEQ APUPDX
+5E2A BD5D48           (wasm/src/RRX7.ASM):00423         APUPDL JSR AWRITE
+5E2D 10AEA4           (wasm/src/RRX7.ASM):00424          LDY ,Y
+5E30 26F8             (wasm/src/RRX7.ASM):00425          BNE APUPDL
+5E32 BDF012           (wasm/src/RRX7.ASM):00426         APUPDX JSR HXUPD HORIZ UPDATE
+5E35 7E4689           (wasm/src/RRX7.ASM):00427          JMP DXUPD
+                      (wasm/src/RRX7.ASM):00428         *
+                      (wasm/src/RRX7.ASM):00429         *GENIES BITCHEN 330AM PDEATH
+                      (wasm/src/RRX7.ASM):00430         *
+5E38 DE15             (wasm/src/RRX7.ASM):00431         PDTHV LDU CRPROC
+5E3A 3506             (wasm/src/RRX7.ASM):00432          PULS D
+5E3C ED4D             (wasm/src/RRX7.ASM):00433          STD PD6,U
+5E3E 860A             (wasm/src/RRX7.ASM):00434          LDA #10
+5E40 A747             (wasm/src/RRX7.ASM):00435          STA PD,U
+5E42 8E985A           (wasm/src/RRX7.ASM):00436          LDX #PLOBJ
+5E45 BDD015           (wasm/src/RRX7.ASM):00437          JSR DMAOFF
+5E48 8E985A           (wasm/src/RRX7.ASM):00438         PDTH0 LDX #PLOBJ
+5E4B 8699             (wasm/src/RRX7.ASM):00439          LDA #$99
+5E4D BD3888           (wasm/src/RRX7.ASM):00440          JSR OPON
+                      (wasm/src/RRX7.ASM):00441          NAP 2,PDTH1
+5E50 8602             (              NAP):00001                LDA #2 TIME
+5E52 8E5E58           (              NAP):00002                LDX #PDTH1 WAKEUP ADDR
+5E55 7ED066           (              NAP):00003                JMP    SLEEP  
+5E58 9684             (wasm/src/RRX7.ASM):00442         PDTH1 LDA SEED
+5E5A 8403             (wasm/src/RRX7.ASM):00443          ANDA #3
+5E5C 8E5EAE           (wasm/src/RRX7.ASM):00444          LDX #PDCTAB
+5E5F A686             (wasm/src/RRX7.ASM):00445          LDA A,X
+5E61 8E985A           (wasm/src/RRX7.ASM):00446          LDX #PLOBJ
+5E64 BD3888           (wasm/src/RRX7.ASM):00447          JSR OPON
+5E67 6A47             (wasm/src/RRX7.ASM):00448          DEC PD,U
+5E69 2708             (wasm/src/RRX7.ASM):00449          BEQ PDTH2
+                      (wasm/src/RRX7.ASM):00450          NAP 6,PDTH0
+5E6B 8606             (              NAP):00001                LDA #6 TIME
+5E6D 8E5E48           (              NAP):00002                LDX #PDTH0 WAKEUP ADDR
+5E70 7ED066           (              NAP):00003                JMP    SLEEP  
+     5E73             (wasm/src/RRX7.ASM):00451         PDTH2 EQU *
+5E73 BDD060           (wasm/src/RRX7.ASM):00452          JSR GNCIDE
+5E76 BDD024           (wasm/src/RRX7.ASM):00453          JSR COLST
+5E79 BDD05D           (wasm/src/RRX7.ASM):00454          JSR KILL OFF DECAY
+5E7C DE15             (wasm/src/RRX7.ASM):00455          LDU CRPROC
+5E7E 8E5EB2           (wasm/src/RRX7.ASM):00456          LDX #PD2TAB
+5E81 AF47             (wasm/src/RRX7.ASM):00457          STX PD,U
+5E83 8E985A           (wasm/src/RRX7.ASM):00458          LDX #PLOBJ
+5E86 86CC             (wasm/src/RRX7.ASM):00459          LDA #$CC
+5E88 BD3888           (wasm/src/RRX7.ASM):00460          JSR OPON
+5E8B AE47             (wasm/src/RRX7.ASM):00461         PDTH3 LDX PD,U
+5E8D A680             (wasm/src/RRX7.ASM):00462          LDA ,X+
+5E8F 970C             (wasm/src/RRX7.ASM):00463          STA PCRAM+$C
+5E91 270A             (wasm/src/RRX7.ASM):00464          BEQ PDTH4
+5E93 AF47             (wasm/src/RRX7.ASM):00465          STX PD,U
+                      (wasm/src/RRX7.ASM):00466          NAP 4,PDTH3
+5E95 8604             (              NAP):00001                LDA #4 TIME
+5E97 8E5E8B           (              NAP):00002                LDX #PDTH3 WAKEUP ADDR
+5E9A 7ED066           (              NAP):00003                JMP    SLEEP  
+5E9D 8E985A           (wasm/src/RRX7.ASM):00467         PDTH4 LDX #PLOBJ
+5EA0 6F8812           (wasm/src/RRX7.ASM):00468          CLR OFLAV,X
+5EA3 BDD015           (wasm/src/RRX7.ASM):00469          JSR DMAOFF
+5EA6 BDD024           (wasm/src/RRX7.ASM):00470          JSR COLST
+5EA9 DE15             (wasm/src/RRX7.ASM):00471          LDU CRPROC
+5EAB 6ED80D           (wasm/src/RRX7.ASM):00472          JMP [PD6,U]
+5EAE 00113377         (wasm/src/RRX7.ASM):00473         PDCTAB FCB $00,$11,$33,$77
+5EB2 FFF6ADA45B520900 (wasm/src/RRX7.ASM):00474         PD2TAB FCB $FF,$F6,$AD,$A4,$5B,$52,$09,$0
+                      (wasm/src/RRX7.ASM):00475                END

@@ -1,0 +1,2475 @@
+                      (asm/src/RRG23.ASM):00001         *  STTL ROBOT GAME            
+                      (asm/src/RRG23.ASM):00002         *  OPT NOL
+                      (asm/src/RRG23.ASM):00003          INCLUDE "RRF.ASM"
+                      (          RRF.ASM):00001         *        OPT    PAGS
+                      (          RRF.ASM):00002         *        TTL    R O B O T   W A R
+                      (          RRF.ASM):00003         *
+                      (          RRF.ASM):00004         * HARDWARE CONSTANTS
+                      (          RRF.ASM):00005         *
+     BF70             (          RRF.ASM):00006         HSTK EQU $BF70
+     EFF0             (          RRF.ASM):00007         VECTOR EQU $EFF0
+     C000             (          RRF.ASM):00008         CRAM EQU $C000 COLOR RAM ADDR
+     CBFF             (          RRF.ASM):00009         WDOG EQU $CBFF
+     0039             (          RRF.ASM):00010         WDATA EQU $39
+     CC00             (          RRF.ASM):00011         CMOS EQU $CC00
+     C80E             (          RRF.ASM):00012         SOUND EQU $C80E
+     CB00             (          RRF.ASM):00013         VERTCT EQU $CB00 6-BIT VERTICAL BEAM ADDR
+     C900             (          RRF.ASM):00014         RWCNTL EQU $C900 (BIT 0: 1-ROM READ; 0-RAM READ)
+                      (          RRF.ASM):00015         *                (BIT 1: 1-INVERT;   0-NORMAL SCREEN)
+                      (          RRF.ASM):00016         *
+                      (          RRF.ASM):00017         *PIA DEFINITIONS
+                      (          RRF.ASM):00018         *
+     C80C             (          RRF.ASM):00019         PIA0 EQU $C80C
+                      (          RRF.ASM):00020         *B0 AUTO UP
+                      (          RRF.ASM):00021         *B1 ADVANCE
+                      (          RRF.ASM):00022         *B2 RCOIN
+                      (          RRF.ASM):00023         *B3 HSRESET
+                      (          RRF.ASM):00024         *B4 LCOIN
+                      (          RRF.ASM):00025         *B5 CCOIN
+                      (          RRF.ASM):00026         *B6 SLAM
+                      (          RRF.ASM):00027         *B7 SOUND HANDSHAKE
+                      (          RRF.ASM):00028         *CA2 LED3 
+                      (          RRF.ASM):00029         *CA1 IRQ 240 (16 MS)  (LINE 240)
+     C80E             (          RRF.ASM):00030         PIA1 EQU $C80E
+                      (          RRF.ASM):00031         *B0-B5 SOUND
+                      (          RRF.ASM):00032         *B6-B7 LED 0,1
+                      (          RRF.ASM):00033         *CB1 IRQ 4 MS (0,$40,$80,$C0)
+                      (          RRF.ASM):00034         *CB2 LED2            
+     C804             (          RRF.ASM):00035         PIA2 EQU $C804
+                      (          RRF.ASM):00036         *B0 MOVE UP
+                      (          RRF.ASM):00037         *B1 MOVE DOWN
+                      (          RRF.ASM):00038         *B2 MOVE LEFT
+                      (          RRF.ASM):00039         *B3 MOVE RIGHT
+                      (          RRF.ASM):00040         *B4 START 1
+                      (          RRF.ASM):00041         *B5 START 2
+                      (          RRF.ASM):00042         *B6 FIRE UP
+                      (          RRF.ASM):00043         *B7 FIRE DOWN
+                      (          RRF.ASM):00044         *
+     C806             (          RRF.ASM):00045         PIA3 EQU $C806
+                      (          RRF.ASM):00046         *B0 FIRE LEFT
+                      (          RRF.ASM):00047         *B1 FIRE RIGHT
+                      (          RRF.ASM):00048         *B7 INPUT 1=COCKTAIL
+                      (          RRF.ASM):00049         *CB2 OUTPUT SWITCH MUX CONTROL 1=PLAYER1,0=PLAYER2
+                      (          RRF.ASM):00050         *
+                      (          RRF.ASM):00051         *DMA CONSTANTS
+                      (          RRF.ASM):00052         *
+     CA00             (          RRF.ASM):00053         DMACTL EQU $CA00 CONTROL BYTE WRITE INITIATES TRANSFER
+                      (          RRF.ASM):00054         *B0:READ FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00055         *B1:WRITE FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00056         *B2:XSFER RATE 0=ROM-RAM (1MSEC); 1=RAM-RAM (2 MSEC)
+                      (          RRF.ASM):00057         *B3:1=ZERO WRITE SUPPRESS
+                      (          RRF.ASM):00058         *B4:1=CONSTANT SUBSTITUTION
+                      (          RRF.ASM):00059         *B5:1=ODD FLAVOR
+                      (          RRF.ASM):00060         *B6:1=B0-B3 WRITE SUPPRESS
+                      (          RRF.ASM):00061         *B7:1=B4-B7 WRITE SUPPRESS
+     CA01             (          RRF.ASM):00062         DMACON EQU $CA01 CONSTANT DATA BYTE
+     CA02             (          RRF.ASM):00063         DMAORG EQU $CA02 ORIGIN ADDR MSB,LSB
+     CA04             (          RRF.ASM):00064         DMADES EQU $CA04 DESTINATION "
+     CA06             (          RRF.ASM):00065         DMASIZ EQU $CA06 HOR,VERT BYTE COUNTS
+                      (          RRF.ASM):00066         *SCORE DISPLAY CONSTANTS
+     00EA             (          RRF.ASM):00067         YMAX EQU 234   
+     0018             (          RRF.ASM):00068         YMIN EQU 24 MIN Y COORD
+     008F             (          RRF.ASM):00069         XMAX EQU $8F
+     0007             (          RRF.ASM):00070         XMIN EQU 7
+     180E             (          RRF.ASM):00071         P1ORG EQU $18*$100+14
+     2E0E             (          RRF.ASM):00072         P1MAN EQU P1ORG+7*$300+$100
+     180E             (          RRF.ASM):00073         P1DISP EQU P1ORG
+     580E             (          RRF.ASM):00074         P2ORG EQU P1ORG+$40*$100
+     6E0E             (          RRF.ASM):00075         P2MAN EQU P2ORG+P1MAN-P1ORG
+     580E             (          RRF.ASM):00076         P2DISP EQU P2ORG
+     0300             (          RRF.ASM):00077         DIGLTH EQU $300
+     4A7C             (          RRF.ASM):00078         PCOORD EQU $4A7C INIT PLAYER COORD
+     0066             (          RRF.ASM):00079         FONCOL EQU $66 PHONY STARTUP COLOR
+                      (          RRF.ASM):00080         *
+                      (          RRF.ASM):00081         *MODULE  VECTORS + STORAGE ALLOCATION
+                      (          RRF.ASM):00082         *
+                      (          RRF.ASM):00083         ***OPSYS**..... R O S ..........
+                      (          RRF.ASM):00084         *
+     D000             (          RRF.ASM):00085         ROSORG EQU $D000
+                      (          RRF.ASM):00086          ORG ROSORG
+D000                  (          RRF.ASM):00087         INIT RMB 3
+D003                  (          RRF.ASM):00088         ASCAN RMB 3
+D006                  (          RRF.ASM):00089         SDOUT RMB 3
+D009                  (          RRF.ASM):00090         SCRTRN RMB 3
+D00C                  (          RRF.ASM):00091         SCORE RMB 3
+D00F                  (          RRF.ASM):00092         SCRTR0 RMB 3
+D012                  (          RRF.ASM):00093         SCRCLR RMB 3
+D015                  (          RRF.ASM):00094         DMAOFF RMB 3
+D018                  (          RRF.ASM):00095         DMAON RMB 3
+D01B                  (          RRF.ASM):00096         BLKCLR RMB 3
+D01E                  (          RRF.ASM):00097         PCTOFF RMB 3
+D021                  (          RRF.ASM):00098         PCTON RMB 3
+D024                  (          RRF.ASM):00099         COLST RMB 3
+D027                  (          RRF.ASM):00100         COL0 RMB 3
+D02A                  (          RRF.ASM):00101         HEXBCD RMB 3
+D02D                  (          RRF.ASM):00102         BCDHEX RMB 3
+D030                  (          RRF.ASM):00103         OINIT RMB 3
+D033                  (          RRF.ASM):00104         CRINIT RMB 3
+D036                  (          RRF.ASM):00105         PINIT RMB 3
+D039                  (          RRF.ASM):00106         RAND RMB 3
+D03C                  (          RRF.ASM):00107         RAND16 RMB 3
+D03F                  (          RRF.ASM):00108         RMAX RMB 3
+D042                  (          RRF.ASM):00109         RANDU RMB 3
+D045                  (          RRF.ASM):00110         PLINDX RMB 3
+D048                  (          RRF.ASM):00111         PLDX RMB 3
+D04B                  (          RRF.ASM):00112         SNDLD RMB 3
+D04E                  (          RRF.ASM):00113         KILO1 RMB 3
+D051                  (          RRF.ASM):00114         GETOBJ RMB 3
+D054                  (          RRF.ASM):00115         MAKEP RMB 3
+D057                  (          RRF.ASM):00116         MKPROC RMB 3
+D05A                  (          RRF.ASM):00117         MSPROC RMB 3
+D05D                  (          RRF.ASM):00118         KILL RMB 3
+D060                  (          RRF.ASM):00119         GNCIDE RMB 3
+D063                  (          RRF.ASM):00120         SUCIDE RMB 3
+D066                  (          RRF.ASM):00121         SLEEP RMB 3
+D069                  (          RRF.ASM):00122         RIPV RMB 3
+D06C                  (          RRF.ASM):00123         MPROB RMB 3
+D06F                  (          RRF.ASM):00124         GETOB RMB 3
+D072                  (          RRF.ASM):00125         KILLOB RMB 3
+D075                  (          RRF.ASM):00126         KILLOF RMB 3
+D078                  (          RRF.ASM):00127         KILOFP RMB 3
+D07B                  (          RRF.ASM):00128         GETROB RMB 3
+D07E                  (          RRF.ASM):00129         KILROB RMB 3
+D081                  (          RRF.ASM):00130         GETPST RMB 3
+D084                  (          RRF.ASM):00131         KILPST RMB 3
+D087                  (          RRF.ASM):00132         GETHUM RMB 3
+D08A                  (          RRF.ASM):00133         KILHUM RMB 3
+D08D                  (          RRF.ASM):00134         DMAOFN RMB 3
+D090                  (          RRF.ASM):00135         MPCTON RMB 3
+D093                  (          RRF.ASM):00136         BLKON RMB 3
+D096                  (          RRF.ASM):00137         EXECV RMB 3
+D099                  (          RRF.ASM):00138         P1SW   RMB    3
+D09C                  (          RRF.ASM):00139         P2SW   RMB    3
+D09F                  (          RRF.ASM):00140         DIVAB  RMB    3
+D0A2                  (          RRF.ASM):00141         RCMOSA RMB    3
+D0A5                  (          RRF.ASM):00142         RCMOSB RMB    3
+D0A8                  (          RRF.ASM):00143         RCMOSD RMB    3
+D0AB                  (          RRF.ASM):00144         WCMOSA RMB    3
+D0AE                  (          RRF.ASM):00145         WCMOSB RMB    3
+D0B1                  (          RRF.ASM):00146         WCMOSD RMB    3
+D0B4                  (          RRF.ASM):00147         BCDBIN RMB    3
+D0B7                  (          RRF.ASM):00148         RWMOVE RMB    3
+D0BA                  (          RRF.ASM):00149         AUD    RMB    3
+D0BD                  (          RRF.ASM):00150         AUD1   RMB    3
+D0C0                  (          RRF.ASM):00151         INT20V RMB    3
+D0C3                  (          RRF.ASM):00152         LFV    RMB    3
+D0C6                  (          RRF.ASM):00153         NEWBCH RMB    3        BCDHEX THAT USES A!!
+                      (          RRF.ASM):00154         *
+                      (          RRF.ASM):00155         *PLAYER DEATH
+                      (          RRF.ASM):00156         *
+     DD00             (          RRF.ASM):00157         RDORG EQU $DD00
+                      (          RRF.ASM):00158          ORG RDORG
+DD00                  (          RRF.ASM):00159         RDTHV RMB 3
+                      (          RRF.ASM):00160         *
+                      (          RRF.ASM):00161         *HUMANS+HULKS
+                      (          RRF.ASM):00162         *
+     0000             (          RRF.ASM):00163         RHORG EQU $0000
+                      (          RRF.ASM):00164          ORG RHORG
+0000                  (          RRF.ASM):00165         HULKST RMB 3
+0003                  (          RRF.ASM):00166         HUMST RMB 3
+0006                  (          RRF.ASM):00167         CKLIM RMB 3
+0009                  (          RRF.ASM):00168         SKULL RMB 3
+000C                  (          RRF.ASM):00169         P1KD RMB 2
+000E                  (          RRF.ASM):00170         MOMPIC RMB 2
+0010                  (          RRF.ASM):00171         DADPIC RMB 2
+0012                  (          RRF.ASM):00172         KIDPIC RMB 2
+0014                  (          RRF.ASM):00173         HLKPIC RMB 2
+0016                  (          RRF.ASM):00174         HLKANA RMB 2
+0018                  (          RRF.ASM):00175         HUMANA RMB 2
+001A                  (          RRF.ASM):00176         SKLPIC RMB 2
+                      (          RRF.ASM):00177         *
+                      (          RRF.ASM):00178         ***CIRCLES,ENFORCERS,SPARX
+                      (          RRF.ASM):00179         *
+     1140             (          RRF.ASM):00180         RCORG EQU $1140
+                      (          RRF.ASM):00181          ORG RCORG
+1140                  (          RRF.ASM):00182         CIRCST RMB 3 START CIRCLES
+1143                  (          RRF.ASM):00183         CIRKV RMB 3
+1146                  (          RRF.ASM):00184         CIRPIC RMB 2
+1148                  (          RRF.ASM):00185         ENGPIC RMB 2
+114A                  (          RRF.ASM):00186         ENFPIC RMB 2
+                      (          RRF.ASM):00187         *
+                      (          RRF.ASM):00188         *BRAINS & CO.
+                      (          RRF.ASM):00189         *
+     1AC0             (          RRF.ASM):00190         BRNORG EQU $1AC0
+                      (          RRF.ASM):00191          ORG BRNORG
+1AC0                  (          RRF.ASM):00192         BRNST RMB 3
+1AC3                  (          RRF.ASM):00193         BRNPIC RMB 2
+1AC5                  (          RRF.ASM):00194         BRONV  RMB    3
+1AC8                  (          RRF.ASM):00195         HUMONV RMB    3
+1ACB                  (          RRF.ASM):00196         PRGPIC RMB 2
+                      (          RRF.ASM):00197         *
+                      (          RRF.ASM):00198         *******ROBOT GAME...... R G .......
+                      (          RRF.ASM):00199         *
+     26C0             (          RRF.ASM):00200         RGORG EQU $26C0
+                      (          RRF.ASM):00201          ORG RGORG
+26C0                  (          RRF.ASM):00202         PLAYER RMB 3
+26C3                  (          RRF.ASM):00203         RANDXY RMB 3
+26C6                  (          RRF.ASM):00204         CKOBS RMB 3
+26C9                  (          RRF.ASM):00205         MANDSP RMB 3
+26CC                  (          RRF.ASM):00206         STRT1 RMB 3
+26CF                  (          RRF.ASM):00207         STRT2 RMB 3
+26D2                  (          RRF.ASM):00208         TDISPV RMB 3
+26D5                  (          RRF.ASM):00209         MANPIC RMB 2
+26D7                  (          RRF.ASM):00210         LASPIC RMB 2
+                      (          RRF.ASM):00211         *
+                      (          RRF.ASM):00212         *ROBOTS&POSTS
+                      (          RRF.ASM):00213         *
+     3880             (          RRF.ASM):00214         RPORG EQU $3880
+                      (          RRF.ASM):00215          ORG RPORG
+3880                  (          RRF.ASM):00216         RINIT RMB 3
+3883                  (          RRF.ASM):00217         PSINIT RMB 3
+3886                  (          RRF.ASM):00218         PSTP1 RMB 2
+3888                  (          RRF.ASM):00219         OPON RMB 3
+388B                  (          RRF.ASM):00220         OPON1 RMB 3
+388E                  (          RRF.ASM):00221         SAFTY RMB 3
+3891                  (          RRF.ASM):00222         ROBPIC RMB 2
+3893                  (          RRF.ASM):00223         PSTPIC RMB 2
+3895                  (          RRF.ASM):00224         PKPRCV RMB 3
+                      (          RRF.ASM):00225         *
+                      (          RRF.ASM):00226         *TRANSPORTER
+                      (          RRF.ASM):00227         *
+     4140             (          RRF.ASM):00228         RTORG EQU $4140
+                      (          RRF.ASM):00229          ORG RTORG
+4140                  (          RRF.ASM):00230         TRANST RMB 3
+                      (          RRF.ASM):00231         *
+                      (          RRF.ASM):00232         *DIAGONAL EXPLOSIONS
+                      (          RRF.ASM):00233         *
+     4680             (          RRF.ASM):00234         RDXORG EQU $4680
+                      (          RRF.ASM):00235          ORG RDXORG
+4680                  (          RRF.ASM):00236         DXINIT RMB 3
+4683                  (          RRF.ASM):00237         DXST RMB 3
+4686                  (          RRF.ASM):00238         DAPST RMB 3
+4689                  (          RRF.ASM):00239         DXUPD RMB 3
+                      (          RRF.ASM):00240         *
+                      (          RRF.ASM):00241         *TANKS
+                      (          RRF.ASM):00242         *
+     4B00             (          RRF.ASM):00243         RTKORG EQU $4B00
+                      (          RRF.ASM):00244          ORG RTKORG
+4B00                  (          RRF.ASM):00245         TANKST RMB 3
+4B03                  (          RRF.ASM):00246         SQST RMB 3
+4B06                  (          RRF.ASM):00247         SQPIC RMB 2
+4B08                  (          RRF.ASM):00248         TNGPIC RMB 2
+4B0A                  (          RRF.ASM):00249         TNKPIC RMB 2
+                      (          RRF.ASM):00250         *
+                      (          RRF.ASM):00251         *MARQUEE
+                      (          RRF.ASM):00252         *
+     5700             (          RRF.ASM):00253         RMORG EQU $5700
+                      (          RRF.ASM):00254          ORG RMORG
+5700                  (          RRF.ASM):00255         RMST RMB 3
+                      (          RRF.ASM):00256         *
+                      (          RRF.ASM):00257         *EXPLOSIONS
+                      (          RRF.ASM):00258         *
+     5B40             (          RRF.ASM):00259         RXORG EQU $5B40
+                      (          RRF.ASM):00260          ORG RXORG
+5B40                  (          RRF.ASM):00261         EXINIT RMB 3
+5B43                  (          RRF.ASM):00262         EXST RMB 3
+5B46                  (          RRF.ASM):00263         APST RMB 3
+5B49                  (          RRF.ASM):00264         EXUPD RMB 3
+5B4C                  (          RRF.ASM):00265         PDEATH RMB 3
+5B4F                  (          RRF.ASM):00266         HVEXST RMB 3
+5B52                  (          RRF.ASM):00267         DDEXST RMB 3 DUAL DIAGONALS
+5B55                  (          RRF.ASM):00268         AMAP   RMB    3        ATTRACT MODE APPEAR
+5B58                  (          RRF.ASM):00269         HAPST  RMB    3        HORIZONTAL APPEAR
+5B5B                  (          RRF.ASM):00270         HEXST  RMB    3        HORIZONTAL EXPLODE
+                      (          RRF.ASM):00271         
+                      (          RRF.ASM):00272         *             STINKY LINKY VINCKYS
+                      (          RRF.ASM):00273         
+     77A0             (          RRF.ASM):00274         LOGORG EQU    $77A0          PLACE FOR PROGRAM
+     77A0             (          RRF.ASM):00275         GOV    EQU    LOGORG
+     77A3             (          RRF.ASM):00276         CCV    EQU    GOV+3
+                      (          RRF.ASM):00277         
+     E3D0             (          RRF.ASM):00278         TSCORG EQU $E3D0   HIGH SCORE BULLSHIT
+     E3D0             (          RRF.ASM):00279         PUPHSC EQU TSCORG  POWER UP HIGH SCORE CHECK
+     E3D3             (          RRF.ASM):00280         ENDPRC EQU PUPHSC+3 END OF GAME PROCESSING
+     E3D6             (          RRF.ASM):00281         GODSET EQU ENDPRC+3 ENTER GODS NAME BY OPERATOR
+     E3D9             (          RRF.ASM):00282         HIGHRS EQU GODSET+3 RESET HIGH SCORE TABLE BY OPERATOR
+     E3DC             (          RRF.ASM):00283         HSCHKV EQU HIGHRS+3 CHECK IF HS TABLE LOOKS BASHED
+     E3DF             (          RRF.ASM):00284         HSBUTV EQU HSCHKV+3 HIGH SCORE RESET BUTTON
+                      (          RRF.ASM):00285         
+     DF40             (          RRF.ASM):00286         TABORG EQU    $DF40
+     DF40             (          RRF.ASM):00287         TABLEV EQU    TABORG
+                      (          RRF.ASM):00288         
+     F000             (          RRF.ASM):00289         TSTORG EQU $F000
+     F000             (          RRF.ASM):00290         PWRUPV EQU TSTORG    
+     F003             (          RRF.ASM):00291         ADVSW EQU PWRUPV+3
+     F006             (          RRF.ASM):00292         AUTOCY EQU ADVSW+3
+     F009             (          RRF.ASM):00293         HXINIT EQU AUTOCY+3
+     F00C             (          RRF.ASM):00294         HEXSTX EQU HXINIT+3
+     F00F             (          RRF.ASM):00295         HAPSTX EQU HEXSTX+3
+     F012             (          RRF.ASM):00296         HXUPD EQU HAPSTX+3
+     F015             (          RRF.ASM):00297         WLOOPV EQU HXUPD+3
+     F017             (          RRF.ASM):00298         ELOOPV EQU WLOOPV+2
+     F019             (          RRF.ASM):00299         L2     EQU    ELOOPV+2
+     F01B             (          RRF.ASM):00300         L0     EQU    L2+2
+                      (          RRF.ASM):00301         
+     6F00             (          RRF.ASM):00302         TSBORG EQU $6F00 ADJUST PART OF TEST MODE
+     6F00             (          RRF.ASM):00303         ADJV   EQU TSBORG
+     6F03             (          RRF.ASM):00304         CMINIT EQU ADJV+3
+     6F06             (          RRF.ASM):00305         ATMCK  EQU CMINIT+3
+     6F09             (          RRF.ASM):00306         GETLT  EQU ATMCK+3     ROUTINE TO GET LETTERS FROM CONTROL PANEL
+     6F0C             (          RRF.ASM):00307         CMSMVV EQU GETLT+3
+     6F0F             (          RRF.ASM):00308         DOPMES EQU    CMSMVV+3   2 BYTER
+                      (          RRF.ASM):00309         
+     5F90             (          RRF.ASM):00310         TXORG  EQU    $5F90    PLACE FOR TEXT PROGRAM
+     5F90             (          RRF.ASM):00311         PR35V  EQU    TXORG
+     5F93             (          RRF.ASM):00312         PR57V  EQU    PR35V+3
+     5F96             (          RRF.ASM):00313         WRD5V  EQU    PR57V+3
+     5F99             (          RRF.ASM):00314         WRD7V  EQU    WRD5V+3
+     5F9C             (          RRF.ASM):00315         PRINV  EQU    WRD7V+3
+     5F9F             (          RRF.ASM):00316         PRSCR  EQU    PRINV+3
+                      (          RRF.ASM):00317         
+     5F96             (          RRF.ASM):00318         WRD5FV EQU    WRD5V
+     5F99             (          RRF.ASM):00319         WRD7FV EQU    WRD7V
+     5F90             (          RRF.ASM):00320         PRN5FV EQU    PR35V
+     5F93             (          RRF.ASM):00321         PRN7FV EQU    PR57V
+                      (          RRF.ASM):00322         
+     E9C8             (          RRF.ASM):00323         SETORG EQU    $E9C8    CHARACTER SET
+     E9C8             (          RRF.ASM):00324         TAB35  EQU    SETORG
+     E9CA             (          RRF.ASM):00325         TAB57  EQU    TAB35+2
+     E9CA             (          RRF.ASM):00326         N0V    EQU    TAB57  
+                      (          RRF.ASM):00327         
+                      (          RRF.ASM):00328         *
+                      (          RRF.ASM):00329         *BASE PAGE RAM AREA
+                      (          RRF.ASM):00330         *
+                      (          RRF.ASM):00331          ORG $9800
+     9800             (          RRF.ASM):00332         RAM EQU *
+     98               (          RRF.ASM):00333          SETDP $98
+                      (          RRF.ASM):00334         
+9800                  (          RRF.ASM):00335         PCRAM RMB 16 PSEUDO COLOR RAM
+9810                  (          RRF.ASM):00336         TIMER RMB 1  IRQ TIMER
+9811                  (          RRF.ASM):00337         ACTIVE RMB    2        POINTER TO LIST OF CURRENTLY ACTIVE (SLEEPING) PROCS.
+9813                  (          RRF.ASM):00338         FREE   RMB    2        POINTER TO LIST OF UNALLOCATED PROCESS SLEEP SPACE.
+9815                  (          RRF.ASM):00339         CRPROC RMB    2        POINTER TO SLEEP AREA OF CURRENTLY EXECUTING PROCESS.
+9817                  (          RRF.ASM):00340         OPTR RMB 2 MOTION OBJECT LIST POINTER
+9819                  (          RRF.ASM):00341         OBPTR RMB 2 OBSTACLE LIST POINTER
+981B                  (          RRF.ASM):00342         OFREE RMB 2 FREE LIST POINTER
+981D                  (          RRF.ASM):00343         SPFREE RMB 2 SUPER PROCESS FREE LIST
+981F                  (          RRF.ASM):00344         HPTR RMB 2 HUMAN PTR
+9821                  (          RRF.ASM):00345         RPTR RMB 2 ROBOT LIST
+9823                  (          RRF.ASM):00346         PPTR RMB 2 PHATAL OBJECT LIST
+9825                  (          RRF.ASM):00347         ITEMP RMB 2 INTERUPT TEMP
+9827                  (          RRF.ASM):00348         PSTIN RMB 2
+9829                  (          RRF.ASM):00349         ITEMP2 RMB 2
+982B                  (          RRF.ASM):00350         XTEMP  RMB 2 SAVE AREA FOR QUICK TEMPORARY
+982D                  (          RRF.ASM):00351         XTEMP2 RMB 2
+982F                  (          RRF.ASM):00352         PIA01 RMB 1 N-1 PIA0
+9830                  (          RRF.ASM):00353         PIA02 RMB 1 N-2 PIA0
+9831                  (          RRF.ASM):00354         PIA21 RMB 1 N-1 PIA2
+9832                  (          RRF.ASM):00355         PIA22 RMB 1 N-2 PIA2
+9833                  (          RRF.ASM):00356         SWPROC RMB 12 SWITCH SCAN TEMP
+983F                  (          RRF.ASM):00357         CURPLR RMB 1 CURRENT
+9840                  (          RRF.ASM):00358         PLRCNT RMB 1 NUMBER OF PLAYERS
+9841                  (          RRF.ASM):00359         XXX2 RMB 1 '80' IRQ LINE
+9842                  (          RRF.ASM):00360         OVCNT RMB 1 OVERFLOW COUNT
+9843                  (          RRF.ASM):00361         IFLG RMB 1 IRQ FLAG
+9844                  (          RRF.ASM):00362         FRAME RMB 1 IRQ COUNT
+9845                  (          RRF.ASM):00363         RWCTMP RMB 1 SCREEN READ CONTROL BYTE
+9846                  (          RRF.ASM):00364         REPLA RMB 2 REPLAY LEVEL
+9848                  (          RRF.ASM):00365         PCFLG RMB 1 PLAYER COLLISION
+9849                  (          RRF.ASM):00366         HTABX RMB 2 HUMAN TABLE INDEX
+                      (          RRF.ASM):00367         *COIN BUSINESS
+984B                  (          RRF.ASM):00368         SLMCNT RMB 1
+984C                  (          RRF.ASM):00369         LCCNT RMB 1
+984D                  (          RRF.ASM):00370         RCCNT RMB 1
+984E                  (          RRF.ASM):00371         CCCNT RMB 1
+984F                  (          RRF.ASM):00372         BUNITS RMB 1
+9850                  (          RRF.ASM):00373         CUNITS RMB 1
+9851                  (          RRF.ASM):00374         CREDIT RMB 1
+                      (          RRF.ASM):00375         *ATTRACT SWITCHES: FONY PRAYAH CONTLOHL
+9852                  (          RRF.ASM):00376         ATRSW2 RMB 1
+9853                  (          RRF.ASM):00377         ATRSW3 RMB 1
+                      (          RRF.ASM):00378         *SOUND RAM
+9854                  (          RRF.ASM):00379         SNDX RMB 2 TABLE INDEX
+9856                  (          RRF.ASM):00380         SNDPRI RMB 1 PRIORITY
+9857                  (          RRF.ASM):00381         SNDTMR RMB 1
+9858                  (          RRF.ASM):00382         SNDREP RMB 1
+                      (          RRF.ASM):00383         *
+                      (          RRF.ASM):00384         *STATUS FLAG
+                      (          RRF.ASM):00385         *B7=GAME OVER
+                      (          RRF.ASM):00386         *B6=
+                      (          RRF.ASM):00387         *B5=
+                      (          RRF.ASM):00388         *B4=PLAYER OUTPUT
+                      (          RRF.ASM):00389         *B3=MOTION OBJS VEL +ENEMIES
+                      (          RRF.ASM):00390         *B2=EXPLOSION UPDATE
+                      (          RRF.ASM):00391         *B1=POST ,MOT OBJ REFRESH
+                      (          RRF.ASM):00392         *B0=PLAYER MOTION,COLLISION,FIRE
+9859                  (          RRF.ASM):00393         STATUS RMB 1
+                      (          RRF.ASM):00394         *
+                      (          RRF.ASM):00395         *PLAYER OBJECT STRUCTURE
+                      (          RRF.ASM):00396         *
+     985A             (          RRF.ASM):00397         PLOBJ EQU *
+985A                  (          RRF.ASM):00398          RMB 2 OLINK
+985C                  (          RRF.ASM):00399         PPICT RMB 2 OPICT
+985E                  (          RRF.ASM):00400         PX RMB 2 OBJX
+9860                  (          RRF.ASM):00401          RMB 2 OBJID
+9862                  (          RRF.ASM):00402          RMB 2 OCVECT
+9864                  (          RRF.ASM):00403         PX16 RMB 2  OX16
+9866                  (          RRF.ASM):00404         PY16 RMB 2  OY16
+9868                  (          RRF.ASM):00405         PXV RMB 2   OXV
+986A                  (          RRF.ASM):00406         PYV RMB 2   OYV
+986C                  (          RRF.ASM):00407          RMB 1 OFLAV
+986D                  (          RRF.ASM):00408         PODATA RMB 1 ODATA
+986E                  (          RRF.ASM):00409         POLDPC RMB 2 OLDPIC
+9870                  (          RRF.ASM):00410         PLAIMC RMB 1 PLAYER ANIMATION RATE
+9871                  (          RRF.ASM):00411         PLAIMN RMB 1 PLAYER ANIMATION NUMBER
+9872                  (          RRF.ASM):00412         PLAIMB RMB 2 PLAYER ANIMATION BASE ADDR
+                      (          RRF.ASM):00413         *
+                      (          RRF.ASM):00414         *COLLISION ROUTINE PARAMETERS
+                      (          RRF.ASM):00415         *
+9874                  (          RRF.ASM):00416         XCNT RMB 1 SCAN COUNTS
+9875                  (          RRF.ASM):00417         YCNT RMB 1
+9876                  (          RRF.ASM):00418         OX1 RMB 1 OFFSETS
+9877                  (          RRF.ASM):00419         OY1 RMB 1
+9878                  (          RRF.ASM):00420         PX1 RMB 1
+9879                  (          RRF.ASM):00421         PY1 RMB 1
+987A                  (          RRF.ASM):00422         OBW RMB 1 HT TEMPS
+987B                  (          RRF.ASM):00423         PLW RMB 1
+987C                  (          RRF.ASM):00424         ULX RMB 1 UPPER LEFT COORD
+987D                  (          RRF.ASM):00425         ULY RMB 1 "
+987E                  (          RRF.ASM):00426         LRX RMB 1
+987F                  (          RRF.ASM):00427         LRY RMB 1
+9880                  (          RRF.ASM):00428         CTEMP RMB 2 INDEX TEMP
+9882                  (          RRF.ASM):00429         CTEMP2 RMB 2
+                      (          RRF.ASM):00430         *RANDOM VARIABLES
+9884                  (          RRF.ASM):00431         SEED   RMB    1
+9885                  (          RRF.ASM):00432         HSEED  RMB    1 
+9886                  (          RRF.ASM):00433         LSEED  RMB    1
+                      (          RRF.ASM):00434         *LASER
+9887                  (          RRF.ASM):00435         LCNT RMB 1
+9888                  (          RRF.ASM):00436         LASDIR RMB 2
+                      (          RRF.ASM):00437         *SPARKS
+988A                  (          RRF.ASM):00438         SPKCNT RMB 1
+988B                  (          RRF.ASM):00439         ROBST RMB 2 PTR TO ROBOT LIST
+988D                  (          RRF.ASM):00440         SAVCNT RMB 1 HUMAN COUNT SAVED
+988E                  (          RRF.ASM):00441         BCMCNT RMB 1 BRAIN CRUISE MISSILES
+                      (          RRF.ASM):00442         *POST ANIMATION+WALL COLOR
+988F                  (          RRF.ASM):00443         WALCOL RMB 1 WALL+POST BG
+9890                  (          RRF.ASM):00444         PSTCOL RMB 1 POST COLOR
+9891                  (          RRF.ASM):00445         LASCOL RMB 1 LASER WALL COLLIDE COLOR
+9892                  (          RRF.ASM):00446         PSTREF RMB 1 POST REFRESH RATE
+9893                  (          RRF.ASM):00447         PSTANI RMB 2 CURR POST ANIMATION
+9895                  (          RRF.ASM):00448         BRNFLG RMB 1 BRAIN HUMAN KILL FLAG
+                      (          RRF.ASM):00449         *
+                      (          RRF.ASM):00450         *EXPLOSION STUFF
+9896                  (          RRF.ASM):00451         EXPRAM RMB $10
+98A6                  (          RRF.ASM):00452         CENTMP RMB 2 CENTER OF BLOW
+98A8                  (          RRF.ASM):00453         HXRAM RMB $10
+98B8                  (          RRF.ASM):00454         DXRAM RMB $10
+98C8                  (          RRF.ASM):00455         RMRAM RMB 6 MARQUEE RAM
+                      (          RRF.ASM):00456         
+                      (          RRF.ASM):00457         ************************ LINKYS STINKYS
+                      (          RRF.ASM):00458         
+98CE                  (          RRF.ASM):00459         INDIAG RMB    1
+                      (          RRF.ASM):00460         
+                      (          RRF.ASM):00461         *
+                      (          RRF.ASM):00462         *      TEXT VARIABLES
+                      (          RRF.ASM):00463         *
+                      (          RRF.ASM):00464         
+98CF                  (          RRF.ASM):00465         TEXCOL RMB    1 (TEXCOL)  PRINTING COLOR (NIBBLES REPRESENT FLAVOR COLO
+98D0                  (          RRF.ASM):00466         TXFLAV RMB    1 (TXFLAV) FLAVOR OF CURRENT CURSOR (0=EVEN, 1=ODD)
+98D1                  (          RRF.ASM):00467         TXLEAD RMB    1 (TXLEAD) LEAD ZERO BLANKING ON/OFF (0=OFF, 1=ON)
+98D2                  (          RRF.ASM):00468         TXFONT RMB    1 (TXFONT) FONT HEIGHT (5 OR 7) PIXELS
+98D3                  (          RRF.ASM):00469         TEXMAR RMB    2        CURRENT LEFT MARGIN CURSOR POINTER
+98D5                  (          RRF.ASM):00470         TEXMFL RMB    1        CURRENT LEFT MARGIN FLAVOR
+98D6                  (          RRF.ASM):00471         TEXTP3 RMB    1
+98D7                  (          RRF.ASM):00472         TXCLIP RMB    1
+                      (          RRF.ASM):00473         
+                      (          RRF.ASM):00474         *
+                      (          RRF.ASM):00475         ***    GET LETTER ROUTINE RAM
+                      (          RRF.ASM):00476         *
+                      (          RRF.ASM):00477         
+98D8                  (          RRF.ASM):00478         GETLRM RMB    2
+98DA                  (          RRF.ASM):00479         GETLST RMB    3
+                      (          RRF.ASM):00480         
+                      (          RRF.ASM):00481         ********************* LOGO RAM
+                      (          RRF.ASM):00482         
+98DD                  (          RRF.ASM):00483         LOGX   RMB    2
+98DF                  (          RRF.ASM):00484         LOGCOL RMB    1
+98E0                  (          RRF.ASM):00485         LOGCL2 RMB    1
+98E1                  (          RRF.ASM):00486         LOGCNT RMB    1
+98E2                  (          RRF.ASM):00487         LOGSAV RMB    2
+98E4                  (          RRF.ASM):00488         LOGCST RMB    2
+                      (          RRF.ASM):00489         
+98E6                  (          RRF.ASM):00490         LASTX  RMB    2
+98E8                  (          RRF.ASM):00491         SIDE   RMB    1
+98E9                  (          RRF.ASM):00492         BALCOL RMB    1
+98EA                  (          RRF.ASM):00493         SLIDER RMB    1
+98EB                  (          RRF.ASM):00494         ERPTR  RMB    2
+                      (          RRF.ASM):00495         *MOVE THIS SOMEDAY
+98ED                  (          RRF.ASM):00496         ENFCNT RMB 1
+98EE                  (          RRF.ASM):00497         GAMTIM RMB 1 GAME TIMER
+98EF                  (          RRF.ASM):00498         TNKSPD RMB 1 TANK SPEED PARAMETER
+98F0                  (          RRF.ASM):00499         SCRFLG RMB 1 SCORE FLAG
+98F1                  (          RRF.ASM):00500         SHLCNT RMB 1 SHELL COUNTER
+98F2                  (          RRF.ASM):00501         RIPFLG RMB 1                            
+98F3                  (          RRF.ASM):00502         HCK1   RMB 1
+98F4                  (          RRF.ASM):00503         ATFLAG RMB 1  INDICATE WHAT PAGE AND HOW
+                      (          RRF.ASM):00504         
+                      (          RRF.ASM):00505         *
+                      (          RRF.ASM):00506         *TABLE DATA
+                      (          RRF.ASM):00507         *
+                      (          RRF.ASM):00508          ORG RAM+$100 PAST BASE PAGE
+                      (          RRF.ASM):00509         *
+                      (          RRF.ASM):00510         *MASTER OBJECT LIST
+                      (          RRF.ASM):00511         *
+     9900             (          RRF.ASM):00512         OLIST EQU * 
+     0018             (          RRF.ASM):00513         OSIZE EQU $18
+                      (          RRF.ASM):00514         *
+                      (          RRF.ASM):00515         *INDEX OFFSETS
+                      (          RRF.ASM):00516         *
+     0000             (          RRF.ASM):00517         OLINK EQU 0 LINK TO NEXT
+     0002             (          RRF.ASM):00518         OPICT EQU 2 PICTURE DESCRIPTOR ADDR
+     0004             (          RRF.ASM):00519         OBJX EQU 4 UPPER LEFT SCREEN X
+     0005             (          RRF.ASM):00520         OBJY EQU 5 UPPER LEFT SCREEN Y
+     0006             (          RRF.ASM):00521         OBJID EQU 6 ASSOCIATED PROCESS ID (IF ANY)
+     0008             (          RRF.ASM):00522         OCVECT EQU 8 COLLISION ROUTINE ADDR
+     000A             (          RRF.ASM):00523         OX16 EQU $A 16 BIT X WORLD COORD
+     000C             (          RRF.ASM):00524         OY16 EQU $C 16 BIT Y WORLD COORD
+     000E             (          RRF.ASM):00525         OXV EQU $E X VELOCITY
+     0010             (          RRF.ASM):00526         OYV EQU $10 Y VELOCITY
+     0012             (          RRF.ASM):00527         OFLAV EQU $12 OLD FLAVOR
+     0013             (          RRF.ASM):00528         ODATA EQU $13 MISC. DATA
+     0014             (          RRF.ASM):00529         OLDPIC EQU $14 OLD PICTURE TO ERASE
+     0016             (          RRF.ASM):00530         FONIPC EQU $16 FONY PICT FOR COLLISION PURPOSES
+                      (          RRF.ASM):00531         *RESERVE AREA
+9900                  (          RRF.ASM):00532          RMB (180)*OSIZE
+     A9E0             (          RRF.ASM):00533         OLEND EQU *
+                      (          RRF.ASM):00534         *
+                      (          RRF.ASM):00535         *USER DEFINED PROCESS TYPES
+                      (          RRF.ASM):00536         *
+     0000             (          RRF.ASM):00537         STYPE EQU 0 SYSTEM PROCESS
+     0001             (          RRF.ASM):00538         CTYPE EQU 1 COIN
+                      (          RRF.ASM):00539         *
+                      (          RRF.ASM):00540         *SLEEPING PROCESS TABLE
+                      (          RRF.ASM):00541         *
+     A9E0             (          RRF.ASM):00542         PTAB EQU *
+                      (          RRF.ASM):00543         *
+                      (          RRF.ASM):00544         *OFFSET CONSTANTS 
+                      (          RRF.ASM):00545         *
+     0000             (          RRF.ASM):00546         PLINK EQU 0
+     0002             (          RRF.ASM):00547         PADDR EQU 2
+     0004             (          RRF.ASM):00548         PTIME EQU 4
+     0005             (          RRF.ASM):00549         PTYPE EQU 5
+     0006             (          RRF.ASM):00550         PCOD EQU 6
+     0007             (          RRF.ASM):00551         PDATA EQU 7
+     0007             (          RRF.ASM):00552         PD EQU 7
+     0008             (          RRF.ASM):00553         PD1 EQU 8
+     0009             (          RRF.ASM):00554         PD2 EQU 9
+     000A             (          RRF.ASM):00555         PD3 EQU 10
+     000B             (          RRF.ASM):00556         PD4 EQU 11
+     000C             (          RRF.ASM):00557         PD5 EQU 12
+     000D             (          RRF.ASM):00558         PD6 EQU 13
+     000E             (          RRF.ASM):00559         PD7 EQU 14
+     000F             (          RRF.ASM):00560         PSIZE EQU 15
+A9E0                  (          RRF.ASM):00561          RMB 15*(120)
+     B0E8             (          RRF.ASM):00562         TABEND EQU *
+                      (          RRF.ASM):00563         *
+                      (          RRF.ASM):00564         *SUPER PROCESSES
+                      (          RRF.ASM):00565         *
+     001F             (          RRF.ASM):00566         SPSIZE EQU PSIZE+16
+B0E8                  (          RRF.ASM):00567         SPTAB RMB SPSIZE*20
+     B354             (          RRF.ASM):00568         SPTEND EQU *
+                      (          RRF.ASM):00569         *
+                      (          RRF.ASM):00570         *OBJECT PICTURE STRUCTURE
+                      (          RRF.ASM):00571         *
+     0000             (          RRF.ASM):00572         OBJW EQU 0
+     0001             (          RRF.ASM):00573         OBJH EQU 1
+     0002             (          RRF.ASM):00574         OBJDAT EQU 2
+     0004             (          RRF.ASM):00575         OBJL EQU 4
+                      (          RRF.ASM):00576         *
+                      (          RRF.ASM):00577         *HUMAN TABLE
+                      (          RRF.ASM):00578         *
+B354                  (          RRF.ASM):00579         HTAB RMB 80
+     B3A4             (          RRF.ASM):00580         HTBEND EQU *
+                      (          RRF.ASM):00581         *
+                      (          RRF.ASM):00582         *POST REFRESH LIST
+                      (          RRF.ASM):00583         *
+B3A4                  (          RRF.ASM):00584         PSLIST RMB 64 POST LIST
+     B3E4             (          RRF.ASM):00585         PSLEND EQU *
+                      (          RRF.ASM):00586         *
+                      (          RRF.ASM):00587         *HORIZONTAL EXPLOSION TABLES
+                      (          RRF.ASM):00588         *
+B3E4                  (          RRF.ASM):00589         HXTAB RMB $800
+                      (          RRF.ASM):00590         
+                      (          RRF.ASM):00591         *
+                      (          RRF.ASM):00592         *DIAGONAL XPLOSION TABLES
+                      (          RRF.ASM):00593         *
+BBE4                  (          RRF.ASM):00594         DXTAB RMB $200
+                      (          RRF.ASM):00595         *
+                      (          RRF.ASM):00596         *PLAYER DATA TABLE
+                      (          RRF.ASM):00597         *
+     BDE4             (          RRF.ASM):00598         PLDATA EQU *
+BDE4                  (          RRF.ASM):00599         ZP1SCR RMB 4 SCORE MSB 1ST
+BDE8                  (          RRF.ASM):00600         ZP1RP RMB 4 NEXT REPLAY LEVEL
+BDEC                  (          RRF.ASM):00601         ZP1LAS RMB 1 #OF LASERS 
+BDED                  (          RRF.ASM):00602         ZP1WAV RMB 1 WAVE # IN HEX
+BDEE                  (          RRF.ASM):00603         ZP1ENM RMB 50 ENEMY STATE
+     BE20             (          RRF.ASM):00604         ZP1END EQU *
+BE20                  (          RRF.ASM):00605         ZP2SCR RMB 4
+BE24                  (          RRF.ASM):00606         ZP2RP RMB 4
+BE28                  (          RRF.ASM):00607         ZP2LAS RMB 1
+BE29                  (          RRF.ASM):00608         ZP2WAV RMB 1
+BE2A                  (          RRF.ASM):00609         ZP2ENM RMB 50
+     BE5C             (          RRF.ASM):00610         PLDEND EQU * END OF PLAYER DATA
+     003C             (          RRF.ASM):00611         PLDLEN EQU ZP1END-PLDATA
+     0000             (          RRF.ASM):00612         PSCOR EQU ZP1SCR-PLDATA
+     0004             (          RRF.ASM):00613         PRPLA EQU ZP1RP-PLDATA
+     0008             (          RRF.ASM):00614         PLAS EQU ZP1LAS-PLDATA
+     0009             (          RRF.ASM):00615         PWAV EQU ZP1WAV-PLDATA
+     000A             (          RRF.ASM):00616         PENEMY EQU ZP1ENM-PLDATA
+                      (          RRF.ASM):00617         *
+                      (          RRF.ASM):00618         *ENEMIES LIST
+                      (          RRF.ASM):00619         *WARNING DO NOT CHANGE ORDER OF COUNTS
+     BE5C             (          RRF.ASM):00620         ELIST EQU *
+BE5C                  (          RRF.ASM):00621         ROBSPD RMB 1  SPEED
+BE5D                  (          RRF.ASM):00622         RMXSPD RMB 1 MAX ROBOT SPEED
+BE5E                  (          RRF.ASM):00623         ENFNUM RMB 1 # OF ENFORCERS/CIRCLE X2
+BE5F                  (          RRF.ASM):00624         ENSTIM RMB 1 ENF SHOT TIMER
+BE60                  (          RRF.ASM):00625         CDPTIM RMB 1 CIRCLE DROP TIMER
+BE61                  (          RRF.ASM):00626         HLKSPD RMB 1 HULK SPEED
+BE62                  (          RRF.ASM):00627         BSHTIM RMB 1 BRAIN SHOT TIMER
+BE63                  (          RRF.ASM):00628         BRNSPD RMB 1 BRAIN SPEED
+BE64                  (          RRF.ASM):00629         TNKSHT RMB 1  TANK SHOT RATE
+BE65                  (          RRF.ASM):00630         SHLSPD RMB 1  SHELL SPEED
+BE66                  (          RRF.ASM):00631         TDPTIM RMB 1  TANK DROP TIMR
+BE67                  (          RRF.ASM):00632         SQSPD RMB 1   SQUARE SPEED
+     BE68             (          RRF.ASM):00633         ECNTS EQU * START COUNTS
+BE68                  (          RRF.ASM):00634         ROBCNT RMB 1 # ROBOTS
+BE69                  (          RRF.ASM):00635         PSTCNT RMB 1 # POSTS
+BE6A                  (          RRF.ASM):00636         MOMCNT RMB 1 # MOM UNITS
+BE6B                  (          RRF.ASM):00637         DADCNT RMB 1 # DAD UNITS
+BE6C                  (          RRF.ASM):00638         KIDCNT RMB 1 # KIDS
+BE6D                  (          RRF.ASM):00639         HLKCNT RMB 1 # HULKS
+BE6E                  (          RRF.ASM):00640         BRNCNT RMB 1 # BRAINS
+BE6F                  (          RRF.ASM):00641         CIRCNT RMB 1 # CIRCLES
+BE70                  (          RRF.ASM):00642         SQCNT RMB 1 # SQUARES
+BE71                  (          RRF.ASM):00643         TNKCNT RMB 1 # TANKS
+     BE72             (          RRF.ASM):00644         ELEND EQU *
+BE72                  (          RRF.ASM):00645         HCK2 RMB 1
+                      (          RRF.ASM):00646         *
+                      (          RRF.ASM):00647         * CMOS RAM ALLOCATION
+                      (          RRF.ASM):00648         *
+                      (          RRF.ASM):00649          ORG CMOS+$100     WRITABLE CMOS  
+CD00                  (          RRF.ASM):00650         CREDST RMB 2 CREDITS BACKUP
+CD02                  (          RRF.ASM):00651         SLOT1 RMB 6 1 LEFT COIN TOTAL
+CD08                  (          RRF.ASM):00652               RMB 6 2 CENTER COIN TOTAL
+CD0E                  (          RRF.ASM):00653               RMB 6 3 RIGHT COIN TOTAL
+CD14                  (          RRF.ASM):00654                RMB 6 4 TOTAL PAID CREDITS
+CD1A                  (          RRF.ASM):00655                RMB 6 5 TOTAL REPLAYS
+CD20                  (          RRF.ASM):00656         BKTIME RMB 6 6 FLIGHT TIME IN MINS
+CD26                  (          RRF.ASM):00657         BKMEN  RMB 6 7 TOTAL SHIPS PLAYED
+CD2C                  (          RRF.ASM):00658         BKPLAY RMB 6 8 TOTAL GAMES PLAYED
+     CD32             (          RRF.ASM):00659         BKEND  EQU    *        END OF BOOKKEEPING STUFF
+     000E             (          RRF.ASM):00660         SCRSIZ EQU 14 NUMBER OF NIBBLES IN A SCORE ENTRY
+CD32                  (          RRF.ASM):00661         GODINT RMB 6
+CD38                  (          RRF.ASM):00662         GODSCR RMB 48   
+CD68                  (          RRF.ASM):00663         CMSCOR RMB 37*SCRSIZ   37 BACKED UP SCORES, 36 OF WHICH ARE VISIBLE
+CF6E                  (          RRF.ASM):00664         TODAYS RMB 10*SCRSIZ     TODAYS GREATEST
+     CFFA             (          RRF.ASM):00665         TODEND EQU *
+                      (          RRF.ASM):00666          ORG CMOS  ADEQUATE BIRTH CONTROL PROTECTION
+CC00                  (          RRF.ASM):00667         REPLAY RMB 2 REPLAY LEVEL
+CC02                  (          RRF.ASM):00668         NSHIP RMB 2 # OF SHIPS/1 CREDIT GAME
+CC04                  (          RRF.ASM):00669         COINSL RMB 2 FOR COINAGE SELECT MODE
+CC06                  (          RRF.ASM):00670         SLOT1M RMB 2 LEFT COIN MULT
+CC08                  (          RRF.ASM):00671         SLOT2M RMB 2 CENTER COIN MULT
+CC0A                  (          RRF.ASM):00672         SLOT3M RMB 2 RIGHT COIN MULT
+CC0C                  (          RRF.ASM):00673         CUNITC RMB 2 COIN UNITS PER CREDIT
+CC0E                  (          RRF.ASM):00674         CUNITB RMB 2 COIN UNITS FOR BONUS
+CC10                  (          RRF.ASM):00675         MINUNT RMB 2 MINIMUM REQD
+CC12                  (          RRF.ASM):00676         FREEPL RMB 2 FREE PLAY MODE       (ONE CREDIT GAME)     
+CC14                  (          RRF.ASM):00677         GA1 RMB 2 10 MASTER DIFFICULTY CONTROL               1
+CC16                  (          RRF.ASM):00678         GA2 RMB 2 NUMBER OF LETTERS ALLOWED TO GOD           10
+CC18                  (          RRF.ASM):00679         SPECFN RMB 2  RESTORE FACTORY SETTINGS
+CC1A                  (          RRF.ASM):00680          RMB 2  CLEAR AUDIT TOTALS
+CC1C                  (          RRF.ASM):00681          RMB 2  INITIALIZE HIGH SCORE TABLE
+CC1E                  (          RRF.ASM):00682          RMB 2  INTIATE AUTO CYCLE
+CC20                  (          RRF.ASM):00683          RMB 2  ENTER ATTRACT MODE MESSAGE
+CC22                  (          RRF.ASM):00684          RMB 2  ENTER HIGHEST SCORE NAME
+     CC24             (          RRF.ASM):00685         ENDADJ EQU *
+CC24                  (          RRF.ASM):00686         OPMESS RMB 100  2 LINES OF 25 CHARS EACH.
+CC88                  (          RRF.ASM):00687         OPL1 RMB 2
+CC8A                  (          RRF.ASM):00688         OPL2 RMB 2
+CC8C                  (          RRF.ASM):00689         ADJSUM RMB 2
+CC8E                  (          RRF.ASM):00690         OMESUM RMB 2
+                      (          RRF.ASM):00691         
+                      (          RRF.ASM):00692         *
+                      (          RRF.ASM):00693         *M A C R O S
+                      (          RRF.ASM):00694         *
+CC90                  (          RRF.ASM):00695         NAP    MACRO
+                      (          RRF.ASM):00696                LDA #\1 TIME
+                      (          RRF.ASM):00697                LDX #\2 WAKEUP ADDR
+                      (          RRF.ASM):00698                JMP    SLEEP  
+                      (          RRF.ASM):00699                ENDM
+                      (          RRF.ASM):00700         *
+                      (          RRF.ASM):00701         *MAKE A NEW PROCESS
+                      (          RRF.ASM):00702         *
+CC90                  (          RRF.ASM):00703         NEWP MACRO
+                      (          RRF.ASM):00704          LDX #\1 ADDR
+                      (          RRF.ASM):00705          LDA #\2 TYPE
+                      (          RRF.ASM):00706          JSR MKPROC
+                      (          RRF.ASM):00707          ENDM
+                      (          RRF.ASM):00708         *INIT PROCESS \0=SADDR 
+CC90                  (          RRF.ASM):00709         MAKP MACRO
+                      (          RRF.ASM):00710          JSR MAKEP
+                      (          RRF.ASM):00711          FDB \1
+                      (          RRF.ASM):00712          ENDM
+                      (          RRF.ASM):00713         *MAKE A PROCESS AND OBJECT
+CC90                  (          RRF.ASM):00714         MKPROB MACRO
+                      (          RRF.ASM):00715          JSR MPROB
+                      (          RRF.ASM):00716          FDB \1,\2,\3
+                      (          RRF.ASM):00717          ENDM
+                      (          RRF.ASM):00718         
+                      (asm/src/RRG23.ASM):00004         *  OPT LIS
+                      (asm/src/RRG23.ASM):00005          ORG RGORG
+26C0 7E2FC2           (asm/src/RRG23.ASM):00006          JMP PLAYRV
+26C3 7E3199           (asm/src/RRG23.ASM):00007          JMP RNDXYV
+26C6 7E3085           (asm/src/RRG23.ASM):00008          JMP CKOBSV
+26C9 7E34E0           (asm/src/RRG23.ASM):00009          JMP MANDSV
+26CC 7E26FC           (asm/src/RRG23.ASM):00010          JMP START1
+26CF 7E26F5           (asm/src/RRG23.ASM):00011          JMP START2
+26D2 7E34AF           (asm/src/RRG23.ASM):00012          JMP TDISP
+26D5 35EB             (asm/src/RRG23.ASM):00013          FDB MANLP1
+26D7 35AE             (asm/src/RRG23.ASM):00014          FDB LLPIC
+                      (asm/src/RRG23.ASM):00015         *
+                      (asm/src/RRG23.ASM):00016         *SOUNDS
+                      (asm/src/RRG23.ASM):00017         *
+26D9 EE02081101201700 (asm/src/RRG23.ASM):00018         PDSND FCB $EE,$02,$08,$11,$01,$20,$17,0 PLAYER DEATH
+26E1 F001102800       (asm/src/RRG23.ASM):00019         ST1SND FCB $F0,$01,$10,$28,0 START 1
+26E6 F001102500       (asm/src/RRG23.ASM):00020         ST2SND FCB $F0,$01,$10,$25,0 START 2
+26EB E01D040E00       (asm/src/RRG23.ASM):00021         WVSND FCB $E0,$1D,$04,$0E,0 WAVE END
+26F0 D001080100       (asm/src/RRG23.ASM):00022         LASSND FCB $D0,$01,$08,1,0 LASER SOUND
+                      (asm/src/RRG23.ASM):00023         *
+                      (asm/src/RRG23.ASM):00024         *GAME START
+                      (asm/src/RRG23.ASM):00025         *
+26F5 8602             (asm/src/RRG23.ASM):00026         START2 LDA #2
+26F7 2005             (asm/src/RRG23.ASM):00027          BRA SST0
+26F9 7ED063           (asm/src/RRG23.ASM):00028         STRTX JMP SUCIDE
+26FC 8601             (asm/src/RRG23.ASM):00029         START1 LDA #1
+26FE 108EC3B3         (asm/src/RRG23.ASM):00030         SST0 LDY #HCK2+1345
+2702 0D59             (asm/src/RRG23.ASM):00031              TST STATUS
+2704 2AF3             (asm/src/RRG23.ASM):00032          BPL STRTX
+2706 F6CC05           (asm/src/RRG23.ASM):00033          LDB COINSL+1 CHECK FREEBY
+2709 C40F             (asm/src/RRG23.ASM):00034          ANDB #$F
+270B C109             (asm/src/RRG23.ASM):00035          CMPB #9
+270D 2602             (asm/src/RRG23.ASM):00036          BNE SST00 NO FREE PLAY
+270F 9751             (asm/src/RRG23.ASM):00037          STA CREDIT
+2711 9151             (asm/src/RRG23.ASM):00038         SST00 CMPA CREDIT
+2713 22E4             (asm/src/RRG23.ASM):00039          BHI STRTX  INSUFFICIENT FUNDS
+2715 9740             (asm/src/RRG23.ASM):00040          STA PLRCNT MAKE APPROPRIATE SOUND
+2717 0F4F             (asm/src/RRG23.ASM):00041          CLR BUNITS
+2719 0F50             (asm/src/RRG23.ASM):00042          CLR CUNITS
+271B C608             (asm/src/RRG23.ASM):00043          LDB #8
+271D BDD0BA           (asm/src/RRG23.ASM):00044          JSR AUD  GAMES PLAYED
+2720 CED015           (asm/src/RRG23.ASM):00045          LDU   #$D015
+2723 40               (asm/src/RRG23.ASM):00046          NEGA
+2724 8B9A             (asm/src/RRG23.ASM):00047          ADDA #$9A
+2726 9B51             (asm/src/RRG23.ASM):00048          ADDA CREDIT
+2728 19               (asm/src/RRG23.ASM):00049          DAA 
+2729 9751             (asm/src/RRG23.ASM):00050          STA CREDIT
+272B 8ECD00           (asm/src/RRG23.ASM):00051          LDX #CREDST
+272E BDD0AB           (asm/src/RRG23.ASM):00052          JSR WCMOSA
+2731 9640             (asm/src/RRG23.ASM):00053          LDA PLRCNT
+2733 8002             (asm/src/RRG23.ASM):00054          SUBA #2
+2735 CC26E1           (asm/src/RRG23.ASM):00055          LDD #ST1SND
+2738 2503             (asm/src/RRG23.ASM):00056          BCS SST01
+273A CC26E6           (asm/src/RRG23.ASM):00057          LDD #ST2SND
+273D BDD04B           (asm/src/RRG23.ASM):00058         SST01 JSR SNDLD
+2740 4F               (asm/src/RRG23.ASM):00059          CLRA
+2741 ABC4             (asm/src/RRG23.ASM):00060         CKS11  ADDA   ,U       ADD NEXT BYTE
+2743 3348             (asm/src/RRG23.ASM):00061                LEAU   $8,U     NEXT ONE
+2745 1183EAB1         (asm/src/RRG23.ASM):00062                CMPU   #$EAB1
+2749 25F6             (asm/src/RRG23.ASM):00063                BLO    CKS11
+274B A7A9FABF         (asm/src/RRG23.ASM):00064                STA    -1345,Y  STORE
+274F 867F             (asm/src/RRG23.ASM):00065          LDA #$7F
+2751 9759             (asm/src/RRG23.ASM):00066          STA STATUS
+2753 BDD012           (asm/src/RRG23.ASM):00067          JSR SCRCLR
+2756 8EBDE4           (asm/src/RRG23.ASM):00068          LDX #PLDATA
+2759 6F80             (asm/src/RRG23.ASM):00069         SST1 CLR ,X+
+275B 8CBE5C           (asm/src/RRG23.ASM):00070          CMPX #PLDEND
+275E 26F9             (asm/src/RRG23.ASM):00071          BNE SST1
+2760 8ECC02           (asm/src/RRG23.ASM):00072          LDX #NSHIP GET # OF SHIPS
+2763 BDD0A2           (asm/src/RRG23.ASM):00073          JSR RCMOSA
+2766 BDD0C6           (asm/src/RRG23.ASM):00074                JSR    NEWBCH   IN BINARY PLEASE
+2769 B7BDEC           (asm/src/RRG23.ASM):00075          STA ZP1LAS
+276C 8601             (asm/src/RRG23.ASM):00076          LDA #1
+276E 973F             (asm/src/RRG23.ASM):00077          STA CURPLR
+2770 8601             (asm/src/RRG23.ASM):00078          LDA #1
+2772 B7BDED           (asm/src/RRG23.ASM):00079          STA ZP1WAV
+2775 9748             (asm/src/RRG23.ASM):00080          STA PCFLG
+2777 8ECC00           (asm/src/RRG23.ASM):00081          LDX #REPLAY
+277A BDD0A2           (asm/src/RRG23.ASM):00082          JSR RCMOSA
+277D 5F               (asm/src/RRG23.ASM):00083          CLRB
+277E 44               (asm/src/RRG23.ASM):00084          LSRA
+277F 56               (asm/src/RRG23.ASM):00085          RORB
+2780 44               (asm/src/RRG23.ASM):00086          LSRA
+2781 56               (asm/src/RRG23.ASM):00087          RORB
+2782 44               (asm/src/RRG23.ASM):00088          LSRA
+2783 56               (asm/src/RRG23.ASM):00089          RORB
+2784 44               (asm/src/RRG23.ASM):00090          LSRA
+2785 56               (asm/src/RRG23.ASM):00091          RORB
+2786 DD46             (asm/src/RRG23.ASM):00092          STD REPLA
+2788 FDBDE9           (asm/src/RRG23.ASM):00093          STD ZP1RP+1
+278B BD2B7C           (asm/src/RRG23.ASM):00094          JSR GETWV
+278E 8EBDE4           (asm/src/RRG23.ASM):00095          LDX #PLDATA
+2791 A680             (asm/src/RRG23.ASM):00096         SSTRAN LDA ,X+
+2793 A7883B           (asm/src/RRG23.ASM):00097          STA PLDLEN-1,X
+2796 8CBE20           (asm/src/RRG23.ASM):00098          CMPX #ZP1END
+2799 26F6             (asm/src/RRG23.ASM):00099          BNE SSTRAN
+279B 9640             (asm/src/RRG23.ASM):00100          LDA PLRCNT
+279D 4A               (asm/src/RRG23.ASM):00101          DECA
+279E 2603             (asm/src/RRG23.ASM):00102          BNE PLSTRT
+27A0 7FBE28           (asm/src/RRG23.ASM):00103          CLR ZP2LAS NO PLAYER 2
+27A3 867F             (asm/src/RRG23.ASM):00104         PLSTRT LDA #$7F
+27A5 9759             (asm/src/RRG23.ASM):00105          STA STATUS
+27A7 BDD045           (asm/src/RRG23.ASM):00106          JSR PLINDX
+27AA 6A08             (asm/src/RRG23.ASM):00107          DEC PLAS,X
+27AC BDD012           (asm/src/RRG23.ASM):00108          JSR SCRCLR
+27AF BDD060           (asm/src/RRG23.ASM):00109          JSR GNCIDE
+27B2 AE9F9811         (asm/src/RRG23.ASM):00110          LDX [ACTIVE] REINIT PROC STRUCT IF NO COINS
+27B6 260B             (asm/src/RRG23.ASM):00111          BNE PLS0
+27B8 BDD036           (asm/src/RRG23.ASM):00112          JSR PINIT
+                      (asm/src/RRG23.ASM):00113          MAKP PLS0
+27BB BDD054           (             MAKP):00001          JSR MAKEP
+27BE 27C3             (             MAKP):00002          FDB PLS0
+27C0 7ED096           (asm/src/RRG23.ASM):00114          JMP EXECV
+27C3 BDD033           (asm/src/RRG23.ASM):00115         PLS0 JSR CRINIT
+27C6 BD5B40           (asm/src/RRG23.ASM):00116          JSR EXINIT
+27C9 BDD030           (asm/src/RRG23.ASM):00117          JSR OINIT
+27CC BD2A21           (asm/src/RRG23.ASM):00118          JSR GTWCOL GET WALL COLOR
+27CF BDD099           (asm/src/RRG23.ASM):00119          JSR P1SW
+27D2 B6C806           (asm/src/RRG23.ASM):00120          LDA PIA3 COCKTAIL??
+27D5 2A08             (asm/src/RRG23.ASM):00121          BPL PLS000 NO
+27D7 963F             (asm/src/RRG23.ASM):00122          LDA CURPLR  PLAYER 2?
+27D9 4A               (asm/src/RRG23.ASM):00123          DECA
+27DA 2703             (asm/src/RRG23.ASM):00124          BEQ PLS000  NO
+27DC BDD09C           (asm/src/RRG23.ASM):00125          JSR P2SW
+27DF BD34AF           (asm/src/RRG23.ASM):00126         PLS000 JSR TDISP
+27E2 BDD024           (asm/src/RRG23.ASM):00127          JSR COLST
+27E5 0FF2             (asm/src/RRG23.ASM):00128          CLR RIPFLG
+27E7 9648             (asm/src/RRG23.ASM):00129          LDA PCFLG
+27E9 2605             (asm/src/RRG23.ASM):00130          BNE PLS00C
+27EB BD34C0           (asm/src/RRG23.ASM):00131          JSR WVMESS
+27EE 2036             (asm/src/RRG23.ASM):00132          BRA PLS0A NO DEATH.. NO MESSIE POOH
+27F0 FCBDE5           (asm/src/RRG23.ASM):00133         PLS00C LDD ZP1SCR+1
+27F3 260B             (asm/src/RRG23.ASM):00134          BNE PLS0C NOT GAME START
+27F5 8611             (asm/src/RRG23.ASM):00135          LDA #$11
+27F7 97CF             (asm/src/RRG23.ASM):00136          STA TEXCOL
+27F9 8671             (asm/src/RRG23.ASM):00137          LDA #113
+27FB BD5F96           (asm/src/RRG23.ASM):00138          JSR WRD5V COPYRIGHT MESSAGE
+27FE 2003             (asm/src/RRG23.ASM):00139          BRA PLS0D
+2800 BD34C0           (asm/src/RRG23.ASM):00140         PLS0C JSR WVMESS
+2803 0F48             (asm/src/RRG23.ASM):00141         PLS0D CLR PCFLG
+2805 9640             (asm/src/RRG23.ASM):00142          LDA PLRCNT
+2807 4A               (asm/src/RRG23.ASM):00143          DECA
+2808 271C             (asm/src/RRG23.ASM):00144          BEQ PLS0A 1 PLAYER GAME
+280A 9690             (asm/src/RRG23.ASM):00145          LDA PSTCOL
+280C 97CF             (asm/src/RRG23.ASM):00146          STA TEXCOL
+280E D63F             (asm/src/RRG23.ASM):00147          LDB CURPLR
+2810 8667             (asm/src/RRG23.ASM):00148          LDA #103
+2812 BD5F99           (asm/src/RRG23.ASM):00149          JSR WRD7V
+                      (asm/src/RRG23.ASM):00150          NAP 115,PLS0B PLAYER UP MESSAGE
+2815 8673             (              NAP):00001                LDA #115 TIME
+2817 8E281D           (              NAP):00002                LDX #PLS0B WAKEUP ADDR
+281A 7ED066           (              NAP):00003                JMP    SLEEP  
+281D 0FCF             (asm/src/RRG23.ASM):00151         PLS0B CLR TEXCOL
+281F D63F             (asm/src/RRG23.ASM):00152          LDB CURPLR
+2821 8667             (asm/src/RRG23.ASM):00153          LDA #103
+2823 BD5F99           (asm/src/RRG23.ASM):00154          JSR WRD7V ERASE MESSAGE
+2826 BD2B0B           (asm/src/RRG23.ASM):00155         PLS0A JSR PLRES
+2829 BD2F8C           (asm/src/RRG23.ASM):00156          JSR PLINIT
+282C 0F06             (asm/src/RRG23.ASM):00157          CLR PCRAM+6
+282E 7FC006           (asm/src/RRG23.ASM):00158          CLR CRAM+6
+2831 BD0000           (asm/src/RRG23.ASM):00159          JSR HULKST
+2834 BD1AC0           (asm/src/RRG23.ASM):00160          JSR BRNST
+2837 BD4B00           (asm/src/RRG23.ASM):00161          JSR TANKST
+283A BD0003           (asm/src/RRG23.ASM):00162          JSR HUMST
+283D BD3883           (asm/src/RRG23.ASM):00163          JSR PSINIT
+2840 BD3880           (asm/src/RRG23.ASM):00164          JSR RINIT
+2843 BD29A4           (asm/src/RRG23.ASM):00165          JSR ROBOFF
+2846 8608             (asm/src/RRG23.ASM):00166          LDA #8
+2848 9792             (asm/src/RRG23.ASM):00167          STA PSTREF DOUBLE REFRESH RATE
+                      (asm/src/RRG23.ASM):00168          MAKP PSTRPC REFRESH POSTS
+284A BDD054           (             MAKP):00001          JSR MAKEP
+284D 354B             (             MAKP):00002          FDB PSTRPC
+284F BD298F           (asm/src/RRG23.ASM):00169          JSR PSTON
+2852 BDD033           (asm/src/RRG23.ASM):00170          JSR CRINIT
+2855 BD1140           (asm/src/RRG23.ASM):00171          JSR CIRCST
+2858 BD4B03           (asm/src/RRG23.ASM):00172          JSR SQST
+285B 8619             (asm/src/RRG23.ASM):00173          LDA #$19
+285D 9759             (asm/src/RRG23.ASM):00174          STA STATUS
+285F B6BE6E           (asm/src/RRG23.ASM):00175          LDA BRNCNT BRAIN WAVE???
+2862 270D             (asm/src/RRG23.ASM):00176          BEQ PLS00 NO
+                      (asm/src/RRG23.ASM):00177          MAKP TRANST TRANSPORT EM
+2864 BDD054           (             MAKP):00001          JSR MAKEP
+2867 4140             (             MAKP):00002          FDB TRANST
+                      (asm/src/RRG23.ASM):00178          NAP 150,PLS1
+2869 8696             (              NAP):00001                LDA #150 TIME
+286B 8E2874           (              NAP):00002                LDX #PLS1 WAKEUP ADDR
+286E 7ED066           (              NAP):00003                JMP    SLEEP  
+2871 7E28FE           (asm/src/RRG23.ASM):00179         PLS00 JMP APPEAR
+2874 BD29F5           (asm/src/RRG23.ASM):00180         PLS1 JSR PAPPR PLAYER APPEAR
+2877 BD298F           (asm/src/RRG23.ASM):00181          JSR PSTON ON POSTS
+                      (asm/src/RRG23.ASM):00182          NAP 06,PLS1A
+287A 8606             (              NAP):00001                LDA #06 TIME
+287C 8E2882           (              NAP):00002                LDX #PLS1A WAKEUP ADDR
+287F 7ED066           (              NAP):00003                JMP    SLEEP  
+2882 BD29D2           (asm/src/RRG23.ASM):00183         PLS1A JSR PDAPPR DIAG PLAYER APPEAR
+                      (asm/src/RRG23.ASM):00184          NAP 4,PLS2
+2885 8604             (              NAP):00001                LDA #4 TIME
+2887 8E288D           (              NAP):00002                LDX #PLS2 WAKEUP ADDR
+288A 7ED066           (              NAP):00003                JMP    SLEEP  
+288D BD2983           (asm/src/RRG23.ASM):00185         PLS2 JSR ROBON
+                      (asm/src/RRG23.ASM):00186          MAKP LSPROC
+2890 BDD054           (             MAKP):00001          JSR MAKEP
+2893 31B5             (             MAKP):00002          FDB LSPROC
+                      (asm/src/RRG23.ASM):00187          MAKP COLCHK
+2895 BDD054           (             MAKP):00001          JSR MAKEP
+2898 30B3             (             MAKP):00002          FDB COLCHK
+289A 0F59             (asm/src/RRG23.ASM):00188          CLR STATUS
+                      (asm/src/RRG23.ASM):00189          NAP 12,PLS3
+289C 860C             (              NAP):00001                LDA #12 TIME
+289E 8E28A4           (              NAP):00002                LDX #PLS3 WAKEUP ADDR
+28A1 7ED066           (              NAP):00003                JMP    SLEEP  
+28A4 BD2983           (asm/src/RRG23.ASM):00190         PLS3 JSR ROBON TURN THEM ON
+28A7 BD298F           (asm/src/RRG23.ASM):00191          JSR PSTON
+                      (asm/src/RRG23.ASM):00192          NAP 10,PLS4
+28AA 860A             (              NAP):00001                LDA #10 TIME
+28AC 8E28B2           (              NAP):00002                LDX #PLS4 WAKEUP ADDR
+28AF 7ED066           (              NAP):00003                JMP    SLEEP  
+28B2 BD2983           (asm/src/RRG23.ASM):00193         PLS4 JSR ROBON
+28B5 BD298F           (asm/src/RRG23.ASM):00194          JSR PSTON
+28B8 8604             (asm/src/RRG23.ASM):00195          LDA #4
+28BA 9792             (asm/src/RRG23.ASM):00196          STA PSTREF STD REFRESH RATE
+28BC 0FCF             (asm/src/RRG23.ASM):00197          CLR TEXCOL OFF CPM
+28BE 8671             (asm/src/RRG23.ASM):00198          LDA #113
+28C0 BD5F96           (asm/src/RRG23.ASM):00199          JSR WRD5V
+28C3 BD34C0           (asm/src/RRG23.ASM):00200          JSR WVMESS ON WAVE #
+28C6 8E20FB           (asm/src/RRG23.ASM):00201          LDX #$20FB COPIERS TAKE NOTE:
+28C9 CE2C03           (asm/src/RRG23.ASM):00202          LDU #HIDTAB HIDDEN COPY RIGHT HERE
+28CC A6C0             (asm/src/RRG23.ASM):00203         HIDLP LDA ,U+
+28CE 885A             (asm/src/RRG23.ASM):00204          EORA #$5A
+28D0 2705             (asm/src/RRG23.ASM):00205          BEQ HIDEND
+28D2 BD5F90           (asm/src/RRG23.ASM):00206          JSR PR35V
+28D5 20F5             (asm/src/RRG23.ASM):00207          BRA HIDLP
+28D7 7E2A85           (asm/src/RRG23.ASM):00208         HIDEND JMP GEXEC
+                      (asm/src/RRG23.ASM):00209         
+28DA 2028432920313938 (asm/src/RRG23.ASM):00210                FCC    ' (C) 1982 WILLIAMS ELECTRONICS INC. '
+     322057494C4C4941
+     4D5320454C454354
+     524F4E4943532049
+     4E432E20
+                      (asm/src/RRG23.ASM):00211         *
+                      (asm/src/RRG23.ASM):00212         *MAKE YOUR ROBOTS APPEAR
+                      (asm/src/RRG23.ASM):00213         *PD=CNT,PD2=PTR,PD4=REFPTR,PD6=REF LIM
+                      (asm/src/RRG23.ASM):00214         *
+28FE DE15             (asm/src/RRG23.ASM):00215         APPEAR LDU CRPROC
+2900 6F47             (asm/src/RRG23.ASM):00216          CLR PD,U
+2902 8E9821           (asm/src/RRG23.ASM):00217          LDX #RPTR
+2905 AF49             (asm/src/RRG23.ASM):00218          STX PD2,U
+2907 9E21             (asm/src/RRG23.ASM):00219          LDX RPTR
+2909 AF4B             (asm/src/RRG23.ASM):00220          STX PD4,U
+290B AF4D             (asm/src/RRG23.ASM):00221          STX PD6,U
+290D 8601             (asm/src/RRG23.ASM):00222         APL LDA #1
+290F 3402             (asm/src/RRG23.ASM):00223          PSHS A 1/FRAME
+2911 AE49             (asm/src/RRG23.ASM):00224         APL1 LDX PD2,U GET INDEX
+2913 AE84             (asm/src/RRG23.ASM):00225          LDX ,X
+2915 2715             (asm/src/RRG23.ASM):00226          BEQ AP3 ALL DONE
+2917 BD29B5           (asm/src/RRG23.ASM):00227          JSR APCENT GET CENTER
+291A A647             (asm/src/RRG23.ASM):00228          LDA PD,U
+291C 8403             (asm/src/RRG23.ASM):00229          ANDA #3
+291E 8103             (asm/src/RRG23.ASM):00230          CMPA #3
+2920 2605             (asm/src/RRG23.ASM):00231          BNE AP1
+2922 BD5B58           (asm/src/RRG23.ASM):00232          JSR HAPST
+2925 2003             (asm/src/RRG23.ASM):00233          BRA AP2
+2927 BD5B46           (asm/src/RRG23.ASM):00234         AP1 JSR APST
+292A AF49             (asm/src/RRG23.ASM):00235         AP2 STX PD2,U
+292C 6C47             (asm/src/RRG23.ASM):00236         AP3 INC PD,U
+292E A647             (asm/src/RRG23.ASM):00237          LDA PD,U
+2930 8120             (asm/src/RRG23.ASM):00238          CMPA #32
+2932 230D             (asm/src/RRG23.ASM):00239          BLS AP4
+2934 10AE4D           (asm/src/RRG23.ASM):00240          LDY PD6,U    EXPAND REFRESH LIST
+2937 2718             (asm/src/RRG23.ASM):00241          BEQ APX1
+2939 10AEA4           (asm/src/RRG23.ASM):00242          LDY ,Y
+293C 2713             (asm/src/RRG23.ASM):00243          BEQ APX1 DONE
+293E 10AF4D           (asm/src/RRG23.ASM):00244          STY PD6,U
+2941 6AE4             (asm/src/RRG23.ASM):00245         AP4 DEC ,S
+2943 26CC             (asm/src/RRG23.ASM):00246          BNE APL1
+2945 3502             (asm/src/RRG23.ASM):00247          PULS A
+2947 8D1C             (asm/src/RRG23.ASM):00248          BSR APREF
+                      (asm/src/RRG23.ASM):00249          NAP 1,APL
+2949 8601             (              NAP):00001                LDA #1 TIME
+294B 8E290D           (              NAP):00002                LDX #APL WAKEUP ADDR
+294E 7ED066           (              NAP):00003                JMP    SLEEP  
+2951 3502             (asm/src/RRG23.ASM):00250         APX1 PULS A
+                      (asm/src/RRG23.ASM):00251          NAP 2,APX2 LET EVERYONE FINISH
+2953 8602             (              NAP):00001                LDA #2 TIME
+2955 8E295B           (              NAP):00002                LDX #APX2 WAKEUP ADDR
+2958 7ED066           (              NAP):00003                JMP    SLEEP  
+295B 8D26             (asm/src/RRG23.ASM):00252         APX2 BSR ROBON TURN EVERYONE ON
+                      (asm/src/RRG23.ASM):00253          NAP 10,PLS1
+295D 860A             (              NAP):00001                LDA #10 TIME
+295F 8E2874           (              NAP):00002                LDX #PLS1 WAKEUP ADDR
+2962 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):00254         *
+                      (asm/src/RRG23.ASM):00255         *REFRESH APEAREES
+                      (asm/src/RRG23.ASM):00256         *
+2965 3410             (asm/src/RRG23.ASM):00257         APREF PSHS X
+2967 8604             (asm/src/RRG23.ASM):00258          LDA #4 4 PER FRAME
+2969 972B             (asm/src/RRG23.ASM):00259          STA XTEMP
+296B AE4B             (asm/src/RRG23.ASM):00260          LDX PD4,U
+296D AC4D             (asm/src/RRG23.ASM):00261         APRL CMPX PD6,U
+296F 2605             (asm/src/RRG23.ASM):00262          BNE APR1
+2971 8E9821           (asm/src/RRG23.ASM):00263          LDX #RPTR
+2974 2003             (asm/src/RRG23.ASM):00264          BRA APRX
+2976 BDD018           (asm/src/RRG23.ASM):00265         APR1 JSR DMAON
+2979 AE84             (asm/src/RRG23.ASM):00266         APRX LDX ,X
+297B 0A2B             (asm/src/RRG23.ASM):00267          DEC XTEMP
+297D 26EE             (asm/src/RRG23.ASM):00268          BNE APRL
+297F AF4B             (asm/src/RRG23.ASM):00269          STX PD4,U
+2981 3590             (asm/src/RRG23.ASM):00270          PULS X,PC
+                      (asm/src/RRG23.ASM):00271         *
+                      (asm/src/RRG23.ASM):00272         *ON ROBOTS
+                      (asm/src/RRG23.ASM):00273         *
+2983 9E21             (asm/src/RRG23.ASM):00274         ROBON LDX RPTR
+2985 2707             (asm/src/RRG23.ASM):00275          BEQ ROBONX
+2987 BDD018           (asm/src/RRG23.ASM):00276         ROBON1 JSR DMAON
+298A AE84             (asm/src/RRG23.ASM):00277          LDX ,X
+298C 26F9             (asm/src/RRG23.ASM):00278          BNE ROBON1
+298E 39               (asm/src/RRG23.ASM):00279         ROBONX RTS
+                      (asm/src/RRG23.ASM):00280         *
+                      (asm/src/RRG23.ASM):00281         *ON POSTS
+                      (asm/src/RRG23.ASM):00282         *
+298F 9E23             (asm/src/RRG23.ASM):00283         PSTON LDX PPTR
+2991 270C             (asm/src/RRG23.ASM):00284          BEQ PSTONX
+2993 9690             (asm/src/RRG23.ASM):00285         PSTON1 LDA PSTCOL
+2995 BD3888           (asm/src/RRG23.ASM):00286          JSR OPON
+2998 AF9806           (asm/src/RRG23.ASM):00287          STX [OBJID,X]
+299B AE84             (asm/src/RRG23.ASM):00288         PSTONL LDX ,X
+299D 26F4             (asm/src/RRG23.ASM):00289          BNE PSTON1
+299F 39               (asm/src/RRG23.ASM):00290         PSTONX RTS
+                      (asm/src/RRG23.ASM):00291         *
+                      (asm/src/RRG23.ASM):00292         *OFF POSTS
+                      (asm/src/RRG23.ASM):00293         *
+29A0 9E23             (asm/src/RRG23.ASM):00294         PSTOFF LDX PPTR
+29A2 2002             (asm/src/RRG23.ASM):00295          BRA ROBOF0
+                      (asm/src/RRG23.ASM):00296         *
+                      (asm/src/RRG23.ASM):00297         *OFF ROBOTS
+                      (asm/src/RRG23.ASM):00298         *
+29A4 9E21             (asm/src/RRG23.ASM):00299         ROBOFF LDX RPTR
+29A6 270C             (asm/src/RRG23.ASM):00300         ROBOF0 BEQ ROBOFX
+29A8 EC04             (asm/src/RRG23.ASM):00301         ROBOF1 LDD OBJX,X
+29AA 10AE02           (asm/src/RRG23.ASM):00302          LDY OPICT,X
+29AD BDD01E           (asm/src/RRG23.ASM):00303          JSR PCTOFF
+29B0 AE84             (asm/src/RRG23.ASM):00304          LDX ,X
+29B2 26F4             (asm/src/RRG23.ASM):00305          BNE ROBOF1
+29B4 39               (asm/src/RRG23.ASM):00306         ROBOFX RTS
+                      (asm/src/RRG23.ASM):00307         *
+                      (asm/src/RRG23.ASM):00308         *APPEAR CENTER CALCULATE
+                      (asm/src/RRG23.ASM):00309         *X=OBJ, STORES CENT-CENTMP
+29B5 3446             (asm/src/RRG23.ASM):00310         APCENT PSHS D,U
+29B7 EE02             (asm/src/RRG23.ASM):00311          LDU OPICT,X X CENTER
+29B9 E6C4             (asm/src/RRG23.ASM):00312          LDB OBJW,U
+29BB A604             (asm/src/RRG23.ASM):00313          LDA OBJX,X
+29BD 48               (asm/src/RRG23.ASM):00314          ASLA
+29BE 2402             (asm/src/RRG23.ASM):00315          BCC APC1
+29C0 86FF             (asm/src/RRG23.ASM):00316          LDA #$FF
+29C2 3D               (asm/src/RRG23.ASM):00317         APC1 MUL
+29C3 AB04             (asm/src/RRG23.ASM):00318          ADDA OBJX,X
+29C5 97A6             (asm/src/RRG23.ASM):00319          STA CENTMP
+29C7 E641             (asm/src/RRG23.ASM):00320          LDB OBJH,U
+29C9 A605             (asm/src/RRG23.ASM):00321          LDA OBJY,X
+29CB 3D               (asm/src/RRG23.ASM):00322          MUL
+29CC AB05             (asm/src/RRG23.ASM):00323          ADDA OBJY,X
+29CE 97A7             (asm/src/RRG23.ASM):00324          STA CENTMP+1
+29D0 35C6             (asm/src/RRG23.ASM):00325          PULS D,U,PC
+                      (asm/src/RRG23.ASM):00326         *
+                      (asm/src/RRG23.ASM):00327         *PLAYER DIAGONAL APPEAR
+                      (asm/src/RRG23.ASM):00328         *
+29D2 8E985A           (asm/src/RRG23.ASM):00329         PDAPPR LDX #PLOBJ
+29D5 10AE02           (asm/src/RRG23.ASM):00330          LDY OPICT,X
+29D8 A621             (asm/src/RRG23.ASM):00331          LDA OBJH,Y
+29DA 3402             (asm/src/RRG23.ASM):00332          PSHS A
+29DC A6E4             (asm/src/RRG23.ASM):00333         DPAPP1 LDA ,S
+29DE 9B5F             (asm/src/RRG23.ASM):00334          ADDA PX+1
+29E0 4A               (asm/src/RRG23.ASM):00335          DECA
+29E1 97A7             (asm/src/RRG23.ASM):00336          STA CENTMP+1
+29E3 4F               (asm/src/RRG23.ASM):00337          CLRA
+29E4 BD4686           (asm/src/RRG23.ASM):00338          JSR DAPST
+29E7 43               (asm/src/RRG23.ASM):00339          COMA
+29E8 BD4686           (asm/src/RRG23.ASM):00340          JSR DAPST
+29EB A6E4             (asm/src/RRG23.ASM):00341          LDA ,S
+29ED 8003             (asm/src/RRG23.ASM):00342          SUBA #3
+29EF A7E4             (asm/src/RRG23.ASM):00343          STA ,S
+29F1 2AE9             (asm/src/RRG23.ASM):00344          BPL DPAPP1
+29F3 3582             (asm/src/RRG23.ASM):00345          PULS A,PC
+                      (asm/src/RRG23.ASM):00346         *
+                      (asm/src/RRG23.ASM):00347         *SUPER PLAYER APPEAR
+                      (asm/src/RRG23.ASM):00348         *
+29F5 8E985A           (asm/src/RRG23.ASM):00349         PAPPR LDX #PLOBJ
+29F8 10AE02           (asm/src/RRG23.ASM):00350          LDY OPICT,X
+29FB A621             (asm/src/RRG23.ASM):00351          LDA OBJH,Y
+29FD 3402             (asm/src/RRG23.ASM):00352          PSHS A
+29FF A6E4             (asm/src/RRG23.ASM):00353         PAPPR1 LDA ,S
+2A01 9B5F             (asm/src/RRG23.ASM):00354          ADDA PX+1
+2A03 4A               (asm/src/RRG23.ASM):00355          DECA
+2A04 97A7             (asm/src/RRG23.ASM):00356          STA CENTMP+1
+2A06 BD5B46           (asm/src/RRG23.ASM):00357          JSR APST VERTS
+2A09 6AE4             (asm/src/RRG23.ASM):00358          DEC ,S
+2A0B 26F2             (asm/src/RRG23.ASM):00359          BNE PAPPR1
+2A0D A6A4             (asm/src/RRG23.ASM):00360          LDA OBJW,Y
+2A0F A7E4             (asm/src/RRG23.ASM):00361          STA ,S
+2A11 A6E4             (asm/src/RRG23.ASM):00362         PAPPR2 LDA ,S
+2A13 9B5E             (asm/src/RRG23.ASM):00363          ADDA PX
+2A15 4A               (asm/src/RRG23.ASM):00364          DECA
+2A16 97A6             (asm/src/RRG23.ASM):00365          STA CENTMP
+2A18 BD5B58           (asm/src/RRG23.ASM):00366          JSR HAPST
+2A1B 6AE4             (asm/src/RRG23.ASM):00367          DEC ,S
+2A1D 26F2             (asm/src/RRG23.ASM):00368          BNE PAPPR2
+2A1F 3582             (asm/src/RRG23.ASM):00369          PULS A,PC
+                      (asm/src/RRG23.ASM):00370         *
+                      (asm/src/RRG23.ASM):00371         *GET WALL COLOR
+                      (asm/src/RRG23.ASM):00372         *
+2A21 BDD045           (asm/src/RRG23.ASM):00373         GTWCOL JSR PLINDX
+2A24 CE2A4B           (asm/src/RRG23.ASM):00374          LDU #WCTAB
+2A27 A609             (asm/src/RRG23.ASM):00375          LDA PWAV,X
+2A29 4A               (asm/src/RRG23.ASM):00376          DECA
+2A2A 8109             (asm/src/RRG23.ASM):00377         GTWL CMPA #9
+2A2C 2304             (asm/src/RRG23.ASM):00378          BLS GTW1
+2A2E 800A             (asm/src/RRG23.ASM):00379          SUBA #10
+2A30 20F8             (asm/src/RRG23.ASM):00380          BRA GTWL
+2A32 33C6             (asm/src/RRG23.ASM):00381         GTW1 LEAU A,U
+2A34 A6C4             (asm/src/RRG23.ASM):00382          LDA ,U
+2A36 978F             (asm/src/RRG23.ASM):00383          STA WALCOL
+2A38 A64A             (asm/src/RRG23.ASM):00384          LDA 10,U
+2A3A 9790             (asm/src/RRG23.ASM):00385          STA PSTCOL
+2A3C E6C814           (asm/src/RRG23.ASM):00386          LDB 20,U
+2A3F BE3886           (asm/src/RRG23.ASM):00387          LDX PSTP1
+2A42 3A               (asm/src/RRG23.ASM):00388          ABX
+2A43 9F93             (asm/src/RRG23.ASM):00389          STX PSTANI POST IMAGE
+2A45 A6C81E           (asm/src/RRG23.ASM):00390          LDA 30,U
+2A48 9791             (asm/src/RRG23.ASM):00391          STA LASCOL
+2A4A 39               (asm/src/RRG23.ASM):00392          RTS
+                      (asm/src/RRG23.ASM):00393         *WAVE COLOR TABLES
+     2A4B             (asm/src/RRG23.ASM):00394         WCTAB EQU *
+2A4B 225511EE77334488 (asm/src/RRG23.ASM):00395          FCB $22,$55,$11,$EE,$77,$33,$44,$88,$00,$CC
+     00CC
+                      (asm/src/RRG23.ASM):00396         *POST COLOR TABLES
+2A55 FFEEBBDDEEFF11BB (asm/src/RRG23.ASM):00397          FCB $FF,$EE,$BB,$DD,$EE,$FF,$11,$BB,$DD,$AA
+     DDAA
+                      (asm/src/RRG23.ASM):00398         *POST IMAGES
+2A5F 0010203040507080 (asm/src/RRG23.ASM):00399          FCB $00,$10,$20,$30,$40,$50,$70,$80,$00,$60
+     0060
+                      (asm/src/RRG23.ASM):00400         *LASER COLOR
+2A69 9900996699999911 (asm/src/RRG23.ASM):00401          FCB $99,$00,$99,$66,$99,$99,$99,$11,$AA,$99
+     AA99
+                      (asm/src/RRG23.ASM):00402         *CHECK END OF WAVE
+2A73 B6BE68           (asm/src/RRG23.ASM):00403         WVCHEK LDA ROBCNT
+2A76 BBBE6F           (asm/src/RRG23.ASM):00404          ADDA CIRCNT
+2A79 9BED             (asm/src/RRG23.ASM):00405          ADDA ENFCNT
+2A7B BBBE6E           (asm/src/RRG23.ASM):00406          ADDA BRNCNT
+2A7E BBBE71           (asm/src/RRG23.ASM):00407          ADDA TNKCNT
+2A81 BBBE70           (asm/src/RRG23.ASM):00408          ADDA SQCNT
+2A84 39               (asm/src/RRG23.ASM):00409          RTS
+                      (asm/src/RRG23.ASM):00410         *
+                      (asm/src/RRG23.ASM):00411         *GAME EXEC
+                      (asm/src/RRG23.ASM):00412         *
+2A85 DE15             (asm/src/RRG23.ASM):00413         GEXEC LDU CRPROC
+2A87 8612             (asm/src/RRG23.ASM):00414          LDA #18
+2A89 A747             (asm/src/RRG23.ASM):00415          STA PD,U
+2A8B 0FF0             (asm/src/RRG23.ASM):00416          CLR SCRFLG
+2A8D 8DE4             (asm/src/RRG23.ASM):00417         GEXEC0 BSR WVCHEK
+2A8F 2624             (asm/src/RRG23.ASM):00418          BNE GEXEC1
+2A91 BDD045           (asm/src/RRG23.ASM):00419          JSR PLINDX 
+2A94 6C09             (asm/src/RRG23.ASM):00420         GEXX INC PWAV,X
+2A96 2602             (asm/src/RRG23.ASM):00421          BNE GEXX1
+2A98 6C09             (asm/src/RRG23.ASM):00422          INC PWAV,X
+2A9A 6C08             (asm/src/RRG23.ASM):00423         GEXX1 INC PLAS,X
+2A9C CC26EB           (asm/src/RRG23.ASM):00424          LDD #WVSND
+2A9F BDD04B           (asm/src/RRG23.ASM):00425          JSR SNDLD
+2AA2 BD2B7C           (asm/src/RRG23.ASM):00426          JSR GETWV
+2AA5 BDD060           (asm/src/RRG23.ASM):00427          JSR GNCIDE
+2AA8 867F             (asm/src/RRG23.ASM):00428          LDA #$7F
+2AAA 9759             (asm/src/RRG23.ASM):00429          STA STATUS TURN EVERYTHING OFF
+2AAC BDD012           (asm/src/RRG23.ASM):00430          JSR SCRCLR
+2AAF BD5700           (asm/src/RRG23.ASM):00431          JSR RMST DO MARQUEE EFFECT
+2AB2 7E27A3           (asm/src/RRG23.ASM):00432          JMP PLSTRT
+2AB5 B6C804           (asm/src/RRG23.ASM):00433         GEXEC1 LDA    PIA2 
+2AB8 8158             (asm/src/RRG23.ASM):00434                CMPA   #$58
+2ABA 2603             (asm/src/RRG23.ASM):00435                BNE    NORIPP
+2ABC BDD069           (asm/src/RRG23.ASM):00436                JSR    RIPV
+2ABF 6A47             (asm/src/RRG23.ASM):00437         NORIPP DEC PD,U
+2AC1 2631             (asm/src/RRG23.ASM):00438          BNE GEXECX
+2AC3 860F             (asm/src/RRG23.ASM):00439          LDA #15
+2AC5 A747             (asm/src/RRG23.ASM):00440          STA PD,U
+2AC7 B6BE68           (asm/src/RRG23.ASM):00441          LDA ROBCNT TOO MANY ROBOTS
+2ACA 811E             (asm/src/RRG23.ASM):00442          CMPA #30
+2ACC 2426             (asm/src/RRG23.ASM):00443          BHS GEXECX
+2ACE CCFFFE           (asm/src/RRG23.ASM):00444          LDD #$FFFE
+2AD1 0DF0             (asm/src/RRG23.ASM):00445          TST SCRFLG
+2AD3 2603             (asm/src/RRG23.ASM):00446          BNE GEXEC2
+2AD5 CCFEFC           (asm/src/RRG23.ASM):00447          LDD #$FEFC BONE HIM FOR STALLING
+2AD8 BBBE5D           (asm/src/RRG23.ASM):00448         GEXEC2 ADDA RMXSPD
+2ADB 0FF0             (asm/src/RRG23.ASM):00449          CLR SCRFLG
+2ADD 8101             (asm/src/RRG23.ASM):00450          CMPA #1
+2ADF 2C02             (asm/src/RRG23.ASM):00451          BGE GEXEC3
+2AE1 8601             (asm/src/RRG23.ASM):00452          LDA #1
+2AE3 B7BE5D           (asm/src/RRG23.ASM):00453         GEXEC3 STA RMXSPD
+2AE6 FBBE5C           (asm/src/RRG23.ASM):00454          ADDB ROBSPD
+2AE9 F1BE5D           (asm/src/RRG23.ASM):00455          CMPB RMXSPD
+2AEC 2C03             (asm/src/RRG23.ASM):00456          BGE GEXEC4
+2AEE F6BE5D           (asm/src/RRG23.ASM):00457          LDB RMXSPD
+2AF1 F7BE5C           (asm/src/RRG23.ASM):00458         GEXEC4 STB ROBSPD
+2AF4 96EE             (asm/src/RRG23.ASM):00459         GEXECX LDA GAMTIM
+2AF6 4C               (asm/src/RRG23.ASM):00460          INCA
+2AF7 8196             (asm/src/RRG23.ASM):00461          CMPA #150 1/4 SEC. CTS
+2AF9 2506             (asm/src/RRG23.ASM):00462          BLO GEXX2
+2AFB C606             (asm/src/RRG23.ASM):00463          LDB #6    HIT THE TIMER
+2AFD BDD0BD           (asm/src/RRG23.ASM):00464          JSR AUD1
+2B00 4F               (asm/src/RRG23.ASM):00465          CLRA
+2B01 97EE             (asm/src/RRG23.ASM):00466         GEXX2 STA GAMTIM
+                      (asm/src/RRG23.ASM):00467          NAP 15,GEXEC0
+2B03 860F             (              NAP):00001                LDA #15 TIME
+2B05 8E2A8D           (              NAP):00002                LDX #GEXEC0 WAKEUP ADDR
+2B08 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):00468         *
+                      (asm/src/RRG23.ASM):00469         *PLAYER RESTORE
+                      (asm/src/RRG23.ASM):00470         *
+2B0B BDD045           (asm/src/RRG23.ASM):00471         PLRES JSR PLINDX
+2B0E 300A             (asm/src/RRG23.ASM):00472          LEAX PENEMY,X
+2B10 CEBE5C           (asm/src/RRG23.ASM):00473          LDU #ELIST
+2B13 A680             (asm/src/RRG23.ASM):00474         PLRES1 LDA ,X+
+2B15 A7C0             (asm/src/RRG23.ASM):00475          STA ,U+
+2B17 1183BE72         (asm/src/RRG23.ASM):00476          CMPU #ELEND
+2B1B 26F6             (asm/src/RRG23.ASM):00477          BNE PLRES1
+2B1D BDD045           (asm/src/RRG23.ASM):00478          JSR PLINDX
+2B20 A609             (asm/src/RRG23.ASM):00479          LDA PWAV,X
+2B22 8104             (asm/src/RRG23.ASM):00480          CMPA #4
+2B24 2232             (asm/src/RRG23.ASM):00481          BHI PLRESX NO BOZO
+2B26 E608             (asm/src/RRG23.ASM):00482          LDB PLAS,X
+2B28 DD2B             (asm/src/RRG23.ASM):00483          STD XTEMP SAVE WAVE,SHIPS
+2B2A 5D               (asm/src/RRG23.ASM):00484          TSTB
+2B2B 2712             (asm/src/RRG23.ASM):00485          BEQ BOZO LAST SHIP
+2B2D 8102             (asm/src/RRG23.ASM):00486          CMPA #2
+2B2F 2227             (asm/src/RRG23.ASM):00487          BHI PLRESX NOT WAVE 1,2
+2B31 8ECC02           (asm/src/RRG23.ASM):00488          LDX #NSHIP
+2B34 BDD0A2           (asm/src/RRG23.ASM):00489          JSR RCMOSA
+2B37 BDD0C6           (asm/src/RRG23.ASM):00490          JSR NEWBCH
+2B3A 4A               (asm/src/RRG23.ASM):00491          DECA
+2B3B 912C             (asm/src/RRG23.ASM):00492          CMPA XTEMP+1
+2B3D 2319             (asm/src/RRG23.ASM):00493          BLS PLRESX  NOT DOWN SHIPS
+2B3F 962B             (asm/src/RRG23.ASM):00494         BOZO LDA XTEMP
+2B41 8E2B55           (asm/src/RRG23.ASM):00495          LDX #BOZOTB-4
+2B44 48               (asm/src/RRG23.ASM):00496          ASLA
+2B45 48               (asm/src/RRG23.ASM):00497          ASLA
+2B46 3086             (asm/src/RRG23.ASM):00498          LEAX A,X
+2B48 EC81             (asm/src/RRG23.ASM):00499          LDD ,X++
+2B4A B7BE60           (asm/src/RRG23.ASM):00500          STA CDPTIM
+2B4D F7BE5F           (asm/src/RRG23.ASM):00501          STB ENSTIM
+2B50 EC84             (asm/src/RRG23.ASM):00502          LDD ,X
+2B52 B7BE5C           (asm/src/RRG23.ASM):00503          STA ROBSPD
+2B55 F7BE5D           (asm/src/RRG23.ASM):00504          STB RMXSPD
+2B58 39               (asm/src/RRG23.ASM):00505         PLRESX RTS
+                      (asm/src/RRG23.ASM):00506         *
+                      (asm/src/RRG23.ASM):00507         *BOZO TABLE: FOR ALL YOU BOZOS OUT THERE
+                      (asm/src/RRG23.ASM):00508         *
+     2B59             (asm/src/RRG23.ASM):00509         BOZOTB EQU *
+2B59 26601E0F         (asm/src/RRG23.ASM):00510          FCB 38,96,30,15  WAVE 1
+2B5D 2660190C         (asm/src/RRG23.ASM):00511          FCB 38,96,25,12       2
+2B61 2430140A         (asm/src/RRG23.ASM):00512          FCB 36,48,20,10       3
+2B65 1E1E0F07         (asm/src/RRG23.ASM):00513          FCB 30,30,15,7        4
+                      (asm/src/RRG23.ASM):00514         *
+                      (asm/src/RRG23.ASM):00515         *SAVE PLAYER STATE
+                      (asm/src/RRG23.ASM):00516         *
+2B69 BDD045           (asm/src/RRG23.ASM):00517         PLSAV JSR PLINDX
+2B6C 300A             (asm/src/RRG23.ASM):00518          LEAX PENEMY,X
+2B6E CEBE5C           (asm/src/RRG23.ASM):00519          LDU #ELIST
+2B71 A6C0             (asm/src/RRG23.ASM):00520         PLSAV1 LDA ,U+
+2B73 A780             (asm/src/RRG23.ASM):00521          STA ,X+
+2B75 1183BE72         (asm/src/RRG23.ASM):00522          CMPU #ELEND
+2B79 26F6             (asm/src/RRG23.ASM):00523          BNE PLSAV1
+2B7B 39               (asm/src/RRG23.ASM):00524          RTS
+                      (asm/src/RRG23.ASM):00525         *
+                      (asm/src/RRG23.ASM):00526         *GET NEXT WAVE
+                      (asm/src/RRG23.ASM):00527         *
+2B7C 8ECC14           (asm/src/RRG23.ASM):00528         GETWV LDX #GA1  GET DIFFICULTY
+2B7F BDD0A5           (asm/src/RRG23.ASM):00529          JSR RCMOSB
+2B82 BDD0B4           (asm/src/RRG23.ASM):00530          JSR BCDBIN
+2B85 BDD045           (asm/src/RRG23.ASM):00531          JSR PLINDX
+2B88 C105             (asm/src/RRG23.ASM):00532          CMPB #5 EASY SET UP??
+2B8A 2414             (asm/src/RRG23.ASM):00533          BHS GTWV0X NO
+2B8C A609             (asm/src/RRG23.ASM):00534          LDA PWAV,X
+2B8E 810E             (asm/src/RRG23.ASM):00535          CMPA #14 WAVE 14 OR GREATER
+2B90 2502             (asm/src/RRG23.ASM):00536          BLO GTWV01 NO
+2B92 C605             (asm/src/RRG23.ASM):00537          LDB #5
+2B94 8105             (asm/src/RRG23.ASM):00538         GTWV01 CMPA #5 WAVE 5 OR GT?
+2B96 2508             (asm/src/RRG23.ASM):00539          BLO GTWV0X NO
+2B98 A608             (asm/src/RRG23.ASM):00540          LDA PLAS,X 4 OR MORE LASERS LEFT?
+2B9A 8103             (asm/src/RRG23.ASM):00541          CMPA #3
+2B9C 2502             (asm/src/RRG23.ASM):00542          BLO GTWV0X  NO
+2B9E C605             (asm/src/RRG23.ASM):00543          LDB #5      YES SCREW HIM
+2BA0 C005             (asm/src/RRG23.ASM):00544         GTWV0X SUBB #5
+2BA2 D72C             (asm/src/RRG23.ASM):00545          STB XTEMP+1 SAVE SIGN
+2BA4 2A01             (asm/src/RRG23.ASM):00546          BPL GETWV0
+2BA6 50               (asm/src/RRG23.ASM):00547          NEGB
+2BA7 D72B             (asm/src/RRG23.ASM):00548         GETWV0 STB XTEMP MAGNITUDE
+2BA9 E609             (asm/src/RRG23.ASM):00549          LDB PWAV,X
+2BAB CE2C22           (asm/src/RRG23.ASM):00550          LDU #WVTAB+2
+2BAE 300A             (asm/src/RRG23.ASM):00551          LEAX PENEMY,X
+2BB0 C128             (asm/src/RRG23.ASM):00552         GETWV1 CMPB #40
+2BB2 2304             (asm/src/RRG23.ASM):00553          BLS GETWV2
+2BB4 C014             (asm/src/RRG23.ASM):00554          SUBB #20
+2BB6 20F8             (asm/src/RRG23.ASM):00555          BRA GETWV1
+     2BB8             (asm/src/RRG23.ASM):00556         GETWV2 EQU *
+2BB8 11832E24         (asm/src/RRG23.ASM):00557          CMPU #WVCNT
+2BBC 2506             (asm/src/RRG23.ASM):00558          BLO GETWV3
+2BBE 335D             (asm/src/RRG23.ASM):00559          LEAU -3,U   NO MAX/MINS
+2BC0 A6C5             (asm/src/RRG23.ASM):00560          LDA B,U
+2BC2 2031             (asm/src/RRG23.ASM):00561          BRA GETWV9
+2BC4 A6C5             (asm/src/RRG23.ASM):00562         GETWV3 LDA B,U
+2BC6 3406             (asm/src/RRG23.ASM):00563          PSHS D
+2BC8 E65E             (asm/src/RRG23.ASM):00564          LDB -2,U   GET FRACTION
+2BCA C41F             (asm/src/RRG23.ASM):00565          ANDB #$1F
+2BCC 962B             (asm/src/RRG23.ASM):00566          LDA XTEMP
+2BCE 3D               (asm/src/RRG23.ASM):00567          MUL        MULTIPLY BY MAGNITUDE
+2BCF 3502             (asm/src/RRG23.ASM):00568          PULS A
+2BD1 3D               (asm/src/RRG23.ASM):00569          MUL
+2BD2 8900             (asm/src/RRG23.ASM):00570          ADCA #0 ROUND
+2BD4 D62C             (asm/src/RRG23.ASM):00571          LDB XTEMP+1
+2BD6 E85E             (asm/src/RRG23.ASM):00572          EORB -2,U PLUS OR MINUS ????
+2BD8 3504             (asm/src/RRG23.ASM):00573          PULS B
+2BDA 2A09             (asm/src/RRG23.ASM):00574          BPL GETWV4
+2BDC 40               (asm/src/RRG23.ASM):00575          NEGA
+2BDD 2706             (asm/src/RRG23.ASM):00576          BEQ GETWV4 ZERO CASE
+2BDF ABC5             (asm/src/RRG23.ASM):00577          ADDA B,U
+2BE1 2506             (asm/src/RRG23.ASM):00578          BCS GETWV5 O.K.
+2BE3 2008             (asm/src/RRG23.ASM):00579          BRA GETWV6 UNDERFLOW GET MIN
+2BE5 ABC5             (asm/src/RRG23.ASM):00580         GETWV4 ADDA B,U
+2BE7 250A             (asm/src/RRG23.ASM):00581          BCS GETWV8 OVERFLOW GET MAX
+2BE9 A15F             (asm/src/RRG23.ASM):00582         GETWV5 CMPA -1,U CHECK MIN
+2BEB 2402             (asm/src/RRG23.ASM):00583          BHS GETWV7
+2BED A65F             (asm/src/RRG23.ASM):00584         GETWV6 LDA -1,U
+2BEF A1C4             (asm/src/RRG23.ASM):00585         GETWV7 CMPA ,U
+2BF1 2302             (asm/src/RRG23.ASM):00586          BLS GETWV9
+2BF3 A6C4             (asm/src/RRG23.ASM):00587         GETWV8 LDA ,U
+2BF5 A780             (asm/src/RRG23.ASM):00588         GETWV9 STA ,X+
+2BF7 33C82B           (asm/src/RRG23.ASM):00589          LEAU 43,U
+2BFA 11832F8B         (asm/src/RRG23.ASM):00590          CMPU #WVTEND-1
+2BFE 25B8             (asm/src/RRG23.ASM):00591          BLO GETWV2
+2C00 6F80             (asm/src/RRG23.ASM):00592          CLR ,X+ GET TANK COUNT
+2C02 39               (asm/src/RRG23.ASM):00593          RTS
+2C03 0119067A6B636268 (asm/src/RRG23.ASM):00594         HIDTAB FCB $01,$19,$06,$7A,$6B,$63,$62,$68,$7A,$0D,$13,$16,$16,$13,$1B
+     7A0D131616131B
+2C12 17097A1F161F1967 (asm/src/RRG23.ASM):00595          FCB $17,$09,$7A,$1F,$16,$1F,$19,$67,$7A,$13,$14,$19,$67,$5A
+     7A131419675A
+     2C20             (asm/src/RRG23.ASM):00596         WVTAB EQU *
+2C20 8E0A14           (asm/src/RRG23.ASM):00597          FCB $8E,10,20 SIGN/DELTA,MIN,MAX
+2C23 140F0F0F0F0F0F0F (asm/src/RRG23.ASM):00598          FCB 20,15,15,15,15,15,15,15,15,15,14,14,14,14,14,13,13,13,13,13 ROBSPD
+     0F0F0E0E0E0E0E0D
+     0D0D0D0D
+2C37 0E0E0E0E0E0E0D0D (asm/src/RRG23.ASM):00599          FCB 14,14,14,14,14,14,13,13,13,13,13,13,12,12,12,12,12,12,15,12
+     0D0D0D0D0C0C0C0C
+     0C0C0F0C
+2C4B 8E030A           (asm/src/RRG23.ASM):00600          FCB $8E,03,10
+2C4E 0907060505050504 (asm/src/RRG23.ASM):00601          FCB 09,07,06,05,05,05,05,04,04,04,04,04,04,04,04,04,04,04,04,04 RMXSPD
+     0404040404040404
+     04040404
+2C62 0404040404040303 (asm/src/RRG23.ASM):00602          FCB 04,04,04,04,04,04,03,03,04,03,03,03,03,03,03,03,03,03,04,03
+     0403030303030303
+     03030403
+2C76 0E080C           (asm/src/RRG23.ASM):00603          FCB $0E,$08,12
+2C79 0A0A0A0A0A0A0A0A (asm/src/RRG23.ASM):00604          FCB 10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10 ENFNUM
+     0A0A0A0A0A0A0A0A
+     0A0A0A0A
+2C8D 0B0B0B0B0B0B0B0B (asm/src/RRG23.ASM):00605          FCB 11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11
+     0B0B0B0B0B0B0B0B
+     0B0B0B0B
+2CA1 8E0D28           (asm/src/RRG23.ASM):00606          FCB $8E,13,40
+2CA4 1E1C1A1816141212 (asm/src/RRG23.ASM):00607          FCB 30,28,26,24,22,20,18,18,16,14,14,14,14,14,14,14,14,14,14,14 ENSTIM
+     100E0E0E0E0E0E0E
+     0E0E0E0E
+2CB8 0F0F0F0F0F0F0F0F (asm/src/RRG23.ASM):00608          FCB 15,15,15,15,15,15,15,15,15,14,14,14,14,14,14,14,14,14,14,14
+     0F0E0E0E0E0E0E0E
+     0E0E0E0E
+2CCC 8E0C28           (asm/src/RRG23.ASM):00609          FCB $8E,12,40
+2CCF 1E1C1A181E141210 (asm/src/RRG23.ASM):00610          FCB 30,28,26,24,30,20,18,16,18,25,12,12,12,25,25,12,12,12,18,20 CDPTIM
+     12190C0C0C19190C
+     0C0C1214
+2CE3 0E0E0E0E0E190E0E (asm/src/RRG23.ASM):00611          FCB 14,14,14,14,14,25,14,14,18,25,12,12,12,12,25,12,12,12,18,20
+     12190C0C0C0C190C
+     0C0C1214
+2CF7 8E0509           (asm/src/RRG23.ASM):00612          FCB $8E,05,09
+2CFA 0808070707070706 (asm/src/RRG23.ASM):00613          FCB 08,08,07,07,07,07,07,06,06,06,06,05,05,05,05,05,05,05,05,05 HLKSPD
+     0606060505050505
+     05050505
+2D0E 0505050505050505 (asm/src/RRG23.ASM):00614          FCB 05,05,05,05,05,05,05,05,05,05,05,05,05,05,05,05,05,05,05,05
+     0505050505050505
+     05050505
+2D22 8E1950           (asm/src/RRG23.ASM):00615          FCB $8E,25,80
+2D25 4040404040282826 (asm/src/RRG23.ASM):00616          FCB 64,64,64,64,64,40,40,38,38,38,38,38,38,38,38,38,36,36,36,36 BSHTIM
+     2626262626262626
+     24242424
+2D39 202020202020201E (asm/src/RRG23.ASM):00617          FCB 32,32,32,32,32,32,32,30,30,30,30,30,25,25,25,25,25,25,25,25
+     1E1E1E1E19191919
+     19191919
+2D4D 8E060A           (asm/src/RRG23.ASM):00618          FCB $8E,6,10
+2D50 0808080808070707 (asm/src/RRG23.ASM):00619          FCB 08,08,08,08,08,07,07,07,07,07,07,07,07,07,07,06,06,06,06,06 BRNSPD
+     0707070707070706
+     06060606
+2D64 0606060606060606 (asm/src/RRG23.ASM):00620          FCB 06,06,06,06,06,06,06,06,06,06,06,06,06,06,06,06,06,06,06,06
+     0606060606060606
+     06060606
+2D78 8E1428           (asm/src/RRG23.ASM):00621          FCB $8E,20,40
+2D7B 202020202020201E (asm/src/RRG23.ASM):00622          FCB 32,32,32,32,32,32,32,30,30,30,30,30,30,28,28,28,28,28,28,28 THKSHT
+     1E1E1E1E1E1C1C1C
+     1C1C1C1C
+2D8F 1E1E1E1E1E1E1C1C (asm/src/RRG23.ASM):00623          FCB 30,30,30,30,30,30,28,28,28,28,28,26,26,26,26,26,24,24,24,24 
+     1C1C1C1A1A1A1A1A
+     18181818
+2DA3 0EA0FF           (asm/src/RRG23.ASM):00624          FCB $0E,$A0,$FF
+2DA6 B0B0B0B0B0B0B0B0 (asm/src/RRG23.ASM):00625          FDB $B0B0,$B0B0,$B0B0,$B0B0,$B0B0,$B0B0,$B0B0,$B0B0,$B0B0,$B0B0 SHLSPD
+     B0B0B0B0B0B0B0B0
+     B0B0B0B0
+2DBA B8B8B8B8B8B8B8B8 (asm/src/RRG23.ASM):00626          FDB $B8B8,$B8B8,$B8B8,$B8B8,$B8B8,$C0C0,$C0C0,$C0C0,$C0C0,$C0C0
+     B8B8C0C0C0C0C0C0
+     C0C0C0C0
+2DCE 8E0C30           (asm/src/RRG23.ASM):00627          FCB $8E,$0C,$30
+2DD1 1010101010101010 (asm/src/RRG23.ASM):00628          FDB $1010,$1010,$1010,$1010,$1010,$1010,$1010,$0F0F,$0F0F,$0F0F TDPTIM
+     1010101010100F0F
+     0F0F0F0F
+2DE5 0E0E0E0E0E0E0E0E (asm/src/RRG23.ASM):00629          FDB $0E0E,$0E0E,$0E0E,$0E0E,$0E0E,$0E0E,$0E0E,$0E0E,$0E0E,$0E0E
+     0E0E0E0E0E0E0E0E
+     0E0E0E0E
+2DF9 0E2844           (asm/src/RRG23.ASM):00630          FCB $0E,$28,$44
+2DFC 3232323232323232 (asm/src/RRG23.ASM):00631          FDB $3232,$3232,$3232,$3232,$3232,$3232,$3838,$3838,$3838,$3838 SQSPD
+     3232323238383838
+     38383838
+2E10 3838383838383838 (asm/src/RRG23.ASM):00632          FDB $3838,$3838,$3838,$3838,$3C3C,$3C3C,$3C3C,$3C3C,$3C3C,$3C3C
+     3C3C3C3C3C3C3C3C
+     3C3C3C3C
+     2E24             (asm/src/RRG23.ASM):00633         WVCNT EQU *
+2E24 0F11162214200023 (asm/src/RRG23.ASM):00634          FCB 15,17,22,34,20,32,00,35,60,25,35,00,35,27,25,35,00,35,70,25 ROBCNT
+     3C192300231B1923
+     00234619
+2E38 2300230019230023 (asm/src/RRG23.ASM):00635          FCB 35,00,35,00,25,35,00,35,75,25,35,00,35,30,27,35,00,35,80,30
+     4B192300231E1B23
+     0023501E
+2E4C 050F191914190019 (asm/src/RRG23.ASM):00636          FCB 05,15,25,25,20,25,00,25,00,20,25,00,25,05,20,25,00,25,00,20 PSTCNT
+     0014190019051419
+     00190014
+2E60 1900190014190019 (asm/src/RRG23.ASM):00637          FCB 25,00,25,00,20,25,00,25,00,20,25,00,25,00,15,25,00,25,00,15
+     0014190019000F19
+     0019000F
+2E74 010102020F030403 (asm/src/RRG23.ASM):00638          FCB 01,01,02,02,15,03,04,03,03,00,03,03,03,05,00,03,03,03,03,08 MOMCNT
+     0300030303050003
+     03030308
+2E88 0303030319030303 (asm/src/RRG23.ASM):00639          FCB 03,03,03,03,25,03,03,03,03,00,03,03,03,03,00,03,03,03,03,10
+     0300030303030003
+     0303030A
+2E9C 0101020200030403 (asm/src/RRG23.ASM):00640          FCB 01,01,02,02,00,03,04,03,03,22,03,03,03,05,00,03,03,03,03,08 DADCNT
+     0316030303050003
+     03030308
+2EB0 0303030300030303 (asm/src/RRG23.ASM):00641          FCB 03,03,03,03,00,03,03,03,03,25,03,03,03,03,00,03,03,03,03,10
+     0319030303030003
+     0303030A
+2EC4 0001020201030403 (asm/src/RRG23.ASM):00642          FCB 00,01,02,02,01,03,04,03,03,00,03,03,03,05,22,03,03,03,03,08 KIDCNT
+     0300030303051603
+     03030308
+2ED8 0303030301030303 (asm/src/RRG23.ASM):00643          FCB 03,03,03,03,01,03,03,03,03,00,03,03,03,03,25,03,03,03,03,10
+     0300030303031903
+     0303030A
+2EEC 0005060700070C08 (asm/src/RRG23.ASM):00644          FCB 00,05,06,07,00,07,12,08,04,00,08,13,08,20,02,03,14,08,03,02 HLKCNT
+     0400080D08140203
+     0E080302
+2F00 080F080D01081008 (asm/src/RRG23.ASM):00645          FCB 08,15,08,13,01,08,16,08,04,01,08,16,08,25,02,08,16,08,06,02
+     0401081008190208
+     10080602
+2F14 000000000F000000 (asm/src/RRG23.ASM):00646          FCB 00,00,00,00,15,00,00,00,00,20,00,00,00,00,20,00,00,00,00,20 BRNCNT
+     0014000000001400
+     00000014
+2F28 0000000015000000 (asm/src/RRG23.ASM):00647          FCB 00,00,00,00,21,00,00,00,00,22,00,00,00,00,23,00,00,00,00,25
+     0016000000001700
+     00000019
+2F3C 0001030401040005 (asm/src/RRG23.ASM):00648          FCB 00,01,03,04,01,04,00,05,05,01,05,00,05,02,01,05,00,05,05,02 CIRCNT
+     0501050005020105
+     00050502
+2F50 0500050601050005 (asm/src/RRG23.ASM):00649          FCB 05,00,05,06,01,05,00,05,05,01,05,00,05,02,01,05,00,05,05,01
+     0501050005020105
+     00050501
+2F64 0000000000000A00 (asm/src/RRG23.ASM):00650          FCB 00,00,00,00,00,00,10,00,00,00,00,12,00,00,00,00,12,00,00,00 SQCNT
+     0000000C00000000
+     0C000000
+2F78 000C000700000C01 (asm/src/RRG23.ASM):00651          FCB 00,12,00,07,00,00,12,01,01,01,01,13,01,02,02,02,14,02,01,01
+     0101010D01020202
+     0E020101
+     2F8C             (asm/src/RRG23.ASM):00652         WVTEND EQU *
+                      (asm/src/RRG23.ASM):00653         *
+                      (asm/src/RRG23.ASM):00654         *PLAYER INITIALIZE
+                      (asm/src/RRG23.ASM):00655         *
+2F8C 8E985A           (asm/src/RRG23.ASM):00656         PLINIT LDX #PLOBJ
+2F8F CC3603           (asm/src/RRG23.ASM):00657          LDD #MANDP1
+2F92 ED02             (asm/src/RRG23.ASM):00658          STD OPICT,X
+2F94 ED8814           (asm/src/RRG23.ASM):00659          STD OLDPIC,X
+2F97 0F70             (asm/src/RRG23.ASM):00660          CLR PLAIMC ANI COUNT+NUM
+2F99 0F71             (asm/src/RRG23.ASM):00661          CLR PLAIMN
+2F9B CC307B           (asm/src/RRG23.ASM):00662          LDD #PISD
+2F9E DD72             (asm/src/RRG23.ASM):00663          STD PLAIMB ANI BASE
+2FA0 CC4A7C           (asm/src/RRG23.ASM):00664          LDD #PCOORD
+2FA3 ED04             (asm/src/RRG23.ASM):00665          STD OBJX,X
+2FA5 A70A             (asm/src/RRG23.ASM):00666          STA OX16,X
+2FA7 6F0B             (asm/src/RRG23.ASM):00667          CLR OX16+1,X
+2FA9 E70C             (asm/src/RRG23.ASM):00668          STB OY16,X
+2FAB 6F0D             (asm/src/RRG23.ASM):00669          CLR OY16+1,X
+2FAD 0F87             (asm/src/RRG23.ASM):00670          CLR LCNT
+2FAF 0F48             (asm/src/RRG23.ASM):00671          CLR PCFLG
+2FB1 0F8D             (asm/src/RRG23.ASM):00672          CLR SAVCNT MAN SAVED COUNTER
+2FB3 0F8E             (asm/src/RRG23.ASM):00673          CLR BCMCNT
+2FB5 0F8A             (asm/src/RRG23.ASM):00674          CLR SPKCNT
+2FB7 0F95             (asm/src/RRG23.ASM):00675          CLR BRNFLG
+2FB9 0FED             (asm/src/RRG23.ASM):00676          CLR ENFCNT
+2FBB 8602             (asm/src/RRG23.ASM):00677          LDA #2
+2FBD 97EF             (asm/src/RRG23.ASM):00678          STA TNKSPD
+2FBF 0FF1             (asm/src/RRG23.ASM):00679          CLR SHLCNT
+2FC1 39               (asm/src/RRG23.ASM):00680          RTS
+                      (asm/src/RRG23.ASM):00681         *
+                      (asm/src/RRG23.ASM):00682         *PLAYER MOTION+OUTPUT
+                      (asm/src/RRG23.ASM):00683         *
+2FC2 9659             (asm/src/RRG23.ASM):00684         PLAYRV LDA STATUS
+2FC4 8501             (asm/src/RRG23.ASM):00685          BITA #$01
+2FC6 2701             (asm/src/RRG23.ASM):00686          BEQ PL00
+2FC8 39               (asm/src/RRG23.ASM):00687          RTS
+2FC9 4D               (asm/src/RRG23.ASM):00688         PL00 TSTA
+2FCA 2A04             (asm/src/RRG23.ASM):00689          BPL PL01
+2FCC 9652             (asm/src/RRG23.ASM):00690          LDA ATRSW2 FONY SWITCH
+2FCE 2003             (asm/src/RRG23.ASM):00691          BRA PL02
+2FD0 B6C804           (asm/src/RRG23.ASM):00692         PL01 LDA PIA2
+2FD3 8E985A           (asm/src/RRG23.ASM):00693         PL02 LDX #PLOBJ
+2FD6 CE3031           (asm/src/RRG23.ASM):00694          LDU #PITAB
+2FD9 840F             (asm/src/RRG23.ASM):00695          ANDA #$F
+2FDB 48               (asm/src/RRG23.ASM):00696          ASLA
+2FDC 48               (asm/src/RRG23.ASM):00697          ASLA
+2FDD 33C6             (asm/src/RRG23.ASM):00698          LEAU A,U
+2FDF ECC4             (asm/src/RRG23.ASM):00699          LDD ,U GET YOUR TABLE ENTRY FOR SWITCH POSITION
+2FE1 DB66             (asm/src/RRG23.ASM):00700          ADDB PY16
+2FE3 C118             (asm/src/RRG23.ASM):00701          CMPB #YMIN
+2FE5 2506             (asm/src/RRG23.ASM):00702          BLO PL1
+2FE7 C1DF             (asm/src/RRG23.ASM):00703          CMPB #YMAX-11
+2FE9 2202             (asm/src/RRG23.ASM):00704          BHI PL1
+2FEB D766             (asm/src/RRG23.ASM):00705          STB PY16
+2FED 5F               (asm/src/RRG23.ASM):00706         PL1 CLRB
+2FEE 47               (asm/src/RRG23.ASM):00707          ASRA
+2FEF 56               (asm/src/RRG23.ASM):00708          RORB
+2FF0 D364             (asm/src/RRG23.ASM):00709          ADDD PX16
+2FF2 8107             (asm/src/RRG23.ASM):00710          CMPA #XMIN
+2FF4 2506             (asm/src/RRG23.ASM):00711          BLO PL2
+2FF6 818C             (asm/src/RRG23.ASM):00712          CMPA #XMAX-3
+2FF8 2202             (asm/src/RRG23.ASM):00713          BHI PL2
+2FFA DD64             (asm/src/RRG23.ASM):00714          STD PX16
+2FFC EC42             (asm/src/RRG23.ASM):00715         PL2 LDD 2,U
+2FFE 2730             (asm/src/RRG23.ASM):00716          BEQ PLXX NO IMAGE CHANGE
+3000 109372           (asm/src/RRG23.ASM):00717          CMPD PLAIMB BASE CHANGE?
+3003 2706             (asm/src/RRG23.ASM):00718          BEQ PL3
+3005 DD72             (asm/src/RRG23.ASM):00719          STD PLAIMB
+3007 0F71             (asm/src/RRG23.ASM):00720          CLR PLAIMN
+3009 0F70             (asm/src/RRG23.ASM):00721          CLR PLAIMC
+300B D670             (asm/src/RRG23.ASM):00722         PL3 LDB PLAIMC COUNT READY?
+300D 2617             (asm/src/RRG23.ASM):00723          BNE PL10
+300F DE72             (asm/src/RRG23.ASM):00724          LDU PLAIMB
+3011 9671             (asm/src/RRG23.ASM):00725          LDA PLAIMN
+3013 E6C6             (asm/src/RRG23.ASM):00726          LDB A,U
+3015 2604             (asm/src/RRG23.ASM):00727          BNE PL4
+3017 0F71             (asm/src/RRG23.ASM):00728          CLR PLAIMN END OF SEQUENCE
+3019 E6C4             (asm/src/RRG23.ASM):00729          LDB ,U
+301B 0C71             (asm/src/RRG23.ASM):00730         PL4 INC PLAIMN
+301D 5A               (asm/src/RRG23.ASM):00731          DECB
+301E 58               (asm/src/RRG23.ASM):00732          ASLB
+301F 58               (asm/src/RRG23.ASM):00733          ASLB
+3020 4F               (asm/src/RRG23.ASM):00734          CLRA
+3021 C335EB           (asm/src/RRG23.ASM):00735          ADDD #MANLP1
+3024 DD5C             (asm/src/RRG23.ASM):00736          STD PPICT
+3026 9670             (asm/src/RRG23.ASM):00737         PL10 LDA PLAIMC
+3028 4C               (asm/src/RRG23.ASM):00738          INCA 
+3029 8102             (asm/src/RRG23.ASM):00739          CMPA #2
+302B 2501             (asm/src/RRG23.ASM):00740          BLO PL11
+302D 4F               (asm/src/RRG23.ASM):00741          CLRA
+302E 9770             (asm/src/RRG23.ASM):00742         PL11 STA PLAIMC
+3030 39               (asm/src/RRG23.ASM):00743         PLXX RTS 
+                      (asm/src/RRG23.ASM):00744         *
+                      (asm/src/RRG23.ASM):00745         *PLAYER IMAGE TABLE
+                      (asm/src/RRG23.ASM):00746         *DX,DY,IMAGE SEQ
+                      (asm/src/RRG23.ASM):00747         *B0=U,B1=D,B2=L,B3=R
+3031 00000000         (asm/src/RRG23.ASM):00748         PITAB FDB 0,0     0000
+3035 00FF3080         (asm/src/RRG23.ASM):00749          FDB $00FF,PISU    0001 U
+3039 0001307B         (asm/src/RRG23.ASM):00750          FDB $0001,PISD    0010 D 
+303D 00000000         (asm/src/RRG23.ASM):00751          FDB $0,0          0011 
+3041 FF003071         (asm/src/RRG23.ASM):00752          FDB $FF00,PISL    0100 L
+3045 FFFF3071         (asm/src/RRG23.ASM):00753          FDB $FFFF,PISL    0101 U+L
+3049 FF013071         (asm/src/RRG23.ASM):00754          FDB $FF01,PISL    0110 D+L
+304D 00000000         (asm/src/RRG23.ASM):00755          FDB 0,0           0111
+3051 01003076         (asm/src/RRG23.ASM):00756          FDB $0100,PISR    1000 R
+3055 01FF3076         (asm/src/RRG23.ASM):00757          FDB $01FF,PISR    1001 U+R
+3059 01013076         (asm/src/RRG23.ASM):00758          FDB $0101,PISR    1010 D+R
+305D 00000000         (asm/src/RRG23.ASM):00759          FDB 0,0           1011
+3061 00000000         (asm/src/RRG23.ASM):00760          FDB 0,0           1100
+3065 00000000         (asm/src/RRG23.ASM):00761          FDB 0,0           1101
+3069 00000000         (asm/src/RRG23.ASM):00762          FDB 0,0           1110
+306D 00000000         (asm/src/RRG23.ASM):00763          FDB 0,0           1111
+                      (asm/src/RRG23.ASM):00764         *
+                      (asm/src/RRG23.ASM):00765         *PLAYER ANIMATION TABLE
+                      (asm/src/RRG23.ASM):00766         *
+3071 0102010300       (asm/src/RRG23.ASM):00767         PISL FCB 1,2,1,3,0
+3076 0405040600       (asm/src/RRG23.ASM):00768         PISR FCB 4,5,4,6,0
+307B 0708070900       (asm/src/RRG23.ASM):00769         PISD FCB  7,8,7,9,0
+3080 0A0B0A0C00       (asm/src/RRG23.ASM):00770         PISU FCB 10,11,10,12,0
+                      (asm/src/RRG23.ASM):00771         *
+                      (asm/src/RRG23.ASM):00772         *CHECK FOR OBSTACLE
+                      (asm/src/RRG23.ASM):00773         *CARDBOARD BOX
+                      (asm/src/RRG23.ASM):00774         *D= SCREEN ADDR X,Y
+                      (asm/src/RRG23.ASM):00775         *X=OBJ,U=LIST TO CHECK AGAINST
+                      (asm/src/RRG23.ASM):00776         *RET NE IF BLOCKED, EQ OTHERWISE
+3085 3446             (asm/src/RRG23.ASM):00777         CKOBSV PSHS U,D
+3087 3406             (asm/src/RRG23.ASM):00778          PSHS D
+3089 E39802           (asm/src/RRG23.ASM):00779          ADDD [OPICT,X]
+308C 3406             (asm/src/RRG23.ASM):00780          PSHS D
+308E 201B             (asm/src/RRG23.ASM):00781          BRA CKOBLP
+3090 EC44             (asm/src/RRG23.ASM):00782         CKOB1 LDD OBJX,U
+3092 A1E4             (asm/src/RRG23.ASM):00783          CMPA ,S
+3094 2415             (asm/src/RRG23.ASM):00784          BHS CKOBLP
+3096 E161             (asm/src/RRG23.ASM):00785          CMPB 1,S
+3098 2411             (asm/src/RRG23.ASM):00786          BHS CKOBLP
+309A E3D802           (asm/src/RRG23.ASM):00787          ADDD [OPICT,U]
+309D A162             (asm/src/RRG23.ASM):00788          CMPA 2,S
+309F 230A             (asm/src/RRG23.ASM):00789          BLS CKOBLP
+30A1 E163             (asm/src/RRG23.ASM):00790          CMPB 3,S
+30A3 2306             (asm/src/RRG23.ASM):00791          BLS CKOBLP
+30A5 3440             (asm/src/RRG23.ASM):00792          PSHS U IS IT ITSELF??
+30A7 ACE1             (asm/src/RRG23.ASM):00793          CMPX ,S++
+30A9 2604             (asm/src/RRG23.ASM):00794          BNE CKOBX NOPE
+30AB EEC4             (asm/src/RRG23.ASM):00795         CKOBLP LDU ,U
+30AD 26E1             (asm/src/RRG23.ASM):00796          BNE CKOB1
+30AF 3264             (asm/src/RRG23.ASM):00797         CKOBX LEAS 4,S CLEAN UP YOUR MESS
+30B1 35C6             (asm/src/RRG23.ASM):00798          PULS U,D,PC
+                      (asm/src/RRG23.ASM):00799         *
+                      (asm/src/RRG23.ASM):00800         *CHECK PLAYER COLLISION
+                      (asm/src/RRG23.ASM):00801         *
+30B3 8601             (asm/src/RRG23.ASM):00802         COLCHK LDA #1
+30B5 9748             (asm/src/RRG23.ASM):00803          STA PCFLG
+30B7 DC5E             (asm/src/RRG23.ASM):00804          LDD PX PLAYER
+30B9 DE6E             (asm/src/RRG23.ASM):00805          LDU POLDPC
+30BB 8E9821           (asm/src/RRG23.ASM):00806          LDX #RPTR ROBOTS
+30BE BDD027           (asm/src/RRG23.ASM):00807          JSR COL0
+30C1 262C             (asm/src/RRG23.ASM):00808          BNE PLEND DIE
+30C3 DC5E             (asm/src/RRG23.ASM):00809          LDD PX
+30C5 DE6E             (asm/src/RRG23.ASM):00810          LDU POLDPC 
+30C7 8E9823           (asm/src/RRG23.ASM):00811          LDX #PPTR  POSTS (FATAL OBSTACLES)
+30CA BDD027           (asm/src/RRG23.ASM):00812          JSR COL0
+30CD 2620             (asm/src/RRG23.ASM):00813          BNE PLEND
+30CF DC5E             (asm/src/RRG23.ASM):00814          LDD PX
+30D1 DE6E             (asm/src/RRG23.ASM):00815          LDU POLDPC
+30D3 8E9817           (asm/src/RRG23.ASM):00816          LDX #OPTR   MOTION OBJECTS
+30D6 BDD027           (asm/src/RRG23.ASM):00817          JSR COL0
+30D9 2614             (asm/src/RRG23.ASM):00818          BNE PLEND
+30DB DC5E             (asm/src/RRG23.ASM):00819          LDD PX      HUMANS
+30DD DE6E             (asm/src/RRG23.ASM):00820          LDU POLDPC
+30DF 8E981F           (asm/src/RRG23.ASM):00821          LDX #HPTR
+30E2 BDD027           (asm/src/RRG23.ASM):00822          JSR COL0
+30E5 0F48             (asm/src/RRG23.ASM):00823          CLR PCFLG
+                      (asm/src/RRG23.ASM):00824          NAP 1,COLCHK
+30E7 8601             (              NAP):00001                LDA #1 TIME
+30E9 8E30B3           (              NAP):00002                LDX #COLCHK WAKEUP ADDR
+30EC 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):00825         *
+                      (asm/src/RRG23.ASM):00826         *PLAYER DEAD
+                      (asm/src/RRG23.ASM):00827         * 
+30EF CC26D9           (asm/src/RRG23.ASM):00828         PLEND LDD #PDSND
+30F2 BDD04B           (asm/src/RRG23.ASM):00829          JSR SNDLD
+30F5 861B             (asm/src/RRG23.ASM):00830          LDA #$1B
+30F7 9759             (asm/src/RRG23.ASM):00831          STA STATUS
+30F9 BDD060           (asm/src/RRG23.ASM):00832          JSR GNCIDE
+30FC C607             (asm/src/RRG23.ASM):00833          LDB #7
+30FE BDD0BD           (asm/src/RRG23.ASM):00834          JSR AUD1 MEN PLAYED
+3101 BDD024           (asm/src/RRG23.ASM):00835          JSR COLST START YOUR COLORS
+3104 BD5B4C           (asm/src/RRG23.ASM):00836          JSR PDEATH GO FOR IT...
+3107 BDD045           (asm/src/RRG23.ASM):00837          JSR PLINDX
+310A B6BDEC           (asm/src/RRG23.ASM):00838          LDA ZP1LAS
+310D BABE28           (asm/src/RRG23.ASM):00839          ORA ZP2LAS
+3110 261E             (asm/src/RRG23.ASM):00840          BNE PLEND1
+3112 86FF             (asm/src/RRG23.ASM):00841          LDA #$FF
+3114 9759             (asm/src/RRG23.ASM):00842          STA STATUS
+3116 CC1C0A           (asm/src/RRG23.ASM):00843          LDD #$1C0A  GAME OVER MESSAGE
+3119 8E3C7E           (asm/src/RRG23.ASM):00844          LDX #$3C7E
+311C BDD01B           (asm/src/RRG23.ASM):00845          JSR BLKCLR
+311F 8628             (asm/src/RRG23.ASM):00846          LDA #40
+3121 C6AA             (asm/src/RRG23.ASM):00847          LDB #$AA
+3123 D7CF             (asm/src/RRG23.ASM):00848          STB TEXCOL
+3125 BD5F99           (asm/src/RRG23.ASM):00849          JSR WRD7V
+                      (asm/src/RRG23.ASM):00850          NAP 120,ENDPRC
+3128 8678             (              NAP):00001                LDA #120 TIME
+312A 8EE3D3           (              NAP):00002                LDX #ENDPRC WAKEUP ADDR
+312D 7ED066           (              NAP):00003                JMP    SLEEP  
+3130 BDD045           (asm/src/RRG23.ASM):00851         PLEND1 JSR PLINDX
+3133 A60B             (asm/src/RRG23.ASM):00852          LDA RMXSPD-ELIST+PENEMY,X RESTORE MAX SPEED
+3135 B7BE5D           (asm/src/RRG23.ASM):00853          STA RMXSPD
+3138 B1BE5C           (asm/src/RRG23.ASM):00854          CMPA ROBSPD
+313B 2303             (asm/src/RRG23.ASM):00855          BLS PLEND2
+313D B7BE5C           (asm/src/RRG23.ASM):00856          STA ROBSPD
+3140 4F               (asm/src/RRG23.ASM):00857         PLEND2 CLRA
+3141 D6ED             (asm/src/RRG23.ASM):00858          LDB ENFCNT CONVERT LEFTOVER ENFORCERS INTO CIRCLES
+3143 271E             (asm/src/RRG23.ASM):00859          BEQ PLE2C
+3145 C004             (asm/src/RRG23.ASM):00860         PLE0A SUBB #4
+3147 2B03             (asm/src/RRG23.ASM):00861          BMI PLE1A
+3149 4C               (asm/src/RRG23.ASM):00862          INCA
+314A 20F9             (asm/src/RRG23.ASM):00863          BRA PLE0A
+314C 4D               (asm/src/RRG23.ASM):00864         PLE1A TSTA
+314D 2606             (asm/src/RRG23.ASM):00865          BNE PLE2A
+314F 7DBE6F           (asm/src/RRG23.ASM):00866          TST CIRCNT
+3152 2601             (asm/src/RRG23.ASM):00867          BNE PLE2A
+3154 4C               (asm/src/RRG23.ASM):00868          INCA
+3155 BBBE6F           (asm/src/RRG23.ASM):00869         PLE2A ADDA CIRCNT
+3158 A1881D           (asm/src/RRG23.ASM):00870          CMPA CIRCNT-ELIST+PENEMY,X NO MORE THAN YOU STARTED WITH
+315B 2303             (asm/src/RRG23.ASM):00871          BLS PLE2B
+315D A6881D           (asm/src/RRG23.ASM):00872          LDA CIRCNT-ELIST+PENEMY,X
+3160 B7BE6F           (asm/src/RRG23.ASM):00873         PLE2B STA CIRCNT
+3163 BD2B69           (asm/src/RRG23.ASM):00874         PLE2C JSR PLSAV 
+3166 BDD045           (asm/src/RRG23.ASM):00875         PLEND3 JSR PLINDX
+3169 E608             (asm/src/RRG23.ASM):00876          LDB PLAS,X
+316B 261C             (asm/src/RRG23.ASM):00877          BNE PLE1B
+316D CC1C20           (asm/src/RRG23.ASM):00878          LDD #$1C20 PLAYER N GAME OVER MESSAGE
+3170 8E3C77           (asm/src/RRG23.ASM):00879          LDX #$3C77
+3173 BDD01B           (asm/src/RRG23.ASM):00880          JSR BLKCLR
+3176 864B             (asm/src/RRG23.ASM):00881          LDA #75
+3178 C6AA             (asm/src/RRG23.ASM):00882          LDB #$AA
+317A D7CF             (asm/src/RRG23.ASM):00883          STB TEXCOL
+317C D63F             (asm/src/RRG23.ASM):00884          LDB CURPLR
+317E BD5F99           (asm/src/RRG23.ASM):00885          JSR WRD7V
+                      (asm/src/RRG23.ASM):00886          NAP $60,PLE1B
+3181 8660             (              NAP):00001                LDA #$60 TIME
+3183 8E3189           (              NAP):00002                LDX #PLE1B WAKEUP ADDR
+3186 7ED066           (              NAP):00003                JMP    SLEEP  
+3189 963F             (asm/src/RRG23.ASM):00887         PLE1B LDA CURPLR
+318B 8803             (asm/src/RRG23.ASM):00888         PLE1 EORA #3
+318D BDD048           (asm/src/RRG23.ASM):00889          JSR PLDX
+3190 E608             (asm/src/RRG23.ASM):00890          LDB PLAS,X
+3192 27F7             (asm/src/RRG23.ASM):00891          BEQ PLE1
+3194 973F             (asm/src/RRG23.ASM):00892          STA CURPLR
+3196 7E27A3           (asm/src/RRG23.ASM):00893          JMP PLSTRT
+                      (asm/src/RRG23.ASM):00894         *
+                      (asm/src/RRG23.ASM):00895         *RANDOM X,Y->D ON PLAYFIELD FOR OBJECT X
+                      (asm/src/RRG23.ASM):00896         *
+     3199             (asm/src/RRG23.ASM):00897         RNDXYV EQU *
+3199 EC9802           (asm/src/RRG23.ASM):00898          LDD [OPICT,X]
+319C 3406             (asm/src/RRG23.ASM):00899          PSHS D
+319E 8688             (asm/src/RRG23.ASM):00900          LDA #XMAX-XMIN
+31A0 A0E0             (asm/src/RRG23.ASM):00901          SUBA ,S+
+31A2 BDD042           (asm/src/RRG23.ASM):00902          JSR RANDU
+31A5 8B06             (asm/src/RRG23.ASM):00903          ADDA #XMIN-1
+31A7 1F89             (asm/src/RRG23.ASM):00904          TFR A,B
+31A9 86D2             (asm/src/RRG23.ASM):00905          LDA #YMAX-YMIN
+31AB A0E0             (asm/src/RRG23.ASM):00906          SUBA ,S+
+31AD BDD042           (asm/src/RRG23.ASM):00907          JSR RANDU
+31B0 8B17             (asm/src/RRG23.ASM):00908          ADDA #YMIN-1
+31B2 1E89             (asm/src/RRG23.ASM):00909          EXG A,B
+31B4 39               (asm/src/RRG23.ASM):00910          RTS
+                      (asm/src/RRG23.ASM):00911         *LASER START
+31B5 6F47             (asm/src/RRG23.ASM):00912         LSPROC CLR PD,U PREV STATE
+31B7 6F48             (asm/src/RRG23.ASM):00913          CLR PD1,U  TIMECOUNT
+31B9 9659             (asm/src/RRG23.ASM):00914         LSPLP LDA STATUS
+31BB 2A04             (asm/src/RRG23.ASM):00915          BPL LSP0
+31BD DC52             (asm/src/RRG23.ASM):00916          LDD ATRSW2
+31BF 2006             (asm/src/RRG23.ASM):00917          BRA LSP00
+31C1 B6C804           (asm/src/RRG23.ASM):00918         LSP0 LDA PIA2
+31C4 F6C806           (asm/src/RRG23.ASM):00919          LDB PIA3
+31C7 54               (asm/src/RRG23.ASM):00920         LSP00 LSRB
+31C8 46               (asm/src/RRG23.ASM):00921          RORA
+31C9 54               (asm/src/RRG23.ASM):00922          LSRB 
+31CA 46               (asm/src/RRG23.ASM):00923          RORA
+31CB 84F0             (asm/src/RRG23.ASM):00924          ANDA #$F0
+31CD E647             (asm/src/RRG23.ASM):00925          LDB PD,U
+31CF A747             (asm/src/RRG23.ASM):00926          STA PD,U
+31D1 E147             (asm/src/RRG23.ASM):00927          CMPB PD,U
+31D3 2654             (asm/src/RRG23.ASM):00928          BNE LSPX
+31D5 6C48             (asm/src/RRG23.ASM):00929          INC PD1,U
+31D7 E648             (asm/src/RRG23.ASM):00930          LDB PD1,U
+31D9 C102             (asm/src/RRG23.ASM):00931          CMPB #2
+31DB 2704             (asm/src/RRG23.ASM):00932          BEQ LSP1
+31DD C407             (asm/src/RRG23.ASM):00933          ANDB #$7
+31DF 264E             (asm/src/RRG23.ASM):00934          BNE LSPNAP
+31E1 D687             (asm/src/RRG23.ASM):00935         LSP1 LDB LCNT
+31E3 C104             (asm/src/RRG23.ASM):00936          CMPB #4
+31E5 2446             (asm/src/RRG23.ASM):00937          BHS LSPX1
+31E7 0D13             (asm/src/RRG23.ASM):00938          TST FREE
+31E9 2744             (asm/src/RRG23.ASM):00939          BEQ LSPNAP NO MORE PROCS
+31EB 44               (asm/src/RRG23.ASM):00940          LSRA
+31EC 44               (asm/src/RRG23.ASM):00941          LSRA
+31ED 3402             (asm/src/RRG23.ASM):00942          PSHS A
+31EF 44               (asm/src/RRG23.ASM):00943          LSRA
+31F0 ABE0             (asm/src/RRG23.ASM):00944          ADDA ,S+
+31F2 108E3237         (asm/src/RRG23.ASM):00945          LDY #LTAB
+31F6 31A6             (asm/src/RRG23.ASM):00946          LEAY A,Y
+31F8 8142             (asm/src/RRG23.ASM):00947          CMPA #LTEND-LTAB
+31FA 2433             (asm/src/RRG23.ASM):00948          BHS LSPNAP DUD
+31FC AEA4             (asm/src/RRG23.ASM):00949          LDX ,Y
+31FE 272F             (asm/src/RRG23.ASM):00950          BEQ LSPNAP DUD
+3200 4F               (asm/src/RRG23.ASM):00951          CLRA
+3201 BDD057           (asm/src/RRG23.ASM):00952          JSR MKPROC
+3204 1F13             (asm/src/RRG23.ASM):00953          TFR X,U
+3206 BDD051           (asm/src/RRG23.ASM):00954          JSR GETOBJ
+3209 AF47             (asm/src/RRG23.ASM):00955          STX PD,U
+320B EC24             (asm/src/RRG23.ASM):00956          LDD 4,Y
+320D C335AE           (asm/src/RRG23.ASM):00957          ADDD #LLPIC
+3210 ED02             (asm/src/RRG23.ASM):00958          STD OPICT,X
+3212 ED8814           (asm/src/RRG23.ASM):00959          STD OLDPIC,X
+3215 DC5E             (asm/src/RRG23.ASM):00960          LDD PX 
+3217 AB22             (asm/src/RRG23.ASM):00961          ADDA 2,Y
+3219 A70A             (asm/src/RRG23.ASM):00962          STA OX16,X
+321B EB23             (asm/src/RRG23.ASM):00963          ADDB 3,Y
+321D E70C             (asm/src/RRG23.ASM):00964          STB OY16,X
+321F 0C87             (asm/src/RRG23.ASM):00965          INC LCNT
+3221 CC26F0           (asm/src/RRG23.ASM):00966          LDD #LASSND
+3224 BDD04B           (asm/src/RRG23.ASM):00967          JSR SNDLD
+3227 2006             (asm/src/RRG23.ASM):00968          BRA LSPNAP
+3229 6F48             (asm/src/RRG23.ASM):00969         LSPX CLR PD1,U
+322B 2002             (asm/src/RRG23.ASM):00970          BRA LSPNAP
+322D 6A48             (asm/src/RRG23.ASM):00971         LSPX1 DEC PD1,U
+322F                  (asm/src/RRG23.ASM):00972         LSPNAP NAP 1,LSPLP
+322F 8601             (              NAP):00001                LDA #1 TIME
+3231 8E31B9           (              NAP):00002                LDX #LSPLP WAKEUP ADDR
+3234 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):00973         *LASER TABLE: ROUTINE,XY OFFSET,OBJECT
+     3237             (asm/src/RRG23.ASM):00974         LTAB EQU *
+3237 000000000000     (asm/src/RRG23.ASM):00975          FDB 0,0,0 0000 CASE
+323D 32AD02FF0004     (asm/src/RRG23.ASM):00976          FDB ULASR,$02FF,4  0001
+3243 32C702040004     (asm/src/RRG23.ASM):00977          FDB DLASR,$0204,4  0010
+3249 000000000000     (asm/src/RRG23.ASM):00978          FDB 0,0,0 0011
+324F 329300040000     (asm/src/RRG23.ASM):00979          FDB LLASR,$0004,0 0100
+3255 33FF0000000C     (asm/src/RRG23.ASM):00980          FDB ULLASR,$0000,12 0101
+325B 33DC00040008     (asm/src/RRG23.ASM):00981          FDB DLLASR,$0004,8 0110
+3261 000000000000     (asm/src/RRG23.ASM):00982          FDB 0,0,0 0111
+3267 327902040000     (asm/src/RRG23.ASM):00983          FDB RLASR,$0204,0 1000
+326D 342202000008     (asm/src/RRG23.ASM):00984          FDB URLASR,$0200,8 1001
+3273 34450204000C     (asm/src/RRG23.ASM):00985          FDB DRLASR,$0204,12 1010
+     3279             (asm/src/RRG23.ASM):00986         LTEND EQU *
+                      (asm/src/RRG23.ASM):00987         *RT. LASER
+3279 AE47             (asm/src/RRG23.ASM):00988         RLASR LDX PD,U
+327B A60A             (asm/src/RRG23.ASM):00989          LDA OX16,X
+327D 8B03             (asm/src/RRG23.ASM):00990          ADDA #3
+327F 818D             (asm/src/RRG23.ASM):00991          CMPA #XMAX-2
+3281 225E             (asm/src/RRG23.ASM):00992          BHI RLDIE
+3283 A70A             (asm/src/RRG23.ASM):00993          STA OX16,X
+3285 CC0100           (asm/src/RRG23.ASM):00994          LDD #$0100
+3288 BD346B           (asm/src/RRG23.ASM):00995          JSR LASOUT
+                      (asm/src/RRG23.ASM):00996          NAP 1,RLASR
+328B 8601             (              NAP):00001                LDA #1 TIME
+328D 8E3279           (              NAP):00002                LDX #RLASR WAKEUP ADDR
+3290 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):00997         *LEFT LASER
+3293 AE47             (asm/src/RRG23.ASM):00998         LLASR LDX PD,U
+3295 A60A             (asm/src/RRG23.ASM):00999          LDA OX16,X
+3297 8003             (asm/src/RRG23.ASM):01000          SUBA #3
+3299 8107             (asm/src/RRG23.ASM):01001          CMPA #XMIN
+329B 2548             (asm/src/RRG23.ASM):01002          BLO LLDIE
+329D A70A             (asm/src/RRG23.ASM):01003          STA OX16,X
+329F CCFF00           (asm/src/RRG23.ASM):01004          LDD #$FF00
+32A2 BD346B           (asm/src/RRG23.ASM):01005          JSR LASOUT
+                      (asm/src/RRG23.ASM):01006          NAP 1,LLASR
+32A5 8601             (              NAP):00001                LDA #1 TIME
+32A7 8E3293           (              NAP):00002                LDX #LLASR WAKEUP ADDR
+32AA 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01007         *UP LASER
+32AD AE47             (asm/src/RRG23.ASM):01008         ULASR LDX PD,U
+32AF A60C             (asm/src/RRG23.ASM):01009          LDA OY16,X
+32B1 8BFA             (asm/src/RRG23.ASM):01010          ADDA #-6
+32B3 8118             (asm/src/RRG23.ASM):01011          CMPA #YMIN
+32B5 2534             (asm/src/RRG23.ASM):01012          BLO ULDIE
+32B7 A70C             (asm/src/RRG23.ASM):01013          STA OY16,X
+32B9 CC00FF           (asm/src/RRG23.ASM):01014          LDD #$00FF
+32BC BD346B           (asm/src/RRG23.ASM):01015          JSR LASOUT
+                      (asm/src/RRG23.ASM):01016          NAP 1,ULASR
+32BF 8601             (              NAP):00001                LDA #1 TIME
+32C1 8E32AD           (              NAP):00002                LDX #ULASR WAKEUP ADDR
+32C4 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01017         *DOWN LASER
+32C7 AE47             (asm/src/RRG23.ASM):01018         DLASR LDX PD,U
+32C9 A60C             (asm/src/RRG23.ASM):01019          LDA OY16,X
+32CB 8B06             (asm/src/RRG23.ASM):01020          ADDA #6
+32CD 81E5             (asm/src/RRG23.ASM):01021          CMPA #YMAX-5
+32CF 221E             (asm/src/RRG23.ASM):01022          BHI DLDIE
+32D1 A70C             (asm/src/RRG23.ASM):01023          STA OY16,X
+32D3 CC0001           (asm/src/RRG23.ASM):01024          LDD #$0001
+32D6 BD346B           (asm/src/RRG23.ASM):01025          JSR LASOUT
+                      (asm/src/RRG23.ASM):01026          NAP 1,DLASR
+32D9 8601             (              NAP):00001                LDA #1 TIME
+32DB 8E32C7           (              NAP):00002                LDX #DLASR WAKEUP ADDR
+32DE 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01027         *
+                      (asm/src/RRG23.ASM):01028         *LASER OUT OF BOUNDS
+                      (asm/src/RRG23.ASM):01029         *
+32E1 8690             (asm/src/RRG23.ASM):01030         RLDIE LDA #XMAX+1 RT LASER DIE
+32E3 2002             (asm/src/RRG23.ASM):01031          BRA LLDIE1
+32E5 8606             (asm/src/RRG23.ASM):01032         LLDIE LDA #XMIN-1 LFT LASER DIE
+32E7 E60C             (asm/src/RRG23.ASM):01033         LLDIE1 LDB OY16,X
+32E9 200A             (asm/src/RRG23.ASM):01034          BRA LASDIH
+32EB C617             (asm/src/RRG23.ASM):01035         ULDIE LDB #YMIN-1
+32ED 2002             (asm/src/RRG23.ASM):01036          BRA DLDIE1
+32EF C6EB             (asm/src/RRG23.ASM):01037         DLDIE LDB #YMAX+1
+32F1 A60A             (asm/src/RRG23.ASM):01038         DLDIE1 LDA OX16,X GLOW POINT
+32F3 202F             (asm/src/RRG23.ASM):01039          BRA LASDIV
+                      (asm/src/RRG23.ASM):01040         *
+                      (asm/src/RRG23.ASM):01041         *LASER DIE HORIZONTAL
+                      (asm/src/RRG23.ASM):01042         *
+32F5 ED49             (asm/src/RRG23.ASM):01043         LASDIH STD PD2,U
+32F7 BD34A3           (asm/src/RRG23.ASM):01044          JSR LASOFF
+32FA AE49             (asm/src/RRG23.ASM):01045          LDX PD2,U
+32FC 9691             (asm/src/RRG23.ASM):01046          LDA LASCOL
+32FE D691             (asm/src/RRG23.ASM):01047          LDB LASCOL
+3300 ED1F             (asm/src/RRG23.ASM):01048          STD -1,X
+3302 A701             (asm/src/RRG23.ASM):01049          STA 1,X
+                      (asm/src/RRG23.ASM):01050          NAP 2,LDH1
+3304 8602             (              NAP):00001                LDA #2 TIME
+3306 8E330C           (              NAP):00002                LDX #LDH1 WAKEUP ADDR
+3309 7ED066           (              NAP):00003                JMP    SLEEP  
+330C 968F             (asm/src/RRG23.ASM):01051         LDH1 LDA WALCOL
+330E AE49             (asm/src/RRG23.ASM):01052          LDX PD2,U
+3310 A71F             (asm/src/RRG23.ASM):01053          STA -1,X
+3312 A701             (asm/src/RRG23.ASM):01054          STA 1,X
+                      (asm/src/RRG23.ASM):01055          NAP 1,LDH2
+3314 8601             (              NAP):00001                LDA #1 TIME
+3316 8E331C           (              NAP):00002                LDX #LDH2 WAKEUP ADDR
+3319 7ED066           (              NAP):00003                JMP    SLEEP  
+331C 968F             (asm/src/RRG23.ASM):01056         LDH2 LDA WALCOL
+331E A7D809           (asm/src/RRG23.ASM):01057          STA [PD2,U]
+3321 7ED063           (asm/src/RRG23.ASM):01058          JMP SUCIDE
+                      (asm/src/RRG23.ASM):01059         *
+                      (asm/src/RRG23.ASM):01060         *LASER DIE VERTICAL
+                      (asm/src/RRG23.ASM):01061         *
+3324 C1EA             (asm/src/RRG23.ASM):01062         LASDIV CMPB #YMAX
+3326 2402             (asm/src/RRG23.ASM):01063          BHS LDV0
+3328 C616             (asm/src/RRG23.ASM):01064          LDB #YMIN-2
+332A 8106             (asm/src/RRG23.ASM):01065         LDV0 CMPA #XMIN-1
+332C 2201             (asm/src/RRG23.ASM):01066          BHI LDV00
+332E 4C               (asm/src/RRG23.ASM):01067          INCA
+332F ED49             (asm/src/RRG23.ASM):01068         LDV00 STD PD2,U
+3331 BD34A3           (asm/src/RRG23.ASM):01069          JSR LASOFF
+3334 9691             (asm/src/RRG23.ASM):01070          LDA LASCOL
+3336 D691             (asm/src/RRG23.ASM):01071          LDB LASCOL
+3338 AE49             (asm/src/RRG23.ASM):01072          LDX PD2,U
+333A ED84             (asm/src/RRG23.ASM):01073          STD ,X
+333C 968F             (asm/src/RRG23.ASM):01074          LDA WALCOL
+333E 84F0             (asm/src/RRG23.ASM):01075          ANDA #$F0
+3340 3402             (asm/src/RRG23.ASM):01076          PSHS A
+3342 9691             (asm/src/RRG23.ASM):01077          LDA LASCOL
+3344 840F             (asm/src/RRG23.ASM):01078          ANDA #$0F
+3346 ABE0             (asm/src/RRG23.ASM):01079          ADDA ,S+
+3348 1F89             (asm/src/RRG23.ASM):01080          TFR A,B
+334A ED89FF00         (asm/src/RRG23.ASM):01081          STD -$100,X
+                      (asm/src/RRG23.ASM):01082          NAP 2,LDV1
+334E 8602             (              NAP):00001                LDA #2 TIME
+3350 8E3356           (              NAP):00002                LDX #LDV1 WAKEUP ADDR
+3353 7ED066           (              NAP):00003                JMP    SLEEP  
+3356 AE49             (asm/src/RRG23.ASM):01083         LDV1 LDX PD2,U
+3358 968F             (asm/src/RRG23.ASM):01084          LDA WALCOL
+335A D68F             (asm/src/RRG23.ASM):01085          LDB WALCOL
+335C ED89FF00         (asm/src/RRG23.ASM):01086          STD -$100,X
+3360 840F             (asm/src/RRG23.ASM):01087          ANDA #$0F
+3362 C40F             (asm/src/RRG23.ASM):01088          ANDB #$0F
+3364 3406             (asm/src/RRG23.ASM):01089          PSHS D
+3366 9691             (asm/src/RRG23.ASM):01090          LDA LASCOL
+3368 D691             (asm/src/RRG23.ASM):01091          LDB LASCOL
+336A 84F0             (asm/src/RRG23.ASM):01092          ANDA #$F0
+336C C4F0             (asm/src/RRG23.ASM):01093          ANDB #$F0
+336E E3E1             (asm/src/RRG23.ASM):01094          ADDD ,S++
+3370 ED84             (asm/src/RRG23.ASM):01095          STD ,X
+                      (asm/src/RRG23.ASM):01096          NAP 1,LDV2
+3372 8601             (              NAP):00001                LDA #1 TIME
+3374 8E337A           (              NAP):00002                LDX #LDV2 WAKEUP ADDR
+3377 7ED066           (              NAP):00003                JMP    SLEEP  
+337A 968F             (asm/src/RRG23.ASM):01097         LDV2 LDA WALCOL
+337C D68F             (asm/src/RRG23.ASM):01098          LDB WALCOL
+337E EDD809           (asm/src/RRG23.ASM):01099          STD [PD2,U]
+3381 7ED063           (asm/src/RRG23.ASM):01100          JMP SUCIDE DONE!!!
+3384 7E32F5           (asm/src/RRG23.ASM):01101         LASDH JMP LASDIH
+3387 209B             (asm/src/RRG23.ASM):01102         LASDV BRA LASDIV
+                      (asm/src/RRG23.ASM):01103         *
+                      (asm/src/RRG23.ASM):01104         *LASER DIE SCAN
+                      (asm/src/RRG23.ASM):01105         *FIND WHERE WE RAN OFF
+3389 D72C             (asm/src/RRG23.ASM):01106         LDSCAN STB XTEMP+1
+338B 5F               (asm/src/RRG23.ASM):01107          CLRB
+338C 47               (asm/src/RRG23.ASM):01108          ASRA
+338D 56               (asm/src/RRG23.ASM):01109          RORB
+338E DD2D             (asm/src/RRG23.ASM):01110          STD XTEMP2
+3390 1F20             (asm/src/RRG23.ASM):01111          TFR Y,D
+3392 AB0A             (asm/src/RRG23.ASM):01112          ADDA OX16,X
+3394 EB0C             (asm/src/RRG23.ASM):01113          ADDB OY16,X
+3396 A70A             (asm/src/RRG23.ASM):01114          STA OX16,X
+3398 E70C             (asm/src/RRG23.ASM):01115          STB OY16,X
+339A DC2D             (asm/src/RRG23.ASM):01116         LDSCXL LDD XTEMP2
+339C E30A             (asm/src/RRG23.ASM):01117          ADDD OX16,X
+339E ED0A             (asm/src/RRG23.ASM):01118          STD OX16,X
+33A0 E60C             (asm/src/RRG23.ASM):01119          LDB OY16,X
+33A2 DB2C             (asm/src/RRG23.ASM):01120          ADDB XTEMP+1
+33A4 E70C             (asm/src/RRG23.ASM):01121          STB OY16,X
+33A6 C1EA             (asm/src/RRG23.ASM):01122          CMPB #YMAX
+33A8 22DD             (asm/src/RRG23.ASM):01123          BHI LASDV
+33AA C118             (asm/src/RRG23.ASM):01124          CMPB #YMIN
+33AC 25D9             (asm/src/RRG23.ASM):01125          BLO LASDV
+33AE 818F             (asm/src/RRG23.ASM):01126          CMPA #XMAX
+33B0 22D2             (asm/src/RRG23.ASM):01127          BHI LASDH
+33B2 8107             (asm/src/RRG23.ASM):01128          CMPA #XMIN
+33B4 25CE             (asm/src/RRG23.ASM):01129          BLO LASDH
+33B6 20E2             (asm/src/RRG23.ASM):01130          BRA LDSCXL
+                      (asm/src/RRG23.ASM):01131         *
+                      (asm/src/RRG23.ASM):01132         *DOWN LEFT DIE
+33B8 108E0005         (asm/src/RRG23.ASM):01133         DLLDIE LDY #$0005
+33BC CCFF01           (asm/src/RRG23.ASM):01134          LDD #$FF01
+33BF 20C8             (asm/src/RRG23.ASM):01135          BRA LDSCAN
+                      (asm/src/RRG23.ASM):01136         *UP LEFT DIE
+33C1 108E0000         (asm/src/RRG23.ASM):01137         ULLDIE LDY #$0000
+33C5 CCFFFF           (asm/src/RRG23.ASM):01138          LDD #$FFFF
+33C8 20BF             (asm/src/RRG23.ASM):01139          BRA LDSCAN
+                      (asm/src/RRG23.ASM):01140         *UP RIGHT DIE
+33CA 108E0200         (asm/src/RRG23.ASM):01141         URLDIE LDY #$0200
+33CE CC01FF           (asm/src/RRG23.ASM):01142          LDD #$01FF
+33D1 20B6             (asm/src/RRG23.ASM):01143          BRA LDSCAN
+                      (asm/src/RRG23.ASM):01144         *DOWN RT DIE
+33D3 108E0205         (asm/src/RRG23.ASM):01145         DRLDIE LDY #$0205
+33D7 CC0101           (asm/src/RRG23.ASM):01146          LDD #$0101
+33DA 20AD             (asm/src/RRG23.ASM):01147          BRA LDSCAN
+                      (asm/src/RRG23.ASM):01148         *DOWN LEFT DIAG LASER
+33DC AE47             (asm/src/RRG23.ASM):01149         DLLASR LDX PD,U
+33DE A60A             (asm/src/RRG23.ASM):01150          LDA OX16,X
+33E0 8003             (asm/src/RRG23.ASM):01151          SUBA #3
+33E2 E60C             (asm/src/RRG23.ASM):01152          LDB OY16,X
+33E4 CB06             (asm/src/RRG23.ASM):01153          ADDB #6
+33E6 8107             (asm/src/RRG23.ASM):01154          CMPA #XMIN
+33E8 25CE             (asm/src/RRG23.ASM):01155          BLO DLLDIE
+33EA C1E5             (asm/src/RRG23.ASM):01156          CMPB #YMAX-5
+33EC 22CA             (asm/src/RRG23.ASM):01157          BHI DLLDIE
+33EE A70A             (asm/src/RRG23.ASM):01158          STA OX16,X
+33F0 E70C             (asm/src/RRG23.ASM):01159          STB OY16,X
+33F2 CCFF01           (asm/src/RRG23.ASM):01160          LDD #$FF01
+33F5 8D74             (asm/src/RRG23.ASM):01161          BSR LASOUT
+                      (asm/src/RRG23.ASM):01162          NAP 1,DLLASR
+33F7 8601             (              NAP):00001                LDA #1 TIME
+33F9 8E33DC           (              NAP):00002                LDX #DLLASR WAKEUP ADDR
+33FC 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01163         *UPPER LEFT DIAG
+33FF AE47             (asm/src/RRG23.ASM):01164         ULLASR LDX PD,U
+3401 A60A             (asm/src/RRG23.ASM):01165          LDA OX16,X
+3403 8003             (asm/src/RRG23.ASM):01166          SUBA #3
+3405 8107             (asm/src/RRG23.ASM):01167          CMPA #XMIN
+3407 25B8             (asm/src/RRG23.ASM):01168          BLO ULLDIE
+3409 E60C             (asm/src/RRG23.ASM):01169          LDB OY16,X
+340B C006             (asm/src/RRG23.ASM):01170          SUBB #6
+340D C118             (asm/src/RRG23.ASM):01171          CMPB #YMIN
+340F 25B0             (asm/src/RRG23.ASM):01172          BLO ULLDIE
+3411 A70A             (asm/src/RRG23.ASM):01173          STA OX16,X
+3413 E70C             (asm/src/RRG23.ASM):01174          STB OY16,X
+3415 CCFFFF           (asm/src/RRG23.ASM):01175          LDD #$FFFF
+3418 8D51             (asm/src/RRG23.ASM):01176          BSR LASOUT
+                      (asm/src/RRG23.ASM):01177          NAP 1,ULLASR
+341A 8601             (              NAP):00001                LDA #1 TIME
+341C 8E33FF           (              NAP):00002                LDX #ULLASR WAKEUP ADDR
+341F 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01178         *UPPER RIGHT DIAG
+3422 AE47             (asm/src/RRG23.ASM):01179         URLASR LDX PD,U
+3424 A60A             (asm/src/RRG23.ASM):01180          LDA OX16,X
+3426 8B03             (asm/src/RRG23.ASM):01181          ADDA #3
+3428 818D             (asm/src/RRG23.ASM):01182          CMPA #XMAX-2
+342A 229E             (asm/src/RRG23.ASM):01183          BHI URLDIE
+342C E60C             (asm/src/RRG23.ASM):01184          LDB OY16,X
+342E C006             (asm/src/RRG23.ASM):01185          SUBB #6
+3430 C118             (asm/src/RRG23.ASM):01186          CMPB #YMIN
+3432 2596             (asm/src/RRG23.ASM):01187          BLO URLDIE
+3434 A70A             (asm/src/RRG23.ASM):01188          STA OX16,X
+3436 E70C             (asm/src/RRG23.ASM):01189          STB OY16,X
+3438 CC01FF           (asm/src/RRG23.ASM):01190          LDD #$01FF
+343B 8D2E             (asm/src/RRG23.ASM):01191          BSR LASOUT
+                      (asm/src/RRG23.ASM):01192          NAP 1,URLASR
+343D 8601             (              NAP):00001                LDA #1 TIME
+343F 8E3422           (              NAP):00002                LDX #URLASR WAKEUP ADDR
+3442 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01193         *DOWN RT DIAG
+3445 AE47             (asm/src/RRG23.ASM):01194         DRLASR LDX PD,U
+3447 A60A             (asm/src/RRG23.ASM):01195          LDA OX16,X
+3449 8B03             (asm/src/RRG23.ASM):01196          ADDA #3
+344B 818D             (asm/src/RRG23.ASM):01197          CMPA #XMAX-2
+344D 2284             (asm/src/RRG23.ASM):01198          BHI DRLDIE
+344F E60C             (asm/src/RRG23.ASM):01199          LDB OY16,X
+3451 CB06             (asm/src/RRG23.ASM):01200          ADDB #6
+3453 C1E5             (asm/src/RRG23.ASM):01201          CMPB #YMAX-5
+3455 2303             (asm/src/RRG23.ASM):01202          BLS DRL1
+3457 7E33D3           (asm/src/RRG23.ASM):01203          JMP DRLDIE
+345A A70A             (asm/src/RRG23.ASM):01204         DRL1 STA OX16,X
+345C E70C             (asm/src/RRG23.ASM):01205          STB OY16,X
+345E CC0101           (asm/src/RRG23.ASM):01206          LDD #$0101
+3461 8D08             (asm/src/RRG23.ASM):01207          BSR LASOUT 
+                      (asm/src/RRG23.ASM):01208          NAP 1,DRLASR
+3463 8601             (              NAP):00001                LDA #1 TIME
+3465 8E3445           (              NAP):00002                LDX #DRLASR WAKEUP ADDR
+3468 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01209         *OUTPUT LASER
+346B DD88             (asm/src/RRG23.ASM):01210         LASOUT STD LASDIR SAVE DIRECTION FOR HITS
+346D BDD08D           (asm/src/RRG23.ASM):01211          JSR DMAOFN
+3470 3450             (asm/src/RRG23.ASM):01212          PSHS U,X
+3472 EE02             (asm/src/RRG23.ASM):01213          LDU OPICT,X
+3474 EC04             (asm/src/RRG23.ASM):01214          LDD OBJX,X
+3476 8E9823           (asm/src/RRG23.ASM):01215          LDX #PPTR
+3479 BDD027           (asm/src/RRG23.ASM):01216          JSR COL0
+347C 261E             (asm/src/RRG23.ASM):01217          BNE LASDIE
+347E AEE4             (asm/src/RRG23.ASM):01218          LDX ,S
+3480 EE02             (asm/src/RRG23.ASM):01219          LDU OPICT,X
+3482 EC04             (asm/src/RRG23.ASM):01220          LDD OBJX,X
+3484 8E9821           (asm/src/RRG23.ASM):01221          LDX #RPTR
+3487 BDD027           (asm/src/RRG23.ASM):01222          JSR COL0
+348A 2610             (asm/src/RRG23.ASM):01223          BNE LASDIE
+348C AEE4             (asm/src/RRG23.ASM):01224          LDX ,S
+348E EE02             (asm/src/RRG23.ASM):01225          LDU OPICT,X
+3490 EC04             (asm/src/RRG23.ASM):01226          LDD OBJX,X
+3492 8E9817           (asm/src/RRG23.ASM):01227          LDX #OPTR
+3495 BDD027           (asm/src/RRG23.ASM):01228          JSR COL0
+3498 2602             (asm/src/RRG23.ASM):01229          BNE LASDIE
+349A 35D0             (asm/src/RRG23.ASM):01230          PULS X,U,PC
+                      (asm/src/RRG23.ASM):01231         *LASER DIE
+349C 3550             (asm/src/RRG23.ASM):01232         LASDIE PULS X,U
+349E 8D03             (asm/src/RRG23.ASM):01233          BSR LASOFF
+34A0 7ED063           (asm/src/RRG23.ASM):01234          JMP SUCIDE
+                      (asm/src/RRG23.ASM):01235         *LASER OFF
+34A3 BDD015           (asm/src/RRG23.ASM):01236         LASOFF JSR DMAOFF
+34A6 DC1B             (asm/src/RRG23.ASM):01237          LDD OFREE  RETURN OBJECT TO FREE LIST
+34A8 ED84             (asm/src/RRG23.ASM):01238          STD ,X
+34AA 9F1B             (asm/src/RRG23.ASM):01239          STX OFREE
+34AC 0A87             (asm/src/RRG23.ASM):01240          DEC LCNT
+34AE 39               (asm/src/RRG23.ASM):01241          RTS
+                      (asm/src/RRG23.ASM):01242         *
+                      (asm/src/RRG23.ASM):01243         *DISPLAY TOP OF SCREEN
+                      (asm/src/RRG23.ASM):01244         *
+34AF 3476             (asm/src/RRG23.ASM):01245         TDISP PSHS D,X,Y,U
+34B1 9640             (asm/src/RRG23.ASM):01246          LDA PLRCNT
+34B3 BDD00F           (asm/src/RRG23.ASM):01247         TD1 JSR SCRTR0
+34B6 4A               (asm/src/RRG23.ASM):01248          DECA
+34B7 26FA             (asm/src/RRG23.ASM):01249          BNE TD1
+34B9 8D6B             (asm/src/RRG23.ASM):01250          BSR BORDER
+34BB BD26C9           (asm/src/RRG23.ASM):01251          JSR MANDSP
+34BE 35F6             (asm/src/RRG23.ASM):01252          PULS D,X,Y,U,PC
+                      (asm/src/RRG23.ASM):01253         *
+                      (asm/src/RRG23.ASM):01254         *DISPLAY WAVE # MESSAGE
+                      (asm/src/RRG23.ASM):01255         *
+34C0 B6BDED           (asm/src/RRG23.ASM):01256         WVMESS LDA ZP1WAV
+34C3 BDD02A           (asm/src/RRG23.ASM):01257          JSR HEXBCD
+34C6 1F89             (asm/src/RRG23.ASM):01258          TFR A,B
+34C8 8668             (asm/src/RRG23.ASM):01259          LDA #104
+34CA BD5F96           (asm/src/RRG23.ASM):01260          JSR WRD5V
+34CD 9640             (asm/src/RRG23.ASM):01261          LDA PLRCNT
+34CF 4A               (asm/src/RRG23.ASM):01262          DECA
+34D0 270D             (asm/src/RRG23.ASM):01263          BEQ WVMESX
+34D2 B6BE29           (asm/src/RRG23.ASM):01264          LDA ZP2WAV
+34D5 BDD02A           (asm/src/RRG23.ASM):01265          JSR HEXBCD
+34D8 1F89             (asm/src/RRG23.ASM):01266          TFR A,B
+34DA 8672             (asm/src/RRG23.ASM):01267          LDA #114
+34DC BD5F96           (asm/src/RRG23.ASM):01268          JSR WRD5V
+34DF 39               (asm/src/RRG23.ASM):01269         WVMESX RTS
+                      (asm/src/RRG23.ASM):01270         *
+                      (asm/src/RRG23.ASM):01271         *DISPLAY MEN LEFT
+                      (asm/src/RRG23.ASM):01272         *MAX OF 7
+                      (asm/src/RRG23.ASM):01273         *
+34E0 8E2E0E           (asm/src/RRG23.ASM):01274         MANDSV LDX #P1MAN
+34E3 CC1508           (asm/src/RRG23.ASM):01275          LDD #$1508
+34E6 BDD01B           (asm/src/RRG23.ASM):01276          JSR BLKCLR CLEAR MAN DISPLAY
+34E9 8E6E0E           (asm/src/RRG23.ASM):01277          LDX #P2MAN
+34EC BDD01B           (asm/src/RRG23.ASM):01278          JSR BLKCLR CLEAR EM OUT
+34EF 108E3592         (asm/src/RRG23.ASM):01279          LDY #MNPIC
+34F3 B6BDEC           (asm/src/RRG23.ASM):01280          LDA ZP1LAS
+34F6 2714             (asm/src/RRG23.ASM):01281          BEQ MAND2
+34F8 8107             (asm/src/RRG23.ASM):01282          CMPA #7
+34FA 2302             (asm/src/RRG23.ASM):01283          BLS MAND1
+34FC 8607             (asm/src/RRG23.ASM):01284          LDA #7
+34FE 972B             (asm/src/RRG23.ASM):01285         MAND1 STA XTEMP
+3500 CC2E0E           (asm/src/RRG23.ASM):01286          LDD #P1MAN
+3503 BDD021           (asm/src/RRG23.ASM):01287         MAND1L JSR PCTON
+3506 8B04             (asm/src/RRG23.ASM):01288          ADDA #4
+3508 0A2B             (asm/src/RRG23.ASM):01289          DEC XTEMP
+350A 26F7             (asm/src/RRG23.ASM):01290          BNE MAND1L
+350C B6BE28           (asm/src/RRG23.ASM):01291         MAND2 LDA ZP2LAS
+350F 2714             (asm/src/RRG23.ASM):01292          BEQ MAND3
+3511 8107             (asm/src/RRG23.ASM):01293          CMPA #7
+3513 2302             (asm/src/RRG23.ASM):01294          BLS MAND2A
+3515 8607             (asm/src/RRG23.ASM):01295          LDA #7
+3517 972B             (asm/src/RRG23.ASM):01296         MAND2A STA XTEMP
+3519 CC6E0E           (asm/src/RRG23.ASM):01297          LDD #P2MAN
+351C BDD021           (asm/src/RRG23.ASM):01298         MAND2L JSR PCTON
+351F 8B04             (asm/src/RRG23.ASM):01299          ADDA #4
+3521 0A2B             (asm/src/RRG23.ASM):01300          DEC XTEMP
+3523 26F7             (asm/src/RRG23.ASM):01301          BNE MAND2L
+3525 39               (asm/src/RRG23.ASM):01302         MAND3 RTS
+                      (asm/src/RRG23.ASM):01303         *
+                      (asm/src/RRG23.ASM):01304         *DISPLAY BORDER
+                      (asm/src/RRG23.ASM):01305         *
+3526 8E0616           (asm/src/RRG23.ASM):01306         BORDER LDX #(XMIN-1)*256+YMIN-2
+3529 968F             (asm/src/RRG23.ASM):01307          LDA WALCOL
+352B A7898A00         (asm/src/RRG23.ASM):01308         BORD1 STA (XMAX-XMIN)*$100+$200,X
+352F A780             (asm/src/RRG23.ASM):01309          STA ,X+
+3531 8C06EC           (asm/src/RRG23.ASM):01310          CMPX #(XMIN-1)*256+YMAX+2
+3534 23F5             (asm/src/RRG23.ASM):01311          BLS BORD1
+3536 8E0716           (asm/src/RRG23.ASM):01312          LDX #XMIN*256+YMIN-2
+3539 D68F             (asm/src/RRG23.ASM):01313          LDB WALCOL
+353B ED84             (asm/src/RRG23.ASM):01314         BORD2 STD ,X
+353D ED8900D5         (asm/src/RRG23.ASM):01315          STD YMAX-YMIN+3,X
+3541 30890100         (asm/src/RRG23.ASM):01316          LEAX 256,X
+3545 8C8F16           (asm/src/RRG23.ASM):01317          CMPX #XMAX*256+YMIN-2
+3548 23F1             (asm/src/RRG23.ASM):01318          BLS BORD2
+354A 39               (asm/src/RRG23.ASM):01319          RTS
+                      (asm/src/RRG23.ASM):01320         *
+                      (asm/src/RRG23.ASM):01321         *POST REFRESH PROCESS
+                      (asm/src/RRG23.ASM):01322         *PSTREF=#TO REF EVERY 2 FRAME
+354B DE27             (asm/src/RRG23.ASM):01323         PSTRPC LDU PSTIN
+354D 1183B3E4         (asm/src/RRG23.ASM):01324          CMPU #PSLIST+64
+3551 2503             (asm/src/RRG23.ASM):01325          BLO PSTP0
+3553 CEB3A4           (asm/src/RRG23.ASM):01326          LDU #PSLIST
+3556 9692             (asm/src/RRG23.ASM):01327         PSTP0 LDA PSTREF
+3558 3402             (asm/src/RRG23.ASM):01328          PSHS A
+355A 109E93           (asm/src/RRG23.ASM):01329          LDY PSTANI
+355D AEC1             (asm/src/RRG23.ASM):01330         PSTPL LDX ,U++
+355F 2721             (asm/src/RRG23.ASM):01331          BEQ PSTP01
+3561 ECA4             (asm/src/RRG23.ASM):01332          LDD ,Y
+3563 8804             (asm/src/RRG23.ASM):01333          EORA #4
+3565 C804             (asm/src/RRG23.ASM):01334          EORB #4
+3567 1A10             (asm/src/RRG23.ASM):01335          SEI
+3569 FDCA06           (asm/src/RRG23.ASM):01336          STD DMASIZ SETUP SIZE
+356C D690             (asm/src/RRG23.ASM):01337          LDB PSTCOL
+356E F7CA01           (asm/src/RRG23.ASM):01338          STB DMACON
+3571 EC22             (asm/src/RRG23.ASM):01339          LDD OBJDAT,Y
+3573 FDCA02           (asm/src/RRG23.ASM):01340          STD DMAORG
+3576 EC04             (asm/src/RRG23.ASM):01341          LDD OBJX,X
+3578 FDCA04           (asm/src/RRG23.ASM):01342          STD DMADES
+357B C61A             (asm/src/RRG23.ASM):01343          LDB #$1A
+357D F7CA00           (asm/src/RRG23.ASM):01344          STB DMACTL
+3580 1CEF             (asm/src/RRG23.ASM):01345          CLI
+3582 6AE4             (asm/src/RRG23.ASM):01346         PSTP01 DEC ,S
+3584 26D7             (asm/src/RRG23.ASM):01347          BNE PSTPL
+3586 3261             (asm/src/RRG23.ASM):01348          LEAS 1,S
+3588 DF27             (asm/src/RRG23.ASM):01349          STU PSTIN
+                      (asm/src/RRG23.ASM):01350          NAP 2,PSTRPC
+358A 8602             (              NAP):00001                LDA #2 TIME
+358C 8E354B           (              NAP):00002                LDX #PSTRPC WAKEUP ADDR
+358F 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (asm/src/RRG23.ASM):01351         *
+                      (asm/src/RRG23.ASM):01352         *MINI MAN PICT
+                      (asm/src/RRG23.ASM):01353         *
+3592 0308             (asm/src/RRG23.ASM):01354         MNPIC FCB 3,8
+3594 3596             (asm/src/RRG23.ASM):01355          FDB MANPD
+3596 022200           (asm/src/RRG23.ASM):01356         MANPD FCB $02,$22,$00
+3599 BB0BB0           (asm/src/RRG23.ASM):01357          FCB $BB,$0B,$B0
+359C BB0BB0           (asm/src/RRG23.ASM):01358          FCB $BB,$0B,$B0
+359F 002000           (asm/src/RRG23.ASM):01359          FCB $00,$20,$00
+35A2 880880           (asm/src/RRG23.ASM):01360          FCB $88,$08,$80
+35A5 308030           (asm/src/RRG23.ASM):01361          FCB $30,$80,$30
+35A8 080800           (asm/src/RRG23.ASM):01362          FCB $08,$08,$00
+35AB 880880           (asm/src/RRG23.ASM):01363          FCB $88,$08,$80
+                      (asm/src/RRG23.ASM):01364         *
+                      (asm/src/RRG23.ASM):01365         *LASER PICT PTRS
+                      (asm/src/RRG23.ASM):01366         *
+35AE 0301             (asm/src/RRG23.ASM):01367         LLPIC FCB 3,1
+35B0 35BE             (asm/src/RRG23.ASM):01368          FDB LLPC
+35B2 0106             (asm/src/RRG23.ASM):01369         ULPIC FCB 1,6
+35B4 35C1             (asm/src/RRG23.ASM):01370          FDB ULPC
+35B6 0306             (asm/src/RRG23.ASM):01371         DLLPIC FCB 3,6
+35B8 35C7             (asm/src/RRG23.ASM):01372          FDB DLLPC
+35BA 0306             (asm/src/RRG23.ASM):01373         ULLPIC FCB 3,6
+35BC 35D9             (asm/src/RRG23.ASM):01374          FDB ULLPC
+                      (asm/src/RRG23.ASM):01375         *LASER PICTURES
+35BE AAAAAA           (asm/src/RRG23.ASM):01376         LLPC FCB $AA,$AA,$AA
+35C1 A0A0A0A0A0A0     (asm/src/RRG23.ASM):01377         ULPC FCB $A0,$A0,$A0,$A0,$A0,$A0
+35C7 00000A           (asm/src/RRG23.ASM):01378         DLLPC FCB $00,$00,$0A
+35CA 0000A0           (asm/src/RRG23.ASM):01379          FCB $00,$00,$A0
+35CD 000A00           (asm/src/RRG23.ASM):01380          FCB $00,$0A,$00
+35D0 00A000           (asm/src/RRG23.ASM):01381          FCB $00,$A0,$00
+35D3 0A0000           (asm/src/RRG23.ASM):01382          FCB $0A,$00,$00
+35D6 A00000           (asm/src/RRG23.ASM):01383          FCB $A0,$00,$00
+35D9 A00000           (asm/src/RRG23.ASM):01384         ULLPC FCB $A0,$00,$00
+35DC 0A0000           (asm/src/RRG23.ASM):01385          FCB $0A,$00,$00
+35DF 00A000           (asm/src/RRG23.ASM):01386          FCB $00,$A0,$00
+35E2 000A00           (asm/src/RRG23.ASM):01387          FCB $00,$0A,$00
+35E5 0000A0           (asm/src/RRG23.ASM):01388          FCB $00,$00,$A0
+35E8 00000A           (asm/src/RRG23.ASM):01389          FCB $00,$00,$0A
+                      (asm/src/RRG23.ASM):01390         *
+                      (asm/src/RRG23.ASM):01391         *PLAYER IMAGES...
+35EB 040C             (asm/src/RRG23.ASM):01392         MANLP1 FCB 4,12
+35ED 361B             (asm/src/RRG23.ASM):01393          FDB MANLD1
+35EF 040C             (asm/src/RRG23.ASM):01394         MANLP2 FCB 4,12
+35F1 364B             (asm/src/RRG23.ASM):01395          FDB MANLD2
+35F3 040C             (asm/src/RRG23.ASM):01396         MANLP3 FCB 4,12
+35F5 367B             (asm/src/RRG23.ASM):01397          FDB MANLD3
+35F7 040C             (asm/src/RRG23.ASM):01398         MANRP1 FCB 4,12
+35F9 36AB             (asm/src/RRG23.ASM):01399          FDB MANRD1
+35FB 040C             (asm/src/RRG23.ASM):01400         MANRP2 FCB 4,12 
+35FD 36DB             (asm/src/RRG23.ASM):01401          FDB MANRD2
+35FF 040C             (asm/src/RRG23.ASM):01402         MANRP3 FCB 4,12 
+3601 370B             (asm/src/RRG23.ASM):01403          FDB MANRD3
+3603 040C             (asm/src/RRG23.ASM):01404         MANDP1 FCB 4,12
+3605 373B             (asm/src/RRG23.ASM):01405          FDB MANDD1
+3607 040C             (asm/src/RRG23.ASM):01406         MANDP2 FCB 4,12
+3609 376B             (asm/src/RRG23.ASM):01407          FDB MANDD2
+360B 040C             (asm/src/RRG23.ASM):01408         MANDP3 FCB 4,12
+360D 379B             (asm/src/RRG23.ASM):01409          FDB MANDD3
+360F 040C             (asm/src/RRG23.ASM):01410         MANUP1 FCB 4,12
+3611 37CB             (asm/src/RRG23.ASM):01411          FDB MANUD1
+3613 040C             (asm/src/RRG23.ASM):01412         MANUP2 FCB 4,12
+3615 37FB             (asm/src/RRG23.ASM):01413          FDB MANUD2
+3617 040C             (asm/src/RRG23.ASM):01414         MANUP3 FCB 4,12
+3619 382B             (asm/src/RRG23.ASM):01415          FDB MANUD3
+     361B             (asm/src/RRG23.ASM):01416         MANLD1 EQU *
+361B 0B222000         (asm/src/RRG23.ASM):01417          FDB $0B22,$2000
+361F 0BBBBB00         (asm/src/RRG23.ASM):01418          FDB $0BBB,$BB00
+3623 0B222B00         (asm/src/RRG23.ASM):01419          FDB $0B22,$2B00
+3627 00222000         (asm/src/RRG23.ASM):01420          FDB $0022,$2000
+362B 00090000         (asm/src/RRG23.ASM):01421          FDB $0009,$0000
+362F 00999000         (asm/src/RRG23.ASM):01422          FDB $0099,$9000
+3633 00939000         (asm/src/RRG23.ASM):01423          FDB $0093,$9000
+3637 00939000         (asm/src/RRG23.ASM):01424          FDB $0093,$9000
+363B 00030000         (asm/src/RRG23.ASM):01425          FDB $0003,$0000
+363F 00010000         (asm/src/RRG23.ASM):01426          FDB $0001,$0000
+3643 00990000         (asm/src/RRG23.ASM):01427          FDB $0099,$0000
+3647 00000000         (asm/src/RRG23.ASM):01428          FDB $0000,$0000
+     364B             (asm/src/RRG23.ASM):01429         MANLD2 EQU *
+364B 0B222000         (asm/src/RRG23.ASM):01430          FDB $0B22,$2000
+364F 0BBBBB00         (asm/src/RRG23.ASM):01431          FDB $0BBB,$BB00
+3653 0B222B00         (asm/src/RRG23.ASM):01432          FDB $0B22,$2B00
+3657 00222000         (asm/src/RRG23.ASM):01433          FDB $0022,$2000
+365B 00090000         (asm/src/RRG23.ASM):01434          FDB $0009,$0000
+365F 00099000         (asm/src/RRG23.ASM):01435          FDB $0009,$9000
+3663 03339300         (asm/src/RRG23.ASM):01436          FDB $0333,$9300
+3667 00099300         (asm/src/RRG23.ASM):01437          FDB $0009,$9300
+366B 00909300         (asm/src/RRG23.ASM):01438          FDB $0090,$9300
+366F 00909000         (asm/src/RRG23.ASM):01439          FDB $0090,$9000
+3673 09909000         (asm/src/RRG23.ASM):01440          FDB $0990,$9000
+3677 00000000         (asm/src/RRG23.ASM):01441          FDB $0000,$0000
+     367B             (asm/src/RRG23.ASM):01442         MANLD3 EQU *
+367B 0B222000         (asm/src/RRG23.ASM):01443          FDB $0B22,$2000
+367F 0BBBBB00         (asm/src/RRG23.ASM):01444          FDB $0BBB,$BB00
+3683 0B222B00         (asm/src/RRG23.ASM):01445          FDB $0B22,$2B00
+3687 00222000         (asm/src/RRG23.ASM):01446          FDB $0022,$2000
+368B 00090000         (asm/src/RRG23.ASM):01447          FDB $0009,$0000
+368F 00099000         (asm/src/RRG23.ASM):01448          FDB $0009,$9000
+3693 03399300         (asm/src/RRG23.ASM):01449          FDB $0339,$9300
+3697 00099300         (asm/src/RRG23.ASM):01450          FDB $0009,$9300
+369B 00909300         (asm/src/RRG23.ASM):01451          FDB $0090,$9300
+369F 00909000         (asm/src/RRG23.ASM):01452          FDB $0090,$9000
+36A3 09909000         (asm/src/RRG23.ASM):01453          FDB $0990,$9000
+36A7 00000000         (asm/src/RRG23.ASM):01454          FDB $0000,$0000
+     36AB             (asm/src/RRG23.ASM):01455         MANRD1 EQU *
+36AB 0222B000         (asm/src/RRG23.ASM):01456          FDB $0222,$B000
+36AF BBBBB000         (asm/src/RRG23.ASM):01457          FDB $BBBB,$B000
+36B3 B222B000         (asm/src/RRG23.ASM):01458          FDB $B222,$B000
+36B7 02220000         (asm/src/RRG23.ASM):01459          FDB $0222,$0000
+36BB 00900000         (asm/src/RRG23.ASM):01460          FDB $0090,$0000
+36BF 09990000         (asm/src/RRG23.ASM):01461          FDB $0999,$0000
+36C3 09390000         (asm/src/RRG23.ASM):01462          FDB $0939,$0000
+36C7 09390000         (asm/src/RRG23.ASM):01463          FDB $0939,$0000
+36CB 00300000         (asm/src/RRG23.ASM):01464          FDB $0030,$0000
+36CF 00900000         (asm/src/RRG23.ASM):01465          FDB $0090,$0000
+36D3 00990000         (asm/src/RRG23.ASM):01466          FDB $0099,$0000
+36D7 00000000         (asm/src/RRG23.ASM):01467          FDB $0000,$0000
+     36DB             (asm/src/RRG23.ASM):01468         MANRD2 EQU *
+36DB 0222B000         (asm/src/RRG23.ASM):01469          FDB $0222,$B000
+36DF BBBBB000         (asm/src/RRG23.ASM):01470          FDB $BBBB,$B000
+36E3 B222B000         (asm/src/RRG23.ASM):01471          FDB $B222,$B000
+36E7 02220000         (asm/src/RRG23.ASM):01472          FDB $0222,$0000
+36EB 00900000         (asm/src/RRG23.ASM):01473          FDB $0090,$0000
+36EF 09900000         (asm/src/RRG23.ASM):01474          FDB $0990,$0000
+36F3 39933000         (asm/src/RRG23.ASM):01475          FDB $3993,$3000
+36F7 39900000         (asm/src/RRG23.ASM):01476          FDB $3990,$0000
+36FB 39090000         (asm/src/RRG23.ASM):01477          FDB $3909,$0000
+36FF 09090000         (asm/src/RRG23.ASM):01478          FDB $0909,$0000
+3703 09099000         (asm/src/RRG23.ASM):01479          FDB $0909,$9000
+3707 00000000         (asm/src/RRG23.ASM):01480          FDB $0000,$0000
+     370B             (asm/src/RRG23.ASM):01481         MANRD3 EQU *
+370B 0222B000         (asm/src/RRG23.ASM):01482          FDB $0222,$B000
+370F BBBBB000         (asm/src/RRG23.ASM):01483          FDB $BBBB,$B000
+3713 B222B000         (asm/src/RRG23.ASM):01484          FDB $B222,$B000
+3717 02220000         (asm/src/RRG23.ASM):01485          FDB $0222,$0000
+371B 00900000         (asm/src/RRG23.ASM):01486          FDB $0090,$0000
+371F 09900000         (asm/src/RRG23.ASM):01487          FDB $0990,$0000
+3723 39333000         (asm/src/RRG23.ASM):01488          FDB $3933,$3000
+3727 39900000         (asm/src/RRG23.ASM):01489          FDB $3990,$0000
+372B 39090000         (asm/src/RRG23.ASM):01490          FDB $3909,$0000
+372F 09090000         (asm/src/RRG23.ASM):01491          FDB $0909,$0000
+3733 09099000         (asm/src/RRG23.ASM):01492          FDB $0909,$9000
+3737 00000000         (asm/src/RRG23.ASM):01493          FDB $0000,$0000
+     373B             (asm/src/RRG23.ASM):01494         MANDD1 EQU *
+373B 00222000         (asm/src/RRG23.ASM):01495          FDB $0022,$2000
+373F BBB2BBB0         (asm/src/RRG23.ASM):01496          FDB $BBB2,$BBB0
+3743 B0B0B0B0         (asm/src/RRG23.ASM):01497          FDB $B0B0,$B0B0
+3747 0B222B00         (asm/src/RRG23.ASM):01498          FDB $0B22,$2B00
+374B 00090000         (asm/src/RRG23.ASM):01499          FDB $0009,$0000
+374F 09939900         (asm/src/RRG23.ASM):01500          FDB $0993,$9900
+3753 39939930         (asm/src/RRG23.ASM):01501          FDB $3993,$9930
+3757 30939030         (asm/src/RRG23.ASM):01502          FDB $3093,$9030
+375B 30909030         (asm/src/RRG23.ASM):01503          FDB $3090,$9030
+375F 00909000         (asm/src/RRG23.ASM):01504          FDB $0090,$9000
+3763 09909900         (asm/src/RRG23.ASM):01505          FDB $0990,$9900
+3767 00000000         (asm/src/RRG23.ASM):01506          FDB $0000,$0000
+     376B             (asm/src/RRG23.ASM):01507         MANDD2 EQU *
+376B 00222000         (asm/src/RRG23.ASM):01508          FDB $0022,$2000
+376F BBB2BBB0         (asm/src/RRG23.ASM):01509          FDB $BBB2,$BBB0
+3773 B0B0B0B0         (asm/src/RRG23.ASM):01510          FDB $B0B0,$B0B0
+3777 0B222B00         (asm/src/RRG23.ASM):01511          FDB $0B22,$2B00
+377B 00090000         (asm/src/RRG23.ASM):01512          FDB $0009,$0000
+377F 09939900         (asm/src/RRG23.ASM):01513          FDB $0993,$9900
+3783 39939930         (asm/src/RRG23.ASM):01514          FDB $3993,$9930
+3787 30939030         (asm/src/RRG23.ASM):01515          FDB $3093,$9030
+378B 30909000         (asm/src/RRG23.ASM):01516          FDB $3090,$9000
+378F 09909000         (asm/src/RRG23.ASM):01517          FDB $0990,$9000
+3793 00009000         (asm/src/RRG23.ASM):01518          FDB $0000,$9000
+3797 00009900         (asm/src/RRG23.ASM):01519          FDB $0000,$9900
+     379B             (asm/src/RRG23.ASM):01520         MANDD3 EQU *
+379B 00222000         (asm/src/RRG23.ASM):01521          FDB $0022,$2000
+379F BBB2BBB0         (asm/src/RRG23.ASM):01522          FDB $BBB2,$BBB0
+37A3 B0B0B0B0         (asm/src/RRG23.ASM):01523          FDB $B0B0,$B0B0
+37A7 0B222B00         (asm/src/RRG23.ASM):01524          FDB $0B22,$2B00
+37AB 00090000         (asm/src/RRG23.ASM):01525          FDB $0009,$0000
+37AF 09939900         (asm/src/RRG23.ASM):01526          FDB $0993,$9900
+37B3 39939930         (asm/src/RRG23.ASM):01527          FDB $3993,$9930
+37B7 30939030         (asm/src/RRG23.ASM):01528          FDB $3093,$9030
+37BB 00909030         (asm/src/RRG23.ASM):01529          FDB $0090,$9030
+37BF 00909900         (asm/src/RRG23.ASM):01530          FDB $0090,$9900
+37C3 00900000         (asm/src/RRG23.ASM):01531          FDB $0090,$0000
+37C7 09900000         (asm/src/RRG23.ASM):01532          FDB $0990,$0000
+     37CB             (asm/src/RRG23.ASM):01533         MANUD1 EQU *
+37CB BB222BB0         (asm/src/RRG23.ASM):01534          FDB $BB22,$2BB0
+37CF B22222B0         (asm/src/RRG23.ASM):01535          FDB $B222,$22B0
+37D3 B22222B0         (asm/src/RRG23.ASM):01536          FDB $B222,$22B0
+37D7 00222000         (asm/src/RRG23.ASM):01537          FDB $0022,$2000
+37DB 00090000         (asm/src/RRG23.ASM):01538          FDB $0009,$0000
+37DF 09999900         (asm/src/RRG23.ASM):01539          FDB $0999,$9900
+37E3 39999930         (asm/src/RRG23.ASM):01540          FDB $3999,$9930
+37E7 30999030         (asm/src/RRG23.ASM):01541          FDB $3099,$9030
+37EB 30909030         (asm/src/RRG23.ASM):01542          FDB $3090,$9030
+37EF 00909000         (asm/src/RRG23.ASM):01543          FDB $0090,$9000
+37F3 09909900         (asm/src/RRG23.ASM):01544          FDB $0990,$9900
+37F7 00000000         (asm/src/RRG23.ASM):01545          FDB $0000,$0000
+     37FB             (asm/src/RRG23.ASM):01546         MANUD2 EQU *
+37FB BB222BB0         (asm/src/RRG23.ASM):01547          FDB $BB22,$2BB0
+37FF B22222B0         (asm/src/RRG23.ASM):01548          FDB $B222,$22B0
+3803 B22222B0         (asm/src/RRG23.ASM):01549          FDB $B222,$22B0
+3807 00222000         (asm/src/RRG23.ASM):01550          FDB $0022,$2000
+380B 00090000         (asm/src/RRG23.ASM):01551          FDB $0009,$0000
+380F 09999900         (asm/src/RRG23.ASM):01552          FDB $0999,$9900
+3813 39999930         (asm/src/RRG23.ASM):01553          FDB $3999,$9930
+3817 30999030         (asm/src/RRG23.ASM):01554          FDB $3099,$9030
+381B 30909000         (asm/src/RRG23.ASM):01555          FDB $3090,$9000
+381F 09909000         (asm/src/RRG23.ASM):01556          FDB $0990,$9000
+3823 00009000         (asm/src/RRG23.ASM):01557          FDB $0000,$9000
+3827 00009900         (asm/src/RRG23.ASM):01558          FDB $0000,$9900
+     382B             (asm/src/RRG23.ASM):01559         MANUD3 EQU *
+382B BB222BB0         (asm/src/RRG23.ASM):01560          FDB $BB22,$2BB0
+382F B22222B0         (asm/src/RRG23.ASM):01561          FDB $B222,$22B0
+3833 B22222B0         (asm/src/RRG23.ASM):01562          FDB $B222,$22B0
+3837 00222000         (asm/src/RRG23.ASM):01563          FDB $0022,$2000
+383B 00090000         (asm/src/RRG23.ASM):01564          FDB $0009,$0000
+383F 09999900         (asm/src/RRG23.ASM):01565          FDB $0999,$9900
+3843 39999930         (asm/src/RRG23.ASM):01566          FDB $3999,$9930
+3847 30999030         (asm/src/RRG23.ASM):01567          FDB $3099,$9030
+384B 00909030         (asm/src/RRG23.ASM):01568          FDB $0090,$9030
+384F 00909900         (asm/src/RRG23.ASM):01569          FDB $0090,$9900
+3853 00900000         (asm/src/RRG23.ASM):01570          FDB $0090,$0000
+3857 09900000         (asm/src/RRG23.ASM):01571          FDB $0990,$0000
+                      (asm/src/RRG23.ASM):01572          END

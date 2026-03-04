@@ -1,0 +1,346 @@
+
+
+
+
+
+                   MATH-BOX DOCUMENTATION
+
+                     (file name MBUDOC)
+
+This paper presents an overview of the "MATH-BOX" micro-coded arithmetic
+processor.  The reader is assumed to have some knowledge of the AMD 2901
+four-bit slice, or at least to have access to the relevant manuals.   It
+is  also  assumed  that  the  reader  has  the  original MATRIX-MULTIPLY
+documentation,  in  which  the  various  variables   are   named   (e.g.
+A,B,E,F,X,Y,X',Y')
+
+MATH-BOX                                                        Page   2
+EXTERNAL APPEARANCE                                            30 Mar 81
+
+
+EXTERNAL APPEARANCE
+
+     MATH-BOX is assigned 32 addresses on the aux board of an X-Y  game.
+The function of each is show below with [timing] in cycles.
+    OFFSET  NAME      FUNCTION
+    
+      0     STAT      read busy/done (D7=1,busy)
+      0     AL *      write low byte of A
+      1     AH *      write high byte of A
+      2     YLOW      read low byte of 2901 output
+      2     BL *      write low byte of B
+      3     YHIGH     read high byte of 2901 output
+      3     BH *      write high byte of B
+      4     EL *      write low byte of E
+      5     EH *      write high byte of E
+      6     FL *      write low byte of F
+      7     FH *      write high byte of F
+      8     XL *      write low byte of X
+      9     XH *      write high byte of X
+      A     YL *      write low byte of Y
+      B     YHSM      write high byte of Y,start multiply
+                      when done,output=(x-e)*a-(y-f)*b
+                      [54-59]
+      C     NL *      write N (# of bits in Quotient)
+      D     ZLL *     )
+      E     ZLH *      )- write 32 bit dividend
+      F     ZHL *      )
+      10    ZHH *     )
+      11    YHSP      write high byte of Y,start whole mess
+                      when done output=(xb+ya+f)/(xa-yb+e)
+                      [119-131+5N]
+      12    SYM       any write will start the Y' multiply
+                      when done, output=(x-e)b+(y-f)a
+                      [50-55]
+      13    SYXD      any write starts Y'/X' divide [11-13+5N]
+      14    SZXD      any write starts Z/X' divide [10-12+5N]
+      15    XPL *     write low byte of X'
+      16    XPH *     write high byte of X'
+      17    DXP       any write will cause X' to appear at output
+      18    DYPL      any write will cause Y'(low 16 bits)to
+                      appear at output
+      19    DYPH      any write will cause Y'(high 16 bits)
+                      to appear at output
+      1A    YPL       write low byte of Y'
+      1B    YPH       write high byte of Y'
+      1C    YHSC      write high byte of Y, start clipping
+      1D-1F           currenty unused
+    
+
+     * WRITEing to these  addresses  will  cause  all  16  bits  of  the
+just-modified  register  to  be present at the output, where they can be
+read ( at YLOW and YHIGH ) to verify correct operation.   This  sort  of
+paranoia is probaby useful only in self-test.
+
+MATH-BOX                                                        Page   3
+ARCHITECTURE                                                   30 Mar 81
+
+
+     ARCHITECTURE
+
+     MATH-BOX consists of four basic sections, detailed below and  shown
+in  Fig  1.   These  are  the  ALU,  SIGN/SHIFT  control, uCODE ROM, and
+uSequencer
+
+     The ALU is a relatively straight-forward 16 bit unit consisting  of         ___
+4  2901's  .   The  major  difference  from  textbook (i.e.  AMD manual)
+examples are the simplified shift "mux" (see  SIGN/SHIFT  control,below)
+and  the  fact  that the D and Y busses are tied together.  In fact, not
+only is D15 connected to Y15, but they are connected to D7, Y7 etc.,  to
+form one 8-bit bi-directional data bus, which is connected to the "HOST"         _____
+(i.e.  6502) data bus.  To allow 8-bit input into the  appropriate  half
+of  the  16-bit ALU, the high and low pairs of 2901's have separate "I2"
+inputs from the  uCODE  ROM.   This  allows  one  byte  to  be  doing  a
+"RAM:=D+0" while the other is doing a "RAM:=0+RAM".
+
+     Another feature of the ALU is  the  capability  of  inverting  "I1"
+depending  on  the state of Q0 in the last cycle.  If the last cycle was
+not a right-shift, the result is at best amusing, but if the last  cycle
+did   include   a   right-shift   and   the   current   instruction   is
+"RAM(B):=RAM(A)+RAM(B)" it will change to a "RAM(B):=RAM(B)+0" if a  "0"
+fell out.  This is the "CADD" instruction (see Assembly Language, below)
+so useful in implementing multiplies.
+
+     The SIGN/SHIFT control provides the correct inputs to  Q0  and  R15         __________ _______
+for  left  and right shifts respectively, and also provides the one test
+condition that the uCODE can branch on.  In a left-shift, the  Q0  input
+is  forced low, as it would otherwise be susceptible to noise.  Since it
+is forced to zero, the lsb of Q can be set to  one  by  incrementing  Q,
+which is easy, rather than by ORing with a constant "1" which we may not
+have handy.  (Setting it to zero is even easier.) In a  right  shift  we
+have  a  choice of an "ASR" or an "LSR", depending on whether SIGN (from
+uCODE) is 1 or 0, respectively.  Of course, when shifting left, R15 must
+not be driven at all, and likewise Q0 when shifting right, as both these
+pins are outputs as well as inputs.
+
+     A word about the ASR mentioned above is in order.  The "MSB"  which
+is  shifted  in is NOT simply the high bit of the result, but rather the                   ___
+exclusive-or of that bit  and  the  overflow  out  of  the  2901.   this
+(N-exor-V) will be familiar to 6800 and PDP-11 programmers, but for 6502
+programmers the following should explain.  When two  sufficiently  large
+positive  numbers  are  added, the result, while actually positive, will
+have the most significant bit set.  Such a case is an overflow  and  the
+OVR   pin   will  be  high.   If  the  result  is  simply  shifted  with
+sign-replication, the answer will have the wrong sign.  The  right  sign
+can  be  provided with one exclusive-or gate, so it was.  The one fly in
+the ointment is that the 2901 does nothing particularly reasonable  with
+OVR  on logical operations, so if you just want to shift a register with        _______
+sign-extension you should do it with an "Add 0 to RAM", not an "Or 0 and                                                        ___
+RAM".
+
+     A by-product of the SIGN/SHIFT control is the signal MSB* which  is
+what would be shifted into R15 if we shift right.  If the JMP bit is set
+in uCODE and  MSB*  is  0,  the  jump  will  be  taken.   Note  that  an
+
+MATH-BOX                                                        Page   4
+ARCHITECTURE                                                   30 Mar 81
+
+
+unconditional  jump  can be done by setting JMP=1 and SIGN=0.  We cannot
+do an ASR and an UNconditional jump in the same uInstruction.                 _____________
+
+     uCODE ROM is 256 words by 24 bits, implemented as six 256*4 prom's.     _____ ___
+Since  the Data-I/O can't handle 24-bit words, the macros in MBUCOD will
+produce a .SAV file with three 256 byte pages.  The fields of  microcode
+are as follows:
+    BITS    NAME      FUNCTION    ____    ____      ________
+    
+    23-20   A         designate the "A" register to be used,
+                      also used for JMP address (see LDAB)
+    19-16   B         designate "B" register (dest) also 
+                      used for JMP address (see LDAB)
+    15      I2HI      I2 (msb of "src") for high byte 2901's
+    14      I2LO      I2 for low byte 2901's
+    13-12   I1,I0     used wth I2 to select one of 8
+                      source operand pairs. See 2901 book
+    11      STALL     if 1, MATHBOX will halt at completion
+                      of current instruction
+    10-8    I5-I3     select one of eight basic functions
+                      to perform between operands selected
+                      by I2-I0 above. See 2901 book
+    7       LDAB      when 1, the A and B fields (above)
+                      are stored in a latch. A successful
+                      JMP will use the contents of the
+                      latch. Note that it is not usually
+                      meaningful to specify LDAB in an
+                      instruction that uses A or B to
+                      designate registers. It is, however,
+                      possible.
+    6-4     I8-6      select one of eight destinations for
+                      the ALU output. See 2901 book
+    3       SIGN      if "1" the signal MSB* is the exor
+                      of OVR and F15 (msb), the "true-sign"
+                      if "0" MSB*=0
+    2       JMP       if 1, and MSB*=0, jump to the 
+                      location specified by the "jump
+                      target" latch. the latch is set to
+                      the contents of the A and B fields
+                      in an instruction having LDAB=1.
+                      The latch can be set in the same
+                      instruction in which it is used, or
+                      in a previous instruction.
+    1       MULT      if 1, and Q0 from last instruction
+                      was 0, invert I1 on this instruction
+    0       CARIN     carry-in to 2901's. As usual, this
+                      should be clear for an add and set
+                      for a subtract. Two useful violations
+                      of this rule are: 
+                       ADD Z,N,RAMF,SEC  ;inc reg N
+                       SUBR Z,N,RAMF,CLC ;dec reg N
+
+     The  Micro-sequencer  provides  addresses  to  the  uCODE-ROM,  and          _______________
+contains  the clock generator for the math-box.  The clock is stopped at
+the completion of any instruction which has STALL=1.  It  is  re-started
+
+MATH-BOX                                                        Page   5
+ARCHITECTURE                                                   30 Mar 81
+
+
+by the 6502 writing to one of the 32 addresses assigned to the math-box.
+During this write, the contents of the MAPPING ROM,  addressed  by  6502
+A0-A4, are loaded into the microPC.  Thus, a write both presents data to
+the 2901's and initiates the execution of a uRoutine.  In many cases the
+uRoutine  will simply place the data in an appropriate register and fall
+through to an instruction containing STALL.
+
+     NOTE-since the D-bus is not latched internally on the 2901,  it  is     ____
+not  reasonable  to specify STALL in an instruction that has D as one of
+its operands.  This would cause the 2901's to track whatever garbage was
+on the D-bus while STALLed.
+
+     Once started, the uSequencer will continue  to  present  successive
+addresses to the uCODE ROM until:
+    1)   An instruction containing a STALL is executed.
+    
+    2)   An instruction with SIGN=0 and JMP=1 is  executed.
+         This will cause the uPC to be loaded from the
+         jump-target latch.
+    
+    3)   An instruction with JMP=1, SIGN=1, and MSB*=0
+         is executed. This will also cause the uPC
+         to be loaded from the latch.
+
+An instruction may both JMP and STALL, but since the clock can  only  be
+restarted by the 6502, which also loads the uPC, this is not useful.
+
+     "ASSEMBLY LANGUAGE"
+
+     A set of macros has been written to provide an "Assembly"  language
+for the uCode.  The basic syntax is:
+
+<label>:<func,source> <destination> <misc> <jump> <jump target>
+
+where any item in "<>" can be omitted
+
+     <label>  is  any  valid  MACRO-11   label,   i.e.    6   or   fewer     _______
+alphanumerics, starting with a letter, ".", or "$", or a local symbol of
+the form n$.
+
+     <func> is one of the following: (r,s  refer  to  first  and  second     ______
+source operand respectively)
+         ADD             r+s+CARIN
+         SUBR            ^Cr+s+CARIN (sets but does not protect carry)
+         SUBS            r+^Cs+CARIN (sets but does not protect carry)
+         OR              r OR s
+         AND             r AND s
+         BIC             ^Cr AND s
+         NOTRS           (same as BIC)
+         EXOR            r EXCLUSIVE-OR s
+         EXNOR           ^Cr EXOR s
+         CADD            equiv to ADD, with MULT bit set. This will
+                         change an "ADD n,m" to an "ADD 0,m" if Q0
+                         was 0 in the last operation.
+
+MATH-BOX                                                        Page   6
+ASSEMBLY LANGUAGE                                              30 Mar 81
+
+
+     <source> is one of the following:(where n,m are  register  numbers,     ________
+i.e.  expressions that evaluate to 0-15.)
+         SOURCE          r               s         ______          _               _
+         
+         n,m             Rn              Rm
+         n,D             Rn (A)          D-buss
+         n,Q             Rn (A)          Q-register
+         ZA,n,m          0               Rn (A)
+         ZB,n,m          0               Rm (B)
+         Z,n             0               Rn (B) (this is ZB, but
+                                          reg A unspec'd)
+         D,Z             D-buss          0
+         Z,Q             0               Q-register
+         D,Q             D-buss          Q-register
+
+     <destination> is one of the following:     _____________
+         NAME            FUNCTION         ____            ________
+         QREG            place result in Q-register
+         NOP             don't store anywhere (default if no
+                         dest. spec'd)
+         RAMA            reg(B)<-result, output<-reg(A)
+         RAMF            reg(B),output <-result
+         RAMQD           reg(B)<-result, then right shift reg(B),Q
+                         concatenated as one 32-bit register
+         RAMD            reg(B)<-result, then right shift reg(B)
+         RAMQU           reg(B)<-result,then left shift reg(B),Q
+                         concatenated as one 32-bit register
+         RAMU            reg(B)<-result, then left shift reg(B).
+                         Since we have a very primitive "shift-
+                         mux", this will shift garbage (from 
+                         floating input) into the lsb of reg(B)
+f;.p
+<misc> is one, or more, of the following:______
+         NAME            FUNCTION         ____            ________
+         BREG n          allows specification of a "B" register
+                         in instrucions that do not normally
+                         require one
+         CLC             force CARIN=0 (default unless func=
+                         subr,subs)
+         SEC             force CARIN=1
+         UNSIGN          force MSB*=0 (for logical shift right,
+                         unconditional jump) default case
+         SIGN            let MSB*=OVR exor F15 (for arithmetic
+                         shift right, conditional jump)
+         LDAB <exp>      load jump-latch from contents of A and B
+                         fields. If <exp> is specified, its value
+                         will be placed in the A,B field.
+         LJT <addr>      equiv. to LDAB (<addr>-<base of uCode>)/4)
+                         This is the normal way to specify a jump
+                         target.
+         STALL           stop the clock at end of this instruction.
+
+     <jump> can be JMP (unconditional) or JPL (only if MSB*=0).   If  an     ______
+<addr>  is  specified,  the  jump,  if  taken,  will be to that address,
+otherwise you should specify the <addr> with a previous  LJT.   Remember
+
+MATH-BOX                                                        Page   7
+ASSEMBLY LANGUAGE                                              30 Mar 81
+
+
+that a jmp address can not generally be specified in an instruction that
+specifies a register.
+
+     NOTE that since the action of LDAB, LJT, JMP,  and  JPL  varies  if     ____
+they  are followed by an argument, they must be the last entry on a line
+if the argument is omitted.
+
+     The macros check for attempts to  set  a  field  to  two  different
+values.  When this occurs, the message:
+         .ERROR  ;CONFLICT IN BYTES
+D0  D1  M0  M1
+D0' D1' M0' M1'
+
+     is printed, where D0,D1 are the existing data and M0,M1 are "masks"
+with  1's  where  fields have been "protected", i.e.  set to some value.
+Similary D0',D1' are the new data, which we are trying to insert in this
+micro-instruction,  while M0',M1' point out the fields we are attempting
+to set.  for example:
+0123 0000 FF7F 0000
+0200 00AB FF00 00FF
+
+     would be interpreted as follows.  The masks coincide  in  the  high
+byte  of  M0,  so  we look at the high byte of D0.  Here we find that we
+already have "01" and are attempting to to set it to "02".   This  error
+can  also  be  an artifact of an error in the previous line which caused
+macro evaluation to  terminate  before  outputting  (and  clearing)  the
+temporaries  used to hold partially assembled instructions.  Such errors
+are typically the result of undefined symbols or mis-spelled keywords.
+                                                                                                                               

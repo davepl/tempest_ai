@@ -9,4 +9,4 @@ pytest
 # Used by tools/rotating_torus_boxes.py
 matplotlib
 # Used by tile.py (Windows only)
-pywin32
+pywin32; platform_system == "Windows"

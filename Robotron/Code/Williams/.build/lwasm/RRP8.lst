@@ -1,0 +1,1466 @@
+                      (wasm/src/RRP8.ASM):00001         *  OPT NOL
+                      (wasm/src/RRP8.ASM):00002          INCLUDE "RRF.ASM"
+                      (          RRF.ASM):00001         *        OPT    PAGS
+                      (          RRF.ASM):00002         *        TTL    R O B O T   W A R
+                      (          RRF.ASM):00003         *
+                      (          RRF.ASM):00004         * HARDWARE CONSTANTS
+                      (          RRF.ASM):00005         *
+     BF70             (          RRF.ASM):00006         HSTK EQU $BF70
+     EFF0             (          RRF.ASM):00007         VECTOR EQU $EFF0
+     C000             (          RRF.ASM):00008         CRAM EQU $C000 COLOR RAM ADDR
+     CBFF             (          RRF.ASM):00009         WDOG EQU $CBFF
+     0039             (          RRF.ASM):00010         WDATA EQU $39
+     CC00             (          RRF.ASM):00011         CMOS EQU $CC00
+     C80E             (          RRF.ASM):00012         SOUND EQU $C80E
+     CB00             (          RRF.ASM):00013         VERTCT EQU $CB00 6-BIT VERTICAL BEAM ADDR
+     C900             (          RRF.ASM):00014         RWCNTL EQU $C900 (BIT 0: 1-ROM READ; 0-RAM READ)
+                      (          RRF.ASM):00015         *                (BIT 1: 1-INVERT;   0-NORMAL SCREEN)
+                      (          RRF.ASM):00016         *
+                      (          RRF.ASM):00017         *PIA DEFINITIONS
+                      (          RRF.ASM):00018         *
+     C80C             (          RRF.ASM):00019         PIA0 EQU $C80C
+                      (          RRF.ASM):00020         *B0 AUTO UP
+                      (          RRF.ASM):00021         *B1 ADVANCE
+                      (          RRF.ASM):00022         *B2 RCOIN
+                      (          RRF.ASM):00023         *B3 HSRESET
+                      (          RRF.ASM):00024         *B4 LCOIN
+                      (          RRF.ASM):00025         *B5 CCOIN
+                      (          RRF.ASM):00026         *B6 SLAM
+                      (          RRF.ASM):00027         *B7 SOUND HANDSHAKE
+                      (          RRF.ASM):00028         *CA2 LED3 
+                      (          RRF.ASM):00029         *CA1 IRQ 240 (16 MS)  (LINE 240)
+     C80E             (          RRF.ASM):00030         PIA1 EQU $C80E
+                      (          RRF.ASM):00031         *B0-B5 SOUND
+                      (          RRF.ASM):00032         *B6-B7 LED 0,1
+                      (          RRF.ASM):00033         *CB1 IRQ 4 MS (0,$40,$80,$C0)
+                      (          RRF.ASM):00034         *CB2 LED2            
+     C804             (          RRF.ASM):00035         PIA2 EQU $C804
+                      (          RRF.ASM):00036         *B0 MOVE UP
+                      (          RRF.ASM):00037         *B1 MOVE DOWN
+                      (          RRF.ASM):00038         *B2 MOVE LEFT
+                      (          RRF.ASM):00039         *B3 MOVE RIGHT
+                      (          RRF.ASM):00040         *B4 START 1
+                      (          RRF.ASM):00041         *B5 START 2
+                      (          RRF.ASM):00042         *B6 FIRE UP
+                      (          RRF.ASM):00043         *B7 FIRE DOWN
+                      (          RRF.ASM):00044         *
+     C806             (          RRF.ASM):00045         PIA3 EQU $C806
+                      (          RRF.ASM):00046         *B0 FIRE LEFT
+                      (          RRF.ASM):00047         *B1 FIRE RIGHT
+                      (          RRF.ASM):00048         *B7 INPUT 1=COCKTAIL
+                      (          RRF.ASM):00049         *CB2 OUTPUT SWITCH MUX CONTROL 1=PLAYER1,0=PLAYER2
+                      (          RRF.ASM):00050         *
+                      (          RRF.ASM):00051         *DMA CONSTANTS
+                      (          RRF.ASM):00052         *
+     CA00             (          RRF.ASM):00053         DMACTL EQU $CA00 CONTROL BYTE WRITE INITIATES TRANSFER
+                      (          RRF.ASM):00054         *B0:READ FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00055         *B1:WRITE FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00056         *B2:XSFER RATE 0=ROM-RAM (1MSEC); 1=RAM-RAM (2 MSEC)
+                      (          RRF.ASM):00057         *B3:1=ZERO WRITE SUPPRESS
+                      (          RRF.ASM):00058         *B4:1=CONSTANT SUBSTITUTION
+                      (          RRF.ASM):00059         *B5:1=ODD FLAVOR
+                      (          RRF.ASM):00060         *B6:1=B0-B3 WRITE SUPPRESS
+                      (          RRF.ASM):00061         *B7:1=B4-B7 WRITE SUPPRESS
+     CA01             (          RRF.ASM):00062         DMACON EQU $CA01 CONSTANT DATA BYTE
+     CA02             (          RRF.ASM):00063         DMAORG EQU $CA02 ORIGIN ADDR MSB,LSB
+     CA04             (          RRF.ASM):00064         DMADES EQU $CA04 DESTINATION "
+     CA06             (          RRF.ASM):00065         DMASIZ EQU $CA06 HOR,VERT BYTE COUNTS
+                      (          RRF.ASM):00066         *SCORE DISPLAY CONSTANTS
+     00EA             (          RRF.ASM):00067         YMAX EQU 234   
+     0018             (          RRF.ASM):00068         YMIN EQU 24 MIN Y COORD
+     008F             (          RRF.ASM):00069         XMAX EQU $8F
+     0007             (          RRF.ASM):00070         XMIN EQU 7
+     180E             (          RRF.ASM):00071         P1ORG EQU $18*$100+14
+     2E0E             (          RRF.ASM):00072         P1MAN EQU P1ORG+7*$300+$100
+     180E             (          RRF.ASM):00073         P1DISP EQU P1ORG
+     580E             (          RRF.ASM):00074         P2ORG EQU P1ORG+$40*$100
+     6E0E             (          RRF.ASM):00075         P2MAN EQU P2ORG+P1MAN-P1ORG
+     580E             (          RRF.ASM):00076         P2DISP EQU P2ORG
+     0300             (          RRF.ASM):00077         DIGLTH EQU $300
+     4A7C             (          RRF.ASM):00078         PCOORD EQU $4A7C INIT PLAYER COORD
+     0066             (          RRF.ASM):00079         FONCOL EQU $66 PHONY STARTUP COLOR
+                      (          RRF.ASM):00080         *
+                      (          RRF.ASM):00081         *MODULE  VECTORS + STORAGE ALLOCATION
+                      (          RRF.ASM):00082         *
+                      (          RRF.ASM):00083         ***OPSYS**..... R O S ..........
+                      (          RRF.ASM):00084         *
+     D000             (          RRF.ASM):00085         ROSORG EQU $D000
+                      (          RRF.ASM):00086          ORG ROSORG
+D000                  (          RRF.ASM):00087         INIT RMB 3
+D003                  (          RRF.ASM):00088         ASCAN RMB 3
+D006                  (          RRF.ASM):00089         SDOUT RMB 3
+D009                  (          RRF.ASM):00090         SCRTRN RMB 3
+D00C                  (          RRF.ASM):00091         SCORE RMB 3
+D00F                  (          RRF.ASM):00092         SCRTR0 RMB 3
+D012                  (          RRF.ASM):00093         SCRCLR RMB 3
+D015                  (          RRF.ASM):00094         DMAOFF RMB 3
+D018                  (          RRF.ASM):00095         DMAON RMB 3
+D01B                  (          RRF.ASM):00096         BLKCLR RMB 3
+D01E                  (          RRF.ASM):00097         PCTOFF RMB 3
+D021                  (          RRF.ASM):00098         PCTON RMB 3
+D024                  (          RRF.ASM):00099         COLST RMB 3
+D027                  (          RRF.ASM):00100         COL0 RMB 3
+D02A                  (          RRF.ASM):00101         HEXBCD RMB 3
+D02D                  (          RRF.ASM):00102         BCDHEX RMB 3
+D030                  (          RRF.ASM):00103         OINIT RMB 3
+D033                  (          RRF.ASM):00104         CRINIT RMB 3
+D036                  (          RRF.ASM):00105         PINIT RMB 3
+D039                  (          RRF.ASM):00106         RAND RMB 3
+D03C                  (          RRF.ASM):00107         RAND16 RMB 3
+D03F                  (          RRF.ASM):00108         RMAX RMB 3
+D042                  (          RRF.ASM):00109         RANDU RMB 3
+D045                  (          RRF.ASM):00110         PLINDX RMB 3
+D048                  (          RRF.ASM):00111         PLDX RMB 3
+D04B                  (          RRF.ASM):00112         SNDLD RMB 3
+D04E                  (          RRF.ASM):00113         KILO1 RMB 3
+D051                  (          RRF.ASM):00114         GETOBJ RMB 3
+D054                  (          RRF.ASM):00115         MAKEP RMB 3
+D057                  (          RRF.ASM):00116         MKPROC RMB 3
+D05A                  (          RRF.ASM):00117         MSPROC RMB 3
+D05D                  (          RRF.ASM):00118         KILL RMB 3
+D060                  (          RRF.ASM):00119         GNCIDE RMB 3
+D063                  (          RRF.ASM):00120         SUCIDE RMB 3
+D066                  (          RRF.ASM):00121         SLEEP RMB 3
+D069                  (          RRF.ASM):00122         RIPV RMB 3
+D06C                  (          RRF.ASM):00123         MPROB RMB 3
+D06F                  (          RRF.ASM):00124         GETOB RMB 3
+D072                  (          RRF.ASM):00125         KILLOB RMB 3
+D075                  (          RRF.ASM):00126         KILLOF RMB 3
+D078                  (          RRF.ASM):00127         KILOFP RMB 3
+D07B                  (          RRF.ASM):00128         GETROB RMB 3
+D07E                  (          RRF.ASM):00129         KILROB RMB 3
+D081                  (          RRF.ASM):00130         GETPST RMB 3
+D084                  (          RRF.ASM):00131         KILPST RMB 3
+D087                  (          RRF.ASM):00132         GETHUM RMB 3
+D08A                  (          RRF.ASM):00133         KILHUM RMB 3
+D08D                  (          RRF.ASM):00134         DMAOFN RMB 3
+D090                  (          RRF.ASM):00135         MPCTON RMB 3
+D093                  (          RRF.ASM):00136         BLKON RMB 3
+D096                  (          RRF.ASM):00137         EXECV RMB 3
+D099                  (          RRF.ASM):00138         P1SW   RMB    3
+D09C                  (          RRF.ASM):00139         P2SW   RMB    3
+D09F                  (          RRF.ASM):00140         DIVAB  RMB    3
+D0A2                  (          RRF.ASM):00141         RCMOSA RMB    3
+D0A5                  (          RRF.ASM):00142         RCMOSB RMB    3
+D0A8                  (          RRF.ASM):00143         RCMOSD RMB    3
+D0AB                  (          RRF.ASM):00144         WCMOSA RMB    3
+D0AE                  (          RRF.ASM):00145         WCMOSB RMB    3
+D0B1                  (          RRF.ASM):00146         WCMOSD RMB    3
+D0B4                  (          RRF.ASM):00147         BCDBIN RMB    3
+D0B7                  (          RRF.ASM):00148         RWMOVE RMB    3
+D0BA                  (          RRF.ASM):00149         AUD    RMB    3
+D0BD                  (          RRF.ASM):00150         AUD1   RMB    3
+D0C0                  (          RRF.ASM):00151         INT20V RMB    3
+D0C3                  (          RRF.ASM):00152         LFV    RMB    3
+D0C6                  (          RRF.ASM):00153         NEWBCH RMB    3        BCDHEX THAT USES A!!
+                      (          RRF.ASM):00154         *
+                      (          RRF.ASM):00155         *PLAYER DEATH
+                      (          RRF.ASM):00156         *
+     DD00             (          RRF.ASM):00157         RDORG EQU $DD00
+                      (          RRF.ASM):00158          ORG RDORG
+DD00                  (          RRF.ASM):00159         RDTHV RMB 3
+                      (          RRF.ASM):00160         *
+                      (          RRF.ASM):00161         *HUMANS+HULKS
+                      (          RRF.ASM):00162         *
+     0000             (          RRF.ASM):00163         RHORG EQU $0000
+                      (          RRF.ASM):00164          ORG RHORG
+0000                  (          RRF.ASM):00165         HULKST RMB 3
+0003                  (          RRF.ASM):00166         HUMST RMB 3
+0006                  (          RRF.ASM):00167         CKLIM RMB 3
+0009                  (          RRF.ASM):00168         SKULL RMB 3
+000C                  (          RRF.ASM):00169         P1KD RMB 2
+000E                  (          RRF.ASM):00170         MOMPIC RMB 2
+0010                  (          RRF.ASM):00171         DADPIC RMB 2
+0012                  (          RRF.ASM):00172         KIDPIC RMB 2
+0014                  (          RRF.ASM):00173         HLKPIC RMB 2
+0016                  (          RRF.ASM):00174         HLKANA RMB 2
+0018                  (          RRF.ASM):00175         HUMANA RMB 2
+001A                  (          RRF.ASM):00176         SKLPIC RMB 2
+                      (          RRF.ASM):00177         *
+                      (          RRF.ASM):00178         ***CIRCLES,ENFORCERS,SPARX
+                      (          RRF.ASM):00179         *
+     1140             (          RRF.ASM):00180         RCORG EQU $1140
+                      (          RRF.ASM):00181          ORG RCORG
+1140                  (          RRF.ASM):00182         CIRCST RMB 3 START CIRCLES
+1143                  (          RRF.ASM):00183         CIRKV RMB 3
+1146                  (          RRF.ASM):00184         CIRPIC RMB 2
+1148                  (          RRF.ASM):00185         ENGPIC RMB 2
+114A                  (          RRF.ASM):00186         ENFPIC RMB 2
+                      (          RRF.ASM):00187         *
+                      (          RRF.ASM):00188         *BRAINS & CO.
+                      (          RRF.ASM):00189         *
+     1AC0             (          RRF.ASM):00190         BRNORG EQU $1AC0
+                      (          RRF.ASM):00191          ORG BRNORG
+1AC0                  (          RRF.ASM):00192         BRNST RMB 3
+1AC3                  (          RRF.ASM):00193         BRNPIC RMB 2
+1AC5                  (          RRF.ASM):00194         BRONV  RMB    3
+1AC8                  (          RRF.ASM):00195         HUMONV RMB    3
+1ACB                  (          RRF.ASM):00196         PRGPIC RMB 2
+                      (          RRF.ASM):00197         *
+                      (          RRF.ASM):00198         *******ROBOT GAME...... R G .......
+                      (          RRF.ASM):00199         *
+     26C0             (          RRF.ASM):00200         RGORG EQU $26C0
+                      (          RRF.ASM):00201          ORG RGORG
+26C0                  (          RRF.ASM):00202         PLAYER RMB 3
+26C3                  (          RRF.ASM):00203         RANDXY RMB 3
+26C6                  (          RRF.ASM):00204         CKOBS RMB 3
+26C9                  (          RRF.ASM):00205         MANDSP RMB 3
+26CC                  (          RRF.ASM):00206         STRT1 RMB 3
+26CF                  (          RRF.ASM):00207         STRT2 RMB 3
+26D2                  (          RRF.ASM):00208         TDISPV RMB 3
+26D5                  (          RRF.ASM):00209         MANPIC RMB 2
+26D7                  (          RRF.ASM):00210         LASPIC RMB 2
+                      (          RRF.ASM):00211         *
+                      (          RRF.ASM):00212         *ROBOTS&POSTS
+                      (          RRF.ASM):00213         *
+     3880             (          RRF.ASM):00214         RPORG EQU $3880
+                      (          RRF.ASM):00215          ORG RPORG
+3880                  (          RRF.ASM):00216         RINIT RMB 3
+3883                  (          RRF.ASM):00217         PSINIT RMB 3
+3886                  (          RRF.ASM):00218         PSTP1 RMB 2
+3888                  (          RRF.ASM):00219         OPON RMB 3
+388B                  (          RRF.ASM):00220         OPON1 RMB 3
+388E                  (          RRF.ASM):00221         SAFTY RMB 3
+3891                  (          RRF.ASM):00222         ROBPIC RMB 2
+3893                  (          RRF.ASM):00223         PSTPIC RMB 2
+3895                  (          RRF.ASM):00224         PKPRCV RMB 3
+                      (          RRF.ASM):00225         *
+                      (          RRF.ASM):00226         *TRANSPORTER
+                      (          RRF.ASM):00227         *
+     4140             (          RRF.ASM):00228         RTORG EQU $4140
+                      (          RRF.ASM):00229          ORG RTORG
+4140                  (          RRF.ASM):00230         TRANST RMB 3
+                      (          RRF.ASM):00231         *
+                      (          RRF.ASM):00232         *DIAGONAL EXPLOSIONS
+                      (          RRF.ASM):00233         *
+     4680             (          RRF.ASM):00234         RDXORG EQU $4680
+                      (          RRF.ASM):00235          ORG RDXORG
+4680                  (          RRF.ASM):00236         DXINIT RMB 3
+4683                  (          RRF.ASM):00237         DXST RMB 3
+4686                  (          RRF.ASM):00238         DAPST RMB 3
+4689                  (          RRF.ASM):00239         DXUPD RMB 3
+                      (          RRF.ASM):00240         *
+                      (          RRF.ASM):00241         *TANKS
+                      (          RRF.ASM):00242         *
+     4B00             (          RRF.ASM):00243         RTKORG EQU $4B00
+                      (          RRF.ASM):00244          ORG RTKORG
+4B00                  (          RRF.ASM):00245         TANKST RMB 3
+4B03                  (          RRF.ASM):00246         SQST RMB 3
+4B06                  (          RRF.ASM):00247         SQPIC RMB 2
+4B08                  (          RRF.ASM):00248         TNGPIC RMB 2
+4B0A                  (          RRF.ASM):00249         TNKPIC RMB 2
+                      (          RRF.ASM):00250         *
+                      (          RRF.ASM):00251         *MARQUEE
+                      (          RRF.ASM):00252         *
+     5700             (          RRF.ASM):00253         RMORG EQU $5700
+                      (          RRF.ASM):00254          ORG RMORG
+5700                  (          RRF.ASM):00255         RMST RMB 3
+                      (          RRF.ASM):00256         *
+                      (          RRF.ASM):00257         *EXPLOSIONS
+                      (          RRF.ASM):00258         *
+     5B40             (          RRF.ASM):00259         RXORG EQU $5B40
+                      (          RRF.ASM):00260          ORG RXORG
+5B40                  (          RRF.ASM):00261         EXINIT RMB 3
+5B43                  (          RRF.ASM):00262         EXST RMB 3
+5B46                  (          RRF.ASM):00263         APST RMB 3
+5B49                  (          RRF.ASM):00264         EXUPD RMB 3
+5B4C                  (          RRF.ASM):00265         PDEATH RMB 3
+5B4F                  (          RRF.ASM):00266         HVEXST RMB 3
+5B52                  (          RRF.ASM):00267         DDEXST RMB 3 DUAL DIAGONALS
+5B55                  (          RRF.ASM):00268         AMAP   RMB    3        ATTRACT MODE APPEAR
+5B58                  (          RRF.ASM):00269         HAPST  RMB    3        HORIZONTAL APPEAR
+5B5B                  (          RRF.ASM):00270         HEXST  RMB    3        HORIZONTAL EXPLODE
+                      (          RRF.ASM):00271         
+                      (          RRF.ASM):00272         *             STINKY LINKY VINCKYS
+                      (          RRF.ASM):00273         
+     77A0             (          RRF.ASM):00274         LOGORG EQU    $77A0          PLACE FOR PROGRAM
+     77A0             (          RRF.ASM):00275         GOV    EQU    LOGORG
+     77A3             (          RRF.ASM):00276         CCV    EQU    GOV+3
+                      (          RRF.ASM):00277         
+     E3D0             (          RRF.ASM):00278         TSCORG EQU $E3D0   HIGH SCORE BULLSHIT
+     E3D0             (          RRF.ASM):00279         PUPHSC EQU TSCORG  POWER UP HIGH SCORE CHECK
+     E3D3             (          RRF.ASM):00280         ENDPRC EQU PUPHSC+3 END OF GAME PROCESSING
+     E3D6             (          RRF.ASM):00281         GODSET EQU ENDPRC+3 ENTER GODS NAME BY OPERATOR
+     E3D9             (          RRF.ASM):00282         HIGHRS EQU GODSET+3 RESET HIGH SCORE TABLE BY OPERATOR
+     E3DC             (          RRF.ASM):00283         HSCHKV EQU HIGHRS+3 CHECK IF HS TABLE LOOKS BASHED
+     E3DF             (          RRF.ASM):00284         HSBUTV EQU HSCHKV+3 HIGH SCORE RESET BUTTON
+                      (          RRF.ASM):00285         
+     DF40             (          RRF.ASM):00286         TABORG EQU    $DF40
+     DF40             (          RRF.ASM):00287         TABLEV EQU    TABORG
+                      (          RRF.ASM):00288         
+     F000             (          RRF.ASM):00289         TSTORG EQU $F000
+     F000             (          RRF.ASM):00290         PWRUPV EQU TSTORG    
+     F003             (          RRF.ASM):00291         ADVSW EQU PWRUPV+3
+     F006             (          RRF.ASM):00292         AUTOCY EQU ADVSW+3
+     F009             (          RRF.ASM):00293         HXINIT EQU AUTOCY+3
+     F00C             (          RRF.ASM):00294         HEXSTX EQU HXINIT+3
+     F00F             (          RRF.ASM):00295         HAPSTX EQU HEXSTX+3
+     F012             (          RRF.ASM):00296         HXUPD EQU HAPSTX+3
+     F015             (          RRF.ASM):00297         WLOOPV EQU HXUPD+3
+     F017             (          RRF.ASM):00298         ELOOPV EQU WLOOPV+2
+     F019             (          RRF.ASM):00299         L2     EQU    ELOOPV+2
+     F01B             (          RRF.ASM):00300         L0     EQU    L2+2
+                      (          RRF.ASM):00301         
+     6F00             (          RRF.ASM):00302         TSBORG EQU $6F00 ADJUST PART OF TEST MODE
+     6F00             (          RRF.ASM):00303         ADJV   EQU TSBORG
+     6F03             (          RRF.ASM):00304         CMINIT EQU ADJV+3
+     6F06             (          RRF.ASM):00305         ATMCK  EQU CMINIT+3
+     6F09             (          RRF.ASM):00306         GETLT  EQU ATMCK+3     ROUTINE TO GET LETTERS FROM CONTROL PANEL
+     6F0C             (          RRF.ASM):00307         CMSMVV EQU GETLT+3
+     6F0F             (          RRF.ASM):00308         DOPMES EQU    CMSMVV+3   2 BYTER
+                      (          RRF.ASM):00309         
+     5F90             (          RRF.ASM):00310         TXORG  EQU    $5F90    PLACE FOR TEXT PROGRAM
+     5F90             (          RRF.ASM):00311         PR35V  EQU    TXORG
+     5F93             (          RRF.ASM):00312         PR57V  EQU    PR35V+3
+     5F96             (          RRF.ASM):00313         WRD5V  EQU    PR57V+3
+     5F99             (          RRF.ASM):00314         WRD7V  EQU    WRD5V+3
+     5F9C             (          RRF.ASM):00315         PRINV  EQU    WRD7V+3
+     5F9F             (          RRF.ASM):00316         PRSCR  EQU    PRINV+3
+                      (          RRF.ASM):00317         
+     5F96             (          RRF.ASM):00318         WRD5FV EQU    WRD5V
+     5F99             (          RRF.ASM):00319         WRD7FV EQU    WRD7V
+     5F90             (          RRF.ASM):00320         PRN5FV EQU    PR35V
+     5F93             (          RRF.ASM):00321         PRN7FV EQU    PR57V
+                      (          RRF.ASM):00322         
+     E9C8             (          RRF.ASM):00323         SETORG EQU    $E9C8    CHARACTER SET
+     E9C8             (          RRF.ASM):00324         TAB35  EQU    SETORG
+     E9CA             (          RRF.ASM):00325         TAB57  EQU    TAB35+2
+     E9CA             (          RRF.ASM):00326         N0V    EQU    TAB57  
+                      (          RRF.ASM):00327         
+                      (          RRF.ASM):00328         *
+                      (          RRF.ASM):00329         *BASE PAGE RAM AREA
+                      (          RRF.ASM):00330         *
+                      (          RRF.ASM):00331          ORG $9800
+     9800             (          RRF.ASM):00332         RAM EQU *
+     98               (          RRF.ASM):00333          SETDP $98
+                      (          RRF.ASM):00334         
+9800                  (          RRF.ASM):00335         PCRAM RMB 16 PSEUDO COLOR RAM
+9810                  (          RRF.ASM):00336         TIMER RMB 1  IRQ TIMER
+9811                  (          RRF.ASM):00337         ACTIVE RMB    2        POINTER TO LIST OF CURRENTLY ACTIVE (SLEEPING) PROCS.
+9813                  (          RRF.ASM):00338         FREE   RMB    2        POINTER TO LIST OF UNALLOCATED PROCESS SLEEP SPACE.
+9815                  (          RRF.ASM):00339         CRPROC RMB    2        POINTER TO SLEEP AREA OF CURRENTLY EXECUTING PROCESS.
+9817                  (          RRF.ASM):00340         OPTR RMB 2 MOTION OBJECT LIST POINTER
+9819                  (          RRF.ASM):00341         OBPTR RMB 2 OBSTACLE LIST POINTER
+981B                  (          RRF.ASM):00342         OFREE RMB 2 FREE LIST POINTER
+981D                  (          RRF.ASM):00343         SPFREE RMB 2 SUPER PROCESS FREE LIST
+981F                  (          RRF.ASM):00344         HPTR RMB 2 HUMAN PTR
+9821                  (          RRF.ASM):00345         RPTR RMB 2 ROBOT LIST
+9823                  (          RRF.ASM):00346         PPTR RMB 2 PHATAL OBJECT LIST
+9825                  (          RRF.ASM):00347         ITEMP RMB 2 INTERUPT TEMP
+9827                  (          RRF.ASM):00348         PSTIN RMB 2
+9829                  (          RRF.ASM):00349         ITEMP2 RMB 2
+982B                  (          RRF.ASM):00350         XTEMP  RMB 2 SAVE AREA FOR QUICK TEMPORARY
+982D                  (          RRF.ASM):00351         XTEMP2 RMB 2
+982F                  (          RRF.ASM):00352         PIA01 RMB 1 N-1 PIA0
+9830                  (          RRF.ASM):00353         PIA02 RMB 1 N-2 PIA0
+9831                  (          RRF.ASM):00354         PIA21 RMB 1 N-1 PIA2
+9832                  (          RRF.ASM):00355         PIA22 RMB 1 N-2 PIA2
+9833                  (          RRF.ASM):00356         SWPROC RMB 12 SWITCH SCAN TEMP
+983F                  (          RRF.ASM):00357         CURPLR RMB 1 CURRENT
+9840                  (          RRF.ASM):00358         PLRCNT RMB 1 NUMBER OF PLAYERS
+9841                  (          RRF.ASM):00359         XXX2 RMB 1 '80' IRQ LINE
+9842                  (          RRF.ASM):00360         OVCNT RMB 1 OVERFLOW COUNT
+9843                  (          RRF.ASM):00361         IFLG RMB 1 IRQ FLAG
+9844                  (          RRF.ASM):00362         FRAME RMB 1 IRQ COUNT
+9845                  (          RRF.ASM):00363         RWCTMP RMB 1 SCREEN READ CONTROL BYTE
+9846                  (          RRF.ASM):00364         REPLA RMB 2 REPLAY LEVEL
+9848                  (          RRF.ASM):00365         PCFLG RMB 1 PLAYER COLLISION
+9849                  (          RRF.ASM):00366         HTABX RMB 2 HUMAN TABLE INDEX
+                      (          RRF.ASM):00367         *COIN BUSINESS
+984B                  (          RRF.ASM):00368         SLMCNT RMB 1
+984C                  (          RRF.ASM):00369         LCCNT RMB 1
+984D                  (          RRF.ASM):00370         RCCNT RMB 1
+984E                  (          RRF.ASM):00371         CCCNT RMB 1
+984F                  (          RRF.ASM):00372         BUNITS RMB 1
+9850                  (          RRF.ASM):00373         CUNITS RMB 1
+9851                  (          RRF.ASM):00374         CREDIT RMB 1
+                      (          RRF.ASM):00375         *ATTRACT SWITCHES: FONY PRAYAH CONTLOHL
+9852                  (          RRF.ASM):00376         ATRSW2 RMB 1
+9853                  (          RRF.ASM):00377         ATRSW3 RMB 1
+                      (          RRF.ASM):00378         *SOUND RAM
+9854                  (          RRF.ASM):00379         SNDX RMB 2 TABLE INDEX
+9856                  (          RRF.ASM):00380         SNDPRI RMB 1 PRIORITY
+9857                  (          RRF.ASM):00381         SNDTMR RMB 1
+9858                  (          RRF.ASM):00382         SNDREP RMB 1
+                      (          RRF.ASM):00383         *
+                      (          RRF.ASM):00384         *STATUS FLAG
+                      (          RRF.ASM):00385         *B7=GAME OVER
+                      (          RRF.ASM):00386         *B6=
+                      (          RRF.ASM):00387         *B5=
+                      (          RRF.ASM):00388         *B4=PLAYER OUTPUT
+                      (          RRF.ASM):00389         *B3=MOTION OBJS VEL +ENEMIES
+                      (          RRF.ASM):00390         *B2=EXPLOSION UPDATE
+                      (          RRF.ASM):00391         *B1=POST ,MOT OBJ REFRESH
+                      (          RRF.ASM):00392         *B0=PLAYER MOTION,COLLISION,FIRE
+9859                  (          RRF.ASM):00393         STATUS RMB 1
+                      (          RRF.ASM):00394         *
+                      (          RRF.ASM):00395         *PLAYER OBJECT STRUCTURE
+                      (          RRF.ASM):00396         *
+     985A             (          RRF.ASM):00397         PLOBJ EQU *
+985A                  (          RRF.ASM):00398          RMB 2 OLINK
+985C                  (          RRF.ASM):00399         PPICT RMB 2 OPICT
+985E                  (          RRF.ASM):00400         PX RMB 2 OBJX
+9860                  (          RRF.ASM):00401          RMB 2 OBJID
+9862                  (          RRF.ASM):00402          RMB 2 OCVECT
+9864                  (          RRF.ASM):00403         PX16 RMB 2  OX16
+9866                  (          RRF.ASM):00404         PY16 RMB 2  OY16
+9868                  (          RRF.ASM):00405         PXV RMB 2   OXV
+986A                  (          RRF.ASM):00406         PYV RMB 2   OYV
+986C                  (          RRF.ASM):00407          RMB 1 OFLAV
+986D                  (          RRF.ASM):00408         PODATA RMB 1 ODATA
+986E                  (          RRF.ASM):00409         POLDPC RMB 2 OLDPIC
+9870                  (          RRF.ASM):00410         PLAIMC RMB 1 PLAYER ANIMATION RATE
+9871                  (          RRF.ASM):00411         PLAIMN RMB 1 PLAYER ANIMATION NUMBER
+9872                  (          RRF.ASM):00412         PLAIMB RMB 2 PLAYER ANIMATION BASE ADDR
+                      (          RRF.ASM):00413         *
+                      (          RRF.ASM):00414         *COLLISION ROUTINE PARAMETERS
+                      (          RRF.ASM):00415         *
+9874                  (          RRF.ASM):00416         XCNT RMB 1 SCAN COUNTS
+9875                  (          RRF.ASM):00417         YCNT RMB 1
+9876                  (          RRF.ASM):00418         OX1 RMB 1 OFFSETS
+9877                  (          RRF.ASM):00419         OY1 RMB 1
+9878                  (          RRF.ASM):00420         PX1 RMB 1
+9879                  (          RRF.ASM):00421         PY1 RMB 1
+987A                  (          RRF.ASM):00422         OBW RMB 1 HT TEMPS
+987B                  (          RRF.ASM):00423         PLW RMB 1
+987C                  (          RRF.ASM):00424         ULX RMB 1 UPPER LEFT COORD
+987D                  (          RRF.ASM):00425         ULY RMB 1 "
+987E                  (          RRF.ASM):00426         LRX RMB 1
+987F                  (          RRF.ASM):00427         LRY RMB 1
+9880                  (          RRF.ASM):00428         CTEMP RMB 2 INDEX TEMP
+9882                  (          RRF.ASM):00429         CTEMP2 RMB 2
+                      (          RRF.ASM):00430         *RANDOM VARIABLES
+9884                  (          RRF.ASM):00431         SEED   RMB    1
+9885                  (          RRF.ASM):00432         HSEED  RMB    1 
+9886                  (          RRF.ASM):00433         LSEED  RMB    1
+                      (          RRF.ASM):00434         *LASER
+9887                  (          RRF.ASM):00435         LCNT RMB 1
+9888                  (          RRF.ASM):00436         LASDIR RMB 2
+                      (          RRF.ASM):00437         *SPARKS
+988A                  (          RRF.ASM):00438         SPKCNT RMB 1
+988B                  (          RRF.ASM):00439         ROBST RMB 2 PTR TO ROBOT LIST
+988D                  (          RRF.ASM):00440         SAVCNT RMB 1 HUMAN COUNT SAVED
+988E                  (          RRF.ASM):00441         BCMCNT RMB 1 BRAIN CRUISE MISSILES
+                      (          RRF.ASM):00442         *POST ANIMATION+WALL COLOR
+988F                  (          RRF.ASM):00443         WALCOL RMB 1 WALL+POST BG
+9890                  (          RRF.ASM):00444         PSTCOL RMB 1 POST COLOR
+9891                  (          RRF.ASM):00445         LASCOL RMB 1 LASER WALL COLLIDE COLOR
+9892                  (          RRF.ASM):00446         PSTREF RMB 1 POST REFRESH RATE
+9893                  (          RRF.ASM):00447         PSTANI RMB 2 CURR POST ANIMATION
+9895                  (          RRF.ASM):00448         BRNFLG RMB 1 BRAIN HUMAN KILL FLAG
+                      (          RRF.ASM):00449         *
+                      (          RRF.ASM):00450         *EXPLOSION STUFF
+9896                  (          RRF.ASM):00451         EXPRAM RMB $10
+98A6                  (          RRF.ASM):00452         CENTMP RMB 2 CENTER OF BLOW
+98A8                  (          RRF.ASM):00453         HXRAM RMB $10
+98B8                  (          RRF.ASM):00454         DXRAM RMB $10
+98C8                  (          RRF.ASM):00455         RMRAM RMB 6 MARQUEE RAM
+                      (          RRF.ASM):00456         
+                      (          RRF.ASM):00457         ************************ LINKYS STINKYS
+                      (          RRF.ASM):00458         
+98CE                  (          RRF.ASM):00459         INDIAG RMB    1
+                      (          RRF.ASM):00460         
+                      (          RRF.ASM):00461         *
+                      (          RRF.ASM):00462         *      TEXT VARIABLES
+                      (          RRF.ASM):00463         *
+                      (          RRF.ASM):00464         
+98CF                  (          RRF.ASM):00465         TEXCOL RMB    1 (TEXCOL)  PRINTING COLOR (NIBBLES REPRESENT FLAVOR COLO
+98D0                  (          RRF.ASM):00466         TXFLAV RMB    1 (TXFLAV) FLAVOR OF CURRENT CURSOR (0=EVEN, 1=ODD)
+98D1                  (          RRF.ASM):00467         TXLEAD RMB    1 (TXLEAD) LEAD ZERO BLANKING ON/OFF (0=OFF, 1=ON)
+98D2                  (          RRF.ASM):00468         TXFONT RMB    1 (TXFONT) FONT HEIGHT (5 OR 7) PIXELS
+98D3                  (          RRF.ASM):00469         TEXMAR RMB    2        CURRENT LEFT MARGIN CURSOR POINTER
+98D5                  (          RRF.ASM):00470         TEXMFL RMB    1        CURRENT LEFT MARGIN FLAVOR
+98D6                  (          RRF.ASM):00471         TEXTP3 RMB    1
+98D7                  (          RRF.ASM):00472         TXCLIP RMB    1
+                      (          RRF.ASM):00473         
+                      (          RRF.ASM):00474         *
+                      (          RRF.ASM):00475         ***    GET LETTER ROUTINE RAM
+                      (          RRF.ASM):00476         *
+                      (          RRF.ASM):00477         
+98D8                  (          RRF.ASM):00478         GETLRM RMB    2
+98DA                  (          RRF.ASM):00479         GETLST RMB    3
+                      (          RRF.ASM):00480         
+                      (          RRF.ASM):00481         ********************* LOGO RAM
+                      (          RRF.ASM):00482         
+98DD                  (          RRF.ASM):00483         LOGX   RMB    2
+98DF                  (          RRF.ASM):00484         LOGCOL RMB    1
+98E0                  (          RRF.ASM):00485         LOGCL2 RMB    1
+98E1                  (          RRF.ASM):00486         LOGCNT RMB    1
+98E2                  (          RRF.ASM):00487         LOGSAV RMB    2
+98E4                  (          RRF.ASM):00488         LOGCST RMB    2
+                      (          RRF.ASM):00489         
+98E6                  (          RRF.ASM):00490         LASTX  RMB    2
+98E8                  (          RRF.ASM):00491         SIDE   RMB    1
+98E9                  (          RRF.ASM):00492         BALCOL RMB    1
+98EA                  (          RRF.ASM):00493         SLIDER RMB    1
+98EB                  (          RRF.ASM):00494         ERPTR  RMB    2
+                      (          RRF.ASM):00495         *MOVE THIS SOMEDAY
+98ED                  (          RRF.ASM):00496         ENFCNT RMB 1
+98EE                  (          RRF.ASM):00497         GAMTIM RMB 1 GAME TIMER
+98EF                  (          RRF.ASM):00498         TNKSPD RMB 1 TANK SPEED PARAMETER
+98F0                  (          RRF.ASM):00499         SCRFLG RMB 1 SCORE FLAG
+98F1                  (          RRF.ASM):00500         SHLCNT RMB 1 SHELL COUNTER
+98F2                  (          RRF.ASM):00501         RIPFLG RMB 1                            
+98F3                  (          RRF.ASM):00502         HCK1   RMB 1
+98F4                  (          RRF.ASM):00503         ATFLAG RMB 1  INDICATE WHAT PAGE AND HOW
+                      (          RRF.ASM):00504         
+                      (          RRF.ASM):00505         *
+                      (          RRF.ASM):00506         *TABLE DATA
+                      (          RRF.ASM):00507         *
+                      (          RRF.ASM):00508          ORG RAM+$100 PAST BASE PAGE
+                      (          RRF.ASM):00509         *
+                      (          RRF.ASM):00510         *MASTER OBJECT LIST
+                      (          RRF.ASM):00511         *
+     9900             (          RRF.ASM):00512         OLIST EQU * 
+     0018             (          RRF.ASM):00513         OSIZE EQU $18
+                      (          RRF.ASM):00514         *
+                      (          RRF.ASM):00515         *INDEX OFFSETS
+                      (          RRF.ASM):00516         *
+     0000             (          RRF.ASM):00517         OLINK EQU 0 LINK TO NEXT
+     0002             (          RRF.ASM):00518         OPICT EQU 2 PICTURE DESCRIPTOR ADDR
+     0004             (          RRF.ASM):00519         OBJX EQU 4 UPPER LEFT SCREEN X
+     0005             (          RRF.ASM):00520         OBJY EQU 5 UPPER LEFT SCREEN Y
+     0006             (          RRF.ASM):00521         OBJID EQU 6 ASSOCIATED PROCESS ID (IF ANY)
+     0008             (          RRF.ASM):00522         OCVECT EQU 8 COLLISION ROUTINE ADDR
+     000A             (          RRF.ASM):00523         OX16 EQU $A 16 BIT X WORLD COORD
+     000C             (          RRF.ASM):00524         OY16 EQU $C 16 BIT Y WORLD COORD
+     000E             (          RRF.ASM):00525         OXV EQU $E X VELOCITY
+     0010             (          RRF.ASM):00526         OYV EQU $10 Y VELOCITY
+     0012             (          RRF.ASM):00527         OFLAV EQU $12 OLD FLAVOR
+     0013             (          RRF.ASM):00528         ODATA EQU $13 MISC. DATA
+     0014             (          RRF.ASM):00529         OLDPIC EQU $14 OLD PICTURE TO ERASE
+     0016             (          RRF.ASM):00530         FONIPC EQU $16 FONY PICT FOR COLLISION PURPOSES
+                      (          RRF.ASM):00531         *RESERVE AREA
+9900                  (          RRF.ASM):00532          RMB (180)*OSIZE
+     A9E0             (          RRF.ASM):00533         OLEND EQU *
+                      (          RRF.ASM):00534         *
+                      (          RRF.ASM):00535         *USER DEFINED PROCESS TYPES
+                      (          RRF.ASM):00536         *
+     0000             (          RRF.ASM):00537         STYPE EQU 0 SYSTEM PROCESS
+     0001             (          RRF.ASM):00538         CTYPE EQU 1 COIN
+                      (          RRF.ASM):00539         *
+                      (          RRF.ASM):00540         *SLEEPING PROCESS TABLE
+                      (          RRF.ASM):00541         *
+     A9E0             (          RRF.ASM):00542         PTAB EQU *
+                      (          RRF.ASM):00543         *
+                      (          RRF.ASM):00544         *OFFSET CONSTANTS 
+                      (          RRF.ASM):00545         *
+     0000             (          RRF.ASM):00546         PLINK EQU 0
+     0002             (          RRF.ASM):00547         PADDR EQU 2
+     0004             (          RRF.ASM):00548         PTIME EQU 4
+     0005             (          RRF.ASM):00549         PTYPE EQU 5
+     0006             (          RRF.ASM):00550         PCOD EQU 6
+     0007             (          RRF.ASM):00551         PDATA EQU 7
+     0007             (          RRF.ASM):00552         PD EQU 7
+     0008             (          RRF.ASM):00553         PD1 EQU 8
+     0009             (          RRF.ASM):00554         PD2 EQU 9
+     000A             (          RRF.ASM):00555         PD3 EQU 10
+     000B             (          RRF.ASM):00556         PD4 EQU 11
+     000C             (          RRF.ASM):00557         PD5 EQU 12
+     000D             (          RRF.ASM):00558         PD6 EQU 13
+     000E             (          RRF.ASM):00559         PD7 EQU 14
+     000F             (          RRF.ASM):00560         PSIZE EQU 15
+A9E0                  (          RRF.ASM):00561          RMB 15*(120)
+     B0E8             (          RRF.ASM):00562         TABEND EQU *
+                      (          RRF.ASM):00563         *
+                      (          RRF.ASM):00564         *SUPER PROCESSES
+                      (          RRF.ASM):00565         *
+     001F             (          RRF.ASM):00566         SPSIZE EQU PSIZE+16
+B0E8                  (          RRF.ASM):00567         SPTAB RMB SPSIZE*20
+     B354             (          RRF.ASM):00568         SPTEND EQU *
+                      (          RRF.ASM):00569         *
+                      (          RRF.ASM):00570         *OBJECT PICTURE STRUCTURE
+                      (          RRF.ASM):00571         *
+     0000             (          RRF.ASM):00572         OBJW EQU 0
+     0001             (          RRF.ASM):00573         OBJH EQU 1
+     0002             (          RRF.ASM):00574         OBJDAT EQU 2
+     0004             (          RRF.ASM):00575         OBJL EQU 4
+                      (          RRF.ASM):00576         *
+                      (          RRF.ASM):00577         *HUMAN TABLE
+                      (          RRF.ASM):00578         *
+B354                  (          RRF.ASM):00579         HTAB RMB 80
+     B3A4             (          RRF.ASM):00580         HTBEND EQU *
+                      (          RRF.ASM):00581         *
+                      (          RRF.ASM):00582         *POST REFRESH LIST
+                      (          RRF.ASM):00583         *
+B3A4                  (          RRF.ASM):00584         PSLIST RMB 64 POST LIST
+     B3E4             (          RRF.ASM):00585         PSLEND EQU *
+                      (          RRF.ASM):00586         *
+                      (          RRF.ASM):00587         *HORIZONTAL EXPLOSION TABLES
+                      (          RRF.ASM):00588         *
+B3E4                  (          RRF.ASM):00589         HXTAB RMB $800
+                      (          RRF.ASM):00590         
+                      (          RRF.ASM):00591         *
+                      (          RRF.ASM):00592         *DIAGONAL XPLOSION TABLES
+                      (          RRF.ASM):00593         *
+BBE4                  (          RRF.ASM):00594         DXTAB RMB $200
+                      (          RRF.ASM):00595         *
+                      (          RRF.ASM):00596         *PLAYER DATA TABLE
+                      (          RRF.ASM):00597         *
+     BDE4             (          RRF.ASM):00598         PLDATA EQU *
+BDE4                  (          RRF.ASM):00599         ZP1SCR RMB 4 SCORE MSB 1ST
+BDE8                  (          RRF.ASM):00600         ZP1RP RMB 4 NEXT REPLAY LEVEL
+BDEC                  (          RRF.ASM):00601         ZP1LAS RMB 1 #OF LASERS 
+BDED                  (          RRF.ASM):00602         ZP1WAV RMB 1 WAVE # IN HEX
+BDEE                  (          RRF.ASM):00603         ZP1ENM RMB 50 ENEMY STATE
+     BE20             (          RRF.ASM):00604         ZP1END EQU *
+BE20                  (          RRF.ASM):00605         ZP2SCR RMB 4
+BE24                  (          RRF.ASM):00606         ZP2RP RMB 4
+BE28                  (          RRF.ASM):00607         ZP2LAS RMB 1
+BE29                  (          RRF.ASM):00608         ZP2WAV RMB 1
+BE2A                  (          RRF.ASM):00609         ZP2ENM RMB 50
+     BE5C             (          RRF.ASM):00610         PLDEND EQU * END OF PLAYER DATA
+     003C             (          RRF.ASM):00611         PLDLEN EQU ZP1END-PLDATA
+     0000             (          RRF.ASM):00612         PSCOR EQU ZP1SCR-PLDATA
+     0004             (          RRF.ASM):00613         PRPLA EQU ZP1RP-PLDATA
+     0008             (          RRF.ASM):00614         PLAS EQU ZP1LAS-PLDATA
+     0009             (          RRF.ASM):00615         PWAV EQU ZP1WAV-PLDATA
+     000A             (          RRF.ASM):00616         PENEMY EQU ZP1ENM-PLDATA
+                      (          RRF.ASM):00617         *
+                      (          RRF.ASM):00618         *ENEMIES LIST
+                      (          RRF.ASM):00619         *WARNING DO NOT CHANGE ORDER OF COUNTS
+     BE5C             (          RRF.ASM):00620         ELIST EQU *
+BE5C                  (          RRF.ASM):00621         ROBSPD RMB 1  SPEED
+BE5D                  (          RRF.ASM):00622         RMXSPD RMB 1 MAX ROBOT SPEED
+BE5E                  (          RRF.ASM):00623         ENFNUM RMB 1 # OF ENFORCERS/CIRCLE X2
+BE5F                  (          RRF.ASM):00624         ENSTIM RMB 1 ENF SHOT TIMER
+BE60                  (          RRF.ASM):00625         CDPTIM RMB 1 CIRCLE DROP TIMER
+BE61                  (          RRF.ASM):00626         HLKSPD RMB 1 HULK SPEED
+BE62                  (          RRF.ASM):00627         BSHTIM RMB 1 BRAIN SHOT TIMER
+BE63                  (          RRF.ASM):00628         BRNSPD RMB 1 BRAIN SPEED
+BE64                  (          RRF.ASM):00629         TNKSHT RMB 1  TANK SHOT RATE
+BE65                  (          RRF.ASM):00630         SHLSPD RMB 1  SHELL SPEED
+BE66                  (          RRF.ASM):00631         TDPTIM RMB 1  TANK DROP TIMR
+BE67                  (          RRF.ASM):00632         SQSPD RMB 1   SQUARE SPEED
+     BE68             (          RRF.ASM):00633         ECNTS EQU * START COUNTS
+BE68                  (          RRF.ASM):00634         ROBCNT RMB 1 # ROBOTS
+BE69                  (          RRF.ASM):00635         PSTCNT RMB 1 # POSTS
+BE6A                  (          RRF.ASM):00636         MOMCNT RMB 1 # MOM UNITS
+BE6B                  (          RRF.ASM):00637         DADCNT RMB 1 # DAD UNITS
+BE6C                  (          RRF.ASM):00638         KIDCNT RMB 1 # KIDS
+BE6D                  (          RRF.ASM):00639         HLKCNT RMB 1 # HULKS
+BE6E                  (          RRF.ASM):00640         BRNCNT RMB 1 # BRAINS
+BE6F                  (          RRF.ASM):00641         CIRCNT RMB 1 # CIRCLES
+BE70                  (          RRF.ASM):00642         SQCNT RMB 1 # SQUARES
+BE71                  (          RRF.ASM):00643         TNKCNT RMB 1 # TANKS
+     BE72             (          RRF.ASM):00644         ELEND EQU *
+BE72                  (          RRF.ASM):00645         HCK2 RMB 1
+                      (          RRF.ASM):00646         *
+                      (          RRF.ASM):00647         * CMOS RAM ALLOCATION
+                      (          RRF.ASM):00648         *
+                      (          RRF.ASM):00649          ORG CMOS+$100     WRITABLE CMOS  
+CD00                  (          RRF.ASM):00650         CREDST RMB 2 CREDITS BACKUP
+CD02                  (          RRF.ASM):00651         SLOT1 RMB 6 1 LEFT COIN TOTAL
+CD08                  (          RRF.ASM):00652               RMB 6 2 CENTER COIN TOTAL
+CD0E                  (          RRF.ASM):00653               RMB 6 3 RIGHT COIN TOTAL
+CD14                  (          RRF.ASM):00654                RMB 6 4 TOTAL PAID CREDITS
+CD1A                  (          RRF.ASM):00655                RMB 6 5 TOTAL REPLAYS
+CD20                  (          RRF.ASM):00656         BKTIME RMB 6 6 FLIGHT TIME IN MINS
+CD26                  (          RRF.ASM):00657         BKMEN  RMB 6 7 TOTAL SHIPS PLAYED
+CD2C                  (          RRF.ASM):00658         BKPLAY RMB 6 8 TOTAL GAMES PLAYED
+     CD32             (          RRF.ASM):00659         BKEND  EQU    *        END OF BOOKKEEPING STUFF
+     000E             (          RRF.ASM):00660         SCRSIZ EQU 14 NUMBER OF NIBBLES IN A SCORE ENTRY
+CD32                  (          RRF.ASM):00661         GODINT RMB 6
+CD38                  (          RRF.ASM):00662         GODSCR RMB 48   
+CD68                  (          RRF.ASM):00663         CMSCOR RMB 37*SCRSIZ   37 BACKED UP SCORES, 36 OF WHICH ARE VISIBLE
+CF6E                  (          RRF.ASM):00664         TODAYS RMB 10*SCRSIZ     TODAYS GREATEST
+     CFFA             (          RRF.ASM):00665         TODEND EQU *
+                      (          RRF.ASM):00666          ORG CMOS  ADEQUATE BIRTH CONTROL PROTECTION
+CC00                  (          RRF.ASM):00667         REPLAY RMB 2 REPLAY LEVEL
+CC02                  (          RRF.ASM):00668         NSHIP RMB 2 # OF SHIPS/1 CREDIT GAME
+CC04                  (          RRF.ASM):00669         COINSL RMB 2 FOR COINAGE SELECT MODE
+CC06                  (          RRF.ASM):00670         SLOT1M RMB 2 LEFT COIN MULT
+CC08                  (          RRF.ASM):00671         SLOT2M RMB 2 CENTER COIN MULT
+CC0A                  (          RRF.ASM):00672         SLOT3M RMB 2 RIGHT COIN MULT
+CC0C                  (          RRF.ASM):00673         CUNITC RMB 2 COIN UNITS PER CREDIT
+CC0E                  (          RRF.ASM):00674         CUNITB RMB 2 COIN UNITS FOR BONUS
+CC10                  (          RRF.ASM):00675         MINUNT RMB 2 MINIMUM REQD
+CC12                  (          RRF.ASM):00676         FREEPL RMB 2 FREE PLAY MODE       (ONE CREDIT GAME)     
+CC14                  (          RRF.ASM):00677         GA1 RMB 2 10 MASTER DIFFICULTY CONTROL               1
+CC16                  (          RRF.ASM):00678         GA2 RMB 2 NUMBER OF LETTERS ALLOWED TO GOD           10
+CC18                  (          RRF.ASM):00679         SPECFN RMB 2  RESTORE FACTORY SETTINGS
+CC1A                  (          RRF.ASM):00680          RMB 2  CLEAR AUDIT TOTALS
+CC1C                  (          RRF.ASM):00681          RMB 2  INITIALIZE HIGH SCORE TABLE
+CC1E                  (          RRF.ASM):00682          RMB 2  INTIATE AUTO CYCLE
+CC20                  (          RRF.ASM):00683          RMB 2  ENTER ATTRACT MODE MESSAGE
+CC22                  (          RRF.ASM):00684          RMB 2  ENTER HIGHEST SCORE NAME
+     CC24             (          RRF.ASM):00685         ENDADJ EQU *
+CC24                  (          RRF.ASM):00686         OPMESS RMB 100  2 LINES OF 25 CHARS EACH.
+CC88                  (          RRF.ASM):00687         OPL1 RMB 2
+CC8A                  (          RRF.ASM):00688         OPL2 RMB 2
+CC8C                  (          RRF.ASM):00689         ADJSUM RMB 2
+CC8E                  (          RRF.ASM):00690         OMESUM RMB 2
+                      (          RRF.ASM):00691         
+                      (          RRF.ASM):00692         *
+                      (          RRF.ASM):00693         *M A C R O S
+                      (          RRF.ASM):00694         *
+CC90                  (          RRF.ASM):00695         NAP    MACRO
+                      (          RRF.ASM):00696                LDA #\1 TIME
+                      (          RRF.ASM):00697                LDX #\2 WAKEUP ADDR
+                      (          RRF.ASM):00698                JMP    SLEEP  
+                      (          RRF.ASM):00699                ENDM
+                      (          RRF.ASM):00700         *
+                      (          RRF.ASM):00701         *MAKE A NEW PROCESS
+                      (          RRF.ASM):00702         *
+CC90                  (          RRF.ASM):00703         NEWP MACRO
+                      (          RRF.ASM):00704          LDX #\1 ADDR
+                      (          RRF.ASM):00705          LDA #\2 TYPE
+                      (          RRF.ASM):00706          JSR MKPROC
+                      (          RRF.ASM):00707          ENDM
+                      (          RRF.ASM):00708         *INIT PROCESS \0=SADDR 
+CC90                  (          RRF.ASM):00709         MAKP MACRO
+                      (          RRF.ASM):00710          JSR MAKEP
+                      (          RRF.ASM):00711          FDB \1
+                      (          RRF.ASM):00712          ENDM
+                      (          RRF.ASM):00713         *MAKE A PROCESS AND OBJECT
+CC90                  (          RRF.ASM):00714         MKPROB MACRO
+                      (          RRF.ASM):00715          JSR MPROB
+                      (          RRF.ASM):00716          FDB \1,\2,\3
+                      (          RRF.ASM):00717          ENDM
+                      (          RRF.ASM):00718         
+                      (wasm/src/RRP8.ASM):00003         *  OPT LIS
+                      (wasm/src/RRP8.ASM):00004         *  STTL ROBOTS AND POSTS
+                      (wasm/src/RRP8.ASM):00005          ORG RPORG
+3880 7E38AA           (wasm/src/RRP8.ASM):00006          JMP RINITV
+3883 7E3950           (wasm/src/RRP8.ASM):00007          JMP PSINV
+3886 3B05             (wasm/src/RRP8.ASM):00008          FDB PSTP1V
+3888 7E3942           (wasm/src/RRP8.ASM):00009          JMP OPONV
+388B 7E393C           (wasm/src/RRP8.ASM):00010          JMP OPON1V
+388E 7E38FE           (wasm/src/RRP8.ASM):00011          JMP SAFTYV
+3891 4063             (wasm/src/RRP8.ASM):00012          FDB RWDP1
+3893 3B05             (wasm/src/RRP8.ASM):00013          FDB PSTP1V
+3895 7E3AD9           (wasm/src/RRP8.ASM):00014          JMP PKPROC
+                      (wasm/src/RRP8.ASM):00015         *
+                      (wasm/src/RRP8.ASM):00016         *SOUND TABLE
+                      (wasm/src/RRP8.ASM):00017         *
+3898 D0010C1401081700 (wasm/src/RRP8.ASM):00018         RBSND FCB $D0,$01,$0C,$14,$01,$08,$17,0 ROBOT HIT
+38A0 C0010A0600       (wasm/src/RRP8.ASM):00019         RMVSND FCB $C0,$01,$0A,$06,0 ROBOT MOVE
+38A5 D001081700       (wasm/src/RRP8.ASM):00020         PSKSND FCB $D0,$01,$08,$17,0 POST KILL
+                      (wasm/src/RRP8.ASM):00021         *
+                      (wasm/src/RRP8.ASM):00022         *INITIALIZE ROBOTS
+                      (wasm/src/RRP8.ASM):00023         *
+38AA B6BE68           (wasm/src/RRP8.ASM):00024         RINITV LDA ROBCNT
+38AD 3402             (wasm/src/RRP8.ASM):00025          PSHS A
+38AF 274B             (wasm/src/RRP8.ASM):00026          BEQ RINX
+38B1 BDD07B           (wasm/src/RRP8.ASM):00027         RINL JSR GETROB
+38B4 CC4063           (wasm/src/RRP8.ASM):00028          LDD #RWDP1
+38B7 ED02             (wasm/src/RRP8.ASM):00029          STD OPICT,X
+38B9 ED8814           (wasm/src/RRP8.ASM):00030          STD OLDPIC,X
+38BC 8DD0             (wasm/src/RRP8.ASM):00031          BSR SAFTY
+38BE BD26C3           (wasm/src/RRP8.ASM):00032         RINL0 JSR RANDXY
+38C1 D12B             (wasm/src/RRP8.ASM):00033          CMPB XTEMP
+38C3 230C             (wasm/src/RRP8.ASM):00034          BLS RINL1
+38C5 D12C             (wasm/src/RRP8.ASM):00035          CMPB XTEMP+1
+38C7 2408             (wasm/src/RRP8.ASM):00036          BHS RINL1
+38C9 912D             (wasm/src/RRP8.ASM):00037          CMPA XTEMP2
+38CB 2304             (wasm/src/RRP8.ASM):00038          BLS RINL1
+38CD 912E             (wasm/src/RRP8.ASM):00039          CMPA XTEMP2+1
+38CF 25ED             (wasm/src/RRP8.ASM):00040          BLO RINL0
+38D1 ED04             (wasm/src/RRP8.ASM):00041         RINL1 STD OBJX,X
+38D3 A70A             (wasm/src/RRP8.ASM):00042          STA OX16,X
+38D5 E70C             (wasm/src/RRP8.ASM):00043          STB OY16,X
+38D7 1F03             (wasm/src/RRP8.ASM):00044          TFR D,U
+38D9 EC9802           (wasm/src/RRP8.ASM):00045          LDD [OPICT,X]
+38DC BDD003           (wasm/src/RRP8.ASM):00046          JSR ASCAN
+38DF 26DD             (wasm/src/RRP8.ASM):00047          BNE RINL0
+38E1 B6BE5C           (wasm/src/RRP8.ASM):00048          LDA ROBSPD
+38E4 BDD042           (wasm/src/RRP8.ASM):00049          JSR RANDU
+38E7 A78813           (wasm/src/RRP8.ASM):00050          STA ODATA,X
+38EA CC3A76           (wasm/src/RRP8.ASM):00051          LDD #ROBKIL
+38ED ED08             (wasm/src/RRP8.ASM):00052          STD OCVECT,X
+38EF 8D9A             (wasm/src/RRP8.ASM):00053          BSR OPON1 TURN HIM ON WITH PHONY COLOR
+38F1 6AE4             (wasm/src/RRP8.ASM):00054          DEC ,S
+38F3 26BC             (wasm/src/RRP8.ASM):00055          BNE RINL
+38F5 9F8B             (wasm/src/RRP8.ASM):00056          STX ROBST SAVE START OF LIST
+                      (wasm/src/RRP8.ASM):00057          MAKP ROBOT
+38F7 BDD054           (             MAKP):00001          JSR MAKEP
+38FA 39B7             (             MAKP):00002          FDB ROBOT
+38FC 3582             (wasm/src/RRP8.ASM):00058         RINX PULS A,PC
+                      (wasm/src/RRP8.ASM):00059         *
+                      (wasm/src/RRP8.ASM):00060         *GRUNT SAFTY MARGIN
+                      (wasm/src/RRP8.ASM):00061         *
+38FE 3456             (wasm/src/RRP8.ASM):00062         SAFTYV PSHS X,U,D
+3900 BDD045           (wasm/src/RRP8.ASM):00063          JSR PLINDX
+3903 A609             (wasm/src/RRP8.ASM):00064          LDA PWAV,X
+3905 810A             (wasm/src/RRP8.ASM):00065          CMPA #10
+3907 2504             (wasm/src/RRP8.ASM):00066          BLO SAF0
+3909 8606             (wasm/src/RRP8.ASM):00067          LDA #6
+390B 2006             (wasm/src/RRP8.ASM):00068          BRA SAF1
+390D 8105             (wasm/src/RRP8.ASM):00069         SAF0 CMPA #5
+390F 2302             (wasm/src/RRP8.ASM):00070          BLS SAF1
+3911 8605             (wasm/src/RRP8.ASM):00071          LDA #5
+3913 8E3920           (wasm/src/RRP8.ASM):00072         SAF1 LDX #SAFTAB-4
+3916 48               (wasm/src/RRP8.ASM):00073          ASLA
+3917 48               (wasm/src/RRP8.ASM):00074          ASLA
+3918 3086             (wasm/src/RRP8.ASM):00075          LEAX A,X
+391A EC84             (wasm/src/RRP8.ASM):00076          LDD ,X
+391C DD2B             (wasm/src/RRP8.ASM):00077          STD XTEMP SET UP LIMITS
+391E EC02             (wasm/src/RRP8.ASM):00078          LDD 2,X
+3920 DD2D             (wasm/src/RRP8.ASM):00079          STD XTEMP2
+3922 35D6             (wasm/src/RRP8.ASM):00080          PULS D,X,U,PC
+3924 40B01A7A         (wasm/src/RRP8.ASM):00081         SAFTAB FCB $40,$B0,$1A,$7A
+3928 48A81A7A         (wasm/src/RRP8.ASM):00082          FCB $48,$A8,$1A,$7A
+392C 50A02A6A         (wasm/src/RRP8.ASM):00083          FCB $50,$A0,$2A,$6A
+3930 549D3060         (wasm/src/RRP8.ASM):00084          FCB $54,$9D,$30,$60
+3934 5D963559         (wasm/src/RRP8.ASM):00085          FCB $5D,$96,$35,$59
+3938 6294385C         (wasm/src/RRP8.ASM):00086          FCB $62,$94,$38,$5C
+                      (wasm/src/RRP8.ASM):00087         *
+                      (wasm/src/RRP8.ASM):00088         *ON PICTURE OF OBJECT
+                      (wasm/src/RRP8.ASM):00089         *X=OBJ, A=COL
+393C 3426             (wasm/src/RRP8.ASM):00090         OPON1V PSHS D,Y
+393E 8666             (wasm/src/RRP8.ASM):00091          LDA #FONCOL
+3940 2002             (wasm/src/RRP8.ASM):00092          BRA OPON2
+3942 3426             (wasm/src/RRP8.ASM):00093         OPONV PSHS D,Y
+3944 972D             (wasm/src/RRP8.ASM):00094         OPON2 STA XTEMP2
+3946 EC04             (wasm/src/RRP8.ASM):00095          LDD OBJX,X
+3948 10AE02           (wasm/src/RRP8.ASM):00096          LDY OPICT,X
+394B BDD090           (wasm/src/RRP8.ASM):00097          JSR MPCTON
+394E 35A6             (wasm/src/RRP8.ASM):00098          PULS D,Y,PC
+                      (wasm/src/RRP8.ASM):00099         *
+                      (wasm/src/RRP8.ASM):00100         *INITIALIZE POSTS
+                      (wasm/src/RRP8.ASM):00101         *
+3950 3470             (wasm/src/RRP8.ASM):00102         PSINV  PSHS X,Y,U
+3952 8EB3A4           (wasm/src/RRP8.ASM):00103          LDX #PSLIST
+3955 9F27             (wasm/src/RRP8.ASM):00104          STX PSTIN
+3957 3184             (wasm/src/RRP8.ASM):00105          LEAY ,X
+3959 6F80             (wasm/src/RRP8.ASM):00106         PSI00 CLR ,X+
+395B 8CB3E4           (wasm/src/RRP8.ASM):00107          CMPX #PSLEND
+395E 25F9             (wasm/src/RRP8.ASM):00108          BLO PSI00
+3960 B6BE69           (wasm/src/RRP8.ASM):00109          LDA PSTCNT
+3963 3402             (wasm/src/RRP8.ASM):00110          PSHS A
+3965 274E             (wasm/src/RRP8.ASM):00111          BEQ PSIX
+3967 BDD081           (wasm/src/RRP8.ASM):00112         PSIL JSR GETPST
+396A DC93             (wasm/src/RRP8.ASM):00113          LDD PSTANI
+396C ED02             (wasm/src/RRP8.ASM):00114          STD OPICT,X
+396E ED8814           (wasm/src/RRP8.ASM):00115          STD OLDPIC,X
+3971 8D8B             (wasm/src/RRP8.ASM):00116          BSR SAFTYV
+3973 DC2B             (wasm/src/RRP8.ASM):00117          LDD XTEMP
+3975 C303FC           (wasm/src/RRP8.ASM):00118          ADDD #$03FC ADJUST BOUNDS
+3978 DD2B             (wasm/src/RRP8.ASM):00119          STD XTEMP
+397A DC2D             (wasm/src/RRP8.ASM):00120          LDD XTEMP2
+397C C302FD           (wasm/src/RRP8.ASM):00121          ADDD #$02FD
+397F DD2D             (wasm/src/RRP8.ASM):00122          STD XTEMP2
+3981 BD26C3           (wasm/src/RRP8.ASM):00123         PSI0 JSR RANDXY
+3984 D12B             (wasm/src/RRP8.ASM):00124          CMPB XTEMP
+3986 230C             (wasm/src/RRP8.ASM):00125          BLS PSI1
+3988 D12C             (wasm/src/RRP8.ASM):00126          CMPB XTEMP+1
+398A 2408             (wasm/src/RRP8.ASM):00127          BHS PSI1
+398C 912D             (wasm/src/RRP8.ASM):00128          CMPA XTEMP2
+398E 2304             (wasm/src/RRP8.ASM):00129          BLS PSI1
+3990 912E             (wasm/src/RRP8.ASM):00130          CMPA XTEMP2+1
+3992 25ED             (wasm/src/RRP8.ASM):00131          BLO PSI0
+3994 ED04             (wasm/src/RRP8.ASM):00132         PSI1 STD OBJX,X
+3996 A70A             (wasm/src/RRP8.ASM):00133          STA OX16,X
+3998 E70C             (wasm/src/RRP8.ASM):00134          STB OY16,X
+399A EE04             (wasm/src/RRP8.ASM):00135          LDU OBJX,X
+399C EC9802           (wasm/src/RRP8.ASM):00136          LDD [OPICT,X]
+399F BDD003           (wasm/src/RRP8.ASM):00137          JSR ASCAN
+39A2 26DD             (wasm/src/RRP8.ASM):00138          BNE PSI0
+39A4 CC3AA9           (wasm/src/RRP8.ASM):00139          LDD #PSTKIL
+39A7 ED08             (wasm/src/RRP8.ASM):00140          STD OCVECT,X
+39A9 10AF06           (wasm/src/RRP8.ASM):00141          STY OBJID,X SAVE REF POINTER FOR KILL
+39AC 3122             (wasm/src/RRP8.ASM):00142          LEAY 2,Y
+39AE BD388B           (wasm/src/RRP8.ASM):00143          JSR OPON1 ON MONO PHONY
+39B1 6AE4             (wasm/src/RRP8.ASM):00144          DEC ,S
+39B3 26B2             (wasm/src/RRP8.ASM):00145          BNE PSIL
+39B5 35F2             (wasm/src/RRP8.ASM):00146         PSIX PULS A,X,Y,U,PC
+                      (wasm/src/RRP8.ASM):00147         *
+                      (wasm/src/RRP8.ASM):00148         *ROBOT PROCESS
+                      (wasm/src/RRP8.ASM):00149         *
+39B7 9659             (wasm/src/RRP8.ASM):00150         ROBOT LDA STATUS
+39B9 857F             (wasm/src/RRP8.ASM):00151          BITA #$7F
+39BB 2708             (wasm/src/RRP8.ASM):00152          BEQ ROB0A
+                      (wasm/src/RRP8.ASM):00153          NAP 2,ROBOT
+39BD 8602             (              NAP):00001                LDA #2 TIME
+39BF 8E39B7           (              NAP):00002                LDX #ROBOT WAKEUP ADDR
+39C2 7ED066           (              NAP):00003                JMP    SLEEP  
+39C5                  (wasm/src/RRP8.ASM):00154         ROB0A NAP 10,ROB0
+39C5 860A             (              NAP):00001                LDA #10 TIME
+39C7 8E39CD           (              NAP):00002                LDX #ROB0 WAKEUP ADDR
+39CA 7ED066           (              NAP):00003                JMP    SLEEP  
+39CD 5F               (wasm/src/RRP8.ASM):00155         ROB0 CLRB
+39CE B6BE68           (wasm/src/RRP8.ASM):00156          LDA ROBCNT
+39D1 3406             (wasm/src/RRP8.ASM):00157          PSHS D
+39D3 270F             (wasm/src/RRP8.ASM):00158          BEQ ROBXXX
+39D5 9E8B             (wasm/src/RRP8.ASM):00159          LDX ROBST
+39D7 2002             (wasm/src/RRP8.ASM):00160          BRA ROB1A
+39D9 AE84             (wasm/src/RRP8.ASM):00161         ROB1 LDX ,X
+39DB 6A8813           (wasm/src/RRP8.ASM):00162         ROB1A DEC ODATA,X TIME TO MOVE?
+39DE 2706             (wasm/src/RRP8.ASM):00163          BEQ ROB1B
+39E0 6AE4             (wasm/src/RRP8.ASM):00164          DEC ,S
+39E2 26F5             (wasm/src/RRP8.ASM):00165          BNE ROB1
+39E4 207E             (wasm/src/RRP8.ASM):00166         ROBXXX BRA ROBX ALL DONE
+39E6 B6BE5C           (wasm/src/RRP8.ASM):00167         ROB1B LDA ROBSPD
+39E9 BDD042           (wasm/src/RRP8.ASM):00168          JSR RANDU
+39EC A78813           (wasm/src/RRP8.ASM):00169          STA ODATA,X
+39EF E60C             (wasm/src/RRP8.ASM):00170          LDB OY16,X
+39F1 D066             (wasm/src/RRP8.ASM):00171          SUBB PY16 SEEK PLAYER
+39F3 2208             (wasm/src/RRP8.ASM):00172          BHI ROB2
+39F5 C1FE             (wasm/src/RRP8.ASM):00173          CMPB #$FE
+39F7 2216             (wasm/src/RRP8.ASM):00174          BHI ROB3
+39F9 C604             (wasm/src/RRP8.ASM):00175          LDB #4
+39FB 2006             (wasm/src/RRP8.ASM):00176          BRA ROB2A
+39FD C102             (wasm/src/RRP8.ASM):00177         ROB2 CMPB #2
+39FF 250E             (wasm/src/RRP8.ASM):00178          BLO ROB3
+3A01 C6FC             (wasm/src/RRP8.ASM):00179          LDB #-4
+3A03 EB0C             (wasm/src/RRP8.ASM):00180         ROB2A ADDB OY16,X
+3A05 C1DE             (wasm/src/RRP8.ASM):00181          CMPB #YMAX-12
+3A07 2206             (wasm/src/RRP8.ASM):00182          BHI ROB3
+3A09 C118             (wasm/src/RRP8.ASM):00183          CMPB #YMIN
+3A0B 2502             (wasm/src/RRP8.ASM):00184          BLO ROB3
+3A0D E70C             (wasm/src/RRP8.ASM):00185          STB OY16,X
+3A0F E60A             (wasm/src/RRP8.ASM):00186         ROB3 LDB OX16,X
+3A11 D064             (wasm/src/RRP8.ASM):00187          SUBB PX16
+3A13 2204             (wasm/src/RRP8.ASM):00188          BHI ROB4
+3A15 C602             (wasm/src/RRP8.ASM):00189          LDB #2
+3A17 2006             (wasm/src/RRP8.ASM):00190          BRA ROB4A
+3A19 C101             (wasm/src/RRP8.ASM):00191         ROB4 CMPB #1
+3A1B 250E             (wasm/src/RRP8.ASM):00192          BLO ROB5
+3A1D C6FE             (wasm/src/RRP8.ASM):00193          LDB #-2
+3A1F EB0A             (wasm/src/RRP8.ASM):00194         ROB4A ADDB OX16,X
+3A21 C18A             (wasm/src/RRP8.ASM):00195          CMPB #XMAX-5
+3A23 2206             (wasm/src/RRP8.ASM):00196          BHI ROB5
+3A25 C107             (wasm/src/RRP8.ASM):00197          CMPB #XMIN 
+3A27 2502             (wasm/src/RRP8.ASM):00198          BLO ROB5
+3A29 E70A             (wasm/src/RRP8.ASM):00199          STB OX16,X
+3A2B EC02             (wasm/src/RRP8.ASM):00200         ROB5 LDD OPICT,X
+3A2D C30004           (wasm/src/RRP8.ASM):00201          ADDD #4
+3A30 1083406F         (wasm/src/RRP8.ASM):00202          CMPD #RWDP4
+3A34 2303             (wasm/src/RRP8.ASM):00203          BLS ROB11
+3A36 CC4063           (wasm/src/RRP8.ASM):00204          LDD #RWDP1
+3A39 ED02             (wasm/src/RRP8.ASM):00205         ROB11 STD OPICT,X
+3A3B BDD08D           (wasm/src/RRP8.ASM):00206          JSR DMAOFN
+3A3E 6C61             (wasm/src/RRP8.ASM):00207          INC 1,S   MAKE A SOUND
+3A40 EE02             (wasm/src/RRP8.ASM):00208          LDU OPICT,X
+3A42 EC04             (wasm/src/RRP8.ASM):00209          LDD OBJX,X
+3A44 3410             (wasm/src/RRP8.ASM):00210          PSHS X
+3A46 8E9823           (wasm/src/RRP8.ASM):00211          LDX #PPTR
+3A49 BDD027           (wasm/src/RRP8.ASM):00212          JSR COL0
+3A4C 3510             (wasm/src/RRP8.ASM):00213          PULS X
+3A4E 270E             (wasm/src/RRP8.ASM):00214          BEQ ROBLP
+3A50 10AE84           (wasm/src/RRP8.ASM):00215          LDY ,X
+3A53 8D21             (wasm/src/RRP8.ASM):00216          BSR ROBKIL
+3A55 6AE4             (wasm/src/RRP8.ASM):00217          DEC ,S
+3A57 270B             (wasm/src/RRP8.ASM):00218          BEQ ROBX ALL DONE
+3A59 30A4             (wasm/src/RRP8.ASM):00219          LEAX ,Y
+3A5B 7E39DB           (wasm/src/RRP8.ASM):00220          JMP ROB1A
+3A5E 6AE4             (wasm/src/RRP8.ASM):00221         ROBLP DEC ,S
+3A60 1026FF75         (wasm/src/RRP8.ASM):00222          LBNE ROB1
+3A64 ECE1             (wasm/src/RRP8.ASM):00223         ROBX LDD ,S++
+3A66 2706             (wasm/src/RRP8.ASM):00224          BEQ ROBXX NO SOUND NEEDED
+3A68 CC38A0           (wasm/src/RRP8.ASM):00225          LDD #RMVSND
+3A6B BDD04B           (wasm/src/RRP8.ASM):00226          JSR SNDLD
+3A6E                  (wasm/src/RRP8.ASM):00227         ROBXX NAP 4,ROB0
+3A6E 8604             (              NAP):00001                LDA #4 TIME
+3A70 8E39CD           (              NAP):00002                LDX #ROB0 WAKEUP ADDR
+3A73 7ED066           (              NAP):00003                JMP    SLEEP  
+                      (wasm/src/RRP8.ASM):00228         *KILL ROBOT
+3A76 9648             (wasm/src/RRP8.ASM):00229         ROBKIL LDA PCFLG  DONT BLOW ON PLAYER
+3A78 262C             (wasm/src/RRP8.ASM):00230          BNE ROBKON
+3A7A BD5B43           (wasm/src/RRP8.ASM):00231          JSR EXST BLOW HIM UP!!!!
+3A7D 9C8B             (wasm/src/RRP8.ASM):00232          CMPX ROBST CHECK FOR START CHANGE
+3A7F 2604             (wasm/src/RRP8.ASM):00233          BNE ROBK0
+3A81 EC84             (wasm/src/RRP8.ASM):00234          LDD ,X
+3A83 DD8B             (wasm/src/RRP8.ASM):00235          STD ROBST
+3A85 BDD07E           (wasm/src/RRP8.ASM):00236         ROBK0 JSR KILROB
+3A88 CC0110           (wasm/src/RRP8.ASM):00237          LDD #$0110
+3A8B BDD00C           (wasm/src/RRP8.ASM):00238          JSR SCORE
+3A8E CC3898           (wasm/src/RRP8.ASM):00239          LDD #RBSND
+3A91 BDD04B           (wasm/src/RRP8.ASM):00240          JSR SNDLD
+3A94 C6E0             (wasm/src/RRP8.ASM):00241          LDB #$E0 SPEED EM UP
+3A96 B6BE5C           (wasm/src/RRP8.ASM):00242          LDA ROBSPD
+3A99 3D               (wasm/src/RRP8.ASM):00243          MUL
+3A9A B1BE5D           (wasm/src/RRP8.ASM):00244          CMPA RMXSPD
+3A9D 2503             (wasm/src/RRP8.ASM):00245          BLO ROBK1
+3A9F B7BE5C           (wasm/src/RRP8.ASM):00246          STA ROBSPD
+3AA2 7ABE68           (wasm/src/RRP8.ASM):00247         ROBK1 DEC ROBCNT
+3AA5 39               (wasm/src/RRP8.ASM):00248         ROBKX RTS
+3AA6 7ED018           (wasm/src/RRP8.ASM):00249         ROBKON JMP DMAON ON GRUNT...SEE WHAT YOU HIT
+                      (wasm/src/RRP8.ASM):00250         *KILL POST
+3AA9 9648             (wasm/src/RRP8.ASM):00251         PSTKIL LDA PCFLG
+3AAB 2627             (wasm/src/RRP8.ASM):00252          BNE PSTKON
+3AAD BDD084           (wasm/src/RRP8.ASM):00253          JSR KILPST
+3AB0 CC0000           (wasm/src/RRP8.ASM):00254          LDD #0
+3AB3 ED9806           (wasm/src/RRP8.ASM):00255          STD [OBJID,X] WIPE OUT REFRESH
+3AB6 BDD015           (wasm/src/RRP8.ASM):00256          JSR DMAOFF
+3AB9 7ABE69           (wasm/src/RRP8.ASM):00257          DEC PSTCNT
+3ABC DC13             (wasm/src/RRP8.ASM):00258          LDD FREE
+3ABE 2713             (wasm/src/RRP8.ASM):00259          BEQ PSTKX OUT OF PROCS
+3AC0 3384             (wasm/src/RRP8.ASM):00260          LEAU ,X
+3AC2 AE84             (wasm/src/RRP8.ASM):00261          LDX ,X
+3AC4 9F1B             (wasm/src/RRP8.ASM):00262          STX OFREE
+                      (wasm/src/RRP8.ASM):00263          MAKP PKPROC
+3AC6 BDD054           (             MAKP):00001          JSR MAKEP
+3AC9 3AD9             (             MAKP):00002          FDB PKPROC
+3ACB EF07             (wasm/src/RRP8.ASM):00264          STU PD,X
+3ACD CC38A5           (wasm/src/RRP8.ASM):00265          LDD #PSKSND
+3AD0 7ED04B           (wasm/src/RRP8.ASM):00266          JMP SNDLD
+3AD3 39               (wasm/src/RRP8.ASM):00267         PSTKX RTS
+3AD4 9690             (wasm/src/RRP8.ASM):00268         PSTKON LDA PSTCOL
+3AD6 7E3888           (wasm/src/RRP8.ASM):00269          JMP OPON TURN HIM ON
+                      (wasm/src/RRP8.ASM):00270         *
+                      (wasm/src/RRP8.ASM):00271         *POST KILL PROCESS
+                      (wasm/src/RRP8.ASM):00272         *
+3AD9 AE47             (wasm/src/RRP8.ASM):00273         PKPROC LDX PD,U
+3ADB 10AE02           (wasm/src/RRP8.ASM):00274          LDY OPICT,X
+3ADE 2017             (wasm/src/RRP8.ASM):00275          BRA PKPR2
+3AE0 AE47             (wasm/src/RRP8.ASM):00276         PKPR1 LDX PD,U
+3AE2 10AE02           (wasm/src/RRP8.ASM):00277          LDY OPICT,X
+3AE5 3125             (wasm/src/RRP8.ASM):00278          LEAY 5,Y
+3AE7 A6A4             (wasm/src/RRP8.ASM):00279          LDA ,Y
+3AE9 260C             (wasm/src/RRP8.ASM):00280          BNE PKPR2
+3AEB BDD015           (wasm/src/RRP8.ASM):00281          JSR DMAOFF ITS ALL OVER....
+3AEE DC1B             (wasm/src/RRP8.ASM):00282          LDD OFREE
+3AF0 ED84             (wasm/src/RRP8.ASM):00283          STD ,X
+3AF2 9F1B             (wasm/src/RRP8.ASM):00284          STX OFREE
+3AF4 7ED063           (wasm/src/RRP8.ASM):00285          JMP SUCIDE
+3AF7 10AF02           (wasm/src/RRP8.ASM):00286         PKPR2 STY OPICT,X
+3AFA BDD08D           (wasm/src/RRP8.ASM):00287          JSR DMAOFN
+3AFD A624             (wasm/src/RRP8.ASM):00288          LDA 4,Y SLEEP TIME  VARIABLE SLEEP
+3AFF 8E3AE0           (wasm/src/RRP8.ASM):00289          LDX #PKPR1
+3B02 7ED066           (wasm/src/RRP8.ASM):00290          JMP SLEEP
+                      (wasm/src/RRP8.ASM):00291         *
+                      (wasm/src/RRP8.ASM):00292         *POST IMAGES
+                      (wasm/src/RRP8.ASM):00293         *
+     3B05             (wasm/src/RRP8.ASM):00294         PSTP1V EQU *
+                      (wasm/src/RRP8.ASM):00295         *STAR
+3B05 0509             (wasm/src/RRP8.ASM):00296         PSP1A FCB 5,9    W,H
+3B07 3B95             (wasm/src/RRP8.ASM):00297          FDB PSD1A       DATA ADDR
+3B09 06               (wasm/src/RRP8.ASM):00298          FCB 6           SLEEP TIME
+3B0A 0509             (wasm/src/RRP8.ASM):00299         PSP2A FCB 5,9
+3B0C 3BC2             (wasm/src/RRP8.ASM):00300          FDB PSD2A
+3B0E 03               (wasm/src/RRP8.ASM):00301          FCB 3
+3B0F 0509             (wasm/src/RRP8.ASM):00302         PSP3A FCB 5,9
+3B11 3BEF             (wasm/src/RRP8.ASM):00303          FDB PSD3A
+3B13 0200             (wasm/src/RRP8.ASM):00304          FCB 2,0        END OF SEQUENCE
+                      (wasm/src/RRP8.ASM):00305         *SNOWFLAKE
+3B15 0509             (wasm/src/RRP8.ASM):00306         PSP1B FCB 5,9    W,H
+3B17 3C1C             (wasm/src/RRP8.ASM):00307          FDB PSD1B       DATA ADDR
+3B19 06               (wasm/src/RRP8.ASM):00308          FCB 6           SLEEP TIME
+3B1A 0509             (wasm/src/RRP8.ASM):00309         PSP2B FCB 5,9
+3B1C 3C49             (wasm/src/RRP8.ASM):00310          FDB PSD2B
+3B1E 03               (wasm/src/RRP8.ASM):00311          FCB 3
+3B1F 0509             (wasm/src/RRP8.ASM):00312         PSP3B FCB 5,9
+3B21 3C76             (wasm/src/RRP8.ASM):00313          FDB PSD3B
+3B23 0200             (wasm/src/RRP8.ASM):00314          FCB 2,0        END OF SEQUENCE
+                      (wasm/src/RRP8.ASM):00315         *SQUARE
+3B25 0509             (wasm/src/RRP8.ASM):00316         PSP1C FCB 5,9    W,H
+3B27 3CA3             (wasm/src/RRP8.ASM):00317          FDB PSD1C       DATA ADDR
+3B29 06               (wasm/src/RRP8.ASM):00318          FCB 6           SLEEP TIME
+3B2A 0509             (wasm/src/RRP8.ASM):00319         PSP2C FCB 5,9
+3B2C 3CD0             (wasm/src/RRP8.ASM):00320          FDB PSD2C
+3B2E 03               (wasm/src/RRP8.ASM):00321          FCB 3
+3B2F 0509             (wasm/src/RRP8.ASM):00322         PSP3C FCB 5,9
+3B31 3CFD             (wasm/src/RRP8.ASM):00323          FDB PSD3C
+3B33 0200             (wasm/src/RRP8.ASM):00324          FCB 2,0        END OF SEQUENCE
+                      (wasm/src/RRP8.ASM):00325         *TRIANGLE
+3B35 0509             (wasm/src/RRP8.ASM):00326         PSP1D FCB 5,9    W,H
+3B37 3D2A             (wasm/src/RRP8.ASM):00327          FDB PSD1D       DATA ADDR
+3B39 06               (wasm/src/RRP8.ASM):00328          FCB 6           SLEEP TIME
+3B3A 0509             (wasm/src/RRP8.ASM):00329         PSP2D FCB 5,9
+3B3C 3D57             (wasm/src/RRP8.ASM):00330          FDB PSD2D
+3B3E 03               (wasm/src/RRP8.ASM):00331          FCB 3
+3B3F 0509             (wasm/src/RRP8.ASM):00332         PSP3D FCB 5,9
+3B41 3D84             (wasm/src/RRP8.ASM):00333          FDB PSD3D
+3B43 0200             (wasm/src/RRP8.ASM):00334          FCB 2,0        END OF SEQUENCE
+                      (wasm/src/RRP8.ASM):00335         *VERT. BAR
+3B45 0309             (wasm/src/RRP8.ASM):00336         PSP1E FCB 3,9    W,H
+3B47 3DB1             (wasm/src/RRP8.ASM):00337          FDB PSD1E       DATA ADDR
+3B49 06               (wasm/src/RRP8.ASM):00338          FCB 6           SLEEP TIME
+3B4A 0309             (wasm/src/RRP8.ASM):00339         PSP2E FCB 3,9
+3B4C 3DCC             (wasm/src/RRP8.ASM):00340          FDB PSD2E
+3B4E 03               (wasm/src/RRP8.ASM):00341          FCB 3
+3B4F 0309             (wasm/src/RRP8.ASM):00342         PSP3E FCB 3,9
+3B51 3DE7             (wasm/src/RRP8.ASM):00343          FDB PSD3E
+3B53 0200             (wasm/src/RRP8.ASM):00344          FCB 2,0        END OF SEQUENCE
+                      (wasm/src/RRP8.ASM):00345         *DIAMOND
+3B55 0509             (wasm/src/RRP8.ASM):00346         PSP1F FCB 5,9    W,H
+3B57 3E02             (wasm/src/RRP8.ASM):00347          FDB PSD1F       DATA ADDR
+3B59 06               (wasm/src/RRP8.ASM):00348          FCB 6           SLEEP TIME
+3B5A 0509             (wasm/src/RRP8.ASM):00349         PSP2F FCB 5,9
+3B5C 3E2F             (wasm/src/RRP8.ASM):00350          FDB PSD2F
+3B5E 03               (wasm/src/RRP8.ASM):00351          FCB 3
+3B5F 0509             (wasm/src/RRP8.ASM):00352         PSP3F FCB 5,9
+3B61 3E5C             (wasm/src/RRP8.ASM):00353          FDB PSD3F
+3B63 0200             (wasm/src/RRP8.ASM):00354          FCB 2,0        END OF SEQUENCE
+                      (wasm/src/RRP8.ASM):00355         *2084 POST
+3B65 0907             (wasm/src/RRP8.ASM):00356         PSP1G FCB 9,7
+3B67 3E89             (wasm/src/RRP8.ASM):00357          FDB PSD1G
+3B69 06               (wasm/src/RRP8.ASM):00358          FCB 6
+3B6A 0907             (wasm/src/RRP8.ASM):00359         PSP2G FCB 9,7
+3B6C 3EC8             (wasm/src/RRP8.ASM):00360          FDB PSD2G
+3B6E 03               (wasm/src/RRP8.ASM):00361          FCB 3
+3B6F 0907             (wasm/src/RRP8.ASM):00362         PSP3G FCB 9,7
+3B71 3F07             (wasm/src/RRP8.ASM):00363          FDB PSD3G
+3B73 0200             (wasm/src/RRP8.ASM):00364          FCB 2,0
+                      (wasm/src/RRP8.ASM):00365         *SPIKE
+3B75 0509             (wasm/src/RRP8.ASM):00366         PSP1H FCB 5,9
+3B77 3F46             (wasm/src/RRP8.ASM):00367          FDB PSD1H
+3B79 06               (wasm/src/RRP8.ASM):00368          FCB 6
+3B7A 0509             (wasm/src/RRP8.ASM):00369         PSP2H FCB 5,9
+3B7C 3F73             (wasm/src/RRP8.ASM):00370          FDB PSD2H
+3B7E 03               (wasm/src/RRP8.ASM):00371          FCB 3
+3B7F 0509             (wasm/src/RRP8.ASM):00372         PSP3H FCB 5,9
+3B81 3FA0             (wasm/src/RRP8.ASM):00373          FDB PSD3H
+3B83 0200             (wasm/src/RRP8.ASM):00374          FCB 2,0
+                      (wasm/src/RRP8.ASM):00375         *SPIRAL
+3B85 050A             (wasm/src/RRP8.ASM):00376         PSP1I FCB 5,10
+3B87 3FCD             (wasm/src/RRP8.ASM):00377          FDB PSD1I
+3B89 06               (wasm/src/RRP8.ASM):00378          FCB 6
+3B8A 050A             (wasm/src/RRP8.ASM):00379         PSP2I FCB 5,10
+3B8C 3FFF             (wasm/src/RRP8.ASM):00380          FDB PSD2I
+3B8E 03               (wasm/src/RRP8.ASM):00381          FCB 3
+3B8F 050A             (wasm/src/RRP8.ASM):00382         PSP3I FCB 5,10
+3B91 4031             (wasm/src/RRP8.ASM):00383          FDB PSD3I
+3B93 0200             (wasm/src/RRP8.ASM):00384          FCB 2,0
+                      (wasm/src/RRP8.ASM):00385         
+                      (wasm/src/RRP8.ASM):00386         *STAR PICTS
+     3B95             (wasm/src/RRP8.ASM):00387         PSD1A EQU *
+3B95 0000900000       (wasm/src/RRP8.ASM):00388          FCB $00,$00,$90,$00,$00
+3B9A 0900900900       (wasm/src/RRP8.ASM):00389          FCB $09,$00,$90,$09,$00
+3B9F 0090909000       (wasm/src/RRP8.ASM):00390          FCB $00,$90,$90,$90,$00
+3BA4 0009990000       (wasm/src/RRP8.ASM):00391          FCB $00,$09,$99,$00,$00
+3BA9 9999999990       (wasm/src/RRP8.ASM):00392          FCB $99,$99,$99,$99,$90
+3BAE 0009990000       (wasm/src/RRP8.ASM):00393          FCB $00,$09,$99,$00,$00
+3BB3 0090909000       (wasm/src/RRP8.ASM):00394          FCB $00,$90,$90,$90,$00
+3BB8 0900900900       (wasm/src/RRP8.ASM):00395          FCB $09,$00,$90,$09,$00
+3BBD 0000900000       (wasm/src/RRP8.ASM):00396          FCB $00,$00,$90,$00,$00
+     3BC2             (wasm/src/RRP8.ASM):00397         PSD2A EQU *
+3BC2 0000000000       (wasm/src/RRP8.ASM):00398          FCB $00,$00,$00,$00,$00
+3BC7 0000A00000       (wasm/src/RRP8.ASM):00399          FCB $00,$00,$A0,$00,$00
+3BCC 00A0A0A000       (wasm/src/RRP8.ASM):00400          FCB $00,$A0,$A0,$A0,$00
+3BD1 000AAA0000       (wasm/src/RRP8.ASM):00401          FCB $00,$0A,$AA,$00,$00
+3BD6 0AAAAAAA00       (wasm/src/RRP8.ASM):00402          FCB $0A,$AA,$AA,$AA,$00
+3BDB 000AAA0000       (wasm/src/RRP8.ASM):00403          FCB $00,$0A,$AA,$00,$00
+3BE0 00A0A0A000       (wasm/src/RRP8.ASM):00404          FCB $00,$A0,$A0,$A0,$00
+3BE5 0000A00000       (wasm/src/RRP8.ASM):00405          FCB $00,$00,$A0,$00,$00
+3BEA 0000000000       (wasm/src/RRP8.ASM):00406          FCB $00,$00,$00,$00,$00
+     3BEF             (wasm/src/RRP8.ASM):00407         PSD3A EQU *
+3BEF 0000000000       (wasm/src/RRP8.ASM):00408          FCB $00,$00,$00,$00,$00
+3BF4 0000000000       (wasm/src/RRP8.ASM):00409          FCB $00,$00,$00,$00,$00
+3BF9 0000000000       (wasm/src/RRP8.ASM):00410          FCB $00,$00,$00,$00,$00
+3BFE 0000A00000       (wasm/src/RRP8.ASM):00411          FCB $00,$00,$A0,$00,$00
+3C03 000AAA0000       (wasm/src/RRP8.ASM):00412          FCB $00,$0A,$AA,$00,$00
+3C08 0000A00000       (wasm/src/RRP8.ASM):00413          FCB $00,$00,$A0,$00,$00
+3C0D 0000000000       (wasm/src/RRP8.ASM):00414          FCB $00,$00,$00,$00,$00
+3C12 0000000000       (wasm/src/RRP8.ASM):00415          FCB $00,$00,$00,$00,$00
+3C17 0000000000       (wasm/src/RRP8.ASM):00416          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00417         *SNOWFLAKE PICTS
+     3C1C             (wasm/src/RRP8.ASM):00418         PSD1B EQU *
+3C1C 0000900000       (wasm/src/RRP8.ASM):00419          FCB $00,$00,$90,$00,$00
+3C21 0909090900       (wasm/src/RRP8.ASM):00420          FCB $09,$09,$09,$09,$00
+3C26 0090909000       (wasm/src/RRP8.ASM):00421          FCB $00,$90,$90,$90,$00
+3C2B 0909090900       (wasm/src/RRP8.ASM):00422          FCB $09,$09,$09,$09,$00
+3C30 9090009090       (wasm/src/RRP8.ASM):00423          FCB $90,$90,$00,$90,$90
+3C35 0909090900       (wasm/src/RRP8.ASM):00424          FCB $09,$09,$09,$09,$00
+3C3A 0090909000       (wasm/src/RRP8.ASM):00425          FCB $00,$90,$90,$90,$00
+3C3F 0909090900       (wasm/src/RRP8.ASM):00426          FCB $09,$09,$09,$09,$00
+3C44 0000900000       (wasm/src/RRP8.ASM):00427          FCB $00,$00,$90,$00,$00
+     3C49             (wasm/src/RRP8.ASM):00428         PSD2B EQU *
+3C49 0000000000       (wasm/src/RRP8.ASM):00429          FCB $00,$00,$00,$00,$00
+3C4E 0000A00000       (wasm/src/RRP8.ASM):00430          FCB $00,$00,$A0,$00,$00
+3C53 000A0A0000       (wasm/src/RRP8.ASM):00431          FCB $00,$0A,$0A,$00,$00
+3C58 00A0A0A000       (wasm/src/RRP8.ASM):00432          FCB $00,$A0,$A0,$A0,$00
+3C5D 0A0A0A0A00       (wasm/src/RRP8.ASM):00433          FCB $0A,$0A,$0A,$0A,$00
+3C62 00A0A0A000       (wasm/src/RRP8.ASM):00434          FCB $00,$A0,$A0,$A0,$00
+3C67 000A0A0000       (wasm/src/RRP8.ASM):00435          FCB $00,$0A,$0A,$00,$00
+3C6C 0000A00000       (wasm/src/RRP8.ASM):00436          FCB $00,$00,$A0,$00,$00
+3C71 0000000000       (wasm/src/RRP8.ASM):00437          FCB $00,$00,$00,$00,$00
+     3C76             (wasm/src/RRP8.ASM):00438         PSD3B EQU *
+3C76 0000000000       (wasm/src/RRP8.ASM):00439          FCB $00,$00,$00,$00,$00
+3C7B 0000000000       (wasm/src/RRP8.ASM):00440          FCB $00,$00,$00,$00,$00
+3C80 0000000000       (wasm/src/RRP8.ASM):00441          FCB $00,$00,$00,$00,$00
+3C85 0000A00000       (wasm/src/RRP8.ASM):00442          FCB $00,$00,$A0,$00,$00
+3C8A 000AAA0000       (wasm/src/RRP8.ASM):00443          FCB $00,$0A,$AA,$00,$00
+3C8F 0000A00000       (wasm/src/RRP8.ASM):00444          FCB $00,$00,$A0,$00,$00
+3C94 0000000000       (wasm/src/RRP8.ASM):00445          FCB $00,$00,$00,$00,$00
+3C99 0000000000       (wasm/src/RRP8.ASM):00446          FCB $00,$00,$00,$00,$00
+3C9E 0000000000       (wasm/src/RRP8.ASM):00447          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00448         *SQUARE PICTS
+     3CA3             (wasm/src/RRP8.ASM):00449         PSD1C EQU *
+3CA3 9999999990       (wasm/src/RRP8.ASM):00450          FCB $99,$99,$99,$99,$90
+3CA8 9999999990       (wasm/src/RRP8.ASM):00451          FCB $99,$99,$99,$99,$90
+3CAD 9999999990       (wasm/src/RRP8.ASM):00452          FCB $99,$99,$99,$99,$90
+3CB2 9999999990       (wasm/src/RRP8.ASM):00453          FCB $99,$99,$99,$99,$90
+3CB7 9999999990       (wasm/src/RRP8.ASM):00454          FCB $99,$99,$99,$99,$90
+3CBC 9999999990       (wasm/src/RRP8.ASM):00455          FCB $99,$99,$99,$99,$90
+3CC1 9999999990       (wasm/src/RRP8.ASM):00456          FCB $99,$99,$99,$99,$90
+3CC6 9999999990       (wasm/src/RRP8.ASM):00457          FCB $99,$99,$99,$99,$90
+3CCB 9999999990       (wasm/src/RRP8.ASM):00458          FCB $99,$99,$99,$99,$90
+     3CD0             (wasm/src/RRP8.ASM):00459         PSD2C EQU *
+3CD0 0000000000       (wasm/src/RRP8.ASM):00460          FCB $00,$00,$00,$00,$00
+3CD5 0AAAAAAA00       (wasm/src/RRP8.ASM):00461          FCB $0A,$AA,$AA,$AA,$00
+3CDA 0AAAAAAA00       (wasm/src/RRP8.ASM):00462          FCB $0A,$AA,$AA,$AA,$00
+3CDF 0AAAAAAA00       (wasm/src/RRP8.ASM):00463          FCB $0A,$AA,$AA,$AA,$00
+3CE4 0AAAAAAA00       (wasm/src/RRP8.ASM):00464          FCB $0A,$AA,$AA,$AA,$00
+3CE9 0AAAAAAA00       (wasm/src/RRP8.ASM):00465          FCB $0A,$AA,$AA,$AA,$00
+3CEE 0AAAAAAA00       (wasm/src/RRP8.ASM):00466          FCB $0A,$AA,$AA,$AA,$00
+3CF3 0AAAAAAA00       (wasm/src/RRP8.ASM):00467          FCB $0A,$AA,$AA,$AA,$00
+3CF8 0000000000       (wasm/src/RRP8.ASM):00468          FCB $00,$00,$00,$00,$00
+     3CFD             (wasm/src/RRP8.ASM):00469         PSD3C EQU *
+3CFD 0000000000       (wasm/src/RRP8.ASM):00470          FCB $00,$00,$00,$00,$00
+3D02 0000000000       (wasm/src/RRP8.ASM):00471          FCB $00,$00,$00,$00,$00
+3D07 0000000000       (wasm/src/RRP8.ASM):00472          FCB $00,$00,$00,$00,$00
+3D0C 000AAA0000       (wasm/src/RRP8.ASM):00473          FCB $00,$0A,$AA,$00,$00
+3D11 000AAA0000       (wasm/src/RRP8.ASM):00474          FCB $00,$0A,$AA,$00,$00
+3D16 000AAA0000       (wasm/src/RRP8.ASM):00475          FCB $00,$0A,$AA,$00,$00
+3D1B 0000000000       (wasm/src/RRP8.ASM):00476          FCB $00,$00,$00,$00,$00
+3D20 0000000000       (wasm/src/RRP8.ASM):00477          FCB $00,$00,$00,$00,$00
+3D25 0000000000       (wasm/src/RRP8.ASM):00478          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00479         *TRIANGLE PICT
+     3D2A             (wasm/src/RRP8.ASM):00480         PSD1D EQU *
+3D2A 0000000090       (wasm/src/RRP8.ASM):00481          FCB $00,$00,$00,$00,$90
+3D2F 0000000990       (wasm/src/RRP8.ASM):00482          FCB $00,$00,$00,$09,$90
+3D34 0000009990       (wasm/src/RRP8.ASM):00483          FCB $00,$00,$00,$99,$90
+3D39 0000099990       (wasm/src/RRP8.ASM):00484          FCB $00,$00,$09,$99,$90
+3D3E 0000999990       (wasm/src/RRP8.ASM):00485          FCB $00,$00,$99,$99,$90
+3D43 0009999990       (wasm/src/RRP8.ASM):00486          FCB $00,$09,$99,$99,$90
+3D48 0099999990       (wasm/src/RRP8.ASM):00487          FCB $00,$99,$99,$99,$90
+3D4D 0999999990       (wasm/src/RRP8.ASM):00488          FCB $09,$99,$99,$99,$90
+3D52 9999999990       (wasm/src/RRP8.ASM):00489          FCB $99,$99,$99,$99,$90
+     3D57             (wasm/src/RRP8.ASM):00490         PSD2D EQU *
+3D57 0000000000       (wasm/src/RRP8.ASM):00491          FCB $00,$00,$00,$00,$00
+3D5C 0000000000       (wasm/src/RRP8.ASM):00492          FCB $00,$00,$00,$00,$00
+3D61 0000000A00       (wasm/src/RRP8.ASM):00493          FCB $00,$00,$00,$0A,$00
+3D66 000000AA00       (wasm/src/RRP8.ASM):00494          FCB $00,$00,$00,$AA,$00
+3D6B 00000AAA00       (wasm/src/RRP8.ASM):00495          FCB $00,$00,$0A,$AA,$00
+3D70 0000AAAA00       (wasm/src/RRP8.ASM):00496          FCB $00,$00,$AA,$AA,$00
+3D75 000AAAAA00       (wasm/src/RRP8.ASM):00497          FCB $00,$0A,$AA,$AA,$00
+3D7A 00AAAAAA00       (wasm/src/RRP8.ASM):00498          FCB $00,$AA,$AA,$AA,$00
+3D7F 0000000000       (wasm/src/RRP8.ASM):00499          FCB $00,$00,$00,$00,$00
+     3D84             (wasm/src/RRP8.ASM):00500         PSD3D EQU *
+3D84 0000000000       (wasm/src/RRP8.ASM):00501          FCB $00,$00,$00,$00,$00
+3D89 0000000000       (wasm/src/RRP8.ASM):00502          FCB $00,$00,$00,$00,$00
+3D8E 0000000000       (wasm/src/RRP8.ASM):00503          FCB $00,$00,$00,$00,$00
+3D93 0000000000       (wasm/src/RRP8.ASM):00504          FCB $00,$00,$00,$00,$00
+3D98 000000A000       (wasm/src/RRP8.ASM):00505          FCB $00,$00,$00,$A0,$00
+3D9D 00000AA000       (wasm/src/RRP8.ASM):00506          FCB $00,$00,$0A,$A0,$00
+3DA2 0000AAA000       (wasm/src/RRP8.ASM):00507          FCB $00,$00,$AA,$A0,$00
+3DA7 0000000000       (wasm/src/RRP8.ASM):00508          FCB $00,$00,$00,$00,$00
+3DAC 0000000000       (wasm/src/RRP8.ASM):00509          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00510         *VERT. BAR PICT
+     3DB1             (wasm/src/RRP8.ASM):00511         PSD1E EQU *
+3DB1 999990           (wasm/src/RRP8.ASM):00512          FCB $99,$99,$90
+3DB4 999990           (wasm/src/RRP8.ASM):00513          FCB $99,$99,$90
+3DB7 999990           (wasm/src/RRP8.ASM):00514          FCB $99,$99,$90
+3DBA 999990           (wasm/src/RRP8.ASM):00515          FCB $99,$99,$90
+3DBD 999990           (wasm/src/RRP8.ASM):00516          FCB $99,$99,$90
+3DC0 999990           (wasm/src/RRP8.ASM):00517          FCB $99,$99,$90
+3DC3 999990           (wasm/src/RRP8.ASM):00518          FCB $99,$99,$90
+3DC6 999990           (wasm/src/RRP8.ASM):00519          FCB $99,$99,$90
+3DC9 999990           (wasm/src/RRP8.ASM):00520          FCB $99,$99,$90
+     3DCC             (wasm/src/RRP8.ASM):00521         PSD2E EQU *
+3DCC 000000           (wasm/src/RRP8.ASM):00522          FCB $00,$00,$00
+3DCF 0AAA00           (wasm/src/RRP8.ASM):00523          FCB $0A,$AA,$00
+3DD2 0AAA00           (wasm/src/RRP8.ASM):00524          FCB $0A,$AA,$00
+3DD5 0AAA00           (wasm/src/RRP8.ASM):00525          FCB $0A,$AA,$00
+3DD8 0AAA00           (wasm/src/RRP8.ASM):00526          FCB $0A,$AA,$00
+3DDB 0AAA00           (wasm/src/RRP8.ASM):00527          FCB $0A,$AA,$00
+3DDE 0AAA00           (wasm/src/RRP8.ASM):00528          FCB $0A,$AA,$00
+3DE1 0AAA00           (wasm/src/RRP8.ASM):00529          FCB $0A,$AA,$00
+3DE4 000000           (wasm/src/RRP8.ASM):00530          FCB $00,$00,$00
+     3DE7             (wasm/src/RRP8.ASM):00531         PSD3E EQU *
+3DE7 000000           (wasm/src/RRP8.ASM):00532          FCB $00,$00,$00
+3DEA 000000           (wasm/src/RRP8.ASM):00533          FCB $00,$00,$00
+3DED 00A000           (wasm/src/RRP8.ASM):00534          FCB $00,$A0,$00
+3DF0 00A000           (wasm/src/RRP8.ASM):00535          FCB $00,$A0,$00
+3DF3 00A000           (wasm/src/RRP8.ASM):00536          FCB $00,$A0,$00
+3DF6 00A000           (wasm/src/RRP8.ASM):00537          FCB $00,$A0,$00
+3DF9 00A000           (wasm/src/RRP8.ASM):00538          FCB $00,$A0,$00
+3DFC 000000           (wasm/src/RRP8.ASM):00539          FCB $00,$00,$00
+3DFF 000000           (wasm/src/RRP8.ASM):00540          FCB $00,$00,$00
+                      (wasm/src/RRP8.ASM):00541         *DIAMOND
+     3E02             (wasm/src/RRP8.ASM):00542         PSD1F EQU *
+3E02 0000900000       (wasm/src/RRP8.ASM):00543          FCB $00,$00,$90,$00,$00
+3E07 0009990000       (wasm/src/RRP8.ASM):00544          FCB $00,$09,$99,$00,$00
+3E0C 0099999000       (wasm/src/RRP8.ASM):00545          FCB $00,$99,$99,$90,$00
+3E11 0999999900       (wasm/src/RRP8.ASM):00546          FCB $09,$99,$99,$99,$00
+3E16 9999999990       (wasm/src/RRP8.ASM):00547          FCB $99,$99,$99,$99,$90
+3E1B 0999999900       (wasm/src/RRP8.ASM):00548          FCB $09,$99,$99,$99,$00
+3E20 0099999000       (wasm/src/RRP8.ASM):00549          FCB $00,$99,$99,$90,$00
+3E25 0009990000       (wasm/src/RRP8.ASM):00550          FCB $00,$09,$99,$00,$00
+3E2A 0000900000       (wasm/src/RRP8.ASM):00551          FCB $00,$00,$90,$00,$00
+     3E2F             (wasm/src/RRP8.ASM):00552         PSD2F EQU *
+3E2F 0000000000       (wasm/src/RRP8.ASM):00553          FCB $00,$00,$00,$00,$00
+3E34 0000A00000       (wasm/src/RRP8.ASM):00554          FCB $00,$00,$A0,$00,$00
+3E39 000AAA0000       (wasm/src/RRP8.ASM):00555          FCB $00,$0A,$AA,$00,$00
+3E3E 00AAAAA000       (wasm/src/RRP8.ASM):00556          FCB $00,$AA,$AA,$A0,$00
+3E43 0AAAAAAA00       (wasm/src/RRP8.ASM):00557          FCB $0A,$AA,$AA,$AA,$00
+3E48 00AAAAA000       (wasm/src/RRP8.ASM):00558          FCB $00,$AA,$AA,$A0,$00
+3E4D 000AAA0000       (wasm/src/RRP8.ASM):00559          FCB $00,$0A,$AA,$00,$00
+3E52 0000A00000       (wasm/src/RRP8.ASM):00560          FCB $00,$00,$A0,$00,$00
+3E57 0000000000       (wasm/src/RRP8.ASM):00561          FCB $00,$00,$00,$00,$00
+     3E5C             (wasm/src/RRP8.ASM):00562         PSD3F EQU *
+3E5C 0000000000       (wasm/src/RRP8.ASM):00563          FCB $00,$00,$00,$00,$00
+3E61 0000000000       (wasm/src/RRP8.ASM):00564          FCB $00,$00,$00,$00,$00
+3E66 0000000000       (wasm/src/RRP8.ASM):00565          FCB $00,$00,$00,$00,$00
+3E6B 0000A00000       (wasm/src/RRP8.ASM):00566          FCB $00,$00,$A0,$00,$00
+3E70 000AAA0000       (wasm/src/RRP8.ASM):00567          FCB $00,$0A,$AA,$00,$00
+3E75 0000A00000       (wasm/src/RRP8.ASM):00568          FCB $00,$00,$A0,$00,$00
+3E7A 0000000000       (wasm/src/RRP8.ASM):00569          FCB $00,$00,$00,$00,$00
+3E7F 0000000000       (wasm/src/RRP8.ASM):00570          FCB $00,$00,$00,$00,$00
+3E84 0000000000       (wasm/src/RRP8.ASM):00571          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00572         *
+                      (wasm/src/RRP8.ASM):00573         *2084
+                      (wasm/src/RRP8.ASM):00574         *
+     3E89             (wasm/src/RRP8.ASM):00575         PSD1G EQU *
+3E89 9999999999999999 (wasm/src/RRP8.ASM):00576          FCB $99,$99,$99,$99,$99,$99,$99,$99,$90
+     90
+3E92 9000900090009090 (wasm/src/RRP8.ASM):00577          FCB $90,$00,$90,$00,$90,$00,$90,$90,$90
+     90
+3E9B 9990909090909090 (wasm/src/RRP8.ASM):00578          FCB $99,$90,$90,$90,$90,$90,$90,$90,$90
+     90
+3EA4 9000909090009000 (wasm/src/RRP8.ASM):00579          FCB $90,$00,$90,$90,$90,$00,$90,$00,$90
+     90
+3EAD 9099909090909990 (wasm/src/RRP8.ASM):00580          FCB $90,$99,$90,$90,$90,$90,$99,$90,$90
+     90
+3EB6 9000900090009990 (wasm/src/RRP8.ASM):00581          FCB $90,$00,$90,$00,$90,$00,$99,$90,$90
+     90
+3EBF 9999999999999999 (wasm/src/RRP8.ASM):00582          FCB $99,$99,$99,$99,$99,$99,$99,$99,$90
+     90
+     3EC8             (wasm/src/RRP8.ASM):00583         PSD2G EQU *
+3EC8 0000000000000000 (wasm/src/RRP8.ASM):00584          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+3ED1 0AAAAAAAAAAAAAAA (wasm/src/RRP8.ASM):00585          FCB $0A,$AA,$AA,$AA,$AA,$AA,$AA,$AA,$00
+     00
+3EDA 0AA0A0A0A0A0A0AA (wasm/src/RRP8.ASM):00586          FCB $0A,$A0,$A0,$A0,$A0,$A0,$A0,$AA,$00
+     00
+3EE3 0A00A0A0A000000A (wasm/src/RRP8.ASM):00587          FCB $0A,$00,$A0,$A0,$A0,$00,$00,$0A,$00
+     00
+3EEC 0AAAA0A0A0A0AAAA (wasm/src/RRP8.ASM):00588          FCB $0A,$AA,$A0,$A0,$A0,$A0,$AA,$AA,$00
+     00
+3EF5 0AAAAAAAAAAAAAAA (wasm/src/RRP8.ASM):00589          FCB $0A,$AA,$AA,$AA,$AA,$AA,$AA,$AA,$00
+     00
+3EFE 0000000000000000 (wasm/src/RRP8.ASM):00590          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+     3F07             (wasm/src/RRP8.ASM):00591         PSD3G EQU *
+3F07 0000000000000000 (wasm/src/RRP8.ASM):00592          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+3F10 0000000000000000 (wasm/src/RRP8.ASM):00593          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+3F19 0000000000000000 (wasm/src/RRP8.ASM):00594          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+3F22 000AAAAAAAAAAA00 (wasm/src/RRP8.ASM):00595          FCB $00,$0A,$AA,$AA,$AA,$AA,$AA,$00,$00
+     00
+3F2B 0000000000000000 (wasm/src/RRP8.ASM):00596          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+3F34 0000000000000000 (wasm/src/RRP8.ASM):00597          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+3F3D 0000000000000000 (wasm/src/RRP8.ASM):00598          FCB $00,$00,$00,$00,$00,$00,$00,$00,$00
+     00
+                      (wasm/src/RRP8.ASM):00599         *SPIKE
+     3F46             (wasm/src/RRP8.ASM):00600         PSD1H EQU *
+3F46 0000900000       (wasm/src/RRP8.ASM):00601          FCB $00,$00,$90,$00,$00
+3F4B 0999999900       (wasm/src/RRP8.ASM):00602          FCB $09,$99,$99,$99,$00
+3F50 0999099900       (wasm/src/RRP8.ASM):00603          FCB $09,$99,$09,$99,$00
+3F55 0990009900       (wasm/src/RRP8.ASM):00604          FCB $09,$90,$00,$99,$00
+3F5A 9900000990       (wasm/src/RRP8.ASM):00605          FCB $99,$00,$00,$09,$90
+3F5F 0990009900       (wasm/src/RRP8.ASM):00606          FCB $09,$90,$00,$99,$00
+3F64 0999099900       (wasm/src/RRP8.ASM):00607          FCB $09,$99,$09,$99,$00
+3F69 0999999900       (wasm/src/RRP8.ASM):00608          FCB $09,$99,$99,$99,$00
+3F6E 0000900000       (wasm/src/RRP8.ASM):00609          FCB $00,$00,$90,$00,$00
+     3F73             (wasm/src/RRP8.ASM):00610         PSD2H EQU *
+3F73 0000000000       (wasm/src/RRP8.ASM):00611          FCB $00,$00,$00,$00,$00
+3F78 0000A00000       (wasm/src/RRP8.ASM):00612          FCB $00,$00,$A0,$00,$00
+3F7D 00AAAAA000       (wasm/src/RRP8.ASM):00613          FCB $00,$AA,$AA,$A0,$00
+3F82 00AA0AA000       (wasm/src/RRP8.ASM):00614          FCB $00,$AA,$0A,$A0,$00
+3F87 0AA000AA00       (wasm/src/RRP8.ASM):00615          FCB $0A,$A0,$00,$AA,$00
+3F8C 00AA0AA000       (wasm/src/RRP8.ASM):00616          FCB $00,$AA,$0A,$A0,$00
+3F91 00AAAAA000       (wasm/src/RRP8.ASM):00617          FCB $00,$AA,$AA,$A0,$00
+3F96 0000A00000       (wasm/src/RRP8.ASM):00618          FCB $00,$00,$A0,$00,$00
+3F9B 0000000000       (wasm/src/RRP8.ASM):00619          FCB $00,$00,$00,$00,$00
+     3FA0             (wasm/src/RRP8.ASM):00620         PSD3H EQU *
+3FA0 0000000000       (wasm/src/RRP8.ASM):00621          FCB $00,$00,$00,$00,$00
+3FA5 0000000000       (wasm/src/RRP8.ASM):00622          FCB $00,$00,$00,$00,$00
+3FAA 0000A00000       (wasm/src/RRP8.ASM):00623          FCB $00,$00,$A0,$00,$00
+3FAF 000AAA0000       (wasm/src/RRP8.ASM):00624          FCB $00,$0A,$AA,$00,$00
+3FB4 00AA0AA000       (wasm/src/RRP8.ASM):00625          FCB $00,$AA,$0A,$A0,$00
+3FB9 000AAA0000       (wasm/src/RRP8.ASM):00626          FCB $00,$0A,$AA,$00,$00
+3FBE 0000A00000       (wasm/src/RRP8.ASM):00627          FCB $00,$00,$A0,$00,$00
+3FC3 0000000000       (wasm/src/RRP8.ASM):00628          FCB $00,$00,$00,$00,$00
+3FC8 0000000000       (wasm/src/RRP8.ASM):00629          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00630         *SPIRAL DATA
+     3FCD             (wasm/src/RRP8.ASM):00631         PSD1I EQU *
+3FCD 9999999990       (wasm/src/RRP8.ASM):00632          FCB $99,$99,$99,$99,$90
+3FD2 9000000090       (wasm/src/RRP8.ASM):00633          FCB $90,$00,$00,$00,$90
+3FD7 9099999090       (wasm/src/RRP8.ASM):00634          FCB $90,$99,$99,$90,$90
+3FDC 9090009090       (wasm/src/RRP8.ASM):00635          FCB $90,$90,$00,$90,$90
+3FE1 9090909090       (wasm/src/RRP8.ASM):00636          FCB $90,$90,$90,$90,$90
+3FE6 9099909090       (wasm/src/RRP8.ASM):00637          FCB $90,$99,$90,$90,$90
+3FEB 9000009090       (wasm/src/RRP8.ASM):00638          FCB $90,$00,$00,$90,$90
+3FF0 9999999090       (wasm/src/RRP8.ASM):00639          FCB $99,$99,$99,$90,$90
+3FF5 0000000090       (wasm/src/RRP8.ASM):00640          FCB $00,$00,$00,$00,$90
+3FFA 0999999990       (wasm/src/RRP8.ASM):00641          FCB $09,$99,$99,$99,$90
+     3FFF             (wasm/src/RRP8.ASM):00642         PSD2I EQU *
+3FFF 0000000000       (wasm/src/RRP8.ASM):00643          FCB $00,$00,$00,$00,$00
+4004 0000000000       (wasm/src/RRP8.ASM):00644          FCB $00,$00,$00,$00,$00
+4009 00AAAAA000       (wasm/src/RRP8.ASM):00645          FCB $00,$AA,$AA,$A0,$00
+400E 00A000A000       (wasm/src/RRP8.ASM):00646          FCB $00,$A0,$00,$A0,$00
+4013 A0A0A0A000       (wasm/src/RRP8.ASM):00647          FCB $A0,$A0,$A0,$A0,$00
+4018 A0AAA0A000       (wasm/src/RRP8.ASM):00648          FCB $A0,$AA,$A0,$A0,$00
+401D A00000A000       (wasm/src/RRP8.ASM):00649          FCB $A0,$00,$00,$A0,$00
+4022 AAAAAAA000       (wasm/src/RRP8.ASM):00650          FCB $AA,$AA,$AA,$A0,$00
+4027 0000000000       (wasm/src/RRP8.ASM):00651          FCB $00,$00,$00,$00,$00
+402C 0000000000       (wasm/src/RRP8.ASM):00652          FCB $00,$00,$00,$00,$00
+     4031             (wasm/src/RRP8.ASM):00653         PSD3I EQU *
+4031 0000000000       (wasm/src/RRP8.ASM):00654          FCB $00,$00,$00,$00,$00
+4036 0000000000       (wasm/src/RRP8.ASM):00655          FCB $00,$00,$00,$00,$00
+403B 00AAAAA000       (wasm/src/RRP8.ASM):00656          FCB $00,$AA,$AA,$A0,$00
+4040 00A000A000       (wasm/src/RRP8.ASM):00657          FCB $00,$A0,$00,$A0,$00
+4045 00A0A0A000       (wasm/src/RRP8.ASM):00658          FCB $00,$A0,$A0,$A0,$00
+404A 00AAA00000       (wasm/src/RRP8.ASM):00659          FCB $00,$AA,$A0,$00,$00
+404F 0000000000       (wasm/src/RRP8.ASM):00660          FCB $00,$00,$00,$00,$00
+4054 0000000000       (wasm/src/RRP8.ASM):00661          FCB $00,$00,$00,$00,$00
+4059 0000000000       (wasm/src/RRP8.ASM):00662          FCB $00,$00,$00,$00,$00
+405E 0000000000       (wasm/src/RRP8.ASM):00663          FCB $00,$00,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00664         *
+                      (wasm/src/RRP8.ASM):00665         *ROBOT PITCHERS
+                      (wasm/src/RRP8.ASM):00666         *
+4063 050D             (wasm/src/RRP8.ASM):00667         RWDP1 FCB 5,13
+4065 4073             (wasm/src/RRP8.ASM):00668          FDB RWDD1
+4067 050D             (wasm/src/RRP8.ASM):00669         RWDP2 FCB 5,13
+4069 40B4             (wasm/src/RRP8.ASM):00670          FDB RWDD2
+406B 050D             (wasm/src/RRP8.ASM):00671         RWDP3 FCB 5,13
+406D 4073             (wasm/src/RRP8.ASM):00672          FDB RWDD1
+406F 050D             (wasm/src/RRP8.ASM):00673         RWDP4 FCB 5,13
+4071 40F5             (wasm/src/RRP8.ASM):00674          FDB RWDD3
+4073 0001110000       (wasm/src/RRP8.ASM):00675         RWDD1 FCB $00,$01,$11,$00,$00
+4078 0066666000       (wasm/src/RRP8.ASM):00676          FCB $00,$66,$66,$60,$00
+407D 00CCCCC000       (wasm/src/RRP8.ASM):00677          FCB $00,$CC,$CC,$C0,$00
+4082 0001110000       (wasm/src/RRP8.ASM):00678          FCB $00,$01,$11,$00,$00
+4087 1191119110       (wasm/src/RRP8.ASM):00679          FCB $11,$91,$11,$91,$10
+408C 5119991150       (wasm/src/RRP8.ASM):00680          FCB $51,$19,$99,$11,$50
+4091 5011911050       (wasm/src/RRP8.ASM):00681          FCB $50,$11,$91,$10,$50
+4096 5001110050       (wasm/src/RRP8.ASM):00682          FCB $50,$01,$11,$00,$50
+409B 0001110000       (wasm/src/RRP8.ASM):00683          FCB $00,$01,$11,$00,$00
+40A0 0011011000       (wasm/src/RRP8.ASM):00684          FCB $00,$11,$01,$10,$00
+40A5 0011011000       (wasm/src/RRP8.ASM):00685          FCB $00,$11,$01,$10,$00
+40AA 0555055500       (wasm/src/RRP8.ASM):00686          FCB $05,$55,$05,$55,$00
+40AF 0000000000       (wasm/src/RRP8.ASM):00687          FCB $00,$00,$00,$00,$00
+40B4 0001110000       (wasm/src/RRP8.ASM):00688         RWDD2 FCB $00,$01,$11,$00,$00
+40B9 0066666000       (wasm/src/RRP8.ASM):00689          FCB $00,$66,$66,$60,$00
+40BE 00CCCCC000       (wasm/src/RRP8.ASM):00690          FCB $00,$CC,$CC,$C0,$00
+40C3 0001110000       (wasm/src/RRP8.ASM):00691          FCB $00,$01,$11,$00,$00
+40C8 1191119110       (wasm/src/RRP8.ASM):00692          FCB $11,$91,$11,$91,$10
+40CD 5119991150       (wasm/src/RRP8.ASM):00693          FCB $51,$19,$99,$11,$50
+40D2 5011911050       (wasm/src/RRP8.ASM):00694          FCB $50,$11,$91,$10,$50
+40D7 5001110050       (wasm/src/RRP8.ASM):00695          FCB $50,$01,$11,$00,$50
+40DC 0011110000       (wasm/src/RRP8.ASM):00696          FCB $00,$11,$11,$00,$00
+40E1 0011011000       (wasm/src/RRP8.ASM):00697          FCB $00,$11,$01,$10,$00
+40E6 0555011000       (wasm/src/RRP8.ASM):00698          FCB $05,$55,$01,$10,$00
+40EB 0000011000       (wasm/src/RRP8.ASM):00699          FCB $00,$00,$01,$10,$00
+40F0 0000055500       (wasm/src/RRP8.ASM):00700          FCB $00,$00,$05,$55,$00
+40F5 0001110000       (wasm/src/RRP8.ASM):00701         RWDD3 FCB $00,$01,$11,$00,$00
+40FA 0066666000       (wasm/src/RRP8.ASM):00702          FCB $00,$66,$66,$60,$00
+40FF 00CCCCC000       (wasm/src/RRP8.ASM):00703          FCB $00,$CC,$CC,$C0,$00
+4104 0001110000       (wasm/src/RRP8.ASM):00704          FCB $00,$01,$11,$00,$00
+4109 1191119110       (wasm/src/RRP8.ASM):00705          FCB $11,$91,$11,$91,$10
+410E 5119991150       (wasm/src/RRP8.ASM):00706          FCB $51,$19,$99,$11,$50
+4113 5011911050       (wasm/src/RRP8.ASM):00707          FCB $50,$11,$91,$10,$50
+4118 5001110050       (wasm/src/RRP8.ASM):00708          FCB $50,$01,$11,$00,$50
+411D 0001111000       (wasm/src/RRP8.ASM):00709          FCB $00,$01,$11,$10,$00
+4122 0011011000       (wasm/src/RRP8.ASM):00710          FCB $00,$11,$01,$10,$00
+4127 0011055500       (wasm/src/RRP8.ASM):00711          FCB $00,$11,$05,$55,$00
+412C 0011000000       (wasm/src/RRP8.ASM):00712          FCB $00,$11,$00,$00,$00
+4131 0555000000       (wasm/src/RRP8.ASM):00713          FCB $05,$55,$00,$00,$00
+                      (wasm/src/RRP8.ASM):00714          END

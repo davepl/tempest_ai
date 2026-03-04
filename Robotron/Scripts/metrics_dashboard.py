@@ -1,0 +1,3969 @@
+#!/usr/bin/env python3
+# ==================================================================================================================
+# ||  ROBOTRON AI v2 • LIVE DASHBOARD                                                                            ||
+# ||  Lightweight Grafana-style metrics dashboard served locally and managed by the Python app lifecycle.         ||
+# ==================================================================================================================
+"""Live dashboard for Robotron AI metrics."""
+
+if __name__ == "__main__":
+    print("This module is launched from main.py")
+    raise SystemExit(1)
+
+import atexit
+import json
+import math
+import mimetypes
+import os
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+import webbrowser
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+try:
+    from config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings
+except ImportError:
+    from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings
+
+try:
+    from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
+except ImportError:
+    try:
+        from Scripts.metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
+    except ImportError:
+        def get_dqn_window_averages():
+            return 0.0, 0.0, 0.0
+        def get_total_window_averages():
+            return 0.0, 0.0, 0.0
+        def get_eplen_1m_average():
+            return 0.0
+        def get_eplen_100k_average():
+            return 0.0
+
+
+def _tail_mean(values, count: int = 20) -> float:
+    if not values:
+        return 0.0
+    tail = list(values)[-count:]
+    if not tail:
+        return 0.0
+    return float(sum(tail) / max(1, len(tail)))
+
+
+LEVEL_25K_FRAMES = 25_000
+LEVEL_100K_FRAMES = 100_000
+LEVEL_1M_FRAMES = 1_000_000
+LEVEL_5M_FRAMES = 5_000_000
+WEB_CLIENT_TIMEOUT_S = 5.0
+DASH_HISTORY_LIMIT = 40_000
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
+FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
+VIDEO_EXTENSIONS = {".mov", ".mp4", ".webm", ".ogv"}
+
+
+def _audio_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "audio")
+
+
+def _fonts_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "fonts")
+
+
+def _html_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(script_dir), "html")
+
+
+def _list_audio_files() -> list[str]:
+    root = _audio_dir()
+    try:
+        names = os.listdir(root)
+    except Exception:
+        return []
+    files = []
+    for name in names:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in AUDIO_EXTENSIONS:
+            continue
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            files.append(name)
+    files.sort(key=lambda s: s.lower())
+    return files
+
+
+class _DashboardState:
+    def __init__(self, metrics_obj, agent_obj=None, history_limit: int = DASH_HISTORY_LIMIT):
+        self.metrics = metrics_obj
+        self.agent = agent_obj
+        self.history = deque(maxlen=max(120, history_limit))
+        self.latest: dict[str, Any] = {}
+        self.lock = threading.Lock()
+        self.last_steps: int | None = None
+        self.last_steps_time: float | None = None
+        self._level_windows = {
+            "25k": {"limit": LEVEL_25K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "100k": {"limit": LEVEL_100K_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "1m": {"limit": LEVEL_1M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+            "5m": {"limit": LEVEL_5M_FRAMES, "samples": deque(), "frames": 0, "weighted": 0.0},
+        }
+        self._last_level_frame_count: int | None = None
+        self._last_avg_inf_ms = 0.0
+        self._web_clients: dict[str, float] = {}
+        self._cached_now_body = b"{}"
+        self._model_desc: str | None = None
+        # Agreement 1M window (frame-weighted EMA)
+        self._agree_window: deque = deque()  # [(agreement, frame_delta), ...]
+        self._agree_window_frames: int = 0
+        self._agree_window_weighted: float = 0.0
+        self._last_agree_frame_count: int | None = None
+        # Skip initial samples to let values stabilize
+        self._sample_count: int = 0
+        self._first_sample_time: float | None = None
+
+    def _clear_level_windows(self):
+        for win in self._level_windows.values():
+            win["samples"].clear()
+            win["frames"] = 0
+            win["weighted"] = 0.0
+
+    def _update_web_client_count_locked(self, now_ts: float | None = None) -> int:
+        now = float(now_ts if now_ts is not None else time.time())
+        stale_before = now - WEB_CLIENT_TIMEOUT_S
+        stale = [cid for cid, ts in self._web_clients.items() if ts < stale_before]
+        for cid in stale:
+            self._web_clients.pop(cid, None)
+        active = len(self._web_clients)
+        with self.metrics.lock:
+            self.metrics.web_client_count = active
+        return active
+
+    def touch_web_client(self, client_id: str | None):
+        if not client_id:
+            return
+        now = time.time()
+        with self.lock:
+            self._web_clients[client_id] = now
+            self._update_web_client_count_locked(now)
+
+    def _update_level_windows(self, frame_count: int, average_level: float) -> tuple[float, float, float, float]:
+        raw_level = float(average_level)
+        level = round(raw_level, 4) if math.isfinite(raw_level) else 0.0
+        if self._last_level_frame_count is None:
+            self._last_level_frame_count = frame_count
+            return level, level, level, level
+
+        if frame_count < self._last_level_frame_count:
+            self._clear_level_windows()
+            self._last_level_frame_count = frame_count
+            return level, level, level, level
+
+        frame_delta = max(0, int(frame_count - self._last_level_frame_count))
+        self._last_level_frame_count = frame_count
+
+        if frame_delta > 0:
+            for win in self._level_windows.values():
+                samples = win["samples"]
+                if samples and abs(samples[-1][0] - level) < 1e-9:
+                    last_level, last_frames = samples[-1]
+                    samples[-1] = (last_level, last_frames + frame_delta)
+                else:
+                    samples.append((level, frame_delta))
+
+                win["frames"] += frame_delta
+                win["weighted"] += (level * frame_delta)
+
+                while samples and win["frames"] > win["limit"]:
+                    overflow = win["frames"] - win["limit"]
+                    oldest_level, oldest_frames = samples[0]
+                    if oldest_frames <= overflow:
+                        samples.popleft()
+                        win["frames"] -= oldest_frames
+                        win["weighted"] -= (oldest_level * oldest_frames)
+                    else:
+                        samples[0] = (oldest_level, oldest_frames - overflow)
+                        win["frames"] -= overflow
+                        win["weighted"] -= (oldest_level * overflow)
+                        break
+
+        def _mean_or_level(win):
+            if win["frames"] <= 0:
+                return level
+            return win["weighted"] / max(1, win["frames"])
+
+        return (
+            _mean_or_level(self._level_windows["25k"]),
+            _mean_or_level(self._level_windows["100k"]),
+            _mean_or_level(self._level_windows["1m"]),
+            _mean_or_level(self._level_windows["5m"]),
+        )
+
+    def _update_agreement_window(self, frame_count: int, agreement: float) -> float:
+        """Track agreement over a 1M-frame sliding window, frame-weighted."""
+        agree = round(float(agreement), 6) if math.isfinite(float(agreement)) else 0.0
+        if self._last_agree_frame_count is None:
+            self._last_agree_frame_count = frame_count
+            return agree
+        if frame_count < self._last_agree_frame_count:
+            self._agree_window.clear()
+            self._agree_window_frames = 0
+            self._agree_window_weighted = 0.0
+            self._last_agree_frame_count = frame_count
+            return agree
+        frame_delta = max(0, int(frame_count - self._last_agree_frame_count))
+        self._last_agree_frame_count = frame_count
+        if frame_delta > 0:
+            samples = self._agree_window
+            if samples and abs(samples[-1][0] - agree) < 1e-9:
+                old_a, old_f = samples[-1]
+                samples[-1] = (old_a, old_f + frame_delta)
+            else:
+                samples.append((agree, frame_delta))
+            self._agree_window_frames += frame_delta
+            self._agree_window_weighted += (agree * frame_delta)
+            limit = LEVEL_1M_FRAMES
+            while samples and self._agree_window_frames > limit:
+                overflow = self._agree_window_frames - limit
+                oldest_a, oldest_f = samples[0]
+                if oldest_f <= overflow:
+                    samples.popleft()
+                    self._agree_window_frames -= oldest_f
+                    self._agree_window_weighted -= (oldest_a * oldest_f)
+                else:
+                    samples[0] = (oldest_a, oldest_f - overflow)
+                    self._agree_window_frames -= overflow
+                    self._agree_window_weighted -= (oldest_a * overflow)
+                    break
+        if self._agree_window_frames <= 0:
+            return agree
+        return self._agree_window_weighted / max(1, self._agree_window_frames)
+
+    def _get_model_desc(self) -> str:
+        if self._model_desc is not None:
+            return self._model_desc
+        cfg = RL_CONFIG
+        try:
+            if self.agent is not None and hasattr(self.agent, 'online_net'):
+                param_count = sum(p.numel() for p in self.agent.online_net.parameters())
+            else:
+                ad = cfg.attn_dim
+                th = cfg.trunk_hidden
+                tl = cfg.trunk_layers
+                ss = cfg.state_size
+                na = cfg.num_move_actions * cfg.num_fire_actions
+                n_atoms = cfg.num_atoms if cfg.use_distributional else 1
+                hm = th // 2
+                attn_p = (5 * ad + ad) + 2 * ad + (14 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
+                trunk_p = (ss + ad) * th + th + 2 * th
+                for _ in range(1, tl):
+                    trunk_p += th * th + th + 2 * th
+                heads_p = 2 * (th * hm + hm) + hm * n_atoms + n_atoms + hm * (na * n_atoms) + na * n_atoms
+                param_count = attn_p + trunk_p + heads_p
+        except Exception:
+            param_count = 0
+        trunk_in = cfg.state_size + (cfg.attn_dim if cfg.use_enemy_attention else 0)
+        layers = [str(trunk_in)]
+        for _ in range(cfg.trunk_layers):
+            layers.append(str(cfg.trunk_hidden))
+        layers.append(str(cfg.trunk_hidden // 2))
+        arch_str = " \u00bb ".join(layers)
+        if param_count >= 1_000_000:
+            p_str = f"{param_count / 1_000_000:.1f}M"
+        elif param_count >= 1_000:
+            p_str = f"{param_count / 1_000:.0f}K"
+        else:
+            p_str = str(param_count)
+        desc = f"Model: {arch_str} \u00b7 {p_str} params"
+        self._model_desc = desc
+        return desc
+
+    def _build_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        _prs = float(RL_CONFIG.point_reward_scale)  # display-only multiplier
+
+        fps = self.metrics.get_fps()
+
+        with self.metrics.lock:
+            frame_count = int(self.metrics.frame_count)
+            epsilon_raw = float(self.metrics.epsilon)
+            _eps_ov = game_settings.epsilon_pct
+            if _eps_ov >= 0:
+                epsilon_effective = _eps_ov / 100.0
+            else:
+                epsilon_effective = 0.0 if bool(self.metrics.override_epsilon) else epsilon_raw
+            _xprt_ov = game_settings.expert_pct
+            expert_ratio = (_xprt_ov / 100.0) if _xprt_ov >= 0 else float(self.metrics.expert_ratio)
+            client_count = int(self.metrics.client_count)
+            web_client_count = int(self.metrics.web_client_count)
+            average_level = float(self.metrics.average_level + 1.0)
+            memory_buffer_size = int(self.metrics.memory_buffer_size)
+            memory_buffer_k = int(memory_buffer_size // 1000)
+            buffer_capacity = int(max(1, getattr(RL_CONFIG, "memory_size", 1)))
+            memory_buffer_pct = max(0.0, min(100.0, (memory_buffer_size / buffer_capacity) * 100.0))
+            total_training_steps = int(self.metrics.total_training_steps)
+            last_loss = float(self.metrics.last_loss)
+            last_grad_norm = float(self.metrics.last_grad_norm)
+            last_bc_loss = float(self.metrics.last_bc_loss)
+            last_q_mean = float(self.metrics.last_q_mean)
+            training_enabled = bool(self.metrics.training_enabled)
+            override_expert = bool(self.metrics.override_expert)
+            override_epsilon = bool(self.metrics.override_epsilon)
+            inference_requests = int(self.metrics.total_inference_requests)
+            inference_time = float(self.metrics.total_inference_time)
+            last_agreement = float(self.metrics.last_agreement)
+
+            reward_total = _tail_mean(self.metrics.episode_rewards) * _prs
+            reward_dqn = _tail_mean(self.metrics.dqn_rewards) * _prs
+            reward_subj = _tail_mean(self.metrics.subj_rewards) * _prs
+            reward_obj = _tail_mean(self.metrics.obj_rewards) * _prs
+
+        try:
+            dqn100k_raw, dqn1m_raw, dqn5m_raw = get_dqn_window_averages()
+        except Exception:
+            dqn100k_raw = dqn1m_raw = dqn5m_raw = 0.0
+        try:
+            total100k_raw, total1m_raw, total5m_raw = get_total_window_averages()
+        except Exception:
+            total100k_raw = total1m_raw = total5m_raw = 0.0
+        level_25k, level_100k, level_1m, level_5m = self._update_level_windows(frame_count, average_level)
+        agreement_1m = self._update_agreement_window(frame_count, last_agreement)
+        if inference_requests > 0:
+            self._last_avg_inf_ms = (inference_time / max(1, inference_requests)) * 1000.0
+        avg_inf_ms = self._last_avg_inf_ms
+
+        steps_per_sec = 0.0
+        if self.last_steps is not None and self.last_steps_time is not None:
+            dt = max(1e-6, now - self.last_steps_time)
+            ds = max(0, total_training_steps - self.last_steps)
+            steps_per_sec = ds / dt
+        self.last_steps = total_training_steps
+        self.last_steps_time = now
+        replay_per_frame = (steps_per_sec * float(getattr(RL_CONFIG, "batch_size", 1))) / max(1e-6, float(fps))
+
+        lr = None
+        q_min = None
+        q_max = None
+        if self.agent is not None:
+            try:
+                lr_val = self.agent.get_lr()
+                lr = float(lr_val)
+            except Exception:
+                lr = None
+            try:
+                mn, mx = self.agent.get_q_value_range()
+                if math.isfinite(float(mn)) and math.isfinite(float(mx)):
+                    q_min = float(mn)
+                    q_max = float(mx)
+            except Exception:
+                q_min = q_max = None
+
+        return {
+            "ts": now,
+            "frame_count": frame_count,
+            "fps": fps,
+            "training_steps": total_training_steps,
+            "steps_per_sec": steps_per_sec,
+            "rpl_per_frame": replay_per_frame,
+            "epsilon": epsilon_effective,
+            "epsilon_raw": epsilon_raw,
+            "expert_ratio": expert_ratio,
+            "client_count": client_count,
+            "web_client_count": web_client_count,
+            "average_level": average_level,
+            "memory_buffer_size": memory_buffer_size,
+            "memory_buffer_k": memory_buffer_k,
+            "memory_buffer_pct": memory_buffer_pct,
+            "avg_inf_ms": avg_inf_ms,
+            "loss": last_loss,
+            "grad_norm": last_grad_norm,
+            "bc_loss": last_bc_loss,
+            "q_mean": last_q_mean,
+            "reward_total": reward_total,
+            "reward_dqn": reward_dqn,
+            "reward_subj": reward_subj,
+            "reward_obj": reward_obj,
+            "dqn_100k": float(dqn100k_raw) * _prs,
+            "dqn_1m": float(dqn1m_raw) * _prs,
+            "dqn_5m": float(dqn5m_raw) * _prs,
+            "total_100k": float(total100k_raw) * _prs,
+            "total_1m": float(total1m_raw) * _prs,
+            "total_5m": float(total5m_raw) * _prs,
+            "level_25k": float(level_25k),
+            "level_100k": float(level_100k),
+            "level_1m": float(level_1m),
+            "level_5m": float(level_5m),
+            "training_enabled": training_enabled,
+            "override_expert": override_expert,
+            "override_epsilon": override_epsilon,
+            "lr": lr,
+            "training_steps": total_training_steps,
+            "lr_max": float(RL_CONFIG.lr),
+            "lr_min": float(RL_CONFIG.lr_min),
+            "lr_warmup_steps": int(RL_CONFIG.lr_warmup_steps),
+            "lr_cosine_period": int(RL_CONFIG.lr_cosine_period),
+            "lr_use_restarts": bool(getattr(RL_CONFIG, "lr_use_restarts", False)),
+            "q_min": q_min,
+            "q_max": q_max,
+            "eplen_1m": get_eplen_1m_average(),
+            "eplen_100k": get_eplen_100k_average(),
+            "peak_level": float(self.metrics.peak_level + 1),
+            "peak_episode_reward": float(self.metrics.peak_episode_reward) * _prs,
+            "peak_game_score": int(self.metrics.peak_game_score),
+            "episodes_this_run": int(self.metrics.episodes_this_run),
+            "agreement": last_agreement,
+            "agreement_1m": agreement_1m,
+            "model_desc": self._get_model_desc(),
+            "pulse_state": plateau_pulser.state,
+            "pulse_remaining": int(self.metrics.manual_pulse_frames_remaining),
+            "pulse_count": plateau_pulser.total_pulses,
+            "pulse_enabled": True,  # manual pulse is always available
+            "game_settings": game_settings.snapshot(),
+        }
+
+    @staticmethod
+    def _pulse_remaining(frame_count: int) -> int:
+        """Frames remaining in current manual pulse, 0 if idle."""
+        from config import metrics as _m
+        return int(_m.manual_pulse_frames_remaining)
+
+    def sample(self):
+        with self.lock:
+            self._update_web_client_count_locked()
+        snap = self._build_snapshot()
+        with self.lock:
+            now = time.time()
+            if self._first_sample_time is None:
+                self._first_sample_time = now
+            self._sample_count += 1
+            # Skip the first 10 samples or 2 seconds, whichever comes first
+            if self._sample_count <= 10 and (now - self._first_sample_time) < 2.0:
+                self.latest = snap
+                self._cached_now_body = json.dumps(snap).encode("utf-8")
+                return
+            self.latest = snap
+            self.history.append(snap)
+            self._cached_now_body = json.dumps(snap).encode("utf-8")
+
+    def payload(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "now": self.latest,
+                "history": list(self.history),
+            }
+
+    def now_body(self) -> bytes:
+        with self.lock:
+            return self._cached_now_body
+
+
+def _render_dashboard_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Robotron AI Metrics</title>
+  <style>
+    /* ══════════════════════════════════════════════════════════════
+     * FONTS — Custom typefaces for VFD / LED readouts
+     * ══════════════════════════════════════════════════════════════ */
+    @font-face {
+      font-family: "LED Dot-Matrix";
+      src: url("/api/font/LED%20Dot-Matrix.ttf") format("truetype");
+      font-display: swap;
+    }
+    @font-face {
+      font-family: "DS-Digital";
+      src: url("/api/font/DS-DIGI.TTF") format("truetype");
+      font-display: swap;
+    }
+    /* ══════════════════════════════════════════════════════════════
+     * CSS VARIABLES — Theme colors and neon accents
+     * ══════════════════════════════════════════════════════════════ */
+    :root {
+      --bg0: #040510;
+      --bg1: #0b1433;
+      --bg2: #1a0a33;
+      --panel: rgba(6, 10, 28, 0.78);
+      --line: rgba(0, 229, 255, 0.26);
+      --ink: #e8f6ff;
+      --muted: #9cb6d4;
+      --accentA: #00e5ff;
+      --accentB: #ffe600;
+      --accentC: #39ff14;
+      --accentD: #ff2bd6;
+      --neonRed: #ff2a55;
+      --neonEdge: rgba(0, 229, 255, 0.65);
+      --panelGlowA: rgba(0, 229, 255, 0.22);
+      --panelGlowB: rgba(255, 43, 214, 0.18);
+      --vfdCyan: #70f7ff;
+    }
+    * { box-sizing: border-box; }
+    *::before, *::after { box-sizing: border-box; }
+    /* ══════════════════════════════════════════════════════════════
+     * BASE LAYOUT — Body background, pseudo-element overlays
+     * Animations intentionally removed for GPU performance.
+     * ══════════════════════════════════════════════════════════════ */
+    html, body { margin: 0; padding: 0; color: var(--ink); background: var(--bg0); }
+    body {
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      min-height: 100vh;
+      position: relative;
+      isolation: isolate;
+      overflow-x: hidden;
+      background: var(--bg0);
+    }
+    /* ── Starfield background video ─────────────────────────────── */
+    #bgVideo {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover;
+      z-index: -2;
+      pointer-events: none;
+      opacity: 0.55;
+    }
+    /* Gradient overlay on top of video for readability */
+    #bgOverlay {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: -1;
+      pointer-events: none;
+      background:
+        radial-gradient(1300px 650px at 6% -8%, rgba(0, 229, 255, 0.18), transparent 58%),
+        radial-gradient(950px 540px at 102% -4%, rgba(255, 43, 214, 0.16), transparent 56%),
+        radial-gradient(900px 500px at 52% 112%, rgba(57, 255, 20, 0.10), transparent 62%);
+    }
+    main {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 20px;
+      display: grid;
+      gap: 16px;
+      position: relative;
+      z-index: 2;
+    }
+    /* ══════════════════════════════════════════════════════════════
+     * CARD & PANEL COMPONENTS — Metric cards, gauge cards, borders
+     * Each card gets --card-border and --card-glow via inline style.
+     * ══════════════════════════════════════════════════════════════ */
+    /* Shared base for header bar, metric cards, and chart panels */
+    .top, .card, .panel {
+      position: relative;
+      overflow: hidden;
+      background:
+        radial-gradient(120% 160% at 0% 0%, rgba(0, 229, 255, 0.10), transparent 58%),
+        radial-gradient(140% 150% at 100% 0%, rgba(255, 43, 214, 0.10), transparent 58%),
+        linear-gradient(155deg, rgba(7, 12, 30, 0.93) 0%, rgba(7, 10, 27, 0.87) 100%);
+      border: 1px solid var(--line);
+      box-shadow:
+        inset 0 0 0 1px rgba(0, 229, 255, 0.06),
+        0 0 26px var(--panelGlowA),
+        0 0 36px var(--panelGlowB);
+    }
+    .card {
+      --card-border: rgba(100, 180, 255, 0.45);
+      --card-glow: rgba(100, 180, 255, 0.18);
+      border: 2px solid var(--card-border);
+      box-shadow:
+        inset 0 0 0 1px color-mix(in srgb, var(--card-border) 15%, transparent),
+        0 0 18px var(--card-glow),
+        0 0 32px var(--card-glow);
+    }
+    .top::before, .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      padding: 1px;
+      background: linear-gradient(110deg, rgba(0, 229, 255, 0.95), rgba(57, 255, 20, 0.9), rgba(255, 43, 214, 0.95), rgba(255, 230, 0, 0.9));
+      background-size: 250% 250%;
+      opacity: 0.35;
+      pointer-events: none;
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+    }
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      opacity: 0;
+    }
+    .top::after, .panel::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 36%);
+      opacity: 0.35;
+    }
+    /* ══════════════════════════════════════════════════════════════
+     * HEADER BAR — Title, subtitle, status dot, display FPS, audio
+     * ══════════════════════════════════════════════════════════════ */
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      border-radius: 16px;
+      padding: 14px 18px;
+    }
+    .title {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      position: relative;
+      z-index: 2;
+    }
+    .title h1 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0.5px;
+      font-weight: 700;
+      color: #f5fbff;
+      text-shadow: 0 0 14px rgba(0, 229, 255, 0.45), 0 0 28px rgba(57, 255, 20, 0.24);
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      text-shadow: 0 0 9px rgba(0, 229, 255, 0.14);
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 13px;
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(2, 6, 23, 0.80);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.18), 0 0 16px rgba(0, 229, 255, 0.16);
+      position: relative;
+      z-index: 2;
+    }
+    .top-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      position: relative;
+      z-index: 2;
+    }
+    .display-fps-box {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: rgba(2, 6, 23, 0.80);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
+    }
+    .display-fps-label {
+      font-size: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: rgba(0, 229, 255, 0.55);
+    }
+    .display-fps-value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 16px;
+      color: #c8e8ff;
+      text-shadow: 0 0 5px rgba(100, 160, 255, 0.7), 0 0 14px rgba(60, 120, 255, 0.55), 0 0 28px rgba(40, 80, 255, 0.4);
+      line-height: 1;
+    }
+    .audio-toggle {
+      border: 1px solid rgba(0, 229, 255, 0.33);
+      background: rgba(2, 6, 23, 0.80);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      line-height: 1;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      cursor: pointer;
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.12), 0 0 14px rgba(0, 229, 255, 0.10);
+    }
+    .audio-toggle.on {
+      border-color: rgba(57, 255, 20, 0.50);
+      box-shadow: inset 0 0 14px rgba(57, 255, 20, 0.18), 0 0 14px rgba(57, 255, 20, 0.14);
+      color: #d9ffd0;
+    }
+    .audio-toggle:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    /* Status LED dot (connection indicator) */
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--accentC);
+      box-shadow: 0 0 0 7px rgba(57, 255, 20, 0.2), 0 0 14px rgba(57, 255, 20, 0.5);
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .card {
+      grid-column: span 2;
+      border-radius: 14px;
+      padding: 6px 9px;
+      min-height: 44px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 3px;
+      overflow: hidden;
+    }
+    .label {
+      color: #a5bfde;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.18);
+      position: relative;
+      z-index: 2;
+    }
+    /* ══════════════════════════════════════════════════════════════
+     * METRIC VALUES — VFD-style text, fixed-width char cells,
+     * record-high labels, mini-chart inline layout
+     * ══════════════════════════════════════════════════════════════ */
+    .value {
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 700;
+      letter-spacing: 0.35px;
+      color: #f0fbff;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.28), 0 0 22px rgba(57, 255, 20, 0.16);
+      position: relative;
+      z-index: 2;
+    }
+    .card:not(.gauge-card) .value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      color: #c8e8ff;
+      font-weight: 400;
+      letter-spacing: normal;
+      font-variant-numeric: normal;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45),
+        0 0 48px rgba(30, 60, 220, 0.3);
+      filter:
+        drop-shadow(0 0 8px rgba(60, 130, 255, 0.5))
+        drop-shadow(0 0 18px rgba(40, 80, 255, 0.35));
+    }
+    .panel-vfd {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 21px;
+      font-weight: 400;
+      color: #c8e8ff;
+      letter-spacing: normal;
+      font-variant-numeric: normal;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45),
+        0 0 48px rgba(30, 60, 220, 0.3);
+      filter:
+        drop-shadow(0 0 8px rgba(60, 130, 255, 0.5))
+        drop-shadow(0 0 18px rgba(40, 80, 255, 0.35));
+      margin: -4px 0 2px;
+      position: relative;
+      z-index: 2;
+    }
+    .value-inline {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #mQ, #mLoss, #mGrad, #mRplF {
+      display: inline-grid;
+      grid-auto-flow: column;
+      grid-auto-columns: 0.62em;
+      align-items: center;
+      justify-content: start;
+      white-space: nowrap;
+      font-variant-ligatures: none;
+      font-kerning: none;
+      letter-spacing: 0 !important;
+      line-height: 1;
+      font-size: 144%;
+    }
+    #mQ .qch, #mLoss .qch, #mGrad .qch, #mRplF .qch {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 0.72em;
+      min-width: 0.72em;
+    }
+    #mRplF {
+      font-size: 100%;
+    }
+    .mini-metric-card .mini-inline {
+      display: grid;
+      grid-template-columns: minmax(0, 23fr) minmax(0, 37fr);
+      grid-template-rows: auto 1fr;
+      align-items: start;
+      column-gap: 8px;
+      min-height: 18px;
+    }
+    .mini-metric-card .mini-inline .mini-canvas {
+      grid-column: 2;
+      grid-row: 1 / 3;
+    }
+    .mini-metric-card .mini-legend {
+      display: flex;
+      flex-direction: column;
+      align-self: stretch;
+      justify-content: center;
+      gap: 0px;
+      font-size: 9px;
+      color: #adc4df;
+      z-index: 2;
+      margin-top: 0;
+      padding-left: 8px;
+    }
+    .mini-metric-card .mini-legend .sw {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      display: inline-block;
+      margin-right: 3px;
+      position: relative;
+      top: 1px;
+      box-shadow: 0 0 6px currentColor;
+    }
+    .mini-metric-card .mini-inline .value {
+      justify-self: start;
+      min-width: 0;
+      white-space: nowrap;
+      font-size: 21px;
+    }
+    .record-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 2px;
+      position: relative;
+      z-index: 2;
+    }
+    .record-label {
+      font-size: 10px;
+      color: var(--muted);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .record-value {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 11px;
+      color: #c8e8ff;
+      letter-spacing: 0.3px;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45);
+      filter:
+        drop-shadow(0 0 6px rgba(60, 130, 255, 0.5));
+    }
+    .mini-metric-card .mini-canvas {
+      width: 100%;
+      max-width: 100%;
+      height: 116px;
+      border-radius: 8px;
+      border: none;
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.40), rgba(2, 6, 23, 0.55)),
+        repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.035) 0px, rgba(120, 150, 210, 0.035) 1px, transparent 1px, transparent 4px);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.10), 0 0 12px rgba(0, 229, 255, 0.09);
+      position: relative;
+      z-index: 2;
+      flex: 0 0 auto;
+      justify-self: end;
+    }
+    /* Per-metric status LED (colored via JS) */
+    .metric-led {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--neonRed);
+      box-shadow: 0 0 0 4px rgba(255, 42, 85, 0.24), 0 0 12px rgba(255, 42, 85, 0.58);
+      flex: 0 0 auto;
+    }
+    .gauge-card {
+      grid-column: span 2;
+      grid-row: span 2;
+      min-height: 200px;
+    }
+    .card-narrow {
+      grid-column: span 1;
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
+    }
+    .card-half {
+      min-height: 0;
+      padding: 6px 9px;
+      gap: 2px;
+    }
+    .card-half.mini-metric-card .mini-inline {
+      min-height: 0;
+      flex: 1;
+    }
+    .card-half.mini-metric-card .mini-canvas {
+      height: 36px;
+      min-height: 36px;
+      flex: 1;
+      border-radius: 4px;
+    }
+    /* Game-settings card controls */
+    .game-settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .game-settings-row label {
+      font-size: 11px;
+      color: #b0c8e8;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .game-settings-row select {
+      background: rgba(10, 20, 40, 0.85);
+      color: #c8e8ff;
+      border: 1px solid rgba(100, 180, 255, 0.35);
+      border-radius: 4px;
+      padding: 2px 4px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+    }
+    .game-settings-row select:focus {
+      border-color: rgba(100, 180, 255, 0.7);
+      box-shadow: 0 0 6px rgba(100, 180, 255, 0.3);
+    }
+    /* Dark toggle switch */
+    .toggle-switch { position: relative; display: inline-block; width: 28px; height: 14px; flex-shrink: 0; }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-switch .slider {
+      position: absolute; inset: 0; border-radius: 7px; cursor: pointer;
+      background: rgba(60, 80, 110, 0.7); transition: background 0.2s;
+    }
+    .toggle-switch .slider::before {
+      content: ""; position: absolute; left: 2px; top: 2px;
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #8899aa; transition: transform 0.2s, background 0.2s;
+    }
+    .toggle-switch input:checked + .slider { background: rgba(0, 200, 255, 0.45); }
+    .toggle-switch input:checked + .slider::before { transform: translateX(14px); background: #00c8ff; }
+    .toggle-switch input:disabled + .slider { opacity: 0.4; cursor: default; }
+    /* Up/down override controls for Epsilon / Expert */
+    .ud-col { display:flex; flex-direction:column; gap:0; line-height:1; }
+    .ud-btn {
+      background:none; border:none; color:#556; cursor:pointer;
+      font-size:9px; padding:0 2px; line-height:1; user-select:none;
+      transition: color 0.15s;
+    }
+    .ud-btn:hover { color:#0ff; }
+    .ud-btn:disabled { opacity:0.25; cursor:default; color:#556; }
+    .gauge-card canvas {
+      border: none;
+      background: transparent;
+      box-shadow: none;
+    }
+    .gauge-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      padding: 0 4px;
+    }
+    /* ── Chart panels ────────────────────────────────────────────── */
+    .charts {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(320px, 1fr));
+      gap: 14px;
+    }
+    .panel {
+      border-radius: 14px;
+      padding: 12px;
+      min-height: 224px;
+      display: grid;
+      grid-template-rows: auto auto auto 1fr;
+      gap: 4px;
+      overflow: hidden;
+    }
+    .panel h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 640;
+      letter-spacing: 0.35px;
+      color: #effbff;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.28), 0 0 22px rgba(255, 43, 214, 0.18);
+      position: relative;
+      z-index: 2;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      color: #adc4df;
+      font-size: 12px;
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.14);
+      position: relative;
+      z-index: 2;
+    }
+    .legend .sw {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      display: inline-block;
+      margin-right: 6px;
+      position: relative;
+      top: 1px;
+      box-shadow: 0 0 10px currentColor;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 210px;
+      border-radius: 10px;
+      border: 1px solid rgba(0, 229, 255, 0.26);
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.55), rgba(2, 6, 23, 0.65)),
+        repeating-linear-gradient(0deg, rgba(120, 150, 210, 0.04) 0px, rgba(120, 150, 210, 0.04) 1px, transparent 1px, transparent 5px);
+      box-shadow: inset 0 0 28px rgba(0, 229, 255, 0.10), 0 0 20px rgba(0, 229, 255, 0.12);
+      position: relative;
+      z-index: 2;
+    }
+    /* ── Responsive breakpoints ───────────────────────────────────── */
+    @media (max-width: 1300px) {
+      .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+      .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
+    }
+    @media (max-width: 950px) {
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .charts { grid-template-columns: 1fr; }
+      .top { flex-direction: column; align-items: flex-start; }
+      .gauge-card { grid-column: span 2; }
+      .mini-metric-card .mini-canvas { height: 96px; }
+    }
+  </style>
+</head>
+<!-- ══════════════════════════════════════════════════════════════════
+     HTML MARKUP — Dashboard layout: cards grid, gauge canvases,
+     mini-metric cards with sparklines, time-series chart panels,
+     and the header bar (rendered last, positioned via CSS grid).
+     ══════════════════════════════════════════════════════════════════ -->
+<body>
+  <video id="bgVideo" autoplay loop muted playsinline src="/api/html/Starfield.mov"></video>
+  <div id="bgOverlay"></div>
+  <main>
+    <section class="cards">
+      <article class="card gauge-card" style="--card-border:rgba(255,60,60,0.66);--card-glow:rgba(255,40,40,0.26)">
+        <div class="gauge-head">
+          <div class="label">FRAMES PER SECOND</div>
+        </div>
+        <canvas id="cFpsGauge"></canvas>
+      </article>
+      <article class="card gauge-card" style="--card-border:rgba(255,220,40,0.66);--card-glow:rgba(255,200,20,0.26)">
+        <div class="gauge-head">
+          <div class="label">STEPS PER SECOND</div>
+        </div>
+        <canvas id="cStepGauge"></canvas>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
+        <div class="label">AVG REWARD 1M</div>
+        <div class="mini-inline">
+          <div class="value" id="mRwrd">0</div>
+          <canvas id="cRewardMini" class="mini-canvas"></canvas>
+          <div class="mini-legend"><span><span class="sw" style="background:#ef4444;"></span>100K</span><span><span class="sw" style="background:#22c55e;"></span>1M</span><span><span class="sw" style="background:#38bdf8;"></span>5M</span></div>
+        </div>
+        <div class="record-row"><span class="record-label">HIGH SCORE:</span><span class="record-value" id="recRwrd">—</span></div>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(255,140,30,0.66);--card-glow:rgba(255,120,20,0.26)">
+        <div class="label">Q-VALUE RANGE</div>
+        <canvas id="cQRange" class="mini-canvas" style="flex:0 1 auto;"></canvas>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(60,130,255,0.66);--card-glow:rgba(40,100,255,0.26)">
+        <div class="label">Avg Level</div>
+        <div class="mini-inline">
+          <div class="value" id="mLevel">0.0</div>
+          <canvas id="cLevelMini" class="mini-canvas"></canvas>
+        </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recLevel">—</span></div>
+      </article>
+      <article class="card mini-metric-card" style="--card-border:rgba(255,160,80,0.66);--card-glow:rgba(255,140,60,0.26)">
+        <div class="label">EPISODE LENGTH</div>
+        <div class="mini-inline">
+          <div class="value" id="mEpLen">0</div>
+          <canvas id="cEpLenMini" class="mini-canvas"></canvas>
+          <div style="grid-column:1;"><div class="record-label" style="margin-bottom:1px;">Duration:</div><div class="record-value" id="mDuration">0:00</div><div class="record-label" style="margin-bottom:1px;margin-top:2px;">Count:</div><div class="record-value" id="mEpisodes">0</div><div class="record-label" style="margin-bottom:1px;margin-top:2px;">Rate:</div><div class="record-value" id="mEpRate">—</div></div>
+        </div>
+        <div class="record-row"><span class="record-label">Record:</span><span class="record-value" id="recEpLen">—</span></div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(180,80,255,0.66);--card-glow:rgba(160,50,255,0.26)">
+        <div class="label">Loss</div>
+        <div class="mini-inline">
+          <div class="value" id="mLoss">0</div>
+          <canvas id="cLossMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(255,60,180,0.66);--card-glow:rgba(255,40,160,0.26)">
+        <div class="label">Grad Norm</div>
+        <div class="mini-inline">
+          <div class="value" id="mGrad">0</div>
+          <canvas id="cGradMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card card-half" style="--card-border:rgba(255,100,100,0.66);--card-glow:rgba(255,80,80,0.26)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div>
+            <div class="label">Epsilon</div>
+            <div style="display:flex;align-items:center;gap:2px;">
+              <div class="ud-col" id="epsUD">
+                <button class="ud-btn" data-field="epsilon_pct" data-dir="1" title="Increase epsilon">&#9650;</button>
+                <button class="ud-btn" data-field="epsilon_pct" data-dir="-1" title="Decrease epsilon">&#9660;</button>
+              </div>
+              <div class="value" id="mEps">0%</div>
+            </div>
+          </div>
+          <div style="text-align:right;">
+            <div class="label">Expert</div>
+            <div style="display:flex;align-items:center;gap:2px;justify-content:flex-end;">
+              <div class="ud-col" id="xprtUD">
+                <button class="ud-btn" data-field="expert_pct" data-dir="1" title="Increase expert">&#9650;</button>
+                <button class="ud-btn" data-field="expert_pct" data-dir="-1" title="Decrease expert">&#9660;</button>
+              </div>
+              <div class="value" id="mXprt">0%</div>
+            </div>
+          </div>
+        </div>
+        <div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div>
+      </article>
+      <article class="card mini-metric-card card-half" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)">
+        <div class="label">LEARNING RATE</div>
+        <div class="mini-inline" style="overflow:hidden;min-height:0;flex:1;">
+          <div class="value" id="mLr">-</div>
+          <canvas id="lrMiniChart" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
+        <div class="label">AVG INFERENCE</div>
+        <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
+      </article>
+      <article class="card" style="--card-border:rgba(220,180,255,0.66);--card-glow:rgba(200,150,255,0.26)">
+        <div class="label">REPLAYS PER FRAME</div>
+        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
+      </article>
+      <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
+      <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
+        <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
+        <div class="game-settings-row">
+          <label>Level:
+            <select id="gsLevel">
+              <option value="1">1</option><option value="3">3</option><option value="5">5</option>
+              <option value="7">7</option><option value="9">9</option><option value="11">11</option>
+              <option value="13" selected>13</option><option value="15">15</option><option value="17">17</option>
+              <option value="20">20</option><option value="22">22</option><option value="24">24</option>
+              <option value="26">26</option><option value="28">28</option><option value="31">31</option>
+              <option value="33">33</option><option value="36">36</option><option value="40">40</option>
+              <option value="44">44</option><option value="47">47</option><option value="49">49</option>
+              <option value="52">52</option><option value="56">56</option><option value="60">60</option>
+              <option value="63">63</option><option value="65">65</option><option value="73">73</option>
+              <option value="81">81</option>
+            </select>
+          </label>
+          <label style="gap:6px;">Advanced <span class="toggle-switch"><input type="checkbox" id="gsAdvanced" checked><span class="slider"></span></span></label>
+        </div>
+      </article>
+    </section>
+
+    <section class="charts">
+      <article class="panel">
+        <h2>Throughput</h2>
+        <div class="legend">
+          <span><span class="sw" style="background:#22c55e;"></span>FPS</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>Avg Lvl (100K)</span>
+          <span><span class="sw" style="background:#e879f9;"></span>Ep Len (100K)</span>
+        </div>
+        <canvas id="cThroughput"></canvas>
+      </article>
+
+      <article class="panel">
+        <h2>Rewards</h2>
+        <div class="legend">
+          <span><span class="sw" style="background:#ef4444;"></span>100K</span>
+          <span><span class="sw" style="background:#22c55e;"></span>1M</span>
+          <span><span class="sw" style="background:#38bdf8;"></span>5M</span>
+          <span><span class="sw" style="background:#facc15;"></span>Subj</span>
+        </div>
+        <canvas id="cRewards"></canvas>
+      </article>
+
+      <article class="panel">
+        <h2>Learning</h2>
+        <div class="legend">
+          <span><span class="sw" style="background:#22c55e;"></span>Loss</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>Grad Norm</span>
+          <span><span class="sw" style="background:#22d3ee;"></span>BC Loss</span>
+        </div>
+        <canvas id="cLearning"></canvas>
+      </article>
+
+      <article class="panel" style="position:relative;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;">
+          <h2 style="margin:0;">Performance</h2>
+          <div style="display:flex;align-items:baseline;gap:6px;"><span style="font-size:11px;color:#a5bfde;letter-spacing:0.5px;text-transform:uppercase;">Agreement:</span><div class="value panel-vfd" id="mAgreePanel">0.0%</div></div>
+        </div>
+        <div class="legend">
+          <span><span class="sw" style="background:#00c8ff;"></span>Agreement 1M</span>
+          <span><span class="sw" style="background:#0090cc55;"></span>Agreement Raw</span>
+          <span><span class="sw" style="background:#ef4444;"></span>Avg Lvl</span>
+        </div>
+        <canvas id="cAgreement"></canvas>
+      </article>
+
+    </section>
+    <section class="top">
+      <div class="title">
+        <h1>Robotron AI Dashboard</h1>
+        <div class="subtitle" id="modelDesc">Loading model info…</div>
+      </div>
+      <div class="top-right">
+        <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connected</span></div>
+        <div class="display-fps-box"><span class="display-fps-label">Display FPS</span><span class="display-fps-value" id="displayFps">0</span></div>
+        <button id="audioToggle" class="audio-toggle" type="button">Audio Off</button>
+      </div>
+    </section>
+  </main>
+  <audio id="bgAudio" preload="auto" autoplay></audio>
+
+  <script>
+    /* ══════════════════════════════════════════════════════════════
+     * CONSTANTS — Refresh rates, history depth, gauge ranges
+     * ══════════════════════════════════════════════════════════════ */
+    const num = new Intl.NumberFormat("en-US");
+    const DASH_MAX_FPS = 30;
+    const DASH_DEFAULT_FPS = 2;
+    const DASH_REFRESH_FPS = (() => {
+      try {
+        const raw = new URLSearchParams(window.location.search).get("fps");
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed <= 0) return DASH_DEFAULT_FPS;
+        return Math.min(DASH_MAX_FPS, parsed);
+      } catch (_) {
+        return DASH_DEFAULT_FPS;
+      }
+    })();
+    const DASH_REFRESH_MS = Math.max(1, Math.round(1000 / DASH_REFRESH_FPS));
+    const HISTORY_WINDOW_MINUTES = 65;
+    const MAX_HISTORY_POINTS = Math.max(
+      900,
+      Math.round((HISTORY_WINDOW_MINUTES * 60 * 1000) / DASH_REFRESH_MS)
+    );
+    const MAX_CHART_POINTS = 1400;
+    const STEP_GAUGE_AVG_WINDOW = 10;
+    const GAUGE_MIN_FPS = 0;
+    const GAUGE_MAX_FPS = 15000;
+    const GAUGE_FPS_RED_MAX = 3000;
+    const GAUGE_FPS_YELLOW_MAX = 6000;
+    const GAUGE_MIN_STEPS = 0;
+    const GAUGE_MAX_STEPS = 120;
+    const AUDIO_PREF_COOKIE = "robotron_dashboard_audio_enabled";
+    const AUDIO_START_RETRY_MS = 800;
+
+    /* ── Display FPS counter ──────────────────────────────────────────── */
+    let _dispFpsFrames = 0;
+    let _dispFpsLast = performance.now();
+    const _dispFpsEl = document.getElementById("displayFps");
+    function _tickDisplayFps() {
+      _dispFpsFrames++;
+      const now = performance.now();
+      const elapsed = now - _dispFpsLast;
+      if (elapsed >= 1000) {
+        const fps = Math.round((_dispFpsFrames * 1000) / elapsed);
+        _dispFpsEl.textContent = fps;
+        _dispFpsFrames = 0;
+        _dispFpsLast = now;
+      }
+    }
+    const CHART_VALUE_SMOOTH_ALPHA = 0.22;
+    const MINI_CHART_VALUE_SMOOTH_ALPHA = 0.28;
+    let failedPings = 0;
+    const CLIENT_ID = (() => {
+      try {
+        if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+      } catch (_) {}
+      return `c_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    })();
+    /* ══════════════════════════════════════════════════════════════
+     * AUDIO — Background music playlist with cookie-based preference
+     * ══════════════════════════════════════════════════════════════ */
+    const bgAudio = document.getElementById("bgAudio");
+    const audioToggle = document.getElementById("audioToggle");
+    let audioPlaylist = [];
+    let audioIndex = 0;
+    let audioEnabled = false;
+    let audioRetryTimer = null;
+
+    /* ══════════════════════════════════════════════════════════════
+     * DOM REFERENCES — Metric card elements, record labels, gauges
+     * ══════════════════════════════════════════════════════════════ */
+    const cards = {
+      clients: document.getElementById("mClients"),
+      web: document.getElementById("mWeb"),
+      level: document.getElementById("mLevel"),
+      inf: document.getElementById("mInf"),
+      infLed: document.getElementById("mInfLed"),
+      rplf: document.getElementById("mRplF"),
+      rplLed: document.getElementById("mRplLed"),
+      eps: document.getElementById("mEps"),
+      pulseStatus: document.getElementById("mPulseStatus"),
+      xprt: document.getElementById("mXprt"),
+      rwrd: document.getElementById("mRwrd"),
+      dqnRwrd: null,
+      loss: document.getElementById("mLoss"),
+      grad: document.getElementById("mGrad"),
+      buf: document.getElementById("mBuf"),
+      lr: document.getElementById("mLr"),
+      q: document.getElementById("mQ"),
+      epLen: document.getElementById("mEpLen"),
+      duration: document.getElementById("mDuration"),
+      episodes: document.getElementById("mEpisodes"),
+      epRate: document.getElementById("mEpRate"),
+      agreePanel: document.getElementById("mAgreePanel"),
+    };
+    /* Game-settings controls */
+    const gsAdvancedEl = document.getElementById("gsAdvanced");
+    const gsLevelEl = document.getElementById("gsLevel");
+    const gsAutoCurrEl = document.getElementById("gsAutoCurriculum");
+    const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
+    if (!_gsAdmin) { gsAdvancedEl.disabled = true; gsLevelEl.disabled = true; gsAutoCurrEl.disabled = true; }
+    /* Epsilon / Expert up-down buttons — admin gate */
+    document.querySelectorAll('#epsUD .ud-btn, #xprtUD .ud-btn').forEach(btn => {
+      if (!_gsAdmin) { btn.disabled = true; return; }
+      btn.addEventListener('click', () => {
+        const field = btn.dataset.field; /* epsilon_pct or expert_pct */
+        const dir   = parseInt(btn.dataset.dir, 10); /* +1 or -1 */
+        const cur   = field === 'epsilon_pct'
+          ? Math.round((_lastNow?.epsilon ?? 0) * 100)
+          : Math.round((_lastNow?.expert_ratio ?? 0) * 100);
+        const next  = Math.max(0, Math.min(100, cur + dir));
+        _postGameSettings({ [field]: next });
+        /* Optimistic UI update */
+        if (field === 'epsilon_pct') cards.eps.textContent = fmtPct(next / 100);
+        else cards.xprt.textContent = fmtPct(next / 100);
+      });
+    });
+    let _lastNow = null;  /* stash latest snapshot for up/down reference */
+    let _gsIgnoreSync = false;  /* suppress sync while user is changing */
+    async function _postGameSettings(obj) {
+      try {
+        _gsIgnoreSync = true;
+        await fetch("/api/game_settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(obj),
+        });
+      } catch (e) { /* ignore */ }
+      finally { setTimeout(() => { _gsIgnoreSync = false; }, 1500); }
+    }
+    if (_gsAdmin) {
+      gsAdvancedEl.addEventListener("change", () => {
+        _postGameSettings({ start_advanced: gsAdvancedEl.checked });
+      });
+      gsLevelEl.addEventListener("change", () => {
+        _postGameSettings({ start_level_min: parseInt(gsLevelEl.value, 10) });
+      });
+      gsAutoCurrEl.addEventListener("change", () => {
+        _postGameSettings({ auto_curriculum: gsAutoCurrEl.checked });
+        _applyAutoCurriculum(gsAutoCurrEl.checked);
+      });
+    }
+    const _selectableLevels = Array.from({ length: 81 }, (_, i) => i + 1);
+    function _computeAutoLevel(avgLevel) {
+      const target = Math.floor(avgLevel) - 2;
+      let best = _selectableLevels[0];
+      for (const lv of _selectableLevels) { if (lv <= target) best = lv; else break; }
+      return best;
+    }
+    function _applyAutoCurriculum(on) {
+      gsAdvancedEl.disabled = on || !_gsAdmin;
+      gsLevelEl.disabled    = on || !_gsAdmin;
+      if (on) {
+        if (gsAdvancedEl.checked) {
+          gsAdvancedEl.checked = false;
+          _postGameSettings({ start_advanced: false });
+        }
+        if (_lastNow) {
+          const lv = _computeAutoLevel(_lastNow.average_level || 1);
+          gsLevelEl.value = String(lv);
+          _postGameSettings({ start_level_min: lv });
+        }
+      }
+    }
+
+    const recEls = {
+      rwrd: document.getElementById("recRwrd"),
+      level: document.getElementById("recLevel"),
+      epLen: document.getElementById("recEpLen"),
+    };
+    const modelDescEl = document.getElementById("modelDesc");
+    const recordHighs = { rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
+    /* Episode rate: 30-second rolling window */
+    const epRateHistory = [];  /* {ts, episodes} */
+    const EP_RATE_WINDOW = 30; /* seconds */
+    const fpsGaugeCanvas = document.getElementById("cFpsGauge");
+    const stepGaugeCanvas = document.getElementById("cStepGauge");
+
+    // ── Gauge needle damping ────────────────────────────────────────
+    // Time-constant in seconds: the needle closes ~63% of the gap
+    // in this many seconds.  Lower = snappier, higher = smoother.
+    const GAUGE_DAMPING_TAU = 0.35;
+    const gaugeState = {
+      fps:  { current: 0, target: 0 },
+      step: { current: 0, target: 0 },
+    };
+    let latestRow = null;
+    let lastGaugeFrameTs = 0;
+
+    function gaugeAnimationLoop(ts) {
+      if (!lastGaugeFrameTs) lastGaugeFrameTs = ts;
+      const dtSec = Math.min((ts - lastGaugeFrameTs) / 1000, 0.25); // cap to avoid jump after tab-hide
+      lastGaugeFrameTs = ts;
+
+      // Exponential ease: factor = 1 - e^(-dt/tau)
+      const alpha = 1.0 - Math.exp(-dtSec / GAUGE_DAMPING_TAU);
+
+      let needsRedraw = false;
+      for (const g of Object.values(gaugeState)) {
+        const diff = g.target - g.current;
+        if (Math.abs(diff) > 0.05) {
+          g.current += diff * alpha;
+          needsRedraw = true;
+        } else if (g.current !== g.target) {
+          g.current = g.target;
+          needsRedraw = true;
+        }
+      }
+
+      if (needsRedraw) {
+        drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
+        drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+      }
+
+      requestAnimationFrame(gaugeAnimationLoop);
+    }
+    // Draw gauges once at zero so they appear before any data arrives
+    drawFpsGauge(fpsGaugeCanvas, 0, null);
+    drawStepGauge(stepGaugeCanvas, 0, null);
+    requestAnimationFrame(gaugeAnimationLoop);
+
+    const charts = {
+      throughput: {
+        canvas: document.getElementById("cThroughput"),
+        series: [
+          {
+            key: "fps",
+            color: "#22c55e",
+            axis: { side: "left", min: 0, max: 3000, group_keys: ["fps", "eplen_100k"] },
+            smooth_alpha: 0.14,
+          },
+          {
+            key: "steps_per_sec_chart",
+            color: "#f59e0b",
+            axis: { side: "right", min: 0, max_floor: 50, max_snap: 25, group_keys: ["steps_per_sec_chart"] },
+            smooth_alpha: 0.10,
+          },
+          {
+            key: "eplen_100k",
+            color: "#e879f9",
+            axis_ref: "fps",
+            smooth_alpha: 0.20,
+          }
+        ]
+      },
+      rewards: {
+        canvas: document.getElementById("cRewards"),
+        series: [
+          { key: "total_5m", color: "#38bdf8", median_window: 3, map: v => Math.max(0, v || 0),
+            axis: {
+              side: "left",
+              min: 0,
+              label_pad: 52,
+              group_keys: ["total_100k", "total_1m", "total_5m"],
+            },
+          },
+          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
+          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
+          { key: "reward_subj", color: "#facc15", median_window: 5, smooth_alpha: 0.15,
+            axis: {
+              side: "right",
+              label_pad: 40,
+              group_keys: ["reward_subj"],
+            },
+          }
+        ]
+      },
+      learning: {
+        canvas: document.getElementById("cLearning"),
+        series: [
+          {
+            key: "loss",
+            color: "#22c55e",
+            axis: { side: "left", min: 0, group_keys: ["loss", "grad_norm"], max_floor: 1.5, tick_decimals: 1 },
+            smooth_alpha: 0.55,
+          },
+          { key: "grad_norm", color: "#f59e0b", axis_ref: "loss", smooth_alpha: 0.55 },
+          {
+            key: "bc_loss",
+            color: "#22d3ee",
+            axis: { side: "right", min: 0, group_keys: ["bc_loss"], max_floor: 1.5, tick_decimals: 1 },
+            smooth_alpha: 0.55,
+          }
+        ]
+      },
+      qRange: {
+        canvas: document.getElementById("cQRange"),
+        fill_between: ["q_max", "q_min", "#22c55e", "#38bdf8"],
+        series: [
+          { key: "q_max", color: "#22c55e", axis: { target_ticks: 4, group_keys: ["q_max", "q_min"] } },
+          { key: "q_min", color: "#38bdf8", axis_ref: "q_max" }
+        ]
+      },
+      level1m: {
+        canvas: document.getElementById("cLevelMini"),
+        series: [
+          {
+            key: "level_25k",
+            color: "#22c55e",
+            axis: { side: "left", min: 0, group_keys: ["level_25k", "level_1m", "level_5m"] },
+          },
+          { key: "level_1m", color: "#f59e0b", axis_ref: "level_25k" },
+          { key: "level_5m", color: "#22d3ee", axis_ref: "level_25k" }
+        ]
+      },
+      rewardMini: {
+        canvas: document.getElementById("cRewardMini"),
+        series: [
+          { key: "total_5m", color: "#38bdf8", median_window: 3, axis: { target_ticks: 3 }, map: v => Math.max(0, v || 0) },
+          { key: "total_1m", color: "#22c55e", median_window: 3, map: v => Math.max(0, v || 0) },
+          { key: "total_100k", color: "#ef4444", median_window: 3, linearTime: true, map: v => Math.max(0, v || 0) }
+        ]
+      },
+      lossMini: {
+        canvas: document.getElementById("cLossMini"),
+        series: [
+          { key: "loss", color: "#22c55e", axis: { min: 0 } }
+        ]
+      },
+      gradMini: {
+        canvas: document.getElementById("cGradMini"),
+        series: [
+          { key: "grad_norm", color: "#f59e0b", axis: { min: 0 } }
+        ]
+      },
+      epLenMini: {
+        canvas: document.getElementById("cEpLenMini"),
+        series: [
+          { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
+        ]
+      },
+      agreement: {
+        canvas: document.getElementById("cAgreement"),
+        series: [
+          { key: "agreement_1m", color: "#00c8ff", smooth_alpha: 0.35,
+            axis: { side: "left", min: 0, min_range: 0.10, label_pad: 52, group_keys: ["agreement_1m", "agreement"], tick_decimals: 2 }
+          },
+          { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 },
+          { key: "level_100k", color: "#ef4444", smooth_alpha: 0.20,
+            axis: { side: "right", min_range: 1.0, label_pad: 40, group_keys: ["level_100k"], tick_decimals: 1 }
+          }
+        ]
+      }
+    };
+
+    function fmtInt(v) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "0";
+      return num.format(Math.round(v));
+    }
+
+    function fmtFloat(v, d = 2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "0";
+      return Number(v).toFixed(d);
+    }
+
+    function fmtSignedFloat(v, d = 2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "+0";
+      const n = Number(v);
+      const mag = Math.abs(n).toFixed(d);
+      // Pad integer part to 2 digits so display stays fixed-width
+      const [ip, fp] = mag.split(".");
+      const padded = ip.padStart(2, "0") + (fp !== undefined ? "." + fp : "");
+      return (n < 0 ? "-" : "+") + padded;
+    }
+
+    function fmtPaddedFloat(v, intDigits = 2, decDigits = 2, padChar = "0") {
+      if (v === null || v === undefined || Number.isNaN(v)) return "0";
+      const n = Math.abs(Number(v));
+      const [ip, fp] = n.toFixed(decDigits).split(".");
+      return ip.padStart(intDigits, padChar) + (fp !== undefined ? "." + fp : "");
+    }
+
+    function qColor(v) {
+      // Color by absolute magnitude relative to C51 support [-100,100]
+      const m = Math.abs(v);
+      if (m < 20) return "#39ff14";         // green – healthy
+      if (m < 40) return "#ffaa33";         // amber – caution
+      if (m < 60) return "#ff9900";         // dark amber – concerning
+      if (m < 80) return "#ff8c14";         // orange – warning
+      return "#ff2020";                      // red – exploding
+    }
+
+    function toColoredQRange(qMin, qMax) {
+      const minStr = fmtSignedFloat(qMin, 1);
+      const maxStr = fmtSignedFloat(qMax, 1);
+      const minColor = qColor(qMin);
+      const maxColor = qColor(qMax);
+      function coloredCells(text, color) {
+        return Array.from(String(text)).map((ch) => {
+          const html = (ch === " ") ? "&nbsp;" : ch
+            .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+          return `<span class="qch" style="color:${color};text-shadow:0 0 6px ${color}44">${html}</span>`;
+        }).join("");
+      }
+      return coloredCells(minStr, minColor) +
+             `<span class="qch">,</span>` +
+             coloredCells(maxStr, maxColor);
+    }
+
+    function toFixedCharCells(text) {
+      const s = String(text ?? "");
+      return Array.from(s).map((ch) => {
+        const html = (ch === " ") ? "&nbsp;" : ch
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+        return `<span class="qch">${html}</span>`;
+      }).join("");
+    }
+
+    function downsampleHistory(rows, targetPoints) {
+      if (!Array.isArray(rows)) return [];
+      const n = rows.length;
+      const limit = Math.max(2, Number(targetPoints) || 0);
+      if (n <= limit) return rows;
+      // End-anchored sampling keeps newest (right-side) points stable as new
+      // samples arrive, reducing visible squirm near "now".
+      const outRev = [];
+      const step = (n - 1) / (limit - 1);
+      for (let i = 0; i < limit; i++) {
+        const fromEnd = Math.floor(i * step);
+        outRev.push(rows[n - 1 - fromEnd]);
+      }
+      outRev[0] = rows[n - 1];
+      outRev[limit - 1] = rows[0];
+      return outRev.reverse();
+    }
+
+    function sliceHistoryLookback(rows, lookbackSec) {
+      if (!Array.isArray(rows) || !rows.length) return [];
+      const lb = Number(lookbackSec);
+      if (!Number.isFinite(lb) || lb <= 0) return rows.slice();
+      const newestTs = Number(rows[rows.length - 1] && rows[rows.length - 1].ts);
+      if (!Number.isFinite(newestTs)) return rows.slice();
+      const cutoff = newestTs - lb;
+      let start = 0;
+      while (start < rows.length) {
+        const ts = Number(rows[start] && rows[start].ts);
+        if (!Number.isFinite(ts) || ts >= cutoff) break;
+        start += 1;
+      }
+      return rows.slice(start);
+    }
+
+    function fmtPct(v) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "0%";
+      return `${(Number(v) * 100.0).toFixed(1)}%`;
+    }
+
+    function setAudioToggle(enabled, hasTracks = true) {
+      if (!audioToggle) return;
+      audioToggle.textContent = hasTracks ? (enabled ? "Audio On" : "Audio Off") : "No Audio";
+      audioToggle.classList.toggle("on", !!enabled && !!hasTracks);
+      audioToggle.disabled = !hasTracks;
+    }
+
+    function clearAudioRetryTimer() {
+      if (audioRetryTimer) {
+        clearTimeout(audioRetryTimer);
+        audioRetryTimer = null;
+      }
+    }
+
+    function scheduleAudioRetry() {
+      clearAudioRetryTimer();
+      if (!audioEnabled || !audioPlaylist.length) return;
+      audioRetryTimer = setTimeout(() => {
+        audioRetryTimer = null;
+        ensureAudioPlaying();
+      }, AUDIO_START_RETRY_MS);
+    }
+
+    function getCookieValue(name) {
+      const key = `${name}=`;
+      const parts = String(document.cookie || "").split(";");
+      for (const raw of parts) {
+        const part = raw.trim();
+        if (part.startsWith(key)) {
+          return decodeURIComponent(part.slice(key.length));
+        }
+      }
+      return null;
+    }
+
+    function setCookieValue(name, value) {
+      // Keep preference for ~1 year and scope to dashboard path.
+      document.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=31536000; Path=/; SameSite=Lax`;
+    }
+
+    function stopAudio() {
+      clearAudioRetryTimer();
+      if (!bgAudio) return;
+      bgAudio.pause();
+      bgAudio.removeAttribute("src");
+      try { bgAudio.load(); } catch (_) {}
+    }
+
+    function playAudioAt(index) {
+      if (!bgAudio || !audioPlaylist.length) return;
+      const n = audioPlaylist.length;
+      audioIndex = ((index % n) + n) % n;
+      bgAudio.src = audioPlaylist[audioIndex].url;
+      try { bgAudio.load(); } catch (_) {}
+      const p = bgAudio.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          clearAudioRetryTimer();
+        }).catch(() => {
+          scheduleAudioRetry();
+        });
+      }
+    }
+
+    function ensureAudioPlaying() {
+      if (!audioEnabled || !audioPlaylist.length) return;
+      if (!bgAudio || !bgAudio.src) {
+        playAudioAt(audioIndex);
+        return;
+      }
+      const p = bgAudio.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          clearAudioRetryTimer();
+        }).catch(() => {
+          scheduleAudioRetry();
+        });
+      }
+    }
+
+    function setAudioEnabled(next) {
+      audioEnabled = !!next;
+      setCookieValue(AUDIO_PREF_COOKIE, audioEnabled ? "1" : "0");
+      setAudioToggle(audioEnabled, audioPlaylist.length > 0);
+      if (audioEnabled) ensureAudioPlaying();
+      else stopAudio();
+    }
+
+    async function loadAudioPlaylist() {
+      try {
+        const res = await fetch(`/api/audio_playlist?t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("playlist");
+        const payload = await res.json();
+        const tracks = Array.isArray(payload && payload.tracks) ? payload.tracks : [];
+        audioPlaylist = tracks
+          .map((t) => ({ name: String(t.name || ""), url: String(t.url || "") }))
+          .filter((t) => t.url.length > 0);
+      } catch (_) {
+        audioPlaylist = [];
+      }
+      if (audioIndex >= audioPlaylist.length) audioIndex = 0;
+      setAudioToggle(audioEnabled, audioPlaylist.length > 0);
+      if (audioEnabled) ensureAudioPlaying();
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * STATUS & LED INDICATORS — Connection dot, inference/replay LEDs
+     * Colors change based on metric thresholds (green/yellow/red).
+     * ══════════════════════════════════════════════════════════════ */
+    function setConnected(connected) {
+      const dot = document.getElementById("statusDot");
+      const text = document.getElementById("statusText");
+      if (connected) {
+        dot.style.background = "#39ff14";
+        dot.style.boxShadow = "0 0 0 7px rgba(57,255,20,0.22), 0 0 16px rgba(57,255,20,0.55)";
+        text.textContent = "Connected";
+      } else {
+        dot.style.background = "#ff2a55";
+        dot.style.boxShadow = "0 0 0 7px rgba(255,42,85,0.24), 0 0 16px rgba(255,42,85,0.55)";
+        text.textContent = "Disconnected";
+      }
+    }
+
+    function setInfLed(avgInfMs) {
+      if (!cards.infLed) return;
+      const ms = Number(avgInfMs);
+      if (!Number.isFinite(ms) || ms < 5.0) {
+        cards.infLed.style.background = "#39ff14";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(57,255,20,0.22), 0 0 12px rgba(57,255,20,0.6)";
+        return;
+      }
+      if (ms < 10.0) {
+        cards.infLed.style.background = "#ffe600";
+        cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
+        return;
+      }
+      cards.infLed.style.background = "#ff2a55";
+      cards.infLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
+    }
+
+    function setRplLed(rplPerFrame) {
+      if (!cards.rplLed) return;
+      const v = Number(rplPerFrame);
+      if (!Number.isFinite(v)) {
+        cards.rplLed.style.background = "#94a3b8";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(148,163,184,0.18), 0 0 12px rgba(148,163,184,0.35)";
+        return;
+      }
+      if (v > 8.0 || v < 0.25) {
+        cards.rplLed.style.background = "#ff2a55";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,42,85,0.24), 0 0 12px rgba(255,42,85,0.58)";
+        return;
+      }
+      if (v >= 4.0) {
+        cards.rplLed.style.background = "#f59e0b";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(245,158,11,0.24), 0 0 12px rgba(245,158,11,0.58)";
+        return;
+      }
+      if (v >= 1.0) {
+        cards.rplLed.style.background = "#39ff14";
+        cards.rplLed.style.boxShadow = "0 0 0 4px rgba(57,255,20,0.22), 0 0 12px rgba(57,255,20,0.6)";
+        return;
+      }
+      cards.rplLed.style.background = "#ffe600";
+      cards.rplLed.style.boxShadow = "0 0 0 4px rgba(255,230,0,0.22), 0 0 12px rgba(255,230,0,0.58)";
+    }
+
+    function roundRectPath(ctx, x, y, w, h, r) {
+      const rr = Math.max(0, Math.min(r, Math.min(w, h) * 0.5));
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rr);
+      ctx.arcTo(x + w, y + h, x, y + h, rr);
+      ctx.arcTo(x, y + h, x, y, rr);
+      ctx.arcTo(x, y, x + w, y, rr);
+      ctx.closePath();
+    }
+
+    /* ── VFD bloom text helper ───────────────────────────────────────
+     * Draws multi-layer glowing text simulating a vacuum fluorescent
+     * display (VFD).  Each layer is progressively brighter and tighter
+     * to create a realistic bloom/glow effect.
+     *
+     * @param {CanvasRenderingContext2D} ctx   Canvas context
+     * @param {string}  text    The text to render
+     * @param {number}  x, y   Position to draw at
+     * @param {Array}   layers  Array of {fill, shadow, blur} objects,
+     *                          ordered widest/faintest → tightest/brightest.
+     *                          Each layer is drawn twice for extra intensity.
+     * @param {object}  crisp   Final crisp layer: {fill, shadow, blur}
+     */
+    function drawBloomText(ctx, text, x, y, layers, crisp) {
+      for (const l of layers) {
+        ctx.fillStyle = l.fill;
+        ctx.shadowColor = l.shadow;
+        ctx.shadowBlur = l.blur;
+        ctx.fillText(text, x, y);
+        ctx.fillText(text, x, y);
+      }
+      ctx.fillStyle = crisp.fill;
+      ctx.shadowColor = crisp.shadow;
+      ctx.shadowBlur = crisp.blur;
+      ctx.fillText(text, x, y);
+      ctx.shadowBlur = 0;
+    }
+
+    /* VFD bloom color presets for gauge sub-text */
+    const VFD_BLOOM_ORANGE = {
+      layers: [
+        { fill: "rgba(180, 80, 0, 0.50)",  shadow: "rgba(255, 100, 0, 0.60)",  blur: 48 },
+        { fill: "rgba(220, 120, 10, 0.70)", shadow: "rgba(255, 130, 10, 0.70)", blur: 28 },
+        { fill: "rgba(240, 160, 30, 0.80)", shadow: "rgba(255, 160, 20, 0.80)", blur: 14 },
+        { fill: "rgba(255, 190, 60, 0.90)", shadow: "rgba(255, 180, 40, 0.90)", blur: 5 },
+      ],
+      crisp: { fill: "#ffaa33", shadow: "rgba(255, 140, 20, 0.60)", blur: 10 },
+    };
+    const VFD_BLOOM_BLUE = {
+      layers: [
+        { fill: "rgba(60, 120, 255, 0.50)",  shadow: "rgba(60, 130, 255, 0.80)",  blur: 52 },
+        { fill: "rgba(80, 140, 255, 0.65)",  shadow: "rgba(80, 150, 255, 0.85)",  blur: 30 },
+        { fill: "rgba(100, 160, 255, 0.75)", shadow: "rgba(100, 170, 255, 0.90)", blur: 16 },
+        { fill: "rgba(140, 190, 255, 0.85)", shadow: "rgba(120, 180, 255, 0.95)", blur: 6 },
+      ],
+      crisp: { fill: "#c8e8ff", shadow: "rgba(80, 160, 255, 0.70)", blur: 12 },
+    };
+
+    /* ══════════════════════════════════════════════════════════════
+     * GAUGE RENDERING — Analogue-style gauge with needle, color arc,
+     * VFD sub-text, and LED odometer badge.
+     * ══════════════════════════════════════════════════════════════ */
+    function drawStyledGauge(canvas, valueRaw, cfg) {
+      if (!canvas) return;
+
+      const width  = canvas.clientWidth  || 360;
+      const height = canvas.clientHeight || 210;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      const minV = Number(cfg.min);
+      const maxV = Number(cfg.max);
+      const spanV = Math.max(1e-9, maxV - minV);
+      const clampVal = (v) => Math.max(minV, Math.min(maxV, Number(v) || 0));
+      const value = clampVal(valueRaw);
+      const displayVal = Math.max(minV, Math.min(199999, Number(valueRaw) || 0));
+
+      const pad = 2;
+      const outerExtent = 1.08;   // tight fit — faint glow may clip, bezel stays
+      const downExtent  = 1.00;   // badge hangs below center — room for LED box
+      // Size the radius so the dial fits snugly inside the canvas
+      const maxRByWidth  = (width  - 2 * pad) / (2.0 * outerExtent);
+      const maxRByHeight = (height - 2 * pad) / (outerExtent + downExtent);
+      const radius = Math.max(20, Math.min(maxRByWidth, maxRByHeight) * 1.08);
+      // Center the full envelope (bezel-top to badge-bottom) in the canvas
+      const cx = width  * 0.5;
+      const cy = (height * 0.5) + ((outerExtent - downExtent) * radius * 0.5);
+
+      const degToRad = (d) => (d * Math.PI) / 180.0;
+      const startDeg = 135;
+      const spanDeg = 270;
+      const startRad = degToRad(startDeg);
+      const endRad = degToRad(startDeg + spanDeg);
+      const valToAngle = (v) => {
+        const t = (clampVal(v) - minV) / spanV;
+        return startRad + (t * (endRad - startRad));
+      };
+
+      // Dial face.
+      const face = ctx.createRadialGradient(cx, cy - radius * 0.5, radius * 0.2, cx, cy, radius * 1.02);
+      face.addColorStop(0.0, "rgba(36, 40, 46, 0.0)");
+      face.addColorStop(0.55, "rgba(22, 25, 30, 0.0)");
+      face.addColorStop(1.0, "rgba(12, 14, 18, 0.0)");
+      ctx.fillStyle = face;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius * 1.02, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Dial ring — colored by threshold zones (red → yellow → green).
+      const arcLW = Math.max(3.5, radius * 0.040);
+      const arcR  = radius * 0.92;
+      // Draw a smooth continuous gradient along the arc
+      const arcSegs = 120;
+      ctx.lineWidth = arcLW;
+      ctx.lineCap = "butt";
+      for (let s = 0; s < arcSegs; s++) {
+        const t0 = s / arcSegs;
+        const t1 = (s + 1) / arcSegs;
+        const tMid = (t0 + t1) * 0.5;
+        const vMid = minV + tMid * spanV;
+        // Interpolate color: red at red_max, yellow at yellow_max, green above
+        const redEnd = (cfg.red_max - minV) / spanV;
+        const yelEnd = (cfg.yellow_max - minV) / spanV;
+        let r, g, b;
+        if (tMid <= redEnd) {
+          // Pure red zone
+          r = 255; g = 58; b = 58;
+        } else if (tMid <= yelEnd) {
+          // Red → Yellow transition
+          const f = (tMid - redEnd) / Math.max(1e-9, yelEnd - redEnd);
+          r = 255; g = Math.round(58 + f * (176 - 58)); b = Math.round(58 - f * (58 - 44));
+        } else {
+          // Yellow → Green transition
+          const f = (tMid - yelEnd) / Math.max(1e-9, 1.0 - yelEnd);
+          r = Math.round(252 - f * (252 - 51)); g = Math.round(176 + f * (219 - 176)); b = Math.round(44 + f * (107 - 44));
+        }
+        const a0 = startRad + t0 * (endRad - startRad);
+        const a1 = startRad + t1 * (endRad - startRad);
+        ctx.strokeStyle = `rgba(${r},${g},${b},0.85)`;
+        ctx.beginPath();
+        ctx.arc(cx, cy, arcR, a0, a1 + 0.005, false);
+        ctx.stroke();
+      }
+
+      // Scale ticks with threshold coloring.
+      const minorStep = Math.max(1e-9, Number(cfg.minor_step));
+      const majorStep = Math.max(minorStep, Number(cfg.major_step));
+      const majorEvery = Math.max(1, Math.round(majorStep / minorStep));
+      const tickOuter = radius * 0.89;
+      const tickMinorInner = radius * 0.825;
+      const tickMajorInner = radius * 0.775;
+      const labelRadius = radius * 0.66 - (cfg.label_inset || 0);
+      const tickCount = Math.max(1, Math.round((maxV - minV) / minorStep));
+      for (let i = 0; i <= tickCount; i++) {
+        const vv = (i >= tickCount) ? maxV : (minV + (i * minorStep));
+        const a = valToAngle(vv);
+        const cosA = Math.cos(a);
+        const sinA = Math.sin(a);
+        const isMajor = ((i % majorEvery) === 0) || i === tickCount;
+        // Skip major tick at end if it doesn't align with a clean major step
+        const isLastAndUnaligned = (i === tickCount) && (Math.abs(vv % majorStep) > 1e-6) && (Math.abs((vv % majorStep) - majorStep) > 1e-6);
+        const drawAsMajor = isMajor && !isLastAndUnaligned;
+        const inner = drawAsMajor ? tickMajorInner : tickMinorInner;
+        let c = "rgba(236, 241, 247, 0.90)";
+        if (drawAsMajor) {
+          if (vv <= cfg.red_max) c = "rgba(255, 58, 58, 0.95)";
+          else if (vv <= cfg.yellow_max) c = "rgba(252, 176, 44, 0.95)";
+          else c = "rgba(51, 219, 107, 0.95)";
+        }
+        ctx.strokeStyle = c;
+        ctx.lineWidth = drawAsMajor ? Math.max(3.0, radius * 0.03) : Math.max(0.9, radius * 0.008);
+        ctx.beginPath();
+        ctx.moveTo(cx + (tickOuter * cosA), cy + (tickOuter * sinA));
+        ctx.lineTo(cx + (inner * cosA), cy + (inner * sinA));
+        ctx.stroke();
+
+        // Value labels at major ticks (infinity symbol on last tick)
+        const labelEvery = cfg.label_every || 1;
+        const majorIdx = Math.round(i / majorEvery);  // which major tick is this (0, 1, 2...)
+        const showLabel = drawAsMajor && (i >= tickCount || (majorIdx % labelEvery) === 0);
+        if (showLabel) {
+          // Push bottom labels outward (closer to ticks) so they don't overlap the LED badge
+          const bottomFactor = Math.max(0, sinA);  // 0 at top, 1 at bottom
+          const inwardOffset = 8 - (bottomFactor * 16);  // 8px inward at top, -8px outward at bottom
+          // Additional radial offset for non-endpoint labels (push toward tick marks)
+          const radialExtra = (cfg.label_radial_offset && i > 0 && i < tickCount) ? cfg.label_radial_offset : 0;
+          let lx = cx + ((labelRadius - inwardOffset - radialExtra) * cosA);
+          let ly = cy + ((labelRadius - inwardOffset - radialExtra) * sinA);
+          // For non-endpoint labels, apply lateral inset toward center (FPS uses label_lateral)
+          const lateralPx = cfg.label_lateral || 0;
+          if (lateralPx && i > 0 && i < tickCount && Math.abs(cosA) > 0.25) {
+            // Shift label horizontally toward cx (skip near-top-center labels)
+            lx += (lx < cx) ? lateralPx : -lateralPx;
+          }
+          ctx.fillStyle = "rgba(230, 235, 242, 0.82)";
+          ctx.textBaseline = "middle";
+          // Outward-justify: left-align on left side, right-align on right side
+          const normA = ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+          if (Math.abs(cosA) < 0.15) ctx.textAlign = "center";
+          else if (normA > Math.PI * 0.5 && normA < Math.PI * 1.5) ctx.textAlign = "right";
+          else ctx.textAlign = "left";
+          if (i >= tickCount) {
+            ctx.font = `${Math.max(12, Math.round(radius * 0.196))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+            ctx.fillText("\u221E", lx, ly);
+          } else {
+            const labelFontScale = cfg.label_font_scale || 0.11;
+            ctx.font = `${Math.max(8, Math.round(radius * labelFontScale))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+            let labelStr;
+            if (vv >= 1000) {
+              labelStr = `${Math.round(vv / 1000)}K`;
+            } else {
+              labelStr = `${Math.round(vv)}`;
+            }
+            ctx.fillText(labelStr, lx, ly);
+          }
+        }
+      }
+
+      // Needle geometry for classic pointy orange pointer.
+      const needleAngle = valToAngle(value);
+      const nCos = Math.cos(needleAngle);
+      const nSin = Math.sin(needleAngle);
+      const needleLen = radius * 0.84;
+      const tailLen = radius * 0.10;
+      const baseHalfW = Math.max(4.0, radius * 0.030);
+      const pTipX = cx + (needleLen * nCos);
+      const pTipY = cy + (needleLen * nSin);
+      const pTailX = cx - (tailLen * nCos);
+      const pTailY = cy - (tailLen * nSin);
+      const perpX = -nSin;
+      const perpY = nCos;
+
+      const drawNeedle = () => {
+        // Drop shadow
+        ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
+        ctx.beginPath();
+        ctx.moveTo(pTipX + 2.5, pTipY + 2.5);
+        ctx.lineTo(pTailX + (perpX * baseHalfW) + 2.5, pTailY + (perpY * baseHalfW) + 2.5);
+        ctx.lineTo(pTailX - (perpX * baseHalfW) + 2.5, pTailY - (perpY * baseHalfW) + 2.5);
+        ctx.closePath();
+        ctx.fill();
+
+        // Multi-layer yellow-orange bloom glow (like VFD but warm)
+        const glowLayers = [
+          { blur: 64, color: "rgba(255, 140, 10, 0.70)", fill: "rgba(255, 120, 10, 0.06)" },
+          { blur: 38, color: "rgba(255, 160, 20, 0.80)", fill: "rgba(255, 130, 10, 0.10)" },
+          { blur: 18, color: "rgba(255, 170, 40, 0.90)", fill: "rgba(255, 140, 20, 0.14)" },
+          { blur:  7, color: "rgba(255, 190, 60, 1.00)", fill: "rgba(255, 160, 30, 0.18)" },
+        ];
+        const needlePath = () => {
+          ctx.beginPath();
+          ctx.moveTo(pTipX, pTipY);
+          ctx.lineTo(pTailX + (perpX * baseHalfW), pTailY + (perpY * baseHalfW));
+          ctx.lineTo(pTailX - (perpX * baseHalfW), pTailY - (perpY * baseHalfW));
+          ctx.closePath();
+        };
+        ctx.save();
+        for (const gl of glowLayers) {
+          ctx.shadowColor = gl.color;
+          ctx.shadowBlur = gl.blur;
+          ctx.shadowOffsetX = 0;
+          ctx.shadowOffsetY = 0;
+          ctx.fillStyle = gl.fill;
+          needlePath();
+          ctx.fill();
+        }
+        ctx.restore();
+
+        // Crisp needle fill
+        const needleGrad = ctx.createLinearGradient(pTailX, pTailY, pTipX, pTipY);
+        needleGrad.addColorStop(0.0, "#c85a00");
+        needleGrad.addColorStop(0.6, "#ff8a00");
+        needleGrad.addColorStop(1.0, "#ffc04d");
+        ctx.fillStyle = needleGrad;
+        needlePath();
+        ctx.fill();
+      };
+      const drawHub = () => {
+        const hubOuter = ctx.createRadialGradient(cx - 2, cy - 2, 2, cx, cy, radius * 0.16);
+        hubOuter.addColorStop(0.0, "rgba(167, 174, 180, 0.98)");
+        hubOuter.addColorStop(1.0, "rgba(38, 44, 51, 0.98)");
+        ctx.fillStyle = hubOuter;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.16, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = "rgba(8, 12, 17, 0.96)";
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.09, 0, Math.PI * 2);
+        ctx.fill();
+      };
+
+      // Center title (matching reference style).
+      ctx.fillStyle = "rgba(232, 236, 241, 0.85)";
+      ctx.font = `700 ${Math.max(13, Math.round(radius * 0.16))}px 'Avenir Next', 'Segoe UI', sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(cfg.title || "", cx, cy - radius * 0.36);
+
+      // Bottom value badge.
+      const badgeW = radius * 1.0;
+      const badgeH = radius * 0.48;
+      const badgeX = cx - (badgeW * 0.5);
+      const badgeY = cy + radius * 0.44;
+
+      // Sub-text above the badge (e.g. total training steps) — VFD odometer display
+      if (cfg.sub_text) {
+        const subFont = `400 ${Math.max(10, Math.round(radius * 0.125))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+        ctx.font = subFont;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        // Fixed width: measure max-width template so box never resizes
+        const maxTemplate = "8,888,888,888";
+        const tmMax = ctx.measureText(maxTemplate);
+        const odoPad = radius * 0.05;
+        const odoW = tmMax.width + odoPad * 2;
+        const odoH = Math.max(14, Math.round(radius * 0.16));
+        const odoX = cx - odoW * 0.5;
+        const odoY = badgeY - odoH - 3;
+        const odoR = Math.max(3, radius * 0.035);
+        const subX = odoX + odoW - odoPad;  // right-justified with padding
+        // VFD housing background — color keyed to gauge type
+        ctx.save();
+        ctx.shadowBlur = 0;
+        const odoColor = cfg.sub_text_color || "amber";
+        roundRectPath(ctx, odoX, odoY, odoW, odoH, odoR);
+        ctx.fillStyle = "#130A2C";  // uniform dark VFD housing
+        ctx.fill();
+        // Subtle inset border matching text color
+        ctx.strokeStyle = odoColor === "orange"
+          ? "rgba(180, 100, 20, 0.35)"
+          : "rgba(60, 130, 255, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+        // Text centered in the VFD box
+        const subTextY = odoY + odoH * 0.5;
+        const bloom = (odoColor === "orange") ? VFD_BLOOM_ORANGE : VFD_BLOOM_BLUE;
+        drawBloomText(ctx, cfg.sub_text, subX, subTextY, bloom.layers, bloom.crisp);
+      }
+
+      const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
+      badgeFill.addColorStop(0.0, "rgba(44, 10, 12, 0.95)");
+      badgeFill.addColorStop(1.0, "rgba(30, 6, 8, 0.98)");
+      roundRectPath(ctx, badgeX, badgeY, badgeW, badgeH, Math.max(8, radius * 0.08));
+      ctx.fillStyle = badgeFill;
+      ctx.fill();
+
+      const valueText = Number(displayVal).toFixed(cfg.decimals ?? 1);
+      const ledX = cx;
+      const ledY = badgeY + (badgeH * 0.5);
+      const ledScale = valueText.length > 5 ? 0.282 : 0.338;
+      const ledFont = `400 ${Math.max(13, Math.round(radius * ledScale))}px 'DS-Digital', 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+      ctx.font = ledFont;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      // Multi-layer LED bloom (widest/faintest first)
+      ctx.fillStyle = "rgba(255, 20, 20, 0.45)";
+      ctx.shadowColor = "rgba(255, 30, 30, 0.80)";
+      ctx.shadowBlur = Math.max(48, radius * 0.55);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 30, 30, 0.55)";
+      ctx.shadowColor = "rgba(255, 40, 40, 0.85)";
+      ctx.shadowBlur = Math.max(28, radius * 0.35);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 40, 40, 0.65)";
+      ctx.shadowColor = "rgba(255, 50, 50, 0.90)";
+      ctx.shadowBlur = Math.max(14, radius * 0.18);
+      ctx.fillText(valueText, ledX, ledY);
+      ctx.fillStyle = "rgba(255, 50, 50, 0.80)";
+      ctx.shadowColor = "rgba(255, 60, 60, 0.95)";
+      ctx.shadowBlur = Math.max(5, radius * 0.08);
+      ctx.fillText(valueText, ledX, ledY);
+      // Bright LED text on top
+      ctx.fillStyle = "rgba(255, 52, 52, 0.98)";
+      ctx.shadowBlur = 0;
+      ctx.fillText(valueText, ledX, ledY);
+      drawNeedle();
+      drawHub();
+    }
+
+    function drawFpsGauge(canvas, fps, totalFrames) {
+      const framesText = totalFrames != null ? Number(totalFrames).toLocaleString() : null;
+      drawStyledGauge(canvas, fps, {
+        min: GAUGE_MIN_FPS,
+        max: GAUGE_MAX_FPS,
+        red_max: GAUGE_FPS_RED_MAX,
+        yellow_max: GAUGE_FPS_YELLOW_MAX,
+        minor_step: 1000,
+        major_step: 3000,
+        title: "FPS",
+        unit: "FPS",
+        decimals: 0,
+        label_inset: 4,
+        label_lateral: 8,
+        label_font_scale: 0.088,
+        label_every: 1,
+        label_radial_offset: -16,
+        sub_text: framesText,
+        sub_text_color: "blue",
+      });
+    }
+
+    function drawStepGauge(canvas, stepsPerSec, totalSteps) {
+      const stepsText = totalSteps != null ? Number(totalSteps).toLocaleString() : null;
+      drawStyledGauge(canvas, stepsPerSec, {
+        min: GAUGE_MIN_STEPS,
+        max: GAUGE_MAX_STEPS,
+        red_max: 20,
+        yellow_max: 40,
+        minor_step: 5,
+        major_step: 10,
+        title: "STEPS/s",
+        unit: "S/S",
+        decimals: 0,
+        label_font_scale: 0.088,
+        label_radial_offset: -4,
+        sub_text: stepsText,
+        sub_text_color: "orange",
+      });
+    }
+
+    /* ═══════════════ Median-of-N filter (spike rejection) ════════════ */
+    // Returns the median of up to `w` values centered on index `i`.
+    // `valueFn(j)` should return Number or NaN for index j.
+    function medianNeighbors(i, n, w, valueFn) {
+      const half = (w - 1) >> 1;
+      const lo = Math.max(0, i - half);
+      const hi = Math.min(n - 1, i + half);
+      const vals = [];
+      for (let j = lo; j <= hi; j++) {
+        const v = valueFn(j);
+        if (Number.isFinite(v)) vals.push(v);
+      }
+      if (!vals.length) return NaN;
+      vals.sort((a, b) => a - b);
+      const mid = vals.length >> 1;
+      return (vals.length & 1) ? vals[mid] : (vals[mid - 1] + vals[mid]) * 0.5;
+    }
+
+    /* ═══════════════ Nice-tick interval (1-2-5 sequence) ═══════════════ */
+    function niceInterval(range, targetTicks) {
+      if (!Number.isFinite(range) || range <= 0) return 1;
+      const rawStep = range / Math.max(1, targetTicks);
+      const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const residual = rawStep / mag;
+      let nice;
+      if (residual < 1.5) nice = 1;
+      else if (residual < 3) nice = 2;
+      else if (residual < 7) nice = 5;
+      else nice = 10;
+      return nice * mag;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * CHART RENDERING — Time-series line charts with gradient fill,
+     * smoothing, grid, axes, and auto-scaled Y range.
+     * ══════════════════════════════════════════════════════════════ */
+    function drawChart(canvas, history, seriesDefs, maxLookbackSec = (5 * 60), useLinearTime = false) {
+      const points = Array.isArray(history) ? history : [];
+      const width = canvas.clientWidth || 320;
+      const height = canvas.clientHeight || 210;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      if (!points.length) return;
+
+      const axisDefs = seriesDefs.filter((s) => !!s.axis);
+      const axisSourceSeries = axisDefs.length ? axisDefs : seriesDefs;
+      const axisSlotDefault = 34;
+      const axisSlotFor = (s) => {
+        const v = Number(s?.axis?.label_pad);
+        return Number.isFinite(v) ? Math.max(20, v) : axisSlotDefault;
+      };
+      const leftAxisSeries = axisSourceSeries.filter((s) => (s.axis?.side || "left") === "left");
+      const rightAxisSeries = axisSourceSeries.filter((s) => (s.axis?.side || "right") === "right");
+      const leftAxisPad = leftAxisSeries.length
+        ? leftAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
+        : axisSlotDefault;
+      const rightAxisPad = rightAxisSeries.length
+        ? rightAxisSeries.reduce((sum, s) => sum + axisSlotFor(s), 0)
+        : 0;
+      const padL = 26 + leftAxisPad;
+      const padR = rightAxisSeries.length ? (26 + rightAxisPad) : 12;
+      const padT = 14, padB = 30;
+      const plotW = width - padL - padR;
+      const plotH = height - padT - padB;
+      if (plotW <= 20 || plotH <= 20) return;
+
+      // Time-compressed x-axis with quarter anchors.
+      // Window spans min(20m, actual buffered time), so during first 20m
+      // nothing scrolls off the left edge.
+      const tsVals = points
+        .map((p) => Number(p.ts))
+        .filter((v) => Number.isFinite(v));
+      const hasTimeAxis = tsVals.length >= 2;
+      const newestTs = hasTimeAxis ? Math.max(...tsVals) : 0.0;
+      const oldestTs = hasTimeAxis ? Math.min(...tsVals) : 0.0;
+      const maxAge = hasTimeAxis ? Math.max(1e-6, newestTs - oldestTs) : 0.0;
+      const AXIS_HARD_MAX_LOOKBACK_S = Math.max(1, Number(maxLookbackSec) || (5 * 60));
+      const axisMaxLookbackSec = hasTimeAxis
+        ? Math.min(AXIS_HARD_MAX_LOOKBACK_S, maxAge)
+        : AXIS_HARD_MAX_LOOKBACK_S;
+      const anchorScale = axisMaxLookbackSec / AXIS_HARD_MAX_LOOKBACK_S;
+      const LOOKBACK_FRAC_ANCHORS = [0.0, 0.25, 0.50, 0.75, 1.0];
+      const LOOKBACK_AGE_ANCHORS = [
+        0.0,
+        10.0 * anchorScale,
+        60.0 * anchorScale,
+        600.0 * anchorScale,
+        axisMaxLookbackSec,
+      ];
+      // Shape-preserving monotone cubic interpolation (continuous slope)
+      // so compression changes smoothly instead of with visible segment kinks.
+      const makeMonotoneSpline = (xsRaw, ysRaw) => {
+        const n = Math.min(xsRaw.length, ysRaw.length);
+        if (n < 2) {
+          const y0 = Number(ysRaw?.[0]) || 0.0;
+          return () => y0;
+        }
+        const xs = xsRaw.slice(0, n).map((v) => Number(v));
+        const ys = ysRaw.slice(0, n).map((v) => Number(v));
+        const h = new Array(n - 1);
+        const d = new Array(n - 1);
+        for (let i = 0; i < n - 1; i++) {
+          const dx = Math.max(1e-9, xs[i + 1] - xs[i]);
+          h[i] = dx;
+          d[i] = (ys[i + 1] - ys[i]) / dx;
+        }
+        const m = new Array(n);
+        m[0] = d[0];
+        m[n - 1] = d[n - 2];
+        for (let i = 1; i < n - 1; i++) {
+          m[i] = 0.5 * (d[i - 1] + d[i]);
+        }
+        for (let i = 0; i < n - 1; i++) {
+          if (Math.abs(d[i]) <= 1e-12) {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+            continue;
+          }
+          const a = m[i] / d[i];
+          const b = m[i + 1] / d[i];
+          const s = (a * a) + (b * b);
+          if (s > 9.0) {
+            const t = 3.0 / Math.sqrt(s);
+            m[i] = t * a * d[i];
+            m[i + 1] = t * b * d[i];
+          }
+        }
+        return (xRaw) => {
+          const x = Math.max(xs[0], Math.min(xs[n - 1], Number(xRaw) || 0.0));
+          let k = n - 2;
+          for (let i = 0; i < n - 1; i++) {
+            if (x <= xs[i + 1]) {
+              k = i;
+              break;
+            }
+          }
+          const hk = h[k];
+          const t = (x - xs[k]) / hk;
+          const t2 = t * t;
+          const t3 = t2 * t;
+          const h00 = (2.0 * t3) - (3.0 * t2) + 1.0;
+          const h10 = t3 - (2.0 * t2) + t;
+          const h01 = (-2.0 * t3) + (3.0 * t2);
+          const h11 = t3 - t2;
+          return (h00 * ys[k]) + (h10 * hk * m[k]) + (h01 * ys[k + 1]) + (h11 * hk * m[k + 1]);
+        };
+      };
+      const ageFromLookbackFrac = makeMonotoneSpline(LOOKBACK_FRAC_ANCHORS, LOOKBACK_AGE_ANCHORS);
+      const lookbackFracFromAge = makeMonotoneSpline(LOOKBACK_AGE_ANCHORS, LOOKBACK_FRAC_ANCHORS);
+
+      const xNormFromAge = (ageRaw) => {
+        if (!hasTimeAxis || maxAge <= 0) return 1.0;
+        const age = Math.max(0.0, Math.min(axisMaxLookbackSec, ageRaw));
+        const lookbackFrac = useLinearTime
+          ? (age / Math.max(1e-9, axisMaxLookbackSec))
+          : lookbackFracFromAge(age);
+        return 1.0 - lookbackFrac;
+      };
+
+      const ageFromXNorm = (xNormRaw) => {
+        const xn = Math.max(0.0, Math.min(1.0, xNormRaw));
+        const lookbackFrac = 1.0 - xn;
+        return useLinearTime
+          ? (lookbackFrac * axisMaxLookbackSec)
+          : ageFromLookbackFrac(lookbackFrac);
+      };
+
+      const formatLookback = (ageSecRaw) => {
+        const ageSec = Math.max(0.0, Number(ageSecRaw) || 0.0);
+        if (ageSec < 90.0) {
+          return `${Math.round(ageSec)}s`;
+        }
+        const mins = ageSec / 60.0;
+        if (mins < 90.0) {
+          return `${Math.round(mins)}m`;
+        }
+        const hours = mins / 60.0;
+        if (hours < 48.0) {
+          return `${hours < 10.0 ? hours.toFixed(1) : Math.round(hours)}h`;
+        }
+        const days = hours / 24.0;
+        return `${days < 10.0 ? days.toFixed(1) : Math.round(days)}d`;
+      };
+
+      const xAt = (i) => {
+        if (!hasTimeAxis) {
+          const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+          return padL + (t * plotW);
+        }
+        const ts = Number(points[i].ts);
+        const age = Number.isFinite(ts) ? (newestTs - ts) : maxAge;
+        const xn = xNormFromAge(age);
+        return padL + (xn * plotW);
+      };
+
+      const seriesByKey = new Map(seriesDefs.map((s) => [s.key, s]));
+      const seriesValue = (row, key) => {
+        const spec = seriesByKey.get(key);
+        const raw = row[key];
+        const val = spec && spec.map ? spec.map(raw) : raw;
+        return Number(val);
+      };
+
+      const axes = [];
+      let leftAxisOffset = 0;
+      let rightAxisOffset = 0;
+      for (const s of axisSourceSeries) {
+        const side = s.axis?.side === "right" ? "right" : "left";
+        const axisSlot = axisSlotFor(s);
+        const sourceKeys = Array.isArray(s.axis?.group_keys) && s.axis.group_keys.length
+          ? s.axis.group_keys
+          : [s.key];
+        const values = [];
+        for (const row of points) {
+          for (const key of sourceKeys) {
+            const val = seriesValue(row, key);
+            if (Number.isFinite(val)) {
+              values.push(val);
+            }
+          }
+        }
+
+        const hasFixedMin = Number.isFinite(s.axis?.min);
+        const hasFixedMax = Number.isFinite(s.axis?.max);
+        let minV = hasFixedMin ? Number(s.axis.min) : (values.length ? Math.min(...values) : 0.0);
+        let maxV = hasFixedMax ? Number(s.axis.max) : (values.length ? Math.max(...values) : 1.0);
+        const minFloor = Number(s.axis?.min_floor);
+        const maxFloor = Number(s.axis?.max_floor);
+        if (!hasFixedMin && Number.isFinite(minFloor)) {
+          minV = Math.min(minV, minFloor);
+        }
+        if (!hasFixedMax && Number.isFinite(maxFloor)) {
+          maxV = Math.max(maxV, maxFloor);
+        }
+        // Snap max to a fixed multiple (e.g. multiples of 25)
+        const maxSnap = Number(s.axis?.max_snap);
+        if (!hasFixedMax && Number.isFinite(maxSnap) && maxSnap > 0) {
+          maxV = Math.ceil(maxV / maxSnap) * maxSnap;
+        }
+        if (maxV < minV) maxV = minV + 1.0;
+        if (minV === maxV) {
+          if (hasFixedMin && !hasFixedMax) maxV = minV + 1.0;
+          else if (!hasFixedMin && hasFixedMax) minV = maxV - 1.0;
+          else { minV -= 1.0; maxV += 1.0; }
+        }
+        // Nice-tick autoscaling: snap axis bounds to clean 1-2-5 intervals
+        const targetTicks = Number.isFinite(s.axis?.target_ticks) ? Math.max(2, s.axis.target_ticks) : 4;
+        const niceStep = niceInterval(maxV - minV, targetTicks);
+        if (!hasFixedMin) minV = Math.floor(minV / niceStep) * niceStep;
+        if (!hasFixedMax) maxV = Math.ceil(maxV / niceStep) * niceStep;
+        if (maxV <= minV) maxV = minV + niceStep;
+
+        const axisX = side === "left"
+          ? (padL - 20 - leftAxisOffset)
+          : (width - padR + 20 + rightAxisOffset);
+        if (side === "left") {
+          leftAxisOffset += axisSlot;
+        } else {
+          rightAxisOffset += axisSlot;
+        }
+        let ticks;
+        if (Array.isArray(s.axis?.ticks) && s.axis.ticks.length) {
+          ticks = s.axis.ticks;
+        } else {
+          // If the nice step produces too many ticks, coarsen until it fits
+          let step = niceStep;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            ticks = [];
+            for (let t = minV; t <= maxV + step * 0.001; t += step) {
+              ticks.push(t);
+            }
+            if (ticks.length <= targetTicks + 1) break;
+            step = niceInterval(maxV - minV, Math.max(2, Math.floor(targetTicks * 0.6)));
+            if (!hasFixedMin) minV = Math.floor(minV / step) * step;
+            if (!hasFixedMax) maxV = Math.ceil(maxV / step) * step;
+            if (maxV <= minV) maxV = minV + step;
+          }
+          if (!ticks.length) ticks = [minV, maxV];
+        }
+
+        axes.push({
+          key: s.key,
+          side,
+          x: axisX,
+          color: s.color,
+          min: minV,
+          max: maxV,
+          ticks,
+          tickDecimals: Number.isFinite(s.axis?.tick_decimals)
+            ? Math.max(0, Number(s.axis.tick_decimals))
+            : Math.max(0, -Math.floor(Math.log10(ticks.length > 1 ? (ticks[1] - ticks[0]) : niceStep))),
+        });
+      }
+      if (!axes.length) return;
+
+      const axisByKey = new Map(axes.map((a) => [a.key, a]));
+
+      // Build map of extra series colors sharing each axis (via axis_ref)
+      const axisExtraColors = new Map();
+      for (const s of seriesDefs) {
+        if (s.axis_ref) {
+          const colors = axisExtraColors.get(s.axis_ref) || [];
+          colors.push(s.color);
+          axisExtraColors.set(s.axis_ref, colors);
+        }
+      }
+
+      const yAt = (axis, value) => {
+        const t = (value - axis.min) / (axis.max - axis.min);
+        return padT + (1.0 - t) * plotH;
+      };
+
+      ctx.lineWidth = 1.0;
+      ctx.strokeStyle = "rgba(148,163,184,0.18)";
+      // Denser grid: 4x the prior vertical density, then mirror that pixel step
+      // on X so the plot reads as a true grid.
+      const gridRows = 12; // was effectively 3 intervals
+      const gridStep = plotH / gridRows;
+      for (let i = 0; i <= gridRows; i++) {
+        const y = padT + (gridStep * i);
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(width - padR, y);
+        ctx.stroke();
+      }
+      for (let x = padL + gridStep; x < (width - padR - 0.5); x += gridStep) {
+        ctx.beginPath();
+        ctx.moveTo(x, padT);
+        ctx.lineTo(x, height - padB);
+        ctx.stroke();
+      }
+
+      // Colored vertical axes with matching tick marks.
+      ctx.font = "11px 'Avenir Next', 'Segoe UI', sans-serif";
+      ctx.textBaseline = "middle";
+      for (const axis of axes) {
+        const isLeft = axis.side === "left";
+        const tickDir = isLeft ? 1 : -1;
+
+        // Draw extra color indicator lines for series sharing this axis
+        const extraColors = axisExtraColors.get(axis.key) || [];
+        for (let ec = extraColors.length - 1; ec >= 0; ec--) {
+          const offset = ((ec + 1) * 2 + 2) * (isLeft ? -1 : 1);
+          ctx.strokeStyle = extraColors[ec];
+          ctx.globalAlpha = 0.65;
+          ctx.lineWidth = 2.0;
+          ctx.beginPath();
+          ctx.moveTo(axis.x + offset, padT);
+          ctx.lineTo(axis.x + offset, height - padB);
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+        }
+
+        // Main axis line with tick marks
+        ctx.strokeStyle = axis.color;
+        ctx.globalAlpha = 0.65;
+        ctx.lineWidth = 2.0;
+        ctx.beginPath();
+        ctx.moveTo(axis.x, padT);
+        ctx.lineTo(axis.x, height - padB);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+
+        for (const tv of axis.ticks) {
+          if (!Number.isFinite(tv)) continue;
+          const y = yAt(axis, Number(tv));
+          if (!Number.isFinite(y)) continue;
+          if (y < (padT - 3) || y > (height - padB + 3)) continue;
+
+          // "Cool" tick: bright short tick plus a faint glow extension.
+          ctx.strokeStyle = axis.color;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          ctx.moveTo(axis.x, y);
+          ctx.lineTo(axis.x + tickDir * 8, y);
+          ctx.stroke();
+
+          ctx.globalAlpha = 0.35;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(axis.x + tickDir * 8, y);
+          ctx.lineTo(axis.x + tickDir * 14, y);
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+
+          const labelText = Number.isFinite(axis.tickDecimals)
+            ? Number(tv).toFixed(axis.tickDecimals)
+            : (Math.abs(tv) >= 100 ? `${Math.round(tv)}` : `${Number(tv).toFixed(0)}`);
+          ctx.fillStyle = axis.color;
+          ctx.textAlign = isLeft ? "right" : "left";
+          ctx.fillText(labelText, axis.x - tickDir * 12, y);
+        }
+
+      }
+
+      // Horizontal lookback axis (0 = now at right, 1 = oldest at left).
+      const xAxisColor = axes[0]?.color || "#22c55e";
+      const xAxisY = height - 18;
+      const xTickDefs = [
+        { frac: 0.0 },
+        { frac: 0.25 },
+        { frac: 0.5 },
+        { frac: 0.75 },
+        { frac: 1.0 },
+      ];
+      ctx.strokeStyle = xAxisColor;
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(padL, xAxisY);
+      ctx.lineTo(width - padR, xAxisY);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      ctx.font = "11px 'Avenir Next', 'Segoe UI', sans-serif";
+      ctx.textBaseline = "top";
+      for (const tk of xTickDefs) {
+        const frac = Math.max(0.0, Math.min(1.0, Number(tk.frac)));
+        const xNorm = 1.0 - frac;
+        const x = padL + (xNorm * plotW);
+        const labelText = hasTimeAxis
+          ? formatLookback(ageFromXNorm(xNorm))
+          : (frac === 0.0 ? "0s" : "n/a");
+
+        // Bright tick plus faint extension, matching vertical style.
+        ctx.strokeStyle = xAxisColor;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(x, xAxisY);
+        ctx.lineTo(x, xAxisY - 8);
+        ctx.stroke();
+
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x, xAxisY - 8);
+        ctx.lineTo(x, xAxisY - 14);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+
+        ctx.fillStyle = xAxisColor;
+        if (frac <= 1e-9) {
+          ctx.textAlign = "right";
+        } else if (frac >= (1.0 - 1e-9)) {
+          ctx.textAlign = "left";
+        } else {
+          ctx.textAlign = "center";
+        }
+        ctx.fillText(labelText, x, xAxisY + 2);
+      }
+
+      const n = points.length;
+      for (let si = 0; si < seriesDefs.length; si++) {
+        const s = seriesDefs[si];
+        const yOff = si;  // 1px vertical offset per series so overlapping lines stay visible
+        const axis = s.axis_ref
+          ? axisByKey.get(s.axis_ref)
+          : (axisByKey.get(s.key) || axes[0]);
+        if (!axis) continue;
+        const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : CHART_VALUE_SMOOTH_ALPHA;
+        const mw = Number.isFinite(s.median_window) ? s.median_window : 0;
+        const readVal = mw >= 3
+          ? (i) => medianNeighbors(i, n, mw, (j) => seriesValue(points[j], s.key))
+          : (i) => seriesValue(points[i], s.key);
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 2.0;
+        ctx.beginPath();
+        let started = false;
+        let smoothVal = null;
+        if (s.pixel_bin_avg) {
+          const bins = new Map();
+          for (let i = n - 1; i >= 0; i--) {
+            const val = readVal(i);
+            if (!Number.isFinite(val)) continue;
+            const x = xAt(i);
+            const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
+            const b = bins.get(xPx);
+            if (b) {
+              b.sum += Number(val);
+              b.count += 1;
+            } else {
+              bins.set(xPx, { sum: Number(val), count: 1 });
+            }
+          }
+          const xKeys = Array.from(bins.keys()).sort((a, b) => b - a);
+          for (const xPx of xKeys) {
+            const b = bins.get(xPx);
+            if (!b || b.count <= 0) continue;
+            const vAvg = b.sum / b.count;
+            smoothVal = (smoothVal === null)
+              ? vAvg
+              : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
+            const y = yAt(axis, smoothVal) + yOff;
+            if (!started) {
+              ctx.moveTo(xPx, y);
+              started = true;
+            } else {
+              ctx.lineTo(xPx, y);
+            }
+          }
+        } else {
+          for (let i = n - 1; i >= 0; i--) {
+            const val = readVal(i);
+            if (!Number.isFinite(val)) continue;
+            smoothVal = (smoothVal === null)
+              ? Number(val)
+              : (smoothVal + ((Number(val) - smoothVal) * smoothAlpha));
+            const x = xAt(i);
+            const y = yAt(axis, smoothVal) + yOff;
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else {
+              ctx.lineTo(x, y);
+            }
+          }
+        }
+        ctx.stroke();
+      }
+    }
+
+    /* ── Mini chart (sparkline) for inline card display ─────────── */
+    function drawMiniChart(canvas, history, seriesDefs, fillBetween) {
+      if (!canvas) return;
+      const points = history.slice(-240);
+      const width = canvas.clientWidth || 120;
+      const height = canvas.clientHeight || 104;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      if (!points.length) return;
+
+      const axisPad = 30;
+      const padL = axisPad;
+      const padR = 4;
+      const isHalf = canvas.closest && canvas.closest('.card-half');
+      const padTop = isHalf ? 1 : 6;
+      const padBot = isHalf ? 3 : 6;
+      const plotW = width - padL - padR;
+      const plotH = height - padTop - padBot;
+      if (plotW <= 4 || plotH <= 4) return;
+
+      const values = [];
+      for (const row of points) {
+        for (const s of seriesDefs) {
+          const v = Number(row[s.key]);
+          if (Number.isFinite(v)) {
+            values.push(v);
+          }
+        }
+      }
+      if (!values.length) return;
+
+      const hasFixedMin = Number.isFinite(seriesDefs?.[0]?.axis?.min);
+      const hasFixedMax = Number.isFinite(seriesDefs?.[0]?.axis?.max);
+      const minRange = Number.isFinite(seriesDefs?.[0]?.axis?.min_range)
+        ? Number(seriesDefs[0].axis.min_range) : 0;
+      let minV = hasFixedMin ? Number(seriesDefs[0].axis.min) : Math.min(...values);
+      let maxV = hasFixedMax ? Number(seriesDefs[0].axis.max) : Math.max(...values);
+      if (maxV <= minV) maxV = minV + 1.0;
+      // Nice-tick autoscaling for mini charts
+      const miniTargetTicks = Number.isFinite(seriesDefs?.[0]?.axis?.target_ticks)
+        ? Math.max(2, seriesDefs[0].axis.target_ticks) : 2;
+      const miniNiceStep = niceInterval(maxV - minV, miniTargetTicks);
+      if (!hasFixedMin) minV = Math.floor(minV / miniNiceStep) * miniNiceStep;
+      if (!hasFixedMax) maxV = Math.ceil(maxV / miniNiceStep) * miniNiceStep;
+      if (maxV <= minV) maxV = minV + miniNiceStep;
+      // Enforce minimum visible range (expand around midpoint, respecting fixed bounds)
+      if (minRange > 0 && (maxV - minV) < minRange) {
+        const mid = (minV + maxV) * 0.5;
+        minV = mid - minRange * 0.5;
+        maxV = mid + minRange * 0.5;
+        if (hasFixedMin && minV < Number(seriesDefs[0].axis.min)) {
+          minV = Number(seriesDefs[0].axis.min);
+          maxV = minV + minRange;
+        }
+        if (hasFixedMax && maxV > Number(seriesDefs[0].axis.max)) {
+          maxV = Number(seriesDefs[0].axis.max);
+          minV = maxV - minRange;
+        }
+      }
+
+      // Logarithmic time-compressed x-axis (same anchors as big charts)
+      const tsVals = points.map(p => Number(p.ts)).filter(v => Number.isFinite(v));
+      const hasTs = tsVals.length >= 2;
+      const newestTs = hasTs ? Math.max(...tsVals) : 0;
+      const oldestTs = hasTs ? Math.min(...tsVals) : 0;
+      const maxAge = hasTs ? Math.max(1e-6, newestTs - oldestTs) : 0;
+      const HARD_MAX = 60 * 60;
+      const axisMax = hasTs ? Math.min(HARD_MAX, maxAge) : HARD_MAX;
+      const sc = axisMax / HARD_MAX;
+      const FRAC_A = [0, 0.25, 0.50, 0.75, 1.0];
+      const AGE_A = [0, 10 * sc, 60 * sc, 600 * sc, axisMax];
+      const buildSpline = (xs, ys) => {
+        const n2 = xs.length;
+        if (n2 < 2) return () => ys[0] || 0;
+        const h2 = [], d2 = [];
+        for (let j = 0; j < n2 - 1; j++) {
+          h2[j] = Math.max(1e-9, xs[j+1] - xs[j]);
+          d2[j] = (ys[j+1] - ys[j]) / h2[j];
+        }
+        const m2 = [d2[0]];
+        for (let j = 1; j < n2 - 1; j++) m2[j] = 0.5 * (d2[j-1] + d2[j]);
+        m2[n2-1] = d2[n2-2];
+        for (let j = 0; j < n2 - 1; j++) {
+          if (Math.abs(d2[j]) <= 1e-12) { m2[j] = 0; m2[j+1] = 0; continue; }
+          const aa = m2[j]/d2[j], bb = m2[j+1]/d2[j];
+          const ss = aa*aa + bb*bb;
+          if (ss > 9) { const tt = 3/Math.sqrt(ss); m2[j]=tt*aa*d2[j]; m2[j+1]=tt*bb*d2[j]; }
+        }
+        return (xr) => {
+          const x2 = Math.max(xs[0], Math.min(xs[n2-1], xr));
+          let k2 = n2 - 2;
+          for (let j = 0; j < n2 - 1; j++) { if (x2 <= xs[j+1]) { k2 = j; break; } }
+          const hk = h2[k2], t2 = (x2 - xs[k2]) / hk;
+          const t22 = t2*t2, t23 = t22*t2;
+          return ((2*t23 - 3*t22 + 1)*ys[k2]) + ((t23 - 2*t22 + t2)*hk*m2[k2])
+               + ((-2*t23 + 3*t22)*ys[k2+1]) + ((t23 - t22)*hk*m2[k2+1]);
+        };
+      };
+      const fracFromAge = buildSpline(AGE_A, FRAC_A);
+      const xAtLog = (i) => {
+        if (!hasTs) {
+          const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+          return padL + (t * plotW);
+        }
+        const ts = Number(points[i].ts);
+        if (!Number.isFinite(ts)) return padL;
+        const age = Math.max(0, Math.min(axisMax, newestTs - ts));
+        const frac = fracFromAge(age);
+        return padL + ((1.0 - frac) * plotW);
+      };
+      const xAtLinear = (i) => {
+        const t = points.length <= 1 ? 1.0 : (i / (points.length - 1));
+        return padL + (t * plotW);
+      };
+      const xAt = xAtLog;
+      const yAt = (v) => {
+        const t = (v - minV) / (maxV - minV);
+        return padTop + ((1.0 - t) * plotH);
+      };
+
+      const fmtTick = (v) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return "";
+        const a = Math.abs(n);
+        if (a >= 100) return `${Math.round(n)}`;
+        if (a >= 10) return `${n.toFixed(1)}`;
+        if (a >= 1) return `${n.toFixed(2)}`;
+        return `${n.toFixed(3)}`;
+      };
+
+      const axisColor = seriesDefs?.[seriesDefs.length - 1]?.color || "#22c55e";
+      const axisX = padL - 1;
+      // Generate ticks from the nice step so target_ticks controls density
+      const yTicks = [];
+      for (let tv = minV; tv <= maxV + miniNiceStep * 0.001; tv += miniNiceStep) {
+        yTicks.push(tv);
+      }
+      if (!yTicks.length) yTicks.push(minV, maxV);
+      ctx.strokeStyle = axisColor;
+      ctx.globalAlpha = 0.52;
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(axisX, padTop);
+      ctx.lineTo(axisX, height - padBot);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      ctx.font = "7px 'DotGothic16', 'Courier New', monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (const tv of yTicks) {
+        const y = yAt(tv);
+        ctx.strokeStyle = axisColor;
+        ctx.globalAlpha = 0.70;
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(axisX - 2, y);
+        ctx.lineTo(axisX + 2, y);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+        ctx.fillStyle = "rgba(165, 191, 222, 0.95)";
+        ctx.fillText(fmtTick(tv), axisX - 3, y);
+      }
+
+      // Soft center guide.
+      const yMid = padTop + (plotH * 0.5);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(padL, yMid);
+      ctx.lineTo(width - padR, yMid);
+      ctx.stroke();
+
+      const n = points.length;
+
+      // ── Fill-between gradient (e.g. q_max → q_min) ────────────
+      if (fillBetween && fillBetween.length >= 4) {
+        const [topKey, botKey, topColor, botColor] = fillBetween;
+        const topSDef = seriesDefs.find(s => s.key === topKey);
+        const botSDef = seriesDefs.find(s => s.key === botKey);
+        if (topSDef && botSDef) {
+          const smA_top = Number.isFinite(topSDef.smooth_alpha) ? topSDef.smooth_alpha : MINI_CHART_VALUE_SMOOTH_ALPHA;
+          const smA_bot = Number.isFinite(botSDef.smooth_alpha) ? botSDef.smooth_alpha : MINI_CHART_VALUE_SMOOTH_ALPHA;
+          const mwT = Number.isFinite(topSDef.median_window) ? topSDef.median_window : 0;
+          const mwB = Number.isFinite(botSDef.median_window) ? botSDef.median_window : 0;
+          const readT = mwT >= 3
+            ? (i) => medianNeighbors(i, n, mwT, (j) => Number(points[j][topKey]))
+            : (i) => Number(points[i][topKey]);
+          const readB = mwB >= 3
+            ? (i) => medianNeighbors(i, n, mwB, (j) => Number(points[j][botKey]))
+            : (i) => Number(points[i][botKey]);
+          const topPts = [], botPts = [];
+          let svT = null, svB = null;
+          for (let i = n - 1; i >= 0; i--) {
+            const vT = readT(i), vB = readB(i);
+            if (!Number.isFinite(vT) || !Number.isFinite(vB)) continue;
+            svT = svT === null ? vT : svT + (vT - svT) * smA_top;
+            svB = svB === null ? vB : svB + (vB - svB) * smA_bot;
+            const x = xAtLog(i);
+            topPts.push({ x, y: yAt(svT) });
+            botPts.push({ x, y: yAt(svB) });
+          }
+          if (topPts.length >= 2) {
+            const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+            grad.addColorStop(0, topColor + "60");
+            grad.addColorStop(0.5, botColor + "40");
+            grad.addColorStop(1, botColor + "60");
+            ctx.beginPath();
+            ctx.moveTo(topPts[0].x, topPts[0].y);
+            for (let i = 1; i < topPts.length; i++) ctx.lineTo(topPts[i].x, topPts[i].y);
+            for (let i = botPts.length - 1; i >= 0; i--) ctx.lineTo(botPts[i].x, botPts[i].y);
+            ctx.closePath();
+            ctx.fillStyle = grad;
+            ctx.globalAlpha = 0.5;
+            ctx.fill();
+            ctx.globalAlpha = 1.0;
+          }
+        }
+      }
+
+      for (let si = 0; si < seriesDefs.length; si++) {
+        const s = seriesDefs[si];
+        const yOff = si;  // 1px vertical offset per series so overlapping lines stay visible
+        const xFn = s.linearTime ? xAtLinear : xAtLog;
+        const smoothAlpha = Number.isFinite(s.smooth_alpha) ? Number(s.smooth_alpha) : MINI_CHART_VALUE_SMOOTH_ALPHA;
+        const mw = Number.isFinite(s.median_window) ? s.median_window : 0;
+        const readVal = mw >= 3
+          ? (i) => medianNeighbors(i, n, mw, (j) => Number(points[j][s.key]))
+          : (i) => Number(points[i][s.key]);
+        ctx.strokeStyle = s.color;
+        ctx.globalAlpha = (s.key === "level_1m") ? 0.95 : 0.82;
+        ctx.lineWidth = (s.key === "level_1m") ? 2.0 : 1.6;
+        ctx.beginPath();
+        let started = false;
+        let smoothVal = null;
+        if (s.pixel_bin_avg) {
+          const bins = new Map();
+          for (let i = n - 1; i >= 0; i--) {
+            const val = readVal(i);
+            if (!Number.isFinite(val)) continue;
+            const x = xFn(i);
+            const xPx = Math.max(padL, Math.min(width - padR, Math.round(x)));
+            const b = bins.get(xPx);
+            if (b) {
+              b.sum += val;
+              b.count += 1;
+            } else {
+              bins.set(xPx, { sum: val, count: 1 });
+            }
+          }
+          const xKeys = Array.from(bins.keys()).sort((a, b) => b - a);
+          for (const xPx of xKeys) {
+            const b = bins.get(xPx);
+            if (!b || b.count <= 0) continue;
+            const vAvg = b.sum / b.count;
+            smoothVal = (smoothVal === null)
+              ? vAvg
+              : (smoothVal + ((vAvg - smoothVal) * smoothAlpha));
+            const y = yAt(smoothVal) + yOff;
+            if (!started) {
+              ctx.moveTo(xPx, y);
+              started = true;
+            } else {
+              ctx.lineTo(xPx, y);
+            }
+          }
+        } else {
+          for (let i = n - 1; i >= 0; i--) {
+            const val = readVal(i);
+            if (!Number.isFinite(val)) continue;
+            smoothVal = (smoothVal === null)
+              ? val
+              : (smoothVal + ((val - smoothVal) * smoothAlpha));
+            const x = xFn(i);
+            const y = yAt(smoothVal) + yOff;
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else {
+              ctx.lineTo(x, y);
+            }
+          }
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
+    function computeSmoothedStepSpd(now, history) {
+      const rows = Array.isArray(history) ? history.slice(-STEP_GAUGE_AVG_WINDOW) : [];
+      const vals = [];
+      for (const row of rows) {
+        const v = Number(row && row.steps_per_sec);
+        if (Number.isFinite(v)) {
+          vals.push(v);
+        }
+      }
+      if (!vals.length) {
+        const fallback = Number(now && now.steps_per_sec);
+        return Number.isFinite(fallback) ? fallback : 0.0;
+      }
+      return vals.reduce((a, b) => a + b, 0.0) / vals.length;
+    }
+
+    function buildThroughputHistory(rows, stepWindowSec = 2.0, emaAlpha = 0.12) {
+      const src = Array.isArray(rows) ? rows : [];
+      if (!src.length) return [];
+      const out = new Array(src.length);
+      let j = 0;
+      let ema = null;
+      for (let i = 0; i < src.length; i++) {
+        const row = src[i] || {};
+        const tsI = Number(row.ts);
+        const stI = Number(row.training_steps);
+        while (j < i) {
+          const tsJ = Number(src[j] && src[j].ts);
+          if (!Number.isFinite(tsI) || !Number.isFinite(tsJ) || (tsI - tsJ) <= stepWindowSec) break;
+          j += 1;
+        }
+
+        let rate = Number(row.steps_per_sec);
+        if (i > j) {
+          const tsJ = Number(src[j] && src[j].ts);
+          const stJ = Number(src[j] && src[j].training_steps);
+          const dt = tsI - tsJ;
+          const ds = stI - stJ;
+          if (Number.isFinite(dt) && dt > 1e-6 && Number.isFinite(ds) && ds >= 0) {
+            rate = ds / dt;
+          }
+        }
+        if (!Number.isFinite(rate)) rate = 0.0;
+        ema = (ema === null) ? rate : (ema + ((rate - ema) * emaAlpha));
+        out[i] = { ...row, steps_per_sec_chart: ema };
+      }
+      return out;
+    }
+
+    function buildWindowSmoothedHistory(rows, specs, windowSec = 2.0) {
+      const src = Array.isArray(rows) ? rows : [];
+      if (!src.length) return [];
+      const defs = Array.isArray(specs) ? specs : [];
+      const out = new Array(src.length);
+      const starts = new Array(defs.length).fill(0);
+      const sums = new Array(defs.length).fill(0.0);
+      const counts = new Array(defs.length).fill(0);
+      const emas = new Array(defs.length).fill(null);
+
+      for (let i = 0; i < src.length; i++) {
+        const row = src[i] || {};
+        const tsI = Number(row.ts);
+        const nextRow = { ...row };
+
+        for (let k = 0; k < defs.length; k++) {
+          const def = defs[k] || {};
+          const key = String(def.key || "");
+          if (!key) continue;
+          const alpha = Number.isFinite(def.alpha) ? Number(def.alpha) : 0.12;
+
+          const vNow = Number(row[key]);
+          if (Number.isFinite(vNow)) {
+            sums[k] += vNow;
+            counts[k] += 1;
+          }
+
+          while (starts[k] < i) {
+            const rowStart = src[starts[k]] || {};
+            const tsS = Number(rowStart.ts);
+            if (!Number.isFinite(tsI) || !Number.isFinite(tsS) || (tsI - tsS) <= windowSec) break;
+            const vS = Number(rowStart[key]);
+            if (Number.isFinite(vS)) {
+              sums[k] -= vS;
+              counts[k] = Math.max(0, counts[k] - 1);
+            }
+            starts[k] += 1;
+          }
+
+          const avg = counts[k] > 0 ? (sums[k] / counts[k]) : (Number.isFinite(vNow) ? vNow : 0.0);
+          emas[k] = (emas[k] === null) ? avg : (emas[k] + ((avg - emas[k]) * alpha));
+          nextRow[key] = emas[k];
+        }
+        out[i] = nextRow;
+      }
+      return out;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * LR COSINE MINI CHART — Draws the cosine annealing curve with
+     * a dot showing current position in the cycle.
+     * ══════════════════════════════════════════════════════════════ */
+    const _lrCanvas = document.getElementById("lrMiniChart");
+    const _lrCtx = _lrCanvas ? _lrCanvas.getContext("2d") : null;
+
+    function drawLrMiniChart(now) {
+      if (!_lrCtx) return;
+      const width  = _lrCanvas.clientWidth  || 120;
+      const height = _lrCanvas.clientHeight || 104;
+      const dpr = window.devicePixelRatio || 1;
+      _lrCanvas.width  = Math.floor(width * dpr);
+      _lrCanvas.height = Math.floor(height * dpr);
+      const ctx = _lrCtx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const W = width, H = height;
+
+      const lrMax     = now.lr_max       || 5e-5;
+      const lrMin     = now.lr_min       || 2e-5;
+      const warmup    = now.lr_warmup_steps    || 5000;
+      const period    = now.lr_cosine_period   || 3000000;
+      const restarts  = !!now.lr_use_restarts;
+      const step      = now.training_steps     || 0;
+
+      // Draw area with left axis padding
+      const axisPad = 38;
+      const padL = axisPad, padR = 2, padTop = 2, padBot = 2;
+      const gw = W - padL - padR, gh = H - padTop - padBot;
+      if (gw <= 4 || gh <= 4) return;
+
+      // Total steps we show: 2 full periods (or up to step + some if larger)
+      const totalShow = restarts ? Math.max(period * 2, step + period * 0.3) : Math.max(period + warmup, step * 1.2);
+
+      // Map step → x
+      const sx = (s) => padL + (s / totalShow) * gw;
+      // Map lr → y (top = lrMax, bottom = lrMin)
+      const lrRange = Math.max(1e-12, lrMax - lrMin);
+      const sy = (lr) => padTop + (1.0 - (lr - lrMin) / lrRange) * gh;
+
+      // ── Vertical axis and ticks ──────────────────────────────────
+      const fmtLr = (v) => {
+        if (v === 0) return "0";
+        const exp = Math.floor(Math.log10(Math.abs(v)));
+        const mantissa = v / Math.pow(10, exp);
+        if (Math.abs(mantissa - Math.round(mantissa)) < 0.05)
+          return Math.round(mantissa) + "e" + exp;
+        return mantissa.toFixed(1) + "e" + exp;
+      };
+      const nTicks = 3;
+      const tickStep = niceInterval(lrRange, nTicks);
+      const axisX = padL - 1;
+      ctx.strokeStyle = "rgba(100,160,255,0.52)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(axisX, padTop);
+      ctx.lineTo(axisX, H - padBot);
+      ctx.stroke();
+
+      ctx.font = "7px 'DotGothic16', 'Courier New', monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let tv = Math.ceil(lrMin / tickStep) * tickStep; tv <= lrMax + tickStep * 0.001; tv += tickStep) {
+        const y = sy(tv);
+        ctx.strokeStyle = "rgba(100,160,255,0.70)";
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(axisX - 2, y);
+        ctx.lineTo(axisX + 2, y);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(165, 191, 222, 0.95)";
+        ctx.fillText(fmtLr(tv), axisX - 3, y);
+      }
+
+      // Compute lr at a given step (mirrors get_lr)
+      function lrAt(s) {
+        if (s < warmup) return lrMin + (lrMax - lrMin) * ((s + 1) / Math.max(1, warmup));
+        const dh = Math.max(1, period);
+        const t = restarts ? ((s - warmup) % dh) : Math.min(s - warmup, dh);
+        const cosine = 0.5 * (1.0 + Math.cos(Math.PI * t / dh));
+        return lrMin + (lrMax - lrMin) * cosine;
+      }
+
+      // Draw curve
+      const nPts = Math.min(280, gw);
+      ctx.beginPath();
+      for (let i = 0; i <= nPts; i++) {
+        const s = (i / nPts) * totalShow;
+        const x = sx(s), y = sy(lrAt(s));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "rgba(100,160,255,0.5)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      // Draw current position dot
+      if (step > 0) {
+        const cx = sx(step), cy = sy(lrAt(step));
+        ctx.beginPath();
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+        ctx.fillStyle = "#0f0";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.7)";
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * CARD UPDATER — Pushes latest snapshot values into DOM elements,
+     * updates record highs, and sets model description.
+     * ══════════════════════════════════════════════════════════════ */
+    function updateCards(now, smoothedSteps) {
+      _lastNow = now;
+      cards.clients.textContent = fmtInt(now.client_count);
+      cards.web.textContent = fmtInt(now.web_client_count);
+      cards.level.textContent = fmtFloat(now.average_level, 2);
+      cards.inf.textContent = `${fmtFloat(now.avg_inf_ms, 2)} ms`;
+      setInfLed(now.avg_inf_ms);
+      cards.rplf.innerHTML = toFixedCharCells(fmtPaddedFloat(now.rpl_per_frame, 2, 2, " "));
+      setRplLed(now.rpl_per_frame);
+      if (!_gsIgnoreSync) cards.eps.textContent = fmtPct(now.epsilon);
+
+      // Pulse status indicator (SVG bolt prefix)
+      const bolt = (fill) => `<svg width="10" height="14" viewBox="0 0 16 22" style="vertical-align:-2px;margin-right:2px"><path d="M10 0L3 12h5l-2 10 7-14H8z" fill="${fill}"/></svg>`;
+      if (now.pulse_state === "pulsing") {
+        cards.pulseStatus.innerHTML = bolt("#facc15") + 'PULSE ' + fmtInt(now.pulse_remaining) + " left";
+        cards.pulseStatus.style.color = "#ef4444";
+      } else if (now.pulse_state === "recovering") {
+        cards.pulseStatus.innerHTML = bolt("#facc15") + 'RECOVER ' + fmtInt(now.pulse_remaining) + " left";
+        cards.pulseStatus.style.color = "#f59e0b";
+      } else if (!now.pulse_enabled) {
+        cards.pulseStatus.innerHTML = bolt("#777") + 'DISABLED';
+        cards.pulseStatus.style.color = "#555";
+      } else {
+        cards.pulseStatus.innerHTML = bolt("#7dd3fc") + 'PULSE ARMED';
+        cards.pulseStatus.style.color = "#888";
+      }
+
+      if (!_gsIgnoreSync) cards.xprt.textContent = fmtPct(now.expert_ratio);
+      cards.rwrd.textContent = fmtInt(Math.max(0, now.total_1m || 0));
+      cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
+      cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
+      cards.buf.textContent = fmtInt(now.memory_buffer_size);
+      cards.lr.textContent = (now.lr === null || now.lr === undefined) ? "-" : Number(now.lr).toExponential(1);
+      drawLrMiniChart(now);
+      cards.q.innerHTML = (now.q_min === null || now.q_max === null)
+        ? toFixedCharCells("-")
+        : toColoredQRange(now.q_min, now.q_max);
+      cards.epLen.textContent = fmtInt(now.eplen_1m);
+      { const secs = Math.round((now.eplen_1m || 0) / 30); const m = Math.floor(secs / 60); const s = secs % 60; cards.duration.textContent = m + ":" + String(s).padStart(2, "0"); }
+
+      /* Episodes count + 30-second rolling rate */
+      cards.episodes.textContent = fmtInt(now.episodes_this_run);
+      {
+        const t = now.ts || (Date.now() / 1000);
+        epRateHistory.push({ts: t, episodes: now.episodes_this_run});
+        while (epRateHistory.length > 1 && epRateHistory[0].ts < t - EP_RATE_WINDOW) epRateHistory.shift();
+        if (epRateHistory.length >= 2) {
+          const first = epRateHistory[0], last = epRateHistory[epRateHistory.length - 1];
+          const dt = last.ts - first.ts;
+          if (dt > 0.5) {
+            const rate = (last.episodes - first.episodes) / dt;
+            cards.epRate.textContent = fmtFloat(rate, 1) + "/s";
+          }
+        }
+      }
+
+      cards.agreePanel.textContent = (now.agreement_1m != null && isFinite(now.agreement_1m))
+        ? fmtFloat(now.agreement_1m * 100, 1) + "%"
+        : "0.0%";
+
+      // ── Record highs ──────────────────────────────────────────────
+      const recPairs = [
+        ["rwrd", now.peak_game_score, fmtInt],
+        ["level", now.peak_level, v => "LEVEL " + Math.round(v)],
+        ["epLen", now.eplen_1m, fmtInt],
+      ];
+      for (const [k, v, fmt] of recPairs) {
+        if (v != null && isFinite(v) && v > recordHighs[k]) {
+          recordHighs[k] = v;
+          if (recEls[k]) recEls[k].textContent = fmt(v);
+        }
+      }
+
+      // ── Model description ─────────────────────────────────────────
+      if (now.model_desc && modelDescEl) modelDescEl.textContent = now.model_desc;
+
+      // ── Game settings sync ────────────────────────────────────────
+      if (!_gsIgnoreSync && now.game_settings) {
+        const gs = now.game_settings;
+        if (gsAutoCurrEl.checked !== gs.auto_curriculum) {
+          gsAutoCurrEl.checked = gs.auto_curriculum;
+          _applyAutoCurriculum(gs.auto_curriculum);
+        }
+        if (gsAdvancedEl.checked !== gs.start_advanced) gsAdvancedEl.checked = gs.start_advanced;
+        if (parseInt(gsLevelEl.value, 10) !== gs.start_level_min) gsLevelEl.value = String(gs.start_level_min);
+      }
+      // ── Auto-curriculum: continuously recompute level each tick ──
+      if (gsAutoCurrEl.checked && now.average_level != null) {
+        const lv = _computeAutoLevel(now.average_level);
+        if (parseInt(gsLevelEl.value, 10) !== lv) {
+          gsLevelEl.value = String(lv);
+          _postGameSettings({ start_level_min: lv });
+        }
+      }
+    }
+
+    function render(payload) {
+      _tickDisplayFps();
+      if (!payload || !payload.now) return;
+      const history = Array.isArray(payload.history) ? payload.history.slice(-MAX_HISTORY_POINTS) : [];
+      const history60m = sliceHistoryLookback(history, 60 * 60);
+      const history2m = sliceHistoryLookback(history, 2 * 60);
+      const history1m = sliceHistoryLookback(history, 60);
+      const chartHistory60m = downsampleHistory(history60m, MAX_CHART_POINTS);
+      const chartHistory2m = downsampleHistory(history2m, MAX_CHART_POINTS);
+      const chartHistory1m = downsampleHistory(history1m, MAX_CHART_POINTS);
+      const throughputHistory = buildThroughputHistory(chartHistory60m);
+      const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history60m);
+      updateCards(payload.now, smoothedStepSpd);
+      gaugeState.fps.target  = payload.now.fps;
+      gaugeState.step.target = smoothedStepSpd;
+      latestRow = payload.now;
+      drawChart(charts.throughput.canvas, throughputHistory, charts.throughput.series, 60 * 60);
+      drawChart(charts.rewards.canvas, chartHistory60m, charts.rewards.series, 60 * 60);
+      drawChart(charts.learning.canvas, chartHistory1m, charts.learning.series, 60, true);
+      drawChart(charts.agreement.canvas, chartHistory60m, charts.agreement.series, 60 * 60);
+      drawMiniChart(charts.qRange.canvas, history60m, charts.qRange.series, charts.qRange.fill_between);
+      drawMiniChart(charts.rewardMini.canvas, history60m, charts.rewardMini.series);
+      drawMiniChart(charts.level1m.canvas, history60m, charts.level1m.series);
+      drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
+      drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
+      drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
+    }
+
+    let historyCache = [];
+    let latestNow = null;
+    let lastTs = -1;
+
+    function renderCurrent() {
+      if (!latestNow) return;
+      render({ now: latestNow, history: historyCache });
+    }
+
+    async function fetchHistory() {
+      try {
+        const res = await fetch(`/api/history?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("bad response");
+        const payload = await res.json();
+        const now = payload && payload.now ? payload.now : null;
+        const history = Array.isArray(payload && payload.history) ? payload.history : [];
+        historyCache = history.slice(-MAX_HISTORY_POINTS);
+        latestNow = now || historyCache[historyCache.length - 1] || latestNow;
+        const ts = Number(latestNow && latestNow.ts);
+        if (Number.isFinite(ts)) {
+          lastTs = ts;
+        }
+        renderCurrent();
+        setConnected(true);
+      } catch (err) {
+        setConnected(false);
+      }
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * DATA FETCH LOOP — Polls /api/now and /api/ping at intervals,
+     * maintains history cache, and triggers re-renders.
+     * ══════════════════════════════════════════════════════════════ */
+    async function fetchNow() {
+      try {
+        const res = await fetch(`/api/now?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("bad response");
+        const now = await res.json();
+        latestNow = now;
+        const ts = Number(now && now.ts);
+        if (Number.isFinite(ts) && ts > lastTs + 1e-9) {
+          historyCache.push(now);
+          if (historyCache.length > MAX_HISTORY_POINTS) {
+            historyCache.shift();
+          }
+          lastTs = ts;
+        }
+        renderCurrent();
+        setConnected(true);
+      } catch (err) {
+        setConnected(false);
+      }
+    }
+
+    async function heartbeat() {
+      try {
+        const res = await fetch(`/api/ping?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("no ping");
+        failedPings = 0;
+        setConnected(true);
+      } catch (err) {
+        failedPings += 1;
+        setConnected(false);
+        if (failedPings >= 3) {
+          try { window.close(); } catch (_) {}
+        }
+      }
+    }
+
+    const cookiePref = getCookieValue(AUDIO_PREF_COOKIE);
+    audioEnabled = (cookiePref === null) ? true : (cookiePref === "1");
+    setAudioToggle(audioEnabled, false);
+    const kickAudioStart = () => {
+      if (audioEnabled) ensureAudioPlaying();
+    };
+    document.addEventListener("pointerdown", kickAudioStart, { passive: true });
+    document.addEventListener("keydown", kickAudioStart);
+    window.addEventListener("focus", kickAudioStart);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) kickAudioStart();
+    });
+    if (audioToggle) {
+      audioToggle.addEventListener("click", () => setAudioEnabled(!audioEnabled));
+    }
+    if (bgAudio) {
+      bgAudio.addEventListener("playing", () => clearAudioRetryTimer());
+      bgAudio.addEventListener("ended", () => {
+        if (!audioEnabled || !audioPlaylist.length) return;
+        playAudioAt(audioIndex + 1);
+      });
+      bgAudio.addEventListener("error", () => {
+        if (!audioEnabled || !audioPlaylist.length) return;
+        playAudioAt(audioIndex + 1);
+      });
+    }
+    loadAudioPlaylist().catch(() => {});
+
+    fetchHistory().then(() => fetchNow()).catch(() => {});
+    setInterval(fetchNow, DASH_REFRESH_MS);
+    setInterval(heartbeat, 1000);
+    window.addEventListener("resize", () => {
+      renderCurrent();
+      // Force gauge repaint since canvas dimensions changed
+      drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
+      drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def _make_handler(state: _DashboardState):
+    page = _render_dashboard_html().encode("utf-8")
+    audio_root = os.path.abspath(_audio_dir())
+    fonts_root = os.path.abspath(_fonts_dir())
+    html_root = os.path.abspath(_html_dir())
+
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def _send(
+            self,
+            payload: bytes,
+            content_type: str = "text/plain",
+            status: int = 200,
+            cache_control: str = "no-store",
+        ):
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _send_file(self, filepath: str, content_type: str):
+            try:
+                size = os.path.getsize(filepath)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                with open(filepath, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, length=64 * 1024)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            except Exception:
+                try:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+        @staticmethod
+        def _safe_audio_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(audio_root, name))
+            try:
+                if os.path.commonpath([audio_root, candidate]) != audio_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in AUDIO_EXTENSIONS:
+                return None
+            return candidate
+
+        @staticmethod
+        def _safe_font_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(fonts_root, name))
+            try:
+                if os.path.commonpath([fonts_root, candidate]) != fonts_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in FONT_EXTENSIONS:
+                return None
+            return candidate
+
+        @staticmethod
+        def _safe_html_file(name: str) -> str | None:
+            if not name or name.startswith("."):
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            candidate = os.path.abspath(os.path.join(html_root, name))
+            try:
+                if os.path.commonpath([html_root, candidate]) != html_root:
+                    return None
+            except Exception:
+                return None
+            if not os.path.isfile(candidate):
+                return None
+            return candidate
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            client_id = (query.get("cid") or [None])[0]
+            if path in ("/api/ping", "/api/now", "/api/history"):
+                state.touch_web_client(client_id)
+            if path == "/":
+                self._send(page, "text/html; charset=utf-8")
+                return
+            if path == "/api/ping":
+                body = json.dumps({"ok": True, "ts": time.time()}).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            if path == "/api/now":
+                self._send(state.now_body(), "application/json")
+                return
+            if path == "/api/history":
+                body = json.dumps(state.payload()).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            if path == "/api/audio_playlist":
+                tracks = _list_audio_files()
+                body = json.dumps({
+                    "tracks": [{"name": name, "url": f"/api/audio/{quote(name)}"} for name in tracks]
+                }).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            if path.startswith("/api/audio/"):
+                raw_name = unquote(path[len("/api/audio/"):])
+                safe_path = self._safe_audio_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+                self._send_file(safe_path, ctype)
+                return
+            if path.startswith("/api/font/"):
+                raw_name = unquote(path[len("/api/font/"):])
+                safe_path = self._safe_font_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "font/ttf"
+                self._send_file(safe_path, ctype)
+                return
+            if path.startswith("/api/html/"):
+                raw_name = unquote(path[len("/api/html/"):])
+                safe_path = self._safe_html_file(raw_name)
+                if not safe_path:
+                    self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+                    return
+                ctype = mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+                self._send_file(safe_path, ctype)
+                return
+            if path == "/api/game_settings":
+                body = json.dumps(game_settings.snapshot()).encode("utf-8")
+                self._send(body, "application/json")
+                return
+            self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/api/game_settings":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    data = json.loads(raw)
+                    if "start_advanced" in data:
+                        game_settings.start_advanced = bool(data["start_advanced"])
+                    if "start_level_min" in data:
+                        game_settings.start_level_min = int(data["start_level_min"])
+                    if "epsilon_pct" in data:
+                        game_settings.epsilon_pct = int(data["epsilon_pct"])
+                    if "expert_pct" in data:
+                        game_settings.expert_pct = int(data["expert_pct"])
+                    if "auto_curriculum" in data:
+                        game_settings.auto_curriculum = bool(data["auto_curriculum"])
+                    game_settings.save()
+                    body = json.dumps(game_settings.snapshot()).encode("utf-8")
+                    self._send(body, "application/json")
+                except Exception:
+                    self._send(b'{"error":"bad request"}', "application/json", status=400)
+                return
+            self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
+
+        def log_message(self, fmt, *args):
+            return
+
+        def handle_one_request(self):
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+
+    return DashboardHandler
+
+
+class MetricsDashboard:
+    """Managed dashboard server + browser window."""
+
+    def __init__(
+        self,
+        metrics_obj,
+        agent_obj=None,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        sample_interval: float = 0.10,
+        history_limit: int = DASH_HISTORY_LIMIT,
+        open_browser: bool = True,
+    ):
+        self.metrics = metrics_obj
+        self.agent = agent_obj
+        self.host = host
+        self.port = port
+        # Cap sampler refresh at 30 Hz max.
+        self.sample_interval = max(0.033, sample_interval)
+        self.open_browser = open_browser
+
+        self.state = _DashboardState(metrics_obj, agent_obj, history_limit=history_limit)
+        self.stop_event = threading.Event()
+        self.httpd: ThreadingHTTPServer | None = None
+        self.server_thread: threading.Thread | None = None
+        self.sampler_thread: threading.Thread | None = None
+        self.browser_proc: subprocess.Popen | None = None
+        self.browser_profile_dir: str | None = None
+        self.url: str | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+        atexit.register(self.stop)
+
+    def _sampling_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.state.sample()
+            except Exception:
+                pass
+            if self.open_browser and self.url and self.browser_proc and self.browser_proc.poll() is not None:
+                try:
+                    self.browser_proc = None
+                    if self.browser_profile_dir:
+                        shutil.rmtree(self.browser_profile_dir, ignore_errors=True)
+                        self.browser_profile_dir = None
+                    self._launch_browser(self.url)
+                except Exception:
+                    pass
+            self.stop_event.wait(self.sample_interval)
+
+    def _bind_server(self):
+        handler_cls = _make_handler(self.state)
+        last_err = None
+        for p in range(self.port, self.port + 40):
+            try:
+                self.httpd = ThreadingHTTPServer((self.host, p), handler_cls)
+                self.port = p
+                return
+            except OSError as e:
+                last_err = e
+        if last_err:
+            raise last_err
+        raise OSError("Could not bind dashboard server")
+
+    @staticmethod
+    def _resolve_browser_binary(candidate: str) -> str | None:
+        if os.path.isabs(candidate):
+            return candidate if os.path.exists(candidate) else None
+        return shutil.which(candidate)
+
+    def _launch_browser(self, url: str):
+        candidates = [
+            ("google-chrome", True),
+            ("google-chrome-stable", True),
+            ("chromium", True),
+            ("chromium-browser", True),
+            ("brave-browser", True),
+            ("msedge", True),
+            ("microsoft-edge", True),
+            ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", True),
+            ("/Applications/Chromium.app/Contents/MacOS/Chromium", True),
+            ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", True),
+            ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", True),
+        ]
+
+        for candidate, chromium_like in candidates:
+            binary = self._resolve_browser_binary(candidate)
+            if not binary:
+                continue
+            cmd = [binary]
+            profile_dir = None
+            if chromium_like:
+                profile_dir = tempfile.mkdtemp(prefix="robotron_dashboard_")
+                cmd.extend(
+                    [
+                        "--new-window",
+                        f"--app={url}",
+                        f"--user-data-dir={profile_dir}",
+                        "--no-first-run",
+                        "--disable-features=TranslateUI",
+                        "--no-default-browser-check",
+                    ]
+                )
+            else:
+                cmd.extend(["--new-window", url])
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=(os.name != "nt"),
+                )
+                self.browser_proc = proc
+                self.browser_profile_dir = profile_dir
+                return
+            except Exception:
+                if profile_dir:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+
+        # Fallback if no managed browser was available.
+        try:
+            webbrowser.open_new(url)
+        except Exception:
+            pass
+
+    def start(self) -> str:
+        self.state.sample()
+        self._bind_server()
+        self.url = f"http://{self.host}:{self.port}"
+
+        self.server_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.server_thread.start()
+
+        self.sampler_thread = threading.Thread(target=self._sampling_loop, daemon=True)
+        self.sampler_thread.start()
+
+        if self.open_browser:
+            self._launch_browser(self.url)
+        return self.url
+
+    def stop(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        self.stop_event.set()
+
+        if self.httpd:
+            try:
+                self.httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                self.httpd.server_close()
+            except Exception:
+                pass
+            self.httpd = None
+
+        if self.server_thread and self.server_thread.is_alive():
+            try:
+                self.server_thread.join(timeout=2.0)
+            except Exception:
+                pass
+        self.server_thread = None
+
+        if self.sampler_thread and self.sampler_thread.is_alive():
+            try:
+                self.sampler_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self.sampler_thread = None
+
+        if self.browser_proc and self.browser_proc.poll() is None:
+            try:
+                if os.name == "nt":
+                    self.browser_proc.terminate()
+                    self.browser_proc.wait(timeout=2.0)
+                else:
+                    os.killpg(self.browser_proc.pid, signal.SIGTERM)
+                    self.browser_proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    if os.name == "nt":
+                        self.browser_proc.kill()
+                    else:
+                        os.killpg(self.browser_proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        self.browser_proc = None
+
+        if self.browser_profile_dir:
+            shutil.rmtree(self.browser_profile_dir, ignore_errors=True)
+            self.browser_profile_dir = None

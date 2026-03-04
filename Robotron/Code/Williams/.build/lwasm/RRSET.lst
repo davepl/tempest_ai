@@ -1,0 +1,1641 @@
+                      (asm/src/RRSET.ASM):00001         *        OPT    NOL
+                      (asm/src/RRSET.ASM):00002          INCLUDE "RRFRED.ASM"
+                      (       RRFRED.ASM):00001         *        OPT    PAG
+                      (       RRFRED.ASM):00002         
+                      (       RRFRED.ASM):00003          INCLUDE "RRF.ASM"
+                      (          RRF.ASM):00001         *        OPT    PAGS
+                      (          RRF.ASM):00002         *        TTL    R O B O T   W A R
+                      (          RRF.ASM):00003         *
+                      (          RRF.ASM):00004         * HARDWARE CONSTANTS
+                      (          RRF.ASM):00005         *
+     BF70             (          RRF.ASM):00006         HSTK EQU $BF70
+     EFF0             (          RRF.ASM):00007         VECTOR EQU $EFF0
+     C000             (          RRF.ASM):00008         CRAM EQU $C000 COLOR RAM ADDR
+     CBFF             (          RRF.ASM):00009         WDOG EQU $CBFF
+     0039             (          RRF.ASM):00010         WDATA EQU $39
+     CC00             (          RRF.ASM):00011         CMOS EQU $CC00
+     C80E             (          RRF.ASM):00012         SOUND EQU $C80E
+     CB00             (          RRF.ASM):00013         VERTCT EQU $CB00 6-BIT VERTICAL BEAM ADDR
+     C900             (          RRF.ASM):00014         RWCNTL EQU $C900 (BIT 0: 1-ROM READ; 0-RAM READ)
+                      (          RRF.ASM):00015         *                (BIT 1: 1-INVERT;   0-NORMAL SCREEN)
+                      (          RRF.ASM):00016         *
+                      (          RRF.ASM):00017         *PIA DEFINITIONS
+                      (          RRF.ASM):00018         *
+     C80C             (          RRF.ASM):00019         PIA0 EQU $C80C
+                      (          RRF.ASM):00020         *B0 AUTO UP
+                      (          RRF.ASM):00021         *B1 ADVANCE
+                      (          RRF.ASM):00022         *B2 RCOIN
+                      (          RRF.ASM):00023         *B3 HSRESET
+                      (          RRF.ASM):00024         *B4 LCOIN
+                      (          RRF.ASM):00025         *B5 CCOIN
+                      (          RRF.ASM):00026         *B6 SLAM
+                      (          RRF.ASM):00027         *B7 SOUND HANDSHAKE
+                      (          RRF.ASM):00028         *CA2 LED3 
+                      (          RRF.ASM):00029         *CA1 IRQ 240 (16 MS)  (LINE 240)
+     C80E             (          RRF.ASM):00030         PIA1 EQU $C80E
+                      (          RRF.ASM):00031         *B0-B5 SOUND
+                      (          RRF.ASM):00032         *B6-B7 LED 0,1
+                      (          RRF.ASM):00033         *CB1 IRQ 4 MS (0,$40,$80,$C0)
+                      (          RRF.ASM):00034         *CB2 LED2            
+     C804             (          RRF.ASM):00035         PIA2 EQU $C804
+                      (          RRF.ASM):00036         *B0 MOVE UP
+                      (          RRF.ASM):00037         *B1 MOVE DOWN
+                      (          RRF.ASM):00038         *B2 MOVE LEFT
+                      (          RRF.ASM):00039         *B3 MOVE RIGHT
+                      (          RRF.ASM):00040         *B4 START 1
+                      (          RRF.ASM):00041         *B5 START 2
+                      (          RRF.ASM):00042         *B6 FIRE UP
+                      (          RRF.ASM):00043         *B7 FIRE DOWN
+                      (          RRF.ASM):00044         *
+     C806             (          RRF.ASM):00045         PIA3 EQU $C806
+                      (          RRF.ASM):00046         *B0 FIRE LEFT
+                      (          RRF.ASM):00047         *B1 FIRE RIGHT
+                      (          RRF.ASM):00048         *B7 INPUT 1=COCKTAIL
+                      (          RRF.ASM):00049         *CB2 OUTPUT SWITCH MUX CONTROL 1=PLAYER1,0=PLAYER2
+                      (          RRF.ASM):00050         *
+                      (          RRF.ASM):00051         *DMA CONSTANTS
+                      (          RRF.ASM):00052         *
+     CA00             (          RRF.ASM):00053         DMACTL EQU $CA00 CONTROL BYTE WRITE INITIATES TRANSFER
+                      (          RRF.ASM):00054         *B0:READ FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00055         *B1:WRITE FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00056         *B2:XSFER RATE 0=ROM-RAM (1MSEC); 1=RAM-RAM (2 MSEC)
+                      (          RRF.ASM):00057         *B3:1=ZERO WRITE SUPPRESS
+                      (          RRF.ASM):00058         *B4:1=CONSTANT SUBSTITUTION
+                      (          RRF.ASM):00059         *B5:1=ODD FLAVOR
+                      (          RRF.ASM):00060         *B6:1=B0-B3 WRITE SUPPRESS
+                      (          RRF.ASM):00061         *B7:1=B4-B7 WRITE SUPPRESS
+     CA01             (          RRF.ASM):00062         DMACON EQU $CA01 CONSTANT DATA BYTE
+     CA02             (          RRF.ASM):00063         DMAORG EQU $CA02 ORIGIN ADDR MSB,LSB
+     CA04             (          RRF.ASM):00064         DMADES EQU $CA04 DESTINATION "
+     CA06             (          RRF.ASM):00065         DMASIZ EQU $CA06 HOR,VERT BYTE COUNTS
+                      (          RRF.ASM):00066         *SCORE DISPLAY CONSTANTS
+     00EA             (          RRF.ASM):00067         YMAX EQU 234   
+     0018             (          RRF.ASM):00068         YMIN EQU 24 MIN Y COORD
+     008F             (          RRF.ASM):00069         XMAX EQU $8F
+     0007             (          RRF.ASM):00070         XMIN EQU 7
+     180E             (          RRF.ASM):00071         P1ORG EQU $18*$100+14
+     2E0E             (          RRF.ASM):00072         P1MAN EQU P1ORG+7*$300+$100
+     180E             (          RRF.ASM):00073         P1DISP EQU P1ORG
+     580E             (          RRF.ASM):00074         P2ORG EQU P1ORG+$40*$100
+     6E0E             (          RRF.ASM):00075         P2MAN EQU P2ORG+P1MAN-P1ORG
+     580E             (          RRF.ASM):00076         P2DISP EQU P2ORG
+     0300             (          RRF.ASM):00077         DIGLTH EQU $300
+     4A7C             (          RRF.ASM):00078         PCOORD EQU $4A7C INIT PLAYER COORD
+     0066             (          RRF.ASM):00079         FONCOL EQU $66 PHONY STARTUP COLOR
+                      (          RRF.ASM):00080         *
+                      (          RRF.ASM):00081         *MODULE  VECTORS + STORAGE ALLOCATION
+                      (          RRF.ASM):00082         *
+                      (          RRF.ASM):00083         ***OPSYS**..... R O S ..........
+                      (          RRF.ASM):00084         *
+     D000             (          RRF.ASM):00085         ROSORG EQU $D000
+                      (          RRF.ASM):00086          ORG ROSORG
+D000                  (          RRF.ASM):00087         INIT RMB 3
+D003                  (          RRF.ASM):00088         ASCAN RMB 3
+D006                  (          RRF.ASM):00089         SDOUT RMB 3
+D009                  (          RRF.ASM):00090         SCRTRN RMB 3
+D00C                  (          RRF.ASM):00091         SCORE RMB 3
+D00F                  (          RRF.ASM):00092         SCRTR0 RMB 3
+D012                  (          RRF.ASM):00093         SCRCLR RMB 3
+D015                  (          RRF.ASM):00094         DMAOFF RMB 3
+D018                  (          RRF.ASM):00095         DMAON RMB 3
+D01B                  (          RRF.ASM):00096         BLKCLR RMB 3
+D01E                  (          RRF.ASM):00097         PCTOFF RMB 3
+D021                  (          RRF.ASM):00098         PCTON RMB 3
+D024                  (          RRF.ASM):00099         COLST RMB 3
+D027                  (          RRF.ASM):00100         COL0 RMB 3
+D02A                  (          RRF.ASM):00101         HEXBCD RMB 3
+D02D                  (          RRF.ASM):00102         BCDHEX RMB 3
+D030                  (          RRF.ASM):00103         OINIT RMB 3
+D033                  (          RRF.ASM):00104         CRINIT RMB 3
+D036                  (          RRF.ASM):00105         PINIT RMB 3
+D039                  (          RRF.ASM):00106         RAND RMB 3
+D03C                  (          RRF.ASM):00107         RAND16 RMB 3
+D03F                  (          RRF.ASM):00108         RMAX RMB 3
+D042                  (          RRF.ASM):00109         RANDU RMB 3
+D045                  (          RRF.ASM):00110         PLINDX RMB 3
+D048                  (          RRF.ASM):00111         PLDX RMB 3
+D04B                  (          RRF.ASM):00112         SNDLD RMB 3
+D04E                  (          RRF.ASM):00113         KILO1 RMB 3
+D051                  (          RRF.ASM):00114         GETOBJ RMB 3
+D054                  (          RRF.ASM):00115         MAKEP RMB 3
+D057                  (          RRF.ASM):00116         MKPROC RMB 3
+D05A                  (          RRF.ASM):00117         MSPROC RMB 3
+D05D                  (          RRF.ASM):00118         KILL RMB 3
+D060                  (          RRF.ASM):00119         GNCIDE RMB 3
+D063                  (          RRF.ASM):00120         SUCIDE RMB 3
+D066                  (          RRF.ASM):00121         SLEEP RMB 3
+D069                  (          RRF.ASM):00122         RIPV RMB 3
+D06C                  (          RRF.ASM):00123         MPROB RMB 3
+D06F                  (          RRF.ASM):00124         GETOB RMB 3
+D072                  (          RRF.ASM):00125         KILLOB RMB 3
+D075                  (          RRF.ASM):00126         KILLOF RMB 3
+D078                  (          RRF.ASM):00127         KILOFP RMB 3
+D07B                  (          RRF.ASM):00128         GETROB RMB 3
+D07E                  (          RRF.ASM):00129         KILROB RMB 3
+D081                  (          RRF.ASM):00130         GETPST RMB 3
+D084                  (          RRF.ASM):00131         KILPST RMB 3
+D087                  (          RRF.ASM):00132         GETHUM RMB 3
+D08A                  (          RRF.ASM):00133         KILHUM RMB 3
+D08D                  (          RRF.ASM):00134         DMAOFN RMB 3
+D090                  (          RRF.ASM):00135         MPCTON RMB 3
+D093                  (          RRF.ASM):00136         BLKON RMB 3
+D096                  (          RRF.ASM):00137         EXECV RMB 3
+D099                  (          RRF.ASM):00138         P1SW   RMB    3
+D09C                  (          RRF.ASM):00139         P2SW   RMB    3
+D09F                  (          RRF.ASM):00140         DIVAB  RMB    3
+D0A2                  (          RRF.ASM):00141         RCMOSA RMB    3
+D0A5                  (          RRF.ASM):00142         RCMOSB RMB    3
+D0A8                  (          RRF.ASM):00143         RCMOSD RMB    3
+D0AB                  (          RRF.ASM):00144         WCMOSA RMB    3
+D0AE                  (          RRF.ASM):00145         WCMOSB RMB    3
+D0B1                  (          RRF.ASM):00146         WCMOSD RMB    3
+D0B4                  (          RRF.ASM):00147         BCDBIN RMB    3
+D0B7                  (          RRF.ASM):00148         RWMOVE RMB    3
+D0BA                  (          RRF.ASM):00149         AUD    RMB    3
+D0BD                  (          RRF.ASM):00150         AUD1   RMB    3
+D0C0                  (          RRF.ASM):00151         INT20V RMB    3
+D0C3                  (          RRF.ASM):00152         LFV    RMB    3
+D0C6                  (          RRF.ASM):00153         NEWBCH RMB    3        BCDHEX THAT USES A!!
+                      (          RRF.ASM):00154         *
+                      (          RRF.ASM):00155         *PLAYER DEATH
+                      (          RRF.ASM):00156         *
+     DD00             (          RRF.ASM):00157         RDORG EQU $DD00
+                      (          RRF.ASM):00158          ORG RDORG
+DD00                  (          RRF.ASM):00159         RDTHV RMB 3
+                      (          RRF.ASM):00160         *
+                      (          RRF.ASM):00161         *HUMANS+HULKS
+                      (          RRF.ASM):00162         *
+     0000             (          RRF.ASM):00163         RHORG EQU $0000
+                      (          RRF.ASM):00164          ORG RHORG
+0000                  (          RRF.ASM):00165         HULKST RMB 3
+0003                  (          RRF.ASM):00166         HUMST RMB 3
+0006                  (          RRF.ASM):00167         CKLIM RMB 3
+0009                  (          RRF.ASM):00168         SKULL RMB 3
+000C                  (          RRF.ASM):00169         P1KD RMB 2
+000E                  (          RRF.ASM):00170         MOMPIC RMB 2
+0010                  (          RRF.ASM):00171         DADPIC RMB 2
+0012                  (          RRF.ASM):00172         KIDPIC RMB 2
+0014                  (          RRF.ASM):00173         HLKPIC RMB 2
+0016                  (          RRF.ASM):00174         HLKANA RMB 2
+0018                  (          RRF.ASM):00175         HUMANA RMB 2
+001A                  (          RRF.ASM):00176         SKLPIC RMB 2
+                      (          RRF.ASM):00177         *
+                      (          RRF.ASM):00178         ***CIRCLES,ENFORCERS,SPARX
+                      (          RRF.ASM):00179         *
+     1140             (          RRF.ASM):00180         RCORG EQU $1140
+                      (          RRF.ASM):00181          ORG RCORG
+1140                  (          RRF.ASM):00182         CIRCST RMB 3 START CIRCLES
+1143                  (          RRF.ASM):00183         CIRKV RMB 3
+1146                  (          RRF.ASM):00184         CIRPIC RMB 2
+1148                  (          RRF.ASM):00185         ENGPIC RMB 2
+114A                  (          RRF.ASM):00186         ENFPIC RMB 2
+                      (          RRF.ASM):00187         *
+                      (          RRF.ASM):00188         *BRAINS & CO.
+                      (          RRF.ASM):00189         *
+     1AC0             (          RRF.ASM):00190         BRNORG EQU $1AC0
+                      (          RRF.ASM):00191          ORG BRNORG
+1AC0                  (          RRF.ASM):00192         BRNST RMB 3
+1AC3                  (          RRF.ASM):00193         BRNPIC RMB 2
+1AC5                  (          RRF.ASM):00194         BRONV  RMB    3
+1AC8                  (          RRF.ASM):00195         HUMONV RMB    3
+1ACB                  (          RRF.ASM):00196         PRGPIC RMB 2
+                      (          RRF.ASM):00197         *
+                      (          RRF.ASM):00198         *******ROBOT GAME...... R G .......
+                      (          RRF.ASM):00199         *
+     26C0             (          RRF.ASM):00200         RGORG EQU $26C0
+                      (          RRF.ASM):00201          ORG RGORG
+26C0                  (          RRF.ASM):00202         PLAYER RMB 3
+26C3                  (          RRF.ASM):00203         RANDXY RMB 3
+26C6                  (          RRF.ASM):00204         CKOBS RMB 3
+26C9                  (          RRF.ASM):00205         MANDSP RMB 3
+26CC                  (          RRF.ASM):00206         STRT1 RMB 3
+26CF                  (          RRF.ASM):00207         STRT2 RMB 3
+26D2                  (          RRF.ASM):00208         TDISPV RMB 3
+26D5                  (          RRF.ASM):00209         MANPIC RMB 2
+26D7                  (          RRF.ASM):00210         LASPIC RMB 2
+                      (          RRF.ASM):00211         *
+                      (          RRF.ASM):00212         *ROBOTS&POSTS
+                      (          RRF.ASM):00213         *
+     3880             (          RRF.ASM):00214         RPORG EQU $3880
+                      (          RRF.ASM):00215          ORG RPORG
+3880                  (          RRF.ASM):00216         RINIT RMB 3
+3883                  (          RRF.ASM):00217         PSINIT RMB 3
+3886                  (          RRF.ASM):00218         PSTP1 RMB 2
+3888                  (          RRF.ASM):00219         OPON RMB 3
+388B                  (          RRF.ASM):00220         OPON1 RMB 3
+388E                  (          RRF.ASM):00221         SAFTY RMB 3
+3891                  (          RRF.ASM):00222         ROBPIC RMB 2
+3893                  (          RRF.ASM):00223         PSTPIC RMB 2
+3895                  (          RRF.ASM):00224         PKPRCV RMB 3
+                      (          RRF.ASM):00225         *
+                      (          RRF.ASM):00226         *TRANSPORTER
+                      (          RRF.ASM):00227         *
+     4140             (          RRF.ASM):00228         RTORG EQU $4140
+                      (          RRF.ASM):00229          ORG RTORG
+4140                  (          RRF.ASM):00230         TRANST RMB 3
+                      (          RRF.ASM):00231         *
+                      (          RRF.ASM):00232         *DIAGONAL EXPLOSIONS
+                      (          RRF.ASM):00233         *
+     4680             (          RRF.ASM):00234         RDXORG EQU $4680
+                      (          RRF.ASM):00235          ORG RDXORG
+4680                  (          RRF.ASM):00236         DXINIT RMB 3
+4683                  (          RRF.ASM):00237         DXST RMB 3
+4686                  (          RRF.ASM):00238         DAPST RMB 3
+4689                  (          RRF.ASM):00239         DXUPD RMB 3
+                      (          RRF.ASM):00240         *
+                      (          RRF.ASM):00241         *TANKS
+                      (          RRF.ASM):00242         *
+     4B00             (          RRF.ASM):00243         RTKORG EQU $4B00
+                      (          RRF.ASM):00244          ORG RTKORG
+4B00                  (          RRF.ASM):00245         TANKST RMB 3
+4B03                  (          RRF.ASM):00246         SQST RMB 3
+4B06                  (          RRF.ASM):00247         SQPIC RMB 2
+4B08                  (          RRF.ASM):00248         TNGPIC RMB 2
+4B0A                  (          RRF.ASM):00249         TNKPIC RMB 2
+                      (          RRF.ASM):00250         *
+                      (          RRF.ASM):00251         *MARQUEE
+                      (          RRF.ASM):00252         *
+     5700             (          RRF.ASM):00253         RMORG EQU $5700
+                      (          RRF.ASM):00254          ORG RMORG
+5700                  (          RRF.ASM):00255         RMST RMB 3
+                      (          RRF.ASM):00256         *
+                      (          RRF.ASM):00257         *EXPLOSIONS
+                      (          RRF.ASM):00258         *
+     5B40             (          RRF.ASM):00259         RXORG EQU $5B40
+                      (          RRF.ASM):00260          ORG RXORG
+5B40                  (          RRF.ASM):00261         EXINIT RMB 3
+5B43                  (          RRF.ASM):00262         EXST RMB 3
+5B46                  (          RRF.ASM):00263         APST RMB 3
+5B49                  (          RRF.ASM):00264         EXUPD RMB 3
+5B4C                  (          RRF.ASM):00265         PDEATH RMB 3
+5B4F                  (          RRF.ASM):00266         HVEXST RMB 3
+5B52                  (          RRF.ASM):00267         DDEXST RMB 3 DUAL DIAGONALS
+5B55                  (          RRF.ASM):00268         AMAP   RMB    3        ATTRACT MODE APPEAR
+5B58                  (          RRF.ASM):00269         HAPST  RMB    3        HORIZONTAL APPEAR
+5B5B                  (          RRF.ASM):00270         HEXST  RMB    3        HORIZONTAL EXPLODE
+                      (          RRF.ASM):00271         
+                      (          RRF.ASM):00272         *             STINKY LINKY VINCKYS
+                      (          RRF.ASM):00273         
+     77A0             (          RRF.ASM):00274         LOGORG EQU    $77A0          PLACE FOR PROGRAM
+     77A0             (          RRF.ASM):00275         GOV    EQU    LOGORG
+     77A3             (          RRF.ASM):00276         CCV    EQU    GOV+3
+                      (          RRF.ASM):00277         
+     E3D0             (          RRF.ASM):00278         TSCORG EQU $E3D0   HIGH SCORE BULLSHIT
+     E3D0             (          RRF.ASM):00279         PUPHSC EQU TSCORG  POWER UP HIGH SCORE CHECK
+     E3D3             (          RRF.ASM):00280         ENDPRC EQU PUPHSC+3 END OF GAME PROCESSING
+     E3D6             (          RRF.ASM):00281         GODSET EQU ENDPRC+3 ENTER GODS NAME BY OPERATOR
+     E3D9             (          RRF.ASM):00282         HIGHRS EQU GODSET+3 RESET HIGH SCORE TABLE BY OPERATOR
+     E3DC             (          RRF.ASM):00283         HSCHKV EQU HIGHRS+3 CHECK IF HS TABLE LOOKS BASHED
+     E3DF             (          RRF.ASM):00284         HSBUTV EQU HSCHKV+3 HIGH SCORE RESET BUTTON
+                      (          RRF.ASM):00285         
+     DF40             (          RRF.ASM):00286         TABORG EQU    $DF40
+     DF40             (          RRF.ASM):00287         TABLEV EQU    TABORG
+                      (          RRF.ASM):00288         
+     F000             (          RRF.ASM):00289         TSTORG EQU $F000
+     F000             (          RRF.ASM):00290         PWRUPV EQU TSTORG    
+     F003             (          RRF.ASM):00291         ADVSW EQU PWRUPV+3
+     F006             (          RRF.ASM):00292         AUTOCY EQU ADVSW+3
+     F009             (          RRF.ASM):00293         HXINIT EQU AUTOCY+3
+     F00C             (          RRF.ASM):00294         HEXSTX EQU HXINIT+3
+     F00F             (          RRF.ASM):00295         HAPSTX EQU HEXSTX+3
+     F012             (          RRF.ASM):00296         HXUPD EQU HAPSTX+3
+     F015             (          RRF.ASM):00297         WLOOPV EQU HXUPD+3
+     F017             (          RRF.ASM):00298         ELOOPV EQU WLOOPV+2
+     F019             (          RRF.ASM):00299         L2     EQU    ELOOPV+2
+     F01B             (          RRF.ASM):00300         L0     EQU    L2+2
+                      (          RRF.ASM):00301         
+     6F00             (          RRF.ASM):00302         TSBORG EQU $6F00 ADJUST PART OF TEST MODE
+     6F00             (          RRF.ASM):00303         ADJV   EQU TSBORG
+     6F03             (          RRF.ASM):00304         CMINIT EQU ADJV+3
+     6F06             (          RRF.ASM):00305         ATMCK  EQU CMINIT+3
+     6F09             (          RRF.ASM):00306         GETLT  EQU ATMCK+3     ROUTINE TO GET LETTERS FROM CONTROL PANEL
+     6F0C             (          RRF.ASM):00307         CMSMVV EQU GETLT+3
+     6F0F             (          RRF.ASM):00308         DOPMES EQU    CMSMVV+3   2 BYTER
+                      (          RRF.ASM):00309         
+     5F90             (          RRF.ASM):00310         TXORG  EQU    $5F90    PLACE FOR TEXT PROGRAM
+     5F90             (          RRF.ASM):00311         PR35V  EQU    TXORG
+     5F93             (          RRF.ASM):00312         PR57V  EQU    PR35V+3
+     5F96             (          RRF.ASM):00313         WRD5V  EQU    PR57V+3
+     5F99             (          RRF.ASM):00314         WRD7V  EQU    WRD5V+3
+     5F9C             (          RRF.ASM):00315         PRINV  EQU    WRD7V+3
+     5F9F             (          RRF.ASM):00316         PRSCR  EQU    PRINV+3
+                      (          RRF.ASM):00317         
+     5F96             (          RRF.ASM):00318         WRD5FV EQU    WRD5V
+     5F99             (          RRF.ASM):00319         WRD7FV EQU    WRD7V
+     5F90             (          RRF.ASM):00320         PRN5FV EQU    PR35V
+     5F93             (          RRF.ASM):00321         PRN7FV EQU    PR57V
+                      (          RRF.ASM):00322         
+     E9C8             (          RRF.ASM):00323         SETORG EQU    $E9C8    CHARACTER SET
+     E9C8             (          RRF.ASM):00324         TAB35  EQU    SETORG
+     E9CA             (          RRF.ASM):00325         TAB57  EQU    TAB35+2
+     E9CA             (          RRF.ASM):00326         N0V    EQU    TAB57  
+                      (          RRF.ASM):00327         
+                      (          RRF.ASM):00328         *
+                      (          RRF.ASM):00329         *BASE PAGE RAM AREA
+                      (          RRF.ASM):00330         *
+                      (          RRF.ASM):00331          ORG $9800
+     9800             (          RRF.ASM):00332         RAM EQU *
+     98               (          RRF.ASM):00333          SETDP $98
+                      (          RRF.ASM):00334         
+9800                  (          RRF.ASM):00335         PCRAM RMB 16 PSEUDO COLOR RAM
+9810                  (          RRF.ASM):00336         TIMER RMB 1  IRQ TIMER
+9811                  (          RRF.ASM):00337         ACTIVE RMB    2        POINTER TO LIST OF CURRENTLY ACTIVE (SLEEPING) PROCS.
+9813                  (          RRF.ASM):00338         FREE   RMB    2        POINTER TO LIST OF UNALLOCATED PROCESS SLEEP SPACE.
+9815                  (          RRF.ASM):00339         CRPROC RMB    2        POINTER TO SLEEP AREA OF CURRENTLY EXECUTING PROCESS.
+9817                  (          RRF.ASM):00340         OPTR RMB 2 MOTION OBJECT LIST POINTER
+9819                  (          RRF.ASM):00341         OBPTR RMB 2 OBSTACLE LIST POINTER
+981B                  (          RRF.ASM):00342         OFREE RMB 2 FREE LIST POINTER
+981D                  (          RRF.ASM):00343         SPFREE RMB 2 SUPER PROCESS FREE LIST
+981F                  (          RRF.ASM):00344         HPTR RMB 2 HUMAN PTR
+9821                  (          RRF.ASM):00345         RPTR RMB 2 ROBOT LIST
+9823                  (          RRF.ASM):00346         PPTR RMB 2 PHATAL OBJECT LIST
+9825                  (          RRF.ASM):00347         ITEMP RMB 2 INTERUPT TEMP
+9827                  (          RRF.ASM):00348         PSTIN RMB 2
+9829                  (          RRF.ASM):00349         ITEMP2 RMB 2
+982B                  (          RRF.ASM):00350         XTEMP  RMB 2 SAVE AREA FOR QUICK TEMPORARY
+982D                  (          RRF.ASM):00351         XTEMP2 RMB 2
+982F                  (          RRF.ASM):00352         PIA01 RMB 1 N-1 PIA0
+9830                  (          RRF.ASM):00353         PIA02 RMB 1 N-2 PIA0
+9831                  (          RRF.ASM):00354         PIA21 RMB 1 N-1 PIA2
+9832                  (          RRF.ASM):00355         PIA22 RMB 1 N-2 PIA2
+9833                  (          RRF.ASM):00356         SWPROC RMB 12 SWITCH SCAN TEMP
+983F                  (          RRF.ASM):00357         CURPLR RMB 1 CURRENT
+9840                  (          RRF.ASM):00358         PLRCNT RMB 1 NUMBER OF PLAYERS
+9841                  (          RRF.ASM):00359         XXX2 RMB 1 '80' IRQ LINE
+9842                  (          RRF.ASM):00360         OVCNT RMB 1 OVERFLOW COUNT
+9843                  (          RRF.ASM):00361         IFLG RMB 1 IRQ FLAG
+9844                  (          RRF.ASM):00362         FRAME RMB 1 IRQ COUNT
+9845                  (          RRF.ASM):00363         RWCTMP RMB 1 SCREEN READ CONTROL BYTE
+9846                  (          RRF.ASM):00364         REPLA RMB 2 REPLAY LEVEL
+9848                  (          RRF.ASM):00365         PCFLG RMB 1 PLAYER COLLISION
+9849                  (          RRF.ASM):00366         HTABX RMB 2 HUMAN TABLE INDEX
+                      (          RRF.ASM):00367         *COIN BUSINESS
+984B                  (          RRF.ASM):00368         SLMCNT RMB 1
+984C                  (          RRF.ASM):00369         LCCNT RMB 1
+984D                  (          RRF.ASM):00370         RCCNT RMB 1
+984E                  (          RRF.ASM):00371         CCCNT RMB 1
+984F                  (          RRF.ASM):00372         BUNITS RMB 1
+9850                  (          RRF.ASM):00373         CUNITS RMB 1
+9851                  (          RRF.ASM):00374         CREDIT RMB 1
+                      (          RRF.ASM):00375         *ATTRACT SWITCHES: FONY PRAYAH CONTLOHL
+9852                  (          RRF.ASM):00376         ATRSW2 RMB 1
+9853                  (          RRF.ASM):00377         ATRSW3 RMB 1
+                      (          RRF.ASM):00378         *SOUND RAM
+9854                  (          RRF.ASM):00379         SNDX RMB 2 TABLE INDEX
+9856                  (          RRF.ASM):00380         SNDPRI RMB 1 PRIORITY
+9857                  (          RRF.ASM):00381         SNDTMR RMB 1
+9858                  (          RRF.ASM):00382         SNDREP RMB 1
+                      (          RRF.ASM):00383         *
+                      (          RRF.ASM):00384         *STATUS FLAG
+                      (          RRF.ASM):00385         *B7=GAME OVER
+                      (          RRF.ASM):00386         *B6=
+                      (          RRF.ASM):00387         *B5=
+                      (          RRF.ASM):00388         *B4=PLAYER OUTPUT
+                      (          RRF.ASM):00389         *B3=MOTION OBJS VEL +ENEMIES
+                      (          RRF.ASM):00390         *B2=EXPLOSION UPDATE
+                      (          RRF.ASM):00391         *B1=POST ,MOT OBJ REFRESH
+                      (          RRF.ASM):00392         *B0=PLAYER MOTION,COLLISION,FIRE
+9859                  (          RRF.ASM):00393         STATUS RMB 1
+                      (          RRF.ASM):00394         *
+                      (          RRF.ASM):00395         *PLAYER OBJECT STRUCTURE
+                      (          RRF.ASM):00396         *
+     985A             (          RRF.ASM):00397         PLOBJ EQU *
+985A                  (          RRF.ASM):00398          RMB 2 OLINK
+985C                  (          RRF.ASM):00399         PPICT RMB 2 OPICT
+985E                  (          RRF.ASM):00400         PX RMB 2 OBJX
+9860                  (          RRF.ASM):00401          RMB 2 OBJID
+9862                  (          RRF.ASM):00402          RMB 2 OCVECT
+9864                  (          RRF.ASM):00403         PX16 RMB 2  OX16
+9866                  (          RRF.ASM):00404         PY16 RMB 2  OY16
+9868                  (          RRF.ASM):00405         PXV RMB 2   OXV
+986A                  (          RRF.ASM):00406         PYV RMB 2   OYV
+986C                  (          RRF.ASM):00407          RMB 1 OFLAV
+986D                  (          RRF.ASM):00408         PODATA RMB 1 ODATA
+986E                  (          RRF.ASM):00409         POLDPC RMB 2 OLDPIC
+9870                  (          RRF.ASM):00410         PLAIMC RMB 1 PLAYER ANIMATION RATE
+9871                  (          RRF.ASM):00411         PLAIMN RMB 1 PLAYER ANIMATION NUMBER
+9872                  (          RRF.ASM):00412         PLAIMB RMB 2 PLAYER ANIMATION BASE ADDR
+                      (          RRF.ASM):00413         *
+                      (          RRF.ASM):00414         *COLLISION ROUTINE PARAMETERS
+                      (          RRF.ASM):00415         *
+9874                  (          RRF.ASM):00416         XCNT RMB 1 SCAN COUNTS
+9875                  (          RRF.ASM):00417         YCNT RMB 1
+9876                  (          RRF.ASM):00418         OX1 RMB 1 OFFSETS
+9877                  (          RRF.ASM):00419         OY1 RMB 1
+9878                  (          RRF.ASM):00420         PX1 RMB 1
+9879                  (          RRF.ASM):00421         PY1 RMB 1
+987A                  (          RRF.ASM):00422         OBW RMB 1 HT TEMPS
+987B                  (          RRF.ASM):00423         PLW RMB 1
+987C                  (          RRF.ASM):00424         ULX RMB 1 UPPER LEFT COORD
+987D                  (          RRF.ASM):00425         ULY RMB 1 "
+987E                  (          RRF.ASM):00426         LRX RMB 1
+987F                  (          RRF.ASM):00427         LRY RMB 1
+9880                  (          RRF.ASM):00428         CTEMP RMB 2 INDEX TEMP
+9882                  (          RRF.ASM):00429         CTEMP2 RMB 2
+                      (          RRF.ASM):00430         *RANDOM VARIABLES
+9884                  (          RRF.ASM):00431         SEED   RMB    1
+9885                  (          RRF.ASM):00432         HSEED  RMB    1 
+9886                  (          RRF.ASM):00433         LSEED  RMB    1
+                      (          RRF.ASM):00434         *LASER
+9887                  (          RRF.ASM):00435         LCNT RMB 1
+9888                  (          RRF.ASM):00436         LASDIR RMB 2
+                      (          RRF.ASM):00437         *SPARKS
+988A                  (          RRF.ASM):00438         SPKCNT RMB 1
+988B                  (          RRF.ASM):00439         ROBST RMB 2 PTR TO ROBOT LIST
+988D                  (          RRF.ASM):00440         SAVCNT RMB 1 HUMAN COUNT SAVED
+988E                  (          RRF.ASM):00441         BCMCNT RMB 1 BRAIN CRUISE MISSILES
+                      (          RRF.ASM):00442         *POST ANIMATION+WALL COLOR
+988F                  (          RRF.ASM):00443         WALCOL RMB 1 WALL+POST BG
+9890                  (          RRF.ASM):00444         PSTCOL RMB 1 POST COLOR
+9891                  (          RRF.ASM):00445         LASCOL RMB 1 LASER WALL COLLIDE COLOR
+9892                  (          RRF.ASM):00446         PSTREF RMB 1 POST REFRESH RATE
+9893                  (          RRF.ASM):00447         PSTANI RMB 2 CURR POST ANIMATION
+9895                  (          RRF.ASM):00448         BRNFLG RMB 1 BRAIN HUMAN KILL FLAG
+                      (          RRF.ASM):00449         *
+                      (          RRF.ASM):00450         *EXPLOSION STUFF
+9896                  (          RRF.ASM):00451         EXPRAM RMB $10
+98A6                  (          RRF.ASM):00452         CENTMP RMB 2 CENTER OF BLOW
+98A8                  (          RRF.ASM):00453         HXRAM RMB $10
+98B8                  (          RRF.ASM):00454         DXRAM RMB $10
+98C8                  (          RRF.ASM):00455         RMRAM RMB 6 MARQUEE RAM
+                      (          RRF.ASM):00456         
+                      (          RRF.ASM):00457         ************************ LINKYS STINKYS
+                      (          RRF.ASM):00458         
+98CE                  (          RRF.ASM):00459         INDIAG RMB    1
+                      (          RRF.ASM):00460         
+                      (          RRF.ASM):00461         *
+                      (          RRF.ASM):00462         *      TEXT VARIABLES
+                      (          RRF.ASM):00463         *
+                      (          RRF.ASM):00464         
+98CF                  (          RRF.ASM):00465         TEXCOL RMB    1 (TEXCOL)  PRINTING COLOR (NIBBLES REPRESENT FLAVOR COLO
+98D0                  (          RRF.ASM):00466         TXFLAV RMB    1 (TXFLAV) FLAVOR OF CURRENT CURSOR (0=EVEN, 1=ODD)
+98D1                  (          RRF.ASM):00467         TXLEAD RMB    1 (TXLEAD) LEAD ZERO BLANKING ON/OFF (0=OFF, 1=ON)
+98D2                  (          RRF.ASM):00468         TXFONT RMB    1 (TXFONT) FONT HEIGHT (5 OR 7) PIXELS
+98D3                  (          RRF.ASM):00469         TEXMAR RMB    2        CURRENT LEFT MARGIN CURSOR POINTER
+98D5                  (          RRF.ASM):00470         TEXMFL RMB    1        CURRENT LEFT MARGIN FLAVOR
+98D6                  (          RRF.ASM):00471         TEXTP3 RMB    1
+98D7                  (          RRF.ASM):00472         TXCLIP RMB    1
+                      (          RRF.ASM):00473         
+                      (          RRF.ASM):00474         *
+                      (          RRF.ASM):00475         ***    GET LETTER ROUTINE RAM
+                      (          RRF.ASM):00476         *
+                      (          RRF.ASM):00477         
+98D8                  (          RRF.ASM):00478         GETLRM RMB    2
+98DA                  (          RRF.ASM):00479         GETLST RMB    3
+                      (          RRF.ASM):00480         
+                      (          RRF.ASM):00481         ********************* LOGO RAM
+                      (          RRF.ASM):00482         
+98DD                  (          RRF.ASM):00483         LOGX   RMB    2
+98DF                  (          RRF.ASM):00484         LOGCOL RMB    1
+98E0                  (          RRF.ASM):00485         LOGCL2 RMB    1
+98E1                  (          RRF.ASM):00486         LOGCNT RMB    1
+98E2                  (          RRF.ASM):00487         LOGSAV RMB    2
+98E4                  (          RRF.ASM):00488         LOGCST RMB    2
+                      (          RRF.ASM):00489         
+98E6                  (          RRF.ASM):00490         LASTX  RMB    2
+98E8                  (          RRF.ASM):00491         SIDE   RMB    1
+98E9                  (          RRF.ASM):00492         BALCOL RMB    1
+98EA                  (          RRF.ASM):00493         SLIDER RMB    1
+98EB                  (          RRF.ASM):00494         ERPTR  RMB    2
+                      (          RRF.ASM):00495         *MOVE THIS SOMEDAY
+98ED                  (          RRF.ASM):00496         ENFCNT RMB 1
+98EE                  (          RRF.ASM):00497         GAMTIM RMB 1 GAME TIMER
+98EF                  (          RRF.ASM):00498         TNKSPD RMB 1 TANK SPEED PARAMETER
+98F0                  (          RRF.ASM):00499         SCRFLG RMB 1 SCORE FLAG
+98F1                  (          RRF.ASM):00500         SHLCNT RMB 1 SHELL COUNTER
+98F2                  (          RRF.ASM):00501         RIPFLG RMB 1                            
+98F3                  (          RRF.ASM):00502         HCK1   RMB 1
+98F4                  (          RRF.ASM):00503         ATFLAG RMB 1  INDICATE WHAT PAGE AND HOW
+                      (          RRF.ASM):00504         
+                      (          RRF.ASM):00505         *
+                      (          RRF.ASM):00506         *TABLE DATA
+                      (          RRF.ASM):00507         *
+                      (          RRF.ASM):00508          ORG RAM+$100 PAST BASE PAGE
+                      (          RRF.ASM):00509         *
+                      (          RRF.ASM):00510         *MASTER OBJECT LIST
+                      (          RRF.ASM):00511         *
+     9900             (          RRF.ASM):00512         OLIST EQU * 
+     0018             (          RRF.ASM):00513         OSIZE EQU $18
+                      (          RRF.ASM):00514         *
+                      (          RRF.ASM):00515         *INDEX OFFSETS
+                      (          RRF.ASM):00516         *
+     0000             (          RRF.ASM):00517         OLINK EQU 0 LINK TO NEXT
+     0002             (          RRF.ASM):00518         OPICT EQU 2 PICTURE DESCRIPTOR ADDR
+     0004             (          RRF.ASM):00519         OBJX EQU 4 UPPER LEFT SCREEN X
+     0005             (          RRF.ASM):00520         OBJY EQU 5 UPPER LEFT SCREEN Y
+     0006             (          RRF.ASM):00521         OBJID EQU 6 ASSOCIATED PROCESS ID (IF ANY)
+     0008             (          RRF.ASM):00522         OCVECT EQU 8 COLLISION ROUTINE ADDR
+     000A             (          RRF.ASM):00523         OX16 EQU $A 16 BIT X WORLD COORD
+     000C             (          RRF.ASM):00524         OY16 EQU $C 16 BIT Y WORLD COORD
+     000E             (          RRF.ASM):00525         OXV EQU $E X VELOCITY
+     0010             (          RRF.ASM):00526         OYV EQU $10 Y VELOCITY
+     0012             (          RRF.ASM):00527         OFLAV EQU $12 OLD FLAVOR
+     0013             (          RRF.ASM):00528         ODATA EQU $13 MISC. DATA
+     0014             (          RRF.ASM):00529         OLDPIC EQU $14 OLD PICTURE TO ERASE
+     0016             (          RRF.ASM):00530         FONIPC EQU $16 FONY PICT FOR COLLISION PURPOSES
+                      (          RRF.ASM):00531         *RESERVE AREA
+9900                  (          RRF.ASM):00532          RMB (180)*OSIZE
+     A9E0             (          RRF.ASM):00533         OLEND EQU *
+                      (          RRF.ASM):00534         *
+                      (          RRF.ASM):00535         *USER DEFINED PROCESS TYPES
+                      (          RRF.ASM):00536         *
+     0000             (          RRF.ASM):00537         STYPE EQU 0 SYSTEM PROCESS
+     0001             (          RRF.ASM):00538         CTYPE EQU 1 COIN
+                      (          RRF.ASM):00539         *
+                      (          RRF.ASM):00540         *SLEEPING PROCESS TABLE
+                      (          RRF.ASM):00541         *
+     A9E0             (          RRF.ASM):00542         PTAB EQU *
+                      (          RRF.ASM):00543         *
+                      (          RRF.ASM):00544         *OFFSET CONSTANTS 
+                      (          RRF.ASM):00545         *
+     0000             (          RRF.ASM):00546         PLINK EQU 0
+     0002             (          RRF.ASM):00547         PADDR EQU 2
+     0004             (          RRF.ASM):00548         PTIME EQU 4
+     0005             (          RRF.ASM):00549         PTYPE EQU 5
+     0006             (          RRF.ASM):00550         PCOD EQU 6
+     0007             (          RRF.ASM):00551         PDATA EQU 7
+     0007             (          RRF.ASM):00552         PD EQU 7
+     0008             (          RRF.ASM):00553         PD1 EQU 8
+     0009             (          RRF.ASM):00554         PD2 EQU 9
+     000A             (          RRF.ASM):00555         PD3 EQU 10
+     000B             (          RRF.ASM):00556         PD4 EQU 11
+     000C             (          RRF.ASM):00557         PD5 EQU 12
+     000D             (          RRF.ASM):00558         PD6 EQU 13
+     000E             (          RRF.ASM):00559         PD7 EQU 14
+     000F             (          RRF.ASM):00560         PSIZE EQU 15
+A9E0                  (          RRF.ASM):00561          RMB 15*(120)
+     B0E8             (          RRF.ASM):00562         TABEND EQU *
+                      (          RRF.ASM):00563         *
+                      (          RRF.ASM):00564         *SUPER PROCESSES
+                      (          RRF.ASM):00565         *
+     001F             (          RRF.ASM):00566         SPSIZE EQU PSIZE+16
+B0E8                  (          RRF.ASM):00567         SPTAB RMB SPSIZE*20
+     B354             (          RRF.ASM):00568         SPTEND EQU *
+                      (          RRF.ASM):00569         *
+                      (          RRF.ASM):00570         *OBJECT PICTURE STRUCTURE
+                      (          RRF.ASM):00571         *
+     0000             (          RRF.ASM):00572         OBJW EQU 0
+     0001             (          RRF.ASM):00573         OBJH EQU 1
+     0002             (          RRF.ASM):00574         OBJDAT EQU 2
+     0004             (          RRF.ASM):00575         OBJL EQU 4
+                      (          RRF.ASM):00576         *
+                      (          RRF.ASM):00577         *HUMAN TABLE
+                      (          RRF.ASM):00578         *
+B354                  (          RRF.ASM):00579         HTAB RMB 80
+     B3A4             (          RRF.ASM):00580         HTBEND EQU *
+                      (          RRF.ASM):00581         *
+                      (          RRF.ASM):00582         *POST REFRESH LIST
+                      (          RRF.ASM):00583         *
+B3A4                  (          RRF.ASM):00584         PSLIST RMB 64 POST LIST
+     B3E4             (          RRF.ASM):00585         PSLEND EQU *
+                      (          RRF.ASM):00586         *
+                      (          RRF.ASM):00587         *HORIZONTAL EXPLOSION TABLES
+                      (          RRF.ASM):00588         *
+B3E4                  (          RRF.ASM):00589         HXTAB RMB $800
+                      (          RRF.ASM):00590         
+                      (          RRF.ASM):00591         *
+                      (          RRF.ASM):00592         *DIAGONAL XPLOSION TABLES
+                      (          RRF.ASM):00593         *
+BBE4                  (          RRF.ASM):00594         DXTAB RMB $200
+                      (          RRF.ASM):00595         *
+                      (          RRF.ASM):00596         *PLAYER DATA TABLE
+                      (          RRF.ASM):00597         *
+     BDE4             (          RRF.ASM):00598         PLDATA EQU *
+BDE4                  (          RRF.ASM):00599         ZP1SCR RMB 4 SCORE MSB 1ST
+BDE8                  (          RRF.ASM):00600         ZP1RP RMB 4 NEXT REPLAY LEVEL
+BDEC                  (          RRF.ASM):00601         ZP1LAS RMB 1 #OF LASERS 
+BDED                  (          RRF.ASM):00602         ZP1WAV RMB 1 WAVE # IN HEX
+BDEE                  (          RRF.ASM):00603         ZP1ENM RMB 50 ENEMY STATE
+     BE20             (          RRF.ASM):00604         ZP1END EQU *
+BE20                  (          RRF.ASM):00605         ZP2SCR RMB 4
+BE24                  (          RRF.ASM):00606         ZP2RP RMB 4
+BE28                  (          RRF.ASM):00607         ZP2LAS RMB 1
+BE29                  (          RRF.ASM):00608         ZP2WAV RMB 1
+BE2A                  (          RRF.ASM):00609         ZP2ENM RMB 50
+     BE5C             (          RRF.ASM):00610         PLDEND EQU * END OF PLAYER DATA
+     003C             (          RRF.ASM):00611         PLDLEN EQU ZP1END-PLDATA
+     0000             (          RRF.ASM):00612         PSCOR EQU ZP1SCR-PLDATA
+     0004             (          RRF.ASM):00613         PRPLA EQU ZP1RP-PLDATA
+     0008             (          RRF.ASM):00614         PLAS EQU ZP1LAS-PLDATA
+     0009             (          RRF.ASM):00615         PWAV EQU ZP1WAV-PLDATA
+     000A             (          RRF.ASM):00616         PENEMY EQU ZP1ENM-PLDATA
+                      (          RRF.ASM):00617         *
+                      (          RRF.ASM):00618         *ENEMIES LIST
+                      (          RRF.ASM):00619         *WARNING DO NOT CHANGE ORDER OF COUNTS
+     BE5C             (          RRF.ASM):00620         ELIST EQU *
+BE5C                  (          RRF.ASM):00621         ROBSPD RMB 1  SPEED
+BE5D                  (          RRF.ASM):00622         RMXSPD RMB 1 MAX ROBOT SPEED
+BE5E                  (          RRF.ASM):00623         ENFNUM RMB 1 # OF ENFORCERS/CIRCLE X2
+BE5F                  (          RRF.ASM):00624         ENSTIM RMB 1 ENF SHOT TIMER
+BE60                  (          RRF.ASM):00625         CDPTIM RMB 1 CIRCLE DROP TIMER
+BE61                  (          RRF.ASM):00626         HLKSPD RMB 1 HULK SPEED
+BE62                  (          RRF.ASM):00627         BSHTIM RMB 1 BRAIN SHOT TIMER
+BE63                  (          RRF.ASM):00628         BRNSPD RMB 1 BRAIN SPEED
+BE64                  (          RRF.ASM):00629         TNKSHT RMB 1  TANK SHOT RATE
+BE65                  (          RRF.ASM):00630         SHLSPD RMB 1  SHELL SPEED
+BE66                  (          RRF.ASM):00631         TDPTIM RMB 1  TANK DROP TIMR
+BE67                  (          RRF.ASM):00632         SQSPD RMB 1   SQUARE SPEED
+     BE68             (          RRF.ASM):00633         ECNTS EQU * START COUNTS
+BE68                  (          RRF.ASM):00634         ROBCNT RMB 1 # ROBOTS
+BE69                  (          RRF.ASM):00635         PSTCNT RMB 1 # POSTS
+BE6A                  (          RRF.ASM):00636         MOMCNT RMB 1 # MOM UNITS
+BE6B                  (          RRF.ASM):00637         DADCNT RMB 1 # DAD UNITS
+BE6C                  (          RRF.ASM):00638         KIDCNT RMB 1 # KIDS
+BE6D                  (          RRF.ASM):00639         HLKCNT RMB 1 # HULKS
+BE6E                  (          RRF.ASM):00640         BRNCNT RMB 1 # BRAINS
+BE6F                  (          RRF.ASM):00641         CIRCNT RMB 1 # CIRCLES
+BE70                  (          RRF.ASM):00642         SQCNT RMB 1 # SQUARES
+BE71                  (          RRF.ASM):00643         TNKCNT RMB 1 # TANKS
+     BE72             (          RRF.ASM):00644         ELEND EQU *
+BE72                  (          RRF.ASM):00645         HCK2 RMB 1
+                      (          RRF.ASM):00646         *
+                      (          RRF.ASM):00647         * CMOS RAM ALLOCATION
+                      (          RRF.ASM):00648         *
+                      (          RRF.ASM):00649          ORG CMOS+$100     WRITABLE CMOS  
+CD00                  (          RRF.ASM):00650         CREDST RMB 2 CREDITS BACKUP
+CD02                  (          RRF.ASM):00651         SLOT1 RMB 6 1 LEFT COIN TOTAL
+CD08                  (          RRF.ASM):00652               RMB 6 2 CENTER COIN TOTAL
+CD0E                  (          RRF.ASM):00653               RMB 6 3 RIGHT COIN TOTAL
+CD14                  (          RRF.ASM):00654                RMB 6 4 TOTAL PAID CREDITS
+CD1A                  (          RRF.ASM):00655                RMB 6 5 TOTAL REPLAYS
+CD20                  (          RRF.ASM):00656         BKTIME RMB 6 6 FLIGHT TIME IN MINS
+CD26                  (          RRF.ASM):00657         BKMEN  RMB 6 7 TOTAL SHIPS PLAYED
+CD2C                  (          RRF.ASM):00658         BKPLAY RMB 6 8 TOTAL GAMES PLAYED
+     CD32             (          RRF.ASM):00659         BKEND  EQU    *        END OF BOOKKEEPING STUFF
+     000E             (          RRF.ASM):00660         SCRSIZ EQU 14 NUMBER OF NIBBLES IN A SCORE ENTRY
+CD32                  (          RRF.ASM):00661         GODINT RMB 6
+CD38                  (          RRF.ASM):00662         GODSCR RMB 48   
+CD68                  (          RRF.ASM):00663         CMSCOR RMB 37*SCRSIZ   37 BACKED UP SCORES, 36 OF WHICH ARE VISIBLE
+CF6E                  (          RRF.ASM):00664         TODAYS RMB 10*SCRSIZ     TODAYS GREATEST
+     CFFA             (          RRF.ASM):00665         TODEND EQU *
+                      (          RRF.ASM):00666          ORG CMOS  ADEQUATE BIRTH CONTROL PROTECTION
+CC00                  (          RRF.ASM):00667         REPLAY RMB 2 REPLAY LEVEL
+CC02                  (          RRF.ASM):00668         NSHIP RMB 2 # OF SHIPS/1 CREDIT GAME
+CC04                  (          RRF.ASM):00669         COINSL RMB 2 FOR COINAGE SELECT MODE
+CC06                  (          RRF.ASM):00670         SLOT1M RMB 2 LEFT COIN MULT
+CC08                  (          RRF.ASM):00671         SLOT2M RMB 2 CENTER COIN MULT
+CC0A                  (          RRF.ASM):00672         SLOT3M RMB 2 RIGHT COIN MULT
+CC0C                  (          RRF.ASM):00673         CUNITC RMB 2 COIN UNITS PER CREDIT
+CC0E                  (          RRF.ASM):00674         CUNITB RMB 2 COIN UNITS FOR BONUS
+CC10                  (          RRF.ASM):00675         MINUNT RMB 2 MINIMUM REQD
+CC12                  (          RRF.ASM):00676         FREEPL RMB 2 FREE PLAY MODE       (ONE CREDIT GAME)     
+CC14                  (          RRF.ASM):00677         GA1 RMB 2 10 MASTER DIFFICULTY CONTROL               1
+CC16                  (          RRF.ASM):00678         GA2 RMB 2 NUMBER OF LETTERS ALLOWED TO GOD           10
+CC18                  (          RRF.ASM):00679         SPECFN RMB 2  RESTORE FACTORY SETTINGS
+CC1A                  (          RRF.ASM):00680          RMB 2  CLEAR AUDIT TOTALS
+CC1C                  (          RRF.ASM):00681          RMB 2  INITIALIZE HIGH SCORE TABLE
+CC1E                  (          RRF.ASM):00682          RMB 2  INTIATE AUTO CYCLE
+CC20                  (          RRF.ASM):00683          RMB 2  ENTER ATTRACT MODE MESSAGE
+CC22                  (          RRF.ASM):00684          RMB 2  ENTER HIGHEST SCORE NAME
+     CC24             (          RRF.ASM):00685         ENDADJ EQU *
+CC24                  (          RRF.ASM):00686         OPMESS RMB 100  2 LINES OF 25 CHARS EACH.
+CC88                  (          RRF.ASM):00687         OPL1 RMB 2
+CC8A                  (          RRF.ASM):00688         OPL2 RMB 2
+CC8C                  (          RRF.ASM):00689         ADJSUM RMB 2
+CC8E                  (          RRF.ASM):00690         OMESUM RMB 2
+                      (          RRF.ASM):00691         
+                      (          RRF.ASM):00692         *
+                      (          RRF.ASM):00693         *M A C R O S
+                      (          RRF.ASM):00694         *
+CC90                  (          RRF.ASM):00695         NAP    MACRO
+                      (          RRF.ASM):00696                LDA #\1 TIME
+                      (          RRF.ASM):00697                LDX #\2 WAKEUP ADDR
+                      (          RRF.ASM):00698                JMP    SLEEP  
+                      (          RRF.ASM):00699                ENDM
+                      (          RRF.ASM):00700         *
+                      (          RRF.ASM):00701         *MAKE A NEW PROCESS
+                      (          RRF.ASM):00702         *
+CC90                  (          RRF.ASM):00703         NEWP MACRO
+                      (          RRF.ASM):00704          LDX #\1 ADDR
+                      (          RRF.ASM):00705          LDA #\2 TYPE
+                      (          RRF.ASM):00706          JSR MKPROC
+                      (          RRF.ASM):00707          ENDM
+                      (          RRF.ASM):00708         *INIT PROCESS \0=SADDR 
+CC90                  (          RRF.ASM):00709         MAKP MACRO
+                      (          RRF.ASM):00710          JSR MAKEP
+                      (          RRF.ASM):00711          FDB \1
+                      (          RRF.ASM):00712          ENDM
+                      (          RRF.ASM):00713         *MAKE A PROCESS AND OBJECT
+CC90                  (          RRF.ASM):00714         MKPROB MACRO
+                      (          RRF.ASM):00715          JSR MPROB
+                      (          RRF.ASM):00716          FDB \1,\2,\3
+                      (          RRF.ASM):00717          ENDM
+                      (          RRF.ASM):00718         
+                      (       RRFRED.ASM):00004         
+     CA06             (       RRFRED.ASM):00005         HORIZ  EQU    $CA06
+     CA04             (       RRFRED.ASM):00006         DEST   EQU    $CA04
+     CA02             (       RRFRED.ASM):00007         ORIG   EQU    $CA02
+     CA01             (       RRFRED.ASM):00008         CONST  EQU    $CA01
+     CA00             (       RRFRED.ASM):00009         CONTRL EQU    $CA00
+                      (       RRFRED.ASM):00010         
+                      (       RRFRED.ASM):00011         *   MESSAGE NUMBER EQUATES
+                      (       RRFRED.ASM):00012         
+     0000             (       RRFRED.ASM):00013         DMFAIL EQU    0           DMA FAILURE
+     0001             (       RRFRED.ASM):00014         OKM    EQU    1           INTITIAL TESTS SAY OK
+     0002             (       RRFRED.ASM):00015         RERRM  EQU    2           TESTS SAY RAM ERROR.
+     0003             (       RRFRED.ASM):00016         ROMERM EQU    3           TESTS SAY ROM ERROR.
+     0004             (       RRFRED.ASM):00017         ROMOK  EQU    4 
+     0005             (       RRFRED.ASM):00018         RAMOK  EQU    5 
+     0006             (       RRFRED.ASM):00019         CMOK   EQU    6 
+     0007             (       RRFRED.ASM):00020         CMERR  EQU    7 
+     0008             (       RRFRED.ASM):00021         CMDOOR EQU    8 
+     0009             (       RRFRED.ASM):00022         SNDTEX EQU    9 
+     000A             (       RRFRED.ASM):00023         FDROMM EQU    10
+     000B             (       RRFRED.ASM):00024         FDRAMM EQU    11
+     000C             (       RRFRED.ASM):00025         SWTESM EQU    12           MESSAGE SAYING "SWITCH TEST"
+     000D             (       RRFRED.ASM):00026         SWMES1 EQU    13           34-50 ARE SWITCH TEST MESSAGES  
+     001E             (       RRFRED.ASM):00027         CMTSTM EQU    30           COLOR MATRIX TEST ETC.
+     001F             (       RRFRED.ASM):00028         BOOKM  EQU    31
+     0020             (       RRFRED.ASM):00029         AUDMES EQU    32           53-61 ARE AUDIT MESSAGES
+                      (       RRFRED.ASM):00030         *                            40 IS GAME OVER
+     0029             (       RRFRED.ASM):00031         AUDM1  EQU    41           FIRST PART OF 6 DIGIT 
+     002A             (       RRFRED.ASM):00032         AUDM2  EQU    42           SECOND PART OF 6 DIGIT
+     002B             (       RRFRED.ASM):00033         AUDM3  EQU    43           4 DIGIT AUDIT
+     002C             (       RRFRED.ASM):00034         FROBM  EQU    44           DIPLAY OF FROB MESSAGE
+     002D             (       RRFRED.ASM):00035         CONTMS EQU    45           EXTRA MESSAGES FOR FIRST PAGE OF ADJUSTMENTS
+     002E             (       RRFRED.ASM):00036         ADJMES EQU    46           ACTUAL MESSAGE FOR FIRST ADJUSTMENT (REPLAY)-63
+     0040             (       RRFRED.ASM):00037         REPMM1 EQU    64
+     0041             (       RRFRED.ASM):00038         REPMM2 EQU    65
+     0042             (       RRFRED.ASM):00039         NOMESS EQU    66
+     0043             (       RRFRED.ASM):00040         HIVOL  EQU    67
+     0044             (       RRFRED.ASM):00041         RECOM  EQU    68
+     0045             (       RRFRED.ASM):00042         POORP  EQU    69
+     0046             (       RRFRED.ASM):00043         CUSTM  EQU    70 
+     0047             (       RRFRED.ASM):00044         YESM   EQU    71 
+     0048             (       RRFRED.ASM):00045         NOM    EQU    72 
+     0049             (       RRFRED.ASM):00046         EXLIB  EQU    73 
+     004A             (       RRFRED.ASM):00047         LIB    EQU    74 
+                      (       RRFRED.ASM):00048         *                  PLAYER X GAME OVER
+     004C             (       RRFRED.ASM):00049         CONS   EQU    76 
+     004D             (       RRFRED.ASM):00050         EXCON  EQU    77 
+     004E             (       RRFRED.ASM):00051         REPMM3 EQU    78 
+     004F             (       RRFRED.ASM):00052         CMIMES EQU    79 
+     0050             (       RRFRED.ASM):00053         RESMES EQU    80 
+     0051             (       RRFRED.ASM):00054         YES1M  EQU    81 
+     0052             (       RRFRED.ASM):00055         COINM1 EQU    82    82-89   
+     005A             (       RRFRED.ASM):00056         NOREPM EQU    90 
+     005B             (       RRFRED.ASM):00057         BOOKRS EQU    91 
+     005C             (       RRFRED.ASM):00058         OMESM EQU     92 
+     005D             (       RRFRED.ASM):00059         HSRESM EQU    93  
+     005E             (       RRFRED.ASM):00060         GODMES EQU    94 
+     005F             (       RRFRED.ASM):00061         CONG EQU      95 
+     0060             (       RRFRED.ASM):00062         NOWMES EQU    96 
+     0061             (       RRFRED.ASM):00063         HSINDX EQU    97 
+     0062             (       RRFRED.ASM):00064         HIGH1 EQU     98 
+     0063             (       RRFRED.ASM):00065         HIGH3 EQU     99 
+     0064             (       RRFRED.ASM):00066         ONLY5M EQU    100
+     0065             (       RRFRED.ASM):00067         OPCNTM EQU    101
+     0066             (       RRFRED.ASM):00068         REPMM4 EQU    102
+                      (       RRFRED.ASM):00069         *                      PLAYER X  UP        
+                      (       RRFRED.ASM):00070         *                      WAVE X        
+     0069             (       RRFRED.ASM):00071         INDMF  EQU    105
+     006A             (       RRFRED.ASM):00072         AVTIM  EQU    106
+     006B             (       RRFRED.ASM):00073         AVTEND EQU    107
+     006C             (       RRFRED.ASM):00074         AVPLA  EQU    108
+     006D             (       RRFRED.ASM):00075         AVPLEN EQU    109
+     006E             (       RRFRED.ASM):00076         SCRMES EQU    110
+     006F             (       RRFRED.ASM):00077         INDMES EQU    111
+     0070             (       RRFRED.ASM):00078         CPM1   EQU    112
+                      (       RRFRED.ASM):00079         *      BOTTOM COPYRITE MESSAGE   113
+                      (       RRFRED.ASM):00080         *      SECOND HALF OF WAVE MESSAGE 114
+     0073             (       RRFRED.ASM):00081         MMOM   EQU    115
+     0074             (       RRFRED.ASM):00082         MDAD   EQU    116
+     0075             (       RRFRED.ASM):00083         MKID   EQU    117
+     0076             (       RRFRED.ASM):00084         MGRUNT EQU    118
+     0077             (       RRFRED.ASM):00085         MHULK  EQU    119
+     0078             (       RRFRED.ASM):00086         MSPCU  EQU    120
+     0079             (       RRFRED.ASM):00087         MENTK  EQU    121
+     007A             (       RRFRED.ASM):00088         MBRAIN EQU    122
+     007B             (       RRFRED.ASM):00089         COINMF EQU    123
+     007C             (       RRFRED.ASM):00090         MPROG  EQU    124
+     007D             (       RRFRED.ASM):00091         EXTMES EQU    125
+     007E             (       RRFRED.ASM):00092         NULMES EQU    126
+     007F             (       RRFRED.ASM):00093         ACRM   EQU    127
+     0080             (       RRFRED.ASM):00094         TITLEM EQU    128
+     0081             (       RRFRED.ASM):00095         FAMMM  EQU    129
+                      (       RRFRED.ASM):00096         
+     C000             (       RRFRED.ASM):00097         RAMTOP EQU    $C000          TOP OF RAM FOR RAM TEST
+                      (       RRFRED.ASM):00098         
+                      (       RRFRED.ASM):00099                ORG    HXTAB
+B3E4                  (       RRFRED.ASM):00100         EGRAM  RMB    2
+B3E6                  (       RRFRED.ASM):00101         EGRAM2 RMB    2
+B3E8                  (       RRFRED.ASM):00102         PLRX   RMB    2
+B3EA                  (       RRFRED.ASM):00103         ALTBL  RMB    20             PLACE FOR 20 CHAR HIGH SCORE SAVE
+                      (       RRFRED.ASM):00104         
+     B3EA             (       RRFRED.ASM):00105         MESOUT EQU    ALTBL          OPERATOR MESSAGE BUFFER
+     B3EA             (       RRFRED.ASM):00106         RAMALS EQU    ALTBL          DIAGNOSTIC/HIGH SCORE SCRATCH REF.
+     B3EA             (       RRFRED.ASM):00107         CRDRAM EQU    ALTBL   
+                      (       RRFRED.ASM):00108         
+                      (       RRFRED.ASM):00109                ORG    ALTBL+60       DO THE BALL PAST THE OPERATOR MESS AREA
+B426                  (       RRFRED.ASM):00110         ARAM1  RMB    392            WILLI PAGE A-MODE STUFF
+B5AE                  (       RRFRED.ASM):00111         ERLIST RMB    28*2
+     B5E6             (       RRFRED.ASM):00112         EREND  EQU    *
+                      (asm/src/RRSET.ASM):00003         *        OPT    LIS
+                      (asm/src/RRSET.ASM):00004         
+                      (asm/src/RRSET.ASM):00005                ORG    SETORG   SET US HERE
+E9C8 E9CC             (asm/src/RRSET.ASM):00006                FDB    TAB35Z
+E9CA EC34             (asm/src/RRSET.ASM):00007                FDB    TAB57Z
+                      (asm/src/RRSET.ASM):00008         
+E9CC EA2A             (asm/src/RRSET.ASM):00009         TAB35Z FDB    C0
+E9CE EA35             (asm/src/RRSET.ASM):00010                FDB    C1
+E9D0 EA40             (asm/src/RRSET.ASM):00011                FDB    C2
+E9D2 EA4B             (asm/src/RRSET.ASM):00012                FDB    C3
+E9D4 EA56             (asm/src/RRSET.ASM):00013                FDB    C4
+E9D6 EA61             (asm/src/RRSET.ASM):00014                FDB    C5
+E9D8 EA6C             (asm/src/RRSET.ASM):00015                FDB    C6
+E9DA EA77             (asm/src/RRSET.ASM):00016                FDB    C7
+E9DC EA82             (asm/src/RRSET.ASM):00017                FDB    C8
+E9DE EA8D             (asm/src/RRSET.ASM):00018                FDB    C9
+E9E0 EA98             (asm/src/RRSET.ASM):00019                FDB    CSP
+E9E2 EA9E             (asm/src/RRSET.ASM):00020                FDB    CEX
+E9E4 EAA4             (asm/src/RRSET.ASM):00021                FDB    CCO
+E9E6 EAAF             (asm/src/RRSET.ASM):00022                FDB    CPE
+E9E8 EAB5             (asm/src/RRSET.ASM):00023                FDB    CAR
+E9EA EAC5             (asm/src/RRSET.ASM):00024                FDB    ACL
+E9EC EACB             (asm/src/RRSET.ASM):00025                FDB    AHY
+E9EE EAD6             (asm/src/RRSET.ASM):00026                FDB    CA
+E9F0 EAE1             (asm/src/RRSET.ASM):00027                FDB    CB
+E9F2 EAEC             (asm/src/RRSET.ASM):00028                FDB    CCC
+E9F4 EAF7             (asm/src/RRSET.ASM):00029                FDB    CD
+E9F6 EB02             (asm/src/RRSET.ASM):00030                FDB    CE
+E9F8 EB0D             (asm/src/RRSET.ASM):00031                FDB    CF
+E9FA EB18             (asm/src/RRSET.ASM):00032                FDB    CG
+E9FC EB23             (asm/src/RRSET.ASM):00033                FDB    CH
+E9FE EB2E             (asm/src/RRSET.ASM):00034                FDB    CI
+EA00 EB39             (asm/src/RRSET.ASM):00035                FDB    CJ
+EA02 EB44             (asm/src/RRSET.ASM):00036                FDB    CK
+EA04 EB4F             (asm/src/RRSET.ASM):00037                FDB    CL
+EA06 EB5A             (asm/src/RRSET.ASM):00038                FDB    CM
+EA08 EB6A             (asm/src/RRSET.ASM):00039                FDB    CN
+EA0A EB75             (asm/src/RRSET.ASM):00040                FDB    CO
+EA0C EB80             (asm/src/RRSET.ASM):00041                FDB    CP
+EA0E EB8B             (asm/src/RRSET.ASM):00042                FDB    CQ
+EA10 EB96             (asm/src/RRSET.ASM):00043                FDB    CR
+EA12 EBA1             (asm/src/RRSET.ASM):00044                FDB    CS
+EA14 EBAC             (asm/src/RRSET.ASM):00045                FDB    CT
+EA16 EBB7             (asm/src/RRSET.ASM):00046                FDB    CU
+EA18 EBC2             (asm/src/RRSET.ASM):00047                FDB    CV
+EA1A EBCD             (asm/src/RRSET.ASM):00048                FDB    CW
+EA1C EBDD             (asm/src/RRSET.ASM):00049                FDB    CX
+EA1E EBE8             (asm/src/RRSET.ASM):00050                FDB    CY
+EA20 EBF3             (asm/src/RRSET.ASM):00051                FDB    CZ
+EA22 EBFE             (asm/src/RRSET.ASM):00052                FDB    CLP
+EA24 EC09             (asm/src/RRSET.ASM):00053                FDB    CRP
+EA26 EC14             (asm/src/RRSET.ASM):00054                FDB    CFRB
+EA28 EC29             (asm/src/RRSET.ASM):00055                FDB    CSLSH
+                      (asm/src/RRSET.ASM):00056         
+EA2A 03               (asm/src/RRSET.ASM):00057         C0     FCB    3
+EA2B FFF0             (asm/src/RRSET.ASM):00058                FCB    $FF,$F0
+EA2D F0F0             (asm/src/RRSET.ASM):00059                FCB    $F0,$F0
+EA2F F0F0             (asm/src/RRSET.ASM):00060                FCB    $F0,$F0
+EA31 F0F0             (asm/src/RRSET.ASM):00061                FCB    $F0,$F0
+EA33 FFF0             (asm/src/RRSET.ASM):00062                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00063         
+EA35 03               (asm/src/RRSET.ASM):00064         C1     FCB    3
+EA36 0F00             (asm/src/RRSET.ASM):00065                FCB    $0F,$00 
+EA38 0F00             (asm/src/RRSET.ASM):00066                FCB    $0F,$00
+EA3A 0F00             (asm/src/RRSET.ASM):00067                FCB    $0F,$00
+EA3C 0F00             (asm/src/RRSET.ASM):00068                FCB    $0F,$00
+EA3E 0F00             (asm/src/RRSET.ASM):00069                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00070         
+EA40 03               (asm/src/RRSET.ASM):00071         C2     FCB    3
+EA41 FFF0             (asm/src/RRSET.ASM):00072                FCB    $FF,$F0
+EA43 00F0             (asm/src/RRSET.ASM):00073                FCB    $00,$F0
+EA45 FFF0             (asm/src/RRSET.ASM):00074                FCB    $FF,$F0
+EA47 F000             (asm/src/RRSET.ASM):00075                FCB    $F0,$00 
+EA49 FFF0             (asm/src/RRSET.ASM):00076                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00077         
+EA4B 03               (asm/src/RRSET.ASM):00078         C3     FCB    3
+EA4C FFF0             (asm/src/RRSET.ASM):00079                FCB    $FF,$F0
+EA4E 00F0             (asm/src/RRSET.ASM):00080                FCB    $00,$F0
+EA50 0FF0             (asm/src/RRSET.ASM):00081                FCB    $0F,$F0
+EA52 00F0             (asm/src/RRSET.ASM):00082                FCB    $00,$F0
+EA54 FFF0             (asm/src/RRSET.ASM):00083                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00084         
+EA56 03               (asm/src/RRSET.ASM):00085         C4     FCB    3
+EA57 F0F0             (asm/src/RRSET.ASM):00086                FCB    $F0,$F0
+EA59 F0F0             (asm/src/RRSET.ASM):00087                FCB    $F0,$F0
+EA5B FFF0             (asm/src/RRSET.ASM):00088                FCB    $FF,$F0
+EA5D 00F0             (asm/src/RRSET.ASM):00089                FCB    $00,$F0
+EA5F 00F0             (asm/src/RRSET.ASM):00090                FCB    $00,$F0
+                      (asm/src/RRSET.ASM):00091         
+EA61 03               (asm/src/RRSET.ASM):00092         C5     FCB    3
+EA62 FFF0             (asm/src/RRSET.ASM):00093                FCB    $FF,$F0
+EA64 F000             (asm/src/RRSET.ASM):00094                FCB    $F0,$00
+EA66 FFF0             (asm/src/RRSET.ASM):00095                FCB    $FF,$F0
+EA68 00F0             (asm/src/RRSET.ASM):00096                FCB    $00,$F0
+EA6A FFF0             (asm/src/RRSET.ASM):00097                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00098         
+EA6C 03               (asm/src/RRSET.ASM):00099         C6     FCB    3
+EA6D FFF0             (asm/src/RRSET.ASM):00100                FCB    $FF,$F0
+EA6F F000             (asm/src/RRSET.ASM):00101                FCB    $F0,$00
+EA71 FFF0             (asm/src/RRSET.ASM):00102                FCB    $FF,$F0
+EA73 F0F0             (asm/src/RRSET.ASM):00103                FCB    $F0,$F0
+EA75 FFF0             (asm/src/RRSET.ASM):00104                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00105         
+EA77 03               (asm/src/RRSET.ASM):00106         C7     FCB    3
+EA78 FFF0             (asm/src/RRSET.ASM):00107                FCB    $FF,$F0
+EA7A 00F0             (asm/src/RRSET.ASM):00108                FCB    $00,$F0
+EA7C 00F0             (asm/src/RRSET.ASM):00109                FCB    $00,$F0
+EA7E 00F0             (asm/src/RRSET.ASM):00110                FCB    $00,$F0
+EA80 00F0             (asm/src/RRSET.ASM):00111                FCB    $00,$F0
+                      (asm/src/RRSET.ASM):00112         
+EA82 03               (asm/src/RRSET.ASM):00113         C8     FCB    3
+EA83 FFF0             (asm/src/RRSET.ASM):00114                FCB    $FF,$F0
+EA85 F0F0             (asm/src/RRSET.ASM):00115                FCB    $F0,$F0
+EA87 FFF0             (asm/src/RRSET.ASM):00116                FCB    $FF,$F0
+EA89 F0F0             (asm/src/RRSET.ASM):00117                FCB    $F0,$F0
+EA8B FFF0             (asm/src/RRSET.ASM):00118                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00119         
+EA8D 03               (asm/src/RRSET.ASM):00120         C9     FCB    3
+EA8E FFF0             (asm/src/RRSET.ASM):00121                FCB    $FF,$F0
+EA90 F0F0             (asm/src/RRSET.ASM):00122                FCB    $F0,$F0
+EA92 FFF0             (asm/src/RRSET.ASM):00123                FCB    $FF,$F0
+EA94 00F0             (asm/src/RRSET.ASM):00124                FCB    $00,$F0
+EA96 00F0             (asm/src/RRSET.ASM):00125                FCB    $00,$F0
+                      (asm/src/RRSET.ASM):00126         
+EA98 01               (asm/src/RRSET.ASM):00127         CSP    FCB    1
+EA99 00               (asm/src/RRSET.ASM):00128                FCB    $00
+EA9A 00               (asm/src/RRSET.ASM):00129                FCB    $00
+EA9B 00               (asm/src/RRSET.ASM):00130                FCB    $00
+EA9C 00               (asm/src/RRSET.ASM):00131                FCB    $00
+EA9D 00               (asm/src/RRSET.ASM):00132                FCB    $00
+                      (asm/src/RRSET.ASM):00133         
+EA9E 01               (asm/src/RRSET.ASM):00134         CEX    FCB    1
+EA9F F0               (asm/src/RRSET.ASM):00135                FCB    $F0        
+EAA0 F0               (asm/src/RRSET.ASM):00136                FCB    $F0  
+EAA1 F0               (asm/src/RRSET.ASM):00137                FCB    $F0
+EAA2 00               (asm/src/RRSET.ASM):00138                FCB    $00
+EAA3 F0               (asm/src/RRSET.ASM):00139                FCB    $F0
+                      (asm/src/RRSET.ASM):00140         
+EAA4 03               (asm/src/RRSET.ASM):00141         CCO    FCB    3
+EAA5 0000             (asm/src/RRSET.ASM):00142                FCB    $00,$00
+EAA7 0000             (asm/src/RRSET.ASM):00143                FCB    $00,$00
+EAA9 0000             (asm/src/RRSET.ASM):00144                FCB    $00,$00
+EAAB FF00             (asm/src/RRSET.ASM):00145                FCB    $FF,$00
+EAAD 0F00             (asm/src/RRSET.ASM):00146                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00147         
+EAAF 01               (asm/src/RRSET.ASM):00148         CPE    FCB    1
+EAB0 00               (asm/src/RRSET.ASM):00149                FCB    $00
+EAB1 00               (asm/src/RRSET.ASM):00150                FCB    $00
+EAB2 00               (asm/src/RRSET.ASM):00151                FCB    $00
+EAB3 00               (asm/src/RRSET.ASM):00152                FCB    $00
+EAB4 F0               (asm/src/RRSET.ASM):00153                FCB    $F0        
+                      (asm/src/RRSET.ASM):00154         
+EAB5 05               (asm/src/RRSET.ASM):00155         CAR    FCB    5
+EAB6 00F000           (asm/src/RRSET.ASM):00156                FCB    $00,$F0,$00
+EAB9 0FFF00           (asm/src/RRSET.ASM):00157                FCB    $0F,$FF,$00
+EABC FFFFF0           (asm/src/RRSET.ASM):00158                FCB    $FF,$FF,$F0
+EABF 00F000           (asm/src/RRSET.ASM):00159                FCB    $00,$F0,$00
+EAC2 00F000           (asm/src/RRSET.ASM):00160                FCB    $00,$F0,$00
+                      (asm/src/RRSET.ASM):00161         
+EAC5 01               (asm/src/RRSET.ASM):00162         ACL    FCB    1  
+EAC6 00               (asm/src/RRSET.ASM):00163                FCB    $00
+EAC7 F0               (asm/src/RRSET.ASM):00164                FCB    $F0
+EAC8 00               (asm/src/RRSET.ASM):00165                FCB    $00
+EAC9 F0               (asm/src/RRSET.ASM):00166                FCB    $F0
+EACA 00               (asm/src/RRSET.ASM):00167                FCB    $00
+                      (asm/src/RRSET.ASM):00168         
+EACB 03               (asm/src/RRSET.ASM):00169         AHY    FCB    3
+EACC 0000             (asm/src/RRSET.ASM):00170                FCB    $00,$00
+EACE 0000             (asm/src/RRSET.ASM):00171                FCB    $00,$00
+EAD0 FFF0             (asm/src/RRSET.ASM):00172                FCB    $FF,$F0
+EAD2 0000             (asm/src/RRSET.ASM):00173                FCB    $00,$00
+EAD4 0000             (asm/src/RRSET.ASM):00174                FCB    $00,$00
+                      (asm/src/RRSET.ASM):00175         
+EAD6 03               (asm/src/RRSET.ASM):00176         CA     FCB    3
+EAD7 FFF0             (asm/src/RRSET.ASM):00177                FCB    $FF,$F0
+EAD9 F0F0             (asm/src/RRSET.ASM):00178                FCB    $F0,$F0
+EADB FFF0             (asm/src/RRSET.ASM):00179                FCB    $FF,$F0
+EADD F0F0             (asm/src/RRSET.ASM):00180                FCB    $F0,$F0
+EADF F0F0             (asm/src/RRSET.ASM):00181                FCB    $F0,$F0
+                      (asm/src/RRSET.ASM):00182         
+EAE1 03               (asm/src/RRSET.ASM):00183         CB     FCB    3
+EAE2 FFF0             (asm/src/RRSET.ASM):00184                FCB    $FF,$F0
+EAE4 F0F0             (asm/src/RRSET.ASM):00185                FCB    $F0,$F0
+EAE6 FF00             (asm/src/RRSET.ASM):00186                FCB    $FF,$00
+EAE8 F0F0             (asm/src/RRSET.ASM):00187                FCB    $F0,$F0
+EAEA FFF0             (asm/src/RRSET.ASM):00188                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00189         
+EAEC 03               (asm/src/RRSET.ASM):00190         CCC    FCB    3
+EAED FFF0             (asm/src/RRSET.ASM):00191                FCB    $FF,$F0
+EAEF F000             (asm/src/RRSET.ASM):00192                FCB    $F0,$00
+EAF1 F000             (asm/src/RRSET.ASM):00193                FCB    $F0,$00
+EAF3 F000             (asm/src/RRSET.ASM):00194                FCB    $F0,$00
+EAF5 FFF0             (asm/src/RRSET.ASM):00195                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00196         
+EAF7 03               (asm/src/RRSET.ASM):00197         CD     FCB    3
+EAF8 FF00             (asm/src/RRSET.ASM):00198                FCB    $FF,$00
+EAFA F0F0             (asm/src/RRSET.ASM):00199                FCB    $F0,$F0
+EAFC F0F0             (asm/src/RRSET.ASM):00200                FCB    $F0,$F0
+EAFE F0F0             (asm/src/RRSET.ASM):00201                FCB    $F0,$F0
+EB00 FF00             (asm/src/RRSET.ASM):00202                FCB    $FF,$00
+                      (asm/src/RRSET.ASM):00203         
+EB02 03               (asm/src/RRSET.ASM):00204         CE     FCB    3
+EB03 FFF0             (asm/src/RRSET.ASM):00205                FCB    $FF,$F0
+EB05 F000             (asm/src/RRSET.ASM):00206                FCB    $F0,$00
+EB07 FF00             (asm/src/RRSET.ASM):00207                FCB    $FF,$00
+EB09 F000             (asm/src/RRSET.ASM):00208                FCB    $F0,$00
+EB0B FFF0             (asm/src/RRSET.ASM):00209                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00210         
+EB0D 03               (asm/src/RRSET.ASM):00211         CF     FCB    3
+EB0E FFF0             (asm/src/RRSET.ASM):00212                FCB    $FF,$F0
+EB10 F000             (asm/src/RRSET.ASM):00213                FCB    $F0,$00
+EB12 FF00             (asm/src/RRSET.ASM):00214                FCB    $FF,$00
+EB14 F000             (asm/src/RRSET.ASM):00215                FCB    $F0,$00
+EB16 F000             (asm/src/RRSET.ASM):00216                FCB    $F0,$00
+                      (asm/src/RRSET.ASM):00217         
+EB18 03               (asm/src/RRSET.ASM):00218         CG     FCB    3
+EB19 FFF0             (asm/src/RRSET.ASM):00219                FCB    $FF,$F0
+EB1B F000             (asm/src/RRSET.ASM):00220                FCB    $F0,$00
+EB1D F0F0             (asm/src/RRSET.ASM):00221                FCB    $F0,$F0
+EB1F F0F0             (asm/src/RRSET.ASM):00222                FCB    $F0,$F0
+EB21 FFF0             (asm/src/RRSET.ASM):00223                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00224         
+EB23 03               (asm/src/RRSET.ASM):00225         CH     FCB    3
+EB24 F0F0             (asm/src/RRSET.ASM):00226                FCB    $F0,$F0
+EB26 F0F0             (asm/src/RRSET.ASM):00227                FCB    $F0,$F0
+EB28 FFF0             (asm/src/RRSET.ASM):00228                FCB    $FF,$F0
+EB2A F0F0             (asm/src/RRSET.ASM):00229                FCB    $F0,$F0
+EB2C F0F0             (asm/src/RRSET.ASM):00230                FCB    $F0,$F0
+                      (asm/src/RRSET.ASM):00231         
+EB2E 03               (asm/src/RRSET.ASM):00232         CI     FCB    3
+EB2F FFF0             (asm/src/RRSET.ASM):00233                FCB    $FF,$F0
+EB31 0F00             (asm/src/RRSET.ASM):00234                FCB    $0F,$00
+EB33 0F00             (asm/src/RRSET.ASM):00235                FCB    $0F,$00
+EB35 0F00             (asm/src/RRSET.ASM):00236                FCB    $0F,$00
+EB37 FFF0             (asm/src/RRSET.ASM):00237                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00238         
+EB39 03               (asm/src/RRSET.ASM):00239         CJ     FCB    3
+EB3A 00F0             (asm/src/RRSET.ASM):00240                FCB    $00,$F0
+EB3C 00F0             (asm/src/RRSET.ASM):00241                FCB    $00,$F0
+EB3E 00F0             (asm/src/RRSET.ASM):00242                FCB    $00,$F0
+EB40 F0F0             (asm/src/RRSET.ASM):00243                FCB    $F0,$F0
+EB42 FFF0             (asm/src/RRSET.ASM):00244                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00245         
+EB44 03               (asm/src/RRSET.ASM):00246         CK     FCB    3
+EB45 F0F0             (asm/src/RRSET.ASM):00247                FCB    $F0,$F0
+EB47 F0F0             (asm/src/RRSET.ASM):00248                FCB    $F0,$F0
+EB49 FF00             (asm/src/RRSET.ASM):00249                FCB    $FF,$00
+EB4B F0F0             (asm/src/RRSET.ASM):00250                FCB    $F0,$F0
+EB4D F0F0             (asm/src/RRSET.ASM):00251                FCB    $F0,$F0
+                      (asm/src/RRSET.ASM):00252         
+EB4F 03               (asm/src/RRSET.ASM):00253         CL     FCB    3
+EB50 F000             (asm/src/RRSET.ASM):00254                FCB    $F0,$00
+EB52 F000             (asm/src/RRSET.ASM):00255                FCB    $F0,$00
+EB54 F000             (asm/src/RRSET.ASM):00256                FCB    $F0,$00
+EB56 F000             (asm/src/RRSET.ASM):00257                FCB    $F0,$00
+EB58 FFF0             (asm/src/RRSET.ASM):00258                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00259         
+EB5A 05               (asm/src/RRSET.ASM):00260         CM     FCB    5
+EB5B FFFFF0           (asm/src/RRSET.ASM):00261                FCB    $FF,$FF,$F0
+EB5E F0F0F0           (asm/src/RRSET.ASM):00262                FCB    $F0,$F0,$F0
+EB61 F0F0F0           (asm/src/RRSET.ASM):00263                FCB    $F0,$F0,$F0
+EB64 F000F0           (asm/src/RRSET.ASM):00264                FCB    $F0,$00,$F0
+EB67 F000F0           (asm/src/RRSET.ASM):00265                FCB    $F0,$00,$F0
+                      (asm/src/RRSET.ASM):00266         
+EB6A 03               (asm/src/RRSET.ASM):00267         CN     FCB    3
+EB6B FFF0             (asm/src/RRSET.ASM):00268                FCB    $FF,$F0
+EB6D F0F0             (asm/src/RRSET.ASM):00269                FCB    $F0,$F0
+EB6F F0F0             (asm/src/RRSET.ASM):00270                FCB    $F0,$F0
+EB71 F0F0             (asm/src/RRSET.ASM):00271                FCB    $F0,$F0
+EB73 F0F0             (asm/src/RRSET.ASM):00272                FCB    $F0,$F0
+                      (asm/src/RRSET.ASM):00273         
+EB75 03               (asm/src/RRSET.ASM):00274         CO     FCB    3
+EB76 FFF0             (asm/src/RRSET.ASM):00275                FCB    $FF,$F0
+EB78 F0F0             (asm/src/RRSET.ASM):00276                FCB    $F0,$F0
+EB7A F0F0             (asm/src/RRSET.ASM):00277                FCB    $F0,$F0
+EB7C F0F0             (asm/src/RRSET.ASM):00278                FCB    $F0,$F0
+EB7E FFF0             (asm/src/RRSET.ASM):00279                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00280         
+EB80 03               (asm/src/RRSET.ASM):00281         CP     FCB    3
+EB81 FFF0             (asm/src/RRSET.ASM):00282                FCB    $FF,$F0
+EB83 F0F0             (asm/src/RRSET.ASM):00283                FCB    $F0,$F0
+EB85 FFF0             (asm/src/RRSET.ASM):00284                FCB    $FF,$F0
+EB87 F000             (asm/src/RRSET.ASM):00285                FCB    $F0,$00
+EB89 F000             (asm/src/RRSET.ASM):00286                FCB    $F0,$00
+                      (asm/src/RRSET.ASM):00287         
+EB8B 03               (asm/src/RRSET.ASM):00288         CQ     FCB    3
+EB8C FFF0             (asm/src/RRSET.ASM):00289                FCB    $FF,$F0
+EB8E F0F0             (asm/src/RRSET.ASM):00290                FCB    $F0,$F0
+EB90 FFF0             (asm/src/RRSET.ASM):00291                FCB    $FF,$F0
+EB92 00F0             (asm/src/RRSET.ASM):00292                FCB    $00,$F0
+EB94 00F0             (asm/src/RRSET.ASM):00293                FCB    $00,$F0
+                      (asm/src/RRSET.ASM):00294         
+EB96 03               (asm/src/RRSET.ASM):00295         CR     FCB    3
+EB97 FFF0             (asm/src/RRSET.ASM):00296                FCB    $FF,$F0
+EB99 F0F0             (asm/src/RRSET.ASM):00297                FCB    $F0,$F0
+EB9B FF00             (asm/src/RRSET.ASM):00298                FCB    $FF,$00
+EB9D F0F0             (asm/src/RRSET.ASM):00299                FCB    $F0,$F0
+EB9F F0F0             (asm/src/RRSET.ASM):00300                FCB    $F0,$F0
+                      (asm/src/RRSET.ASM):00301         
+EBA1 03               (asm/src/RRSET.ASM):00302         CS     FCB    3
+EBA2 FFF0             (asm/src/RRSET.ASM):00303                FCB    $FF,$F0
+EBA4 F000             (asm/src/RRSET.ASM):00304                FCB    $F0,$00
+EBA6 FFF0             (asm/src/RRSET.ASM):00305                FCB    $FF,$F0
+EBA8 00F0             (asm/src/RRSET.ASM):00306                FCB    $00,$F0
+EBAA FFF0             (asm/src/RRSET.ASM):00307                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00308         
+EBAC 03               (asm/src/RRSET.ASM):00309         CT     FCB    3
+EBAD FFF0             (asm/src/RRSET.ASM):00310                FCB    $FF,$F0
+EBAF 0F00             (asm/src/RRSET.ASM):00311                FCB    $0F,$00
+EBB1 0F00             (asm/src/RRSET.ASM):00312                FCB    $0F,$00
+EBB3 0F00             (asm/src/RRSET.ASM):00313                FCB    $0F,$00
+EBB5 0F00             (asm/src/RRSET.ASM):00314                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00315         
+EBB7 03               (asm/src/RRSET.ASM):00316         CU     FCB    $3
+EBB8 F0F0             (asm/src/RRSET.ASM):00317                FCB    $F0,$F0
+EBBA F0F0             (asm/src/RRSET.ASM):00318                FCB    $F0,$F0
+EBBC F0F0             (asm/src/RRSET.ASM):00319                FCB    $F0,$F0
+EBBE F0F0             (asm/src/RRSET.ASM):00320                FCB    $F0,$F0
+EBC0 FFF0             (asm/src/RRSET.ASM):00321                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00322         
+EBC2 03               (asm/src/RRSET.ASM):00323         CV     FCB    3
+EBC3 F0F0             (asm/src/RRSET.ASM):00324                FCB    $F0,$F0
+EBC5 F0F0             (asm/src/RRSET.ASM):00325                FCB    $F0,$F0
+EBC7 F0F0             (asm/src/RRSET.ASM):00326                FCB    $F0,$F0
+EBC9 0F00             (asm/src/RRSET.ASM):00327                FCB    $0F,$00
+EBCB 0F00             (asm/src/RRSET.ASM):00328                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00329         
+EBCD 05               (asm/src/RRSET.ASM):00330         CW     FCB    5
+EBCE F000F0           (asm/src/RRSET.ASM):00331                FCB    $F0,$00,$F0
+EBD1 F000F0           (asm/src/RRSET.ASM):00332                FCB    $F0,$00,$F0
+EBD4 F0F0F0           (asm/src/RRSET.ASM):00333                FCB    $F0,$F0,$F0
+EBD7 F0F0F0           (asm/src/RRSET.ASM):00334                FCB    $F0,$F0,$F0
+EBDA FFFFF0           (asm/src/RRSET.ASM):00335                FCB    $FF,$FF,$F0
+                      (asm/src/RRSET.ASM):00336         
+EBDD 03               (asm/src/RRSET.ASM):00337         CX     FCB    3
+EBDE F0F0             (asm/src/RRSET.ASM):00338                FCB    $F0,$F0
+EBE0 F0F0             (asm/src/RRSET.ASM):00339                FCB    $F0,$F0
+EBE2 0F00             (asm/src/RRSET.ASM):00340                FCB    $0F,$00
+EBE4 F0F0             (asm/src/RRSET.ASM):00341                FCB    $F0,$F0
+EBE6 F0F0             (asm/src/RRSET.ASM):00342                FCB    $F0,$F0
+                      (asm/src/RRSET.ASM):00343         
+EBE8 03               (asm/src/RRSET.ASM):00344         CY     FCB    3
+EBE9 F0F0             (asm/src/RRSET.ASM):00345                FCB    $F0,$F0
+EBEB F0F0             (asm/src/RRSET.ASM):00346                FCB    $F0,$F0
+EBED FFF0             (asm/src/RRSET.ASM):00347                FCB    $FF,$F0
+EBEF 0F00             (asm/src/RRSET.ASM):00348                FCB    $0F,$00 
+EBF1 0F00             (asm/src/RRSET.ASM):00349                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00350         
+EBF3 03               (asm/src/RRSET.ASM):00351         CZ     FCB    3
+EBF4 FFF0             (asm/src/RRSET.ASM):00352                FCB    $FF,$F0
+EBF6 00F0             (asm/src/RRSET.ASM):00353                FCB    $00,$F0
+EBF8 0F00             (asm/src/RRSET.ASM):00354                FCB    $0F,$00
+EBFA F000             (asm/src/RRSET.ASM):00355                FCB    $F0,$00
+EBFC FFF0             (asm/src/RRSET.ASM):00356                FCB    $FF,$F0
+                      (asm/src/RRSET.ASM):00357         
+EBFE 03               (asm/src/RRSET.ASM):00358         CLP    FCB    3
+EBFF 0F00             (asm/src/RRSET.ASM):00359                FCB    $0F,$00
+EC01 F000             (asm/src/RRSET.ASM):00360                FCB    $F0,$00
+EC03 F000             (asm/src/RRSET.ASM):00361                FCB    $F0,$00
+EC05 F000             (asm/src/RRSET.ASM):00362                FCB    $F0,$00
+EC07 0F00             (asm/src/RRSET.ASM):00363                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00364         
+EC09 03               (asm/src/RRSET.ASM):00365         CRP    FCB    3
+EC0A 0F00             (asm/src/RRSET.ASM):00366                FCB    $0F,$00
+EC0C 00F0             (asm/src/RRSET.ASM):00367                FCB    $00,$F0
+EC0E 00F0             (asm/src/RRSET.ASM):00368                FCB    $00,$F0
+EC10 00F0             (asm/src/RRSET.ASM):00369                FCB    $00,$F0
+EC12 0F00             (asm/src/RRSET.ASM):00370                FCB    $0F,$00
+                      (asm/src/RRSET.ASM):00371         
+EC14 07               (asm/src/RRSET.ASM):00372         CFRB   FCB    7
+EC15 000F0000         (asm/src/RRSET.ASM):00373                FCB    $00,$0F,$00,$00
+EC19 0000F000         (asm/src/RRSET.ASM):00374                FCB    $00,$00,$F0,$00
+EC1D FF00FF00         (asm/src/RRSET.ASM):00375                FCB    $FF,$00,$FF,$00
+EC21 0000F000         (asm/src/RRSET.ASM):00376                FCB    $00,$00,$F0,$00
+EC25 000F0000         (asm/src/RRSET.ASM):00377                FCB    $00,$0F,$00,$00
+                      (asm/src/RRSET.ASM):00378         
+EC29 03               (asm/src/RRSET.ASM):00379         CSLSH  FCB    3
+EC2A 00F0             (asm/src/RRSET.ASM):00380                FCB    $00,$F0
+EC2C 00F0             (asm/src/RRSET.ASM):00381                FCB    $00,$F0
+EC2E 0F00             (asm/src/RRSET.ASM):00382                FCB    $0F,$00
+EC30 F000             (asm/src/RRSET.ASM):00383                FCB    $F0,$00
+EC32 F000             (asm/src/RRSET.ASM):00384                FCB    $F0,$00
+                      (asm/src/RRSET.ASM):00385         
+EC34 EC92             (asm/src/RRSET.ASM):00386         TAB57Z FDB    D0
+EC36 ECA5             (asm/src/RRSET.ASM):00387                FDB    D1
+EC38 ECB8             (asm/src/RRSET.ASM):00388                FDB    D2
+EC3A ECCB             (asm/src/RRSET.ASM):00389                FDB    D3
+EC3C ECDE             (asm/src/RRSET.ASM):00390                FDB    D4
+EC3E ECF1             (asm/src/RRSET.ASM):00391                FDB    D5
+EC40 ED04             (asm/src/RRSET.ASM):00392                FDB    D6
+EC42 ED17             (asm/src/RRSET.ASM):00393                FDB    D7
+EC44 ED2A             (asm/src/RRSET.ASM):00394                FDB    D8
+EC46 ED3D             (asm/src/RRSET.ASM):00395                FDB    D9
+EC48 ED50             (asm/src/RRSET.ASM):00396                FDB    DSP
+EC4A ED5D             (asm/src/RRSET.ASM):00397                FDB    DEX
+EC4C ED6C             (asm/src/RRSET.ASM):00398                FDB    DCO
+EC4E ED79             (asm/src/RRSET.ASM):00399                FDB    DPE
+EC50 ED86             (asm/src/RRSET.ASM):00400                FDB    DAR
+EC52 EDA5             (asm/src/RRSET.ASM):00401                FDB    DCL
+EC54 EDB2             (asm/src/RRSET.ASM):00402                FDB    DHY
+EC56 EDBF             (asm/src/RRSET.ASM):00403                FDB    DA
+EC58 EDD2             (asm/src/RRSET.ASM):00404                FDB    DB
+EC5A EDE5             (asm/src/RRSET.ASM):00405                FDB    DCC
+EC5C EDF8             (asm/src/RRSET.ASM):00406                FDB    DD
+EC5E EE0B             (asm/src/RRSET.ASM):00407                FDB    DE
+EC60 EE1E             (asm/src/RRSET.ASM):00408                FDB    DF
+EC62 EE31             (asm/src/RRSET.ASM):00409                FDB    DG
+EC64 EE44             (asm/src/RRSET.ASM):00410                FDB    DH
+EC66 EE57             (asm/src/RRSET.ASM):00411                FDB    DI
+EC68 EE6A             (asm/src/RRSET.ASM):00412                FDB    DJ
+EC6A EE7D             (asm/src/RRSET.ASM):00413                FDB    DK
+EC6C EE90             (asm/src/RRSET.ASM):00414                FDB    DL
+EC6E EEA3             (asm/src/RRSET.ASM):00415                FDB    DM
+EC70 EEB6             (asm/src/RRSET.ASM):00416                FDB    DN
+EC72 EEC9             (asm/src/RRSET.ASM):00417                FDB    DO
+EC74 EEDC             (asm/src/RRSET.ASM):00418                FDB    DP
+EC76 EEEF             (asm/src/RRSET.ASM):00419                FDB    DQ
+EC78 EF02             (asm/src/RRSET.ASM):00420                FDB    DR
+EC7A EF15             (asm/src/RRSET.ASM):00421                FDB    DS
+EC7C EF28             (asm/src/RRSET.ASM):00422                FDB    DT
+EC7E EF3B             (asm/src/RRSET.ASM):00423                FDB    DU
+EC80 EF4E             (asm/src/RRSET.ASM):00424                FDB    DV
+EC82 EF61             (asm/src/RRSET.ASM):00425                FDB    DW
+EC84 EF74             (asm/src/RRSET.ASM):00426                FDB    DX
+EC86 EF87             (asm/src/RRSET.ASM):00427                FDB    DY
+EC88 EF9A             (asm/src/RRSET.ASM):00428                FDB    DZ
+EC8A EFAD             (asm/src/RRSET.ASM):00429                FDB    DLP
+EC8C EFBA             (asm/src/RRSET.ASM):00430                FDB    DRP
+EC8E EFC7             (asm/src/RRSET.ASM):00431                FDB    DFRB
+EC90 EFDA             (asm/src/RRSET.ASM):00432                FDB    DSLSH
+                      (asm/src/RRSET.ASM):00433         
+EC92 05               (asm/src/RRSET.ASM):00434         D0     FCB    5
+EC93 999990           (asm/src/RRSET.ASM):00435                FCB    $99,$99,$90
+EC96 900090           (asm/src/RRSET.ASM):00436                FCB    $90,$00,$90
+EC99 900090           (asm/src/RRSET.ASM):00437                FCB    $90,$00,$90
+EC9C 900090           (asm/src/RRSET.ASM):00438                FCB    $90,$00,$90
+EC9F 900090           (asm/src/RRSET.ASM):00439                FCB    $90,$00,$90
+ECA2 999990           (asm/src/RRSET.ASM):00440                FCB    $99,$99,$90
+                      (asm/src/RRSET.ASM):00441         
+ECA5 05               (asm/src/RRSET.ASM):00442         D1     FCB    5
+ECA6 009900           (asm/src/RRSET.ASM):00443                FCB    $00,$99,$00
+ECA9 000900           (asm/src/RRSET.ASM):00444                FCB    $00,$09,$00
+ECAC 000900           (asm/src/RRSET.ASM):00445                FCB    $00,$09,$00
+ECAF 000900           (asm/src/RRSET.ASM):00446                FCB    $00,$09,$00
+ECB2 000900           (asm/src/RRSET.ASM):00447                FCB    $00,$09,$00
+ECB5 099990           (asm/src/RRSET.ASM):00448                FCB    $09,$99,$90
+                      (asm/src/RRSET.ASM):00449         
+ECB8 05               (asm/src/RRSET.ASM):00450         D2     FCB    5
+ECB9 099990           (asm/src/RRSET.ASM):00451                FCB    $09,$99,$90
+ECBC 000090           (asm/src/RRSET.ASM):00452                FCB    $00,$00,$90
+ECBF 999990           (asm/src/RRSET.ASM):00453                FCB    $99,$99,$90
+ECC2 900000           (asm/src/RRSET.ASM):00454                FCB    $90,$00,$00
+ECC5 900000           (asm/src/RRSET.ASM):00455                FCB    $90,$00,$00
+ECC8 999900           (asm/src/RRSET.ASM):00456                FCB    $99,$99,$00
+                      (asm/src/RRSET.ASM):00457         
+ECCB 05               (asm/src/RRSET.ASM):00458         D3     FCB    5
+ECCC 099990           (asm/src/RRSET.ASM):00459                FCB    $09,$99,$90
+ECCF 000090           (asm/src/RRSET.ASM):00460                FCB    $00,$00,$90
+ECD2 099990           (asm/src/RRSET.ASM):00461                FCB    $09,$99,$90
+ECD5 000090           (asm/src/RRSET.ASM):00462                FCB    $00,$00,$90
+ECD8 000090           (asm/src/RRSET.ASM):00463                FCB    $00,$00,$90
+ECDB 999990           (asm/src/RRSET.ASM):00464                FCB    $99,$99,$90
+                      (asm/src/RRSET.ASM):00465         
+ECDE 05               (asm/src/RRSET.ASM):00466         D4     FCB    5
+ECDF 900000           (asm/src/RRSET.ASM):00467                FCB    $90,$00,$00
+ECE2 900900           (asm/src/RRSET.ASM):00468                FCB    $90,$09,$00
+ECE5 900900           (asm/src/RRSET.ASM):00469                FCB    $90,$09,$00
+ECE8 999990           (asm/src/RRSET.ASM):00470                FCB    $99,$99,$90
+ECEB 000900           (asm/src/RRSET.ASM):00471                FCB    $00,$09,$00
+ECEE 000900           (asm/src/RRSET.ASM):00472                FCB    $00,$09,$00
+                      (asm/src/RRSET.ASM):00473         
+ECF1 05               (asm/src/RRSET.ASM):00474         D5     FCB    5
+ECF2 999900           (asm/src/RRSET.ASM):00475                FCB    $99,$99,$00
+ECF5 900000           (asm/src/RRSET.ASM):00476                FCB    $90,$00,$00
+ECF8 999990           (asm/src/RRSET.ASM):00477                FCB    $99,$99,$90
+ECFB 000090           (asm/src/RRSET.ASM):00478                FCB    $00,$00,$90
+ECFE 000090           (asm/src/RRSET.ASM):00479                FCB    $00,$00,$90
+ED01 999990           (asm/src/RRSET.ASM):00480                FCB    $99,$99,$90
+                      (asm/src/RRSET.ASM):00481         
+ED04 05               (asm/src/RRSET.ASM):00482         D6     FCB    5
+ED05 999900           (asm/src/RRSET.ASM):00483                FCB    $99,$99,$00
+ED08 900000           (asm/src/RRSET.ASM):00484                FCB    $90,$00,$00
+ED0B 999990           (asm/src/RRSET.ASM):00485                FCB    $99,$99,$90
+ED0E 900090           (asm/src/RRSET.ASM):00486                FCB    $90,$00,$90
+ED11 900090           (asm/src/RRSET.ASM):00487                FCB    $90,$00,$90
+ED14 999990           (asm/src/RRSET.ASM):00488                FCB    $99,$99,$90
+                      (asm/src/RRSET.ASM):00489         
+ED17 05               (asm/src/RRSET.ASM):00490         D7     FCB    5
+ED18 999990           (asm/src/RRSET.ASM):00491                FCB    $99,$99,$90
+ED1B 000090           (asm/src/RRSET.ASM):00492                FCB    $00,$00,$90
+ED1E 000900           (asm/src/RRSET.ASM):00493                FCB    $00,$09,$00
+ED21 009000           (asm/src/RRSET.ASM):00494                FCB    $00,$90,$00
+ED24 090000           (asm/src/RRSET.ASM):00495                FCB    $09,$00,$00
+ED27 900000           (asm/src/RRSET.ASM):00496                FCB    $90,$00,$00
+                      (asm/src/RRSET.ASM):00497         
+ED2A 05               (asm/src/RRSET.ASM):00498         D8     FCB    5
+ED2B 999990           (asm/src/RRSET.ASM):00499                FCB    $99,$99,$90
+ED2E 900090           (asm/src/RRSET.ASM):00500                FCB    $90,$00,$90
+ED31 999990           (asm/src/RRSET.ASM):00501                FCB    $99,$99,$90
+ED34 900090           (asm/src/RRSET.ASM):00502                FCB    $90,$00,$90
+ED37 900090           (asm/src/RRSET.ASM):00503                FCB    $90,$00,$90
+ED3A 999990           (asm/src/RRSET.ASM):00504                FCB    $99,$99,$90
+                      (asm/src/RRSET.ASM):00505         
+ED3D 05               (asm/src/RRSET.ASM):00506         D9     FCB    5
+ED3E 999990           (asm/src/RRSET.ASM):00507                FCB    $99,$99,$90
+ED41 900090           (asm/src/RRSET.ASM):00508                FCB    $90,$00,$90
+ED44 999990           (asm/src/RRSET.ASM):00509                FCB    $99,$99,$90
+ED47 000090           (asm/src/RRSET.ASM):00510                FCB    $00,$00,$90
+ED4A 000090           (asm/src/RRSET.ASM):00511                FCB    $00,$00,$90
+ED4D 099990           (asm/src/RRSET.ASM):00512                FCB    $09,$99,$90
+                      (asm/src/RRSET.ASM):00513         
+ED50 03               (asm/src/RRSET.ASM):00514         DSP    FCB    3                   SPACE
+ED51 0000             (asm/src/RRSET.ASM):00515                FCB    $00,$00
+ED53 0000             (asm/src/RRSET.ASM):00516                FCB    $00,$00
+ED55 0000             (asm/src/RRSET.ASM):00517                FCB    $00,$00
+ED57 0000             (asm/src/RRSET.ASM):00518                FCB    $00,$00
+ED59 0000             (asm/src/RRSET.ASM):00519                FCB    $00,$00
+ED5B 0000             (asm/src/RRSET.ASM):00520                FCB    $00,$00
+                      (asm/src/RRSET.ASM):00521         
+ED5D 02               (asm/src/RRSET.ASM):00522         DEX    FCB    2
+ED5E FF00             (asm/src/RRSET.ASM):00523                FCB    $FF,$00
+ED60 FF00             (asm/src/RRSET.ASM):00524                FCB    $FF,$00
+ED62 FF00             (asm/src/RRSET.ASM):00525                FCB    $FF,$00
+ED64 FF00             (asm/src/RRSET.ASM):00526                FCB    $FF,$00
+ED66 0000             (asm/src/RRSET.ASM):00527                FCB    $00,$00
+ED68 FF00             (asm/src/RRSET.ASM):00528                FCB    $FF,$00
+ED6A FF00             (asm/src/RRSET.ASM):00529                FCB    $FF,$00
+                      (asm/src/RRSET.ASM):00530         
+ED6C 02               (asm/src/RRSET.ASM):00531         DCO    FCB    2                   COMMA
+ED6D 0000             (asm/src/RRSET.ASM):00532                FCB    $00,$00
+ED6F 0000             (asm/src/RRSET.ASM):00533                FCB    $00,$00
+ED71 0000             (asm/src/RRSET.ASM):00534                FCB    $00,$00
+ED73 FF00             (asm/src/RRSET.ASM):00535                FCB    $FF,$00
+ED75 FF00             (asm/src/RRSET.ASM):00536                FCB    $FF,$00
+ED77 F000             (asm/src/RRSET.ASM):00537                FCB    $F0,$00
+                      (asm/src/RRSET.ASM):00538         
+ED79 02               (asm/src/RRSET.ASM):00539         DPE    FCB    2
+ED7A 0000             (asm/src/RRSET.ASM):00540                FCB    $00,$00
+ED7C 0000             (asm/src/RRSET.ASM):00541                FCB    $00,$00
+ED7E 0000             (asm/src/RRSET.ASM):00542                FCB    $00,$00
+ED80 0000             (asm/src/RRSET.ASM):00543                FCB    $00,$00
+ED82 FF00             (asm/src/RRSET.ASM):00544                FCB    $FF,$00
+ED84 FF00             (asm/src/RRSET.ASM):00545                FCB    $FF,$00
+                      (asm/src/RRSET.ASM):00546         
+ED86 09               (asm/src/RRSET.ASM):00547         DAR    FCB    9                       BLANKR  USED TO BLOCK ERASE
+ED87 FFFFFFFFF0       (asm/src/RRSET.ASM):00548                FCB    $FF,$FF,$FF,$FF,$F0
+ED8C FFFFFFFFF0       (asm/src/RRSET.ASM):00549                FCB    $FF,$FF,$FF,$FF,$F0
+ED91 FFFFFFFFF0       (asm/src/RRSET.ASM):00550                FCB    $FF,$FF,$FF,$FF,$F0
+ED96 FFFFFFFFF0       (asm/src/RRSET.ASM):00551                FCB    $FF,$FF,$FF,$FF,$F0
+ED9B FFFFFFFFF0       (asm/src/RRSET.ASM):00552                FCB    $FF,$FF,$FF,$FF,$F0
+EDA0 FFFFFFFFF0       (asm/src/RRSET.ASM):00553                FCB    $FF,$FF,$FF,$FF,$F0
+                      (asm/src/RRSET.ASM):00554         
+EDA5 02               (asm/src/RRSET.ASM):00555         DCL    FCB    2                   COLON
+EDA6 0000             (asm/src/RRSET.ASM):00556                FCB    $00,$00
+EDA8 FF00             (asm/src/RRSET.ASM):00557                FCB    $FF,$00
+EDAA FF00             (asm/src/RRSET.ASM):00558                FCB    $FF,$00
+EDAC 0000             (asm/src/RRSET.ASM):00559                FCB    $00,$00
+EDAE FF00             (asm/src/RRSET.ASM):00560                FCB    $FF,$00
+EDB0 FF00             (asm/src/RRSET.ASM):00561                FCB    $FF,$00
+                      (asm/src/RRSET.ASM):00562         
+EDB2 03               (asm/src/RRSET.ASM):00563         DHY    FCB    3
+EDB3 0000             (asm/src/RRSET.ASM):00564                FCB    $00,$00
+EDB5 0000             (asm/src/RRSET.ASM):00565                FCB    $00,$00
+EDB7 0000             (asm/src/RRSET.ASM):00566                FCB    $00,$00
+EDB9 2220             (asm/src/RRSET.ASM):00567                FCB    $22,$20
+EDBB 0000             (asm/src/RRSET.ASM):00568                FCB    $00,$00
+EDBD 0000             (asm/src/RRSET.ASM):00569                FCB    $00,$00
+                      (asm/src/RRSET.ASM):00570         
+EDBF 05               (asm/src/RRSET.ASM):00571         DA     FCB    5
+EDC0 666660           (asm/src/RRSET.ASM):00572                FCB    $66,$66,$60
+EDC3 600660           (asm/src/RRSET.ASM):00573                FCB    $60,$06,$60
+EDC6 666660           (asm/src/RRSET.ASM):00574                FCB    $66,$66,$60
+EDC9 600660           (asm/src/RRSET.ASM):00575                FCB    $60,$06,$60
+EDCC 600660           (asm/src/RRSET.ASM):00576                FCB    $60,$06,$60
+EDCF 600660           (asm/src/RRSET.ASM):00577                FCB    $60,$06,$60
+                      (asm/src/RRSET.ASM):00578         
+EDD2 05               (asm/src/RRSET.ASM):00579         DB     FCB    5
+EDD3 666600           (asm/src/RRSET.ASM):00580                FCB    $66,$66,$00
+EDD6 600600           (asm/src/RRSET.ASM):00581                FCB    $60,$06,$00
+EDD9 666660           (asm/src/RRSET.ASM):00582                FCB    $66,$66,$60
+EDDC 660060           (asm/src/RRSET.ASM):00583                FCB    $66,$00,$60
+EDDF 660060           (asm/src/RRSET.ASM):00584                FCB    $66,$00,$60
+EDE2 666660           (asm/src/RRSET.ASM):00585                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00586         
+EDE5 05               (asm/src/RRSET.ASM):00587         DCC    FCB    5
+EDE6 666660           (asm/src/RRSET.ASM):00588                FCB    $66,$66,$60
+EDE9 660000           (asm/src/RRSET.ASM):00589                FCB    $66,$00,$00
+EDEC 660000           (asm/src/RRSET.ASM):00590                FCB    $66,$00,$00
+EDEF 660000           (asm/src/RRSET.ASM):00591                FCB    $66,$00,$00
+EDF2 660000           (asm/src/RRSET.ASM):00592                FCB    $66,$00,$00
+EDF5 666660           (asm/src/RRSET.ASM):00593                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00594         
+EDF8 05               (asm/src/RRSET.ASM):00595         DD     FCB    5
+EDF9 666600           (asm/src/RRSET.ASM):00596                FCB    $66,$66,$00
+EDFC 660060           (asm/src/RRSET.ASM):00597                FCB    $66,$00,$60
+EDFF 660060           (asm/src/RRSET.ASM):00598                FCB    $66,$00,$60
+EE02 660060           (asm/src/RRSET.ASM):00599                FCB    $66,$00,$60
+EE05 660060           (asm/src/RRSET.ASM):00600                FCB    $66,$00,$60
+EE08 666600           (asm/src/RRSET.ASM):00601                FCB    $66,$66,$00
+                      (asm/src/RRSET.ASM):00602         
+EE0B 05               (asm/src/RRSET.ASM):00603         DE     FCB    5
+EE0C 666660           (asm/src/RRSET.ASM):00604                FCB    $66,$66,$60
+EE0F 600000           (asm/src/RRSET.ASM):00605                FCB    $60,$00,$00
+EE12 666660           (asm/src/RRSET.ASM):00606                FCB    $66,$66,$60
+EE15 660000           (asm/src/RRSET.ASM):00607                FCB    $66,$00,$00
+EE18 660000           (asm/src/RRSET.ASM):00608                FCB    $66,$00,$00
+EE1B 666660           (asm/src/RRSET.ASM):00609                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00610         
+EE1E 05               (asm/src/RRSET.ASM):00611         DF     FCB    5
+EE1F 666660           (asm/src/RRSET.ASM):00612                FCB    $66,$66,$60
+EE22 600000           (asm/src/RRSET.ASM):00613                FCB    $60,$00,$00
+EE25 666660           (asm/src/RRSET.ASM):00614                FCB    $66,$66,$60
+EE28 660000           (asm/src/RRSET.ASM):00615                FCB    $66,$00,$00
+EE2B 660000           (asm/src/RRSET.ASM):00616                FCB    $66,$00,$00
+EE2E 660000           (asm/src/RRSET.ASM):00617                FCB    $66,$00,$00
+                      (asm/src/RRSET.ASM):00618         
+EE31 05               (asm/src/RRSET.ASM):00619         DG     FCB    5
+EE32 666660           (asm/src/RRSET.ASM):00620                FCB    $66,$66,$60
+EE35 660660           (asm/src/RRSET.ASM):00621                FCB    $66,$06,$60
+EE38 660000           (asm/src/RRSET.ASM):00622                FCB    $66,$00,$00
+EE3B 660660           (asm/src/RRSET.ASM):00623                FCB    $66,$06,$60
+EE3E 660060           (asm/src/RRSET.ASM):00624                FCB    $66,$00,$60
+EE41 666660           (asm/src/RRSET.ASM):00625                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00626         
+EE44 05               (asm/src/RRSET.ASM):00627         DH     FCB    5
+EE45 660060           (asm/src/RRSET.ASM):00628                FCB    $66,$00,$60
+EE48 660060           (asm/src/RRSET.ASM):00629                FCB    $66,$00,$60
+EE4B 666660           (asm/src/RRSET.ASM):00630                FCB    $66,$66,$60
+EE4E 660060           (asm/src/RRSET.ASM):00631                FCB    $66,$00,$60
+EE51 660060           (asm/src/RRSET.ASM):00632                FCB    $66,$00,$60
+EE54 660060           (asm/src/RRSET.ASM):00633                FCB    $66,$00,$60
+                      (asm/src/RRSET.ASM):00634         
+EE57 04               (asm/src/RRSET.ASM):00635         DI     FCB    4
+EE58 066000           (asm/src/RRSET.ASM):00636                FCB    $06,$60,$00
+EE5B 066000           (asm/src/RRSET.ASM):00637                FCB    $06,$60,$00
+EE5E 066000           (asm/src/RRSET.ASM):00638                FCB    $06,$60,$00
+EE61 066000           (asm/src/RRSET.ASM):00639                FCB    $06,$60,$00
+EE64 066000           (asm/src/RRSET.ASM):00640                FCB    $06,$60,$00
+EE67 066000           (asm/src/RRSET.ASM):00641                FCB    $06,$60,$00
+                      (asm/src/RRSET.ASM):00642         
+EE6A 05               (asm/src/RRSET.ASM):00643         DJ     FCB    5
+EE6B 000060           (asm/src/RRSET.ASM):00644                FCB    $00,$00,$60
+EE6E 000060           (asm/src/RRSET.ASM):00645                FCB    $00,$00,$60
+EE71 000060           (asm/src/RRSET.ASM):00646                FCB    $00,$00,$60
+EE74 000060           (asm/src/RRSET.ASM):00647                FCB    $00,$00,$60
+EE77 660060           (asm/src/RRSET.ASM):00648                FCB    $66,$00,$60
+EE7A 666660           (asm/src/RRSET.ASM):00649                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00650         
+EE7D 05               (asm/src/RRSET.ASM):00651         DK     FCB    5
+EE7E 660060           (asm/src/RRSET.ASM):00652                FCB    $66,$00,$60
+EE81 660600           (asm/src/RRSET.ASM):00653                FCB    $66,$06,$00
+EE84 666000           (asm/src/RRSET.ASM):00654                FCB    $66,$60,$00
+EE87 666000           (asm/src/RRSET.ASM):00655                FCB    $66,$60,$00
+EE8A 660600           (asm/src/RRSET.ASM):00656                FCB    $66,$06,$00
+EE8D 660060           (asm/src/RRSET.ASM):00657                FCB    $66,$00,$60
+                      (asm/src/RRSET.ASM):00658         
+EE90 05               (asm/src/RRSET.ASM):00659         DL     FCB    5
+EE91 600000           (asm/src/RRSET.ASM):00660                FCB    $60,$00,$00
+EE94 600000           (asm/src/RRSET.ASM):00661                FCB    $60,$00,$00
+EE97 600000           (asm/src/RRSET.ASM):00662                FCB    $60,$00,$00
+EE9A 600000           (asm/src/RRSET.ASM):00663                FCB    $60,$00,$00
+EE9D 666660           (asm/src/RRSET.ASM):00664                FCB    $66,$66,$60
+EEA0 666660           (asm/src/RRSET.ASM):00665                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00666         
+EEA3 05               (asm/src/RRSET.ASM):00667         DM     FCB    5
+EEA4 666660           (asm/src/RRSET.ASM):00668                FCB    $66,$66,$60
+EEA7 606060           (asm/src/RRSET.ASM):00669                FCB    $60,$60,$60
+EEAA 606060           (asm/src/RRSET.ASM):00670                FCB    $60,$60,$60
+EEAD 600060           (asm/src/RRSET.ASM):00671                FCB    $60,$00,$60
+EEB0 600060           (asm/src/RRSET.ASM):00672                FCB    $60,$00,$60
+EEB3 600060           (asm/src/RRSET.ASM):00673                FCB    $60,$00,$60
+                      (asm/src/RRSET.ASM):00674         
+EEB6 05               (asm/src/RRSET.ASM):00675         DN     FCB    5
+EEB7 666660           (asm/src/RRSET.ASM):00676                FCB    $66,$66,$60
+EEBA 600060           (asm/src/RRSET.ASM):00677                FCB    $60,$00,$60
+EEBD 660060           (asm/src/RRSET.ASM):00678                FCB    $66,$00,$60
+EEC0 660060           (asm/src/RRSET.ASM):00679                FCB    $66,$00,$60
+EEC3 660060           (asm/src/RRSET.ASM):00680                FCB    $66,$00,$60
+EEC6 660060           (asm/src/RRSET.ASM):00681                FCB    $66,$00,$60
+                      (asm/src/RRSET.ASM):00682         
+EEC9 05               (asm/src/RRSET.ASM):00683         DO     FCB    5
+EECA 666660           (asm/src/RRSET.ASM):00684                FCB    $66,$66,$60
+EECD 600660           (asm/src/RRSET.ASM):00685                FCB    $60,$06,$60
+EED0 600060           (asm/src/RRSET.ASM):00686                FCB    $60,$00,$60
+EED3 600060           (asm/src/RRSET.ASM):00687                FCB    $60,$00,$60
+EED6 600060           (asm/src/RRSET.ASM):00688                FCB    $60,$00,$60
+EED9 666660           (asm/src/RRSET.ASM):00689                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00690         
+EEDC 05               (asm/src/RRSET.ASM):00691         DP     FCB    5
+EEDD 666660           (asm/src/RRSET.ASM):00692                FCB    $66,$66,$60
+EEE0 600060           (asm/src/RRSET.ASM):00693                FCB    $60,$00,$60
+EEE3 666660           (asm/src/RRSET.ASM):00694                FCB    $66,$66,$60
+EEE6 660000           (asm/src/RRSET.ASM):00695                FCB    $66,$00,$00
+EEE9 660000           (asm/src/RRSET.ASM):00696                FCB    $66,$00,$00
+EEEC 660000           (asm/src/RRSET.ASM):00697                FCB    $66,$00,$00
+                      (asm/src/RRSET.ASM):00698         
+EEEF 05               (asm/src/RRSET.ASM):00699         DQ     FCB    5
+EEF0 666660           (asm/src/RRSET.ASM):00700                FCB    $66,$66,$60
+EEF3 660060           (asm/src/RRSET.ASM):00701                FCB    $66,$00,$60
+EEF6 660060           (asm/src/RRSET.ASM):00702                FCB    $66,$00,$60
+EEF9 660060           (asm/src/RRSET.ASM):00703                FCB    $66,$00,$60
+EEFC 660600           (asm/src/RRSET.ASM):00704                FCB    $66,$06,$00
+EEFF 666060           (asm/src/RRSET.ASM):00705                FCB    $66,$60,$60
+                      (asm/src/RRSET.ASM):00706         
+EF02 05               (asm/src/RRSET.ASM):00707         DR     FCB    5
+EF03 666600           (asm/src/RRSET.ASM):00708                FCB    $66,$66,$00
+EF06 600600           (asm/src/RRSET.ASM):00709                FCB    $60,$06,$00
+EF09 666660           (asm/src/RRSET.ASM):00710                FCB    $66,$66,$60
+EF0C 660060           (asm/src/RRSET.ASM):00711                FCB    $66,$00,$60
+EF0F 660060           (asm/src/RRSET.ASM):00712                FCB    $66,$00,$60
+EF12 660060           (asm/src/RRSET.ASM):00713                FCB    $66,$00,$60
+                      (asm/src/RRSET.ASM):00714         
+EF15 05               (asm/src/RRSET.ASM):00715         DS     FCB    5
+EF16 666660           (asm/src/RRSET.ASM):00716                FCB    $66,$66,$60
+EF19 600000           (asm/src/RRSET.ASM):00717                FCB    $60,$00,$00
+EF1C 666660           (asm/src/RRSET.ASM):00718                FCB    $66,$66,$60
+EF1F 000060           (asm/src/RRSET.ASM):00719                FCB    $00,$00,$60
+EF22 660060           (asm/src/RRSET.ASM):00720                FCB    $66,$00,$60
+EF25 666660           (asm/src/RRSET.ASM):00721                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00722         
+EF28 05               (asm/src/RRSET.ASM):00723         DT     FCB    5
+EF29 666660           (asm/src/RRSET.ASM):00724                FCB    $66,$66,$60
+EF2C 006000           (asm/src/RRSET.ASM):00725                FCB    $00,$60,$00
+EF2F 006600           (asm/src/RRSET.ASM):00726                FCB    $00,$66,$00
+EF32 006600           (asm/src/RRSET.ASM):00727                FCB    $00,$66,$00
+EF35 006600           (asm/src/RRSET.ASM):00728                FCB    $00,$66,$00
+EF38 006600           (asm/src/RRSET.ASM):00729                FCB    $00,$66,$00
+                      (asm/src/RRSET.ASM):00730         
+EF3B 05               (asm/src/RRSET.ASM):00731         DU     FCB    5
+EF3C 600660           (asm/src/RRSET.ASM):00732                FCB    $60,$06,$60
+EF3F 600660           (asm/src/RRSET.ASM):00733                FCB    $60,$06,$60
+EF42 600660           (asm/src/RRSET.ASM):00734                FCB    $60,$06,$60
+EF45 600660           (asm/src/RRSET.ASM):00735                FCB    $60,$06,$60
+EF48 600660           (asm/src/RRSET.ASM):00736                FCB    $60,$06,$60
+EF4B 666660           (asm/src/RRSET.ASM):00737                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00738         
+EF4E 05               (asm/src/RRSET.ASM):00739         DV     FCB    5
+EF4F 660060           (asm/src/RRSET.ASM):00740                FCB    $66,$00,$60
+EF52 660060           (asm/src/RRSET.ASM):00741                FCB    $66,$00,$60
+EF55 660060           (asm/src/RRSET.ASM):00742                FCB    $66,$00,$60
+EF58 660060           (asm/src/RRSET.ASM):00743                FCB    $66,$00,$60
+EF5B 060600           (asm/src/RRSET.ASM):00744                FCB    $06,$06,$00
+EF5E 006000           (asm/src/RRSET.ASM):00745                FCB    $00,$60,$00
+                      (asm/src/RRSET.ASM):00746         
+EF61 05               (asm/src/RRSET.ASM):00747         DW     FCB    5
+EF62 600060           (asm/src/RRSET.ASM):00748                FCB    $60,$00,$60
+EF65 600060           (asm/src/RRSET.ASM):00749                FCB    $60,$00,$60
+EF68 600060           (asm/src/RRSET.ASM):00750                FCB    $60,$00,$60
+EF6B 606060           (asm/src/RRSET.ASM):00751                FCB    $60,$60,$60
+EF6E 606060           (asm/src/RRSET.ASM):00752                FCB    $60,$60,$60
+EF71 666660           (asm/src/RRSET.ASM):00753                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00754         
+EF74 05               (asm/src/RRSET.ASM):00755         DX     FCB    5
+EF75 600060           (asm/src/RRSET.ASM):00756                FCB    $60,$00,$60
+EF78 060600           (asm/src/RRSET.ASM):00757                FCB    $06,$06,$00
+EF7B 006000           (asm/src/RRSET.ASM):00758                FCB    $00,$60,$00
+EF7E 006000           (asm/src/RRSET.ASM):00759                FCB    $00,$60,$00
+EF81 060600           (asm/src/RRSET.ASM):00760                FCB    $06,$06,$00
+EF84 600060           (asm/src/RRSET.ASM):00761                FCB    $60,$00,$60
+                      (asm/src/RRSET.ASM):00762         
+EF87 05               (asm/src/RRSET.ASM):00763         DY     FCB    5
+EF88 660060           (asm/src/RRSET.ASM):00764                FCB    $66,$00,$60
+EF8B 660060           (asm/src/RRSET.ASM):00765                FCB    $66,$00,$60
+EF8E 666660           (asm/src/RRSET.ASM):00766                FCB    $66,$66,$60
+EF91 006000           (asm/src/RRSET.ASM):00767                FCB    $00,$60,$00
+EF94 006000           (asm/src/RRSET.ASM):00768                FCB    $00,$60,$00
+EF97 006000           (asm/src/RRSET.ASM):00769                FCB    $00,$60,$00
+                      (asm/src/RRSET.ASM):00770         
+EF9A 05               (asm/src/RRSET.ASM):00771         DZ     FCB    5
+EF9B 666660           (asm/src/RRSET.ASM):00772                FCB    $66,$66,$60
+EF9E 000600           (asm/src/RRSET.ASM):00773                FCB    $00,$06,$00
+EFA1 006000           (asm/src/RRSET.ASM):00774                FCB    $00,$60,$00
+EFA4 060000           (asm/src/RRSET.ASM):00775                FCB    $06,$00,$00
+EFA7 666660           (asm/src/RRSET.ASM):00776                FCB    $66,$66,$60
+EFAA 666660           (asm/src/RRSET.ASM):00777                FCB    $66,$66,$60
+                      (asm/src/RRSET.ASM):00778         
+EFAD 03               (asm/src/RRSET.ASM):00779         DLP    FCB    3
+EFAE 00F0             (asm/src/RRSET.ASM):00780                FCB    $00,$F0
+EFB0 0F00             (asm/src/RRSET.ASM):00781                FCB    $0F,$00
+EFB2 F000             (asm/src/RRSET.ASM):00782                FCB    $F0,$00
+EFB4 F000             (asm/src/RRSET.ASM):00783                FCB    $F0,$00
+EFB6 0F00             (asm/src/RRSET.ASM):00784                FCB    $0F,$00
+EFB8 00F0             (asm/src/RRSET.ASM):00785                FCB    $00,$F0
+                      (asm/src/RRSET.ASM):00786         
+EFBA 03               (asm/src/RRSET.ASM):00787         DRP    FCB    3
+EFBB F000             (asm/src/RRSET.ASM):00788                FCB    $F0,$00
+EFBD 0F00             (asm/src/RRSET.ASM):00789                FCB    $0F,$00
+EFBF 00F0             (asm/src/RRSET.ASM):00790                FCB    $00,$F0
+EFC1 00F0             (asm/src/RRSET.ASM):00791                FCB    $00,$F0
+EFC3 0F00             (asm/src/RRSET.ASM):00792                FCB    $0F,$00
+EFC5 F000             (asm/src/RRSET.ASM):00793                FCB    $F0,$00
+                      (asm/src/RRSET.ASM):00794         
+EFC7 04               (asm/src/RRSET.ASM):00795         DFRB   FCB    4                   SLASH
+EFC8 000F00           (asm/src/RRSET.ASM):00796                FCB    $00,$0F,$00
+EFCB 00F000           (asm/src/RRSET.ASM):00797                FCB    $00,$F0,$00
+EFCE 00F000           (asm/src/RRSET.ASM):00798                FCB    $00,$F0,$00
+EFD1 0F0000           (asm/src/RRSET.ASM):00799                FCB    $0F,$00,$00
+EFD4 0F0000           (asm/src/RRSET.ASM):00800                FCB    $0F,$00,$00
+EFD7 F00000           (asm/src/RRSET.ASM):00801                FCB    $F0,$00,$00
+                      (asm/src/RRSET.ASM):00802         
+EFDA 05               (asm/src/RRSET.ASM):00803         DSLSH  FCB    5
+EFDB 00F000           (asm/src/RRSET.ASM):00804                FCB    $00,$F0,$00
+EFDE 0FF000           (asm/src/RRSET.ASM):00805                FCB    $0F,$F0,$00
+EFE1 FFFFF0           (asm/src/RRSET.ASM):00806                FCB    $FF,$FF,$F0
+EFE4 0FF000           (asm/src/RRSET.ASM):00807                FCB    $0F,$F0,$00
+EFE7 00F000           (asm/src/RRSET.ASM):00808                FCB    $00,$F0,$00
+EFEA 000000           (asm/src/RRSET.ASM):00809                FCB    $00,$00,$00
+                      (asm/src/RRSET.ASM):00810         
+                      (asm/src/RRSET.ASM):00811                END

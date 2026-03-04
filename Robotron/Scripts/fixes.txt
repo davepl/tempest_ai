@@ -1,0 +1,13 @@
+Robotron baseline notes
+======================
+
+This project copy has been reset from legacy gameplay logic to a Robotron baseline.
+
+Current active pipeline changes:
+- State payload reduced to two dummy values: PlayerAlive and Score.
+- Action payload changed to dual 8-way joystick directions.
+- Legacy Lua gameplay modules replaced with stubs pending Robotron memory mapping.
+
+Remaining TODOs:
+- Wire real Robotron memory addresses for PlayerAlive and Score.
+- Map exact MAME input fields for Coin and Start.

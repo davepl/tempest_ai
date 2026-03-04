@@ -1,0 +1,19 @@
+                      (/src/RRELESE6.ASM):00001         *
+                      (/src/RRELESE6.ASM):00002         *      Additional patch bytes for version 6.   It is assumed that
+                      (/src/RRELESE6.ASM):00003         *      the binary of all of these sources, Plus these patches,
+                      (/src/RRELESE6.ASM):00004         *      plus setting the checksum block around ffb0 comprises
+                      (/src/RRELESE6.ASM):00005         *      the correct binary image.
+                      (/src/RRELESE6.ASM):00006         *
+                      (/src/RRELESE6.ASM):00007         
+                      (/src/RRELESE6.ASM):00008                ORG    $26B1
+26B1 5555555555555555 (/src/RRELESE6.ASM):00009                FCB    $55,$55,$55,$55,$55,$55,$55,$55
+                      (/src/RRELESE6.ASM):00010                ORG    $DF34
+DF34 0A0A0A0A0A0A0A   (/src/RRELESE6.ASM):00011                FCB    $A,$A,$A,$A,$A,$A,$A       
+                      (/src/RRELESE6.ASM):00012                ORG    $E3B0
+E3B0 2626262626262626 (/src/RRELESE6.ASM):00013                FCB    $26,$26,$26,$26,$26,$26,$26,$26,$26
+     26
+                      (/src/RRELESE6.ASM):00014                ORG    $6D2E
+6D2E 21               (/src/RRELESE6.ASM):00015                FCB    $21
+                      (/src/RRELESE6.ASM):00016                ORG    $E398
+E398 A6               (/src/RRELESE6.ASM):00017                FCB    $A6
+                      (/src/RRELESE6.ASM):00018                END

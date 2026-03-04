@@ -1,0 +1,1385 @@
+                      (asm/src/RRDX2.ASM):00001         *  OPT NOL
+                      (asm/src/RRDX2.ASM):00002          INCLUDE "RRF.ASM"
+                      (          RRF.ASM):00001         *        OPT    PAGS
+                      (          RRF.ASM):00002         *        TTL    R O B O T   W A R
+                      (          RRF.ASM):00003         *
+                      (          RRF.ASM):00004         * HARDWARE CONSTANTS
+                      (          RRF.ASM):00005         *
+     BF70             (          RRF.ASM):00006         HSTK EQU $BF70
+     EFF0             (          RRF.ASM):00007         VECTOR EQU $EFF0
+     C000             (          RRF.ASM):00008         CRAM EQU $C000 COLOR RAM ADDR
+     CBFF             (          RRF.ASM):00009         WDOG EQU $CBFF
+     0039             (          RRF.ASM):00010         WDATA EQU $39
+     CC00             (          RRF.ASM):00011         CMOS EQU $CC00
+     C80E             (          RRF.ASM):00012         SOUND EQU $C80E
+     CB00             (          RRF.ASM):00013         VERTCT EQU $CB00 6-BIT VERTICAL BEAM ADDR
+     C900             (          RRF.ASM):00014         RWCNTL EQU $C900 (BIT 0: 1-ROM READ; 0-RAM READ)
+                      (          RRF.ASM):00015         *                (BIT 1: 1-INVERT;   0-NORMAL SCREEN)
+                      (          RRF.ASM):00016         *
+                      (          RRF.ASM):00017         *PIA DEFINITIONS
+                      (          RRF.ASM):00018         *
+     C80C             (          RRF.ASM):00019         PIA0 EQU $C80C
+                      (          RRF.ASM):00020         *B0 AUTO UP
+                      (          RRF.ASM):00021         *B1 ADVANCE
+                      (          RRF.ASM):00022         *B2 RCOIN
+                      (          RRF.ASM):00023         *B3 HSRESET
+                      (          RRF.ASM):00024         *B4 LCOIN
+                      (          RRF.ASM):00025         *B5 CCOIN
+                      (          RRF.ASM):00026         *B6 SLAM
+                      (          RRF.ASM):00027         *B7 SOUND HANDSHAKE
+                      (          RRF.ASM):00028         *CA2 LED3 
+                      (          RRF.ASM):00029         *CA1 IRQ 240 (16 MS)  (LINE 240)
+     C80E             (          RRF.ASM):00030         PIA1 EQU $C80E
+                      (          RRF.ASM):00031         *B0-B5 SOUND
+                      (          RRF.ASM):00032         *B6-B7 LED 0,1
+                      (          RRF.ASM):00033         *CB1 IRQ 4 MS (0,$40,$80,$C0)
+                      (          RRF.ASM):00034         *CB2 LED2            
+     C804             (          RRF.ASM):00035         PIA2 EQU $C804
+                      (          RRF.ASM):00036         *B0 MOVE UP
+                      (          RRF.ASM):00037         *B1 MOVE DOWN
+                      (          RRF.ASM):00038         *B2 MOVE LEFT
+                      (          RRF.ASM):00039         *B3 MOVE RIGHT
+                      (          RRF.ASM):00040         *B4 START 1
+                      (          RRF.ASM):00041         *B5 START 2
+                      (          RRF.ASM):00042         *B6 FIRE UP
+                      (          RRF.ASM):00043         *B7 FIRE DOWN
+                      (          RRF.ASM):00044         *
+     C806             (          RRF.ASM):00045         PIA3 EQU $C806
+                      (          RRF.ASM):00046         *B0 FIRE LEFT
+                      (          RRF.ASM):00047         *B1 FIRE RIGHT
+                      (          RRF.ASM):00048         *B7 INPUT 1=COCKTAIL
+                      (          RRF.ASM):00049         *CB2 OUTPUT SWITCH MUX CONTROL 1=PLAYER1,0=PLAYER2
+                      (          RRF.ASM):00050         *
+                      (          RRF.ASM):00051         *DMA CONSTANTS
+                      (          RRF.ASM):00052         *
+     CA00             (          RRF.ASM):00053         DMACTL EQU $CA00 CONTROL BYTE WRITE INITIATES TRANSFER
+                      (          RRF.ASM):00054         *B0:READ FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00055         *B1:WRITE FORMAT 0=SERIAL;1=BLOCK
+                      (          RRF.ASM):00056         *B2:XSFER RATE 0=ROM-RAM (1MSEC); 1=RAM-RAM (2 MSEC)
+                      (          RRF.ASM):00057         *B3:1=ZERO WRITE SUPPRESS
+                      (          RRF.ASM):00058         *B4:1=CONSTANT SUBSTITUTION
+                      (          RRF.ASM):00059         *B5:1=ODD FLAVOR
+                      (          RRF.ASM):00060         *B6:1=B0-B3 WRITE SUPPRESS
+                      (          RRF.ASM):00061         *B7:1=B4-B7 WRITE SUPPRESS
+     CA01             (          RRF.ASM):00062         DMACON EQU $CA01 CONSTANT DATA BYTE
+     CA02             (          RRF.ASM):00063         DMAORG EQU $CA02 ORIGIN ADDR MSB,LSB
+     CA04             (          RRF.ASM):00064         DMADES EQU $CA04 DESTINATION "
+     CA06             (          RRF.ASM):00065         DMASIZ EQU $CA06 HOR,VERT BYTE COUNTS
+                      (          RRF.ASM):00066         *SCORE DISPLAY CONSTANTS
+     00EA             (          RRF.ASM):00067         YMAX EQU 234   
+     0018             (          RRF.ASM):00068         YMIN EQU 24 MIN Y COORD
+     008F             (          RRF.ASM):00069         XMAX EQU $8F
+     0007             (          RRF.ASM):00070         XMIN EQU 7
+     180E             (          RRF.ASM):00071         P1ORG EQU $18*$100+14
+     2E0E             (          RRF.ASM):00072         P1MAN EQU P1ORG+7*$300+$100
+     180E             (          RRF.ASM):00073         P1DISP EQU P1ORG
+     580E             (          RRF.ASM):00074         P2ORG EQU P1ORG+$40*$100
+     6E0E             (          RRF.ASM):00075         P2MAN EQU P2ORG+P1MAN-P1ORG
+     580E             (          RRF.ASM):00076         P2DISP EQU P2ORG
+     0300             (          RRF.ASM):00077         DIGLTH EQU $300
+     4A7C             (          RRF.ASM):00078         PCOORD EQU $4A7C INIT PLAYER COORD
+     0066             (          RRF.ASM):00079         FONCOL EQU $66 PHONY STARTUP COLOR
+                      (          RRF.ASM):00080         *
+                      (          RRF.ASM):00081         *MODULE  VECTORS + STORAGE ALLOCATION
+                      (          RRF.ASM):00082         *
+                      (          RRF.ASM):00083         ***OPSYS**..... R O S ..........
+                      (          RRF.ASM):00084         *
+     D000             (          RRF.ASM):00085         ROSORG EQU $D000
+                      (          RRF.ASM):00086          ORG ROSORG
+D000                  (          RRF.ASM):00087         INIT RMB 3
+D003                  (          RRF.ASM):00088         ASCAN RMB 3
+D006                  (          RRF.ASM):00089         SDOUT RMB 3
+D009                  (          RRF.ASM):00090         SCRTRN RMB 3
+D00C                  (          RRF.ASM):00091         SCORE RMB 3
+D00F                  (          RRF.ASM):00092         SCRTR0 RMB 3
+D012                  (          RRF.ASM):00093         SCRCLR RMB 3
+D015                  (          RRF.ASM):00094         DMAOFF RMB 3
+D018                  (          RRF.ASM):00095         DMAON RMB 3
+D01B                  (          RRF.ASM):00096         BLKCLR RMB 3
+D01E                  (          RRF.ASM):00097         PCTOFF RMB 3
+D021                  (          RRF.ASM):00098         PCTON RMB 3
+D024                  (          RRF.ASM):00099         COLST RMB 3
+D027                  (          RRF.ASM):00100         COL0 RMB 3
+D02A                  (          RRF.ASM):00101         HEXBCD RMB 3
+D02D                  (          RRF.ASM):00102         BCDHEX RMB 3
+D030                  (          RRF.ASM):00103         OINIT RMB 3
+D033                  (          RRF.ASM):00104         CRINIT RMB 3
+D036                  (          RRF.ASM):00105         PINIT RMB 3
+D039                  (          RRF.ASM):00106         RAND RMB 3
+D03C                  (          RRF.ASM):00107         RAND16 RMB 3
+D03F                  (          RRF.ASM):00108         RMAX RMB 3
+D042                  (          RRF.ASM):00109         RANDU RMB 3
+D045                  (          RRF.ASM):00110         PLINDX RMB 3
+D048                  (          RRF.ASM):00111         PLDX RMB 3
+D04B                  (          RRF.ASM):00112         SNDLD RMB 3
+D04E                  (          RRF.ASM):00113         KILO1 RMB 3
+D051                  (          RRF.ASM):00114         GETOBJ RMB 3
+D054                  (          RRF.ASM):00115         MAKEP RMB 3
+D057                  (          RRF.ASM):00116         MKPROC RMB 3
+D05A                  (          RRF.ASM):00117         MSPROC RMB 3
+D05D                  (          RRF.ASM):00118         KILL RMB 3
+D060                  (          RRF.ASM):00119         GNCIDE RMB 3
+D063                  (          RRF.ASM):00120         SUCIDE RMB 3
+D066                  (          RRF.ASM):00121         SLEEP RMB 3
+D069                  (          RRF.ASM):00122         RIPV RMB 3
+D06C                  (          RRF.ASM):00123         MPROB RMB 3
+D06F                  (          RRF.ASM):00124         GETOB RMB 3
+D072                  (          RRF.ASM):00125         KILLOB RMB 3
+D075                  (          RRF.ASM):00126         KILLOF RMB 3
+D078                  (          RRF.ASM):00127         KILOFP RMB 3
+D07B                  (          RRF.ASM):00128         GETROB RMB 3
+D07E                  (          RRF.ASM):00129         KILROB RMB 3
+D081                  (          RRF.ASM):00130         GETPST RMB 3
+D084                  (          RRF.ASM):00131         KILPST RMB 3
+D087                  (          RRF.ASM):00132         GETHUM RMB 3
+D08A                  (          RRF.ASM):00133         KILHUM RMB 3
+D08D                  (          RRF.ASM):00134         DMAOFN RMB 3
+D090                  (          RRF.ASM):00135         MPCTON RMB 3
+D093                  (          RRF.ASM):00136         BLKON RMB 3
+D096                  (          RRF.ASM):00137         EXECV RMB 3
+D099                  (          RRF.ASM):00138         P1SW   RMB    3
+D09C                  (          RRF.ASM):00139         P2SW   RMB    3
+D09F                  (          RRF.ASM):00140         DIVAB  RMB    3
+D0A2                  (          RRF.ASM):00141         RCMOSA RMB    3
+D0A5                  (          RRF.ASM):00142         RCMOSB RMB    3
+D0A8                  (          RRF.ASM):00143         RCMOSD RMB    3
+D0AB                  (          RRF.ASM):00144         WCMOSA RMB    3
+D0AE                  (          RRF.ASM):00145         WCMOSB RMB    3
+D0B1                  (          RRF.ASM):00146         WCMOSD RMB    3
+D0B4                  (          RRF.ASM):00147         BCDBIN RMB    3
+D0B7                  (          RRF.ASM):00148         RWMOVE RMB    3
+D0BA                  (          RRF.ASM):00149         AUD    RMB    3
+D0BD                  (          RRF.ASM):00150         AUD1   RMB    3
+D0C0                  (          RRF.ASM):00151         INT20V RMB    3
+D0C3                  (          RRF.ASM):00152         LFV    RMB    3
+D0C6                  (          RRF.ASM):00153         NEWBCH RMB    3        BCDHEX THAT USES A!!
+                      (          RRF.ASM):00154         *
+                      (          RRF.ASM):00155         *PLAYER DEATH
+                      (          RRF.ASM):00156         *
+     DD00             (          RRF.ASM):00157         RDORG EQU $DD00
+                      (          RRF.ASM):00158          ORG RDORG
+DD00                  (          RRF.ASM):00159         RDTHV RMB 3
+                      (          RRF.ASM):00160         *
+                      (          RRF.ASM):00161         *HUMANS+HULKS
+                      (          RRF.ASM):00162         *
+     0000             (          RRF.ASM):00163         RHORG EQU $0000
+                      (          RRF.ASM):00164          ORG RHORG
+0000                  (          RRF.ASM):00165         HULKST RMB 3
+0003                  (          RRF.ASM):00166         HUMST RMB 3
+0006                  (          RRF.ASM):00167         CKLIM RMB 3
+0009                  (          RRF.ASM):00168         SKULL RMB 3
+000C                  (          RRF.ASM):00169         P1KD RMB 2
+000E                  (          RRF.ASM):00170         MOMPIC RMB 2
+0010                  (          RRF.ASM):00171         DADPIC RMB 2
+0012                  (          RRF.ASM):00172         KIDPIC RMB 2
+0014                  (          RRF.ASM):00173         HLKPIC RMB 2
+0016                  (          RRF.ASM):00174         HLKANA RMB 2
+0018                  (          RRF.ASM):00175         HUMANA RMB 2
+001A                  (          RRF.ASM):00176         SKLPIC RMB 2
+                      (          RRF.ASM):00177         *
+                      (          RRF.ASM):00178         ***CIRCLES,ENFORCERS,SPARX
+                      (          RRF.ASM):00179         *
+     1140             (          RRF.ASM):00180         RCORG EQU $1140
+                      (          RRF.ASM):00181          ORG RCORG
+1140                  (          RRF.ASM):00182         CIRCST RMB 3 START CIRCLES
+1143                  (          RRF.ASM):00183         CIRKV RMB 3
+1146                  (          RRF.ASM):00184         CIRPIC RMB 2
+1148                  (          RRF.ASM):00185         ENGPIC RMB 2
+114A                  (          RRF.ASM):00186         ENFPIC RMB 2
+                      (          RRF.ASM):00187         *
+                      (          RRF.ASM):00188         *BRAINS & CO.
+                      (          RRF.ASM):00189         *
+     1AC0             (          RRF.ASM):00190         BRNORG EQU $1AC0
+                      (          RRF.ASM):00191          ORG BRNORG
+1AC0                  (          RRF.ASM):00192         BRNST RMB 3
+1AC3                  (          RRF.ASM):00193         BRNPIC RMB 2
+1AC5                  (          RRF.ASM):00194         BRONV  RMB    3
+1AC8                  (          RRF.ASM):00195         HUMONV RMB    3
+1ACB                  (          RRF.ASM):00196         PRGPIC RMB 2
+                      (          RRF.ASM):00197         *
+                      (          RRF.ASM):00198         *******ROBOT GAME...... R G .......
+                      (          RRF.ASM):00199         *
+     26C0             (          RRF.ASM):00200         RGORG EQU $26C0
+                      (          RRF.ASM):00201          ORG RGORG
+26C0                  (          RRF.ASM):00202         PLAYER RMB 3
+26C3                  (          RRF.ASM):00203         RANDXY RMB 3
+26C6                  (          RRF.ASM):00204         CKOBS RMB 3
+26C9                  (          RRF.ASM):00205         MANDSP RMB 3
+26CC                  (          RRF.ASM):00206         STRT1 RMB 3
+26CF                  (          RRF.ASM):00207         STRT2 RMB 3
+26D2                  (          RRF.ASM):00208         TDISPV RMB 3
+26D5                  (          RRF.ASM):00209         MANPIC RMB 2
+26D7                  (          RRF.ASM):00210         LASPIC RMB 2
+                      (          RRF.ASM):00211         *
+                      (          RRF.ASM):00212         *ROBOTS&POSTS
+                      (          RRF.ASM):00213         *
+     3880             (          RRF.ASM):00214         RPORG EQU $3880
+                      (          RRF.ASM):00215          ORG RPORG
+3880                  (          RRF.ASM):00216         RINIT RMB 3
+3883                  (          RRF.ASM):00217         PSINIT RMB 3
+3886                  (          RRF.ASM):00218         PSTP1 RMB 2
+3888                  (          RRF.ASM):00219         OPON RMB 3
+388B                  (          RRF.ASM):00220         OPON1 RMB 3
+388E                  (          RRF.ASM):00221         SAFTY RMB 3
+3891                  (          RRF.ASM):00222         ROBPIC RMB 2
+3893                  (          RRF.ASM):00223         PSTPIC RMB 2
+3895                  (          RRF.ASM):00224         PKPRCV RMB 3
+                      (          RRF.ASM):00225         *
+                      (          RRF.ASM):00226         *TRANSPORTER
+                      (          RRF.ASM):00227         *
+     4140             (          RRF.ASM):00228         RTORG EQU $4140
+                      (          RRF.ASM):00229          ORG RTORG
+4140                  (          RRF.ASM):00230         TRANST RMB 3
+                      (          RRF.ASM):00231         *
+                      (          RRF.ASM):00232         *DIAGONAL EXPLOSIONS
+                      (          RRF.ASM):00233         *
+     4680             (          RRF.ASM):00234         RDXORG EQU $4680
+                      (          RRF.ASM):00235          ORG RDXORG
+4680                  (          RRF.ASM):00236         DXINIT RMB 3
+4683                  (          RRF.ASM):00237         DXST RMB 3
+4686                  (          RRF.ASM):00238         DAPST RMB 3
+4689                  (          RRF.ASM):00239         DXUPD RMB 3
+                      (          RRF.ASM):00240         *
+                      (          RRF.ASM):00241         *TANKS
+                      (          RRF.ASM):00242         *
+     4B00             (          RRF.ASM):00243         RTKORG EQU $4B00
+                      (          RRF.ASM):00244          ORG RTKORG
+4B00                  (          RRF.ASM):00245         TANKST RMB 3
+4B03                  (          RRF.ASM):00246         SQST RMB 3
+4B06                  (          RRF.ASM):00247         SQPIC RMB 2
+4B08                  (          RRF.ASM):00248         TNGPIC RMB 2
+4B0A                  (          RRF.ASM):00249         TNKPIC RMB 2
+                      (          RRF.ASM):00250         *
+                      (          RRF.ASM):00251         *MARQUEE
+                      (          RRF.ASM):00252         *
+     5700             (          RRF.ASM):00253         RMORG EQU $5700
+                      (          RRF.ASM):00254          ORG RMORG
+5700                  (          RRF.ASM):00255         RMST RMB 3
+                      (          RRF.ASM):00256         *
+                      (          RRF.ASM):00257         *EXPLOSIONS
+                      (          RRF.ASM):00258         *
+     5B40             (          RRF.ASM):00259         RXORG EQU $5B40
+                      (          RRF.ASM):00260          ORG RXORG
+5B40                  (          RRF.ASM):00261         EXINIT RMB 3
+5B43                  (          RRF.ASM):00262         EXST RMB 3
+5B46                  (          RRF.ASM):00263         APST RMB 3
+5B49                  (          RRF.ASM):00264         EXUPD RMB 3
+5B4C                  (          RRF.ASM):00265         PDEATH RMB 3
+5B4F                  (          RRF.ASM):00266         HVEXST RMB 3
+5B52                  (          RRF.ASM):00267         DDEXST RMB 3 DUAL DIAGONALS
+5B55                  (          RRF.ASM):00268         AMAP   RMB    3        ATTRACT MODE APPEAR
+5B58                  (          RRF.ASM):00269         HAPST  RMB    3        HORIZONTAL APPEAR
+5B5B                  (          RRF.ASM):00270         HEXST  RMB    3        HORIZONTAL EXPLODE
+                      (          RRF.ASM):00271         
+                      (          RRF.ASM):00272         *             STINKY LINKY VINCKYS
+                      (          RRF.ASM):00273         
+     77A0             (          RRF.ASM):00274         LOGORG EQU    $77A0          PLACE FOR PROGRAM
+     77A0             (          RRF.ASM):00275         GOV    EQU    LOGORG
+     77A3             (          RRF.ASM):00276         CCV    EQU    GOV+3
+                      (          RRF.ASM):00277         
+     E3D0             (          RRF.ASM):00278         TSCORG EQU $E3D0   HIGH SCORE BULLSHIT
+     E3D0             (          RRF.ASM):00279         PUPHSC EQU TSCORG  POWER UP HIGH SCORE CHECK
+     E3D3             (          RRF.ASM):00280         ENDPRC EQU PUPHSC+3 END OF GAME PROCESSING
+     E3D6             (          RRF.ASM):00281         GODSET EQU ENDPRC+3 ENTER GODS NAME BY OPERATOR
+     E3D9             (          RRF.ASM):00282         HIGHRS EQU GODSET+3 RESET HIGH SCORE TABLE BY OPERATOR
+     E3DC             (          RRF.ASM):00283         HSCHKV EQU HIGHRS+3 CHECK IF HS TABLE LOOKS BASHED
+     E3DF             (          RRF.ASM):00284         HSBUTV EQU HSCHKV+3 HIGH SCORE RESET BUTTON
+                      (          RRF.ASM):00285         
+     DF40             (          RRF.ASM):00286         TABORG EQU    $DF40
+     DF40             (          RRF.ASM):00287         TABLEV EQU    TABORG
+                      (          RRF.ASM):00288         
+     F000             (          RRF.ASM):00289         TSTORG EQU $F000
+     F000             (          RRF.ASM):00290         PWRUPV EQU TSTORG    
+     F003             (          RRF.ASM):00291         ADVSW EQU PWRUPV+3
+     F006             (          RRF.ASM):00292         AUTOCY EQU ADVSW+3
+     F009             (          RRF.ASM):00293         HXINIT EQU AUTOCY+3
+     F00C             (          RRF.ASM):00294         HEXSTX EQU HXINIT+3
+     F00F             (          RRF.ASM):00295         HAPSTX EQU HEXSTX+3
+     F012             (          RRF.ASM):00296         HXUPD EQU HAPSTX+3
+     F015             (          RRF.ASM):00297         WLOOPV EQU HXUPD+3
+     F017             (          RRF.ASM):00298         ELOOPV EQU WLOOPV+2
+     F019             (          RRF.ASM):00299         L2     EQU    ELOOPV+2
+     F01B             (          RRF.ASM):00300         L0     EQU    L2+2
+                      (          RRF.ASM):00301         
+     6F00             (          RRF.ASM):00302         TSBORG EQU $6F00 ADJUST PART OF TEST MODE
+     6F00             (          RRF.ASM):00303         ADJV   EQU TSBORG
+     6F03             (          RRF.ASM):00304         CMINIT EQU ADJV+3
+     6F06             (          RRF.ASM):00305         ATMCK  EQU CMINIT+3
+     6F09             (          RRF.ASM):00306         GETLT  EQU ATMCK+3     ROUTINE TO GET LETTERS FROM CONTROL PANEL
+     6F0C             (          RRF.ASM):00307         CMSMVV EQU GETLT+3
+     6F0F             (          RRF.ASM):00308         DOPMES EQU    CMSMVV+3   2 BYTER
+                      (          RRF.ASM):00309         
+     5F90             (          RRF.ASM):00310         TXORG  EQU    $5F90    PLACE FOR TEXT PROGRAM
+     5F90             (          RRF.ASM):00311         PR35V  EQU    TXORG
+     5F93             (          RRF.ASM):00312         PR57V  EQU    PR35V+3
+     5F96             (          RRF.ASM):00313         WRD5V  EQU    PR57V+3
+     5F99             (          RRF.ASM):00314         WRD7V  EQU    WRD5V+3
+     5F9C             (          RRF.ASM):00315         PRINV  EQU    WRD7V+3
+     5F9F             (          RRF.ASM):00316         PRSCR  EQU    PRINV+3
+                      (          RRF.ASM):00317         
+     5F96             (          RRF.ASM):00318         WRD5FV EQU    WRD5V
+     5F99             (          RRF.ASM):00319         WRD7FV EQU    WRD7V
+     5F90             (          RRF.ASM):00320         PRN5FV EQU    PR35V
+     5F93             (          RRF.ASM):00321         PRN7FV EQU    PR57V
+                      (          RRF.ASM):00322         
+     E9C8             (          RRF.ASM):00323         SETORG EQU    $E9C8    CHARACTER SET
+     E9C8             (          RRF.ASM):00324         TAB35  EQU    SETORG
+     E9CA             (          RRF.ASM):00325         TAB57  EQU    TAB35+2
+     E9CA             (          RRF.ASM):00326         N0V    EQU    TAB57  
+                      (          RRF.ASM):00327         
+                      (          RRF.ASM):00328         *
+                      (          RRF.ASM):00329         *BASE PAGE RAM AREA
+                      (          RRF.ASM):00330         *
+                      (          RRF.ASM):00331          ORG $9800
+     9800             (          RRF.ASM):00332         RAM EQU *
+     98               (          RRF.ASM):00333          SETDP $98
+                      (          RRF.ASM):00334         
+9800                  (          RRF.ASM):00335         PCRAM RMB 16 PSEUDO COLOR RAM
+9810                  (          RRF.ASM):00336         TIMER RMB 1  IRQ TIMER
+9811                  (          RRF.ASM):00337         ACTIVE RMB    2        POINTER TO LIST OF CURRENTLY ACTIVE (SLEEPING) PROCS.
+9813                  (          RRF.ASM):00338         FREE   RMB    2        POINTER TO LIST OF UNALLOCATED PROCESS SLEEP SPACE.
+9815                  (          RRF.ASM):00339         CRPROC RMB    2        POINTER TO SLEEP AREA OF CURRENTLY EXECUTING PROCESS.
+9817                  (          RRF.ASM):00340         OPTR RMB 2 MOTION OBJECT LIST POINTER
+9819                  (          RRF.ASM):00341         OBPTR RMB 2 OBSTACLE LIST POINTER
+981B                  (          RRF.ASM):00342         OFREE RMB 2 FREE LIST POINTER
+981D                  (          RRF.ASM):00343         SPFREE RMB 2 SUPER PROCESS FREE LIST
+981F                  (          RRF.ASM):00344         HPTR RMB 2 HUMAN PTR
+9821                  (          RRF.ASM):00345         RPTR RMB 2 ROBOT LIST
+9823                  (          RRF.ASM):00346         PPTR RMB 2 PHATAL OBJECT LIST
+9825                  (          RRF.ASM):00347         ITEMP RMB 2 INTERUPT TEMP
+9827                  (          RRF.ASM):00348         PSTIN RMB 2
+9829                  (          RRF.ASM):00349         ITEMP2 RMB 2
+982B                  (          RRF.ASM):00350         XTEMP  RMB 2 SAVE AREA FOR QUICK TEMPORARY
+982D                  (          RRF.ASM):00351         XTEMP2 RMB 2
+982F                  (          RRF.ASM):00352         PIA01 RMB 1 N-1 PIA0
+9830                  (          RRF.ASM):00353         PIA02 RMB 1 N-2 PIA0
+9831                  (          RRF.ASM):00354         PIA21 RMB 1 N-1 PIA2
+9832                  (          RRF.ASM):00355         PIA22 RMB 1 N-2 PIA2
+9833                  (          RRF.ASM):00356         SWPROC RMB 12 SWITCH SCAN TEMP
+983F                  (          RRF.ASM):00357         CURPLR RMB 1 CURRENT
+9840                  (          RRF.ASM):00358         PLRCNT RMB 1 NUMBER OF PLAYERS
+9841                  (          RRF.ASM):00359         XXX2 RMB 1 '80' IRQ LINE
+9842                  (          RRF.ASM):00360         OVCNT RMB 1 OVERFLOW COUNT
+9843                  (          RRF.ASM):00361         IFLG RMB 1 IRQ FLAG
+9844                  (          RRF.ASM):00362         FRAME RMB 1 IRQ COUNT
+9845                  (          RRF.ASM):00363         RWCTMP RMB 1 SCREEN READ CONTROL BYTE
+9846                  (          RRF.ASM):00364         REPLA RMB 2 REPLAY LEVEL
+9848                  (          RRF.ASM):00365         PCFLG RMB 1 PLAYER COLLISION
+9849                  (          RRF.ASM):00366         HTABX RMB 2 HUMAN TABLE INDEX
+                      (          RRF.ASM):00367         *COIN BUSINESS
+984B                  (          RRF.ASM):00368         SLMCNT RMB 1
+984C                  (          RRF.ASM):00369         LCCNT RMB 1
+984D                  (          RRF.ASM):00370         RCCNT RMB 1
+984E                  (          RRF.ASM):00371         CCCNT RMB 1
+984F                  (          RRF.ASM):00372         BUNITS RMB 1
+9850                  (          RRF.ASM):00373         CUNITS RMB 1
+9851                  (          RRF.ASM):00374         CREDIT RMB 1
+                      (          RRF.ASM):00375         *ATTRACT SWITCHES: FONY PRAYAH CONTLOHL
+9852                  (          RRF.ASM):00376         ATRSW2 RMB 1
+9853                  (          RRF.ASM):00377         ATRSW3 RMB 1
+                      (          RRF.ASM):00378         *SOUND RAM
+9854                  (          RRF.ASM):00379         SNDX RMB 2 TABLE INDEX
+9856                  (          RRF.ASM):00380         SNDPRI RMB 1 PRIORITY
+9857                  (          RRF.ASM):00381         SNDTMR RMB 1
+9858                  (          RRF.ASM):00382         SNDREP RMB 1
+                      (          RRF.ASM):00383         *
+                      (          RRF.ASM):00384         *STATUS FLAG
+                      (          RRF.ASM):00385         *B7=GAME OVER
+                      (          RRF.ASM):00386         *B6=
+                      (          RRF.ASM):00387         *B5=
+                      (          RRF.ASM):00388         *B4=PLAYER OUTPUT
+                      (          RRF.ASM):00389         *B3=MOTION OBJS VEL +ENEMIES
+                      (          RRF.ASM):00390         *B2=EXPLOSION UPDATE
+                      (          RRF.ASM):00391         *B1=POST ,MOT OBJ REFRESH
+                      (          RRF.ASM):00392         *B0=PLAYER MOTION,COLLISION,FIRE
+9859                  (          RRF.ASM):00393         STATUS RMB 1
+                      (          RRF.ASM):00394         *
+                      (          RRF.ASM):00395         *PLAYER OBJECT STRUCTURE
+                      (          RRF.ASM):00396         *
+     985A             (          RRF.ASM):00397         PLOBJ EQU *
+985A                  (          RRF.ASM):00398          RMB 2 OLINK
+985C                  (          RRF.ASM):00399         PPICT RMB 2 OPICT
+985E                  (          RRF.ASM):00400         PX RMB 2 OBJX
+9860                  (          RRF.ASM):00401          RMB 2 OBJID
+9862                  (          RRF.ASM):00402          RMB 2 OCVECT
+9864                  (          RRF.ASM):00403         PX16 RMB 2  OX16
+9866                  (          RRF.ASM):00404         PY16 RMB 2  OY16
+9868                  (          RRF.ASM):00405         PXV RMB 2   OXV
+986A                  (          RRF.ASM):00406         PYV RMB 2   OYV
+986C                  (          RRF.ASM):00407          RMB 1 OFLAV
+986D                  (          RRF.ASM):00408         PODATA RMB 1 ODATA
+986E                  (          RRF.ASM):00409         POLDPC RMB 2 OLDPIC
+9870                  (          RRF.ASM):00410         PLAIMC RMB 1 PLAYER ANIMATION RATE
+9871                  (          RRF.ASM):00411         PLAIMN RMB 1 PLAYER ANIMATION NUMBER
+9872                  (          RRF.ASM):00412         PLAIMB RMB 2 PLAYER ANIMATION BASE ADDR
+                      (          RRF.ASM):00413         *
+                      (          RRF.ASM):00414         *COLLISION ROUTINE PARAMETERS
+                      (          RRF.ASM):00415         *
+9874                  (          RRF.ASM):00416         XCNT RMB 1 SCAN COUNTS
+9875                  (          RRF.ASM):00417         YCNT RMB 1
+9876                  (          RRF.ASM):00418         OX1 RMB 1 OFFSETS
+9877                  (          RRF.ASM):00419         OY1 RMB 1
+9878                  (          RRF.ASM):00420         PX1 RMB 1
+9879                  (          RRF.ASM):00421         PY1 RMB 1
+987A                  (          RRF.ASM):00422         OBW RMB 1 HT TEMPS
+987B                  (          RRF.ASM):00423         PLW RMB 1
+987C                  (          RRF.ASM):00424         ULX RMB 1 UPPER LEFT COORD
+987D                  (          RRF.ASM):00425         ULY RMB 1 "
+987E                  (          RRF.ASM):00426         LRX RMB 1
+987F                  (          RRF.ASM):00427         LRY RMB 1
+9880                  (          RRF.ASM):00428         CTEMP RMB 2 INDEX TEMP
+9882                  (          RRF.ASM):00429         CTEMP2 RMB 2
+                      (          RRF.ASM):00430         *RANDOM VARIABLES
+9884                  (          RRF.ASM):00431         SEED   RMB    1
+9885                  (          RRF.ASM):00432         HSEED  RMB    1 
+9886                  (          RRF.ASM):00433         LSEED  RMB    1
+                      (          RRF.ASM):00434         *LASER
+9887                  (          RRF.ASM):00435         LCNT RMB 1
+9888                  (          RRF.ASM):00436         LASDIR RMB 2
+                      (          RRF.ASM):00437         *SPARKS
+988A                  (          RRF.ASM):00438         SPKCNT RMB 1
+988B                  (          RRF.ASM):00439         ROBST RMB 2 PTR TO ROBOT LIST
+988D                  (          RRF.ASM):00440         SAVCNT RMB 1 HUMAN COUNT SAVED
+988E                  (          RRF.ASM):00441         BCMCNT RMB 1 BRAIN CRUISE MISSILES
+                      (          RRF.ASM):00442         *POST ANIMATION+WALL COLOR
+988F                  (          RRF.ASM):00443         WALCOL RMB 1 WALL+POST BG
+9890                  (          RRF.ASM):00444         PSTCOL RMB 1 POST COLOR
+9891                  (          RRF.ASM):00445         LASCOL RMB 1 LASER WALL COLLIDE COLOR
+9892                  (          RRF.ASM):00446         PSTREF RMB 1 POST REFRESH RATE
+9893                  (          RRF.ASM):00447         PSTANI RMB 2 CURR POST ANIMATION
+9895                  (          RRF.ASM):00448         BRNFLG RMB 1 BRAIN HUMAN KILL FLAG
+                      (          RRF.ASM):00449         *
+                      (          RRF.ASM):00450         *EXPLOSION STUFF
+9896                  (          RRF.ASM):00451         EXPRAM RMB $10
+98A6                  (          RRF.ASM):00452         CENTMP RMB 2 CENTER OF BLOW
+98A8                  (          RRF.ASM):00453         HXRAM RMB $10
+98B8                  (          RRF.ASM):00454         DXRAM RMB $10
+98C8                  (          RRF.ASM):00455         RMRAM RMB 6 MARQUEE RAM
+                      (          RRF.ASM):00456         
+                      (          RRF.ASM):00457         ************************ LINKYS STINKYS
+                      (          RRF.ASM):00458         
+98CE                  (          RRF.ASM):00459         INDIAG RMB    1
+                      (          RRF.ASM):00460         
+                      (          RRF.ASM):00461         *
+                      (          RRF.ASM):00462         *      TEXT VARIABLES
+                      (          RRF.ASM):00463         *
+                      (          RRF.ASM):00464         
+98CF                  (          RRF.ASM):00465         TEXCOL RMB    1 (TEXCOL)  PRINTING COLOR (NIBBLES REPRESENT FLAVOR COLO
+98D0                  (          RRF.ASM):00466         TXFLAV RMB    1 (TXFLAV) FLAVOR OF CURRENT CURSOR (0=EVEN, 1=ODD)
+98D1                  (          RRF.ASM):00467         TXLEAD RMB    1 (TXLEAD) LEAD ZERO BLANKING ON/OFF (0=OFF, 1=ON)
+98D2                  (          RRF.ASM):00468         TXFONT RMB    1 (TXFONT) FONT HEIGHT (5 OR 7) PIXELS
+98D3                  (          RRF.ASM):00469         TEXMAR RMB    2        CURRENT LEFT MARGIN CURSOR POINTER
+98D5                  (          RRF.ASM):00470         TEXMFL RMB    1        CURRENT LEFT MARGIN FLAVOR
+98D6                  (          RRF.ASM):00471         TEXTP3 RMB    1
+98D7                  (          RRF.ASM):00472         TXCLIP RMB    1
+                      (          RRF.ASM):00473         
+                      (          RRF.ASM):00474         *
+                      (          RRF.ASM):00475         ***    GET LETTER ROUTINE RAM
+                      (          RRF.ASM):00476         *
+                      (          RRF.ASM):00477         
+98D8                  (          RRF.ASM):00478         GETLRM RMB    2
+98DA                  (          RRF.ASM):00479         GETLST RMB    3
+                      (          RRF.ASM):00480         
+                      (          RRF.ASM):00481         ********************* LOGO RAM
+                      (          RRF.ASM):00482         
+98DD                  (          RRF.ASM):00483         LOGX   RMB    2
+98DF                  (          RRF.ASM):00484         LOGCOL RMB    1
+98E0                  (          RRF.ASM):00485         LOGCL2 RMB    1
+98E1                  (          RRF.ASM):00486         LOGCNT RMB    1
+98E2                  (          RRF.ASM):00487         LOGSAV RMB    2
+98E4                  (          RRF.ASM):00488         LOGCST RMB    2
+                      (          RRF.ASM):00489         
+98E6                  (          RRF.ASM):00490         LASTX  RMB    2
+98E8                  (          RRF.ASM):00491         SIDE   RMB    1
+98E9                  (          RRF.ASM):00492         BALCOL RMB    1
+98EA                  (          RRF.ASM):00493         SLIDER RMB    1
+98EB                  (          RRF.ASM):00494         ERPTR  RMB    2
+                      (          RRF.ASM):00495         *MOVE THIS SOMEDAY
+98ED                  (          RRF.ASM):00496         ENFCNT RMB 1
+98EE                  (          RRF.ASM):00497         GAMTIM RMB 1 GAME TIMER
+98EF                  (          RRF.ASM):00498         TNKSPD RMB 1 TANK SPEED PARAMETER
+98F0                  (          RRF.ASM):00499         SCRFLG RMB 1 SCORE FLAG
+98F1                  (          RRF.ASM):00500         SHLCNT RMB 1 SHELL COUNTER
+98F2                  (          RRF.ASM):00501         RIPFLG RMB 1                            
+98F3                  (          RRF.ASM):00502         HCK1   RMB 1
+98F4                  (          RRF.ASM):00503         ATFLAG RMB 1  INDICATE WHAT PAGE AND HOW
+                      (          RRF.ASM):00504         
+                      (          RRF.ASM):00505         *
+                      (          RRF.ASM):00506         *TABLE DATA
+                      (          RRF.ASM):00507         *
+                      (          RRF.ASM):00508          ORG RAM+$100 PAST BASE PAGE
+                      (          RRF.ASM):00509         *
+                      (          RRF.ASM):00510         *MASTER OBJECT LIST
+                      (          RRF.ASM):00511         *
+     9900             (          RRF.ASM):00512         OLIST EQU * 
+     0018             (          RRF.ASM):00513         OSIZE EQU $18
+                      (          RRF.ASM):00514         *
+                      (          RRF.ASM):00515         *INDEX OFFSETS
+                      (          RRF.ASM):00516         *
+     0000             (          RRF.ASM):00517         OLINK EQU 0 LINK TO NEXT
+     0002             (          RRF.ASM):00518         OPICT EQU 2 PICTURE DESCRIPTOR ADDR
+     0004             (          RRF.ASM):00519         OBJX EQU 4 UPPER LEFT SCREEN X
+     0005             (          RRF.ASM):00520         OBJY EQU 5 UPPER LEFT SCREEN Y
+     0006             (          RRF.ASM):00521         OBJID EQU 6 ASSOCIATED PROCESS ID (IF ANY)
+     0008             (          RRF.ASM):00522         OCVECT EQU 8 COLLISION ROUTINE ADDR
+     000A             (          RRF.ASM):00523         OX16 EQU $A 16 BIT X WORLD COORD
+     000C             (          RRF.ASM):00524         OY16 EQU $C 16 BIT Y WORLD COORD
+     000E             (          RRF.ASM):00525         OXV EQU $E X VELOCITY
+     0010             (          RRF.ASM):00526         OYV EQU $10 Y VELOCITY
+     0012             (          RRF.ASM):00527         OFLAV EQU $12 OLD FLAVOR
+     0013             (          RRF.ASM):00528         ODATA EQU $13 MISC. DATA
+     0014             (          RRF.ASM):00529         OLDPIC EQU $14 OLD PICTURE TO ERASE
+     0016             (          RRF.ASM):00530         FONIPC EQU $16 FONY PICT FOR COLLISION PURPOSES
+                      (          RRF.ASM):00531         *RESERVE AREA
+9900                  (          RRF.ASM):00532          RMB (180)*OSIZE
+     A9E0             (          RRF.ASM):00533         OLEND EQU *
+                      (          RRF.ASM):00534         *
+                      (          RRF.ASM):00535         *USER DEFINED PROCESS TYPES
+                      (          RRF.ASM):00536         *
+     0000             (          RRF.ASM):00537         STYPE EQU 0 SYSTEM PROCESS
+     0001             (          RRF.ASM):00538         CTYPE EQU 1 COIN
+                      (          RRF.ASM):00539         *
+                      (          RRF.ASM):00540         *SLEEPING PROCESS TABLE
+                      (          RRF.ASM):00541         *
+     A9E0             (          RRF.ASM):00542         PTAB EQU *
+                      (          RRF.ASM):00543         *
+                      (          RRF.ASM):00544         *OFFSET CONSTANTS 
+                      (          RRF.ASM):00545         *
+     0000             (          RRF.ASM):00546         PLINK EQU 0
+     0002             (          RRF.ASM):00547         PADDR EQU 2
+     0004             (          RRF.ASM):00548         PTIME EQU 4
+     0005             (          RRF.ASM):00549         PTYPE EQU 5
+     0006             (          RRF.ASM):00550         PCOD EQU 6
+     0007             (          RRF.ASM):00551         PDATA EQU 7
+     0007             (          RRF.ASM):00552         PD EQU 7
+     0008             (          RRF.ASM):00553         PD1 EQU 8
+     0009             (          RRF.ASM):00554         PD2 EQU 9
+     000A             (          RRF.ASM):00555         PD3 EQU 10
+     000B             (          RRF.ASM):00556         PD4 EQU 11
+     000C             (          RRF.ASM):00557         PD5 EQU 12
+     000D             (          RRF.ASM):00558         PD6 EQU 13
+     000E             (          RRF.ASM):00559         PD7 EQU 14
+     000F             (          RRF.ASM):00560         PSIZE EQU 15
+A9E0                  (          RRF.ASM):00561          RMB 15*(120)
+     B0E8             (          RRF.ASM):00562         TABEND EQU *
+                      (          RRF.ASM):00563         *
+                      (          RRF.ASM):00564         *SUPER PROCESSES
+                      (          RRF.ASM):00565         *
+     001F             (          RRF.ASM):00566         SPSIZE EQU PSIZE+16
+B0E8                  (          RRF.ASM):00567         SPTAB RMB SPSIZE*20
+     B354             (          RRF.ASM):00568         SPTEND EQU *
+                      (          RRF.ASM):00569         *
+                      (          RRF.ASM):00570         *OBJECT PICTURE STRUCTURE
+                      (          RRF.ASM):00571         *
+     0000             (          RRF.ASM):00572         OBJW EQU 0
+     0001             (          RRF.ASM):00573         OBJH EQU 1
+     0002             (          RRF.ASM):00574         OBJDAT EQU 2
+     0004             (          RRF.ASM):00575         OBJL EQU 4
+                      (          RRF.ASM):00576         *
+                      (          RRF.ASM):00577         *HUMAN TABLE
+                      (          RRF.ASM):00578         *
+B354                  (          RRF.ASM):00579         HTAB RMB 80
+     B3A4             (          RRF.ASM):00580         HTBEND EQU *
+                      (          RRF.ASM):00581         *
+                      (          RRF.ASM):00582         *POST REFRESH LIST
+                      (          RRF.ASM):00583         *
+B3A4                  (          RRF.ASM):00584         PSLIST RMB 64 POST LIST
+     B3E4             (          RRF.ASM):00585         PSLEND EQU *
+                      (          RRF.ASM):00586         *
+                      (          RRF.ASM):00587         *HORIZONTAL EXPLOSION TABLES
+                      (          RRF.ASM):00588         *
+B3E4                  (          RRF.ASM):00589         HXTAB RMB $800
+                      (          RRF.ASM):00590         
+                      (          RRF.ASM):00591         *
+                      (          RRF.ASM):00592         *DIAGONAL XPLOSION TABLES
+                      (          RRF.ASM):00593         *
+BBE4                  (          RRF.ASM):00594         DXTAB RMB $200
+                      (          RRF.ASM):00595         *
+                      (          RRF.ASM):00596         *PLAYER DATA TABLE
+                      (          RRF.ASM):00597         *
+     BDE4             (          RRF.ASM):00598         PLDATA EQU *
+BDE4                  (          RRF.ASM):00599         ZP1SCR RMB 4 SCORE MSB 1ST
+BDE8                  (          RRF.ASM):00600         ZP1RP RMB 4 NEXT REPLAY LEVEL
+BDEC                  (          RRF.ASM):00601         ZP1LAS RMB 1 #OF LASERS 
+BDED                  (          RRF.ASM):00602         ZP1WAV RMB 1 WAVE # IN HEX
+BDEE                  (          RRF.ASM):00603         ZP1ENM RMB 50 ENEMY STATE
+     BE20             (          RRF.ASM):00604         ZP1END EQU *
+BE20                  (          RRF.ASM):00605         ZP2SCR RMB 4
+BE24                  (          RRF.ASM):00606         ZP2RP RMB 4
+BE28                  (          RRF.ASM):00607         ZP2LAS RMB 1
+BE29                  (          RRF.ASM):00608         ZP2WAV RMB 1
+BE2A                  (          RRF.ASM):00609         ZP2ENM RMB 50
+     BE5C             (          RRF.ASM):00610         PLDEND EQU * END OF PLAYER DATA
+     003C             (          RRF.ASM):00611         PLDLEN EQU ZP1END-PLDATA
+     0000             (          RRF.ASM):00612         PSCOR EQU ZP1SCR-PLDATA
+     0004             (          RRF.ASM):00613         PRPLA EQU ZP1RP-PLDATA
+     0008             (          RRF.ASM):00614         PLAS EQU ZP1LAS-PLDATA
+     0009             (          RRF.ASM):00615         PWAV EQU ZP1WAV-PLDATA
+     000A             (          RRF.ASM):00616         PENEMY EQU ZP1ENM-PLDATA
+                      (          RRF.ASM):00617         *
+                      (          RRF.ASM):00618         *ENEMIES LIST
+                      (          RRF.ASM):00619         *WARNING DO NOT CHANGE ORDER OF COUNTS
+     BE5C             (          RRF.ASM):00620         ELIST EQU *
+BE5C                  (          RRF.ASM):00621         ROBSPD RMB 1  SPEED
+BE5D                  (          RRF.ASM):00622         RMXSPD RMB 1 MAX ROBOT SPEED
+BE5E                  (          RRF.ASM):00623         ENFNUM RMB 1 # OF ENFORCERS/CIRCLE X2
+BE5F                  (          RRF.ASM):00624         ENSTIM RMB 1 ENF SHOT TIMER
+BE60                  (          RRF.ASM):00625         CDPTIM RMB 1 CIRCLE DROP TIMER
+BE61                  (          RRF.ASM):00626         HLKSPD RMB 1 HULK SPEED
+BE62                  (          RRF.ASM):00627         BSHTIM RMB 1 BRAIN SHOT TIMER
+BE63                  (          RRF.ASM):00628         BRNSPD RMB 1 BRAIN SPEED
+BE64                  (          RRF.ASM):00629         TNKSHT RMB 1  TANK SHOT RATE
+BE65                  (          RRF.ASM):00630         SHLSPD RMB 1  SHELL SPEED
+BE66                  (          RRF.ASM):00631         TDPTIM RMB 1  TANK DROP TIMR
+BE67                  (          RRF.ASM):00632         SQSPD RMB 1   SQUARE SPEED
+     BE68             (          RRF.ASM):00633         ECNTS EQU * START COUNTS
+BE68                  (          RRF.ASM):00634         ROBCNT RMB 1 # ROBOTS
+BE69                  (          RRF.ASM):00635         PSTCNT RMB 1 # POSTS
+BE6A                  (          RRF.ASM):00636         MOMCNT RMB 1 # MOM UNITS
+BE6B                  (          RRF.ASM):00637         DADCNT RMB 1 # DAD UNITS
+BE6C                  (          RRF.ASM):00638         KIDCNT RMB 1 # KIDS
+BE6D                  (          RRF.ASM):00639         HLKCNT RMB 1 # HULKS
+BE6E                  (          RRF.ASM):00640         BRNCNT RMB 1 # BRAINS
+BE6F                  (          RRF.ASM):00641         CIRCNT RMB 1 # CIRCLES
+BE70                  (          RRF.ASM):00642         SQCNT RMB 1 # SQUARES
+BE71                  (          RRF.ASM):00643         TNKCNT RMB 1 # TANKS
+     BE72             (          RRF.ASM):00644         ELEND EQU *
+BE72                  (          RRF.ASM):00645         HCK2 RMB 1
+                      (          RRF.ASM):00646         *
+                      (          RRF.ASM):00647         * CMOS RAM ALLOCATION
+                      (          RRF.ASM):00648         *
+                      (          RRF.ASM):00649          ORG CMOS+$100     WRITABLE CMOS  
+CD00                  (          RRF.ASM):00650         CREDST RMB 2 CREDITS BACKUP
+CD02                  (          RRF.ASM):00651         SLOT1 RMB 6 1 LEFT COIN TOTAL
+CD08                  (          RRF.ASM):00652               RMB 6 2 CENTER COIN TOTAL
+CD0E                  (          RRF.ASM):00653               RMB 6 3 RIGHT COIN TOTAL
+CD14                  (          RRF.ASM):00654                RMB 6 4 TOTAL PAID CREDITS
+CD1A                  (          RRF.ASM):00655                RMB 6 5 TOTAL REPLAYS
+CD20                  (          RRF.ASM):00656         BKTIME RMB 6 6 FLIGHT TIME IN MINS
+CD26                  (          RRF.ASM):00657         BKMEN  RMB 6 7 TOTAL SHIPS PLAYED
+CD2C                  (          RRF.ASM):00658         BKPLAY RMB 6 8 TOTAL GAMES PLAYED
+     CD32             (          RRF.ASM):00659         BKEND  EQU    *        END OF BOOKKEEPING STUFF
+     000E             (          RRF.ASM):00660         SCRSIZ EQU 14 NUMBER OF NIBBLES IN A SCORE ENTRY
+CD32                  (          RRF.ASM):00661         GODINT RMB 6
+CD38                  (          RRF.ASM):00662         GODSCR RMB 48   
+CD68                  (          RRF.ASM):00663         CMSCOR RMB 37*SCRSIZ   37 BACKED UP SCORES, 36 OF WHICH ARE VISIBLE
+CF6E                  (          RRF.ASM):00664         TODAYS RMB 10*SCRSIZ     TODAYS GREATEST
+     CFFA             (          RRF.ASM):00665         TODEND EQU *
+                      (          RRF.ASM):00666          ORG CMOS  ADEQUATE BIRTH CONTROL PROTECTION
+CC00                  (          RRF.ASM):00667         REPLAY RMB 2 REPLAY LEVEL
+CC02                  (          RRF.ASM):00668         NSHIP RMB 2 # OF SHIPS/1 CREDIT GAME
+CC04                  (          RRF.ASM):00669         COINSL RMB 2 FOR COINAGE SELECT MODE
+CC06                  (          RRF.ASM):00670         SLOT1M RMB 2 LEFT COIN MULT
+CC08                  (          RRF.ASM):00671         SLOT2M RMB 2 CENTER COIN MULT
+CC0A                  (          RRF.ASM):00672         SLOT3M RMB 2 RIGHT COIN MULT
+CC0C                  (          RRF.ASM):00673         CUNITC RMB 2 COIN UNITS PER CREDIT
+CC0E                  (          RRF.ASM):00674         CUNITB RMB 2 COIN UNITS FOR BONUS
+CC10                  (          RRF.ASM):00675         MINUNT RMB 2 MINIMUM REQD
+CC12                  (          RRF.ASM):00676         FREEPL RMB 2 FREE PLAY MODE       (ONE CREDIT GAME)     
+CC14                  (          RRF.ASM):00677         GA1 RMB 2 10 MASTER DIFFICULTY CONTROL               1
+CC16                  (          RRF.ASM):00678         GA2 RMB 2 NUMBER OF LETTERS ALLOWED TO GOD           10
+CC18                  (          RRF.ASM):00679         SPECFN RMB 2  RESTORE FACTORY SETTINGS
+CC1A                  (          RRF.ASM):00680          RMB 2  CLEAR AUDIT TOTALS
+CC1C                  (          RRF.ASM):00681          RMB 2  INITIALIZE HIGH SCORE TABLE
+CC1E                  (          RRF.ASM):00682          RMB 2  INTIATE AUTO CYCLE
+CC20                  (          RRF.ASM):00683          RMB 2  ENTER ATTRACT MODE MESSAGE
+CC22                  (          RRF.ASM):00684          RMB 2  ENTER HIGHEST SCORE NAME
+     CC24             (          RRF.ASM):00685         ENDADJ EQU *
+CC24                  (          RRF.ASM):00686         OPMESS RMB 100  2 LINES OF 25 CHARS EACH.
+CC88                  (          RRF.ASM):00687         OPL1 RMB 2
+CC8A                  (          RRF.ASM):00688         OPL2 RMB 2
+CC8C                  (          RRF.ASM):00689         ADJSUM RMB 2
+CC8E                  (          RRF.ASM):00690         OMESUM RMB 2
+                      (          RRF.ASM):00691         
+                      (          RRF.ASM):00692         *
+                      (          RRF.ASM):00693         *M A C R O S
+                      (          RRF.ASM):00694         *
+CC90                  (          RRF.ASM):00695         NAP    MACRO
+                      (          RRF.ASM):00696                LDA #\1 TIME
+                      (          RRF.ASM):00697                LDX #\2 WAKEUP ADDR
+                      (          RRF.ASM):00698                JMP    SLEEP  
+                      (          RRF.ASM):00699                ENDM
+                      (          RRF.ASM):00700         *
+                      (          RRF.ASM):00701         *MAKE A NEW PROCESS
+                      (          RRF.ASM):00702         *
+CC90                  (          RRF.ASM):00703         NEWP MACRO
+                      (          RRF.ASM):00704          LDX #\1 ADDR
+                      (          RRF.ASM):00705          LDA #\2 TYPE
+                      (          RRF.ASM):00706          JSR MKPROC
+                      (          RRF.ASM):00707          ENDM
+                      (          RRF.ASM):00708         *INIT PROCESS \0=SADDR 
+CC90                  (          RRF.ASM):00709         MAKP MACRO
+                      (          RRF.ASM):00710          JSR MAKEP
+                      (          RRF.ASM):00711          FDB \1
+                      (          RRF.ASM):00712          ENDM
+                      (          RRF.ASM):00713         *MAKE A PROCESS AND OBJECT
+CC90                  (          RRF.ASM):00714         MKPROB MACRO
+                      (          RRF.ASM):00715          JSR MPROB
+                      (          RRF.ASM):00716          FDB \1,\2,\3
+                      (          RRF.ASM):00717          ENDM
+                      (          RRF.ASM):00718         
+                      (asm/src/RRDX2.ASM):00003         *  OPT LIS
+                      (asm/src/RRDX2.ASM):00004         *  STTL DIAGONAL EXPLOSIONS
+                      (asm/src/RRDX2.ASM):00005         *
+                      (asm/src/RRDX2.ASM):00006         *      EXPLODING OBJECT DATA STRUCTURE
+                      (asm/src/RRDX2.ASM):00007         *
+                      (asm/src/RRDX2.ASM):00008                ORG    DXTAB          PLACE FOR DATA
+                      (asm/src/RRDX2.ASM):00009         
+     BBE4             (asm/src/RRDX2.ASM):00010         EX     EQU    *
+BBE4                  (asm/src/RRDX2.ASM):00011         NEXTZ  RMB    2  LIST POINTER
+BBE6                  (asm/src/RRDX2.ASM):00012         PICPTZ RMB    2  POINTER TO DATA   
+BBE8                  (asm/src/RRDX2.ASM):00013         XCENTZ RMB    1  SCREEN X CENTER (LEFT X OF CENTER LINE)
+BBE9                  (asm/src/RRDX2.ASM):00014         YCENTZ RMB    1  SCREEN Y CENTER
+BBEA                  (asm/src/RRDX2.ASM):00015         YOFZ   RMB    1  OFFSET IN Y TO OBJECT CENTER  (PIXELS) (0-HEIGHT)
+BBEB                  (asm/src/RRDX2.ASM):00016         XSIZEZ RMB    1  X SIZE USED LAST (THIS) FRAME
+BBEC                  (asm/src/RRDX2.ASM):00017         YSIZEZ RMB    2  CURRENT Y POINT SPACING                          
+BBEE                  (asm/src/RRDX2.ASM):00018         FRAMEZ RMB    1  FRAMES TO RUN IN EFFECT
+BBEF                  (asm/src/RRDX2.ASM):00019         ULZ    RMB    2  UPPER LEFT
+BBF1                  (asm/src/RRDX2.ASM):00020         WHZ    RMB    2  WIDTH,HEIGHT
+BBF3                  (asm/src/RRDX2.ASM):00021         DMAWHZ RMB    2  DMA HEIGHT WIDTH
+BBF5                  (asm/src/RRDX2.ASM):00022         YHITEZ RMB    1
+BBF6                  (asm/src/RRDX2.ASM):00023         SLOPEZ RMB    1  SLOPE OF DIAGONAL LINE WE ARE EXPLODING (SIGN BIT)
+BBF7                  (asm/src/RRDX2.ASM):00024         DATAZ  RMB    16*2    LIST OF ROW DATA POINTERS (FOR SPEED MAN)
+     BC17             (asm/src/RRDX2.ASM):00025         ESIZEZ EQU    *
+                      (asm/src/RRDX2.ASM):00026         
+     0000             (asm/src/RRDX2.ASM):00027         NEXT   EQU    NEXTZ-EX
+     0002             (asm/src/RRDX2.ASM):00028         PICPTR EQU    PICPTZ-EX
+     0004             (asm/src/RRDX2.ASM):00029         XCENT  EQU    XCENTZ-EX
+     0005             (asm/src/RRDX2.ASM):00030         YCENT  EQU    YCENTZ-EX
+     0006             (asm/src/RRDX2.ASM):00031         YOF    EQU    YOFZ-EX
+     0007             (asm/src/RRDX2.ASM):00032         XSIZER EQU    XSIZEZ-EX
+     0008             (asm/src/RRDX2.ASM):00033         YSIZER EQU    YSIZEZ-EX
+     000A             (asm/src/RRDX2.ASM):00034         FRAMES EQU    FRAMEZ-EX
+     000B             (asm/src/RRDX2.ASM):00035         UL     EQU    ULZ-EX
+     000D             (asm/src/RRDX2.ASM):00036         WH     EQU    WHZ-EX
+     000F             (asm/src/RRDX2.ASM):00037         DMAWH  EQU    DMAWHZ-EX
+     0011             (asm/src/RRDX2.ASM):00038         YHITE  EQU    YHITEZ-EX
+     0012             (asm/src/RRDX2.ASM):00039         SLOPE  EQU    SLOPEZ-EX
+     0013             (asm/src/RRDX2.ASM):00040         DATA   EQU    DATAZ-EX
+     0033             (asm/src/RRDX2.ASM):00041         EXSIZE EQU    ESIZEZ-EX
+                      (asm/src/RRDX2.ASM):00042         
+BC17                  (asm/src/RRDX2.ASM):00043                RMB    ((10-1)*EXSIZE)    NUMBER OF BLOCKS
+                      (asm/src/RRDX2.ASM):00044         
+     BDE2             (asm/src/RRDX2.ASM):00045         EXEND  EQU    *
+                      (asm/src/RRDX2.ASM):00046         
+                      (asm/src/RRDX2.ASM):00047                ORG    DXRAM      (BASE PAGE)
+                      (asm/src/RRDX2.ASM):00048         
+98B8                  (asm/src/RRDX2.ASM):00049         YYCNT   RMB    1        WHEN CHOPPING UP X, SAVE TO UPDATE ULY
+98B9                  (asm/src/RRDX2.ASM):00050         YOFF   RMB    1        ACTUAL PIXEL OFFSET TO CENTER (USED)
+98BA                  (asm/src/RRDX2.ASM):00051         XSIZE  RMB    1        DISTANCE BETWEEN X POINTS THIS FRAME
+98BB                  (asm/src/RRDX2.ASM):00052         YSIZE  RMB    1        DISTANCE BETWEEN Y POINTS THIS FRAME
+98BC                  (asm/src/RRDX2.ASM):00053         EXPTR  RMB    2
+98BE                  (asm/src/RRDX2.ASM):00054         APPTR  RMB    2        APPEAR POINTER
+98C0                  (asm/src/RRDX2.ASM):00055         EXFREE RMB    2
+98C2                  (asm/src/RRDX2.ASM):00056         HITE   RMB    1
+98C3                  (asm/src/RRDX2.ASM):00057         TEMP1  RMB    2
+98C5                  (asm/src/RRDX2.ASM):00058         TEMP2  RMB    1
+                      (asm/src/RRDX2.ASM):00059         *
+                      (asm/src/RRDX2.ASM):00060         *VECTORS
+                      (asm/src/RRDX2.ASM):00061         *
+                      (asm/src/RRDX2.ASM):00062                ORG    RDXORG
+4680 7E468C           (asm/src/RRDX2.ASM):00063          JMP EXINV
+4683 7E473F           (asm/src/RRDX2.ASM):00064          JMP EXSTZ
+4686 7E46E6           (asm/src/RRDX2.ASM):00065          JMP APSTZ
+4689 7E4A79           (asm/src/RRDX2.ASM):00066          JMP DXUPDV
+                      (asm/src/RRDX2.ASM):00067         *
+                      (asm/src/RRDX2.ASM):00068         *INIT DATA STRUCT
+                      (asm/src/RRDX2.ASM):00069         *
+                      (asm/src/RRDX2.ASM):00070         
+468C 3430             (asm/src/RRDX2.ASM):00071         EXINV  PSHS   X,Y    
+468E 8EBBE4           (asm/src/RRDX2.ASM):00072                LDX    #EX      FIRST
+4691 9FC0             (asm/src/RRDX2.ASM):00073                STX    EXFREE
+4693 318833           (asm/src/RRDX2.ASM):00074         EXIN0  LEAY   EXSIZE,X FIND NEXT
+4696 10AF84           (asm/src/RRDX2.ASM):00075                STY    ,X       STORE
+4699 108CBDE2         (asm/src/RRDX2.ASM):00076                CMPY   #EXEND   DONE??        
+469D 2404             (asm/src/RRDX2.ASM):00077                BHS    EXIN1
+469F 30A4             (asm/src/RRDX2.ASM):00078                LEAX   ,Y       MAKE US NEXT
+46A1 20F0             (asm/src/RRDX2.ASM):00079                BRA    EXIN0
+46A3 108E0000         (asm/src/RRDX2.ASM):00080         EXIN1  LDY    #0
+46A7 10AF84           (asm/src/RRDX2.ASM):00081                STY    ,X
+46AA 109FBC           (asm/src/RRDX2.ASM):00082                STY    EXPTR
+46AD 109FBE           (asm/src/RRDX2.ASM):00083                STY    APPTR
+46B0 35B0             (asm/src/RRDX2.ASM):00084                PULS   X,Y,PC
+                      (asm/src/RRDX2.ASM):00085         
+46B2 3420             (asm/src/RRDX2.ASM):00086         GETBLK PSHS   Y
+46B4 DEC0             (asm/src/RRDX2.ASM):00087                LDU    EXFREE
+46B6 2712             (asm/src/RRDX2.ASM):00088                BEQ    NOBLK          NONE
+46B8 10AEC4           (asm/src/RRDX2.ASM):00089                LDY    ,U             GET NEXT
+46BB 109FC0           (asm/src/RRDX2.ASM):00090                STY    EXFREE
+46BE 109EBC           (asm/src/RRDX2.ASM):00091                LDY    EXPTR          GET LIST
+46C1 10AFC4           (asm/src/RRDX2.ASM):00092                STY    ,U             APPEND US
+46C4 DFBC             (asm/src/RRDX2.ASM):00093                STU    EXPTR
+46C6 1CFE             (asm/src/RRDX2.ASM):00094                CLC
+46C8 35A0             (asm/src/RRDX2.ASM):00095                PULS   Y,PC           RETURN IN U
+46CA 1A01             (asm/src/RRDX2.ASM):00096         NOBLK  SEC
+46CC 35A0             (asm/src/RRDX2.ASM):00097                PULS   Y,PC    
+                      (asm/src/RRDX2.ASM):00098         
+46CE 3420             (asm/src/RRDX2.ASM):00099         GETAP  PSHS   Y
+46D0 DEC0             (asm/src/RRDX2.ASM):00100                LDU    EXFREE
+46D2 27F6             (asm/src/RRDX2.ASM):00101                BEQ    NOBLK
+46D4 10AEC4           (asm/src/RRDX2.ASM):00102                LDY    ,U
+46D7 109FC0           (asm/src/RRDX2.ASM):00103                STY    EXFREE
+46DA 109EBE           (asm/src/RRDX2.ASM):00104                LDY    APPTR
+46DD 10AFC4           (asm/src/RRDX2.ASM):00105                STY    ,U
+46E0 DFBE             (asm/src/RRDX2.ASM):00106                STU    APPTR
+46E2 1CFE             (asm/src/RRDX2.ASM):00107                CLC
+46E4 35A0             (asm/src/RRDX2.ASM):00108                PULS   Y,PC
+                      (asm/src/RRDX2.ASM):00109         *
+                      (asm/src/RRDX2.ASM):00110         *START AN APPEAR
+                      (asm/src/RRDX2.ASM):00111         *X=OBJ,A=SLOPE
+46E6 3476             (asm/src/RRDX2.ASM):00112         APSTZ  PSHS   X,Y,D,U
+46E8 BD46CE           (asm/src/RRDX2.ASM):00113                JSR    GETAP    GET AN APPEAR BLOCK
+46EB 2540             (asm/src/RRDX2.ASM):00114                BCS    APBY     NONE
+46ED A7C812           (asm/src/RRDX2.ASM):00115                STA    SLOPE,U  SAVE SLOPE
+46F0 EC04             (asm/src/RRDX2.ASM):00116                LDD    OBJX,X
+46F2 AE02             (asm/src/RRDX2.ASM):00117                LDX    OPICT,X
+46F4 ED4B             (asm/src/RRDX2.ASM):00118                STD    UL,U     START AS UPPER LEFT
+46F6 A744             (asm/src/RRDX2.ASM):00119                STA    XCENT,U  SAVE X CENTER
+46F8 D6A7             (asm/src/RRDX2.ASM):00120                LDB    CENTMP+1
+46FA E745             (asm/src/RRDX2.ASM):00121                STB    YCENT,U
+46FC E04C             (asm/src/RRDX2.ASM):00122                SUBB   UL+1,U   SUBTRACT Y UPPER LEFT
+46FE 2504             (asm/src/RRDX2.ASM):00123                BCS    NWCEAP   NO GOOD
+4700 E101             (asm/src/RRDX2.ASM):00124                CMPB   1,X      COMPARE 
+4702 250B             (asm/src/RRDX2.ASM):00125                BLO    APNTOK
+4704 E684             (asm/src/RRDX2.ASM):00126         NWCEAP LDB    ,X       GET WIDTH
+4706 54               (asm/src/RRDX2.ASM):00127                LSRB            1/2 Y
+4707 E746             (asm/src/RRDX2.ASM):00128                STB    YOF,U    SAVE OFFSET
+4709 EB4C             (asm/src/RRDX2.ASM):00129                ADDB   UL+1,U   ADD TOP         
+470B E745             (asm/src/RRDX2.ASM):00130                STB    YCENT,U  THIS IS 
+470D 2002             (asm/src/RRDX2.ASM):00131                BRA    CCOAP 
+470F E746             (asm/src/RRDX2.ASM):00132         APNTOK STB    YOF,U
+4711 EC84             (asm/src/RRDX2.ASM):00133         CCOAP  LDD    ,X       FETCH H,W
+4713 ED4D             (asm/src/RRDX2.ASM):00134                STD    WH,U     SAVE
+4715 C601             (asm/src/RRDX2.ASM):00135                LDB    #1       HEIGHT IS 1 FOR DMA 
+4717 E7C811           (asm/src/RRDX2.ASM):00136                STB    YHITE,U  SMALL HEIGHT FOR FIRST (CRAZY) ERASE
+471A 8804             (asm/src/RRDX2.ASM):00137                EORA   #$4
+471C C804             (asm/src/RRDX2.ASM):00138                EORB   #$4
+471E ED4F             (asm/src/RRDX2.ASM):00139                STD    DMAWH,U  FORMED
+4720 AE02             (asm/src/RRDX2.ASM):00140                LDX    2,X      GET DATA POINTER
+4722 AF42             (asm/src/RRDX2.ASM):00141                STX    PICPTR,U SAVE OBJECT DESC
+4724 CC1000           (asm/src/RRDX2.ASM):00142                LDD    #$1000   START LARGE FOR APPEAR
+4727 ED48             (asm/src/RRDX2.ASM):00143                STD    YSIZER,U
+4729 6F47             (asm/src/RRDX2.ASM):00144                CLR    XSIZER,U ERASE NORMAL OBJECT FIRST FRAME
+472B 8D02             (asm/src/RRDX2.ASM):00145                BSR    DATALD   LOAD THE ROW DATA PTRS
+472D 35F6             (asm/src/RRDX2.ASM):00146         APBY   PULS   X,D,U,PC,Y   AND RETURN TO CALLER
+                      (asm/src/RRDX2.ASM):00147         
+472F AE42             (asm/src/RRDX2.ASM):00148         DATALD LDX    PICPTR,U GET POINTER TO DATA
+4731 E64D             (asm/src/RRDX2.ASM):00149                LDB    WH,U     WIDTH IN B                   
+4733 A64E             (asm/src/RRDX2.ASM):00150                LDA    WH+1,U   HEIGHT IN A
+4735 33C813           (asm/src/RRDX2.ASM):00151                LEAU   DATA,U   POINT AT THE DATA
+4738 AFC1             (asm/src/RRDX2.ASM):00152         DATLD1 STX    ,U++     STORE POINTER TO CURRENT ROW
+473A 3A               (asm/src/RRDX2.ASM):00153                ABX             ADDING WIDTH FORMS POINTER TO NEXT ROW
+473B 4A               (asm/src/RRDX2.ASM):00154                DECA            1 LESS ROW (OFF HEIGHT)
+473C 26FA             (asm/src/RRDX2.ASM):00155                BNE    DATLD1   DONE?
+473E 39               (asm/src/RRDX2.ASM):00156                RTS             YEP
+                      (asm/src/RRDX2.ASM):00157         
+                      (asm/src/RRDX2.ASM):00158         
+                      (asm/src/RRDX2.ASM):00159         *
+                      (asm/src/RRDX2.ASM):00160         *START AN EXPLOSION
+                      (asm/src/RRDX2.ASM):00161         *X=OBJ,A=SLOPE
+473F 3476             (asm/src/RRDX2.ASM):00162         EXSTZ  PSHS   X,U,D,Y
+4741 BD46B2           (asm/src/RRDX2.ASM):00163                JSR    GETBLK   GET A BLOCK TO USE
+4744 2544             (asm/src/RRDX2.ASM):00164                BCS    EXBYE    DONE...NO BLOCKS
+4746 A7C812           (asm/src/RRDX2.ASM):00165                STA    SLOPE,U
+4749 EC04             (asm/src/RRDX2.ASM):00166                LDD    OBJX,X
+474B AE02             (asm/src/RRDX2.ASM):00167                LDX    OPICT,X
+474D ED4B             (asm/src/RRDX2.ASM):00168                STD    UL,U     STORE UPPER LEFT (FIRST FRAME)
+474F A744             (asm/src/RRDX2.ASM):00169                STA    XCENT,U  SAVE LEFT X
+4751 D6A7             (asm/src/RRDX2.ASM):00170                LDB    CENTMP+1
+4753 E745             (asm/src/RRDX2.ASM):00171                STB    YCENT,U
+4755 E04C             (asm/src/RRDX2.ASM):00172                SUBB   UL+1,U   SUBTRACT Y UPPER LEFT
+4757 2504             (asm/src/RRDX2.ASM):00173                BCS    NWCENT   NO GOOD
+4759 E101             (asm/src/RRDX2.ASM):00174                CMPB   1,X      COMPARE 
+475B 250B             (asm/src/RRDX2.ASM):00175                BLO    CENTOK
+475D E684             (asm/src/RRDX2.ASM):00176         NWCENT LDB    ,X       GET WIDTH
+475F 54               (asm/src/RRDX2.ASM):00177                LSRB            1/2 Y
+4760 E746             (asm/src/RRDX2.ASM):00178                STB    YOF,U    SAVE OFFSET
+4762 EB4C             (asm/src/RRDX2.ASM):00179                ADDB   UL+1,U   ADD TOP         
+4764 E745             (asm/src/RRDX2.ASM):00180                STB    YCENT,U  THIS IS 
+4766 2002             (asm/src/RRDX2.ASM):00181                BRA    CCONT 
+4768 E746             (asm/src/RRDX2.ASM):00182         CENTOK STB    YOF,U
+476A EC84             (asm/src/RRDX2.ASM):00183         CCONT  LDD    ,X       FETCH H,W
+476C ED4D             (asm/src/RRDX2.ASM):00184                STD    WH,U     SAVE
+476E E7C811           (asm/src/RRDX2.ASM):00185                STB    YHITE,U  HITE FOR FIRST ERASE
+4771 C601             (asm/src/RRDX2.ASM):00186                LDB    #1       HEIGHT IS 1 FOR DMA 
+4773 8804             (asm/src/RRDX2.ASM):00187                EORA   #$4
+4775 C804             (asm/src/RRDX2.ASM):00188                EORB   #$4
+4777 ED4F             (asm/src/RRDX2.ASM):00189                STD    DMAWH,U  FORMED
+4779 AE02             (asm/src/RRDX2.ASM):00190                LDX    2,X      GET DATA POINTER
+477B AF42             (asm/src/RRDX2.ASM):00191                STX    PICPTR,U SAVE OBJECT DESC
+477D CC0100           (asm/src/RRDX2.ASM):00192                LDD    #$100    1 UNIT IS MIN
+4780 ED48             (asm/src/RRDX2.ASM):00193                STD    YSIZER,U
+4782 6F47             (asm/src/RRDX2.ASM):00194                CLR    XSIZER,U
+4784 8610             (asm/src/RRDX2.ASM):00195                LDA    #$10    NUMBER OF BYTES TO ERASE, NUMBER OF FRAMES LEFT
+4786 A74A             (asm/src/RRDX2.ASM):00196                STA    FRAMES,U
+4788 8DA5             (asm/src/RRDX2.ASM):00197                BSR    DATALD   LOAD THE ROW POINTERS
+478A 35F6             (asm/src/RRDX2.ASM):00198         EXBYE  PULS   X,D,U,PC,Y   AND RETURN TO CALLER
+                      (asm/src/RRDX2.ASM):00199         
+                      (asm/src/RRDX2.ASM):00200         *      THIS CODE DMA'S THE DMASIZONTAL LINES
+                      (asm/src/RRDX2.ASM):00201         *      A JUMP INTO HERE IS MADE BASED ON NUMBER OF
+                      (asm/src/RRDX2.ASM):00202         *      DMASIZONTAL LINES IN OBJECT
+                      (asm/src/RRDX2.ASM):00203         
+478C AEA1             (asm/src/RRDX2.ASM):00204         BSLOOP LDX    ,Y++           GET THE ROW POINTER
+478E BFCA02           (asm/src/RRDX2.ASM):00205                STX    DMAORG           THIS IS ORIGIN
+4791 FDCA04           (asm/src/RRDX2.ASM):00206                STD    DMADES           D IS DEST
+4794 FFCA00           (asm/src/RRDX2.ASM):00207                STU    DMACTL         THIS IS THE CONTROL REGISTER
+4797 D3BA             (asm/src/RRDX2.ASM):00208                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+     000D             (asm/src/RRDX2.ASM):00209         BSSIZE EQU    *-BSLOOP
+                      (asm/src/RRDX2.ASM):00210         
+4799 AEA1             (asm/src/RRDX2.ASM):00211                LDX    ,Y++           GET THE ROW POINTER
+479B BFCA02           (asm/src/RRDX2.ASM):00212                STX    DMAORG           THIS IS ORIGIN
+479E FDCA04           (asm/src/RRDX2.ASM):00213                STD    DMADES           D IS DEST
+47A1 FFCA00           (asm/src/RRDX2.ASM):00214                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47A4 D3BA             (asm/src/RRDX2.ASM):00215                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00216         
+47A6 AEA1             (asm/src/RRDX2.ASM):00217                LDX    ,Y++           GET THE ROW POINTER
+47A8 BFCA02           (asm/src/RRDX2.ASM):00218                STX    DMAORG           THIS IS ORIGIN
+47AB FDCA04           (asm/src/RRDX2.ASM):00219                STD    DMADES           D IS DEST
+47AE FFCA00           (asm/src/RRDX2.ASM):00220                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47B1 D3BA             (asm/src/RRDX2.ASM):00221                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00222         
+47B3 AEA1             (asm/src/RRDX2.ASM):00223                LDX    ,Y++           GET THE ROW POINTER
+47B5 BFCA02           (asm/src/RRDX2.ASM):00224                STX    DMAORG           THIS IS ORIGIN
+47B8 FDCA04           (asm/src/RRDX2.ASM):00225                STD    DMADES           D IS DEST
+47BB FFCA00           (asm/src/RRDX2.ASM):00226                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47BE D3BA             (asm/src/RRDX2.ASM):00227                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00228         
+47C0 AEA1             (asm/src/RRDX2.ASM):00229                LDX    ,Y++           GET THE ROW POINTER
+47C2 BFCA02           (asm/src/RRDX2.ASM):00230                STX    DMAORG           THIS IS ORIGIN
+47C5 FDCA04           (asm/src/RRDX2.ASM):00231                STD    DMADES           D IS DEST
+47C8 FFCA00           (asm/src/RRDX2.ASM):00232                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47CB D3BA             (asm/src/RRDX2.ASM):00233                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00234         
+47CD AEA1             (asm/src/RRDX2.ASM):00235                LDX    ,Y++           GET THE ROW POINTER
+47CF BFCA02           (asm/src/RRDX2.ASM):00236                STX    DMAORG           THIS IS ORIGIN
+47D2 FDCA04           (asm/src/RRDX2.ASM):00237                STD    DMADES           D IS DEST
+47D5 FFCA00           (asm/src/RRDX2.ASM):00238                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47D8 D3BA             (asm/src/RRDX2.ASM):00239                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00240         
+47DA AEA1             (asm/src/RRDX2.ASM):00241                LDX    ,Y++           GET THE ROW POINTER
+47DC BFCA02           (asm/src/RRDX2.ASM):00242                STX    DMAORG           THIS IS ORIGIN
+47DF FDCA04           (asm/src/RRDX2.ASM):00243                STD    DMADES           D IS DEST
+47E2 FFCA00           (asm/src/RRDX2.ASM):00244                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47E5 D3BA             (asm/src/RRDX2.ASM):00245                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00246         
+47E7 AEA1             (asm/src/RRDX2.ASM):00247                LDX    ,Y++           GET THE ROW POINTER
+47E9 BFCA02           (asm/src/RRDX2.ASM):00248                STX    DMAORG           THIS IS ORIGIN
+47EC FDCA04           (asm/src/RRDX2.ASM):00249                STD    DMADES           D IS DEST
+47EF FFCA00           (asm/src/RRDX2.ASM):00250                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47F2 D3BA             (asm/src/RRDX2.ASM):00251                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00252         
+47F4 AEA1             (asm/src/RRDX2.ASM):00253                LDX    ,Y++           GET THE ROW POINTER
+47F6 BFCA02           (asm/src/RRDX2.ASM):00254                STX    DMAORG           THIS IS ORIGIN
+47F9 FDCA04           (asm/src/RRDX2.ASM):00255                STD    DMADES           D IS DEST
+47FC FFCA00           (asm/src/RRDX2.ASM):00256                STU    DMACTL         THIS IS THE CONTROL REGISTER
+47FF D3BA             (asm/src/RRDX2.ASM):00257                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00258         
+4801 AEA1             (asm/src/RRDX2.ASM):00259                LDX    ,Y++           GET THE ROW POINTER
+4803 BFCA02           (asm/src/RRDX2.ASM):00260                STX    DMAORG           THIS IS ORIGIN
+4806 FDCA04           (asm/src/RRDX2.ASM):00261                STD    DMADES           D IS DEST
+4809 FFCA00           (asm/src/RRDX2.ASM):00262                STU    DMACTL         THIS IS THE CONTROL REGISTER
+480C D3BA             (asm/src/RRDX2.ASM):00263                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00264         
+480E AEA1             (asm/src/RRDX2.ASM):00265                LDX    ,Y++           GET THE ROW POINTER
+4810 BFCA02           (asm/src/RRDX2.ASM):00266                STX    DMAORG           THIS IS ORIGIN
+4813 FDCA04           (asm/src/RRDX2.ASM):00267                STD    DMADES           D IS DEST
+4816 FFCA00           (asm/src/RRDX2.ASM):00268                STU    DMACTL         THIS IS THE CONTROL REGISTER
+4819 D3BA             (asm/src/RRDX2.ASM):00269                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00270         
+481B AEA1             (asm/src/RRDX2.ASM):00271                LDX    ,Y++           GET THE ROW POINTER
+481D BFCA02           (asm/src/RRDX2.ASM):00272                STX    DMAORG           THIS IS ORIGIN
+4820 FDCA04           (asm/src/RRDX2.ASM):00273                STD    DMADES           D IS DEST
+4823 FFCA00           (asm/src/RRDX2.ASM):00274                STU    DMACTL         THIS IS THE CONTROL REGISTER
+4826 D3BA             (asm/src/RRDX2.ASM):00275                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00276         
+4828 AEA1             (asm/src/RRDX2.ASM):00277                LDX    ,Y++           GET THE ROW POINTER
+482A BFCA02           (asm/src/RRDX2.ASM):00278                STX    DMAORG           THIS IS ORIGIN
+482D FDCA04           (asm/src/RRDX2.ASM):00279                STD    DMADES           D IS DEST
+4830 FFCA00           (asm/src/RRDX2.ASM):00280                STU    DMACTL         THIS IS THE CONTROL REGISTER
+4833 D3BA             (asm/src/RRDX2.ASM):00281                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00282         
+4835 AEA1             (asm/src/RRDX2.ASM):00283                LDX    ,Y++           GET THE ROW POINTER
+4837 BFCA02           (asm/src/RRDX2.ASM):00284                STX    DMAORG           THIS IS ORIGIN
+483A FDCA04           (asm/src/RRDX2.ASM):00285                STD    DMADES           D IS DEST
+483D FFCA00           (asm/src/RRDX2.ASM):00286                STU    DMACTL         THIS IS THE CONTROL REGISTER
+4840 D3BA             (asm/src/RRDX2.ASM):00287                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00288         
+4842 AEA1             (asm/src/RRDX2.ASM):00289                LDX    ,Y++           GET THE ROW POINTER
+4844 BFCA02           (asm/src/RRDX2.ASM):00290                STX    DMAORG           THIS IS ORIGIN
+4847 FDCA04           (asm/src/RRDX2.ASM):00291                STD    DMADES           D IS DEST
+484A FFCA00           (asm/src/RRDX2.ASM):00292                STU    DMACTL         THIS IS THE CONTROL REGISTER
+484D D3BA             (asm/src/RRDX2.ASM):00293                ADDD   XSIZE          KICK POINTER TO NEXT ONE
+                      (asm/src/RRDX2.ASM):00294         
+484F AEA1             (asm/src/RRDX2.ASM):00295                LDX    ,Y++           GET THE ROW POINTER
+4851 BFCA02           (asm/src/RRDX2.ASM):00296                STX    DMAORG           THIS IS ORIGIN
+4854 FDCA04           (asm/src/RRDX2.ASM):00297                STD    DMADES           D IS DEST
+4857 FFCA00           (asm/src/RRDX2.ASM):00298                STU    DMACTL         THIS IS THE CONTROL REGISTER
+                      (asm/src/RRDX2.ASM):00299         
+485A 1CEF             (asm/src/RRDX2.ASM):00300                CLI
+485C 35A0             (asm/src/RRDX2.ASM):00301                PULS   Y,PC           RESTORE Y, RETURN
+                      (asm/src/RRDX2.ASM):00302         
+485E FDCA04           (asm/src/RRDX2.ASM):00303         ERLOOP STD    DMADES           DEST TO ERASE
+4861 FFC9FF           (asm/src/RRDX2.ASM):00304                STU    DMACTL-1         BYTE TO DO IT
+4864 D3BA             (asm/src/RRDX2.ASM):00305                ADDD   XSIZE          ADD OFFSETS
+     0008             (asm/src/RRDX2.ASM):00306         ERSIZ  EQU    *-ERLOOP
+                      (asm/src/RRDX2.ASM):00307         
+4866 FDCA04           (asm/src/RRDX2.ASM):00308                STD    DMADES
+4869 FFC9FF           (asm/src/RRDX2.ASM):00309                STU    DMACTL-1
+486C D3BA             (asm/src/RRDX2.ASM):00310                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00311         
+486E FDCA04           (asm/src/RRDX2.ASM):00312                STD    DMADES
+4871 FFC9FF           (asm/src/RRDX2.ASM):00313                STU    DMACTL-1
+4874 D3BA             (asm/src/RRDX2.ASM):00314                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00315         
+4876 FDCA04           (asm/src/RRDX2.ASM):00316                STD    DMADES
+4879 FFC9FF           (asm/src/RRDX2.ASM):00317                STU    DMACTL-1
+487C D3BA             (asm/src/RRDX2.ASM):00318                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00319         
+487E FDCA04           (asm/src/RRDX2.ASM):00320                STD    DMADES
+4881 FFC9FF           (asm/src/RRDX2.ASM):00321                STU    DMACTL-1
+4884 D3BA             (asm/src/RRDX2.ASM):00322                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00323         
+4886 FDCA04           (asm/src/RRDX2.ASM):00324                STD    DMADES
+4889 FFC9FF           (asm/src/RRDX2.ASM):00325                STU    DMACTL-1
+488C D3BA             (asm/src/RRDX2.ASM):00326                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00327         
+488E FDCA04           (asm/src/RRDX2.ASM):00328                STD    DMADES
+4891 FFC9FF           (asm/src/RRDX2.ASM):00329                STU    DMACTL-1
+4894 D3BA             (asm/src/RRDX2.ASM):00330                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00331         
+4896 FDCA04           (asm/src/RRDX2.ASM):00332                STD    DMADES
+4899 FFC9FF           (asm/src/RRDX2.ASM):00333                STU    DMACTL-1
+489C D3BA             (asm/src/RRDX2.ASM):00334                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00335         
+489E FDCA04           (asm/src/RRDX2.ASM):00336                STD    DMADES
+48A1 FFC9FF           (asm/src/RRDX2.ASM):00337                STU    DMACTL-1
+48A4 D3BA             (asm/src/RRDX2.ASM):00338                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00339         
+48A6 FDCA04           (asm/src/RRDX2.ASM):00340                STD    DMADES
+48A9 FFC9FF           (asm/src/RRDX2.ASM):00341                STU    DMACTL-1
+48AC D3BA             (asm/src/RRDX2.ASM):00342                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00343         
+48AE FDCA04           (asm/src/RRDX2.ASM):00344                STD    DMADES
+48B1 FFC9FF           (asm/src/RRDX2.ASM):00345                STU    DMACTL-1
+48B4 D3BA             (asm/src/RRDX2.ASM):00346                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00347         
+48B6 FDCA04           (asm/src/RRDX2.ASM):00348                STD    DMADES
+48B9 FFC9FF           (asm/src/RRDX2.ASM):00349                STU    DMACTL-1
+48BC D3BA             (asm/src/RRDX2.ASM):00350                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00351         
+48BE FDCA04           (asm/src/RRDX2.ASM):00352                STD    DMADES
+48C1 FFC9FF           (asm/src/RRDX2.ASM):00353                STU    DMACTL-1
+48C4 D3BA             (asm/src/RRDX2.ASM):00354                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00355         
+48C6 FDCA04           (asm/src/RRDX2.ASM):00356                STD    DMADES
+48C9 FFC9FF           (asm/src/RRDX2.ASM):00357                STU    DMACTL-1
+48CC D3BA             (asm/src/RRDX2.ASM):00358                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00359         
+48CE FDCA04           (asm/src/RRDX2.ASM):00360                STD    DMADES
+48D1 FFC9FF           (asm/src/RRDX2.ASM):00361                STU    DMACTL-1
+48D4 D3BA             (asm/src/RRDX2.ASM):00362                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00363         
+48D6 FDCA04           (asm/src/RRDX2.ASM):00364                STD    DMADES
+48D9 FFC9FF           (asm/src/RRDX2.ASM):00365                STU    DMACTL-1
+48DC D3BA             (asm/src/RRDX2.ASM):00366                ADDD   XSIZE
+                      (asm/src/RRDX2.ASM):00367         
+48DE 1CEF             (asm/src/RRDX2.ASM):00368                CLI
+48E0 39               (asm/src/RRDX2.ASM):00369                RTS                                        
+                      (asm/src/RRDX2.ASM):00370         
+48E1 E6A811           (asm/src/RRDX2.ASM):00371         ERASE  LDB    YHITE,Y        ACTUALLY PLOTTED
+48E4 C010             (asm/src/RRDX2.ASM):00372                SUBB   #16            MAX OF 16
+48E6 50               (asm/src/RRDX2.ASM):00373                NEGB
+48E7 58               (asm/src/RRDX2.ASM):00374                ASLB
+48E8 58               (asm/src/RRDX2.ASM):00375                ASLB
+48E9 58               (asm/src/RRDX2.ASM):00376                ASLB
+48EA 8E485E           (asm/src/RRDX2.ASM):00377                LDX    #ERLOOP
+48ED 3A               (asm/src/RRDX2.ASM):00378                ABX
+                      (asm/src/RRDX2.ASM):00379         
+48EE EC27             (asm/src/RRDX2.ASM):00380                LDD    XSIZER,Y
+48F0 DDBA             (asm/src/RRDX2.ASM):00381                STD    XSIZE
+                      (asm/src/RRDX2.ASM):00382         
+48F2 9645             (asm/src/RRDX2.ASM):00383                LDA    RWCTMP         GET RWBYTE
+48F4 C612             (asm/src/RRDX2.ASM):00384                LDB    #$12           ERASE
+                      (asm/src/RRDX2.ASM):00385         
+48F6 1F03             (asm/src/RRDX2.ASM):00386                TFR    D,U
+48F8 CC0000           (asm/src/RRDX2.ASM):00387                LDD    #0
+                      (asm/src/RRDX2.ASM):00388         
+48FB 1A10             (asm/src/RRDX2.ASM):00389                SEI
+                      (asm/src/RRDX2.ASM):00390         
+48FD FDCA01           (asm/src/RRDX2.ASM):00391                STD    DMACON          CONSTANT, AND HIGH HALF OF DMAORG
+                      (asm/src/RRDX2.ASM):00392         
+4900 EC2F             (asm/src/RRDX2.ASM):00393                LDD    DMAWH,Y
+4902 FDCA06           (asm/src/RRDX2.ASM):00394                STD    DMASIZ
+                      (asm/src/RRDX2.ASM):00395         
+4905 EC2B             (asm/src/RRDX2.ASM):00396                LDD    UL,Y           DMADESINATION STARTS WITH UPPER LEFT
+                      (asm/src/RRDX2.ASM):00397         
+4907 6E84             (asm/src/RRDX2.ASM):00398                JMP    ,X      
+                      (asm/src/RRDX2.ASM):00399         
+4909 CE98BC           (asm/src/RRDX2.ASM):00400         KILEXP LDU    #EXPTR         LETS WALK LIST TO FIND HIM
+490C 10ACC4           (asm/src/RRDX2.ASM):00401         KILEX2 CMPY   ,U             ARE WE SET
+490F 2708             (asm/src/RRDX2.ASM):00402                BEQ    KILEX1         YEP
+4911 EEC4             (asm/src/RRDX2.ASM):00403                LDU    ,U             KEEP WALKING
+4913 26F7             (asm/src/RRDX2.ASM):00404                BNE    KILEX2         STILL STUFF THERE
+4915 1A10             (asm/src/RRDX2.ASM):00405                SEI
+4917 20FE             (asm/src/RRDX2.ASM):00406                BRA    *              ERROR TRAP
+4919 ECA4             (asm/src/RRDX2.ASM):00407         KILEX1 LDD    ,Y             GET GUY WE POINT AT
+491B EDC4             (asm/src/RRDX2.ASM):00408                STD    ,U             POINT AROUND US
+491D DCC0             (asm/src/RRDX2.ASM):00409                LDD    EXFREE
+491F EDA4             (asm/src/RRDX2.ASM):00410                STD    ,Y             APPEND FREE LIST
+4921 109FC0           (asm/src/RRDX2.ASM):00411                STY    EXFREE
+4924 31C4             (asm/src/RRDX2.ASM):00412                LEAY   ,U             RETURN GUY BEFORE US TO WALK FROM
+4926 39               (asm/src/RRDX2.ASM):00413                RTS                   DONE!
+                      (asm/src/RRDX2.ASM):00414         *
+                      (asm/src/RRDX2.ASM):00415         *WRITE YOUR APPEAR!!!
+                      (asm/src/RRDX2.ASM):00416         *Y=EXPLOSION
+4927 EC28             (asm/src/RRDX2.ASM):00417         AWRITE LDD YSIZER,Y
+4929 830100           (asm/src/RRDX2.ASM):00418          SUBD #$100
+492C A128             (asm/src/RRDX2.ASM):00419          CMPA YSIZER,Y ANY SIZE CHANGE?
+492E 2603             (asm/src/RRDX2.ASM):00420          BNE AWRIT0 YES
+4930 E729             (asm/src/RRDX2.ASM):00421          STB YSIZER+1,Y NO DICE
+4932 39               (asm/src/RRDX2.ASM):00422          RTS
+4933 BD48E1           (asm/src/RRDX2.ASM):00423         AWRIT0 JSR ERASE
+4936 9659             (asm/src/RRDX2.ASM):00424          LDA STATUS
+4938 2608             (asm/src/RRDX2.ASM):00425          BNE AWRIT1
+493A DC5E             (asm/src/RRDX2.ASM):00426          LDD PX SCROLL THE COCK SUCKER
+493C A724             (asm/src/RRDX2.ASM):00427          STA XCENT,Y
+493E EB26             (asm/src/RRDX2.ASM):00428          ADDB YOF,Y
+4940 E725             (asm/src/RRDX2.ASM):00429          STB YCENT,Y
+4942 A62E             (asm/src/RRDX2.ASM):00430         AWRIT1 LDA    WH+1,Y   GET HEIGHT
+4944 97C2             (asm/src/RRDX2.ASM):00431                STA    HITE     PRELIMINARY ATTEMPT AT HEIGHT
+                      (asm/src/RRDX2.ASM):00432         
+4946 EC28             (asm/src/RRDX2.ASM):00433                LDD    YSIZER,Y GET CURRENT SIZE
+4948 830100           (asm/src/RRDX2.ASM):00434                SUBD   #$0100    TAKE AWAY SOME SIZE
+494B 8101             (asm/src/RRDX2.ASM):00435                CMPA   #1
+494D 2212             (asm/src/RRDX2.ASM):00436                BHI    APGO     DONE!
+494F CE98BE           (asm/src/RRDX2.ASM):00437                LDU    #APPTR   FIND HE WHO POINTS AT HIM....NOW KILL IT
+4952 20B8             (asm/src/RRDX2.ASM):00438                BRA    KILEX2   NOW ITS JUST LIKE AN EXPLODE KILL 
+                      (asm/src/RRDX2.ASM):00439         
+4954 6A2A             (asm/src/RRDX2.ASM):00440         WRITE  DEC    FRAMES,Y       ONE LESS FRAME
+4956 27B1             (asm/src/RRDX2.ASM):00441                BEQ    KILEXP         DONE
+                      (asm/src/RRDX2.ASM):00442         
+4958 A62E             (asm/src/RRDX2.ASM):00443                LDA    WH+1,Y   GET HEIGHT
+495A 97C2             (asm/src/RRDX2.ASM):00444                STA    HITE
+                      (asm/src/RRDX2.ASM):00445         
+495C EC28             (asm/src/RRDX2.ASM):00446                LDD    YSIZER,Y
+495E C30100           (asm/src/RRDX2.ASM):00447                ADDD   #$100
+4961 97BB             (asm/src/RRDX2.ASM):00448         APGO   STA    YSIZE
+4963 ED28             (asm/src/RRDX2.ASM):00449                STD    YSIZER,Y
+                      (asm/src/RRDX2.ASM):00450         
+4965 44               (asm/src/RRDX2.ASM):00451                LSRA            1/2 FOR X SIZE
+4966 97C5             (asm/src/RRDX2.ASM):00452                STA    TEMP2    ALSO SAVE TO ADD 1/2 SIZE UNIT FOR CENTER LINE
+4968 E6A812           (asm/src/RRDX2.ASM):00453                LDB    SLOPE,Y  CHECK SLOPE
+496B 2A01             (asm/src/RRDX2.ASM):00454                BPL    APGG1    POSITIVE
+496D 40               (asm/src/RRDX2.ASM):00455                NEGA            NEGATIVE
+496E A727             (asm/src/RRDX2.ASM):00456         APGG1  STA    XSIZER,Y AND SAVE
+4970 97BA             (asm/src/RRDX2.ASM):00457                STA    XSIZE    SCRATCH SOME SPEED
+                      (asm/src/RRDX2.ASM):00458         
+4972 E626             (asm/src/RRDX2.ASM):00459                LDB    YOF,Y    CHECK FOR ZERO OFFSET
+4974 2602             (asm/src/RRDX2.ASM):00460                BNE    APGO1
+4976 D7C5             (asm/src/RRDX2.ASM):00461                STB    TEMP2    IF DOWN FROM TOP....FIX TOP ONE (OBSCURE BUG)
+                      (asm/src/RRDX2.ASM):00462         
+4978 96BB             (asm/src/RRDX2.ASM):00463         APGO1  LDA    YSIZE
+497A E626             (asm/src/RRDX2.ASM):00464                LDB    YOF,Y          GET OFFSET
+497C D7B9             (asm/src/RRDX2.ASM):00465                STB    YOFF           SAVE FOR X CALCULATION
+497E 3D               (asm/src/RRDX2.ASM):00466                MUL                   DISTANCE UP FROM CENTER
+                      (asm/src/RRDX2.ASM):00467         
+497F DDC3             (asm/src/RRDX2.ASM):00468                STD    TEMP1          SAVE
+4981 E625             (asm/src/RRDX2.ASM):00469                LDB    YCENT,Y        GET CENTER
+4983 4F               (asm/src/RRDX2.ASM):00470                CLRA
+4984 93C3             (asm/src/RRDX2.ASM):00471                SUBD   TEMP1          LETS BE GENERAL PURPOSE
+4986 DBC5             (asm/src/RRDX2.ASM):00472                ADDB   TEMP2          ADD 1/2 SIZE
+4988 8900             (asm/src/RRDX2.ASM):00473                ADCA   #0             AND PROPAGATE
+498A 2604             (asm/src/RRDX2.ASM):00474                BNE    CHK2           NO GOOD..TIME TO SCREW AROUND
+                      (asm/src/RRDX2.ASM):00475         *
+                      (asm/src/RRDX2.ASM):00476         *      DON'T WORRY EUGENE...I GOT THIS FIX THIS TIME
+                      (asm/src/RRDX2.ASM):00477         *
+498C C118             (asm/src/RRDX2.ASM):00478                CMPB   #YMIN
+498E 220E             (asm/src/RRDX2.ASM):00479                BHI    CHK3           IN RANGE
+                      (asm/src/RRDX2.ASM):00480         
+4990 0AC2             (asm/src/RRDX2.ASM):00481         CHK2   DEC    HITE           1 LESS
+4992 0AB9             (asm/src/RRDX2.ASM):00482                DEC    YOFF
+4994 DBBB             (asm/src/RRDX2.ASM):00483                ADDB   YSIZE          BRING BACK FROM NEGATIVE NOWHERE
+4996 8900             (asm/src/RRDX2.ASM):00484                ADCA   #0
+4998 26F6             (asm/src/RRDX2.ASM):00485                BNE    CHK2           AND LOOP A WHILE
+                      (asm/src/RRDX2.ASM):00486         
+499A C118             (asm/src/RRDX2.ASM):00487                CMPB   #YMIN          POSITIVE-VILLE...BIG ENOUGH 
+499C 23F2             (asm/src/RRDX2.ASM):00488                BLS    CHK2           NOPE
+                      (asm/src/RRDX2.ASM):00489         
+499E E72C             (asm/src/RRDX2.ASM):00490         CHK3   STB    UL+1,Y         STORE IN PLACE
+49A0 96B9             (asm/src/RRDX2.ASM):00491                LDA    YOFF           ACTUAL Y OFFSET USED
+49A2 D6BA             (asm/src/RRDX2.ASM):00492                LDB    XSIZE          WHICH SLOPE??
+49A4 2B2C             (asm/src/RRDX2.ASM):00493                BMI    XNEG           BUMMER
+                      (asm/src/RRDX2.ASM):00494         
+49A6 3D               (asm/src/RRDX2.ASM):00495                MUL                   FIND DEFLECTION
+49A7 DDC3             (asm/src/RRDX2.ASM):00496                STD    TEMP1          WHERE HAVE I SEED CODE LIKE THIS
+49A9 E624             (asm/src/RRDX2.ASM):00497                LDB    XCENT,Y        GET X "CENTER"
+49AB 4F               (asm/src/RRDX2.ASM):00498                CLRA                  X CENTER HAS BEEN COMPUTED
+                      (asm/src/RRDX2.ASM):00499         
+49AC 93C3             (asm/src/RRDX2.ASM):00500                SUBD   TEMP1          FIND WHERE LEFTMOST X OCCURS
+49AE 4D               (asm/src/RRDX2.ASM):00501                TSTA                  NEGATIVE??
+49AF 2604             (asm/src/RRDX2.ASM):00502                BNE    CKK2A          YEP...SHIFT IT IN
+                      (asm/src/RRDX2.ASM):00503         
+49B1 C107             (asm/src/RRDX2.ASM):00504                CMPB   #XMIN          IN RANGE??
+49B3 2241             (asm/src/RRDX2.ASM):00505                BHI    CKK3AA         RIGHT ON
+                      (asm/src/RRDX2.ASM):00506         
+49B5 0FB8             (asm/src/RRDX2.ASM):00507         CKK2A  CLR    YYCNT           COUNT TO UDPATE 1 STARTING POINT
+                      (asm/src/RRDX2.ASM):00508         
+49B7 0AC2             (asm/src/RRDX2.ASM):00509         CKK2B  DEC    HITE           CHOP SOME MORE AWAY
+49B9 0CB8             (asm/src/RRDX2.ASM):00510                INC    YYCNT           INCICATE 1 MORE
+49BB DBBA             (asm/src/RRDX2.ASM):00511                ADDB   XSIZE          ADD THE X UNITS
+49BD 8900             (asm/src/RRDX2.ASM):00512                ADCA   #0
+49BF 26F6             (asm/src/RRDX2.ASM):00513                BNE    CKK2B          AND ITERATE
+                      (asm/src/RRDX2.ASM):00514         
+49C1 C107             (asm/src/RRDX2.ASM):00515                CMPB   #XMIN
+49C3 23F2             (asm/src/RRDX2.ASM):00516                BLS    CKK2B          THANK YOU SIR MAY I HAVE ANOTHER
+                      (asm/src/RRDX2.ASM):00517         
+49C5 E72B             (asm/src/RRDX2.ASM):00518         CKK3C  STB    UL,Y           THIS IS THE UPPER LEFT X
+                      (asm/src/RRDX2.ASM):00519         
+49C7 D6B8             (asm/src/RRDX2.ASM):00520                LDB    YYCNT           GET THE YER
+49C9 96BB             (asm/src/RRDX2.ASM):00521                LDA    YSIZE          GET Y SIZE
+49CB 3D               (asm/src/RRDX2.ASM):00522                MUL                   NUMBER OF Y UNITS FROM X CLIP
+                      (asm/src/RRDX2.ASM):00523         
+49CC EB2C             (asm/src/RRDX2.ASM):00524                ADDB   UL+1,Y
+49CE E72C             (asm/src/RRDX2.ASM):00525                STB    UL+1,Y
+                      (asm/src/RRDX2.ASM):00526         
+49D0 2026             (asm/src/RRDX2.ASM):00527                BRA    CKK3B
+                      (asm/src/RRDX2.ASM):00528         
+49D2 50               (asm/src/RRDX2.ASM):00529         XNEG   NEGB                  MAKE SIZE POSITIVE (NEG STATE BY CONTROL HERE)
+49D3 3D               (asm/src/RRDX2.ASM):00530                MUL                   NUMBER OF BYTES POS DISPLACEMENT
+49D4 EB2D             (asm/src/RRDX2.ASM):00531                ADDB   WH,Y           ADD IN THE WIDTH, (GUAR NO CARRY IF SIZE<32I
+49D6 EB24             (asm/src/RRDX2.ASM):00532                ADDB   XCENT,Y        ADD CENTER TO FIND LAST PIXEL PLOTTED
+49D8 8900             (asm/src/RRDX2.ASM):00533                ADCA   #0             ALL RIGHT!
+                      (asm/src/RRDX2.ASM):00534         
+49DA 2604             (asm/src/RRDX2.ASM):00535                BNE    XN2            NO GOOD...BIG CARRY 
+                      (asm/src/RRDX2.ASM):00536         
+49DC C18F             (asm/src/RRDX2.ASM):00537                CMPB   #XMAX          IN RANGE??
+49DE 2314             (asm/src/RRDX2.ASM):00538                BLS    CKK3A          SAME IS OK SINCE THIS IS 1 BEYOND OB
+                      (asm/src/RRDX2.ASM):00539         
+49E0 0FB8             (asm/src/RRDX2.ASM):00540         XN2    CLR    YYCNT           WE NEED TO KNOW HOW MANY CLIPPED
+                      (asm/src/RRDX2.ASM):00541         
+49E2 0AC2             (asm/src/RRDX2.ASM):00542         XN22   DEC    HITE           1 MORE Y UNIT
+49E4 0CB8             (asm/src/RRDX2.ASM):00543                INC    YYCNT
+49E6 DBBA             (asm/src/RRDX2.ASM):00544                ADDB   XSIZE          ADD THE SIZE (REMEMBER, ITS NEGATIVE)
+49E8 89FF             (asm/src/RRDX2.ASM):00545                ADCA   #$FF           ADD EXTENDED SIGN
+49EA 26F6             (asm/src/RRDX2.ASM):00546                BNE    XN22           STILL TOO LARGE
+                      (asm/src/RRDX2.ASM):00547         
+49EC C18F             (asm/src/RRDX2.ASM):00548                CMPB   #XMAX          DID WE MAKE IT??
+49EE 22F2             (asm/src/RRDX2.ASM):00549                BHI    XN22           NOPE
+49F0 E02D             (asm/src/RRDX2.ASM):00550                SUBB   WH,Y           REMOVE THE WIDTH TO GET BACK TO LEFT
+49F2 20D1             (asm/src/RRDX2.ASM):00551                BRA    CKK3C          ADJUST Y FOR THE DAMAGES
+                      (asm/src/RRDX2.ASM):00552         *                            (CKK3C IS UP, EUGENE)
+                      (asm/src/RRDX2.ASM):00553         
+49F4 E02D             (asm/src/RRDX2.ASM):00554         CKK3A  SUBB   WH,Y           GET BACK TO LEFT OF OB
+49F6 E72B             (asm/src/RRDX2.ASM):00555         CKK3AA STB    UL,Y           SAVE GOOD X
+                      (asm/src/RRDX2.ASM):00556         
+49F8 30A813           (asm/src/RRDX2.ASM):00557         CKK3B  LEAX   DATA,Y         POINT AT FIRST ITEM 
+49FB E62E             (asm/src/RRDX2.ASM):00558                LDB    WH+1,Y         GET HEIGHT
+49FD D0C2             (asm/src/RRDX2.ASM):00559                SUBB   HITE           FIND NUMBER WE WILL SKIP    
+49FF 58               (asm/src/RRDX2.ASM):00560                ASLB                  POINTERS ARE 2 BYTES
+4A00 3A               (asm/src/RRDX2.ASM):00561                ABX                   WE NOW POINT AT FIRST ONE WE WILL USE
+                      (asm/src/RRDX2.ASM):00562         
+                      (asm/src/RRDX2.ASM):00563         *
+                      (asm/src/RRDX2.ASM):00564         *      TIME FOR THE BUTT CLIP
+                      (asm/src/RRDX2.ASM):00565         *
+                      (asm/src/RRDX2.ASM):00566         
+4A01 96C2             (asm/src/RRDX2.ASM):00567                LDA    HITE           GET HEIGHT
+4A03 4A               (asm/src/RRDX2.ASM):00568                DECA
+4A04 D6BB             (asm/src/RRDX2.ASM):00569                LDB    YSIZE          FIND FILL DEFLECTION
+4A06 3D               (asm/src/RRDX2.ASM):00570                MUL
+4A07 EB2C             (asm/src/RRDX2.ASM):00571                ADDB   UL+1,Y         ADD FIRST POINT
+4A09 8900             (asm/src/RRDX2.ASM):00572                ADCA   #0             FIND FULL DEFLECTION
+4A0B 270A             (asm/src/RRDX2.ASM):00573                BEQ    CHK4           AOK
+4A0D 0AC2             (asm/src/RRDX2.ASM):00574         CHK5   DEC    HITE           1 LESS
+4A0F 2748             (asm/src/RRDX2.ASM):00575                BEQ    KLJMP          EXIT IMMEDIATELY ON TOTAL CLIP
+4A11 D0BB             (asm/src/RRDX2.ASM):00576                SUBB   YSIZE          1 LESS DOWNWARD
+4A13 8200             (asm/src/RRDX2.ASM):00577                SBCA   #0
+4A15 26F6             (asm/src/RRDX2.ASM):00578                BNE    CHK5
+4A17 C1EA             (asm/src/RRDX2.ASM):00579         CHK4   CMPB   #YMAX
+4A19 24F2             (asm/src/RRDX2.ASM):00580                BHS    CHK5
+                      (asm/src/RRDX2.ASM):00581         
+4A1B 96C2             (asm/src/RRDX2.ASM):00582                LDA    HITE           GET HITE BACK
+4A1D 4A               (asm/src/RRDX2.ASM):00583                DECA                  FIRSTIES DON'T COUNT
+4A1E D6BA             (asm/src/RRDX2.ASM):00584                LDB    XSIZE          GET X SIZE
+4A20 2B19             (asm/src/RRDX2.ASM):00585                BMI    XNT            NEGATIVE SLOPE
+                      (asm/src/RRDX2.ASM):00586         
+4A22 3D               (asm/src/RRDX2.ASM):00587                MUL                   DEFLECTION OF LAST GUY
+4A23 EB2D             (asm/src/RRDX2.ASM):00588                ADDB   WH,Y           ADD WIDTH
+4A25 EB2B             (asm/src/RRDX2.ASM):00589                ADDB   UL,Y           ADD STARTING X
+4A27 8900             (asm/src/RRDX2.ASM):00590                ADCA   #0             PROP IT
+4A29 270A             (asm/src/RRDX2.ASM):00591                BEQ    NCK4           NOT HUGE
+4A2B 0AC2             (asm/src/RRDX2.ASM):00592         NCK5   DEC    HITE           TAKE 1 AWAY
+4A2D 272A             (asm/src/RRDX2.ASM):00593                BEQ    KLJMP          TOTAL CLIP...BYE
+4A2F D0BA             (asm/src/RRDX2.ASM):00594                SUBB   XSIZE          TRY AND BRING DOWN TO SIZE
+4A31 8200             (asm/src/RRDX2.ASM):00595                SBCA   #0
+4A33 26F6             (asm/src/RRDX2.ASM):00596                BNE    NCK5
+4A35 C18F             (asm/src/RRDX2.ASM):00597         NCK4   CMPB   #XMAX
+4A37 22F2             (asm/src/RRDX2.ASM):00598                BHI    NCK5           EQUAL IS OK
+4A39 201A             (asm/src/RRDX2.ASM):00599                BRA    NCK6
+                      (asm/src/RRDX2.ASM):00600         
+4A3B 50               (asm/src/RRDX2.ASM):00601         XNT    NEGB                  MAKE 
+4A3C 3D               (asm/src/RRDX2.ASM):00602                MUL
+4A3D DDC3             (asm/src/RRDX2.ASM):00603                STD    TEMP1          SAVE OFFSET
+                      (asm/src/RRDX2.ASM):00604         
+4A3F E62B             (asm/src/RRDX2.ASM):00605                LDB    UL,Y           GET UPPER LEFT
+4A41 4F               (asm/src/RRDX2.ASM):00606                CLRA
+                      (asm/src/RRDX2.ASM):00607         
+4A42 93C3             (asm/src/RRDX2.ASM):00608                SUBD   TEMP1          REMOVE OFFSET
+4A44 4D               (asm/src/RRDX2.ASM):00609                TSTA
+                      (asm/src/RRDX2.ASM):00610         
+4A45 270A             (asm/src/RRDX2.ASM):00611                BEQ    NNCK4          NOT WAY TOO SMALL
+                      (asm/src/RRDX2.ASM):00612         
+4A47 0AC2             (asm/src/RRDX2.ASM):00613         NNCK5  DEC    HITE           1 LESS
+4A49 270E             (asm/src/RRDX2.ASM):00614                BEQ    KLJMP
+4A4B D0BA             (asm/src/RRDX2.ASM):00615                SUBB   XSIZE          ADDING NEG MOVES US POSITVE
+4A4D 82FF             (asm/src/RRDX2.ASM):00616                SBCA   #$FF           SUB SIGN EXT
+4A4F 26F6             (asm/src/RRDX2.ASM):00617                BNE    NNCK5          KEEP GOING
+                      (asm/src/RRDX2.ASM):00618         
+4A51 C107             (asm/src/RRDX2.ASM):00619         NNCK4  CMPB   #XMIN
+4A53 23F2             (asm/src/RRDX2.ASM):00620                BLS    NNCK5          KEEP GOING
+                      (asm/src/RRDX2.ASM):00621         
+                      (asm/src/RRDX2.ASM):00622         *      FIND "LOOP" ENTRY
+                      (asm/src/RRDX2.ASM):00623         
+4A55 96C2             (asm/src/RRDX2.ASM):00624         NCK6   LDA    HITE           GET HEIGHT
+4A57 2603             (asm/src/RRDX2.ASM):00625                BNE    NOKILE
+4A59 7E4909           (asm/src/RRDX2.ASM):00626         KLJMP  JMP    KILEXP         NO HEIGHT
+                      (asm/src/RRDX2.ASM):00627         
+4A5C A7A811           (asm/src/RRDX2.ASM):00628         NOKILE STA    YHITE,Y        SAVE FOR ERASE
+4A5F 8010             (asm/src/RRDX2.ASM):00629                SUBA   #16            16 = 0 OFFSET, 0 = 16 OFFSET
+4A61 40               (asm/src/RRDX2.ASM):00630                NEGA
+4A62 C60D             (asm/src/RRDX2.ASM):00631                LDB    #BSSIZE        SIZE OF ITERATION
+4A64 3D               (asm/src/RRDX2.ASM):00632                MUL
+4A65 C3478C           (asm/src/RRDX2.ASM):00633                ADDD   #BSLOOP        BEGINNING
+4A68 3426             (asm/src/RRDX2.ASM):00634                PSHS   D,Y            SETUP STACK AS FOLLOWS:    
+                      (asm/src/RRDX2.ASM):00635         
+                      (asm/src/RRDX2.ASM):00636         *      PTR     ->   D = JUMP ADDRESS
+                      (asm/src/RRDX2.ASM):00637         *                   Y = PUSHED TO SAVE FOR RTS
+                      (asm/src/RRDX2.ASM):00638         *                   <RETURN ADDRESS>
+                      (asm/src/RRDX2.ASM):00639         
+                      (asm/src/RRDX2.ASM):00640         *                   PULS   Y,PC     AT END OF LOOP CAUSES PROPER RETURN
+                      (asm/src/RRDX2.ASM):00641         
+4A6A CE0A0A           (asm/src/RRDX2.ASM):00642                LDU    #$0A0A         CONTROL REGISTER
+4A6D EC2F             (asm/src/RRDX2.ASM):00643                LDD    DMAWH,Y        GET WH
+                      (asm/src/RRDX2.ASM):00644         
+4A6F 1A10             (asm/src/RRDX2.ASM):00645                SEI                   NO INTS BABY
+4A71 FDCA06           (asm/src/RRDX2.ASM):00646                STD    DMASIZ
+4A74 EC2B             (asm/src/RRDX2.ASM):00647                LDD    UL,Y           GET DMADESINATION IN D 
+                      (asm/src/RRDX2.ASM):00648         
+4A76 3184             (asm/src/RRDX2.ASM):00649                LEAY   ,X             MAKE Y POINT AT PROPER DATA GUY
+                      (asm/src/RRDX2.ASM):00650         
+4A78 39               (asm/src/RRDX2.ASM):00651                RTS                   RETURN, MY ASS!
+                      (asm/src/RRDX2.ASM):00652         *
+                      (asm/src/RRDX2.ASM):00653         *UPDATE YOUR DIAGONALS
+                      (asm/src/RRDX2.ASM):00654         *
+4A79 109EBC           (asm/src/RRDX2.ASM):00655         DXUPDV LDY EXPTR
+4A7C 270B             (asm/src/RRDX2.ASM):00656          BEQ APUPD
+4A7E BD48E1           (asm/src/RRDX2.ASM):00657         DXUPDL JSR ERASE
+4A81 BD4954           (asm/src/RRDX2.ASM):00658          JSR WRITE
+4A84 10AEA4           (asm/src/RRDX2.ASM):00659          LDY ,Y
+4A87 26F5             (asm/src/RRDX2.ASM):00660          BNE DXUPDL
+4A89 109EBE           (asm/src/RRDX2.ASM):00661         APUPD LDY APPTR
+4A8C 2708             (asm/src/RRDX2.ASM):00662          BEQ APUPDX
+4A8E BD4927           (asm/src/RRDX2.ASM):00663         APUPDL JSR AWRITE
+4A91 10AEA4           (asm/src/RRDX2.ASM):00664          LDY ,Y
+4A94 26F8             (asm/src/RRDX2.ASM):00665          BNE APUPDL
+4A96 39               (asm/src/RRDX2.ASM):00666         APUPDX RTS
+                      (asm/src/RRDX2.ASM):00667          END
