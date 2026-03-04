@@ -8,7 +8,7 @@ LINK_SCRIPT := $(WILLIAMS_DIR)/link_williams_rom.sh
 VARIANT ?= none
 MAME_ZIP ?= $(ROBOTRON_DIR)/roms/robotron_williams.zip
 
-.PHONY: all help tools build roms verify clean
+.PHONY: all help tools build roms verify run-fg clean
 
 all: roms
 
@@ -18,6 +18,7 @@ help:
 	@echo "  make build [VARIANT=none]   Build 64K linked image only"
 	@echo "  make roms [VARIANT=none]    Build and stage MAME ROM files into Robotron/roms/robotron"
 	@echo "  make verify                 Run MAME verification for robotron set"
+	@echo "  make run-fg                 Launch Robotron in foreground with autoboot script"
 	@echo "  make clean                  Remove generated build and ROM output"
 
 tools:
@@ -34,6 +35,10 @@ roms: tools
 verify:
 	@command -v mame >/dev/null || { echo "Missing tool: mame"; exit 1; }
 	@mame -rompath "$(ROBOTRON_DIR)/roms" -verifyroms robotron
+
+run-fg:
+	@echo "Tip: run 'make verify' first if boot issues appear."
+	@cd "$(ROBOTRON_DIR)" && ./startmame.sh --fg
 
 clean:
 	rm -rf "$(WILLIAMS_DIR)/.build"

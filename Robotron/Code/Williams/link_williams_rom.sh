@@ -331,7 +331,6 @@ PY
 
 if [[ "$MAME_ROBOTRON" -eq 1 ]]; then
     MAME_DIR="$(cd "$SCRIPT_DIR/../../roms" && pwd)/robotron"
-    MAME_DEPLOY_DIR="$HOME/mame/roms/robotron2"
     SOURCE_ZIP="$(cd "$SCRIPT_DIR/../../roms" && pwd)/robotron.zip"
     mkdir -p "$MAME_DIR"
 
@@ -391,9 +390,6 @@ if [[ "$MAME_ROBOTRON" -eq 1 ]]; then
         echo "Created MAME zip: $ZIP_PATH"
     fi
 
-    mkdir -p "$MAME_DEPLOY_DIR"
-    cp -f "$MAME_DIR"/* "$MAME_DEPLOY_DIR"/
-    echo "Deployed ROM set to: $MAME_DEPLOY_DIR"
 fi
 
 echo "Done."

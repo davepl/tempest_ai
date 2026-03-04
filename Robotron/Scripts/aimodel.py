@@ -119,15 +119,17 @@ class FrameData:
     player_alive: bool
     level_number: int = 0
     game_score: int = 0
+    next_replay_level: int = 0
+    num_lasers: int = 0
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     try:
-        fmt = ">HddBIBB"
+        fmt = ">HddBIBBIBB"
         hdr = struct.calcsize(fmt)
         if not data or len(data) < hdr:
             return None
         vals = struct.unpack(fmt, data[:hdr])
-        (n, subj, obj, done, score, player_alive, save) = vals
+        (n, subj, obj, done, score, player_alive, save, replay_level, num_lasers, wave_number) = vals
         state = np.frombuffer(data[hdr:], dtype=">f4", count=n).astype(np.float32)
         if state.shape[0] != int(n):
             return None
@@ -135,7 +137,10 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             state=state, subjreward=float(subj), objreward=float(obj),
             done=bool(done), save_signal=bool(save),
             player_alive=bool(player_alive),
+            level_number=int(wave_number),
             game_score=int(score),
+            next_replay_level=int(replay_level),
+            num_lasers=int(num_lasers),
         )
     except Exception as e:
         print(f"Parse error: {e}")

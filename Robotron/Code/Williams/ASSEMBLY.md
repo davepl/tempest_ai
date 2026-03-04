@@ -73,7 +73,6 @@ Behavior:
     - `decoder_rom_6.3c`
     from existing `Robotron/roms/robotron.zip` if present.
 - `--mame-zip` optionally packages the staged MAME files into a zip.
-- `--mame-robotron` also deploys the staged set to `~/mame/roms/robotron2/`.
 - In `--mame-robotron` mode, the CPU split map matches the real board layout:
   - `0x0000..0x8FFF` -> ROMs 1..9
   - `0xD000..0xFFFF` -> ROMs 10..12

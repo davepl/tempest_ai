@@ -14,3 +14,5 @@ log.txt
 Robotron/Code/Williams/.build/
 Robotron/roms/robotron/
 Robotron/roms/robotron_williams.zip
+models/robotron_model_latest.pt
+models/robotron_model_latest.pt.bak

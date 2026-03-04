@@ -281,9 +281,6 @@ class SocketServer:
                 sock.setblocking(False)
                 sock.settimeout(None)
 
-            BATCH = 8
-            local_accum = 0
-
             while self.running and not self.shutdown_event.is_set():
                 ready = select.select([sock], [], [], 0.002)
                 if not ready[0]:
@@ -332,13 +329,13 @@ class SocketServer:
                         cs["fps"] = 1.0 / el
                         cs["last_time"] = now
 
-                local_accum += 1
-                if local_accum >= BATCH:
-                    self.metrics.update_frame_count(delta=local_accum)
-                    local_accum = 0
-                    self.metrics.update_epsilon()
-                    self.metrics.update_expert_ratio()
-                    self._calc_avg_level()
+                # Keep metrics synchronized to actual processed frames.
+                # Do not batch this by connection-local counters, because
+                # reconnects can reset local state and hide frame progress.
+                self.metrics.update_frame_count(delta=1)
+                self.metrics.update_epsilon()
+                self.metrics.update_expert_ratio()
+                self._calc_avg_level()
                 self.metrics.update_game_state(0, False)
 
                 # ── Process previous step ───────────────────────────────
