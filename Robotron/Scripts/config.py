@@ -26,7 +26,7 @@ SETTINGS_PATH = f"{MODEL_DIR}/game_settings.json"
 @dataclass
 class ServerConfigData:
     host: str = "0.0.0.0"
-    port: int = 9999
+    port: int = 9998
     max_clients: int = 36
     # State layout:
     #   5 core (alive, score, replay, lasers, wave/level) + 50 ELIST bytes

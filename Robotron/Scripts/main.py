@@ -317,9 +317,9 @@ def main():
     else:
         dashboard_open_browser = _env_enabled("ROBOTRON_DASHBOARD_BROWSER", desktop_session)
     try:
-        dashboard_port = int(os.getenv("ROBOTRON_DASHBOARD_PORT", "8765"))
+        dashboard_port = int(os.getenv("ROBOTRON_DASHBOARD_PORT", "8796"))
     except Exception:
-        dashboard_port = 8765
+        dashboard_port = 8796
     if dashboard_enabled:
         try:
             dashboard = MetricsDashboard(

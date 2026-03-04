@@ -3780,7 +3780,7 @@ class MetricsDashboard:
         metrics_obj,
         agent_obj=None,
         host: str = "127.0.0.1",
-        port: int = 8765,
+        port: int = 8796,
         sample_interval: float = 0.10,
         history_limit: int = DASH_HISTORY_LIMIT,
         open_browser: bool = True,
