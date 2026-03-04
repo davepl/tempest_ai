@@ -9,3 +9,8 @@ venv/
 *.pyc
 audio/*.mp3
 log.txt
+
+# Robotron build outputs
+Robotron/Code/Williams/.build/
+Robotron/roms/robotron/
+Robotron/roms/robotron_williams.zip
