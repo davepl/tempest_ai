@@ -28,7 +28,12 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9999
     max_clients: int = 36
-    params_count: int = 55
+    # State layout:
+    #   5 core (alive, score, replay, lasers, wave/level) + 50 ELIST bytes
+    #   + 4 active lists (OBPTR, HPTR, RPTR, PPTR)
+    #     each: 1 occupancy + 16 slots * 4 features
+    #   = 315 floats
+    params_count: int = 315
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -53,7 +58,7 @@ class RLConfigData:
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Disabled for initial Robotron bring-up (state is currently 2 values only).
+    # Enemy attention currently disabled for flat 315-feature state.
     use_enemy_attention: bool = False
     enemy_slots: int = 7
     enemy_features: int = 6
@@ -90,7 +95,8 @@ class RLConfigData:
     priority_beta_frames: int = 10_000_000
     priority_eps: float = 1e-6
     per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
-    min_replay_to_train: int = 5_000
+    # Start training earlier during bring-up so end-to-end control learns quickly.
+    min_replay_to_train: int = 1_024
 
     # Target network (periodic hard sync; moderate refresh for stable learning)
     target_update_period: int = 2_500
@@ -102,7 +108,7 @@ class RLConfigData:
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
     epsilon_end: float = 0.01
-    epsilon_decay_frames: int = 500_000
+    epsilon_decay_frames: int = 2_500_000
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000
@@ -118,19 +124,18 @@ class RLConfigData:
     expert_ratio_zoom_gamestate: int = 0x00
     epsilon_zoom_multiplier: float = 1.0
 
-    # Expert BC
-    expert_bc_weight: float = 1.0
+    # Expert BC disabled for Robotron bring-up (no expert policy yet).
+    expert_bc_weight: float = 0.0
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 2_000_000
-    # Keep a small floor to anchor policy as expert ratio approaches its minimum.
-    expert_bc_min_weight: float = 0.001
+    expert_bc_min_weight: float = 0.0
 
     # ── reward ──────────────────────────────────────────────────────────
-    obj_reward_scale: float = 0.01
-    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
+    obj_reward_scale: float = 1.0
+    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 1.0
     subj_reward_scale: float = 0.005
-    reward_clip: float = 10.0
-    death_reward_clip: float = 10.0        # Same as normal reward_clip — no special death amplification
+    reward_clip: float = 10000.0
+    death_reward_clip: float = 10000.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
@@ -425,18 +430,16 @@ class MetricsData:
 
     def get_expert_ratio(self):
         with self.lock:
-            xp = game_settings.expert_pct
-            if xp >= 0:
-                return xp / 100.0
-            return float(self.expert_ratio)
+            return 0.0
 
     def update_expert_ratio(self):
         with self.lock:
-            if self.expert_mode or self.override_expert or self.manual_expert_override:
-                return self.expert_ratio
-            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.expert_ratio_decay_frames))
-            self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
-            return self.expert_ratio
+            # Robotron currently runs without any expert policy.
+            self.expert_mode = False
+            self.override_expert = False
+            self.manual_expert_override = False
+            self.expert_ratio = 0.0
+            return 0.0
 
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
@@ -479,21 +482,15 @@ class MetricsData:
     # ── UI toggle methods ───────────────────────────────────────────────
     def toggle_override(self, kb=None):
         with self.lock:
-            self.override_expert = not self.override_expert
-            if self.override_expert:
-                self.saved_expert_ratio = self.expert_ratio
-                self.expert_ratio = 0.0
-            else:
-                self.expert_ratio = self.saved_expert_ratio
+            self.override_expert = False
+            self.saved_expert_ratio = 0.0
+            self.expert_ratio = 0.0
 
     def toggle_expert_mode(self, kb=None):
         with self.lock:
-            self.expert_mode = not self.expert_mode
-            if self.expert_mode:
-                self.saved_expert_ratio = self.expert_ratio
-                self.expert_ratio = 1.0
-            else:
-                self.expert_ratio = self.saved_expert_ratio
+            self.expert_mode = False
+            self.saved_expert_ratio = 0.0
+            self.expert_ratio = 0.0
 
     def toggle_training_mode(self, kb=None):
         with self.lock:
@@ -521,23 +518,18 @@ class MetricsData:
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:
-            p = int(self.expert_ratio * 100)
-            p = min(100, p + (1 if p < 10 else 5))
-            self.expert_ratio = p / 100.0
-            self.manual_expert_override = True
+            self.expert_ratio = 0.0
+            self.manual_expert_override = False
 
     def decrease_expert_ratio(self, kb=None):
         with self.lock:
-            p = int(self.expert_ratio * 100)
-            p = max(0, p - (1 if p <= 10 else 5))
-            self.expert_ratio = p / 100.0
-            self.manual_expert_override = True
+            self.expert_ratio = 0.0
+            self.manual_expert_override = False
 
     def restore_natural_expert_ratio(self, kb=None):
         with self.lock:
             self.manual_expert_override = False
-            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.expert_ratio_decay_frames))
-            self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
+            self.expert_ratio = 0.0
 
     def increase_epsilon(self, kb=None):
         with self.lock:

@@ -268,7 +268,7 @@ def display_metrics_row(agent, kb_handler):
         metrics.episode_length_count_interval = 0
 
     # ── Level ───────────────────────────────────────────────────────────
-    display_level = metrics.average_level + 1.0
+    display_level = metrics.average_level
 
     # ── DQN windows ─────────────────────────────────────────────────────
     dqn100k, dqn1m, dqn5m = get_dqn_window_averages()

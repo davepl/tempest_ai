@@ -1,10 +1,10 @@
 --[[
-    Robotron AI Lua script for MAME (baseline bring-up).
+    Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a minimal 2-value state vector: [PlayerAlive, Score]
+      - Sends a 315-value state vector:
+        core stats + ELIST bytes + active OBPTR/HPTR/RPTR/PPTR list features
       - Receives dual 8-way joystick commands: movement_dir, firing_dir
-      - Uses dummy/startup-safe placeholders where Robotron wiring is still unknown
 --]]
 
 local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "127.0.0.1:9999"
@@ -18,10 +18,14 @@ local SAVE_INTERVAL_S = 300
 local unpack = table.unpack or unpack
 
 -- Startup diagnostics (bounded, opt-in style flags kept local to script).
-local DEBUG_STARTUP_TRACE = true
+local DEBUG_STARTUP_TRACE = false
 local DEBUG_TRACE_FRAMES = 10
 local DEBUG_BYPASS_SOCKET_FOR_FRAMES = 0
 local DEBUG_TRACE_FILE = "logs/startup_trace.log"
+local DEBUG_FORCE_ACTION_FRAMES = 0
+local DEBUG_FORCE_MOVE_DIR = 2  -- right
+local DEBUG_FORCE_FIRE_DIR = 2  -- right
+local DEATH_PENALTY_POINTS = 1000
 
 local mainCpu = nil
 local mem = nil
@@ -63,6 +67,45 @@ local ZP1WAV_ADDR = 0xBDED
 local ZP1ENM_ADDR = 0xBDEE
 local ZP1ENM_SIZE = 50
 
+-- Active object-list heads (from Williams base-page RAM map).
+local OBPTR_ADDR = 0x9819 -- obstacle list
+local HPTR_ADDR = 0x981B  -- humans to rescue
+local RPTR_ADDR = 0x9821  -- robots/enemies
+local PPTR_ADDR = 0x9823  -- fatal obstacles
+
+-- Object pool geometry (master list @ OLIST).
+local OLIST_START = 0x9900
+local OLIST_ENTRY_SIZE = 0x18
+local OLIST_CAPACITY = 180
+local OLIST_END = OLIST_START + (OLIST_ENTRY_SIZE * OLIST_CAPACITY)
+
+-- Object entry offsets.
+local OLINK_OFF = 0x00
+local OPICT_OFF = 0x02
+local OBJX_OFF = 0x04
+local OBJY_OFF = 0x05
+local OX16_OFF = 0x0A
+local OY16_OFF = 0x0C
+
+-- Fixed-size state encoding for linked lists (stable for learning).
+local LIST_SLOT_COUNT = 16
+local LIST_FEATURES_PER_SLOT = 4 -- present, x, y, type_ptr_norm
+local MAX_LIST_WALK = 256
+
+local ACTIVE_LISTS = {
+    {name = "obptr", addr = OBPTR_ADDR},
+    {name = "hptr", addr = HPTR_ADDR},
+    {name = "rptr", addr = RPTR_ADDR},
+    {name = "pptr", addr = PPTR_ADDR},
+}
+
+local EXPECTED_LIST_FEATURES_PER_LIST = 1 + (LIST_SLOT_COUNT * LIST_FEATURES_PER_SLOT)
+local EXPECTED_STATE_VALUES = 5 + ZP1ENM_SIZE + (#ACTIVE_LISTS * EXPECTED_LIST_FEATURES_PER_LIST)
+local CANONICAL_TYPE_BACKTRACK_STEPS = 8
+
+-- Cache canonicalized descriptor pointers to avoid repeated probe reads.
+local canonical_type_cache = {}
+
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
         return false
@@ -74,6 +117,9 @@ local function trace_enabled_for_frame(frame_idx)
 end
 
 local function trace_log(frame_idx, phase, detail, force)
+    if not DEBUG_STARTUP_TRACE then
+        return
+    end
     local enabled = force or trace_enabled_for_frame(frame_idx)
     if not enabled then
         return
@@ -104,8 +150,11 @@ local function decode_bcd4(memory, addr)
         local byte = memory:read_u8(addr + i)
         local hi = (byte >> 4) & 0x0F
         local lo = byte & 0x0F
-        if hi > 9 then hi = 9 end
-        if lo > 9 then lo = 9 end
+        -- Treat non-BCD digits as invalid instead of clamping to 9,
+        -- which can fabricate very large scores from transient RAM.
+        if hi > 9 or lo > 9 then
+            return nil
+        end
         value = (value * 10) + hi
         value = (value * 10) + lo
     end
@@ -146,6 +195,155 @@ local function read_enemy_state(memory)
     }
 
     return enemy_state
+end
+
+local function read_u16_be(memory, addr)
+    local hi = memory:read_u8(addr)
+    local lo = memory:read_u8(addr + 1)
+    return ((hi << 8) | lo) & 0xFFFF
+end
+
+local function u16_to_i16(v)
+    local u = v & 0xFFFF
+    if u >= 0x8000 then
+        return u - 0x10000
+    end
+    return u
+end
+
+local function norm_i16(v)
+    local x = math.max(-32768, math.min(32767, v or 0))
+    return (x + 32768) / 65535.0
+end
+
+local function is_probable_object_descriptor(memory, addr)
+    if addr == nil then
+        return false
+    end
+    local a = addr & 0xFFFF
+    if a > 0xFFFB then
+        return false
+    end
+
+    local base_pic_ptr = read_u16_be(memory, a)
+    local image_count = memory:read_u8(a + 2)
+    local bytes_per = memory:read_u8(a + 3)
+
+    if base_pic_ptr == 0 then
+        return false
+    end
+    if image_count < 1 or image_count > 64 then
+        return false
+    end
+    -- Robotron object descriptors are predominantly 4-byte entries; tanks use 6.
+    if bytes_per ~= 4 and bytes_per ~= 6 then
+        return false
+    end
+    return true
+end
+
+local function canonicalize_object_type_ptr(memory, pict_ptr)
+    local p = (pict_ptr or 0) & 0xFFFF
+    if p == 0 then
+        return 0
+    end
+
+    local cached = canonical_type_cache[p]
+    if cached ~= nil then
+        return cached
+    end
+
+    -- First try exact pointer; if animated frame pointers are in use, walk backward
+    -- in 4-byte steps to find the stable descriptor header.
+    if is_probable_object_descriptor(memory, p) then
+        canonical_type_cache[p] = p
+        return p
+    end
+    for i = 1, CANONICAL_TYPE_BACKTRACK_STEPS do
+        local cand = (p - (i * 4)) & 0xFFFF
+        if is_probable_object_descriptor(memory, cand) then
+            canonical_type_cache[p] = cand
+            return cand
+        end
+    end
+
+    -- Fallback: 4-byte alignment still removes some frame-pointer jitter.
+    local aligned = p & 0xFFFC
+    canonical_type_cache[p] = aligned
+    return aligned
+end
+
+local function is_valid_object_ptr(ptr)
+    if ptr == nil or ptr == 0 then
+        return false
+    end
+    if ptr < OLIST_START or ptr >= OLIST_END then
+        return false
+    end
+    return ((ptr - OLIST_START) % OLIST_ENTRY_SIZE) == 0
+end
+
+local function extract_list_state(memory, head_addr)
+    local objects = {}
+    local seen = {}
+    local ptr = read_u16_be(memory, head_addr)
+    local steps = 0
+
+    while ptr ~= 0 and steps < MAX_LIST_WALK do
+        if seen[ptr] then
+            break
+        end
+        seen[ptr] = true
+        steps = steps + 1
+
+        if not is_valid_object_ptr(ptr) then
+            break
+        end
+
+        local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
+        local canonical_type_ptr = canonicalize_object_type_ptr(memory, pict_ptr)
+        local x16 = u16_to_i16(read_u16_be(memory, ptr + OX16_OFF))
+        local y16 = u16_to_i16(read_u16_be(memory, ptr + OY16_OFF))
+        local objx = memory:read_u8(ptr + OBJX_OFF)
+        local objy = memory:read_u8(ptr + OBJY_OFF)
+        objects[#objects + 1] = {
+            obj_addr = ptr,
+            pict_ptr = pict_ptr,
+            canonical_type_ptr = canonical_type_ptr,
+            x16 = x16,
+            y16 = y16,
+            objx = objx,
+            objy = objy,
+        }
+
+        ptr = read_u16_be(memory, ptr + OLINK_OFF)
+    end
+
+    table.sort(objects, function(a, b)
+        return a.obj_addr < b.obj_addr
+    end)
+
+    local features = {}
+    features[#features + 1] = math.min(1.0, (#objects / LIST_SLOT_COUNT))
+
+    for i = 1, LIST_SLOT_COUNT do
+        local obj = objects[i]
+        if obj then
+            features[#features + 1] = 1.0
+            -- Use true 16-bit world coordinates from OX16/OY16 (RRF.ASM).
+            features[#features + 1] = norm_i16(obj.x16)
+            features[#features + 1] = norm_i16(obj.y16)
+            -- Canonical object-type signal anchored to descriptor base, not raw frame pointer.
+            features[#features + 1] = (obj.canonical_type_ptr or 0) / 65535.0
+        else
+            features[#features + 1] = 0.0
+            features[#features + 1] = 0.0
+            features[#features + 1] = 0.0
+            features[#features + 1] = 0.0
+        end
+    end
+
+    return features, #objects
 end
 
 local function initialize_mame_interface()
@@ -221,12 +419,64 @@ local function find_field(ioport, field_name_options)
             for _, field_name in ipairs(field_name_options) do
                 local field = port.fields[field_name]
                 if field then
-                    return field
+                    return field, field_name
                 end
             end
         end
     end
 
+    return nil, nil
+end
+
+local function find_field_fuzzy(ioport, name_fragments)
+    local function any_match(label)
+        local ll = string.lower(label or "")
+        for _, frag in ipairs(name_fragments) do
+            local ff = string.lower(frag)
+            if string.find(ll, ff, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local candidate_ports = {":IN0", ":IN1", ":IN2", ":IN3", ":IN4", ":IN5", ":P1", ":P2"}
+    for _, port_name in ipairs(candidate_ports) do
+        local port = ioport.ports[port_name]
+        if port and port.fields then
+            for label, field in pairs(port.fields) do
+                if any_match(label) then
+                    return field, label
+                end
+            end
+        end
+    end
+
+    for _, port in pairs(ioport.ports) do
+        if port and port.fields then
+            for label, field in pairs(port.fields) do
+                if any_match(label) then
+                    return field, label
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+local function bind_control(ioport, exact_names, fuzzy_names, tag)
+    local field, label = find_field(ioport, exact_names)
+    if field then
+        print(string.format("Mapped %-10s => %s", tag, tostring(label)))
+        return field
+    end
+    field, label = find_field_fuzzy(ioport, fuzzy_names)
+    if field then
+        print(string.format("Mapped %-10s => %s (fuzzy)", tag, tostring(label)))
+        return field
+    end
+    print(string.format("WARN: unmapped control %-10s", tag))
     return nil
 end
 
@@ -237,25 +487,68 @@ function Controls:new(mame_manager)
     local self = setmetatable({}, Controls)
     local ioport = mame_manager.machine.ioport
 
-    self.move_up = find_field(ioport, {"P1 Move Up", "P1 Left Up", "P1 Joystick Up"})
-    self.move_down = find_field(ioport, {"P1 Move Down", "P1 Left Down", "P1 Joystick Down"})
-    self.move_left = find_field(ioport, {"P1 Move Left", "P1 Left Left", "P1 Joystick Left"})
-    self.move_right = find_field(ioport, {"P1 Move Right", "P1 Left Right", "P1 Joystick Right"})
+    self.move_up = bind_control(
+        ioport,
+        {"P1 Move Up", "P1 Left Up", "P1 Joystick Up"},
+        {"move up", "left up", "left stick up", "joystick up"},
+        "move_up"
+    )
+    self.move_down = bind_control(
+        ioport,
+        {"P1 Move Down", "P1 Left Down", "P1 Joystick Down"},
+        {"move down", "left down", "left stick down", "joystick down"},
+        "move_down"
+    )
+    self.move_left = bind_control(
+        ioport,
+        {"P1 Move Left", "P1 Left Left", "P1 Joystick Left"},
+        {"move left", "left left", "left stick left", "joystick left"},
+        "move_left"
+    )
+    self.move_right = bind_control(
+        ioport,
+        {"P1 Move Right", "P1 Left Right", "P1 Joystick Right"},
+        {"move right", "left right", "left stick right", "joystick right"},
+        "move_right"
+    )
 
-    self.fire_up = find_field(ioport, {"P1 Fire Up", "P1 Right Up"})
-    self.fire_down = find_field(ioport, {"P1 Fire Down", "P1 Right Down"})
-    self.fire_left = find_field(ioport, {"P1 Fire Left", "P1 Right Left"})
-    self.fire_right = find_field(ioport, {"P1 Fire Right", "P1 Right Right"})
+    self.fire_up = bind_control(
+        ioport,
+        {"P1 Fire Up", "P1 Right Up"},
+        {"fire up", "right up", "right stick up"},
+        "fire_up"
+    )
+    self.fire_down = bind_control(
+        ioport,
+        {"P1 Fire Down", "P1 Right Down"},
+        {"fire down", "right down", "right stick down"},
+        "fire_down"
+    )
+    self.fire_left = bind_control(
+        ioport,
+        {"P1 Fire Left", "P1 Right Left"},
+        {"fire left", "right left", "right stick left"},
+        "fire_left"
+    )
+    self.fire_right = bind_control(
+        ioport,
+        {"P1 Fire Right", "P1 Right Right"},
+        {"fire right", "right right", "right stick right"},
+        "fire_right"
+    )
 
-    self.p1_start = find_field(ioport, {"1 Player Start", "P1 Start", "Start 1"})
-    self.coin_1 = find_field(ioport, {"Coin 1", "P1 Coin", "Insert Coin"})
-
-    if not self.p1_start then
-        print("TODO: Robotron start input field not mapped yet (need exact MAME field name).")
-    end
-    if not self.coin_1 then
-        print("TODO: Robotron coin input field not mapped yet (need exact MAME field name).")
-    end
+    self.p1_start = bind_control(
+        ioport,
+        {"1 Player Start", "P1 Start", "Start 1"},
+        {"1 player start", "start 1", "p1 start"},
+        "start"
+    )
+    self.coin_1 = bind_control(
+        ioport,
+        {"Coin 1", "P1 Coin", "Insert Coin"},
+        {"coin 1", "insert coin"},
+        "coin_1"
+    )
 
     return self
 end
@@ -292,7 +585,7 @@ function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
     end
 end
 
-local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number, enemy_state,
+local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number, enemy_state, list_state_values,
                                done, subj_reward, obj_reward, save_signal)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
     local replay_u32 = math.max(0, math.min(4294967295, math.floor(replay_level or 0)))
@@ -308,7 +601,13 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     for i = 1, ZP1ENM_SIZE do
         state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
     end
+    for i = 1, #list_state_values do
+        state_values[#state_values + 1] = list_state_values[i]
+    end
     local num_values = #state_values
+    if num_values ~= EXPECTED_STATE_VALUES then
+        error(string.format("state size mismatch: got=%d expected=%d", num_values, EXPECTED_STATE_VALUES))
+    end
 
     local header = string.pack(
         ">HddBIBBIBB",
@@ -382,11 +681,12 @@ local function process_frame_via_socket(frame_payload, frame_idx)
     return move_dir or 0, fire_dir or 0, true
 end
 
-local function determine_meta_commands(frame_idx)
+local function determine_meta_commands(frame_idx, player_alive)
     local start_cmd = 0
     local coin_cmd = 0
 
-    if AUTOBOOT_ENABLED then
+    -- Keep autoboot inputs out of active gameplay to avoid contaminating control/reward dynamics.
+    if AUTOBOOT_ENABLED and (player_alive == 0) then
         local cycle_pos = frame_idx % AUTOBOOT_CYCLE_FRAMES
         if cycle_pos < AUTOBOOT_COIN_PULSE_FRAMES then
             coin_cmd = 1
@@ -440,9 +740,37 @@ local function frame_callback()
     local enemy_state = enemy_or_err
     trace_log(frame_counter, "read_enemy_state", "bytes=" .. tostring(#enemy_state.raw))
 
+    local list_state_values = {}
+    local list_counts = {}
+    for _, def in ipairs(ACTIVE_LISTS) do
+        local ok_list, vals_or_err, count = pcall(extract_list_state, mem, def.addr)
+        if not ok_list then
+            trace_log(frame_counter, "read_list_state_error", def.name .. ": " .. tostring(vals_or_err), true)
+            return true
+        end
+        for i = 1, #vals_or_err do
+            list_state_values[#list_state_values + 1] = vals_or_err[i]
+        end
+        list_counts[#list_counts + 1] = string.format("%s=%d", def.name, count or 0)
+    end
+    trace_log(frame_counter, "read_active_lists", table.concat(list_counts, " "))
+
     local done = (previous_player_alive == 1 and player_alive == 0)
-    local obj_reward = score - previous_score
+    local score_delta = score - previous_score
+    if score_delta < 0 then
+        score_delta = 0
+    end
+    local obj_reward = score_delta
+    if done then
+        obj_reward = obj_reward - DEATH_PENALTY_POINTS
+    end
     local subj_reward = 0.0
+    trace_log(
+        frame_counter,
+        "reward_calc",
+        string.format("score_delta=%d done=%s death_penalty=%d obj_reward=%.1f",
+            score_delta, tostring(done), done and DEATH_PENALTY_POINTS or 0, obj_reward)
+    )
 
     local now = os.time()
     local save_signal = 0
@@ -453,7 +781,7 @@ local function frame_callback()
 
     local ok_payload, payload_or_err = pcall(
         serialize_frame,
-        player_alive, score, replay_level, num_lasers, wave_number, enemy_state,
+        player_alive, score, replay_level, num_lasers, wave_number, enemy_state, list_state_values,
         done, subj_reward, obj_reward, save_signal
     )
     if not ok_payload then
@@ -461,7 +789,7 @@ local function frame_callback()
         return true
     end
     local payload = payload_or_err
-    local payload_count = 5 + ZP1ENM_SIZE
+    local payload_count = 5 + ZP1ENM_SIZE + #list_state_values
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
     local move_cmd, fire_cmd = 0, 0
@@ -484,7 +812,17 @@ local function frame_callback()
         move_cmd, fire_cmd = 0, 0
     end
 
-    local start_cmd, coin_cmd = determine_meta_commands(frame_counter)
+    if DEBUG_FORCE_ACTION_FRAMES > 0 and frame_counter < DEBUG_FORCE_ACTION_FRAMES then
+        move_cmd = DEBUG_FORCE_MOVE_DIR
+        fire_cmd = DEBUG_FORCE_FIRE_DIR
+        trace_log(
+            frame_counter,
+            "force_action",
+            string.format("move=%d fire=%d", move_cmd, fire_cmd)
+        )
+    end
+
+    local start_cmd, coin_cmd = determine_meta_commands(frame_counter, player_alive)
     local ok_apply, apply_err = pcall(controls.apply_action, controls, move_cmd, fire_cmd, start_cmd, coin_cmd)
     if not ok_apply then
         trace_log(frame_counter, "apply_action_error", tostring(apply_err), true)

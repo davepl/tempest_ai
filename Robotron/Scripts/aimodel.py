@@ -130,6 +130,9 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             return None
         vals = struct.unpack(fmt, data[:hdr])
         (n, subj, obj, done, score, player_alive, save, replay_level, num_lasers, wave_number) = vals
+        expected_len = hdr + (int(n) * 4)
+        if len(data) != expected_len:
+            return None
         state = np.frombuffer(data[hdr:], dtype=">f4", count=n).astype(np.float32)
         if state.shape[0] != int(n):
             return None
@@ -995,13 +998,13 @@ class RainbowAgent:
             try:
                 with metrics.lock:
                     if not RESET_METRICS:
-                        metrics.expert_ratio = ckpt.get("expert_ratio", RL_CONFIG.expert_ratio_start)
+                        metrics.expert_ratio = 0.0
                         metrics.epsilon = ckpt.get("epsilon", RL_CONFIG.epsilon_start)
                         metrics.frame_count = int(ckpt.get("frame_count", 0))
                         metrics.loaded_frame_count = metrics.frame_count
                         metrics.total_training_steps = int(ckpt.get("total_training_steps", self.training_steps))
                     else:
-                        metrics.expert_ratio = RL_CONFIG.expert_ratio_start
+                        metrics.expert_ratio = 0.0
                         metrics.epsilon = RL_CONFIG.epsilon_start
                         metrics.frame_count = 0
                         metrics.loaded_frame_count = 0

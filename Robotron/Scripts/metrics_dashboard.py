@@ -303,7 +303,7 @@ class _DashboardState:
             expert_ratio = (_xprt_ov / 100.0) if _xprt_ov >= 0 else float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
             web_client_count = int(self.metrics.web_client_count)
-            average_level = float(self.metrics.average_level + 1.0)
+            average_level = float(self.metrics.average_level)
             memory_buffer_size = int(self.metrics.memory_buffer_size)
             memory_buffer_k = int(memory_buffer_size // 1000)
             buffer_capacity = int(max(1, getattr(RL_CONFIG, "memory_size", 1)))
@@ -414,7 +414,7 @@ class _DashboardState:
             "q_max": q_max,
             "eplen_1m": get_eplen_1m_average(),
             "eplen_100k": get_eplen_100k_average(),
-            "peak_level": float(self.metrics.peak_level + 1),
+            "peak_level": float(self.metrics.peak_level),
             "peak_episode_reward": float(self.metrics.peak_episode_reward) * _prs,
             "peak_game_score": int(self.metrics.peak_game_score),
             "episodes_this_run": int(self.metrics.episodes_this_run),
@@ -1271,6 +1271,7 @@ def _render_dashboard_html() -> str:
     const num = new Intl.NumberFormat("en-US");
     const DASH_MAX_FPS = 30;
     const DASH_DEFAULT_FPS = 2;
+    const GAME_FPS = 60;
     const DASH_REFRESH_FPS = (() => {
       try {
         const raw = new URLSearchParams(window.location.search).get("fps");
@@ -1512,16 +1513,15 @@ def _render_dashboard_html() -> str:
       rewards: {
         canvas: document.getElementById("cRewards"),
         series: [
-          { key: "total_5m", color: "#38bdf8", median_window: 3, map: v => Math.max(0, v || 0),
+          { key: "total_5m", color: "#38bdf8", median_window: 3,
             axis: {
               side: "left",
-              min: 0,
               label_pad: 52,
               group_keys: ["total_100k", "total_1m", "total_5m"],
             },
           },
-          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
-          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m", map: v => Math.max(0, v || 0) },
+          { key: "total_1m", color: "#22c55e", median_window: 3, axis_ref: "total_5m" },
+          { key: "total_100k", color: "#ef4444", median_window: 3, axis_ref: "total_5m" },
           { key: "reward_subj", color: "#facc15", median_window: 5, smooth_alpha: 0.15,
             axis: {
               side: "right",
@@ -1572,9 +1572,9 @@ def _render_dashboard_html() -> str:
       rewardMini: {
         canvas: document.getElementById("cRewardMini"),
         series: [
-          { key: "total_5m", color: "#38bdf8", median_window: 3, axis: { target_ticks: 3 }, map: v => Math.max(0, v || 0) },
-          { key: "total_1m", color: "#22c55e", median_window: 3, map: v => Math.max(0, v || 0) },
-          { key: "total_100k", color: "#ef4444", median_window: 3, linearTime: true, map: v => Math.max(0, v || 0) }
+          { key: "total_5m", color: "#38bdf8", median_window: 3, axis: { target_ticks: 3 } },
+          { key: "total_1m", color: "#22c55e", median_window: 3 },
+          { key: "total_100k", color: "#ef4444", median_window: 3, linearTime: true }
         ]
       },
       lossMini: {
@@ -3369,7 +3369,7 @@ def _render_dashboard_html() -> str:
       }
 
       if (!_gsIgnoreSync) cards.xprt.textContent = fmtPct(now.expert_ratio);
-      cards.rwrd.textContent = fmtInt(Math.max(0, now.total_1m || 0));
+      cards.rwrd.textContent = fmtInt(now.total_1m || 0);
       cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
       cards.buf.textContent = fmtInt(now.memory_buffer_size);
@@ -3379,7 +3379,7 @@ def _render_dashboard_html() -> str:
         ? toFixedCharCells("-")
         : toColoredQRange(now.q_min, now.q_max);
       cards.epLen.textContent = fmtInt(now.eplen_1m);
-      { const secs = Math.round((now.eplen_1m || 0) / 30); const m = Math.floor(secs / 60); const s = secs % 60; cards.duration.textContent = m + ":" + String(s).padStart(2, "0"); }
+      { const secs = Math.round((now.eplen_1m || 0) / GAME_FPS); const m = Math.floor(secs / 60); const s = secs % 60; cards.duration.textContent = m + ":" + String(s).padStart(2, "0"); }
 
       /* Episodes count + 30-second rolling rate */
       cards.episodes.textContent = fmtInt(now.episodes_this_run);

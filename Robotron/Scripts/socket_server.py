@@ -321,7 +321,8 @@ class SocketServer:
                     cs = self.client_states[cid]
                     cs["frames"] += 1
                     cs["level_number"] = frame.level_number
-                    if frame.game_score > self.metrics.peak_game_score:
+                    # Ignore attract/menu/transient frames for high-score tracking.
+                    if frame.player_alive and frame.game_score > self.metrics.peak_game_score:
                         self.metrics.peak_game_score = frame.game_score
                     now = time.time()
                     el = now - cs["last_time"]

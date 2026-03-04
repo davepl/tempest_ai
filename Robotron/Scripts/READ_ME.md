@@ -4,10 +4,14 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 
 ## Current Scope
 
-- Lua sends a **55-value state vector** each frame:
+- Lua sends a **315-value state vector** each frame:
   - `PlayerAlive` (real RAM-derived from `STATUS`)
-  - normalized score/replay/lasers/wave values
+  - normalized score/replay/lasers/wave(level) values
   - `ZP1ENM` enemy-state bag (50 normalized bytes)
+  - active object-list features from `OBPTR`, `HPTR`, `RPTR`, `PPTR`
+    - per list: occupancy + 16 slots * (`present`, `x16`, `y16`, `canonical_type`)
+      - `canonical_type` is derived from `OPICT` and stabilized to descriptor base
+        so animation-frame pointer churn does not change semantic object identity
 - Python returns **dual 8-way joystick actions**:
   - movement direction index `0..7`
   - firing direction index `0..7`
@@ -16,7 +20,7 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 ## Protocol (Lua -> Python)
 
 - Header format: `>HddBIBBIBB`
-  - `H`: number of float state values (currently `55`)
+  - `H`: number of float state values (currently `315`)
   - `d`: subjective reward
   - `d`: objective reward
   - `B`: done flag

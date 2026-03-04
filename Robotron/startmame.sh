@@ -68,17 +68,24 @@ if [[ "$COUNT" -gt 1 ]]; then
     SOUND_FLAG="-sound none"
 fi
 
+WARNING_FLAG=""
+if mame -showusage 2>&1 | rg -q -- "-skip_warnings"; then
+    WARNING_FLAG="-skip_warnings"
+else
+    echo "Note: this MAME build does not support -skip_warnings; continuing without it."
+fi
+
 if [[ "$FOREGROUND" -eq 1 ]]; then
     echo "Mode: foreground"
     echo "Launching 1 MAME instance (attached)..."
-    exec mame robotron -nothrottle $SOUND_FLAG -window -skip_gameinfo -autoboot_script "$LUA_SCRIPT"
+    exec mame robotron -nothrottle $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
 fi
 
 echo "Mode: background"
 echo "Launching $COUNT MAME instance(s)..."
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
-    mame robotron -nothrottle $SOUND_FLAG -window -skip_gameinfo -autoboot_script "$LUA_SCRIPT" &
+    mame robotron -nothrottle $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
     pid=$!
     PIDS+=("$pid")
     echo "  Started instance $i (PID $pid)"
