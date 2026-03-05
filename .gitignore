@@ -16,3 +16,14 @@ Robotron/roms/robotron/
 Robotron/roms/robotron_williams.zip
 models/robotron_model_latest.pt
 models/robotron_model_latest.pt.bak
+Robotron/models/robotron_model_latest.pt
+Robotron/models/robotron_model_latest.pt.bak
+Robotron/models/robotron_model_latest_replay/_meta.npy
+Robotron/models/robotron_model_latest_replay/actions.npy
+Robotron/models/robotron_model_latest_replay/dones.npy
+Robotron/models/robotron_model_latest_replay/horizons.npy
+Robotron/models/robotron_model_latest_replay/is_expert.npy
+Robotron/models/robotron_model_latest_replay/next_states.npy
+Robotron/models/robotron_model_latest_replay/priorities.npy
+Robotron/models/robotron_model_latest_replay/rewards.npy
+Robotron/models/robotron_model_latest_replay/states.npy

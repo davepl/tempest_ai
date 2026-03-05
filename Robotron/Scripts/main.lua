@@ -2,9 +2,18 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a 315-value state vector:
-        core stats + ELIST bytes + active OBPTR/HPTR/RPTR/PPTR list features
+      - Sends a 317-value state vector:
+        5 core stats (alive, score, replay, lasers, wave)
+        + 2 player position (x16, y16)
+        + 50 ELIST enemy state bytes
+        + 4 active lists (OPTR/HPTR/RPTR/PPTR) × 65 features each
       - Receives dual 8-way joystick commands: movement_dir, firing_dir
+    
+    Active object lists extracted:
+      - OPTR (0x9817): motion objects - enforcers, sparks, circles, squares, shells, player lasers
+      - HPTR (0x981F): humans - mom, dad, kid
+      - RPTR (0x9821): robots - grunts, brains, hulks, tanks, progs, cruise missiles
+      - PPTR (0x9823): fatal obstacles - electrodes
 --]]
 
 local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "127.0.0.1:9998"
@@ -67,11 +76,20 @@ local ZP1WAV_ADDR = 0xBDED
 local ZP1ENM_ADDR = 0xBDEE
 local ZP1ENM_SIZE = 50
 
--- Active object-list heads (from Williams base-page RAM map).
-local OBPTR_ADDR = 0x9819 -- obstacle list
-local HPTR_ADDR = 0x981B  -- humans to rescue
-local RPTR_ADDR = 0x9821  -- robots/enemies
-local PPTR_ADDR = 0x9823  -- fatal obstacles
+-- Active object-list heads (from Williams base-page RAM map / RRF.ASM).
+-- Address layout: OPTR($9817), OBPTR($9819), OFREE($981B), SPFREE($981D),
+--                 HPTR($981F), RPTR($9821), PPTR($9823)
+local OPTR_ADDR = 0x9817  -- motion objects (enforcers, sparks, circles, squares, shells, player lasers)
+local HPTR_ADDR = 0x981F  -- humans to rescue (mom, dad, kid)
+local RPTR_ADDR = 0x9821  -- robots/enemies (grunts, brains, hulks, tanks, progs, cruise missiles)
+local PPTR_ADDR = 0x9823  -- fatal obstacles (electrodes)
+
+-- Player object structure (PLOBJ at $985A from RRF.ASM).
+local PLOBJ_ADDR = 0x985A
+local PX16_ADDR = 0x9864   -- player 16-bit X world coordinate
+local PY16_ADDR = 0x9866   -- player 16-bit Y world coordinate
+local PXV_ADDR = 0x9868    -- player X velocity
+local PYV_ADDR = 0x986A    -- player Y velocity
 
 -- Object pool geometry (master list @ OLIST).
 local OLIST_START = 0x9900
@@ -93,14 +111,15 @@ local LIST_FEATURES_PER_SLOT = 4 -- present, x, y, type_ptr_norm
 local MAX_LIST_WALK = 256
 
 local ACTIVE_LISTS = {
-    {name = "obptr", addr = OBPTR_ADDR},
-    {name = "hptr", addr = HPTR_ADDR},
-    {name = "rptr", addr = RPTR_ADDR},
-    {name = "pptr", addr = PPTR_ADDR},
+    {name = "optr", addr = OPTR_ADDR},   -- motion objects: enforcers, sparks, circles, squares, shells, lasers
+    {name = "hptr", addr = HPTR_ADDR},   -- humans: mom, dad, kid
+    {name = "rptr", addr = RPTR_ADDR},   -- robots: grunts, brains, hulks, tanks, progs, cruise missiles
+    {name = "pptr", addr = PPTR_ADDR},   -- fatal: electrodes
 }
 
 local EXPECTED_LIST_FEATURES_PER_LIST = 1 + (LIST_SLOT_COUNT * LIST_FEATURES_PER_SLOT)
-local EXPECTED_STATE_VALUES = 5 + ZP1ENM_SIZE + (#ACTIVE_LISTS * EXPECTED_LIST_FEATURES_PER_LIST)
+-- State vector: 5 core + 2 player pos + 2 player vel + 50 ELIST + 4 lists × 65 = 319 floats
+local EXPECTED_STATE_VALUES = 9 + ZP1ENM_SIZE + (#ACTIVE_LISTS * EXPECTED_LIST_FEATURES_PER_LIST)
 local CANONICAL_TYPE_BACKTRACK_STEPS = 8
 
 -- Cache canonicalized descriptor pointers to avoid repeated probe reads.
@@ -214,6 +233,15 @@ end
 local function norm_i16(v)
     local x = math.max(-32768, math.min(32767, v or 0))
     return (x + 32768) / 65535.0
+end
+
+local function read_player_position(memory)
+    -- Read player 16-bit world coordinates and velocity from PLOBJ structure.
+    local px16 = u16_to_i16(read_u16_be(memory, PX16_ADDR))
+    local py16 = u16_to_i16(read_u16_be(memory, PY16_ADDR))
+    local pxv = u16_to_i16(read_u16_be(memory, PXV_ADDR))
+    local pyv = u16_to_i16(read_u16_be(memory, PYV_ADDR))
+    return px16, py16, pxv, pyv
 end
 
 local function is_probable_object_descriptor(memory, addr)
@@ -585,7 +613,9 @@ function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
     end
 end
 
-local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number, enemy_state, list_state_values,
+local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
+                               player_x16, player_y16, player_xv, player_yv,
+                               enemy_state, list_state_values,
                                done, subj_reward, obj_reward, save_signal)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
     local replay_u32 = math.max(0, math.min(4294967295, math.floor(replay_level or 0)))
@@ -593,14 +623,23 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     local wave_u8 = math.max(0, math.min(255, math.floor(wave_number or 0)))
 
     local state_values = {}
+    -- 5 core stats
     state_values[#state_values + 1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
     state_values[#state_values + 1] = score_u32 / 99999999.0
     state_values[#state_values + 1] = replay_u32 / 99999999.0
     state_values[#state_values + 1] = lasers_u8 / 9.0
     state_values[#state_values + 1] = wave_u8 / 255.0
+    -- 2 player position values (normalized 16-bit world coordinates)
+    state_values[#state_values + 1] = norm_i16(player_x16 or 0)
+    state_values[#state_values + 1] = norm_i16(player_y16 or 0)
+    -- 2 player velocity values (normalized 16-bit signed)
+    state_values[#state_values + 1] = norm_i16(player_xv or 0)
+    state_values[#state_values + 1] = norm_i16(player_yv or 0)
+    -- 50 ELIST enemy state bytes
     for i = 1, ZP1ENM_SIZE do
         state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
     end
+    -- 4 active lists × 65 features each
     for i = 1, #list_state_values do
         state_values[#state_values + 1] = list_state_values[i]
     end
@@ -740,6 +779,13 @@ local function frame_callback()
     local enemy_state = enemy_or_err
     trace_log(frame_counter, "read_enemy_state", "bytes=" .. tostring(#enemy_state.raw))
 
+    local ok_player_pos, player_x16, player_y16, player_xv, player_yv = pcall(read_player_position, mem)
+    if not ok_player_pos then
+        trace_log(frame_counter, "read_player_position_error", tostring(player_x16), true)
+        return true
+    end
+    trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d xv=%d yv=%d", player_x16 or 0, player_y16 or 0, player_xv or 0, player_yv or 0))
+
     local list_state_values = {}
     local list_counts = {}
     for _, def in ipairs(ACTIVE_LISTS) do
@@ -781,7 +827,9 @@ local function frame_callback()
 
     local ok_payload, payload_or_err = pcall(
         serialize_frame,
-        player_alive, score, replay_level, num_lasers, wave_number, enemy_state, list_state_values,
+        player_alive, score, replay_level, num_lasers, wave_number,
+        player_x16, player_y16, player_xv, player_yv,
+        enemy_state, list_state_values,
         done, subj_reward, obj_reward, save_signal
     )
     if not ok_payload then
@@ -789,7 +837,7 @@ local function frame_callback()
         return true
     end
     local payload = payload_or_err
-    local payload_count = 5 + ZP1ENM_SIZE + #list_state_values
+    local payload_count = 7 + ZP1ENM_SIZE + #list_state_values
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
     local move_cmd, fire_cmd = 0, 0

@@ -4,11 +4,17 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 
 ## Current Scope
 
-- Lua sends a **315-value state vector** each frame:
+- Lua sends a **319-value state vector** each frame:
   - `PlayerAlive` (real RAM-derived from `STATUS`)
   - normalized score/replay/lasers/wave(level) values
+  - player position (`PX16`, `PY16` world coordinates)
+  - player velocity (`PXV`, `PYV`)
   - `ZP1ENM` enemy-state bag (50 normalized bytes)
-  - active object-list features from `OBPTR`, `HPTR`, `RPTR`, `PPTR`
+  - active object-list features from `OPTR`, `HPTR`, `RPTR`, `PPTR`
+    - `OPTR` (0x9817): motion objects - enforcers, sparks, circles, squares, shells, player lasers
+    - `HPTR` (0x981F): humans - mom, dad, kid
+    - `RPTR` (0x9821): robots - grunts, brains, hulks, tanks, progs, cruise missiles
+    - `PPTR` (0x9823): fatal obstacles - electrodes
     - per list: occupancy + 16 slots * (`present`, `x16`, `y16`, `canonical_type`)
       - `canonical_type` is derived from `OPICT` and stabilized to descriptor base
         so animation-frame pointer churn does not change semantic object identity
@@ -20,7 +26,7 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 ## Protocol (Lua -> Python)
 
 - Header format: `>HddBIBBIBB`
-  - `H`: number of float state values (currently `315`)
+  - `H`: number of float state values (currently `319`)
   - `d`: subjective reward
   - `d`: objective reward
   - `B`: done flag
@@ -51,7 +57,7 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 
 Lua debug controls in `Robotron/Scripts/main.lua`:
 
-- `DEBUG_STARTUP_TRACE` (default `true`)
+- `DEBUG_STARTUP_TRACE` (default `false`)
 - `DEBUG_TRACE_FRAMES` (default `10`)
 - `DEBUG_BYPASS_SOCKET_FOR_FRAMES` (default `0`)
   - Set to `10` to skip socket send/recv for first 10 frames (neutral action), for A/B isolation.

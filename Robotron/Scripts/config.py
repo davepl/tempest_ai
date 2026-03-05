@@ -29,11 +29,19 @@ class ServerConfigData:
     port: int = 9998
     max_clients: int = 36
     # State layout:
-    #   5 core (alive, score, replay, lasers, wave/level) + 50 ELIST bytes
-    #   + 4 active lists (OBPTR, HPTR, RPTR, PPTR)
-    #     each: 1 occupancy + 16 slots * 4 features
-    #   = 315 floats
-    params_count: int = 315
+    #   5 core (alive, score, replay, lasers, wave/level)
+    #   + 2 player position (x16, y16)
+    #   + 2 player velocity (xv, yv)
+    #   + 50 ELIST enemy state bytes
+    #   + 4 active lists (OPTR, HPTR, RPTR, PPTR), each: 1 occupancy + 16 slots × 4 features = 65
+    #   = 9 + 50 + 260 = 319 floats
+    #
+    # Active object lists:
+    #   - OPTR (0x9817): motion objects - enforcers, sparks, circles, squares, shells, player lasers
+    #   - HPTR (0x981F): humans - mom, dad, kid
+    #   - RPTR (0x9821): robots - grunts, brains, hulks, tanks, progs, cruise missiles
+    #   - PPTR (0x9823): fatal obstacles - electrodes
+    params_count: int = 319
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -58,7 +66,7 @@ class RLConfigData:
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Enemy attention currently disabled for flat 315-feature state.
+    # Enemy attention currently disabled for flat 317-feature state.
     use_enemy_attention: bool = False
     enemy_slots: int = 7
     enemy_features: int = 6
@@ -66,14 +74,13 @@ class RLConfigData:
     attn_dim: int = 128
 
     # Distributional C51
-    # Support scaled to match Rainbow's 20:1 ratio (support range / reward_clip).
-    # Old [-50,50] was 10:1 — too tight, causing Bellman target clipping on
-    # kill rewards above 245 points.  New [-100,100] eliminates clipping for
-    # kills under 490 pts and gives ~5× headroom for Q-value growth.
+    # Robotron per-frame rewards: grunt=100, brain=500, human rescue=1000-5000.
+    # With obj_reward_scale=0.01, these become 1-50. Support [-250,250] gives
+    # headroom for n-step=3 accumulation (max ~150) and multi-episode Q growth.
     use_distributional: bool = True
     num_atoms: int = 51
-    v_min: float = -100.0
-    v_max: float = 100.0
+    v_min: float = -250.0
+    v_max: float = 250.0
 
     use_dueling: bool = True
 
@@ -131,11 +138,13 @@ class RLConfigData:
     expert_bc_min_weight: float = 0.0
 
     # ── reward ──────────────────────────────────────────────────────────
-    obj_reward_scale: float = 1.0
-    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 1.0
+    # Scale objective rewards to fit C51 support. Human rescue (5000) → 50,
+    # grunt kill (100) → 1. Preserves relative importance while fitting support.
+    obj_reward_scale: float = 0.01
+    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
     subj_reward_scale: float = 0.005
-    reward_clip: float = 10000.0
-    death_reward_clip: float = 10000.0
+    reward_clip: float = 100.0          # Post-scaling: 10000 raw pts → 100
+    death_reward_clip: float = 100.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails

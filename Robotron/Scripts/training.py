@@ -221,6 +221,9 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             metrics.last_q_mean = float(q_all.mean().item())
             agree = (pred == actions_t).float().mean().item()
             metrics.last_agreement = agree
+            # Debug: print once every 1000 steps
+            if agent.training_steps % 1000 == 0:
+                print(f"[DEBUG] step={agent.training_steps} agree={agree:.4f} pred_sample={pred[:5].tolist()} act_sample={actions_t[:5].tolist()}")
 
         if hasattr(metrics, "agree_sum_interval"):
             metrics.agree_sum_interval += agree
@@ -228,7 +231,9 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         if hasattr(metrics, "loss_sum_interval"):
             metrics.loss_sum_interval += loss_val
             metrics.loss_count_interval += 1
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        print(f"[train_step] metrics exception: {e}")
+        traceback.print_exc()
 
     return loss_val

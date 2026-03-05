@@ -39,7 +39,7 @@ fi
 
 echo "Launching $COUNT MAME instance(s)..."
 for i in $(seq 1 "$COUNT"); do
-    mame tempest1 -nothrottle $SOUND_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+    mame tempest1 -window -nothrottle $SOUND_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
     echo "  Started instance $i (PID $!)"
 done
 echo "All instances launched."
