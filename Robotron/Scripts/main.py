@@ -276,6 +276,7 @@ def print_network_info(agent):
 
     print(f"\n🎓 Exploration:")
     print(f"   ε:    {RL_CONFIG.epsilon_start} → {RL_CONFIG.epsilon_end} over {RL_CONFIG.epsilon_decay_frames:,} frames")
+    print(f"   Greedy decode:    {'factored (move/fire independent)' if RL_CONFIG.factored_greedy_action else 'joint argmax'}")
     print(f"   Expert: {RL_CONFIG.expert_ratio_start*100:.0f}% → {RL_CONFIG.expert_ratio_end*100:.0f}% over {RL_CONFIG.expert_ratio_decay_frames:,} frames")
     print(f"   BC weight: {RL_CONFIG.expert_bc_weight} → {RL_CONFIG.expert_bc_min_weight}")
 
@@ -358,13 +359,8 @@ def main():
 
     threading.Thread(target=stats_reporter, args=(agent, kb), daemon=True).start()
 
-    last_save = time.time()
     try:
         while srv_thread.is_alive() and not server.shutdown_event.is_set():
-            if time.time() - last_save >= 300:
-                # Quiet periodic autosave to keep metrics rows clean.
-                agent.save(LATEST_MODEL_PATH, show_status=False)
-                last_save = time.time()
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard interrupt, shutting down...")

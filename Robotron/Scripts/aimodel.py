@@ -350,7 +350,7 @@ class RainbowNet(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
 
     def _build_object_tokens(self, state: torch.Tensor):
-        """Build 68 object tokens from 9 per-type entity categories.
+        """Build 144 object tokens from 9 per-type entity categories.
 
         Each token gets 4 features: [x, y, dist, category_id_norm]
         Slots are sorted by distance (nearest first) per category.
@@ -585,6 +585,7 @@ class RainbowAgent:
         self.state_size = state_size
         self.device = device
         cfg = RL_CONFIG
+        self.factored_greedy_action = bool(getattr(cfg, "factored_greedy_action", True))
 
         # Counters and locks (must be created before _sync_inference)
         self.training_steps = 0
@@ -725,12 +726,32 @@ class RainbowAgent:
         # Need greedy action for at least one axis
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         q = self._infer_q_values(st)
-        joint = int(q.argmax(dim=1).item())
-        greedy_move, greedy_fire = split_joint_action(joint)
+        if self.factored_greedy_action:
+            greedy_move_t, greedy_fire_t = self._greedy_axes_from_q(q)
+            greedy_move = int(greedy_move_t[0].item())
+            greedy_fire = int(greedy_fire_t[0].item())
+        else:
+            joint = int(q.argmax(dim=1).item())
+            greedy_move, greedy_fire = split_joint_action(joint)
 
         move_idx = random.randrange(NUM_MOVE) if rand_move else greedy_move
         fire_idx = random.randrange(NUM_FIRE) if rand_fire else greedy_fire
         return move_idx, fire_idx, rand_move or rand_fire
+
+    @staticmethod
+    def _greedy_axes_from_q(q_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode per-axis greedy actions from a joint Q-table.
+
+        Args:
+            q_values: (B, NUM_MOVE*NUM_FIRE)
+        Returns:
+            move_idx: (B,) long
+            fire_idx: (B,) long
+        """
+        q_joint = q_values.view(-1, NUM_MOVE, NUM_FIRE)
+        move_scores = q_joint.max(dim=2).values  # (B, NUM_MOVE)
+        fire_scores = q_joint.max(dim=1).values  # (B, NUM_FIRE)
+        return move_scores.argmax(dim=1), fire_scores.argmax(dim=1)
 
     def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
         net = self.infer_net if self.use_separate_inference else self.online_net
@@ -783,9 +804,16 @@ class RainbowAgent:
             batch_np = np.asarray(greedy_states, dtype=np.float32)
             st = torch.from_numpy(batch_np).to(self.inference_device)
             q = self._infer_q_values(st)
-            joints = q.argmax(dim=1).detach().cpu().tolist()
-            for pos, joint in zip(greedy_idx, joints):
-                greedy_actions[pos] = split_joint_action(int(joint))
+            if self.factored_greedy_action:
+                gm_t, gf_t = self._greedy_axes_from_q(q)
+                gm = gm_t.detach().cpu().tolist()
+                gf = gf_t.detach().cpu().tolist()
+                for pos, m, f in zip(greedy_idx, gm, gf):
+                    greedy_actions[pos] = (int(m), int(f))
+            else:
+                joints = q.argmax(dim=1).detach().cpu().tolist()
+                for pos, joint in zip(greedy_idx, joints):
+                    greedy_actions[pos] = split_joint_action(int(joint))
 
         actions: list[Tuple[int, int, bool]] = []
         for i in range(n):

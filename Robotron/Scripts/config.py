@@ -64,6 +64,11 @@ class RLConfigData:
     #   movement_direction (0..7) × firing_direction (0..7) = 64 actions
     num_move_actions: int = 8
     num_fire_actions: int = 8
+    # Action selection uses per-axis greedy decoding from the joint Q table
+    # (move = argmax_m max_f Q[m,f], fire = argmax_f max_m Q[m,f]).
+    # This preserves 64-action training targets while making online behavior
+    # less coupled between movement and firing directions.
+    factored_greedy_action: bool = True
 
     @property
     def num_joint_actions(self) -> int:
@@ -75,7 +80,7 @@ class RLConfigData:
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Object-slot self-attention over 4 lists × 16 slots = 64 tokens.
+    # Object-slot self-attention over 9 typed categories = 144 tokens.
     use_enemy_attention: bool = True
     # Per-type entity categories: name, slots — matches Lua ENTITY_CATEGORIES.
     entity_categories: list = field(default_factory=lambda: [

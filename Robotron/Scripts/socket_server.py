@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, time, socket, select, struct, threading, traceback, queue
+import os, time, socket, select, struct, threading, traceback, queue, random
 import numpy as np
 from collections import deque
 
@@ -45,6 +45,7 @@ try:
     _ACTION_DIAG_INTERVAL = max(500, int(os.getenv("ROBOTRON_ACTION_DIAG_INTERVAL", "5000")))
 except Exception:
     _ACTION_DIAG_INTERVAL = 5000
+_FORCE_RANDOM_ACTIONS = os.getenv("ROBOTRON_FORCE_RANDOM_ACTIONS", "").strip().lower() not in {"", "0", "false", "off", "no"}
 
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
@@ -238,6 +239,8 @@ class SocketServer:
                 f"wait_ms={self.inference_batcher.max_wait_s * 1000.0:.2f}"
             )
         self.metrics = SafeMetrics(metrics_wrapper)
+        if _FORCE_RANDOM_ACTIONS:
+            print("FORCE RANDOM ACTIONS enabled (ROBOTRON_FORCE_RANDOM_ACTIONS=1)")
 
         self.server_socket = None
         self.running = False
@@ -265,7 +268,11 @@ class SocketServer:
                 "last_player_alive": False,
                 "last_action_source": None, "prev_action_source": None,
                 "act_total": 0, "act_eps": 0, "act_last_diag_total": 0,
-                "act_fire_hist": [0] * 8, "act_fire_hist_eps": [0] * 8,
+                "act_same": 0, "act_diff": 0,
+                "act_move_hist": [0] * 8, "act_fire_hist": [0] * 8,
+                "act_pair_hist": [0] * 64,
+                "act_move_hist_eps": [0] * 8, "act_fire_hist_eps": [0] * 8,
+                "act_pair_hist_eps": [0] * 64,
                 "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
@@ -474,7 +481,12 @@ class SocketServer:
                 is_epsilon = False
                 epsilon = self.metrics.get_effective_epsilon()
 
-                if self.agent:
+                if _FORCE_RANDOM_ACTIONS:
+                    move_idx = random.randrange(max(1, int(getattr(RL_CONFIG, "num_move_actions", 8))))
+                    fire_idx = random.randrange(max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8))))
+                    is_epsilon = True
+                    action_source = "forced_random"
+                elif self.agent:
                     t0 = time.perf_counter()
                     if self.inference_batcher is not None:
                         move_idx, fire_idx, is_epsilon = self.inference_batcher.infer(frame.state, epsilon)
@@ -484,22 +496,54 @@ class SocketServer:
                     action_source = "dqn"
 
                 cs["act_total"] = int(cs.get("act_total", 0)) + 1
+                if 0 <= int(move_idx) <= 7:
+                    cs["act_move_hist"][int(move_idx)] += 1
                 if 0 <= int(fire_idx) <= 7:
                     cs["act_fire_hist"][int(fire_idx)] += 1
+                if 0 <= int(move_idx) <= 7 and 0 <= int(fire_idx) <= 7:
+                    pair_idx = int(move_idx) * 8 + int(fire_idx)
+                    cs["act_pair_hist"][pair_idx] += 1
+                if int(move_idx) == int(fire_idx):
+                    cs["act_same"] = int(cs.get("act_same", 0)) + 1
+                else:
+                    cs["act_diff"] = int(cs.get("act_diff", 0)) + 1
                 if is_epsilon:
                     cs["act_eps"] = int(cs.get("act_eps", 0)) + 1
+                    if 0 <= int(move_idx) <= 7:
+                        cs["act_move_hist_eps"][int(move_idx)] += 1
                     if 0 <= int(fire_idx) <= 7:
                         cs["act_fire_hist_eps"][int(fire_idx)] += 1
+                    if 0 <= int(move_idx) <= 7 and 0 <= int(fire_idx) <= 7:
+                        pair_idx = int(move_idx) * 8 + int(fire_idx)
+                        cs["act_pair_hist_eps"][pair_idx] += 1
                 if _ACTION_DIAGNOSTICS:
                     last_diag = int(cs.get("act_last_diag_total", 0))
                     total = int(cs.get("act_total", 0))
                     if (total - last_diag) >= _ACTION_DIAG_INTERVAL:
+                        def _top_pairs(hist, k=4):
+                            tops = sorted(enumerate(hist), key=lambda x: x[1], reverse=True)
+                            out = []
+                            for idx, cnt in tops:
+                                if cnt <= 0:
+                                    break
+                                out.append(f"{idx // 8}->{idx % 8}:{cnt}")
+                                if len(out) >= k:
+                                    break
+                            return "[" + ", ".join(out) + "]"
+
                         eps_used = int(cs.get("act_eps", 0))
                         eps_rate = eps_used / max(1, total)
+                        same = int(cs.get("act_same", 0))
+                        diff = int(cs.get("act_diff", 0))
+                        diff_rate = diff / max(1, (same + diff))
                         print(
                             f"[actdiag] client={cid} eps_eff={float(epsilon):.3f} "
                             f"eps_used={eps_used}/{total} ({eps_rate:.1%}) "
-                            f"fire_all={cs.get('act_fire_hist')} fire_eps={cs.get('act_fire_hist_eps')}"
+                            f"same={same} diff={diff} ({diff_rate:.1%} diff) "
+                            f"move_all={cs.get('act_move_hist')} "
+                            f"fire_all={cs.get('act_fire_hist')} "
+                            f"top_pairs={_top_pairs(cs.get('act_pair_hist', []))} "
+                            f"top_pairs_eps={_top_pairs(cs.get('act_pair_hist_eps', []))}"
                         )
                         cs["act_last_diag_total"] = total
 

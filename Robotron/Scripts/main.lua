@@ -165,6 +165,13 @@ local ocvect_category_cache = {}       -- OCVECT address → category name | "sk
 local discovered_tank_ocvect = nil     -- TNKIL address once discovered via growing phase
 local unresolved_7x16 = {}             -- {[ocvect] = true} for ambiguous 7×16 on RPTR
 
+-- Debug HUD overlay state (draws entity letters on screen each frame).
+local mame_screen = nil                -- MAME screen device for draw_text
+local hud_objects = nil                -- last frame's classified object list (reference)
+local hud_player_x16 = nil
+local hud_player_y16 = nil
+local DEBUG_HUD_ENABLED = true         -- set false to disable overlay
+
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
         return false
@@ -634,7 +641,62 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
         end
     end
 
+    -- Stash classified objects for the debug HUD (zero-alloc reference swap).
+    hud_objects = all_objects
+    hud_player_x16 = player_x16
+    hud_player_y16 = player_y16
+
     return features, nearest_enemy_dist, nearest_human_dist
+end
+
+-- ── Debug HUD: draw entity category letters on the MAME screen ──────────
+
+local CAT_HUD = {
+    grunt      = { ch = "g", fg = 0xFFFF4444 },
+    hulk       = { ch = "H", fg = 0xFFFF8800 },
+    brain      = { ch = "B", fg = 0xFFFF00FF },
+    tank       = { ch = "T", fg = 0xFFFFFF00 },
+    spawner    = { ch = "S", fg = 0xFF00FFFF },
+    enforcer   = { ch = "E", fg = 0xFF8888FF },
+    projectile = { ch = "!", fg = 0xFFFF0000 },
+    human      = { ch = "*", fg = 0xFF44FF44 },
+    electrode  = { ch = "+", fg = 0xFF888888 },
+}
+
+local function draw_debug_hud()
+    if not DEBUG_HUD_ENABLED then return end
+    if not mame_screen then
+        -- Lazy-init: grab the screen device on first use.
+        local ok, s = pcall(function()
+            return manager.machine.screens[":screen"]
+        end)
+        if ok and s then
+            mame_screen = s
+        else
+            return
+        end
+    end
+
+    -- Player marker
+    if hud_player_x16 and hud_player_y16 then
+        local px = (hud_player_x16 >> 8) & 0xFF
+        local py = (hud_player_y16 >> 8) & 0xFF
+        mame_screen:draw_text(px - 3, py - 4, "P", 0xFFFFFFFF, 0x80000080)
+    end
+
+    -- Entity markers
+    if hud_objects then
+        for _, obj in ipairs(hud_objects) do
+            if obj.category and obj.category ~= "skip" then
+                local info = CAT_HUD[obj.category]
+                if info then
+                    local sx = (obj.x16 >> 8) & 0xFF
+                    local sy = (obj.y16 >> 8) & 0xFF
+                    mame_screen:draw_text(sx - 3, sy - 4, info.ch, info.fg, 0x00000000)
+                end
+            end
+        end
+    end
 end
 
 local function initialize_mame_interface()
@@ -1250,6 +1312,10 @@ local function frame_callback()
 
     previous_player_alive = player_alive
     previous_score = score
+
+    -- Draw debug HUD overlay (entity letters on screen)
+    draw_debug_hud()
+
     trace_log(frame_counter, "frame_end", "done=" .. tostring(done))
     frame_counter = frame_counter + 1
 
