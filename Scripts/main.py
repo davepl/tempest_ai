@@ -275,6 +275,8 @@ def print_network_info(agent):
     print(f"   Batch size:       {RL_CONFIG.batch_size}")
     print(f"   γ = {RL_CONFIG.gamma},  n-step = {RL_CONFIG.n_step}")
     print(f"   PER α={RL_CONFIG.priority_alpha}, β={RL_CONFIG.priority_beta_start}→1.0")
+    mm_dir = getattr(RL_CONFIG, 'replay_memmap_dir', '')
+    print(f"   Replay buffer:    {RL_CONFIG.memory_size:,} capacity, {'memmap (' + mm_dir + ')' if mm_dir else 'RAM-backed'}")
     print(f"   Target update:    every {RL_CONFIG.target_update_period} steps (hard)")
     print(f"   Grad clip:        {RL_CONFIG.grad_clip_norm}")
 
@@ -313,6 +315,9 @@ def main():
         print("⚠ No model found, starting fresh\n")
         game_settings.reset()
         game_settings.save()
+
+    # Restore persisted episode count
+    metrics.episodes_this_run = game_settings.episodes_total
 
     dashboard_enabled = _env_enabled("TEMPEST_DASHBOARD", True)
     dashboard_host = _resolve_dashboard_host()
@@ -365,12 +370,15 @@ def main():
             if time.time() - last_save >= 300:
                 # Quiet periodic autosave to keep metrics rows clean.
                 agent.save(LATEST_MODEL_PATH, show_status=False)
+                game_settings.episodes_total = metrics.episodes_this_run
+                game_settings.save()
                 last_save = time.time()
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard interrupt, shutting down...")
     finally:
         agent.save(LATEST_MODEL_PATH)
+        game_settings.episodes_total = metrics.episodes_this_run
         game_settings.save()
         print("Final model & settings saved")
         if IS_INTERACTIVE and kb:

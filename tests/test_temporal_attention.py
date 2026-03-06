@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for temporal enemy tokens, stack-skip assembly, and diagnose_attention()."""
+"""Tests for enemy attention tokens, stack-skip assembly, and diagnose_attention()."""
 
 import os
 import sys
@@ -21,46 +21,30 @@ def _make_net():
 
 # ── Temporal token shapes ────────────────────────────────────────────────────
 
-def test_temporal_token_shape():
-    """Enemy tokens should be (B, 7*fs, 15) with temporal index as feature 14."""
+def test_enemy_token_shape():
+    """Enemy tokens should be (B, 7, 14) — current frame only."""
     net, fs, raw, stacked = _make_net()
     B = 2
     state = torch.randn(B, stacked)
     tokens, mask = net._build_enemy_tokens(state)
-    assert tokens.shape == (B, 7 * fs, 15), f"Expected (B, {7*fs}, 15), got {tokens.shape}"
-    assert mask.shape == (B, 7 * fs), f"Expected (B, {7*fs}), got {mask.shape}"
+    assert tokens.shape == (B, 7, 14), f"Expected (B, 7, 14), got {tokens.shape}"
+    assert mask.shape == (B, 7), f"Expected (B, 7), got {mask.shape}"
 
 
-def test_temporal_index_values():
-    """Temporal index (feature 14) should be 0.0 for current frame, ascending to 1.0."""
+def test_enemy_tokens_use_current_frame():
+    """Enemy tokens should come from frame 0 (current) only."""
     net, fs, raw, stacked = _make_net()
-    state = torch.randn(1, stacked)
-    tokens, _ = net._build_enemy_tokens(state)
-    # Feature 14 is the temporal index
-    for f in range(fs):
-        expected = f / max(1, fs - 1) if fs > 1 else 0.0
-        actual = tokens[0, f * 7, 14].item()
-        assert abs(actual - expected) < 1e-5, (
-            f"Frame {f}: temporal_idx expected {expected:.4f}, got {actual:.4f}"
-        )
-
-
-def test_temporal_tokens_use_correct_frame_data():
-    """Each frame's enemy tokens should reflect that frame's data, not frame 0's."""
-    net, fs, raw, stacked = _make_net()
-    if fs < 2:
-        return  # nothing to test with single frame
     state = torch.zeros(1, stacked)
-    # Put a distinctive depth in frame 0 slot 0 vs frame 1 slot 0
+    # Put a distinctive depth in frame 0 slot 0
     state[0, 135] = 0.5        # frame 0, slot 0 depth
-    state[0, raw + 135] = 0.8  # frame 1, slot 0 depth
+    if fs > 1:
+        state[0, raw + 135] = 0.8  # frame 1, slot 0 depth (should be ignored)
     tokens, _ = net._build_enemy_tokens(state)
-    # After per-frame sort, the active enemy lands in first slot of each frame's block.
-    # Depth is feature index 7 in the 14-feature base (decoded(6) + seg(1) + depth(1)).
+    # Depth is feature index 7 (decoded(6) + seg(1) + depth(1))
     depth_f0 = tokens[0, 0, 7].item()
-    depth_f1 = tokens[0, 7, 7].item()
     assert abs(depth_f0 - 0.5) < 1e-5, f"Frame 0 depth: expected 0.5, got {depth_f0}"
-    assert abs(depth_f1 - 0.8) < 1e-5, f"Frame 1 depth: expected 0.8, got {depth_f1}"
+    # Should only have 7 tokens, no frame 1 data
+    assert tokens.shape[1] == 7
 
 
 # ── Stack-skip assembly ─────────────────────────────────────────────────────
@@ -156,16 +140,11 @@ def test_diagnose_attention_no_crash():
     result = agent.diagnose_attention(num_samples=64)
     assert isinstance(result, str)
     assert "LANE-CROSS-ATTENTION DIAGNOSTICS" in result
-    # With temporal tokens, should include temporal section
-    if fs > 1:
-        assert "Temporal attention distribution" in result
 
 
-def test_diagnose_attention_temporal_section():
-    """Temporal distribution section should report per-frame percentages."""
+def test_diagnose_attention_no_temporal_section():
+    """Diagnostics should NOT contain temporal distribution section after revert."""
     fs = max(1, RL_CONFIG.frame_stack)
-    if fs <= 1:
-        return
     stacked = SERVER_CONFIG.params_count * fs
     agent = RainbowAgent(stacked)
 
@@ -176,6 +155,4 @@ def test_diagnose_attention_temporal_section():
         agent.memory.add(s, 0, 0.1, ns, False, 1, False)
 
     result = agent.diagnose_attention(num_samples=64)
-    # Should contain per-frame labels
-    assert "current" in result
-    assert "t-1" in result
+    assert "Temporal attention distribution" not in result

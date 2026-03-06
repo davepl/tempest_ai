@@ -86,10 +86,11 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12                        # Wider horizon for better long-range credit assignment
-    max_samples_per_frame: float = 50      # Moderate replay pressure for better adaptation without overtraining
+    max_samples_per_frame: float = 999      # Moderate replay pressure for better adaptation without overtraining
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 30_000_000
+    replay_memmap_dir: str = "models/replay_memmap"  # Disk-backed memmap; "" to disable
+    memory_size: int = 50_000_000
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000
@@ -191,10 +192,11 @@ class GameSettings:
     def __init__(self):
         self._lock = threading.Lock()
         self._start_advanced: bool = True
-        self._start_level_min: int = 13
+        self._start_level_min: int = 1
         self._epsilon_pct: int = -1   # -1 = auto (follow decay), 0-100 = manual override %
         self._expert_pct: int = -1    # -1 = auto (follow decay), 0-100 = manual override %
-        self._auto_curriculum: bool = False
+        self._auto_curriculum: bool = True
+        self._episodes_total: int = 0
 
     @property
     def start_advanced(self) -> bool:
@@ -246,6 +248,16 @@ class GameSettings:
         with self._lock:
             self._auto_curriculum = bool(value)
 
+    @property
+    def episodes_total(self) -> int:
+        with self._lock:
+            return self._episodes_total
+
+    @episodes_total.setter
+    def episodes_total(self, value: int):
+        with self._lock:
+            self._episodes_total = max(0, int(value))
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -254,16 +266,18 @@ class GameSettings:
                 "epsilon_pct": self._epsilon_pct,
                 "expert_pct": self._expert_pct,
                 "auto_curriculum": self._auto_curriculum,
+                "episodes_total": self._episodes_total,
             }
 
     def reset(self) -> None:
         """Restore all settings to initial defaults (fresh-start)."""
         with self._lock:
             self._start_advanced = True
-            self._start_level_min = 13
+            self._start_level_min = 1
             self._epsilon_pct = -1
             self._expert_pct = -1
-            self._auto_curriculum = False
+            self._auto_curriculum = True
+            self._episodes_total = 0
 
     # ── Persistence ───────────────────────────────────────────────
 
@@ -295,6 +309,8 @@ class GameSettings:
                     self._expert_pct = max(-1, min(100, int(data["expert_pct"])))
                 if "auto_curriculum" in data:
                     self._auto_curriculum = bool(data["auto_curriculum"])
+                if "episodes_total" in data:
+                    self._episodes_total = max(0, int(data["episodes_total"]))
         except FileNotFoundError:
             pass  # first run — use defaults
         except Exception:

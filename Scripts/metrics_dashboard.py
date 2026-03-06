@@ -271,7 +271,7 @@ class _DashboardState:
                 na = cfg.num_firezap_actions * len(cfg.spinner_command_levels)
                 n_atoms = cfg.num_atoms if cfg.use_distributional else 1
                 hm = th // 2
-                attn_p = (5 * ad + ad) + 2 * ad + (15 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
+                attn_p = (5 * ad + ad) + 2 * ad + (14 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
                 trunk_p = (ss + ad) * th + th + 2 * th
                 for _ in range(1, tl):
                     trunk_p += th * th + th + 2 * th
@@ -1508,7 +1508,7 @@ def _render_dashboard_html() -> str:
           {
             key: "fps",
             color: "#22c55e",
-            axis: { side: "left", min: 0, max: 3000, group_keys: ["fps", "eplen_100k"] },
+            axis: { side: "left", min: 0, max_floor: 500, max_snap: 500, group_keys: ["fps", "eplen_100k"] },
             smooth_alpha: 0.14,
           },
           {
@@ -1938,6 +1938,36 @@ def _render_dashboard_html() -> str:
       ctx.shadowBlur = 0;
     }
 
+    // Fixed-width bloom: draws each character at a constant cell width
+    // so numeric text doesn't jump when digits change. Right-aligned
+    // from (x, y) — x is the right edge.
+    function drawBloomTextFixed(ctx, text, x, y, layers, crisp, cellW) {
+      const chars = Array.from(text);
+      const totalW = chars.length * cellW;
+      const startX = x - totalW;  // right-aligned from x
+      const savedAlign = ctx.textAlign;
+      ctx.textAlign = "center";
+      for (const l of layers) {
+        ctx.fillStyle = l.fill;
+        ctx.shadowColor = l.shadow;
+        ctx.shadowBlur = l.blur;
+        for (let i = 0; i < chars.length; i++) {
+          const cx = startX + (i + 0.5) * cellW;
+          ctx.fillText(chars[i], cx, y);
+          ctx.fillText(chars[i], cx, y);
+        }
+      }
+      ctx.fillStyle = crisp.fill;
+      ctx.shadowColor = crisp.shadow;
+      ctx.shadowBlur = crisp.blur;
+      for (let i = 0; i < chars.length; i++) {
+        const cx = startX + (i + 0.5) * cellW;
+        ctx.fillText(chars[i], cx, y);
+      }
+      ctx.shadowBlur = 0;
+      ctx.textAlign = savedAlign;
+    }
+
     /* VFD bloom color presets for gauge sub-text */
     const VFD_BLOOM_ORANGE = {
       layers: [
@@ -2107,9 +2137,11 @@ def _render_dashboard_html() -> str:
           else if (normA > Math.PI * 0.5 && normA < Math.PI * 1.5) ctx.textAlign = "right";
           else ctx.textAlign = "left";
           if (i >= tickCount) {
+            lx += 4;  // nudge ∞ rightward
             ctx.font = `${Math.max(12, Math.round(radius * 0.196))}px 'Avenir Next', 'Segoe UI', sans-serif`;
             ctx.fillText("\u221E", lx, ly);
           } else {
+            if (i === 0) lx -= 4;  // nudge "0" leftward
             const labelFontScale = cfg.label_font_scale || 0.11;
             ctx.font = `${Math.max(8, Math.round(radius * labelFontScale))}px 'Avenir Next', 'Segoe UI', sans-serif`;
             let labelStr;
@@ -2208,11 +2240,12 @@ def _render_dashboard_html() -> str:
       const badgeW = radius * 1.0;
       const badgeH = radius * 0.48;
       const badgeX = cx - (badgeW * 0.5);
-      const badgeY = cy + radius * 0.44;
+      const extraDrop = cfg.sub_text_2 ? 4 : 0;  // nudge badge down when 2-line odometer
+      const badgeY = cy + radius * 0.44 + extraDrop;
 
-      // Sub-text above the badge (e.g. total training steps) — VFD odometer display
+      // Sub-text above the badge — VFD odometer display (1 or 2 lines)
       if (cfg.sub_text) {
-        const subFont = `400 ${Math.max(10, Math.round(radius * 0.125))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
+        const subFont = `400 ${Math.max(8, Math.round(radius * 0.110))}px 'LED Dot-Matrix', 'Dot Matrix', 'DotGothic16', 'Courier New', monospace`;
         ctx.font = subFont;
         ctx.textAlign = "right";
         ctx.textBaseline = "middle";
@@ -2221,9 +2254,12 @@ def _render_dashboard_html() -> str:
         const tmMax = ctx.measureText(maxTemplate);
         const odoPad = radius * 0.05;
         const odoW = tmMax.width + odoPad * 2;
-        const odoH = Math.max(14, Math.round(radius * 0.16));
+        const lineH = Math.max(14, Math.round(radius * 0.16));
+        const odoLines = cfg.sub_text_2 ? 2 : 1;
+        const lineGap = 0.5;
+        const odoH = lineH * odoLines + (odoLines > 1 ? lineGap : 0);
         const odoX = cx - odoW * 0.5;
-        const odoY = badgeY - odoH - 3;
+        const odoY = badgeY - odoH + 3;
         const odoR = Math.max(3, radius * 0.035);
         const subX = odoX + odoW - odoPad;  // right-justified with padding
         // VFD housing background — color keyed to gauge type
@@ -2240,10 +2276,23 @@ def _render_dashboard_html() -> str:
         ctx.lineWidth = 1;
         ctx.stroke();
         ctx.restore();
-        // Text centered in the VFD box
-        const subTextY = odoY + odoH * 0.5;
+        // Measure a fixed cell width from the widest digit so text never jumps
+        const cellW = ctx.measureText("8").width * 1.05;
+        // Line 1: primary sub_text (e.g. frame count)
+        const line1Y = odoY + lineH * 0.5;
         const bloom = (odoColor === "orange") ? VFD_BLOOM_ORANGE : VFD_BLOOM_BLUE;
-        drawBloomText(ctx, cfg.sub_text, subX, subTextY, bloom.layers, bloom.crisp);
+        ctx.font = subFont;
+        ctx.textBaseline = "middle";
+        drawBloomTextFixed(ctx, cfg.sub_text, subX, line1Y, bloom.layers, bloom.crisp, cellW);
+        // Line 2: secondary sub_text (e.g. wall-clock duration)
+        if (cfg.sub_text_2) {
+          const line2Color = cfg.sub_text_2_color || odoColor;
+          const bloom2 = (line2Color === "orange") ? VFD_BLOOM_ORANGE : VFD_BLOOM_BLUE;
+          const line2Y = odoY + lineH + lineGap + lineH * 0.5;
+          ctx.font = subFont;
+          ctx.textBaseline = "middle";
+          drawBloomTextFixed(ctx, cfg.sub_text_2, subX, line2Y, bloom2.layers, bloom2.crisp, cellW);
+        }
       }
 
       const badgeFill = ctx.createLinearGradient(0, badgeY, 0, badgeY + badgeH);
@@ -2282,12 +2331,25 @@ def _render_dashboard_html() -> str:
       ctx.fillStyle = "rgba(255, 52, 52, 0.98)";
       ctx.shadowBlur = 0;
       ctx.fillText(valueText, ledX, ledY);
+
       drawNeedle();
       drawHub();
     }
 
+    function fmtWallTime(totalFrames) {
+      if (totalFrames == null || totalFrames <= 0) return '';
+      let sec = Math.floor(totalFrames / 30);
+      const d = Math.floor(sec / 86400); sec %= 86400;
+      const h = Math.floor(sec / 3600);  sec %= 3600;
+      const m = Math.floor(sec / 60);    sec %= 60;
+      if (d > 0) return `${d}d ${String(h).padStart(2,'0')}h ${String(m).padStart(2,'0')}m`;
+      if (h > 0) return `${h}h ${String(m).padStart(2,'0')}m`;
+      return `${m}m`;
+    }
+
     function drawFpsGauge(canvas, fps, totalFrames) {
       const framesText = totalFrames != null ? Number(totalFrames).toLocaleString() : null;
+      const wallText = fmtWallTime(totalFrames);
       drawStyledGauge(canvas, fps, {
         min: GAUGE_MIN_FPS,
         max: GAUGE_MAX_FPS,
@@ -2305,6 +2367,8 @@ def _render_dashboard_html() -> str:
         label_radial_offset: -16,
         sub_text: framesText,
         sub_text_color: "blue",
+        sub_text_2: wallText || null,
+        sub_text_2_color: "blue",
       });
     }
 
@@ -2584,6 +2648,31 @@ def _render_dashboard_html() -> str:
         if (!hasFixedMin) minV = Math.floor(minV / niceStep) * niceStep;
         if (!hasFixedMax) maxV = Math.ceil(maxV / niceStep) * niceStep;
         if (maxV <= minV) maxV = minV + niceStep;
+
+        // Sticky-max: zoom OUT immediately, zoom IN only every 4 seconds
+        if (!hasFixedMax) {
+          if (!canvas._stickyMax) canvas._stickyMax = {};
+          const cacheKey = s.key;
+          const now = performance.now();
+          const cached = canvas._stickyMax[cacheKey];
+          if (!cached) {
+            canvas._stickyMax[cacheKey] = { max: maxV, lastShrinkTime: now };
+          } else {
+            if (maxV >= cached.max) {
+              // Zoom out: apply immediately
+              cached.max = maxV;
+              cached.lastShrinkTime = now;
+            } else {
+              // Zoom in: only if 4+ seconds since last change
+              if (now - cached.lastShrinkTime >= 4000) {
+                cached.max = maxV;
+                cached.lastShrinkTime = now;
+              } else {
+                maxV = cached.max;  // hold the old (larger) scale
+              }
+            }
+          }
+        }
 
         const axisX = side === "left"
           ? (padL - 20 - leftAxisOffset)
