@@ -4,6 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LUA_SCRIPT="$SCRIPT_DIR/Scripts/main.lua"
 LOG_DIR="$SCRIPT_DIR/logs"
+ROM_DIR="$SCRIPT_DIR/roms"
+MAME_BIN="${MAME_BIN:-mame}"
+
+# Default to project-local ROMs; allow callers to append/override via MAME_ROMPATH.
+if [[ -n "${MAME_ROMPATH:-}" ]]; then
+    ROMPATH="$ROM_DIR;$MAME_ROMPATH"
+else
+    ROMPATH="$ROM_DIR"
+fi
 
 usage() {
     echo "Usage: $0 [COUNT] [--fg] [-kill]"
@@ -69,23 +78,34 @@ if [[ "$COUNT" -gt 1 ]]; then
 fi
 
 WARNING_FLAG=""
-if mame -showusage 2>&1 | rg -q -- "-skip_warnings"; then
+if "$MAME_BIN" -showusage 2>&1 | grep -q -- "-skip_warnings"; then
     WARNING_FLAG="-skip_warnings"
 else
     echo "Note: this MAME build does not support -skip_warnings; continuing without it."
 fi
 
+if [[ ! -d "$ROM_DIR" ]]; then
+    echo "error: ROM directory not found: $ROM_DIR" >&2
+    exit 1
+fi
+
+if ! "$MAME_BIN" -rompath "$ROMPATH" -verifyroms robotron >/dev/null 2>&1; then
+    echo "error: Robotron ROM verification failed for rompath: $ROMPATH" >&2
+    "$MAME_BIN" -rompath "$ROMPATH" -verifyroms robotron || true
+    exit 1
+fi
+
 if [[ "$FOREGROUND" -eq 1 ]]; then
     echo "Mode: foreground"
     echo "Launching 1 MAME instance (attached)..."
-    exec mame robotron -nothrottle $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
+    exec "$MAME_BIN" robotron -rompath "$ROMPATH" -nothrottle $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
 fi
 
 echo "Mode: background"
 echo "Launching $COUNT MAME instance(s)..."
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
-    mame robotron -nothrottle $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+    "$MAME_BIN" robotron -rompath "$ROMPATH" -nothrottle $SOUND_FLAG -video none -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
     pid=$!
     PIDS+=("$pid")
     echo "  Started instance $i (PID $pid)"
