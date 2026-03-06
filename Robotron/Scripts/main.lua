@@ -215,6 +215,8 @@ local hud_objects = nil                -- last frame's classified object list (r
 local hud_player_x16 = nil
 local hud_player_y16 = nil
 local DEBUG_HUD_ENABLED = true         -- set false to disable overlay
+local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
+local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
@@ -817,7 +819,31 @@ local HUD_PLAYER_COLOR = 0xFFFFFFFF   -- white ring for player
 local HUD_RING_RADIUS  = 8           -- half-size of ring box in screen pixels
 
 local function draw_debug_hud()
-    -- Called from emu.register_frame_done so we paint AFTER the game renders.
+    -- Toggle HUD on/off with the 'H' key (edge-triggered).
+    local ok_input, inp = pcall(function() return manager.machine.input end)
+    if ok_input and inp then
+        if not hud_key_code then
+            local ok_code, code = pcall(function()
+                return inp:code_from_token("KEYCODE_H")
+            end)
+            if ok_code and code then
+                hud_key_code = code
+            end
+        end
+        if hud_key_code then
+            local ok_pressed, down = pcall(function()
+                return inp:code_pressed(hud_key_code)
+            end)
+            if ok_pressed then
+                if down and not hud_key_was_down then
+                    DEBUG_HUD_ENABLED = not DEBUG_HUD_ENABLED
+                    print("[HUD] toggled " .. (DEBUG_HUD_ENABLED and "ON" or "OFF"))
+                end
+                hud_key_was_down = down
+            end
+        end
+    end
+
     if not DEBUG_HUD_ENABLED then return end
 
     -- Lazy-init: grab the screen device on first use.
