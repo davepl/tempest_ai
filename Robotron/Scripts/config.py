@@ -141,8 +141,8 @@ class RLConfigData:
 
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.01
-    epsilon_decay_frames: int = 2_500_000
+    epsilon_end: float = 0.02
+    epsilon_decay_frames: int = 10_000_000
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000

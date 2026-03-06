@@ -57,6 +57,32 @@ local SUBJ_ENEMY_NEAR_NORM = 0.035
 local SUBJ_ENEMY_FAR_NORM = 0.200
 local SUBJ_HUMAN_NEAR_NORM = 0.120
 
+-- Aiming reward: bonus for firing toward aligned enemies/obstacles.
+local SUBJ_AIM_WEIGHT = 15.0        -- reward per frame when correctly aimed
+local AIM_CROSS_THRESHOLD = 2048     -- 8 screen-pixels in x16 units (8 * 256)
+local AIM_MIN_FORWARD = 1024         -- ~4 screen-pixels minimum forward distance
+-- Categories that count as "targets" for aim reward (everything but humans).
+local AIM_TARGET_CATS = {
+    grunt = true, hulk = true, brain = true, tank = true,
+    spawner = true, enforcer = true, projectile = true, electrode = true,
+}
+-- Direction unit vectors for 8-way fire (dx, dy in x16 coordinates).
+-- y-up: 0=up (+y), 1=up-right, 2=right, 3=down-right, 4=down, 5=down-left, 6=left, 7=up-left
+local FIRE_DIR_VEC = {
+    [0] = { 0,  1},   -- up
+    [1] = { 1,  1},   -- up-right
+    [2] = { 1,  0},   -- right
+    [3] = { 1, -1},   -- down-right
+    [4] = { 0, -1},   -- down
+    [5] = {-1, -1},   -- down-left
+    [6] = {-1,  0},   -- left
+    [7] = {-1,  1},   -- up-left
+}
+-- Evasion reward: bonus for moving away from nearest enemy when close.
+local SUBJ_EVADE_WEIGHT = 10.0       -- reward when moving away from nearest threat
+local EVADE_DANGER_NORM  = 0.08      -- only reward evasion when enemy within this normalised dist
+local MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
+
 local mainCpu = nil
 local mem = nil
 local controls = nil
@@ -70,6 +96,14 @@ local dead_frame_counter = 0
 local last_save_time = 0
 local previous_player_alive = 1
 local previous_score = 0
+local prev_fire_cmd = -1          -- fire direction from previous frame
+local prev_move_cmd = -1          -- move direction from previous frame
+local prev_aim_objects = nil      -- classified objects from previous frame
+local prev_aim_px16 = nil         -- player x16 from previous frame
+local prev_aim_py16 = nil         -- player y16 from previous frame
+local prev_nearest_enemy_x16 = nil
+local prev_nearest_enemy_y16 = nil
+local prev_nearest_enemy_dist = nil
 
 -- Autoboot input sequence (MAME input level, no game-specific memory logic required).
 -- Every cycle: pulse Coin 1, then pulse 1P Start shortly after.
@@ -316,6 +350,83 @@ local function human_proximity_score(nearest_dist_norm)
         return 0.0
     end
     return 1.0 - clamp01(nearest_dist_norm / math.max(1e-6, SUBJ_HUMAN_NEAR_NORM))
+end
+
+local function compute_aim_reward(fire_cmd, px16, py16, objects)
+    -- Returns 0..1 aim score: 1 if fire_cmd is toward at least one aligned target.
+    -- Only evaluates if fire_cmd is a valid direction (0-7).
+    if fire_cmd == nil or fire_cmd < 0 or fire_cmd > 7 then
+        return 0.0
+    end
+    if px16 == nil or py16 == nil or objects == nil then
+        return 0.0
+    end
+
+    local vec = FIRE_DIR_VEC[fire_cmd]
+    if vec == nil then return 0.0 end
+    local vx, vy = vec[1], vec[2]
+
+    -- For diagonal directions the cross-threshold is wider by ~1.414
+    local is_diagonal = (vx ~= 0 and vy ~= 0)
+    local cross_thresh = is_diagonal and (AIM_CROSS_THRESHOLD * 1.414) or AIM_CROSS_THRESHOLD
+
+    local best_score = 0.0
+    for _, obj in ipairs(objects) do
+        if obj.category and AIM_TARGET_CATS[obj.category] then
+            local dx = obj.x16 - px16
+            local dy = obj.y16 - py16
+
+            -- Forward component (dot product with direction vector, unnormalised)
+            local forward = dx * vx + dy * vy
+            -- Cross component (absolute perpendicular distance, unnormalised)
+            local cross = math.abs(dx * vy - dy * vx)
+
+            if forward >= AIM_MIN_FORWARD and cross <= cross_thresh then
+                -- Score by inverse distance: closer targets give higher reward
+                local dist = math.sqrt(dx * dx + dy * dy)
+                local score = clamp01(1.0 - dist / 32768.0)
+                if score > best_score then
+                    best_score = score
+                end
+            end
+        end
+    end
+    return best_score
+end
+
+local function compute_evasion_reward(move_cmd, px16, py16, enemy_x16, enemy_y16, enemy_dist_norm)
+    -- Returns 0..1 evasion score: reward for moving away from nearest enemy when close.
+    if move_cmd == nil or move_cmd < 0 or move_cmd > 7 then
+        return 0.0
+    end
+    if px16 == nil or py16 == nil or enemy_x16 == nil or enemy_y16 == nil then
+        return 0.0
+    end
+    if enemy_dist_norm == nil or enemy_dist_norm > EVADE_DANGER_NORM then
+        return 0.0  -- not in danger zone, no evasion reward
+    end
+
+    local vec = MOVE_DIR_VEC[move_cmd]
+    if vec == nil then return 0.0 end
+
+    -- Flee vector: from enemy toward player (direction we WANT to move)
+    local flee_x = px16 - enemy_x16
+    local flee_y = py16 - enemy_y16
+    local flee_len = math.sqrt(flee_x * flee_x + flee_y * flee_y)
+    if flee_len < 1.0 then return 0.0 end
+
+    -- Normalise flee vector
+    flee_x = flee_x / flee_len
+    flee_y = flee_y / flee_len
+
+    -- Dot product with move direction (move vecs are already unit/sqrt2)
+    local dot = vec[1] * flee_x + vec[2] * flee_y
+    -- dot ranges from -1.414 to +1.414 for diagonals; normalise to 0..1
+    local score = clamp01(dot / 1.414)
+
+    -- Scale by proximity: closer = more reward for correct evasion
+    local proximity = clamp01(1.0 - enemy_dist_norm / EVADE_DANGER_NORM)
+    return score * proximity
 end
 
 local function read_player_position(memory)
@@ -637,6 +748,8 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
                 nearest_human_dist = nd
             elseif nearest_enemy_dist == nil or nd < nearest_enemy_dist then
                 nearest_enemy_dist = nd
+                nearest_enemy_x16 = bucket[1].x16
+                nearest_enemy_y16 = bucket[1].y16
             end
         end
     end
@@ -646,7 +759,7 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
     hud_player_x16 = player_x16
     hud_player_y16 = player_y16
 
-    return features, nearest_enemy_dist, nearest_human_dist
+    return features, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16
 end
 
 -- ── Debug HUD: draw entity category letters on the MAME screen ──────────
@@ -1229,7 +1342,7 @@ local function frame_callback()
     end
     trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d xv=%d yv=%d", player_x16 or 0, player_y16 or 0, player_xv or 0, player_yv or 0))
 
-    local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist = pcall(
+    local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16 = pcall(
         extract_typed_entities, mem, player_x16, player_y16, enemy_state
     )
     if not ok_entities then
@@ -1256,8 +1369,15 @@ local function frame_callback()
 
     local spacing_score = enemy_spacing_score(nearest_enemy_dist)
     local rescue_score = human_proximity_score(nearest_human_dist)
+    local aim_score = compute_aim_reward(prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects)
+    local evade_score = compute_evasion_reward(prev_move_cmd, prev_aim_px16, prev_aim_py16,
+        prev_nearest_enemy_x16, prev_nearest_enemy_y16, prev_nearest_enemy_dist)
     local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
-    local subj_reward = survival_bonus + (spacing_score * SUBJ_ENEMY_WEIGHT) + (rescue_score * SUBJ_HUMAN_WEIGHT)
+    local subj_reward = survival_bonus
+        + (spacing_score * SUBJ_ENEMY_WEIGHT)
+        + (rescue_score * SUBJ_HUMAN_WEIGHT)
+        + (aim_score * SUBJ_AIM_WEIGHT)
+        + (evade_score * SUBJ_EVADE_WEIGHT)
     if done then
         subj_reward = subj_reward - SUBJ_DEATH_PENALTY
     end
@@ -1342,6 +1462,19 @@ local function frame_callback()
 
     previous_player_alive = player_alive
     previous_score = score
+
+    -- Stash aim-reward data for use on the NEXT frame (reward for this frame's action).
+    prev_fire_cmd = fire_cmd
+    prev_move_cmd = move_cmd
+    prev_aim_objects = hud_objects   -- reuse the same reference (set in extract_typed_entities)
+    prev_aim_px16 = player_x16
+    prev_aim_py16 = player_y16
+    prev_nearest_enemy_x16 = nearest_enemy_x16
+    prev_nearest_enemy_y16 = nearest_enemy_y16
+    prev_nearest_enemy_dist = nearest_enemy_dist
+
+    -- Draw debug HUD overlay (entity letters on screen)
+    draw_debug_hud()
 
     trace_log(frame_counter, "frame_end", "done=" .. tostring(done))
     frame_counter = frame_counter + 1
