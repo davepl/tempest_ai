@@ -871,9 +871,9 @@ local function draw_debug_hud()
     if hud_player_x16 and hud_player_y16 then
         local px = ((hud_player_x16 >> 8) & 0xFF) * 2
         local py = (hud_player_y16 >> 8) & 0xFF
-        -- Player X is doubled on screen; use known player sprite 5×13
-        local prx = (5 + PAD) * 2   -- 14  (doubled for screen X scaling)
-        local pry = math.floor((13 + PAD) / 2)  -- 7
+        -- Use known player sprite 5×13
+        local prx = 5 + PAD
+        local pry = math.floor((13 + PAD) / 2)
         pcall(function() draw_diamond(px, py, prx, pry, HUD_PLAYER_COLOR) end)
     end
 
@@ -885,10 +885,10 @@ local function draw_debug_hud()
                 if color then
                     local sx = ((obj.x16 >> 8) & 0xFF) * 2
                     local sy = (obj.y16 >> 8) & 0xFF
-                    -- Size diamond to sprite: width is doubled on screen
+                    -- Size diamond to sprite dimensions
                     local w = math.max(obj.width or 4, 4)
                     local h = math.max(obj.height or 4, 4)
-                    local rx = (w + PAD) * 2               -- X is 2× on screen
+                    local rx = w + PAD
                     local ry = math.floor((h + PAD) / 2)
                     pcall(function() draw_diamond(sx, sy, rx, ry, color) end)
                     -- Distance rank number just below the diamond
