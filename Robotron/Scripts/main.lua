@@ -652,36 +652,64 @@ end
 -- ── Debug HUD: draw entity category letters on the MAME screen ──────────
 
 local CAT_HUD = {
-    grunt      = { ch = "g", fg = 0xFFFF4444 },
-    hulk       = { ch = "H", fg = 0xFFFF8800 },
-    brain      = { ch = "B", fg = 0xFFFF00FF },
-    tank       = { ch = "T", fg = 0xFFFFFF00 },
-    spawner    = { ch = "S", fg = 0xFF00FFFF },
-    enforcer   = { ch = "E", fg = 0xFF8888FF },
-    projectile = { ch = "!", fg = 0xFFFF0000 },
-    human      = { ch = "*", fg = 0xFF44FF44 },
-    electrode  = { ch = "+", fg = 0xFF888888 },
+    grunt      = { ch = "g", fg = 0xFFFFFFFF },   -- white
+    hulk       = { ch = "H", fg = 0xFF00FFFF },   -- cyan
+    brain      = { ch = "B", fg = 0xFFFFFF00 },   -- yellow
+    tank       = { ch = "T", fg = 0xFF00FF00 },   -- green
+    spawner    = { ch = "S", fg = 0xFFFF80FF },   -- pink
+    enforcer   = { ch = "E", fg = 0xFFFFAA00 },   -- orange
+    projectile = { ch = "!", fg = 0xFF00FFFF },   -- cyan
+    human      = { ch = "HUM", fg = 0xFFFFFFFF }, -- white
+    electrode  = { ch = "+", fg = 0xFFFFFF00 },   -- yellow
 }
 
 local function draw_debug_hud()
+    -- Called from emu.register_frame_done so we paint AFTER the game renders.
     if not DEBUG_HUD_ENABLED then return end
+
+    -- Lazy-init: grab the screen device on first use.
     if not mame_screen then
-        -- Lazy-init: grab the screen device on first use.
         local ok, s = pcall(function()
             return manager.machine.screens[":screen"]
         end)
         if ok and s then
             mame_screen = s
+            print("[HUD] Screen device acquired: :screen")
         else
-            return
+            -- Try iterating all screens as a fallback.
+            local ok2, s2 = pcall(function()
+                for tag, scr in pairs(manager.machine.screens) do
+                    print("[HUD] Found screen: " .. tostring(tag))
+                    return scr
+                end
+            end)
+            if ok2 and s2 then
+                mame_screen = s2
+                print("[HUD] Screen device acquired via fallback")
+            else
+                return
+            end
         end
+    end
+
+    -- Always draw "HUD ACTIVE" banner at top-centre so we know painting works.
+    local ok_banner, banner_err = pcall(function()
+        mame_screen:draw_text("center", 0, "HUD ACTIVE", 0xFF00FF00, 0xC0000000)
+    end)
+    if not ok_banner then
+        -- Some MAME versions don't support "center"; use manual X.
+        pcall(function()
+            mame_screen:draw_text(100, 0, "HUD ACTIVE", 0xFF00FF00, 0xC0000000)
+        end)
     end
 
     -- Player marker
     if hud_player_x16 and hud_player_y16 then
-        local px = (hud_player_x16 >> 8) & 0xFF
+        local px = ((hud_player_x16 >> 8) & 0xFF) * 2
         local py = (hud_player_y16 >> 8) & 0xFF
-        mame_screen:draw_text(px - 3, py - 4, "P", 0xFFFFFFFF, 0x80000080)
+        pcall(function()
+            mame_screen:draw_text(px - 3, py - 4, "P", 0xFFFFFFFF, 0x80000080)
+        end)
     end
 
     -- Entity markers
@@ -690,9 +718,11 @@ local function draw_debug_hud()
             if obj.category and obj.category ~= "skip" then
                 local info = CAT_HUD[obj.category]
                 if info then
-                    local sx = (obj.x16 >> 8) & 0xFF
+                    local sx = ((obj.x16 >> 8) & 0xFF) * 2
                     local sy = (obj.y16 >> 8) & 0xFF
-                    mame_screen:draw_text(sx - 3, sy - 4, info.ch, info.fg, 0x00000000)
+                    pcall(function()
+                        mame_screen:draw_text(sx - 3, sy - 4, info.ch, info.fg, 0x00000000)
+                    end)
                 end
             end
         end
@@ -1313,9 +1343,6 @@ local function frame_callback()
     previous_player_alive = player_alive
     previous_score = score
 
-    -- Draw debug HUD overlay (entity letters on screen)
-    draw_debug_hud()
-
     trace_log(frame_counter, "frame_end", "done=" .. tostring(done))
     frame_counter = frame_counter + 1
 
@@ -1349,6 +1376,11 @@ previous_player_alive = (read_player_alive(mem) ~= 0) and 1 or 0
 previous_score = math.max(0, math.floor(read_player_score(mem) or 0))
 
 global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
+
+-- Register HUD drawing AFTER video rendering so our overlay is not overwritten.
+emu.register_frame_done(draw_debug_hud)
+print("[HUD] Registered frame_done callback for debug overlay")
+
 emu.add_machine_stop_notifier(on_mame_exit)
 
 print("Robotron AI Lua script initialized.")
