@@ -857,18 +857,24 @@ local function draw_debug_hud()
     local r = HUD_RING_RADIUS
 
     -- Helper: draw a diamond (4 lines) to approximate a circle outline.
-    local function draw_diamond(cx, cy, rad, color)
-        mame_screen:draw_line(cx, cy - rad, cx + rad, cy, color)   -- top to right
-        mame_screen:draw_line(cx + rad, cy, cx, cy + rad, color)   -- right to bottom
-        mame_screen:draw_line(cx, cy + rad, cx - rad, cy, color)   -- bottom to left
-        mame_screen:draw_line(cx - rad, cy, cx, cy - rad, color)   -- left to top
+    -- Draw a diamond with separate horizontal/vertical radii to match sprite aspect ratio.
+    local function draw_diamond(cx, cy, rx, ry, color)
+        mame_screen:draw_line(cx, cy - ry, cx + rx, cy, color)   -- top to right
+        mame_screen:draw_line(cx + rx, cy, cx, cy + ry, color)   -- right to bottom
+        mame_screen:draw_line(cx, cy + ry, cx - rx, cy, color)   -- bottom to left
+        mame_screen:draw_line(cx - rx, cy, cx, cy - ry, color)   -- left to top
     end
 
-    -- Player ring
+    local PAD = 2   -- extra pixels of clearance around the sprite
+
+    -- Player ring (player sprite is roughly 5×13 pixels)
     if hud_player_x16 and hud_player_y16 then
         local px = ((hud_player_x16 >> 8) & 0xFF) * 2
         local py = (hud_player_y16 >> 8) & 0xFF
-        pcall(function() draw_diamond(px, py, r, HUD_PLAYER_COLOR) end)
+        -- Player X is doubled on screen; use known player sprite 5×13
+        local prx = (5 + PAD) * 2   -- 14  (doubled for screen X scaling)
+        local pry = math.floor((13 + PAD) / 2)  -- 7
+        pcall(function() draw_diamond(px, py, prx, pry, HUD_PLAYER_COLOR) end)
     end
 
     -- Entity rings + rank numbers
@@ -879,11 +885,16 @@ local function draw_debug_hud()
                 if color then
                     local sx = ((obj.x16 >> 8) & 0xFF) * 2
                     local sy = (obj.y16 >> 8) & 0xFF
-                    pcall(function() draw_diamond(sx, sy, r, color) end)
+                    -- Size diamond to sprite: width is doubled on screen
+                    local w = math.max(obj.width or 4, 4)
+                    local h = math.max(obj.height or 4, 4)
+                    local rx = (w + PAD) * 2               -- X is 2× on screen
+                    local ry = math.floor((h + PAD) / 2)
+                    pcall(function() draw_diamond(sx, sy, rx, ry, color) end)
                     -- Distance rank number just below the diamond
                     if obj.rank then
                         pcall(function()
-                            mame_screen:draw_text(sx - 3, sy + r + 1,
+                            mame_screen:draw_text(sx - 3, sy + ry + 1,
                                                   tostring(obj.rank), color, 0x00000000)
                         end)
                     end
