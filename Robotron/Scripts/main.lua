@@ -2,18 +2,30 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a 319-value state vector:
+      - Sends a 644-value state vector:
         5 core stats (alive, score, replay, lasers, wave)
         + 2 player position (x16, y16)
+        + 2 player velocity (xv, yv)
         + 50 ELIST enemy state bytes
-        + 4 active lists (OPTR/HPTR/RPTR/PPTR) × 65 features each
+        + 9 per-type entity categories, each: 1 occupancy + N slots × 4 features
+          Per-slot features: present, x, y, distance
+          Slots sorted by distance to player (nearest first).
       - Receives dual 8-way joystick commands: movement_dir, firing_dir
-    
-    Active object lists extracted:
-      - OPTR (0x9817): motion objects - enforcers, sparks, circles, squares, shells, player lasers
-      - HPTR (0x981F): humans - mom, dad, kid
-      - RPTR (0x9821): robots - grunts, brains, hulks, tanks, progs, cruise missiles
-      - PPTR (0x9823): fatal obstacles - electrodes
+
+    Entity categories (type is implicit in category position):
+      0. grunt      (40 slots) - grunts                          peak 80
+      1. hulk       (16 slots) - indestructible hulks             peak 25
+      2. brain      (16 slots) - brains                          peak 25
+      3. tank       ( 8 slots) - tanks (growing + full)          peak ~14
+      4. spawner    ( 8 slots) - circles, squares/quarks         peak 14
+      5. enforcer   (12 slots) - enforcers                       peak ~10
+      6. projectile (12 slots) - sparks, shells, cruise, progs
+      7. human      (16 slots) - mom, dad, kid                   peak 30
+      8. electrode  (16 slots) - electrodes/posts                peak 25
+
+    Entity type is determined by OCVECT (collision handler address at
+    object offset $08), which is stable for an entity's lifetime and
+    unique per type.  Classification is auto-discovered at runtime.
 --]]
 
 local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "127.0.0.1:9998"
@@ -115,11 +127,10 @@ local OBJY_OFF = 0x05
 local OX16_OFF = 0x0A
 local OY16_OFF = 0x0C
 
--- Fixed-size state encoding for linked lists (stable for learning).
-local LIST_SLOT_COUNT = 16
-local LIST_FEATURES_PER_SLOT = 4 -- present, x, y, type_ptr_norm
 local MAX_LIST_WALK = 256
+local OCVECT_OFF = 0x08  -- collision routine address (stable per entity type)
 
+-- Object list head pointers (used to walk linked lists).
 local ACTIVE_LISTS = {
     {name = "optr", addr = OPTR_ADDR},   -- motion objects: enforcers, sparks, circles, squares, shells, lasers
     {name = "hptr", addr = HPTR_ADDR},   -- humans: mom, dad, kid
@@ -127,13 +138,32 @@ local ACTIVE_LISTS = {
     {name = "pptr", addr = PPTR_ADDR},   -- fatal: electrodes
 }
 
-local EXPECTED_LIST_FEATURES_PER_LIST = 1 + (LIST_SLOT_COUNT * LIST_FEATURES_PER_SLOT)
--- State vector: 5 core + 2 player pos + 2 player vel + 50 ELIST + 4 lists × 65 = 319 floats
-local EXPECTED_STATE_VALUES = 9 + ZP1ENM_SIZE + (#ACTIVE_LISTS * EXPECTED_LIST_FEATURES_PER_LIST)
-local CANONICAL_TYPE_BACKTRACK_STEPS = 8
+-- Per-type entity categories.  Order MUST match Python config/aimodel.py.
+local ENTITY_CATEGORIES = {
+    {name = "grunt",      slots = 40},
+    {name = "hulk",       slots = 16},
+    {name = "brain",      slots = 16},
+    {name = "tank",       slots =  8},
+    {name = "spawner",    slots =  8},
+    {name = "enforcer",   slots = 12},
+    {name = "projectile", slots = 12},
+    {name = "human",      slots = 16},
+    {name = "electrode",  slots = 16},
+}
+local ENTITY_FEATURES_PER_SLOT = 4          -- present, x, y, distance
+local ENTITY_TOTAL_SLOTS = 0
+local ENTITY_TOTAL_FEATURES = 0
+for _, cat in ipairs(ENTITY_CATEGORIES) do
+    ENTITY_TOTAL_SLOTS = ENTITY_TOTAL_SLOTS + cat.slots
+    ENTITY_TOTAL_FEATURES = ENTITY_TOTAL_FEATURES + 1 + cat.slots * ENTITY_FEATURES_PER_SLOT
+end
+-- State vector: 9 core + 50 ELIST + entity features (585) = 644 floats
+local EXPECTED_STATE_VALUES = 9 + ZP1ENM_SIZE + ENTITY_TOTAL_FEATURES
 
--- Cache canonicalized descriptor pointers to avoid repeated probe reads.
-local canonical_type_cache = {}
+-- OCVECT-based entity classification (auto-discovered at runtime).
+local ocvect_category_cache = {}       -- OCVECT address → category name | "skip"
+local discovered_tank_ocvect = nil     -- TNKIL address once discovered via growing phase
+local unresolved_7x16 = {}             -- {[ocvect] = true} for ambiguous 7×16 on RPTR
 
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
@@ -290,62 +320,7 @@ local function read_player_position(memory)
     return px16, py16, pxv, pyv
 end
 
-local function is_probable_object_descriptor(memory, addr)
-    if addr == nil then
-        return false
-    end
-    local a = addr & 0xFFFF
-    if a > 0xFFFB then
-        return false
-    end
-
-    local base_pic_ptr = read_u16_be(memory, a)
-    local image_count = memory:read_u8(a + 2)
-    local bytes_per = memory:read_u8(a + 3)
-
-    if base_pic_ptr == 0 then
-        return false
-    end
-    if image_count < 1 or image_count > 64 then
-        return false
-    end
-    -- Robotron object descriptors are predominantly 4-byte entries; tanks use 6.
-    if bytes_per ~= 4 and bytes_per ~= 6 then
-        return false
-    end
-    return true
-end
-
-local function canonicalize_object_type_ptr(memory, pict_ptr)
-    local p = (pict_ptr or 0) & 0xFFFF
-    if p == 0 then
-        return 0
-    end
-
-    local cached = canonical_type_cache[p]
-    if cached ~= nil then
-        return cached
-    end
-
-    -- First try exact pointer; if animated frame pointers are in use, walk backward
-    -- in 4-byte steps to find the stable descriptor header.
-    if is_probable_object_descriptor(memory, p) then
-        canonical_type_cache[p] = p
-        return p
-    end
-    for i = 1, CANONICAL_TYPE_BACKTRACK_STEPS do
-        local cand = (p - (i * 4)) & 0xFFFF
-        if is_probable_object_descriptor(memory, cand) then
-            canonical_type_cache[p] = cand
-            return cand
-        end
-    end
-
-    -- Fallback: 4-byte alignment still removes some frame-pointer jitter.
-    local aligned = p & 0xFFFC
-    canonical_type_cache[p] = aligned
-    return aligned
-end
+-- ── Per-Type Entity Classification ──────────────────────────────────────
 
 local function is_valid_object_ptr(ptr)
     if ptr == nil or ptr == 0 then
@@ -357,74 +332,309 @@ local function is_valid_object_ptr(ptr)
     return ((ptr - OLIST_START) % OLIST_ENTRY_SIZE) == 0
 end
 
-local function extract_list_state(memory, head_addr, player_x16, player_y16)
-    local objects = {}
-    local seen = {}
-    local ptr = read_u16_be(memory, head_addr)
-    local steps = 0
-    local nearest_dist_norm = nil
+local function classify_by_heuristic(list_name, width, height)
+    -- Classify an unknown OCVECT by list membership + picture dimensions.
+    -- Returns category name, "skip" (player laser), or nil (ambiguous 7×16).
+    if list_name == "pptr" then return "electrode" end
+    if list_name == "hptr" then return "human" end
 
-    while ptr ~= 0 and steps < MAX_LIST_WALK do
-        if seen[ptr] then
-            break
+    if list_name == "rptr" then
+        if width == 5 and height == 13 then return "grunt" end
+        if width == 3 and height == 4 then return "projectile" end   -- cruise missile
+        -- Growing tank phases: 2×4, 4×7, 4×8, 6×12
+        if (width == 2 and height == 4) or
+           (width == 4 and (height == 7 or height == 8)) or
+           (width == 6 and height == 12) then
+            return "tank"
         end
-        seen[ptr] = true
-        steps = steps + 1
+        if width == 7 and height == 16 then return nil end  -- hulk/brain/tank: ambiguous
+        return "projectile"  -- prog or other unknown RPTR object
+    end
 
-        if not is_valid_object_ptr(ptr) then
-            break
+    if list_name == "optr" then
+        if width <= 3 and height <= 6 then return "skip" end   -- player laser
+        if width == 8 and height == 15 then return "spawner" end
+        if width == 4 and height == 7 then return "projectile" end  -- spark / shell
+        return "enforcer"  -- growing or full enforcer
+    end
+
+    return "skip"
+end
+
+local function try_resolve_7x16(all_objects, enemy_state)
+    -- Try to resolve ambiguous 7×16 RPTR objects (hulk / brain / tank)
+    -- by matching per-OCVECT counts to ELIST counters.
+    -- Returns true if any new assignments were made.
+
+    -- Count 7×16 objects on RPTR grouped by OCVECT (excluding already-resolved)
+    local ocv_counts = {}
+    for _, obj in ipairs(all_objects) do
+        if obj.list_name == "rptr" and obj.width == 7 and obj.height == 16
+           and unresolved_7x16[obj.ocvect] then
+            ocv_counts[obj.ocvect] = (ocv_counts[obj.ocvect] or 0) + 1
         end
+    end
 
-        local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
-        local canonical_type_ptr = canonicalize_object_type_ptr(memory, pict_ptr)
-        local x16 = u16_to_i16(read_u16_be(memory, ptr + OX16_OFF))
-        local y16 = u16_to_i16(read_u16_be(memory, ptr + OY16_OFF))
-        local objx = memory:read_u8(ptr + OBJX_OFF)
-        local objy = memory:read_u8(ptr + OBJY_OFF)
-        if player_x16 ~= nil and player_y16 ~= nil then
-            local dnorm = dist_norm_i16(player_x16, player_y16, x16, y16)
-            if nearest_dist_norm == nil or dnorm < nearest_dist_norm then
-                nearest_dist_norm = dnorm
+    -- Exclude already-discovered tank OCVECT
+    local candidates = {}
+    for ocv, count in pairs(ocv_counts) do
+        if ocv ~= discovered_tank_ocvect then
+            candidates[#candidates + 1] = {ocvect = ocv, count = count}
+        else
+            -- This 7×16 is actually a full-grown tank
+            ocvect_category_cache[ocv] = "tank"
+            unresolved_7x16[ocv] = nil
+            print(string.format("[DISCOVERY] OCVECT 0x%04X → tank (matches growing-tank OCVECT)", ocv))
+        end
+    end
+
+    if #candidates == 0 then return false end
+
+    local hlkcnt = enemy_state.hlkcnt or 0
+    local brncnt = enemy_state.brncnt or 0
+    local tnkcnt = enemy_state.tnkcnt or 0
+
+    local changed = false
+
+    -- Fast path: if only one type of 7x16 enemy is present this wave,
+    -- we can resolve all candidates directly.
+    local only_hulks  = (hlkcnt > 0 and brncnt == 0 and tnkcnt == 0)
+    local only_brains = (brncnt > 0 and hlkcnt == 0 and tnkcnt == 0)
+    if only_hulks then
+        for _, c in ipairs(candidates) do
+            ocvect_category_cache[c.ocvect] = "hulk"
+            unresolved_7x16[c.ocvect] = nil
+            print(string.format("[DISCOVERY] OCVECT 0x%04X → hulk (only hulks this wave, HLKCNT=%d)", c.ocvect, hlkcnt))
+        end
+        return true
+    end
+    if only_brains then
+        for _, c in ipairs(candidates) do
+            ocvect_category_cache[c.ocvect] = "brain"
+            unresolved_7x16[c.ocvect] = nil
+            print(string.format("[DISCOVERY] OCVECT 0x%04X → brain (only brains this wave, BRNCNT=%d)", c.ocvect, brncnt))
+        end
+        return true
+    end
+
+    -- General case: try to match individual candidate counts to ELIST counters.
+    -- Build a set of unresolved total to compare against.
+    local total_unresolved = 0
+    for _, c in ipairs(candidates) do
+        total_unresolved = total_unresolved + c.count
+    end
+
+    if #candidates == 1 then
+        local c = candidates[1]
+        if c.count == hlkcnt and (brncnt == 0 or c.count ~= brncnt) then
+            ocvect_category_cache[c.ocvect] = "hulk"
+            unresolved_7x16[c.ocvect] = nil
+            print(string.format("[DISCOVERY] OCVECT 0x%04X → hulk (count=%d matches HLKCNT)", c.ocvect, c.count))
+            changed = true
+        elseif c.count == brncnt and (hlkcnt == 0 or c.count ~= hlkcnt) then
+            ocvect_category_cache[c.ocvect] = "brain"
+            unresolved_7x16[c.ocvect] = nil
+            print(string.format("[DISCOVERY] OCVECT 0x%04X → brain (count=%d matches BRNCNT)", c.ocvect, c.count))
+            changed = true
+        elseif c.count == tnkcnt and (hlkcnt == 0 or c.count ~= tnkcnt) and (brncnt == 0 or c.count ~= tnkcnt) then
+            ocvect_category_cache[c.ocvect] = "tank"
+            unresolved_7x16[c.ocvect] = nil
+            print(string.format("[DISCOVERY] OCVECT 0x%04X → tank (count=%d matches TNKCNT)", c.ocvect, c.count))
+            changed = true
+        end
+    elseif #candidates == 2 then
+        local a, b = candidates[1], candidates[2]
+        -- Try all permutations of (hulk, brain, tank) for 2 candidates.
+        local function try_assign(c1, type1, cnt1, c2, type2, cnt2)
+            if c1.count == cnt1 and c2.count == cnt2 then
+                ocvect_category_cache[c1.ocvect] = type1
+                ocvect_category_cache[c2.ocvect] = type2
+                unresolved_7x16[c1.ocvect] = nil
+                unresolved_7x16[c2.ocvect] = nil
+                print(string.format("[DISCOVERY] OCVECT 0x%04X → %s, 0x%04X → %s (count match)",
+                    c1.ocvect, type1, c2.ocvect, type2))
+                return true
+            end
+            return false
+        end
+        changed = try_assign(a, "hulk", hlkcnt, b, "brain", brncnt)
+            or try_assign(a, "brain", brncnt, b, "hulk", hlkcnt)
+            or try_assign(a, "hulk", hlkcnt, b, "tank", tnkcnt)
+            or try_assign(a, "tank", tnkcnt, b, "hulk", hlkcnt)
+            or try_assign(a, "brain", brncnt, b, "tank", tnkcnt)
+            or try_assign(a, "tank", tnkcnt, b, "brain", brncnt)
+    elseif #candidates == 3 then
+        -- Hulk + brain + tank: try matching all 6 permutations
+        local perms = {
+            {"hulk", hlkcnt, "brain", brncnt, "tank", tnkcnt},
+            {"hulk", hlkcnt, "tank", tnkcnt, "brain", brncnt},
+            {"brain", brncnt, "hulk", hlkcnt, "tank", tnkcnt},
+            {"brain", brncnt, "tank", tnkcnt, "hulk", hlkcnt},
+            {"tank", tnkcnt, "hulk", hlkcnt, "brain", brncnt},
+            {"tank", tnkcnt, "brain", brncnt, "hulk", hlkcnt},
+        }
+        local a, b, c = candidates[1], candidates[2], candidates[3]
+        for _, p in ipairs(perms) do
+            if a.count == p[2] and b.count == p[4] and c.count == p[6] then
+                ocvect_category_cache[a.ocvect] = p[1]
+                ocvect_category_cache[b.ocvect] = p[3]
+                ocvect_category_cache[c.ocvect] = p[5]
+                unresolved_7x16[a.ocvect] = nil
+                unresolved_7x16[b.ocvect] = nil
+                unresolved_7x16[c.ocvect] = nil
+                print(string.format("[DISCOVERY] OCVECT 0x%04X → %s, 0x%04X → %s, 0x%04X → %s (count match)",
+                    a.ocvect, p[1], b.ocvect, p[3], c.ocvect, p[5]))
+                changed = true
+                break
             end
         end
-        objects[#objects + 1] = {
-            obj_addr = ptr,
-            pict_ptr = pict_ptr,
-            canonical_type_ptr = canonical_type_ptr,
-            x16 = x16,
-            y16 = y16,
-            objx = objx,
-            objy = objy,
-        }
-
-        ptr = read_u16_be(memory, ptr + OLINK_OFF)
     end
 
-    table.sort(objects, function(a, b)
-        return a.obj_addr < b.obj_addr
-    end)
+    return changed
+end
 
-    local features = {}
-    features[#features + 1] = math.min(1.0, (#objects / LIST_SLOT_COUNT))
+local function extract_typed_entities(memory, player_x16, player_y16, enemy_state)
+    -- Walk all 4 linked lists, classify each object by OCVECT into 9 typed
+    -- categories, sort each by distance, and produce a flat feature vector.
 
-    for i = 1, LIST_SLOT_COUNT do
-        local obj = objects[i]
-        if obj then
-            features[#features + 1] = 1.0
-            -- Use true 16-bit world coordinates from OX16/OY16 (RRF.ASM).
-            features[#features + 1] = norm_i16(obj.x16)
-            features[#features + 1] = norm_i16(obj.y16)
-            -- Canonical object-type signal anchored to descriptor base, not raw frame pointer.
-            features[#features + 1] = (obj.canonical_type_ptr or 0) / 65535.0
-        else
-            features[#features + 1] = 0.0
-            features[#features + 1] = 0.0
-            features[#features + 1] = 0.0
-            features[#features + 1] = 0.0
+    -- Phase 1: collect raw objects ------------------------------------------
+    local all_objects = {}
+    for _, list_def in ipairs(ACTIVE_LISTS) do
+        local ptr = read_u16_be(memory, list_def.addr)
+        local seen = {}
+        local steps = 0
+        while ptr ~= 0 and steps < MAX_LIST_WALK do
+            if seen[ptr] then break end
+            seen[ptr] = true
+            steps = steps + 1
+            if not is_valid_object_ptr(ptr) then break end
+
+            local ocvect = read_u16_be(memory, ptr + OCVECT_OFF)
+            -- Skip objects with zero OCVECT (transient/uninitialized)
+            if ocvect == 0 then
+                ptr = read_u16_be(memory, ptr + OLINK_OFF)
+            else
+
+            local x16 = u16_to_i16(read_u16_be(memory, ptr + OX16_OFF))
+            local y16 = u16_to_i16(read_u16_be(memory, ptr + OY16_OFF))
+            local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
+
+            local width, height = 0, 0
+            if pict_ptr > 0 then
+                width = memory:read_u8(pict_ptr)
+                height = memory:read_u8(pict_ptr + 1)
+            end
+
+            local dnorm = 1.0
+            if player_x16 and player_y16 then
+                dnorm = dist_norm_i16(player_x16, player_y16, x16, y16)
+            end
+
+            all_objects[#all_objects + 1] = {
+                list_name = list_def.name,
+                x16 = x16,
+                y16 = y16,
+                ocvect = ocvect,
+                width = width,
+                height = height,
+                dist_norm = dnorm,
+            }
+
+            ptr = read_u16_be(memory, ptr + OLINK_OFF)
+
+            end  -- end of ocvect ~= 0 guard
         end
     end
 
-    return features, #objects, nearest_dist_norm
+    -- Phase 2: classify each object -----------------------------------------
+    for _, obj in ipairs(all_objects) do
+        local cat = ocvect_category_cache[obj.ocvect]
+        if cat == nil then
+            cat = classify_by_heuristic(obj.list_name, obj.width, obj.height)
+            if cat ~= nil then
+                ocvect_category_cache[obj.ocvect] = cat
+                if cat == "tank" and obj.width ~= 7 then
+                    discovered_tank_ocvect = obj.ocvect
+                end
+                if cat ~= "skip" then
+                    print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
+                                        obj.ocvect, cat, obj.list_name, obj.width, obj.height))
+                end
+            else
+                unresolved_7x16[obj.ocvect] = true
+            end
+        end
+        obj.category = ocvect_category_cache[obj.ocvect]
+    end
+
+    -- Phase 3: resolve pending 7×16 ambiguities -----------------------------
+    if next(unresolved_7x16) then
+        if try_resolve_7x16(all_objects, enemy_state) then
+            for _, obj in ipairs(all_objects) do
+                if obj.category == nil then
+                    obj.category = ocvect_category_cache[obj.ocvect]
+                end
+            end
+        end
+    end
+    -- Any still-unresolved 7×16 → treat as hulk (conservative: avoid)
+    for _, obj in ipairs(all_objects) do
+        if obj.category == nil and obj.list_name == "rptr" then
+            obj.category = "hulk"
+        end
+    end
+
+    -- Phase 4: bucket, sort, and build features ----------------------------
+    local buckets = {}
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        buckets[cat.name] = {}
+    end
+    for _, obj in ipairs(all_objects) do
+        if obj.category and obj.category ~= "skip" and buckets[obj.category] then
+            local bucket = buckets[obj.category]
+            bucket[#bucket + 1] = obj
+        end
+    end
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        table.sort(buckets[cat.name], function(a, b)
+            return a.dist_norm < b.dist_norm
+        end)
+    end
+
+    -- Phase 5: emit feature vector ------------------------------------------
+    local features = {}
+    local nearest_enemy_dist = nil
+    local nearest_human_dist = nil
+
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        local bucket = buckets[cat.name]
+        features[#features + 1] = math.min(1.0, #bucket / cat.slots)
+        for i = 1, cat.slots do
+            local obj = bucket[i]
+            if obj then
+                features[#features + 1] = 1.0
+                features[#features + 1] = norm_i16(obj.x16)
+                features[#features + 1] = norm_i16(obj.y16)
+                features[#features + 1] = obj.dist_norm
+            else
+                features[#features + 1] = 0.0
+                features[#features + 1] = 0.0
+                features[#features + 1] = 0.0
+                features[#features + 1] = 0.0
+            end
+        end
+        -- Track nearest distances for reward shaping
+        if #bucket > 0 then
+            local nd = bucket[1].dist_norm
+            if cat.name == "human" then
+                nearest_human_dist = nd
+            elseif nearest_enemy_dist == nil or nd < nearest_enemy_dist then
+                nearest_enemy_dist = nd
+            end
+        end
+    end
+
+    return features, nearest_enemy_dist, nearest_human_dist
 end
 
 local function initialize_mame_interface()
@@ -521,14 +731,20 @@ local function find_field_fuzzy(ioport, name_fragments)
         end
 
         -- Token-aware fallback so "right up" can match "right joystick up".
+        -- Count occurrences to avoid false positives like:
+        --   fragment="right right" matching label="move right".
         local label_words = {}
         for w in string.gmatch(ll, "%w+") do
-            label_words[w] = true
+            label_words[w] = (label_words[w] or 0) + 1
+        end
+        local frag_words = {}
+        for w in string.gmatch(ff, "%w+") do
+            frag_words[w] = (frag_words[w] or 0) + 1
         end
         local have_tokens = false
-        for w in string.gmatch(ff, "%w+") do
+        for w, count in pairs(frag_words) do
             have_tokens = true
-            if not label_words[w] then
+            if (label_words[w] or 0) < count then
                 return false
             end
         end
@@ -536,6 +752,11 @@ local function find_field_fuzzy(ioport, name_fragments)
     end
 
     local function any_match(label)
+        local ll = string.lower(label or "")
+        -- This script is strictly Player-1 control; avoid accidental P2 binds.
+        if string.find(ll, "p2", 1, true) then
+            return false
+        end
         for _, frag in ipairs(name_fragments) do
             if label_matches_fragment(label, frag) then
                 return true
@@ -573,15 +794,15 @@ local function bind_control(ioport, exact_names, fuzzy_names, tag)
     local field, label = find_field(ioport, exact_names)
     if field then
         print(string.format("Mapped %-10s => %s", tag, tostring(label)))
-        return field
+        return field, label
     end
     field, label = find_field_fuzzy(ioport, fuzzy_names)
     if field then
         print(string.format("Mapped %-10s => %s (fuzzy)", tag, tostring(label)))
-        return field
+        return field, label
     end
     print(string.format("WARN: unmapped control %-10s", tag))
-    return nil
+    return nil, nil
 end
 
 local Controls = {}
@@ -591,52 +812,52 @@ function Controls:new(mame_manager)
     local self = setmetatable({}, Controls)
     local ioport = mame_manager.machine.ioport
 
-    self.move_up = bind_control(
+    self.move_up, self.move_up_label = bind_control(
         ioport,
-        {"P1 Move Up", "P1 Left Up", "P1 Joystick Up", "P1 Left Joystick Up"},
+        {"Move Up", "P1 Move Up", "P1 Left Up", "P1 Joystick Up", "P1 Left Joystick Up", "P1 Left Stick Up"},
         {"move up", "left up", "left stick up", "joystick up"},
         "move_up"
     )
-    self.move_down = bind_control(
+    self.move_down, self.move_down_label = bind_control(
         ioport,
-        {"P1 Move Down", "P1 Left Down", "P1 Joystick Down", "P1 Left Joystick Down"},
+        {"Move Down", "P1 Move Down", "P1 Left Down", "P1 Joystick Down", "P1 Left Joystick Down", "P1 Left Stick Down"},
         {"move down", "left down", "left stick down", "joystick down"},
         "move_down"
     )
-    self.move_left = bind_control(
+    self.move_left, self.move_left_label = bind_control(
         ioport,
-        {"P1 Move Left", "P1 Left Left", "P1 Joystick Left", "P1 Left Joystick Left"},
+        {"Move Left", "P1 Move Left", "P1 Left Left", "P1 Joystick Left", "P1 Left Joystick Left", "P1 Left Stick Left"},
         {"move left", "left left", "left stick left", "joystick left"},
         "move_left"
     )
-    self.move_right = bind_control(
+    self.move_right, self.move_right_label = bind_control(
         ioport,
-        {"P1 Move Right", "P1 Left Right", "P1 Joystick Right", "P1 Left Joystick Right"},
+        {"Move Right", "P1 Move Right", "P1 Left Right", "P1 Joystick Right", "P1 Left Joystick Right", "P1 Left Stick Right"},
         {"move right", "left right", "left stick right", "joystick right"},
         "move_right"
     )
 
-    self.fire_up = bind_control(
+    self.fire_up, self.fire_up_label = bind_control(
         ioport,
-        {"P1 Fire Up", "P1 Right Up", "P1 Right Joystick Up"},
+        {"Fire Up", "P1 Fire Up", "P1 Right Up", "P1 Right Joystick Up", "P1 Right Stick Up"},
         {"fire up", "right up", "right stick up"},
         "fire_up"
     )
-    self.fire_down = bind_control(
+    self.fire_down, self.fire_down_label = bind_control(
         ioport,
-        {"P1 Fire Down", "P1 Right Down", "P1 Right Joystick Down"},
+        {"Fire Down", "P1 Fire Down", "P1 Right Down", "P1 Right Joystick Down", "P1 Right Stick Down"},
         {"fire down", "right down", "right stick down"},
         "fire_down"
     )
-    self.fire_left = bind_control(
+    self.fire_left, self.fire_left_label = bind_control(
         ioport,
-        {"P1 Fire Left", "P1 Right Left", "P1 Right Joystick Left"},
+        {"Fire Left", "P1 Fire Left", "P1 Right Left", "P1 Right Joystick Left", "P1 Right Stick Left"},
         {"fire left", "right left", "right stick left"},
         "fire_left"
     )
-    self.fire_right = bind_control(
+    self.fire_right, self.fire_right_label = bind_control(
         ioport,
-        {"P1 Fire Right", "P1 Right Right", "P1 Right Joystick Right"},
+        {"Fire Right", "P1 Fire Right", "P1 Right Right", "P1 Right Joystick Right", "P1 Right Stick Right"},
         {"fire right", "right right", "right stick right"},
         "fire_right"
     )
@@ -661,6 +882,42 @@ function Controls:new(mame_manager)
         print("  This run would generate mostly non-causal training data.")
         print("  Confirm MAME input labels for left/right sticks and update bind_control names.")
         return nil
+    end
+
+    local move_fields = {self.move_up, self.move_down, self.move_left, self.move_right}
+    local move_labels = {self.move_up_label, self.move_down_label, self.move_left_label, self.move_right_label}
+    local fire_fields = {self.fire_up, self.fire_down, self.fire_left, self.fire_right}
+    local fire_labels = {self.fire_up_label, self.fire_down_label, self.fire_left_label, self.fire_right_label}
+    local dir_names = {"up", "down", "left", "right"}
+
+    for i = 1, 4 do
+        for j = i + 1, 4 do
+            if move_fields[i] == move_fields[j] then
+                print(string.format(
+                    "FATAL: move_%s and move_%s mapped to same field (%s / %s).",
+                    dir_names[i], dir_names[j], tostring(move_labels[i]), tostring(move_labels[j])
+                ))
+                return nil
+            end
+            if fire_fields[i] == fire_fields[j] then
+                print(string.format(
+                    "FATAL: fire_%s and fire_%s mapped to same field (%s / %s).",
+                    dir_names[i], dir_names[j], tostring(fire_labels[i]), tostring(fire_labels[j])
+                ))
+                return nil
+            end
+        end
+    end
+    for i = 1, 4 do
+        for j = 1, 4 do
+            if move_fields[i] == fire_fields[j] then
+                print(string.format(
+                    "FATAL: move_%s and fire_%s share the same mapped field (%s / %s).",
+                    dir_names[i], dir_names[j], tostring(move_labels[i]), tostring(fire_labels[j])
+                ))
+                return nil
+            end
+        end
     end
 
     return self
@@ -880,24 +1137,15 @@ local function frame_callback()
     end
     trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d xv=%d yv=%d", player_x16 or 0, player_y16 or 0, player_xv or 0, player_yv or 0))
 
-    local list_state_values = {}
-    local list_counts = {}
-    local list_nearest_dist = {}
-    for _, def in ipairs(ACTIVE_LISTS) do
-        local ok_list, vals_or_err, count, nearest_dist_norm = pcall(
-            extract_list_state, mem, def.addr, player_x16, player_y16
-        )
-        if not ok_list then
-            trace_log(frame_counter, "read_list_state_error", def.name .. ": " .. tostring(vals_or_err), true)
-            return true
-        end
-        for i = 1, #vals_or_err do
-            list_state_values[#list_state_values + 1] = vals_or_err[i]
-        end
-        list_nearest_dist[def.name] = nearest_dist_norm
-        list_counts[#list_counts + 1] = string.format("%s=%d", def.name, count or 0)
+    local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist = pcall(
+        extract_typed_entities, mem, player_x16, player_y16, enemy_state
+    )
+    if not ok_entities then
+        trace_log(frame_counter, "extract_typed_entities_error", tostring(entity_features_or_err), true)
+        return true
     end
-    trace_log(frame_counter, "read_active_lists", table.concat(list_counts, " "))
+    local list_state_values = entity_features_or_err
+    trace_log(frame_counter, "extract_typed_entities", "features=" .. tostring(#list_state_values))
 
     local done = (previous_player_alive == 1 and player_alive == 0)
     local score_delta = score - previous_score
@@ -913,11 +1161,6 @@ local function frame_callback()
     else
         dead_frame_counter = 0
     end
-    local nearest_enemy_dist = list_nearest_dist.rptr
-    if list_nearest_dist.pptr ~= nil and (nearest_enemy_dist == nil or list_nearest_dist.pptr < nearest_enemy_dist) then
-        nearest_enemy_dist = list_nearest_dist.pptr
-    end
-    local nearest_human_dist = list_nearest_dist.hptr
 
     local spacing_score = enemy_spacing_score(nearest_enemy_dist)
     local rescue_score = human_proximity_score(nearest_human_dist)

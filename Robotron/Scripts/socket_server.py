@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import time, socket, select, struct, threading, traceback, queue
+import os, time, socket, select, struct, threading, traceback, queue
 import numpy as np
 from collections import deque
 
@@ -39,6 +39,12 @@ except ImportError:
     add_episode_to_dqn100k_window = add_episode_to_dqn1m_window = add_episode_to_dqn5m_window = lambda *a: None
     add_episode_to_total_windows = lambda *a: None
     add_episode_to_eplen_window = lambda *a: None
+
+_ACTION_DIAGNOSTICS = os.getenv("ROBOTRON_ACTION_DIAGNOSTICS", "").strip().lower() not in {"", "0", "false", "off", "no"}
+try:
+    _ACTION_DIAG_INTERVAL = max(500, int(os.getenv("ROBOTRON_ACTION_DIAG_INTERVAL", "5000")))
+except Exception:
+    _ACTION_DIAG_INTERVAL = 5000
 
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
@@ -258,6 +264,8 @@ class SocketServer:
                 "level_number": 0, "last_state": None, "last_action": None,
                 "last_player_alive": False,
                 "last_action_source": None, "prev_action_source": None,
+                "act_total": 0, "act_eps": 0, "act_last_diag_total": 0,
+                "act_fire_hist": [0] * 8, "act_fire_hist_eps": [0] * 8,
                 "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
@@ -463,16 +471,37 @@ class SocketServer:
                 self.metrics.increment_total_controls()
                 move_idx = fire_idx = 0
                 action_source = "none"
+                is_epsilon = False
+                epsilon = self.metrics.get_effective_epsilon()
 
                 if self.agent:
-                    epsilon = self.metrics.get_effective_epsilon()
                     t0 = time.perf_counter()
                     if self.inference_batcher is not None:
-                        move_idx, fire_idx, _ = self.inference_batcher.infer(frame.state, epsilon)
+                        move_idx, fire_idx, is_epsilon = self.inference_batcher.infer(frame.state, epsilon)
                     else:
-                        move_idx, fire_idx, _ = self.agent.act(frame.state, epsilon)
+                        move_idx, fire_idx, is_epsilon = self.agent.act(frame.state, epsilon)
                     self.metrics.add_inference_time(time.perf_counter() - t0)
                     action_source = "dqn"
+
+                cs["act_total"] = int(cs.get("act_total", 0)) + 1
+                if 0 <= int(fire_idx) <= 7:
+                    cs["act_fire_hist"][int(fire_idx)] += 1
+                if is_epsilon:
+                    cs["act_eps"] = int(cs.get("act_eps", 0)) + 1
+                    if 0 <= int(fire_idx) <= 7:
+                        cs["act_fire_hist_eps"][int(fire_idx)] += 1
+                if _ACTION_DIAGNOSTICS:
+                    last_diag = int(cs.get("act_last_diag_total", 0))
+                    total = int(cs.get("act_total", 0))
+                    if (total - last_diag) >= _ACTION_DIAG_INTERVAL:
+                        eps_used = int(cs.get("act_eps", 0))
+                        eps_rate = eps_used / max(1, total)
+                        print(
+                            f"[actdiag] client={cid} eps_eff={float(epsilon):.3f} "
+                            f"eps_used={eps_used}/{total} ({eps_rate:.1%}) "
+                            f"fire_all={cs.get('act_fire_hist')} fire_eps={cs.get('act_fire_hist_eps')}"
+                        )
+                        cs["act_last_diag_total"] = total
 
                 cs["last_state"] = frame.state
                 cs["last_action"] = (move_idx, fire_idx)

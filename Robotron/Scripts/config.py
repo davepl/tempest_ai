@@ -33,15 +33,24 @@ class ServerConfigData:
     #   + 2 player position (x16, y16)
     #   + 2 player velocity (xv, yv)
     #   + 50 ELIST enemy state bytes
-    #   + 4 active lists (OPTR, HPTR, RPTR, PPTR), each: 1 occupancy + 16 slots × 4 features = 65
-    #   = 9 + 50 + 260 = 319 floats
+    #   + 9 per-type entity categories, each: 1 occupancy + N slots × 4 features
+    #   = 9 + 50 + 585 = 644 floats
     #
-    # Active object lists:
-    #   - OPTR (0x9817): motion objects - enforcers, sparks, circles, squares, shells, player lasers
-    #   - HPTR (0x981F): humans - mom, dad, kid
-    #   - RPTR (0x9821): robots - grunts, brains, hulks, tanks, progs, cruise missiles
-    #   - PPTR (0x9823): fatal obstacles - electrodes
-    params_count: int = 319
+    # Per-slot features: present, x, y, distance_norm
+    # Type is implicit in category position (no type feature needed).
+    # Slots sorted by distance to player (nearest first).
+    #
+    # Entity categories (order matches Lua ENTITY_CATEGORIES):
+    #   0. grunt      (40 slots) - grunts                          peak 80
+    #   1. hulk       (16 slots) - indestructible hulks             peak 25
+    #   2. brain      (16 slots) - brains                          peak 25
+    #   3. tank       ( 8 slots) - tanks (growing + full)          peak ~14
+    #   4. spawner    ( 8 slots) - circles, squares/quarks         peak 14
+    #   5. enforcer   (12 slots) - enforcers                       peak ~10
+    #   6. projectile (12 slots) - sparks, shells, cruise, progs
+    #   7. human      (16 slots) - mom, dad, kid                   peak 30
+    #   8. electrode  (16 slots) - electrodes/posts                peak 25
+    params_count: int = 644
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -66,10 +75,23 @@ class RLConfigData:
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Enemy attention currently disabled for flat 317-feature state.
-    use_enemy_attention: bool = False
-    enemy_slots: int = 7
-    enemy_features: int = 6
+    # Object-slot self-attention over 4 lists × 16 slots = 64 tokens.
+    use_enemy_attention: bool = True
+    # Per-type entity categories: name, slots — matches Lua ENTITY_CATEGORIES.
+    entity_categories: list = field(default_factory=lambda: [
+        ("grunt",      40),
+        ("hulk",       16),
+        ("brain",      16),
+        ("tank",        8),
+        ("spawner",     8),
+        ("enforcer",   12),
+        ("projectile", 12),
+        ("human",      16),
+        ("electrode",  16),
+    ])
+    object_slots: int = 144             # total slots across all 9 categories
+    object_token_features: int = 4      # x, y, dist, category_id_norm
+    slot_state_features: int = 4        # present, x, y, dist (in state vector)
     attn_heads: int = 8
     attn_dim: int = 128
 

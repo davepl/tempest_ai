@@ -273,27 +273,38 @@ class RainbowNet(nn.Module):
         self.use_dueling = cfg.use_dueling
         self.num_actions = NUM_JOINT
 
-        # ── Lane-Cross-Attention Encoder ───────────────────────────────
+        # ── Object-Slot Self-Attention ──────────────────────────────────
+        # 9 per-type entity categories with variable slots, 144 tokens total.
+        # Each token gets 4 features for attention: x, y, dist, category_id_norm.
+        # Type is implicit in category position — no noisy type pointer needed.
         self.use_attn = cfg.use_enemy_attention
         attn_out_dim = 0
         if self.use_attn:
-            self.lane_features = 5    # spike, angle, player_here, sin_pos, cos_pos
-            self.enemy_slot_features = 14  # 6 decoded + seg+depth+top+toprail + Δseg+Δdepth + sin+cos pos
-            self.num_lanes = 16
-            self.num_enemy_slots = cfg.enemy_slots  # 7
+            self.num_object_slots = getattr(cfg, 'object_slots', 144)
+            self.object_token_features = getattr(cfg, 'object_token_features', 4)
+            self.slot_state_features = getattr(cfg, 'slot_state_features', 4)  # present, x, y, dist
 
-            self.lane_cross_attn = LaneCrossAttentionEncoder(
-                lane_features=self.lane_features,
-                enemy_features=self.enemy_slot_features,
+            # Category layout: (slots, category_id) — must match Lua ENTITY_CATEGORIES order.
+            cat_defs = getattr(cfg, 'entity_categories', [
+                ("grunt", 16), ("hulk", 8), ("brain", 4), ("tank", 4),
+                ("spawner", 4), ("enforcer", 8), ("projectile", 8),
+                ("human", 8), ("electrode", 8),
+            ])
+            # Pre-compute base index in state vector for each category.
+            # State: 9 core + 50 ELIST = 59, then per-category blocks.
+            self._cat_info = []   # [(base, slots, cat_id), ...]
+            offset = 59
+            for cat_id, (name, slots) in enumerate(cat_defs):
+                self._cat_info.append((offset, slots, cat_id))
+                offset += 1 + slots * self.slot_state_features
+            self._num_categories = len(cat_defs)
+
+            self.object_attn = EnemyAttention(
+                slot_features=self.object_token_features,
                 embed_dim=cfg.attn_dim,
                 num_heads=cfg.attn_heads,
             )
             attn_out_dim = cfg.attn_dim
-
-            # Pre-compute circular positional encoding for lanes
-            lane_idx = torch.arange(16, dtype=torch.float32)
-            self.register_buffer('_lane_sin_pos', torch.sin(2 * math.pi * lane_idx / 16))
-            self.register_buffer('_lane_cos_pos', torch.cos(2 * math.pi * lane_idx / 16))
 
         # ── Trunk ──────────────────────────────────────────────────────
         # Input: full state concatenated with attention output
@@ -338,86 +349,51 @@ class RainbowNet(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
                 nn.init.constant_(m.bias, 0.0)
 
-    def _build_lane_tokens(self, state: torch.Tensor):
-        """Build 16 lane tokens from flat state vector.
+    def _build_object_tokens(self, state: torch.Tensor):
+        """Build 68 object tokens from 9 per-type entity categories.
 
-        Each lane gets: [spike_height, tube_angle, player_here, sin_pos, cos_pos]
-        Returns: (B, 16, 5)
-        """
-        B = state.shape[0]
-
-        # Static per-lane features
-        spike_heights = state[:, 31:47]   # (B, 16)
-        tube_angles   = state[:, 47:63]   # (B, 16)
-
-        # Player lane indicator (one-hot)
-        player_pos_norm = state[:, 5]                                    # (B,) normalized pos/15
-        player_lane = (player_pos_norm * 15).round().long().clamp(0, 15) # (B,)
-        player_here = F.one_hot(player_lane, 16).float()                 # (B, 16)
-
-        # Circular positional encoding (pre-computed buffers)
-        lane_sin = self._lane_sin_pos.unsqueeze(0).expand(B, -1)  # (B, 16)
-        lane_cos = self._lane_cos_pos.unsqueeze(0).expand(B, -1)  # (B, 16)
-
-        # Stack: (B, 16, 5)
-        tokens = torch.stack([spike_heights, tube_angles, player_here, lane_sin, lane_cos], dim=2)
-        return tokens
-
-    def _build_enemy_tokens(self, state: torch.Tensor):
-        """Build 7 enemy tokens from flat state vector.
-
-        Each enemy gets 14 features:
-          [core_type, direction, between, moving_away, can_shoot, split,   (6 decoded)
-           seg, depth, top_seg, toprail,                                   (4 spatial)
-           Δseg, Δdepth,                                                   (2 velocity)
-           sin_pos, cos_pos]                                                (2 circular pos)
+        Each token gets 4 features: [x, y, dist, category_id_norm]
+        Slots are sorted by distance (nearest first) per category.
+        Type is implicit in category position — no noisy type pointer.
 
         Returns:
-          tokens: (B, 7, 14) — sorted by depth (nearest first, empty last)
-          mask:   (B, 7) bool — True where slot is EMPTY
+          tokens: (B, 144, 4)
+          mask:   (B, 144) bool — True where slot is EMPTY
         """
         B = state.shape[0]
         device = state.device
 
-        # Decoded info: 7 slots × 6 features at indices 86..127
-        decoded = state[:, 86:128].reshape(B, 7, 6)          # (B, 7, 6)
-        # Spatial per-slot
-        segs    = state[:, 128:135].unsqueeze(2)              # (B, 7, 1)
-        depths  = state[:, 135:142].unsqueeze(2)              # (B, 7, 1)
-        tops    = state[:, 142:149].unsqueeze(2)              # (B, 7, 1)
-        toprail = state[:, 171:178].unsqueeze(2)              # (B, 7, 1)
-        # Velocity per-slot (new state indices 181-194)
-        delta_seg   = state[:, 181:188].unsqueeze(2)          # (B, 7, 1)
-        delta_depth = state[:, 188:195].unsqueeze(2)          # (B, 7, 1)
+        all_tokens = []
+        all_masks = []
 
-        # Circular positional encoding for enemy absolute position
-        player_pos_norm = state[:, 5]                          # (B,)
-        enemy_rel_seg   = state[:, 128:135]                    # (B, 7) normalised [-1, 1]
-        # enemy_abs ≈ (player * 15 + enemy_rel * 15) mod 16 → fraction around circle
-        enemy_abs_raw  = player_pos_norm.unsqueeze(1) * 15 + enemy_rel_seg * 15  # (B, 7)
-        enemy_abs_frac = torch.remainder(enemy_abs_raw, 16.0) / 16.0             # (B, 7) ∈ [0, 1)
-        enemy_sin = torch.sin(2 * math.pi * enemy_abs_frac).unsqueeze(2)         # (B, 7, 1)
-        enemy_cos = torch.cos(2 * math.pi * enemy_abs_frac).unsqueeze(2)         # (B, 7, 1)
+        for base, slots, cat_id in self._cat_info:
+            # Each category: [occupancy, slot0_present, slot0_x, slot0_y, slot0_dist, ...]
+            # Skip occupancy (+1), extract slots × 4 state features
+            slot_data = state[:, base + 1 : base + 1 + slots * self.slot_state_features]
+            slot_data = slot_data.reshape(B, slots, self.slot_state_features)  # (B, slots, 4)
 
-        # Concatenate all 14 features
-        tokens = torch.cat([decoded, segs, depths, tops, toprail,
-                            delta_seg, delta_depth, enemy_sin, enemy_cos], dim=2)  # (B, 7, 14)
+            present = slot_data[:, :, 0]            # (B, slots) — used as mask
+            x       = slot_data[:, :, 1:2]          # (B, slots, 1)
+            y       = slot_data[:, :, 2:3]          # (B, slots, 1)
+            dist    = slot_data[:, :, 3:4]          # (B, slots, 1)
 
-        # Empty mask: depth ≈ 0 → inactive slot
-        depth_vals = state[:, 135:142]                         # (B, 7)
-        empty = (depth_vals < 1e-6)                            # (B, 7) True = empty
+            # Category identity as normalised scalar
+            cat_norm = torch.full((B, slots, 1),
+                                  cat_id / max(1, self._num_categories - 1),
+                                  device=device, dtype=state.dtype)
 
-        # Sort by depth: nearest first, empty slots last
-        sort_key = torch.where(empty, torch.tensor(2.0, device=device), depth_vals)
-        order = sort_key.argsort(dim=1)
-        order_exp = order.unsqueeze(2).expand_as(tokens)
-        tokens = torch.gather(tokens, 1, order_exp)
-        empty  = torch.gather(empty,  1, order)
+            tokens = torch.cat([x, y, dist, cat_norm], dim=2)  # (B, slots, 4)
+            all_tokens.append(tokens)
+            all_masks.append(present < 0.5)  # True = empty slot
 
-        # If ALL empty (e.g. between rounds), unmask all to avoid NaN
-        all_empty = empty.all(dim=1, keepdim=True)
-        empty = empty & ~all_empty
-        return tokens, empty
+        tokens = torch.cat(all_tokens, dim=1)   # (B, 144, 4)
+        mask = torch.cat(all_masks, dim=1)       # (B, 144)
+
+        # If ALL slots empty (e.g. between waves), unmask all to avoid NaN
+        all_empty = mask.all(dim=1, keepdim=True)
+        mask = mask & ~all_empty
+
+        return tokens, mask
 
     def forward(self, state: torch.Tensor, log: bool = False):
         """
@@ -427,11 +403,10 @@ class RainbowNet(nn.Module):
         """
         B = state.shape[0]
 
-        # Lane-Cross-Attention
+        # Object-slot self-attention
         if self.use_attn:
-            lane_tokens = self._build_lane_tokens(state)                    # (B, 16, 5)
-            enemy_tokens, enemy_mask = self._build_enemy_tokens(state)      # (B, 7, 14), (B, 7)
-            attn_out = self.lane_cross_attn(lane_tokens, enemy_tokens, enemy_mask)  # (B, D)
+            obj_tokens, obj_mask = self._build_object_tokens(state)  # (B, 144, 4), (B, 144)
+            attn_out = self.object_attn(obj_tokens, obj_mask)       # (B, attn_dim)
             trunk_in = torch.cat([state, attn_out], dim=1)
         else:
             trunk_in = state
@@ -1069,12 +1044,12 @@ class RainbowAgent:
         self.memory.flush()
 
     def reset_attention_weights(self):
-        """Reinitialize only the lane-cross-attention weights, keeping trunk and heads intact."""
+        """Reinitialize only the object self-attention weights, keeping trunk and heads intact."""
         if not self.online_net.use_attn:
             print("No attention layer to reset.")
             return
         for net in (self.online_net, self.target_net):
-            for m in net.lane_cross_attn.modules():
+            for m in net.object_attn.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight, gain=1.0)
                     nn.init.constant_(m.bias, 0.0)
@@ -1083,19 +1058,19 @@ class RainbowAgent:
                     nn.init.constant_(m.bias, 0.0)
         self._sync_inference(force=True)
         # Reset optimizer state for attention parameters so momentum doesn't carry old bias
-        attn_param_ids = {id(p) for p in self.online_net.lane_cross_attn.parameters()}
+        attn_param_ids = {id(p) for p in self.online_net.object_attn.parameters()}
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if id(p) in attn_param_ids and p in self.optimizer.state:
                     del self.optimizer.state[p]
-        print("✓ Lane-cross-attention weights and optimizer state reset (trunk + heads preserved)")
+        print("Object self-attention weights and optimizer state reset (trunk + heads preserved)")
 
     def diagnose_attention(self, num_samples: int = 256) -> str:
-        """Analyze lane-cross-attention patterns to determine if they're meaningful."""
+        """Analyze object self-attention patterns to determine if they're meaningful."""
         if not self.online_net.use_attn:
             return "Attention is disabled in this model."
-        if not hasattr(self.online_net, 'lane_cross_attn'):
-            return "No lane-cross-attention found (old architecture?)."
+        if not hasattr(self.online_net, 'object_attn'):
+            return "No object self-attention found."
         if len(self.memory) < num_samples:
             return f"Need {num_samples} samples in buffer, have {len(self.memory)}."
 
@@ -1106,37 +1081,48 @@ class RainbowAgent:
         states = torch.from_numpy(batch[0]).float().to(self.device)
         self.online_net.eval()
         with torch.no_grad():
-            lane_tokens = self.online_net._build_lane_tokens(states)
-            enemy_tokens, enemy_mask = self.online_net._build_enemy_tokens(states)
-            _, attn_w = self.online_net.lane_cross_attn(
-                lane_tokens, enemy_tokens, enemy_mask, return_weights=True
-            )  # (B, H, 16, 7)
+            obj_tokens, obj_mask = self.online_net._build_object_tokens(states)
+            _, attn_w = self.online_net.object_attn(
+                obj_tokens, obj_mask, return_weights=True
+            )
         self.online_net.train()
-
-        # attn_w: (B, num_heads, 16_lanes, 7_enemies)
-        B, H, L, S = attn_w.shape
-        aw = attn_w.cpu().numpy()
-        em = enemy_mask.cpu().numpy()  # (B, 7) bool — True = empty
 
         import numpy as np
         eps = 1e-8
+
+        # attn_w: (B, H, T, T) self-attention over T=144 object tokens
+        B, H, T, _ = attn_w.shape
+        aw = attn_w.cpu().numpy()
+        em = obj_mask.cpu().numpy()  # (B, T) bool — True = empty
+
+        # Category layout for labelling
+        cat_defs = getattr(RL_CONFIG, 'entity_categories', [])
+        cat_ranges = []
+        offset = 0
+        for name, slots in cat_defs:
+            cat_ranges.append((name, offset, offset + slots))
+            offset += slots
+
         lines = []
         lines.append("\n" + "=" * 70)
-        lines.append("  LANE-CROSS-ATTENTION DIAGNOSTICS".center(70))
+        lines.append("  OBJECT SELF-ATTENTION DIAGNOSTICS".center(70))
         lines.append("=" * 70)
-        lines.append(f"  Shape: {B} samples × {H} heads × {L} lanes → {S} enemy slots")
+        lines.append(f"  Shape: {B} samples x {H} heads x {T} tokens (self-attn)")
 
-        # Enemy slot occupancy
-        occ_rate = 1.0 - em.mean(axis=0)  # (7,)
-        lines.append(f"\n  Enemy slot occupancy:")
-        for s in range(S):
-            bar = "█" * int(occ_rate[s] * 20) + "░" * (20 - int(occ_rate[s] * 20))
-            lines.append(f"    Slot {s}: {occ_rate[s]:.1%}  {bar}")
-        lines.append(f"    Avg active: {occ_rate.sum():.1f} / {S}")
+        # Per-category occupancy
+        lines.append(f"\n  Per-category slot occupancy:")
+        for name, lo, hi in cat_ranges:
+            occ = 1.0 - em[:, lo:hi].mean()
+            bar = "#" * int(occ * 20) + "." * (20 - int(occ * 20))
+            lines.append(f"    {name:12s} [{lo:3d}..{hi:3d}): {occ:.1%}  {bar}")
 
-        # 1. Entropy per head (max = ln(7) ≈ 1.946 for 7 enemy keys)
-        max_entropy = np.log(S)
-        entropy = -(aw * np.log(aw + eps)).sum(axis=-1)  # (B, H, L)
+        # Overall active tokens
+        avg_active = (~em).sum(axis=1).mean()
+        lines.append(f"    Avg active tokens: {avg_active:.1f} / {T}")
+
+        # 1. Entropy per head
+        max_entropy = np.log(T)
+        entropy = -(aw * np.log(aw + eps)).sum(axis=-1)  # (B, H, T)
         mean_entropy_per_head = entropy.mean(axis=(0, 2))  # (H,)
         overall_entropy = entropy.mean()
         ratio = overall_entropy / max_entropy
@@ -1145,105 +1131,60 @@ class RainbowAgent:
         for h in range(H):
             e = mean_entropy_per_head[h]
             pct = e / max_entropy * 100
-            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            bar = "#" * int(pct / 5) + "." * (20 - int(pct / 5))
             lines.append(f"    Head {h}: {e:.3f} ({pct:.0f}% uniform)  {bar}")
         lines.append(f"    Overall: {overall_entropy:.3f} ({ratio*100:.0f}% uniform)")
 
         if ratio > 0.95:
-            lines.append("    → ⚠️  Near-uniform: not yet selective")
+            lines.append("    -> Near-uniform: not yet selective")
         elif ratio > 0.80:
-            lines.append("    → 🟡 Mildly selective: some structure emerging")
+            lines.append("    -> Mildly selective: some structure emerging")
         elif ratio > 0.60:
-            lines.append("    → 🟢 Moderately selective: meaningful patterns forming")
+            lines.append("    -> Moderately selective: meaningful patterns forming")
         else:
-            lines.append("    → 🟢 Highly selective: strong learned patterns")
+            lines.append("    -> Highly selective: strong learned patterns")
 
-        # 2. Player-lane focus: does the player's lane attend more strongly?
-        player_pos = states[:, 5].cpu().numpy()  # (B,) normalized pos/15
-        player_lanes = np.round(player_pos * 15).astype(int).clip(0, 15)
-        # Avg total attention weight from player's lane vs other lanes
-        player_attn_vals = []
-        other_attn_vals = []
-        for b in range(B):
-            pl = player_lanes[b]
-            player_attn_vals.append(aw[b, :, pl, :].sum(axis=-1).mean())
-            mask_ = np.ones(L, dtype=bool)
-            mask_[pl] = False
-            other_attn_vals.append(aw[b, :, mask_, :].sum(axis=-1).mean())
-        player_mean = np.mean(player_attn_vals)
-        other_mean = np.mean(other_attn_vals)
-        lines.append(f"\n  Player-lane focus:")
-        lines.append(f"    Player's lane avg attention sum: {player_mean:.4f}")
-        lines.append(f"    Other lanes avg attention sum:   {other_mean:.4f}")
-        if player_mean > other_mean * 1.3:
-            lines.append("    → 🟢 Player's lane attends more strongly to enemies")
-        else:
-            lines.append("    → ⚪ Uniform across lanes (spatial differentiation not yet learned)")
+        # 2. Cross-category attention: do entities attend to other types?
+        lines.append(f"\n  Cross-category attention (avg weight given to other categories):")
+        for name_q, lo_q, hi_q in cat_ranges:
+            same_attn = aw[:, :, lo_q:hi_q, lo_q:hi_q].mean()
+            total_attn = aw[:, :, lo_q:hi_q, :].mean()
+            cross_attn = total_attn - same_attn if total_attn > 0 else 0
+            lines.append(f"    {name_q:12s}: same={same_attn:.4f}  cross={cross_attn:.4f}")
 
-        # 3. Spatial coherence: do lanes attend more to nearby enemies?
-        #    For each (lane, enemy) pair, compute angular distance on the tube circle.
-        #    Check if attention weight correlates with proximity.
-        enemy_segs = states[:, 128:135].cpu().numpy()  # (B, 7) normalised rel segs
-        spatial_close_attn = []
-        spatial_far_attn = []
-        for b in range(B):
-            for l in range(L):
-                for s_idx in range(S):
-                    if em[b, s_idx]:
-                        continue
-                    # Enemy lane on circle
-                    e_abs = (player_lanes[b] + enemy_segs[b, s_idx] * 15) % 16
-                    dist = min(abs(l - e_abs), 16 - abs(l - e_abs))
-                    w = aw[b, :, l, s_idx].mean()
-                    if dist <= 2:
-                        spatial_close_attn.append(w)
-                    else:
-                        spatial_far_attn.append(w)
-        if spatial_close_attn and spatial_far_attn:
-            close_mean = np.mean(spatial_close_attn)
-            far_mean = np.mean(spatial_far_attn)
-            lines.append(f"\n  Spatial coherence (lane↔enemy proximity):")
-            lines.append(f"    Nearby (≤2 lanes) avg attn: {close_mean:.4f}")
-            lines.append(f"    Distant (>2 lanes) avg attn: {far_mean:.4f}")
-            if close_mean > far_mean * 1.5:
-                lines.append("    → 🟢 Strong spatial coherence: lanes attend to nearby enemies")
-            elif close_mean > far_mean * 1.1:
-                lines.append("    → 🟡 Mild spatial coherence")
-            else:
-                lines.append("    → ⚪ No spatial preference yet")
-
-        # 4. Empty-slot masking
-        lane_avg_attn = aw.mean(axis=(1, 2))  # (B, 7) avg over heads and lanes
-        active_mask_all = ~em
+        # 3. Empty-slot masking
         if em.any():
-            empty_recv = lane_avg_attn[em].mean()
-            active_recv = lane_avg_attn[active_mask_all].mean() if active_mask_all.any() else 0
+            # Average attention weight received by empty vs active tokens
+            recv_attn = aw.mean(axis=(1, 2))  # (B, T)
+            empty_recv = recv_attn[em].mean() if em.any() else 0
+            active_recv = recv_attn[~em].mean() if (~em).any() else 0
             lines.append(f"\n  Empty-slot masking:")
-            lines.append(f"    Avg attention to active enemies: {active_recv:.4f}")
-            lines.append(f"    Avg attention to empty enemies:  {empty_recv:.4f}")
+            lines.append(f"    Avg attention to active tokens: {active_recv:.4f}")
+            lines.append(f"    Avg attention to empty tokens:  {empty_recv:.4f}")
             if empty_recv < 0.01:
-                lines.append("    → 🟢 Empty slots effectively masked")
+                lines.append("    -> Empty slots effectively masked")
             elif empty_recv < active_recv * 0.1:
-                lines.append("    → 🟢 Minimal attention leakage")
+                lines.append("    -> Minimal attention leakage")
             else:
-                lines.append("    → ⚠️  Significant attention to empty slots")
+                lines.append("    -> Significant attention to empty slots")
 
-        # 5. Head specialization
-        head_avg = aw.mean(axis=(0, 2))  # (H, S)
+        # 4. Head specialization
+        head_avg = aw.mean(axis=(0, 2))  # (H, T)
         head_kls = []
         for i in range(H):
             for j in range(i + 1, H):
                 p, q = head_avg[i] + eps, head_avg[j] + eps
+                p, q = p / p.sum(), q / q.sum()
                 kl = (p * np.log(p / q)).sum()
                 head_kls.append(kl)
         avg_kl = np.mean(head_kls) if head_kls else 0
         lines.append(f"\n  Head specialization (avg KL between heads): {avg_kl:.4f}")
         if avg_kl > 0.1:
-            lines.append("    → 🟢 Heads are specialized")
+            lines.append("    -> Heads are specialized")
         elif avg_kl > 0.01:
-            lines.append("    → 🟡 Mild specialization")
+            lines.append("    -> Mild specialization")
         else:
-            lines.append("    → ⚠️  Heads are redundant")
+            lines.append("    -> Heads are redundant")
 
         lines.append("\n" + "=" * 70)
         return "\n".join(lines)
