@@ -336,14 +336,37 @@ local function clamp01(v)
     return v
 end
 
-local function dist_norm_i16(x1, y1, x2, y2)
+-- Game playfield bounds from RRF.ASM.  Coordinates are 8.8 fixed-point
+-- (high byte = screen pixel, low byte = sub-pixel fraction).  Positions
+-- are UNSIGNED 16-bit values; treating them as signed creates a discontinuity
+-- at pixel 128 that cuts right through the playfield.
+local GAME_XMIN   = 7      -- XMIN EQU 7
+local GAME_XMAX   = 0x8F   -- XMAX EQU $8F = 143
+local GAME_YMIN   = 24     -- YMIN EQU 24
+local GAME_YMAX   = 234    -- YMAX EQU 234
+local POS_X_MIN   = GAME_XMIN * 256                        -- 1792
+local POS_X_RANGE = (GAME_XMAX - GAME_XMIN) * 256          -- 34816
+local POS_Y_MIN   = GAME_YMIN * 256                        -- 6144
+local POS_Y_RANGE = (GAME_YMAX - GAME_YMIN) * 256          -- 53760
+local POS_MAX_DIAG = math.sqrt(POS_X_RANGE * POS_X_RANGE
+                             + POS_Y_RANGE * POS_Y_RANGE)  -- ≈64022
+
+local function norm_pos_x(u16)
+    return clamp01(((u16 or 0) - POS_X_MIN) / POS_X_RANGE)
+end
+
+local function norm_pos_y(u16)
+    return clamp01(((u16 or 0) - POS_Y_MIN) / POS_Y_RANGE)
+end
+
+local function dist_norm(x1, y1, x2, y2)
     local dx = (x2 or 0) - (x1 or 0)
     local dy = (y2 or 0) - (y1 or 0)
     local d2 = (dx * dx) + (dy * dy)
     if d2 <= 0 then
         return 0.0
     end
-    return math.sqrt(d2) / 65535.0
+    return math.sqrt(d2) / POS_MAX_DIAG
 end
 
 local function enemy_spacing_score(nearest_dist_norm)
@@ -440,9 +463,10 @@ local function compute_evasion_reward(move_cmd, px16, py16, enemy_x16, enemy_y16
 end
 
 local function read_player_position(memory)
-    -- Read player 16-bit world coordinates and velocity from PLOBJ structure.
-    local px16 = u16_to_i16(read_u16_be(memory, PX16_ADDR))
-    local py16 = u16_to_i16(read_u16_be(memory, PY16_ADDR))
+    -- Positions are UNSIGNED 8.8 fixed-point (high byte = screen pixel).
+    -- Velocities are truly signed.
+    local px16 = read_u16_be(memory, PX16_ADDR)   -- unsigned
+    local py16 = read_u16_be(memory, PY16_ADDR)   -- unsigned
     local pxv = u16_to_i16(read_u16_be(memory, PXV_ADDR))
     local pyv = u16_to_i16(read_u16_be(memory, PYV_ADDR))
     return px16, py16, pxv, pyv
@@ -643,8 +667,8 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
                 ptr = read_u16_be(memory, ptr + OLINK_OFF)
             else
 
-            local x16 = u16_to_i16(read_u16_be(memory, ptr + OX16_OFF))
-            local y16 = u16_to_i16(read_u16_be(memory, ptr + OY16_OFF))
+            local x16 = read_u16_be(memory, ptr + OX16_OFF)   -- unsigned 8.8 fixed-point
+            local y16 = read_u16_be(memory, ptr + OY16_OFF)
             local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
 
             local width, height = 0, 0
@@ -655,7 +679,7 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
 
             local dnorm = 1.0
             if player_x16 and player_y16 then
-                dnorm = dist_norm_i16(player_x16, player_y16, x16, y16)
+                dnorm = dist_norm(player_x16, player_y16, x16, y16)
             end
 
             all_objects[#all_objects + 1] = {
@@ -727,6 +751,10 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
         table.sort(buckets[cat.name], function(a, b)
             return a.dist_norm < b.dist_norm
         end)
+        -- Stamp 1-based distance rank so the HUD can display it.
+        for i, obj in ipairs(buckets[cat.name]) do
+            obj.rank = i
+        end
     end
 
     -- Phase 5: emit feature vector ------------------------------------------
@@ -741,8 +769,8 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
             local obj = bucket[i]
             if obj then
                 features[#features + 1] = 1.0
-                features[#features + 1] = norm_i16(obj.x16)
-                features[#features + 1] = norm_i16(obj.y16)
+                features[#features + 1] = norm_pos_x(obj.x16)
+                features[#features + 1] = norm_pos_y(obj.y16)
                 features[#features + 1] = obj.dist_norm
             else
                 features[#features + 1] = 0.0
@@ -772,19 +800,21 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
     return features, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16
 end
 
--- ── Debug HUD: draw entity category letters on the MAME screen ──────────
+-- ── Debug HUD: draw coloured rings + rank numbers on MAME screen ────────
 
-local CAT_HUD = {
-    grunt      = { ch = "g", fg = 0xFFFFFFFF },   -- white
-    hulk       = { ch = "H", fg = 0xFF00FFFF },   -- cyan
-    brain      = { ch = "B", fg = 0xFFFFFF00 },   -- yellow
-    tank       = { ch = "T", fg = 0xFF00FF00 },   -- green
-    spawner    = { ch = "S", fg = 0xFFFF80FF },   -- pink
-    enforcer   = { ch = "E", fg = 0xFFFFAA00 },   -- orange
-    projectile = { ch = "!", fg = 0xFF00FFFF },   -- cyan
-    human      = { ch = "HUM", fg = 0xFFFFFFFF }, -- white
-    electrode  = { ch = "+", fg = 0xFFFFFF00 },   -- yellow
+local CAT_HUD_COLOR = {
+    grunt      = 0xFFFF0000,   -- red
+    hulk       = 0xFF00FF00,   -- green
+    brain      = 0xFFFFFF00,   -- yellow
+    tank       = 0xFFFF8000,   -- orange
+    spawner    = 0xFFFF00FF,   -- magenta
+    enforcer   = 0xFFFFFFFF,   -- white
+    projectile = 0xFFFF8080,   -- light red
+    human      = 0xFF4080FF,   -- blue
+    electrode  = 0xFF808080,   -- grey
 }
+local HUD_PLAYER_COLOR = 0xFFFFFFFF   -- white ring for player
+local HUD_RING_RADIUS  = 8           -- half-size of ring box in screen pixels
 
 local function draw_debug_hud()
     -- Called from emu.register_frame_done so we paint AFTER the game renders.
@@ -799,7 +829,6 @@ local function draw_debug_hud()
             mame_screen = s
             print("[HUD] Screen device acquired: :screen")
         else
-            -- Try iterating all screens as a fallback.
             local ok2, s2 = pcall(function()
                 for tag, scr in pairs(manager.machine.screens) do
                     print("[HUD] Found screen: " .. tostring(tag))
@@ -815,37 +844,46 @@ local function draw_debug_hud()
         end
     end
 
-    -- Always draw "HUD ACTIVE" banner at top-centre so we know painting works.
-    local ok_banner, banner_err = pcall(function()
+    -- "HUD ACTIVE" banner at top.
+    local ok_banner = pcall(function()
         mame_screen:draw_text("center", 0, "HUD ACTIVE", 0xFF00FF00, 0xC0000000)
     end)
     if not ok_banner then
-        -- Some MAME versions don't support "center"; use manual X.
         pcall(function()
             mame_screen:draw_text(100, 0, "HUD ACTIVE", 0xFF00FF00, 0xC0000000)
         end)
     end
 
-    -- Player marker
+    local r = HUD_RING_RADIUS
+
+    -- Player ring
     if hud_player_x16 and hud_player_y16 then
         local px = ((hud_player_x16 >> 8) & 0xFF) * 2
         local py = (hud_player_y16 >> 8) & 0xFF
         pcall(function()
-            mame_screen:draw_text(px - 3, py - 4, "P", 0xFFFFFFFF, 0x80000080)
+            mame_screen:draw_box(px - r, py - r, px + r, py + r, 0x00000000, HUD_PLAYER_COLOR)
         end)
     end
 
-    -- Entity markers
+    -- Entity rings + rank numbers
     if hud_objects then
         for _, obj in ipairs(hud_objects) do
             if obj.category and obj.category ~= "skip" then
-                local info = CAT_HUD[obj.category]
-                if info then
+                local color = CAT_HUD_COLOR[obj.category]
+                if color then
                     local sx = ((obj.x16 >> 8) & 0xFF) * 2
                     local sy = (obj.y16 >> 8) & 0xFF
                     pcall(function()
-                        mame_screen:draw_text(sx - 3, sy - 4, info.ch, info.fg, 0x00000000)
+                        mame_screen:draw_box(sx - r, sy - r, sx + r, sy + r,
+                                             0x00000000, color)
                     end)
+                    -- Distance rank number just below the ring
+                    if obj.rank then
+                        pcall(function()
+                            mame_screen:draw_text(sx - 3, sy + r + 1,
+                                                  tostring(obj.rank), color, 0x00000000)
+                        end)
+                    end
                 end
             end
         end
@@ -1218,9 +1256,9 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     state_values[#state_values + 1] = replay_u32 / 99999999.0
     state_values[#state_values + 1] = lasers_u8 / 9.0
     state_values[#state_values + 1] = wave_u8 / 255.0
-    -- 2 player position values (normalized 16-bit world coordinates)
-    state_values[#state_values + 1] = norm_i16(player_x16 or 0)
-    state_values[#state_values + 1] = norm_i16(player_y16 or 0)
+    -- 2 player position values (unsigned 8.8 fixed-point, screen-bound normalized)
+    state_values[#state_values + 1] = norm_pos_x(player_x16 or 0)
+    state_values[#state_values + 1] = norm_pos_y(player_y16 or 0)
     -- 2 player velocity values (normalized 16-bit signed)
     state_values[#state_values + 1] = norm_i16(player_xv or 0)
     state_values[#state_values + 1] = norm_i16(player_yv or 0)

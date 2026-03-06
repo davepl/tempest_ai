@@ -174,7 +174,7 @@ class RLConfigData:
     # grunt kill (100) → 1. Preserves relative importance while fitting support.
     obj_reward_scale: float = 0.01
     point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
-    subj_reward_scale: float = 0.005
+    subj_reward_scale: float = 0.0005
     reward_clip: float = 100.0          # Post-scaling: 10000 raw pts → 100
     death_reward_clip: float = 100.0
 
