@@ -120,24 +120,96 @@ class PrioritizedReplayBuffer:
     Thread-safe via a reentrant lock.
     """
 
-    def __init__(self, capacity: int, state_size: int, alpha: float = 0.6):
+    def __init__(self, capacity: int, state_size: int, alpha: float = 0.6,
+                 memmap_dir: str = None):
         self.capacity = int(capacity)
         self.state_size = int(state_size)
         self.alpha = float(alpha)
         self.lock = threading.Lock()
+        self._memmap_dir = memmap_dir or None
 
-        # Storage arrays
-        self.states      = np.zeros((self.capacity, self.state_size), dtype=np.float32)
-        self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
-        self.actions     = np.zeros(self.capacity, dtype=np.int64)
-        self.rewards     = np.zeros(self.capacity, dtype=np.float32)
-        self.dones       = np.zeros(self.capacity, dtype=np.float32)
-        self.horizons    = np.ones(self.capacity, dtype=np.int32)
-        self.is_expert   = np.zeros(self.capacity, dtype=np.uint8)
+        # Storage arrays — either RAM-backed (np.zeros) or disk-backed (np.memmap)
+        if self._memmap_dir:
+            os.makedirs(self._memmap_dir, exist_ok=True)
+            self.states      = self._open_memmap("states",      (self.capacity, self.state_size), np.float32)
+            self.next_states = self._open_memmap("next_states", (self.capacity, self.state_size), np.float32)
+            self.actions     = self._open_memmap("actions",     (self.capacity,), np.int64)
+            self.rewards     = self._open_memmap("rewards",     (self.capacity,), np.float32)
+            self.dones       = self._open_memmap("dones",       (self.capacity,), np.float32)
+            self.horizons    = self._open_memmap("horizons",    (self.capacity,), np.int32, fill=1)
+            self.is_expert   = self._open_memmap("is_expert",   (self.capacity,), np.uint8)
+        else:
+            self.states      = np.zeros((self.capacity, self.state_size), dtype=np.float32)
+            self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
+            self.actions     = np.zeros(self.capacity, dtype=np.int64)
+            self.rewards     = np.zeros(self.capacity, dtype=np.float32)
+            self.dones       = np.zeros(self.capacity, dtype=np.float32)
+            self.horizons    = np.ones(self.capacity, dtype=np.int32)
+            self.is_expert   = np.zeros(self.capacity, dtype=np.uint8)
 
         self.tree = SumTree(self.capacity)
         self.size = 0
         self._n_expert = 0          # O(1) expert tracking
+
+        # Auto-restore from memmap metadata if available.
+        if self._memmap_dir:
+            self._try_restore_memmap_meta()
+
+    # ── Memmap helpers ───────────────────────────────────────────────────
+
+    def _open_memmap(self, name: str, shape: tuple, dtype, fill=0):
+        """Open an existing memmap file (if shape matches) or create a new one."""
+        path = os.path.join(self._memmap_dir, f"{name}.dat")
+        expected_bytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        if os.path.isfile(path) and os.path.getsize(path) == expected_bytes:
+            return np.memmap(path, dtype=dtype, mode="r+", shape=shape)
+        # Wrong size or missing — (re)create.
+        if os.path.exists(path):
+            os.remove(path)
+        mm = np.memmap(path, dtype=dtype, mode="w+", shape=shape)
+        if fill != 0:
+            mm.fill(fill)
+            mm.flush()
+        return mm
+
+    def _try_restore_memmap_meta(self):
+        """Restore buffer state (size, SumTree) from memmap metadata."""
+        meta_path = os.path.join(self._memmap_dir, "_meta.npy")
+        pri_path = os.path.join(self._memmap_dir, "priorities.npy")
+        if not os.path.isfile(meta_path) or not os.path.isfile(pri_path):
+            return
+        try:
+            meta = np.load(meta_path, allow_pickle=False)
+            data_ptr = int(meta[0])
+            n = int(meta[1])
+            max_priority = float(meta[2])
+            priorities = np.load(pri_path, allow_pickle=False)
+            if n == 0 or len(priorities) < n:
+                return
+            if n > self.capacity:
+                # Capacity shrank since last save — keep most recent.
+                offset = n - self.capacity
+                priorities = priorities[offset:]
+                n = self.capacity
+                data_ptr = n % self.capacity
+
+            t0 = time.time()
+            self.tree.size = n
+            self.tree.data_ptr = data_ptr
+            self.tree.max_priority = max_priority
+            self.tree.tree[self.tree.capacity:self.tree.capacity + n] = priorities[:n].astype(np.float64)
+            if n < self.capacity:
+                self.tree.tree[self.tree.capacity + n:] = 0.0
+
+            for i in range(self.tree.capacity - 1, 0, -1):
+                self.tree.tree[i] = self.tree.tree[2 * i] + self.tree.tree[2 * i + 1]
+
+            self.size = n
+            self._n_expert = int(self.is_expert[:n].sum())
+            elapsed = time.time() - t0
+            print(f"  Replay buffer restored from memmap: {n:,} transitions ({elapsed:.1f}s)")
+        except Exception as e:
+            print(f"  Memmap metadata restore failed ({e}), starting with empty buffer.")
 
     @staticmethod
     def _progress_bar(label: str, frac: float, width: int = 28):
@@ -259,7 +331,17 @@ class PrioritizedReplayBuffer:
     # ── Persistence ─────────────────────────────────────────────────────
 
     def save(self, filepath: str, verbose: bool = True):
-        """Save the full replay buffer as individual .npy files in a directory."""
+        """Save the replay buffer.
+
+        Memmap mode: flush dirty pages + write metadata/priority files.
+        Legacy mode: write a directory of .npy arrays.
+        """
+        if self._memmap_dir:
+            return self._save_memmap(verbose)
+        return self._save_npy(filepath, verbose)
+
+    def _save_memmap(self, verbose: bool = True):
+        """Fast save path for memmap-backed buffers."""
         with self.lock:
             if self.size == 0:
                 if verbose:
@@ -267,42 +349,76 @@ class PrioritizedReplayBuffer:
                 return
 
             n = self.size
-            if verbose:
-                print(f"  Saving replay buffer ({n:,} transitions)...")
-            t0 = time.time()
-            if verbose:
-                self._progress_bar("  Replay save", 0.05)
-
-            # Snapshot arrays while holding the lock
-            arrays = {
-                "states":      self.states[:n].copy(),
-                "next_states": self.next_states[:n].copy(),
-                "actions":     self.actions[:n].copy(),
-                "rewards":     self.rewards[:n].copy(),
-                "dones":       self.dones[:n].copy(),
-                "horizons":    self.horizons[:n].copy(),
-                "is_expert":   self.is_expert[:n].copy(),
-                "priorities":  self.tree.tree[self.tree.capacity:self.tree.capacity + n].copy(),
-            }
             meta = np.array([self.tree.data_ptr, n, self.tree.max_priority])
-            if verbose:
-                self._progress_bar("  Replay save", 0.15)
+            priorities = self.tree.tree[self.tree.capacity:self.tree.capacity + n].copy()
 
-        # Write outside the lock to minimise contention
+        t0 = time.time()
+        if verbose:
+            self._progress_bar("  Replay save", 0.05)
+
+        # Flush dirty pages to disk.
+        for arr in (self.states, self.next_states, self.actions,
+                    self.rewards, self.dones, self.horizons, self.is_expert):
+            if hasattr(arr, "flush"):
+                arr.flush()
+        if verbose:
+            self._progress_bar("  Replay save", 0.80)
+
+        # Write metadata and SumTree priorities atomically.
+        for name, data in [("_meta", meta), ("priorities", priorities)]:
+            tmp = os.path.join(self._memmap_dir, f"{name}.tmp.npy")
+            dst = os.path.join(self._memmap_dir, f"{name}.npy")
+            np.save(tmp, data)
+            os.replace(tmp, dst)
+
+        if verbose:
+            self._progress_bar("  Replay save", 1.0)
+            elapsed = time.time() - t0
+            print(f"  Replay buffer saved (memmap flush): {n:,} transitions in {elapsed:.1f}s")
+
+    def _save_npy(self, filepath: str, verbose: bool = True):
+        """Legacy save path writing a directory of .npy arrays."""
+        with self.lock:
+            if self.size == 0:
+                if verbose:
+                    print("  Replay buffer is empty — nothing to save.")
+                return
+            n = self.size
+            meta = np.array([self.tree.data_ptr, n, self.tree.max_priority])
+
+        if verbose:
+            print(f"  Saving replay buffer ({n:,} transitions)...")
+        t0 = time.time()
+
         tmp_dir = filepath + ".tmp"
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         os.makedirs(tmp_dir, exist_ok=True)
 
-        names = list(arrays.keys())
-        for i, name in enumerate(names):
-            np.save(os.path.join(tmp_dir, f"{name}.npy"), arrays[name])
+        array_specs = [
+            ("states",      lambda: self.states[:n]),
+            ("next_states", lambda: self.next_states[:n]),
+            ("actions",     lambda: self.actions[:n]),
+            ("rewards",     lambda: self.rewards[:n]),
+            ("dones",       lambda: self.dones[:n]),
+            ("horizons",    lambda: self.horizons[:n]),
+            ("is_expert",   lambda: self.is_expert[:n]),
+            ("priorities",  lambda: self.tree.tree[self.tree.capacity:self.tree.capacity + n]),
+        ]
+
+        total_bytes = 0
+        for i, (name, src_fn) in enumerate(array_specs):
+            with self.lock:
+                arr = src_fn().copy()
+            total_bytes += arr.nbytes
+            np.save(os.path.join(tmp_dir, f"{name}.npy"), arr)
+            del arr
             if verbose:
-                frac = 0.15 + 0.70 * ((i + 1) / len(names))
-                self._progress_bar("  Replay save", frac)
+                frac = (i + 1) / len(array_specs)
+                self._progress_bar("  Replay save", frac * 0.95)
+
         np.save(os.path.join(tmp_dir, "_meta.npy"), meta)
 
-        # Atomic rename
         if os.path.exists(filepath):
             if os.path.isdir(filepath):
                 shutil.rmtree(filepath, ignore_errors=True)
@@ -313,7 +429,6 @@ class PrioritizedReplayBuffer:
             self._progress_bar("  Replay save", 1.0)
 
         elapsed = time.time() - t0
-        total_bytes = sum(a.nbytes for a in arrays.values())
         mb = total_bytes / (1024 * 1024)
         if verbose:
             print(f"  Replay buffer saved: {mb:.0f} MB in {elapsed:.1f}s")
@@ -332,7 +447,7 @@ class PrioritizedReplayBuffer:
             self._progress_bar("  Replay load", 0.05)
 
         try:
-            meta = np.load(meta_path)
+            meta = np.load(meta_path, allow_pickle=False)
             data_ptr = int(meta[0])
             saved_n = int(meta[1])
             max_priority = float(meta[2])
@@ -348,7 +463,7 @@ class PrioritizedReplayBuffer:
             if not os.path.isfile(fpath):
                 print(f"  Missing array file: {name}.npy")
                 return False
-            arch[name] = np.load(fpath)
+            arch[name] = np.load(fpath, allow_pickle=False)
             if verbose:
                 frac = 0.05 + 0.30 * ((i + 1) / len(names))
                 self._progress_bar("  Replay load", frac)
@@ -442,23 +557,56 @@ class PrioritizedReplayBuffer:
         return True
 
     def load(self, filepath: str, verbose: bool = True) -> bool:
-        """Load replay buffer: tries directory format first, then falls back to legacy .npz."""
+        """Load replay buffer.
+
+        Memmap mode: data is auto-restored in __init__; this falls through
+        to legacy loaders only for one-time migration from old saves.
+        Legacy mode: tries directory format first, then .npz.
+        """
+        if self._memmap_dir and self.size > 0:
+            if verbose:
+                print(f"  Replay buffer live from memmap ({self.size:,} transitions)")
+            return True
+
         # Try directory format (new fast path)
         if os.path.isdir(filepath):
-            return self._load_directory(filepath, verbose)
+            ok = self._load_directory(filepath, verbose)
+            if ok and self._memmap_dir:
+                self._flush_memmaps_after_migration(verbose)
+            if ok:
+                return True
         # Try .npz at the given path
         if os.path.isfile(filepath):
-            return self._load_npz(filepath, verbose)
+            ok = self._load_npz(filepath, verbose)
+            if ok and self._memmap_dir:
+                self._flush_memmaps_after_migration(verbose)
+            if ok:
+                return True
         # Try deriving the directory path from a .npz path or vice versa
         if filepath.endswith(".npz"):
             dir_path = filepath[:-4]
             if os.path.isdir(dir_path):
-                return self._load_directory(dir_path, verbose)
+                ok = self._load_directory(dir_path, verbose)
+                if ok and self._memmap_dir:
+                    self._flush_memmaps_after_migration(verbose)
+                return ok
         else:
             npz_path = filepath + ".npz"
             if os.path.isfile(npz_path):
-                return self._load_npz(npz_path, verbose)
+                ok = self._load_npz(npz_path, verbose)
+                if ok and self._memmap_dir:
+                    self._flush_memmaps_after_migration(verbose)
+                return ok
         return False
+
+    def _flush_memmaps_after_migration(self, verbose: bool):
+        """After migrating from legacy format into memmaps, flush metadata."""
+        try:
+            self._save_memmap(verbose=False)
+            if verbose:
+                print(f"  Migrated replay data into memmap at {self._memmap_dir}")
+        except Exception as e:
+            print(f"  Memmap migration flush failed: {e}")
 
     def flush(self):
         """Clear the entire replay buffer."""
@@ -474,4 +622,17 @@ class PrioritizedReplayBuffer:
             self.dones.fill(0)
             self.horizons.fill(1)
             self.is_expert.fill(0)
+            if self._memmap_dir:
+                for arr in (self.states, self.next_states, self.actions,
+                            self.rewards, self.dones, self.horizons, self.is_expert):
+                    if hasattr(arr, "flush"):
+                        arr.flush()
+                # Clear persisted metadata so next startup does not restore stale entries.
+                for name in ("_meta.npy", "priorities.npy"):
+                    p = os.path.join(self._memmap_dir, name)
+                    if os.path.isfile(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
         print("  Replay buffer flushed.")

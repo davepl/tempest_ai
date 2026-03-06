@@ -124,6 +124,11 @@ class RLConfigData:
 
     # Replay (PER with proportional priorities)
     memory_size: int = 20_000_000
+    # True = keep replay arrays as persistent np.memmap files and only save
+    # compact metadata/priorities on checkpoint (fast restart/save path).
+    replay_use_memmap_storage: bool = True
+    # Empty string means derive from latest checkpoint path (<model>_replay).
+    replay_memmap_dir: str = ""
     priority_alpha: float = 0.7
     priority_beta_start: float = 0.4
     priority_beta_frames: int = 10_000_000

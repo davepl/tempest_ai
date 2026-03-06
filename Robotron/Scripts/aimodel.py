@@ -645,11 +645,22 @@ class RainbowAgent:
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=cfg.lr, eps=1.5e-4)
 
         # Replay
+        use_memmap_replay = bool(
+            getattr(cfg, "replay_use_memmap_storage",
+                    getattr(cfg, "replay_use_mmap_persistence", True))
+        )
+        replay_memmap_dir = None
+        if use_memmap_replay:
+            configured_dir = str(getattr(cfg, "replay_memmap_dir", "") or "").strip()
+            replay_memmap_dir = configured_dir or (LATEST_MODEL_PATH.rsplit(".", 1)[0] + "_replay")
         self.memory = PrioritizedReplayBuffer(
             capacity=cfg.memory_size,
             state_size=state_size,
             alpha=cfg.priority_alpha,
+            memmap_dir=replay_memmap_dir,
         )
+        if replay_memmap_dir:
+            print(f"Replay storage: memmap ({replay_memmap_dir})")
 
         # AMP
         self.use_amp = cfg.enable_amp and (self.device.type == "cuda")

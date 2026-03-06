@@ -99,6 +99,15 @@ local previous_score = 0
 local prev_fire_cmd = -1          -- fire direction from previous frame
 local prev_move_cmd = -1          -- move direction from previous frame
 local prev_aim_objects = nil      -- classified objects from previous frame
+
+-- Fire-hold state:  The game's LSPROC laser routine (RRG23.ASM) requires
+-- the fire joystick to stay in the SAME direction for 3 consecutive frames
+-- before it creates a laser.  At high epsilon, random fire directions change
+-- every frame, so shots almost never fire.  We hold each fire direction for
+-- a minimum of FIRE_HOLD_FRAMES before accepting a new one.
+local FIRE_HOLD_FRAMES = 4       -- frames to lock each fire direction (3 = minimum for 1 shot)
+local fire_hold_dir   = -1       -- direction currently being held
+local fire_hold_count = 0        -- frames remaining in current hold
 local prev_aim_px16 = nil         -- player x16 from previous frame
 local prev_aim_py16 = nil         -- player y16 from previous frame
 local prev_nearest_enemy_x16 = nil
@@ -198,6 +207,7 @@ local EXPECTED_STATE_VALUES = 9 + ZP1ENM_SIZE + ENTITY_TOTAL_FEATURES
 local ocvect_category_cache = {}       -- OCVECT address → category name | "skip"
 local discovered_tank_ocvect = nil     -- TNKIL address once discovered via growing phase
 local unresolved_7x16 = {}             -- {[ocvect] = true} for ambiguous 7×16 on RPTR
+local DEBUG_LOG_DISCOVERY = false      -- set true to log OCVECT classification discoveries
 
 -- Debug HUD overlay state (draws entity letters on screen each frame).
 local mame_screen = nil                -- MAME screen device for draw_text
@@ -502,7 +512,7 @@ local function try_resolve_7x16(all_objects, enemy_state)
             -- This 7×16 is actually a full-grown tank
             ocvect_category_cache[ocv] = "tank"
             unresolved_7x16[ocv] = nil
-            print(string.format("[DISCOVERY] OCVECT 0x%04X → tank (matches growing-tank OCVECT)", ocv))
+            if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → tank (matches growing-tank OCVECT)", ocv)) end
         end
     end
 
@@ -522,7 +532,7 @@ local function try_resolve_7x16(all_objects, enemy_state)
         for _, c in ipairs(candidates) do
             ocvect_category_cache[c.ocvect] = "hulk"
             unresolved_7x16[c.ocvect] = nil
-            print(string.format("[DISCOVERY] OCVECT 0x%04X → hulk (only hulks this wave, HLKCNT=%d)", c.ocvect, hlkcnt))
+            if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → hulk (only hulks this wave, HLKCNT=%d)", c.ocvect, hlkcnt)) end
         end
         return true
     end
@@ -530,7 +540,7 @@ local function try_resolve_7x16(all_objects, enemy_state)
         for _, c in ipairs(candidates) do
             ocvect_category_cache[c.ocvect] = "brain"
             unresolved_7x16[c.ocvect] = nil
-            print(string.format("[DISCOVERY] OCVECT 0x%04X → brain (only brains this wave, BRNCNT=%d)", c.ocvect, brncnt))
+            if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → brain (only brains this wave, BRNCNT=%d)", c.ocvect, brncnt)) end
         end
         return true
     end
@@ -547,17 +557,17 @@ local function try_resolve_7x16(all_objects, enemy_state)
         if c.count == hlkcnt and (brncnt == 0 or c.count ~= brncnt) then
             ocvect_category_cache[c.ocvect] = "hulk"
             unresolved_7x16[c.ocvect] = nil
-            print(string.format("[DISCOVERY] OCVECT 0x%04X → hulk (count=%d matches HLKCNT)", c.ocvect, c.count))
+            if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → hulk (count=%d matches HLKCNT)", c.ocvect, c.count)) end
             changed = true
         elseif c.count == brncnt and (hlkcnt == 0 or c.count ~= hlkcnt) then
             ocvect_category_cache[c.ocvect] = "brain"
             unresolved_7x16[c.ocvect] = nil
-            print(string.format("[DISCOVERY] OCVECT 0x%04X → brain (count=%d matches BRNCNT)", c.ocvect, c.count))
+            if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → brain (count=%d matches BRNCNT)", c.ocvect, c.count)) end
             changed = true
         elseif c.count == tnkcnt and (hlkcnt == 0 or c.count ~= tnkcnt) and (brncnt == 0 or c.count ~= tnkcnt) then
             ocvect_category_cache[c.ocvect] = "tank"
             unresolved_7x16[c.ocvect] = nil
-            print(string.format("[DISCOVERY] OCVECT 0x%04X → tank (count=%d matches TNKCNT)", c.ocvect, c.count))
+            if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → tank (count=%d matches TNKCNT)", c.ocvect, c.count)) end
             changed = true
         end
     elseif #candidates == 2 then
@@ -569,8 +579,8 @@ local function try_resolve_7x16(all_objects, enemy_state)
                 ocvect_category_cache[c2.ocvect] = type2
                 unresolved_7x16[c1.ocvect] = nil
                 unresolved_7x16[c2.ocvect] = nil
-                print(string.format("[DISCOVERY] OCVECT 0x%04X → %s, 0x%04X → %s (count match)",
-                    c1.ocvect, type1, c2.ocvect, type2))
+                if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → %s, 0x%04X → %s (count match)",
+                    c1.ocvect, type1, c2.ocvect, type2)) end
                 return true
             end
             return false
@@ -600,8 +610,8 @@ local function try_resolve_7x16(all_objects, enemy_state)
                 unresolved_7x16[a.ocvect] = nil
                 unresolved_7x16[b.ocvect] = nil
                 unresolved_7x16[c.ocvect] = nil
-                print(string.format("[DISCOVERY] OCVECT 0x%04X → %s, 0x%04X → %s, 0x%04X → %s (count match)",
-                    a.ocvect, p[1], b.ocvect, p[3], c.ocvect, p[5]))
+                if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → %s, 0x%04X → %s, 0x%04X → %s (count match)",
+                    a.ocvect, p[1], b.ocvect, p[3], c.ocvect, p[5])) end
                 changed = true
                 break
             end
@@ -675,8 +685,8 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
                     discovered_tank_ocvect = obj.ocvect
                 end
                 if cat ~= "skip" then
-                    print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
-                                        obj.ocvect, cat, obj.list_name, obj.width, obj.height))
+                    if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
+                                        obj.ocvect, cat, obj.list_name, obj.width, obj.height)) end
                 end
             else
                 unresolved_7x16[obj.ocvect] = true
@@ -1152,9 +1162,36 @@ local function apply_direction(up_field, down_field, left_field, right_field, di
     if right_field then right_field:set_value(axis[4]) end
 end
 
+--- Apply fire-hold: keep each fire direction stable for FIRE_HOLD_FRAMES.
+-- Returns the effective fire direction actually sent to the game.
+local function apply_fire_hold(requested_dir)
+    if requested_dir < 0 then
+        -- No fire requested (e.g. player dead) – release immediately
+        fire_hold_dir   = -1
+        fire_hold_count = 0
+        return -1
+    end
+    if requested_dir == fire_hold_dir then
+        -- Same direction requested – keep holding, reset counter
+        fire_hold_count = FIRE_HOLD_FRAMES
+        return fire_hold_dir
+    end
+    if fire_hold_count > 0 then
+        -- Still in hold period for previous direction, decrement and keep old
+        fire_hold_count = fire_hold_count - 1
+        return fire_hold_dir
+    end
+    -- Hold expired (or first fire) – accept new direction
+    fire_hold_dir   = requested_dir
+    fire_hold_count = FIRE_HOLD_FRAMES - 1   -- this frame counts as 1
+    return requested_dir
+end
+
 function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
     apply_direction(self.move_up, self.move_down, self.move_left, self.move_right, move_dir)
-    apply_direction(self.fire_up, self.fire_down, self.fire_left, self.fire_right, fire_dir)
+    -- Apply fire hold so the game's LSPROC sees a stable direction long enough to fire
+    local effective_fire = apply_fire_hold(fire_dir)
+    apply_direction(self.fire_up, self.fire_down, self.fire_left, self.fire_right, effective_fire)
 
     if self.p1_start then
         self.p1_start:set_value(start_cmd)
@@ -1162,6 +1199,7 @@ function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
     if self.coin_1 then
         self.coin_1:set_value(coin_cmd)
     end
+    return effective_fire   -- caller uses this for reward attribution
 end
 
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
@@ -1449,22 +1487,27 @@ local function frame_callback()
     end
 
     local start_cmd, coin_cmd = determine_meta_commands(dead_frame_counter, player_alive)
-    local ok_apply, apply_err = pcall(controls.apply_action, controls, move_cmd, fire_cmd, start_cmd, coin_cmd)
+    local effective_fire = fire_cmd  -- fallback if pcall fails
+    local ok_apply, apply_result = pcall(controls.apply_action, controls, move_cmd, fire_cmd, start_cmd, coin_cmd)
     if not ok_apply then
-        trace_log(frame_counter, "apply_action_error", tostring(apply_err), true)
+        trace_log(frame_counter, "apply_action_error", tostring(apply_result), true)
         return true
     end
+    effective_fire = apply_result or fire_cmd  -- apply_action returns the held fire direction
     trace_log(
         frame_counter,
         "apply_action",
-        string.format("move=%d fire=%d start=%d coin=%d socket_ok=%s", move_cmd, fire_cmd, start_cmd, coin_cmd, tostring(socket_ok))
+        string.format("move=%d fire=%d eff_fire=%d start=%d coin=%d socket_ok=%s",
+            move_cmd, fire_cmd, effective_fire, start_cmd, coin_cmd, tostring(socket_ok))
     )
 
     previous_player_alive = player_alive
     previous_score = score
 
     -- Stash aim-reward data for use on the NEXT frame (reward for this frame's action).
-    prev_fire_cmd = fire_cmd
+    -- Use effective_fire (the direction actually sent to the game after hold) for correct
+    -- aim-reward attribution.
+    prev_fire_cmd = effective_fire
     prev_move_cmd = move_cmd
     prev_aim_objects = hud_objects   -- reuse the same reference (set in extract_typed_entities)
     prev_aim_px16 = player_x16
