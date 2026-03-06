@@ -309,6 +309,10 @@ def main():
         game_settings.reset()
         game_settings.save()
 
+    eps_override = int(game_settings.epsilon_pct)
+    if eps_override >= 0:
+        print(f"⚠ Epsilon override is active from settings: {eps_override}% random actions")
+
     dashboard_enabled = _env_enabled("ROBOTRON_DASHBOARD", True)
     dashboard_host = _resolve_dashboard_host()
     desktop_session = _has_desktop_session()

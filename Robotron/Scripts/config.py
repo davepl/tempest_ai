@@ -382,7 +382,9 @@ class MetricsData:
     # ── helpers ─────────────────────────────────────────────────────────
     def update_frame_count(self, delta: int = 1):
         with self.lock:
-            d = max(1, delta)
+            d = max(0, int(delta))
+            if d <= 0:
+                return
             self.frame_count += d
             self.frames_count_interval += d
             self.frames_last_second += d

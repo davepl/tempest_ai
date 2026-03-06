@@ -2,7 +2,7 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a 317-value state vector:
+      - Sends a 319-value state vector:
         5 core stats (alive, score, replay, lasers, wave)
         + 2 player position (x16, y16)
         + 50 ELIST enemy state bytes
@@ -16,7 +16,7 @@
       - PPTR (0x9823): fatal obstacles - electrodes
 --]]
 
-local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
+local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "127.0.0.1:9998"
 local SOCKET_ADDRESS = RAW_SOCKET_ADDRESS
 if string.sub(SOCKET_ADDRESS, 1, 7) ~= "socket." then
     SOCKET_ADDRESS = "socket." .. SOCKET_ADDRESS
@@ -35,6 +35,15 @@ local DEBUG_FORCE_ACTION_FRAMES = 0
 local DEBUG_FORCE_MOVE_DIR = 2  -- right
 local DEBUG_FORCE_FIRE_DIR = 2  -- right
 local DEATH_PENALTY_POINTS = 1000
+-- Subjective shaping rewards (raw points; scaled in Python by subj_reward_scale).
+-- Goal: densify survival signal without dominating objective score rewards.
+local SUBJ_ENEMY_WEIGHT = 20.0
+local SUBJ_HUMAN_WEIGHT = 12.0
+local SUBJ_SURVIVAL_BONUS = 5.0
+local SUBJ_DEATH_PENALTY = 25.0
+local SUBJ_ENEMY_NEAR_NORM = 0.035
+local SUBJ_ENEMY_FAR_NORM = 0.200
+local SUBJ_HUMAN_NEAR_NORM = 0.120
 
 local mainCpu = nil
 local mem = nil
@@ -45,6 +54,7 @@ local last_connection_attempt_time = 0
 local shutdown_requested = false
 
 local frame_counter = 0
+local dead_frame_counter = 0
 local last_save_time = 0
 local previous_player_alive = 1
 local previous_score = 0
@@ -235,6 +245,42 @@ local function norm_i16(v)
     return (x + 32768) / 65535.0
 end
 
+local function clamp01(v)
+    if v <= 0.0 then
+        return 0.0
+    end
+    if v >= 1.0 then
+        return 1.0
+    end
+    return v
+end
+
+local function dist_norm_i16(x1, y1, x2, y2)
+    local dx = (x2 or 0) - (x1 or 0)
+    local dy = (y2 or 0) - (y1 or 0)
+    local d2 = (dx * dx) + (dy * dy)
+    if d2 <= 0 then
+        return 0.0
+    end
+    return math.sqrt(d2) / 65535.0
+end
+
+local function enemy_spacing_score(nearest_dist_norm)
+    if nearest_dist_norm == nil then
+        return 1.0
+    end
+    local span = math.max(1e-6, SUBJ_ENEMY_FAR_NORM - SUBJ_ENEMY_NEAR_NORM)
+    local t = clamp01((nearest_dist_norm - SUBJ_ENEMY_NEAR_NORM) / span)
+    return (2.0 * t) - 1.0
+end
+
+local function human_proximity_score(nearest_dist_norm)
+    if nearest_dist_norm == nil then
+        return 0.0
+    end
+    return 1.0 - clamp01(nearest_dist_norm / math.max(1e-6, SUBJ_HUMAN_NEAR_NORM))
+end
+
 local function read_player_position(memory)
     -- Read player 16-bit world coordinates and velocity from PLOBJ structure.
     local px16 = u16_to_i16(read_u16_be(memory, PX16_ADDR))
@@ -311,11 +357,12 @@ local function is_valid_object_ptr(ptr)
     return ((ptr - OLIST_START) % OLIST_ENTRY_SIZE) == 0
 end
 
-local function extract_list_state(memory, head_addr)
+local function extract_list_state(memory, head_addr, player_x16, player_y16)
     local objects = {}
     local seen = {}
     local ptr = read_u16_be(memory, head_addr)
     local steps = 0
+    local nearest_dist_norm = nil
 
     while ptr ~= 0 and steps < MAX_LIST_WALK do
         if seen[ptr] then
@@ -334,6 +381,12 @@ local function extract_list_state(memory, head_addr)
         local y16 = u16_to_i16(read_u16_be(memory, ptr + OY16_OFF))
         local objx = memory:read_u8(ptr + OBJX_OFF)
         local objy = memory:read_u8(ptr + OBJY_OFF)
+        if player_x16 ~= nil and player_y16 ~= nil then
+            local dnorm = dist_norm_i16(player_x16, player_y16, x16, y16)
+            if nearest_dist_norm == nil or dnorm < nearest_dist_norm then
+                nearest_dist_norm = dnorm
+            end
+        end
         objects[#objects + 1] = {
             obj_addr = ptr,
             pict_ptr = pict_ptr,
@@ -371,7 +424,7 @@ local function extract_list_state(memory, head_addr)
         end
     end
 
-    return features, #objects
+    return features, #objects, nearest_dist_norm
 end
 
 local function initialize_mame_interface()
@@ -457,11 +510,34 @@ local function find_field(ioport, field_name_options)
 end
 
 local function find_field_fuzzy(ioport, name_fragments)
-    local function any_match(label)
+    local function label_matches_fragment(label, fragment)
         local ll = string.lower(label or "")
+        local ff = string.lower(fragment or "")
+        if ff == "" then
+            return false
+        end
+        if string.find(ll, ff, 1, true) then
+            return true
+        end
+
+        -- Token-aware fallback so "right up" can match "right joystick up".
+        local label_words = {}
+        for w in string.gmatch(ll, "%w+") do
+            label_words[w] = true
+        end
+        local have_tokens = false
+        for w in string.gmatch(ff, "%w+") do
+            have_tokens = true
+            if not label_words[w] then
+                return false
+            end
+        end
+        return have_tokens
+    end
+
+    local function any_match(label)
         for _, frag in ipairs(name_fragments) do
-            local ff = string.lower(frag)
-            if string.find(ll, ff, 1, true) then
+            if label_matches_fragment(label, frag) then
                 return true
             end
         end
@@ -517,50 +593,50 @@ function Controls:new(mame_manager)
 
     self.move_up = bind_control(
         ioport,
-        {"P1 Move Up", "P1 Left Up", "P1 Joystick Up"},
+        {"P1 Move Up", "P1 Left Up", "P1 Joystick Up", "P1 Left Joystick Up"},
         {"move up", "left up", "left stick up", "joystick up"},
         "move_up"
     )
     self.move_down = bind_control(
         ioport,
-        {"P1 Move Down", "P1 Left Down", "P1 Joystick Down"},
+        {"P1 Move Down", "P1 Left Down", "P1 Joystick Down", "P1 Left Joystick Down"},
         {"move down", "left down", "left stick down", "joystick down"},
         "move_down"
     )
     self.move_left = bind_control(
         ioport,
-        {"P1 Move Left", "P1 Left Left", "P1 Joystick Left"},
+        {"P1 Move Left", "P1 Left Left", "P1 Joystick Left", "P1 Left Joystick Left"},
         {"move left", "left left", "left stick left", "joystick left"},
         "move_left"
     )
     self.move_right = bind_control(
         ioport,
-        {"P1 Move Right", "P1 Left Right", "P1 Joystick Right"},
+        {"P1 Move Right", "P1 Left Right", "P1 Joystick Right", "P1 Left Joystick Right"},
         {"move right", "left right", "left stick right", "joystick right"},
         "move_right"
     )
 
     self.fire_up = bind_control(
         ioport,
-        {"P1 Fire Up", "P1 Right Up"},
+        {"P1 Fire Up", "P1 Right Up", "P1 Right Joystick Up"},
         {"fire up", "right up", "right stick up"},
         "fire_up"
     )
     self.fire_down = bind_control(
         ioport,
-        {"P1 Fire Down", "P1 Right Down"},
+        {"P1 Fire Down", "P1 Right Down", "P1 Right Joystick Down"},
         {"fire down", "right down", "right stick down"},
         "fire_down"
     )
     self.fire_left = bind_control(
         ioport,
-        {"P1 Fire Left", "P1 Right Left"},
+        {"P1 Fire Left", "P1 Right Left", "P1 Right Joystick Left"},
         {"fire left", "right left", "right stick left"},
         "fire_left"
     )
     self.fire_right = bind_control(
         ioport,
-        {"P1 Fire Right", "P1 Right Right"},
+        {"P1 Fire Right", "P1 Right Right", "P1 Right Joystick Right"},
         {"fire right", "right right", "right stick right"},
         "fire_right"
     )
@@ -578,6 +654,15 @@ function Controls:new(mame_manager)
         "coin_1"
     )
 
+    local missing_move = (not self.move_up) or (not self.move_down) or (not self.move_left) or (not self.move_right)
+    local missing_fire = (not self.fire_up) or (not self.fire_down) or (not self.fire_left) or (not self.fire_right)
+    if missing_move or missing_fire then
+        print("FATAL: required joystick mappings are incomplete.")
+        print("  This run would generate mostly non-causal training data.")
+        print("  Confirm MAME input labels for left/right sticks and update bind_control names.")
+        return nil
+    end
+
     return self
 end
 
@@ -591,9 +676,13 @@ local DIR_AXES = {
     [6] = {0, 0, 1, 0}, -- left
     [7] = {1, 0, 1, 0}, -- up-left
 }
+local DIR_NEUTRAL = {0, 0, 0, 0}
 
 local function apply_direction(up_field, down_field, left_field, right_field, dir_idx)
-    local axis = DIR_AXES[math.max(0, math.min(7, dir_idx or 0))] or DIR_AXES[0]
+    local axis = DIR_NEUTRAL
+    if dir_idx ~= nil and dir_idx >= 0 then
+        axis = DIR_AXES[math.max(0, math.min(7, dir_idx))] or DIR_NEUTRAL
+    end
 
     if up_field then up_field:set_value(axis[1]) end
     if down_field then down_field:set_value(axis[2]) end
@@ -675,7 +764,7 @@ local function process_frame_via_socket(frame_payload, frame_idx)
         trace_log(frame_idx, "socket_open_needed", "no active socket")
         if not open_socket() then
             trace_log(frame_idx, "socket_open_failed", "open_socket() returned false")
-            return 0, 0, false
+            return -1, -1, false
         end
         trace_log(frame_idx, "socket_open_ok", "socket ready")
     end
@@ -690,7 +779,7 @@ local function process_frame_via_socket(frame_payload, frame_idx)
         trace_log(frame_idx, "socket_write_error", tostring(write_err))
         print("Socket write error: " .. tostring(write_err))
         close_socket()
-        return 0, 0, false
+        return -1, -1, false
     end
     trace_log(frame_idx, "socket_write_ok", "payload sent")
 
@@ -706,27 +795,27 @@ local function process_frame_via_socket(frame_payload, frame_idx)
             end
         end
         trace_log(frame_idx, "socket_read_timeout", "using neutral action")
-        return {0, 0}
+        return {-1, -1}
     end)
 
     if not read_ok then
         trace_log(frame_idx, "socket_read_error", tostring(read_result))
         print("Socket read error: " .. tostring(read_result))
         close_socket()
-        return 0, 0, false
+        return -1, -1, false
     end
 
     local move_dir, fire_dir = unpack(read_result)
-    return move_dir or 0, fire_dir or 0, true
+    return move_dir or -1, fire_dir or -1, true
 end
 
-local function determine_meta_commands(frame_idx, player_alive)
+local function determine_meta_commands(dead_frames, player_alive)
     local start_cmd = 0
     local coin_cmd = 0
 
     -- Keep autoboot inputs out of active gameplay to avoid contaminating control/reward dynamics.
     if AUTOBOOT_ENABLED and (player_alive == 0) then
-        local cycle_pos = frame_idx % AUTOBOOT_CYCLE_FRAMES
+        local cycle_pos = dead_frames % AUTOBOOT_CYCLE_FRAMES
         if cycle_pos < AUTOBOOT_COIN_PULSE_FRAMES then
             coin_cmd = 1
         end
@@ -755,7 +844,12 @@ local function frame_callback()
     trace_log(frame_counter, "read_player_alive", "alive=" .. tostring(player_alive))
 
     local ok_core, score, replay_level, num_lasers, wave_number = pcall(function()
-        local score = math.max(0, math.floor(read_player_score(mem) or 0))
+        local raw_score = read_player_score(mem)
+        if raw_score == nil then
+            -- Keep previous score on transient invalid BCD reads to avoid reward spikes.
+            raw_score = previous_score
+        end
+        local score = math.max(0, math.floor(raw_score or 0))
         local replay_level = math.max(0, math.floor(read_next_replay_level(mem) or 0))
         local num_lasers = math.max(0, math.floor(read_num_lasers(mem) or 0))
         local wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
@@ -788,8 +882,11 @@ local function frame_callback()
 
     local list_state_values = {}
     local list_counts = {}
+    local list_nearest_dist = {}
     for _, def in ipairs(ACTIVE_LISTS) do
-        local ok_list, vals_or_err, count = pcall(extract_list_state, mem, def.addr)
+        local ok_list, vals_or_err, count, nearest_dist_norm = pcall(
+            extract_list_state, mem, def.addr, player_x16, player_y16
+        )
         if not ok_list then
             trace_log(frame_counter, "read_list_state_error", def.name .. ": " .. tostring(vals_or_err), true)
             return true
@@ -797,6 +894,7 @@ local function frame_callback()
         for i = 1, #vals_or_err do
             list_state_values[#list_state_values + 1] = vals_or_err[i]
         end
+        list_nearest_dist[def.name] = nearest_dist_norm
         list_counts[#list_counts + 1] = string.format("%s=%d", def.name, count or 0)
     end
     trace_log(frame_counter, "read_active_lists", table.concat(list_counts, " "))
@@ -810,12 +908,37 @@ local function frame_callback()
     if done then
         obj_reward = obj_reward - DEATH_PENALTY_POINTS
     end
-    local subj_reward = 0.0
+    if player_alive == 0 then
+        dead_frame_counter = dead_frame_counter + 1
+    else
+        dead_frame_counter = 0
+    end
+    local nearest_enemy_dist = list_nearest_dist.rptr
+    if list_nearest_dist.pptr ~= nil and (nearest_enemy_dist == nil or list_nearest_dist.pptr < nearest_enemy_dist) then
+        nearest_enemy_dist = list_nearest_dist.pptr
+    end
+    local nearest_human_dist = list_nearest_dist.hptr
+
+    local spacing_score = enemy_spacing_score(nearest_enemy_dist)
+    local rescue_score = human_proximity_score(nearest_human_dist)
+    local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
+    local subj_reward = survival_bonus + (spacing_score * SUBJ_ENEMY_WEIGHT) + (rescue_score * SUBJ_HUMAN_WEIGHT)
+    if done then
+        subj_reward = subj_reward - SUBJ_DEATH_PENALTY
+    end
+
     trace_log(
         frame_counter,
         "reward_calc",
-        string.format("score_delta=%d done=%s death_penalty=%d obj_reward=%.1f",
-            score_delta, tostring(done), done and DEATH_PENALTY_POINTS or 0, obj_reward)
+        string.format(
+            "score_delta=%d done=%s obj_reward=%.1f subj_reward=%.2f enemy_dist=%s human_dist=%s",
+            score_delta,
+            tostring(done),
+            obj_reward,
+            subj_reward,
+            nearest_enemy_dist and string.format("%.4f", nearest_enemy_dist) or "nil",
+            nearest_human_dist and string.format("%.4f", nearest_human_dist) or "nil"
+        )
     )
 
     local now = os.time()
@@ -837,14 +960,14 @@ local function frame_callback()
         return true
     end
     local payload = payload_or_err
-    local payload_count = 7 + ZP1ENM_SIZE + #list_state_values
+    local payload_count = 9 + ZP1ENM_SIZE + #list_state_values
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
-    local move_cmd, fire_cmd = 0, 0
+    local move_cmd, fire_cmd = -1, -1
     local socket_ok = false
     if DEBUG_BYPASS_SOCKET_FOR_FRAMES > 0 and frame_counter < DEBUG_BYPASS_SOCKET_FOR_FRAMES then
         trace_log(frame_counter, "socket_bypass", "bypassing exchange; neutral action")
-        move_cmd, fire_cmd, socket_ok = 0, 0, true
+        move_cmd, fire_cmd, socket_ok = -1, -1, true
     elseif current_socket then
         move_cmd, fire_cmd, socket_ok = process_frame_via_socket(payload, frame_counter)
     else
@@ -853,11 +976,11 @@ local function frame_callback()
             last_connection_attempt_time = now
             open_socket()
         end
-        move_cmd, fire_cmd = 0, 0
+        move_cmd, fire_cmd = -1, -1
     end
 
     if not socket_ok then
-        move_cmd, fire_cmd = 0, 0
+        move_cmd, fire_cmd = -1, -1
     end
 
     if DEBUG_FORCE_ACTION_FRAMES > 0 and frame_counter < DEBUG_FORCE_ACTION_FRAMES then
@@ -870,7 +993,7 @@ local function frame_callback()
         )
     end
 
-    local start_cmd, coin_cmd = determine_meta_commands(frame_counter, player_alive)
+    local start_cmd, coin_cmd = determine_meta_commands(dead_frame_counter, player_alive)
     local ok_apply, apply_err = pcall(controls.apply_action, controls, move_cmd, fire_cmd, start_cmd, coin_cmd)
     if not ok_apply then
         trace_log(frame_counter, "apply_action_error", tostring(apply_err), true)
@@ -905,6 +1028,10 @@ end
 
 print("Robotron socket target: " .. SOCKET_ADDRESS)
 controls = Controls:new(manager)
+if not controls then
+    print("Robotron AI Lua script aborted due to missing control mappings.")
+    return
+end
 open_socket()
 
 trace_log(nil, "session_start", "robotron lua init", true)

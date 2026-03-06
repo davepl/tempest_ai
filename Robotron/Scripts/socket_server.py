@@ -256,12 +256,39 @@ class SocketServer:
             self.client_states[cid] = {
                 "frames": 0, "last_time": time.time(), "fps": 0.0,
                 "level_number": 0, "last_state": None, "last_action": None,
+                "last_player_alive": False,
                 "last_action_source": None, "prev_action_source": None,
                 "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
             }
             metrics.client_count = len(self.client_states)
+
+    def _recv_exact(self, sock, nbytes: int, timeout_s: float = 0.5):
+        """Read exactly nbytes from a non-blocking socket, or return None on timeout/EOF."""
+        remaining = int(nbytes)
+        if remaining <= 0:
+            return b""
+        chunks = []
+        deadline = time.time() + max(0.001, float(timeout_s))
+
+        while remaining > 0 and self.running and not self.shutdown_event.is_set():
+            try:
+                chunk = sock.recv(remaining)
+            except (BlockingIOError, InterruptedError):
+                if time.time() >= deadline:
+                    return None
+                ready = select.select([sock], [], [], 0.002)
+                if not ready[0]:
+                    continue
+                continue
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining > 0:
+            return None
+        return b"".join(chunks)
 
     def handle_client(self, sock, cid):
         try:
@@ -287,20 +314,15 @@ class SocketServer:
                     continue
 
                 # Read length header
-                hdr = sock.recv(2)
-                if not hdr or len(hdr) < 2:
+                hdr = self._recv_exact(sock, 2, timeout_s=0.25)
+                if hdr is None or len(hdr) < 2:
                     raise ConnectionError("EOF")
                 dlen = struct.unpack(">H", hdr)[0]
 
                 # Read payload
-                data = b""
-                rem = dlen
-                while rem > 0:
-                    chunk = sock.recv(min(32768, rem))
-                    if not chunk:
-                        raise ConnectionError("Broken")
-                    data += chunk
-                    rem -= len(chunk)
+                data = self._recv_exact(sock, dlen, timeout_s=0.5)
+                if data is None:
+                    raise ConnectionError("Broken")
 
                 if len(data) >= 2:
                     n = struct.unpack(">H", data[:2])[0]
@@ -312,7 +334,7 @@ class SocketServer:
 
                 frame = parse_frame_data(data)
                 if not frame:
-                    sock.sendall(struct.pack("bb", 0, 0))
+                    sock.sendall(struct.pack("bb", -1, -1))
                     continue
 
                 with self.client_lock:
@@ -333,14 +355,22 @@ class SocketServer:
                 # Keep metrics synchronized to actual processed frames.
                 # Do not batch this by connection-local counters, because
                 # reconnects can reset local state and hide frame progress.
-                self.metrics.update_frame_count(delta=1)
-                self.metrics.update_epsilon()
-                self.metrics.update_expert_ratio()
+                # Count only active gameplay frames for RL schedules so
+                # attract/death downtime does not decay epsilon.
+                active_delta = 1 if frame.player_alive else 0
+                self.metrics.update_frame_count(delta=active_delta)
+                if active_delta:
+                    self.metrics.update_epsilon()
+                    self.metrics.update_expert_ratio()
                 self._calc_avg_level()
                 self.metrics.update_game_state(0, False)
 
                 # ── Process previous step ───────────────────────────────
-                if cs.get("last_state") is not None and cs.get("last_action") is not None:
+                if (
+                    cs.get("last_state") is not None
+                    and cs.get("last_action") is not None
+                    and cs.get("last_player_alive", False)
+                ):
                     move_i, fire_i = cs["last_action"]
                     subj_r = float(frame.subjreward) * RL_CONFIG.subj_reward_scale
                     obj_r = float(frame.objreward) * RL_CONFIG.obj_reward_scale
@@ -398,10 +428,11 @@ class SocketServer:
                             pass
                     cs["was_done"] = True
                     try:
-                        sock.sendall(struct.pack("bb", 0, 0))
+                        sock.sendall(struct.pack("bb", -1, -1))
                     except Exception:
                         break
                     cs["last_state"] = cs["last_action"] = None
+                    cs["last_player_alive"] = False
                     cs["last_action_source"] = cs["prev_action_source"] = None
                     cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
                     cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
@@ -413,6 +444,20 @@ class SocketServer:
                     cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
                     cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
                     cs["ep_frames"] = 0
+
+                # Do not let dead/attract frames pollute replay; actions are ignored there.
+                if not frame.player_alive:
+                    nstep = cs.get("nstep")
+                    if nstep is not None:
+                        nstep.reset()
+                    cs["last_state"] = cs["last_action"] = None
+                    cs["last_player_alive"] = False
+                    cs["last_action_source"] = cs["prev_action_source"] = None
+                    try:
+                        sock.sendall(struct.pack("bb", -1, -1))
+                    except Exception:
+                        break
+                    continue
 
                 # ── Choose action ───────────────────────────────────────
                 self.metrics.increment_total_controls()
@@ -431,6 +476,7 @@ class SocketServer:
 
                 cs["last_state"] = frame.state
                 cs["last_action"] = (move_idx, fire_idx)
+                cs["last_player_alive"] = bool(frame.player_alive)
                 cs["prev_action_source"] = action_source
                 cs["last_action_source"] = action_source
 

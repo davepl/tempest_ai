@@ -221,8 +221,8 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             metrics.last_q_mean = float(q_all.mean().item())
             agree = (pred == actions_t).float().mean().item()
             metrics.last_agreement = agree
-            # Debug: print once every 1000 steps
-            if agent.training_steps % 1000 == 0:
+            # Debug: print once every 1000 steps only in verbose mode.
+            if getattr(metrics, "verbose_mode", False) and agent.training_steps % 1000 == 0:
                 print(f"[DEBUG] step={agent.training_steps} agree={agree:.4f} pred_sample={pred[:5].tolist()} act_sample={actions_t[:5].tolist()}")
 
         if hasattr(metrics, "agree_sum_interval"):

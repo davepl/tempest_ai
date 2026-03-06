@@ -8,7 +8,6 @@
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, List, Optional, Tuple
-import numpy as np
 
 
 @dataclass
@@ -49,6 +48,9 @@ class NStepReplayBuffer:
 
         for i in range(min(self.n_step, len(self._deque))):
             step = self._deque[i]
+            # Do not aggregate returns across actor boundaries.
+            if i > 0 and step.actor != actor0:
+                break
             R += (self.gamma ** i) * step.reward
             priority_R += (self.gamma ** i) * step.priority_reward
             last_next = step.next_state
@@ -62,12 +64,14 @@ class NStepReplayBuffer:
     def _should_emit(self) -> bool:
         if not self._deque:
             return False
-        if len(self._deque) >= self.n_step:
-            return True
+        actor0 = self._deque[0].actor
         for i in range(min(self.n_step, len(self._deque))):
-            if self._deque[i].done:
+            step = self._deque[i]
+            if i > 0 and step.actor != actor0:
                 return True
-        return False
+            if step.done:
+                return True
+        return len(self._deque) >= self.n_step
 
     def add(self, state, action, reward, next_state, done,
             actor: Optional[str] = None, priority_reward: Optional[float] = None):

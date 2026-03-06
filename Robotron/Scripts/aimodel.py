@@ -87,7 +87,11 @@ NUM_JOINT = RL_CONFIG.num_joint_actions
 
 
 def _clamp_dir(idx: int) -> int:
-    return max(0, min(7, int(idx)))
+    i = int(idx)
+    if i < 0:
+        # Preserve -1 as an explicit neutral sentinel for Lua fallback paths.
+        return -1
+    return max(0, min(7, i))
 
 
 def _random_move_fire() -> Tuple[int, int]:
@@ -731,16 +735,27 @@ class RainbowAgent:
                 self._sync_event.record()  # recorded on default stream
 
     def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int, bool]:
-        """Return (move_dir_idx, fire_dir_idx, is_epsilon)."""
-        if random.random() < epsilon:
-            move_idx, fire_idx = _random_move_fire()
-            return move_idx, fire_idx, True
+        """Return (move_dir_idx, fire_dir_idx, is_epsilon).
 
+        Move and fire independently undergo epsilon-random exploration,
+        so the player can randomly explore firing while making a greedy
+        move, or vice versa.
+        """
+        rand_move = random.random() < epsilon
+        rand_fire = random.random() < epsilon
+
+        if rand_move and rand_fire:
+            return random.randrange(NUM_MOVE), random.randrange(NUM_FIRE), True
+
+        # Need greedy action for at least one axis
         st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
         q = self._infer_q_values(st)
         joint = int(q.argmax(dim=1).item())
-        move_idx, fire_idx = split_joint_action(joint)
-        return move_idx, fire_idx, False
+        greedy_move, greedy_fire = split_joint_action(joint)
+
+        move_idx = random.randrange(NUM_MOVE) if rand_move else greedy_move
+        fire_idx = random.randrange(NUM_FIRE) if rand_fire else greedy_fire
+        return move_idx, fire_idx, rand_move or rand_fire
 
     def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
         net = self.infer_net if self.use_separate_inference else self.online_net
@@ -759,34 +774,55 @@ class RainbowAgent:
 
     def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int, bool]]:
         """Return batched actions for aligned state/epsilon lists.
-        Each element is (move_dir_idx, fire_dir_idx, is_epsilon)."""
+        Each element is (move_dir_idx, fire_dir_idx, is_epsilon).
+
+        Move and fire independently undergo epsilon-random exploration.
+        """
         n = min(len(states), len(epsilons))
         if n <= 0:
             return []
 
-        actions: list[Tuple[int, int, bool] | None] = [None] * n
+        # Independent epsilon flips for move and fire per element
+        rand_moves = [False] * n
+        rand_fires = [False] * n
+        rnd_move_vals = [0] * n
+        rnd_fire_vals = [0] * n
         greedy_idx: list[int] = []
         greedy_states: list[np.ndarray] = []
 
         for i in range(n):
             eps = float(epsilons[i])
-            if random.random() < eps:
-                move_idx, fire_idx = _random_move_fire()
-                actions[i] = (move_idx, fire_idx, True)
-            else:
+            rand_moves[i] = random.random() < eps
+            rand_fires[i] = random.random() < eps
+            if rand_moves[i]:
+                rnd_move_vals[i] = random.randrange(NUM_MOVE)
+            if rand_fires[i]:
+                rnd_fire_vals[i] = random.randrange(NUM_FIRE)
+            # Need inference whenever at least one axis is greedy
+            if not (rand_moves[i] and rand_fires[i]):
                 greedy_idx.append(i)
                 greedy_states.append(states[i])
 
+        greedy_actions: dict[int, Tuple[int, int]] = {}
         if greedy_idx:
             batch_np = np.asarray(greedy_states, dtype=np.float32)
             st = torch.from_numpy(batch_np).to(self.inference_device)
             q = self._infer_q_values(st)
             joints = q.argmax(dim=1).detach().cpu().tolist()
             for pos, joint in zip(greedy_idx, joints):
-                move_idx, fire_idx = split_joint_action(int(joint))
-                actions[pos] = (move_idx, fire_idx, False)
+                greedy_actions[pos] = split_joint_action(int(joint))
 
-        return [a if a is not None else (0, 0, False) for a in actions]
+        actions: list[Tuple[int, int, bool]] = []
+        for i in range(n):
+            if rand_moves[i] and rand_fires[i]:
+                actions.append((rnd_move_vals[i], rnd_fire_vals[i], True))
+            else:
+                g_move, g_fire = greedy_actions.get(i, (0, 0))
+                m = rnd_move_vals[i] if rand_moves[i] else g_move
+                f = rnd_fire_vals[i] if rand_fires[i] else g_fire
+                actions.append((m, f, rand_moves[i] or rand_fires[i]))
+
+        return actions
 
     # ── Step (add experience) ───────────────────────────────────────────
     def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None):
