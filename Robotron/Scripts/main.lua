@@ -856,13 +856,19 @@ local function draw_debug_hud()
 
     local r = HUD_RING_RADIUS
 
+    -- Helper: draw a diamond (4 lines) to approximate a circle outline.
+    local function draw_diamond(cx, cy, rad, color)
+        mame_screen:draw_line(cx, cy - rad, cx + rad, cy, color)   -- top to right
+        mame_screen:draw_line(cx + rad, cy, cx, cy + rad, color)   -- right to bottom
+        mame_screen:draw_line(cx, cy + rad, cx - rad, cy, color)   -- bottom to left
+        mame_screen:draw_line(cx - rad, cy, cx, cy - rad, color)   -- left to top
+    end
+
     -- Player ring
     if hud_player_x16 and hud_player_y16 then
         local px = ((hud_player_x16 >> 8) & 0xFF) * 2
         local py = (hud_player_y16 >> 8) & 0xFF
-        pcall(function()
-            mame_screen:draw_box(px - r, py - r, px + r, py + r, 0x00000000, HUD_PLAYER_COLOR)
-        end)
+        pcall(function() draw_diamond(px, py, r, HUD_PLAYER_COLOR) end)
     end
 
     -- Entity rings + rank numbers
@@ -873,11 +879,8 @@ local function draw_debug_hud()
                 if color then
                     local sx = ((obj.x16 >> 8) & 0xFF) * 2
                     local sy = (obj.y16 >> 8) & 0xFF
-                    pcall(function()
-                        mame_screen:draw_box(sx - r, sy - r, sx + r, sy + r,
-                                             0x00000000, color)
-                    end)
-                    -- Distance rank number just below the ring
+                    pcall(function() draw_diamond(sx, sy, r, color) end)
+                    -- Distance rank number just below the diamond
                     if obj.rank then
                         pcall(function()
                             mame_screen:draw_text(sx - 3, sy + r + 1,
