@@ -15,6 +15,7 @@ from collections import deque
 
 from aimodel import (
     parse_frame_data,
+    get_expert_action,
     encode_action_to_game,
     combine_action_indices,
     split_joint_action,
@@ -56,14 +57,18 @@ def _apply_fire_hold(cs: dict, raw_fire: int) -> int:
     On each tick the most-recently-commanded direction is adopted.
     This guarantees LSPROC's 3-stable-frame requirement while letting
     the model's latest intent always win on the next boundary."""
+    # Always track the newest requested fire direction so commands issued
+    # during a hold window are not dropped.
+    cs["fire_pending_dir"] = int(raw_fire)
     count = cs.get("fire_hold_count", 0)
     if count > 0:
         cs["fire_hold_count"] = count - 1
         return cs.get("fire_hold_dir", raw_fire)
-    # Cadence tick: adopt the model's current (latest) request
-    cs["fire_hold_dir"] = raw_fire
+    # Cadence tick: adopt the latest queued request.
+    next_fire = int(cs.get("fire_pending_dir", raw_fire))
+    cs["fire_hold_dir"] = next_fire
     cs["fire_hold_count"] = FIRE_HOLD_FRAMES - 1
-    return raw_fire
+    return next_fire
 
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
@@ -154,11 +159,12 @@ class AsyncReplayBuffer:
 
 
 class _InferenceRequest:
-    __slots__ = ("state", "epsilon", "event", "action")
+    __slots__ = ("state", "epsilon", "locked_fire", "event", "action")
 
-    def __init__(self, state, epsilon: float):
+    def __init__(self, state, epsilon: float, locked_fire: int | None = None):
         self.state = state
         self.epsilon = float(epsilon)
+        self.locked_fire = locked_fire
         self.event = threading.Event()
         self.action = None
 
@@ -176,16 +182,16 @@ class AsyncInferenceBatcher:
         self._thread = threading.Thread(target=self._consume, daemon=True, name="InferBatchWorker")
         self._thread.start()
 
-    def infer(self, state, epsilon: float):
+    def infer(self, state, epsilon: float, locked_fire: int | None = None):
         if not self.running:
-            return self.agent.act(state, epsilon)
-        req = _InferenceRequest(state, epsilon)
+            return self.agent.act(state, epsilon, locked_fire=locked_fire)
+        req = _InferenceRequest(state, epsilon, locked_fire=locked_fire)
         try:
             self.queue.put(req, timeout=self.request_timeout_s)
         except queue.Full:
-            return self.agent.act(state, epsilon)
+            return self.agent.act(state, epsilon, locked_fire=locked_fire)
         if not req.event.wait(timeout=self.request_timeout_s):
-            return self.agent.act(state, epsilon)
+            return self.agent.act(state, epsilon, locked_fire=locked_fire)
         return req.action if req.action is not None else (0, 0, False)
 
     def _consume(self):
@@ -209,7 +215,8 @@ class AsyncInferenceBatcher:
             try:
                 states = [r.state for r in batch]
                 epsilons = [r.epsilon for r in batch]
-                actions = self.agent.act_batch(states, epsilons)
+                locked_fires = [r.locked_fire for r in batch]
+                actions = self.agent.act_batch(states, epsilons, locked_fires=locked_fires)
             except Exception as e:
                 print(f"AsyncInferenceBatcher error: {e}")
                 actions = []
@@ -218,7 +225,7 @@ class AsyncInferenceBatcher:
                 act = actions[idx] if idx < len(actions) else None
                 if act is None:
                     try:
-                        act = self.agent.act(req.state, req.epsilon)
+                        act = self.agent.act(req.state, req.epsilon, locked_fire=req.locked_fire)
                     except Exception:
                         act = (0, 0, False)
                 req.action = act
@@ -279,6 +286,9 @@ class SocketServer:
         n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
         nstep = NStepReplayBuffer(n_step=n, gamma=gamma) if n > 1 else None
+        move_bins = max(1, int(getattr(RL_CONFIG, "num_move_actions", 8)))
+        fire_bins = max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8)))
+        pair_bins = move_bins * fire_bins
         with self.client_lock:
             self.client_states[cid] = {
                 "frames": 0, "last_time": time.time(), "fps": 0.0,
@@ -287,13 +297,14 @@ class SocketServer:
                 "last_action_source": None, "prev_action_source": None,
                 "act_total": 0, "act_eps": 0, "act_last_diag_total": 0,
                 "act_same": 0, "act_diff": 0,
-                "act_move_hist": [0] * 8, "act_fire_hist": [0] * 8,
-                "act_pair_hist": [0] * 64,
-                "act_move_hist_eps": [0] * 8, "act_fire_hist_eps": [0] * 8,
-                "act_pair_hist_eps": [0] * 64,
+                "act_move_hist": [0] * move_bins, "act_fire_hist": [0] * fire_bins,
+                "act_pair_hist": [0] * pair_bins,
+                "act_move_hist_eps": [0] * move_bins, "act_fire_hist_eps": [0] * fire_bins,
+                "act_pair_hist_eps": [0] * pair_bins,
                 "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
+                "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
             }
             metrics.client_count = len(self.client_states)
 
@@ -446,6 +457,7 @@ class SocketServer:
                     # Reset fire hold on death
                     cs["fire_hold_dir"] = -1
                     cs["fire_hold_count"] = 0
+                    cs["fire_pending_dir"] = -1
                     # Boost priorities of the last N frames for this client
                     if self.async_buffer is not None:
                         self.async_buffer.boost_pre_death(cid)
@@ -492,6 +504,7 @@ class SocketServer:
                     # Reset fire hold when player is dead
                     cs["fire_hold_dir"] = -1
                     cs["fire_hold_count"] = 0
+                    cs["fire_pending_dir"] = -1
                     try:
                         sock.sendall(struct.pack("bb", -1, -1))
                     except Exception:
@@ -504,42 +517,78 @@ class SocketServer:
                 action_source = "none"
                 is_epsilon = False
                 epsilon = self.metrics.get_effective_epsilon()
+                # Fire updates only on cadence boundaries; between boundaries
+                # we keep fire fixed so decisions are not silently overwritten.
+                fire_update_open = int(cs.get("fire_hold_count", 0)) <= 0
+                locked_fire = None
+                if not fire_update_open:
+                    held = int(cs.get("fire_hold_dir", -1))
+                    if held >= 0:
+                        max_fire = max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8)))
+                        locked_fire = max(0, min(max_fire - 1, held))
+                    else:
+                        locked_fire = 0
 
                 if _FORCE_RANDOM_ACTIONS:
                     move_idx = random.randrange(max(1, int(getattr(RL_CONFIG, "num_move_actions", 8))))
-                    fire_idx = random.randrange(max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8))))
+                    if fire_update_open:
+                        fire_idx = random.randrange(max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8))))
+                    else:
+                        fire_idx = int(locked_fire)
                     is_epsilon = True
                     action_source = "forced_random"
                 elif self.agent:
-                    t0 = time.perf_counter()
-                    if self.inference_batcher is not None:
-                        move_idx, fire_idx, is_epsilon = self.inference_batcher.infer(frame.state, epsilon)
+                    expert_ratio = self.metrics.get_expert_ratio()
+                    use_expert = (random.random() < expert_ratio) and not self.metrics.override_expert
+                    if use_expert:
+                        move_idx, fire_idx = get_expert_action(frame.state, locked_fire=locked_fire)
+                        is_epsilon = False
+                        action_source = "expert"
                     else:
-                        move_idx, fire_idx, is_epsilon = self.agent.act(frame.state, epsilon)
-                    self.metrics.add_inference_time(time.perf_counter() - t0)
-                    action_source = "dqn"
+                        t0 = time.perf_counter()
+                        if self.inference_batcher is not None:
+                            move_idx, fire_idx, is_epsilon = self.inference_batcher.infer(
+                                frame.state, epsilon, locked_fire=locked_fire
+                            )
+                        else:
+                            move_idx, fire_idx, is_epsilon = self.agent.act(
+                                frame.state, epsilon, locked_fire=locked_fire
+                            )
+                        self.metrics.add_inference_time(time.perf_counter() - t0)
+                        action_source = "dqn"
+
+                move_hist = cs.get("act_move_hist", [])
+                fire_hist = cs.get("act_fire_hist", [])
+                pair_hist = cs.get("act_pair_hist", [])
+                move_hist_eps = cs.get("act_move_hist_eps", [])
+                fire_hist_eps = cs.get("act_fire_hist_eps", [])
+                pair_hist_eps = cs.get("act_pair_hist_eps", [])
+                move_bins = len(move_hist)
+                fire_bins = len(fire_hist)
 
                 cs["act_total"] = int(cs.get("act_total", 0)) + 1
-                if 0 <= int(move_idx) <= 7:
-                    cs["act_move_hist"][int(move_idx)] += 1
-                if 0 <= int(fire_idx) <= 7:
-                    cs["act_fire_hist"][int(fire_idx)] += 1
-                if 0 <= int(move_idx) <= 7 and 0 <= int(fire_idx) <= 7:
-                    pair_idx = int(move_idx) * 8 + int(fire_idx)
-                    cs["act_pair_hist"][pair_idx] += 1
+                if 0 <= int(move_idx) < move_bins:
+                    move_hist[int(move_idx)] += 1
+                if 0 <= int(fire_idx) < fire_bins:
+                    fire_hist[int(fire_idx)] += 1
+                if 0 <= int(move_idx) < move_bins and 0 <= int(fire_idx) < fire_bins:
+                    pair_idx = int(move_idx) * fire_bins + int(fire_idx)
+                    if 0 <= pair_idx < len(pair_hist):
+                        pair_hist[pair_idx] += 1
                 if int(move_idx) == int(fire_idx):
                     cs["act_same"] = int(cs.get("act_same", 0)) + 1
                 else:
                     cs["act_diff"] = int(cs.get("act_diff", 0)) + 1
                 if is_epsilon:
                     cs["act_eps"] = int(cs.get("act_eps", 0)) + 1
-                    if 0 <= int(move_idx) <= 7:
-                        cs["act_move_hist_eps"][int(move_idx)] += 1
-                    if 0 <= int(fire_idx) <= 7:
-                        cs["act_fire_hist_eps"][int(fire_idx)] += 1
-                    if 0 <= int(move_idx) <= 7 and 0 <= int(fire_idx) <= 7:
-                        pair_idx = int(move_idx) * 8 + int(fire_idx)
-                        cs["act_pair_hist_eps"][pair_idx] += 1
+                    if 0 <= int(move_idx) < move_bins:
+                        move_hist_eps[int(move_idx)] += 1
+                    if 0 <= int(fire_idx) < fire_bins:
+                        fire_hist_eps[int(fire_idx)] += 1
+                    if 0 <= int(move_idx) < move_bins and 0 <= int(fire_idx) < fire_bins:
+                        pair_idx = int(move_idx) * fire_bins + int(fire_idx)
+                        if 0 <= pair_idx < len(pair_hist_eps):
+                            pair_hist_eps[pair_idx] += 1
                 if _ACTION_DIAGNOSTICS:
                     last_diag = int(cs.get("act_last_diag_total", 0))
                     total = int(cs.get("act_total", 0))
@@ -550,7 +599,10 @@ class SocketServer:
                             for idx, cnt in tops:
                                 if cnt <= 0:
                                     break
-                                out.append(f"{idx // 8}->{idx % 8}:{cnt}")
+                                if fire_bins > 0:
+                                    out.append(f"{idx // fire_bins}->{idx % fire_bins}:{cnt}")
+                                else:
+                                    out.append(f"{idx}:{cnt}")
                                 if len(out) >= k:
                                     break
                             return "[" + ", ".join(out) + "]"
@@ -571,10 +623,10 @@ class SocketServer:
                         )
                         cs["act_last_diag_total"] = total
 
-                # Apply fire hold so the replay stores the EFFECTIVE fire
-                # direction, not the model's raw request.  This is critical:
-                # the game needs 3 stable frames to register a shot (LSPROC),
-                # and the reward reflects the effective direction, not the raw.
+                # Apply fire hold and store the EFFECTIVE fire direction.
+                # Since fire selection is gated to hold boundaries above, we
+                # avoid dropping 3/4 fire decisions while still satisfying
+                # LSPROC's 3-stable-frame requirement.
                 effective_fire = _apply_fire_hold(cs, fire_idx)
 
                 cs["last_state"] = frame.state

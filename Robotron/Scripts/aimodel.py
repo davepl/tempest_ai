@@ -79,19 +79,34 @@ else:
     device = torch.device("cpu")
 
 # ── Action helpers ──────────────────────────────────────────────────────────
-# Direction encoding (8-way sticks):
-#   0=UP, 1=UP_RIGHT, 2=RIGHT, 3=DOWN_RIGHT, 4=DOWN, 5=DOWN_LEFT, 6=LEFT, 7=UP_LEFT
+# Direction encoding:
+#   Move: 0..7 are directions, 8 is idle/no-move (when enabled via num_move_actions=9)
+#   Fire: 0..7 are directions (no idle action in policy space)
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
 
 
-def _clamp_dir(idx: int) -> int:
+def _clamp_game_dir(idx: int) -> int:
     i = int(idx)
     if i < 0:
         # Preserve -1 as an explicit neutral sentinel for Lua fallback paths.
         return -1
     return max(0, min(7, i))
+
+
+def _move_idle_action_index() -> int:
+    # Convention: if an explicit move-idle action exists, it is the final move bin.
+    if NUM_MOVE >= 9:
+        return NUM_MOVE - 1
+    return 0
+
+
+def _encode_move_to_game(move_dir: int) -> int:
+    i = int(move_dir)
+    if NUM_MOVE >= 9 and i == (NUM_MOVE - 1):
+        return -1
+    return _clamp_game_dir(i)
 
 
 def _random_move_fire() -> Tuple[int, int]:
@@ -110,7 +125,7 @@ def split_joint_action(idx: int) -> Tuple[int, int]:
 
 
 def encode_action_to_game(move_dir: int, fire_dir: int) -> Tuple[int, int]:
-    return _clamp_dir(move_dir), _clamp_dir(fire_dir)
+    return _encode_move_to_game(move_dir), _clamp_game_dir(fire_dir)
 
 # ── Frame data ──────────────────────────────────────────────────────────────
 @dataclass
@@ -153,10 +168,111 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         print(f"Parse error: {e}")
         return None
 
-# ── Expert system placeholder ───────────────────────────────────────────────
-def get_expert_action(*_args, **_kwargs):
-    """Robotron expert policy is not implemented yet."""
-    return 0, 0
+# ── Expert system (heuristic) ───────────────────────────────────────────────
+_DIR8_VECTORS: tuple[tuple[float, float], ...] = (
+    (0.0, -1.0),                     # up
+    (0.70710678, -0.70710678),       # up-right
+    (1.0, 0.0),                      # right
+    (0.70710678, 0.70710678),        # down-right
+    (0.0, 1.0),                      # down
+    (-0.70710678, 0.70710678),       # down-left
+    (-1.0, 0.0),                     # left
+    (-0.70710678, -0.70710678),      # up-left
+)
+
+# Lua encodes relative dx/dy with different per-axis divisors:
+#   rel_x = delta_x / 34816, rel_y = delta_y / 53760
+# Re-scale before direction quantisation so 8-way aiming uses true geometry.
+_REL_POS_X_RANGE = 34816.0
+_REL_POS_Y_RANGE = 53760.0
+
+
+def _closest_dir8(vx: float, vy: float, default_dir: int = 0) -> int:
+    if not np.isfinite(vx) or not np.isfinite(vy):
+        return int(default_dir)
+    mag2 = (vx * vx) + (vy * vy)
+    if mag2 <= 1e-10:
+        return int(default_dir)
+    best_idx = int(default_dir)
+    best_dot = -1e30
+    for i, (dx, dy) in enumerate(_DIR8_VECTORS):
+        dot = vx * dx + vy * dy
+        if dot > best_dot:
+            best_dot = dot
+            best_idx = i
+    return best_idx
+
+
+def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    """Return (dx, dy, dist) for nearest non-human object in typed slot state."""
+    s = np.asarray(state, dtype=np.float32).reshape(-1)
+    state_size = int(getattr(RL_CONFIG, "state_size", 0))
+    if state_size > 0 and s.size > state_size:
+        # If future state stacking is enabled, use the most recent frame slice.
+        s = s[-state_size:]
+    if s.size < 60:
+        return None
+
+    cat_defs = getattr(RL_CONFIG, "entity_categories", [])
+    if not cat_defs:
+        return None
+
+    base = 59  # 9 core + 50 ELIST
+    best: Optional[Tuple[float, float, float]] = None
+    for name, slots in cat_defs:
+        n_slots = int(slots)
+        if n_slots <= 0:
+            continue
+        slot_base = base + 1  # skip occupancy
+        if name == "human":
+            base += 1 + n_slots * 4
+            continue
+
+        # Slots are nearest-first within each category; scan until first present.
+        for j in range(n_slots):
+            i = slot_base + j * 4
+            if i + 3 >= s.size:
+                break
+            present = float(s[i])
+            if present < 0.5:
+                continue
+            dx = float(s[i + 1])
+            dy = float(s[i + 2])
+            dist = float(s[i + 3])
+            if not np.isfinite(dist):
+                # Keep scanning this category for a valid nearest entry.
+                continue
+            if best is None or dist < best[2]:
+                best = (dx, dy, dist)
+            break
+
+        base += 1 + n_slots * 4
+
+    return best
+
+
+def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> Tuple[int, int]:
+    """Heuristic Robotron expert.
+
+    - Move away from nearest enemy vector.
+    - Fire toward nearest enemy vector.
+    - If locked_fire is set (fire hold cadence), keep that fire direction.
+    """
+    nearest = _nearest_enemy_vector_from_state(state)
+    if nearest is None:
+        fire_dir = 0
+        if locked_fire is not None and int(locked_fire) >= 0:
+            fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
+        return _move_idle_action_index(), fire_dir
+
+    ex, ey, _ = nearest
+    ex_world = ex * _REL_POS_X_RANGE
+    ey_world = ey * _REL_POS_Y_RANGE
+    move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
+    fire_dir = _closest_dir8(ex_world, ey_world, default_dir=0)
+    if locked_fire is not None and int(locked_fire) >= 0:
+        fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
+    return move_dir, fire_dir
 
 # ── Enemy-Slot Self-Attention ───────────────────────────────────────────────
 class EnemyAttention(nn.Module):
@@ -743,14 +859,34 @@ class RainbowAgent:
             if self._sync_event is not None:
                 self._sync_event.record()  # recorded on default stream
 
-    def act(self, state: np.ndarray, epsilon: float) -> Tuple[int, int, bool]:
+    def act(self, state: np.ndarray, epsilon: float, locked_fire: Optional[int] = None) -> Tuple[int, int, bool]:
         """Return (move_dir_idx, fire_dir_idx, is_epsilon).
 
         Move and fire independently undergo epsilon-random exploration,
         so the player can randomly explore firing while making a greedy
         move, or vice versa.
+
+        If locked_fire >= 0, only the move axis is decided; fire is fixed
+        to locked_fire (used by fire-hold cadence in the socket server).
         """
+        lock_fire = None
+        if locked_fire is not None:
+            lf = int(locked_fire)
+            if lf >= 0:
+                lock_fire = max(0, min(NUM_FIRE - 1, lf))
+
         rand_move = random.random() < epsilon
+        if lock_fire is not None:
+            if rand_move:
+                return random.randrange(NUM_MOVE), lock_fire, True
+            st = torch.from_numpy(state).float().unsqueeze(0).to(self.inference_device)
+            q = self._infer_q_values(st)
+            # For move-only greedy selection, maximize over fire axis.
+            q_joint = q.view(-1, NUM_MOVE, NUM_FIRE)
+            move_scores = q_joint.max(dim=2).values
+            greedy_move = int(move_scores.argmax(dim=1)[0].item())
+            return greedy_move, lock_fire, False
+
         rand_fire = random.random() < epsilon
 
         if rand_move and rand_fire:
@@ -801,34 +937,61 @@ class RainbowAgent:
                     return net.q_values(states_t)
             return net.q_values(states_t)
 
-    def act_batch(self, states: list[np.ndarray], epsilons: list[float]) -> list[Tuple[int, int, bool]]:
+    def act_batch(
+        self,
+        states: list[np.ndarray],
+        epsilons: list[float],
+        locked_fires: Optional[list[Optional[int]]] = None,
+    ) -> list[Tuple[int, int, bool]]:
         """Return batched actions for aligned state/epsilon lists.
         Each element is (move_dir_idx, fire_dir_idx, is_epsilon).
 
-        Move and fire independently undergo epsilon-random exploration.
+        Move and fire independently undergo epsilon-random exploration unless
+        a per-element locked_fires entry is provided (>=0), in which case
+        fire is held fixed and only move is selected.
         """
         n = min(len(states), len(epsilons))
         if n <= 0:
             return []
+        if locked_fires is None:
+            lock_list: list[Optional[int]] = [None] * n
+        else:
+            lock_list = list(locked_fires[:n])
+            if len(lock_list) < n:
+                lock_list.extend([None] * (n - len(lock_list)))
 
         # Independent epsilon flips for move and fire per element
         rand_moves = [False] * n
         rand_fires = [False] * n
         rnd_move_vals = [0] * n
         rnd_fire_vals = [0] * n
+        fire_fixed = [False] * n
+        fire_fixed_vals = [0] * n
         greedy_idx: list[int] = []
         greedy_states: list[np.ndarray] = []
 
         for i in range(n):
             eps = float(epsilons[i])
+            lf = lock_list[i]
+            if lf is not None:
+                lf_i = int(lf)
+                if lf_i >= 0:
+                    fire_fixed[i] = True
+                    fire_fixed_vals[i] = max(0, min(NUM_FIRE - 1, lf_i))
             rand_moves[i] = random.random() < eps
-            rand_fires[i] = random.random() < eps
             if rand_moves[i]:
                 rnd_move_vals[i] = random.randrange(NUM_MOVE)
-            if rand_fires[i]:
-                rnd_fire_vals[i] = random.randrange(NUM_FIRE)
-            # Need inference whenever at least one axis is greedy
-            if not (rand_moves[i] and rand_fires[i]):
+            if fire_fixed[i]:
+                rand_fires[i] = False
+                rnd_fire_vals[i] = fire_fixed_vals[i]
+                needs_greedy = not rand_moves[i]  # need greedy move only
+            else:
+                rand_fires[i] = random.random() < eps
+                if rand_fires[i]:
+                    rnd_fire_vals[i] = random.randrange(NUM_FIRE)
+                # Need inference whenever at least one axis is greedy
+                needs_greedy = not (rand_moves[i] and rand_fires[i])
+            if needs_greedy:
                 greedy_idx.append(i)
                 greedy_states.append(states[i])
 
@@ -837,26 +1000,31 @@ class RainbowAgent:
             batch_np = np.asarray(greedy_states, dtype=np.float32)
             st = torch.from_numpy(batch_np).to(self.inference_device)
             q = self._infer_q_values(st)
+            gm_t, gf_t = self._greedy_axes_from_q(q)
+            gm = gm_t.detach().cpu().tolist()
+            gf = gf_t.detach().cpu().tolist()
             if self.factored_greedy_action:
-                gm_t, gf_t = self._greedy_axes_from_q(q)
-                gm = gm_t.detach().cpu().tolist()
-                gf = gf_t.detach().cpu().tolist()
                 for pos, m, f in zip(greedy_idx, gm, gf):
                     greedy_actions[pos] = (int(m), int(f))
             else:
                 joints = q.argmax(dim=1).detach().cpu().tolist()
-                for pos, joint in zip(greedy_idx, joints):
-                    greedy_actions[pos] = split_joint_action(int(joint))
+                for k, (pos, joint) in enumerate(zip(greedy_idx, joints)):
+                    if fire_fixed[pos]:
+                        # When fire is locked, move should still be greedy over
+                        # fire axis rather than tied to a joint argmax fire.
+                        greedy_actions[pos] = (int(gm[k]), int(gf[k]))
+                    else:
+                        greedy_actions[pos] = split_joint_action(int(joint))
 
         actions: list[Tuple[int, int, bool]] = []
         for i in range(n):
-            if rand_moves[i] and rand_fires[i]:
-                actions.append((rnd_move_vals[i], rnd_fire_vals[i], True))
+            g_move, g_fire = greedy_actions.get(i, (0, 0))
+            m = rnd_move_vals[i] if rand_moves[i] else g_move
+            if fire_fixed[i]:
+                f = fire_fixed_vals[i]
             else:
-                g_move, g_fire = greedy_actions.get(i, (0, 0))
-                m = rnd_move_vals[i] if rand_moves[i] else g_move
                 f = rnd_fire_vals[i] if rand_fires[i] else g_fire
-                actions.append((m, f, rand_moves[i] or rand_fires[i]))
+            actions.append((m, f, rand_moves[i] or rand_fires[i]))
 
         return actions
 
@@ -1069,14 +1237,18 @@ class RainbowAgent:
 
             try:
                 with metrics.lock:
+                    ckpt_expert_ratio = float(ckpt.get("expert_ratio", RL_CONFIG.expert_ratio_start))
+                    if not math.isfinite(ckpt_expert_ratio):
+                        ckpt_expert_ratio = RL_CONFIG.expert_ratio_start
+                    ckpt_expert_ratio = max(0.0, min(1.0, ckpt_expert_ratio))
                     if not RESET_METRICS:
-                        metrics.expert_ratio = 0.0
+                        metrics.expert_ratio = ckpt_expert_ratio
                         metrics.epsilon = ckpt.get("epsilon", RL_CONFIG.epsilon_start)
                         metrics.frame_count = int(ckpt.get("frame_count", 0))
                         metrics.loaded_frame_count = metrics.frame_count
                         metrics.total_training_steps = int(ckpt.get("total_training_steps", self.training_steps))
                     else:
-                        metrics.expert_ratio = 0.0
+                        metrics.expert_ratio = RL_CONFIG.expert_ratio_start
                         metrics.epsilon = RL_CONFIG.epsilon_start
                         metrics.frame_count = 0
                         metrics.loaded_frame_count = 0

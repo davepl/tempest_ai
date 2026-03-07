@@ -359,8 +359,13 @@ def main():
 
     threading.Thread(target=stats_reporter, args=(agent, kb), daemon=True).start()
 
+    last_save = time.time()
     try:
         while srv_thread.is_alive() and not server.shutdown_event.is_set():
+            if time.time() - last_save >= 300:
+                # Quiet periodic autosave to keep metrics rows clean.
+                agent.save(LATEST_MODEL_PATH, show_status=False)
+                last_save = time.time()
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard interrupt, shutting down...")

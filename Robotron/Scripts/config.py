@@ -61,9 +61,10 @@ class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     state_size: int = SERVER_CONFIG.params_count
 
-    # Factored action space for Robotron dual 8-way sticks:
-    #   movement_direction (0..7) × firing_direction (0..7) = 64 actions
-    num_move_actions: int = 8
+    # Factored action space for Robotron dual sticks:
+    #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
+    #   = 9 × 8 = 72 joint actions
+    num_move_actions: int = 9
     num_fire_actions: int = 8
     # Decode greedy action from the SAME joint Q head used for training.
     # Factored greedy (axis-wise argmax) can pick a low-value pair that is
@@ -102,12 +103,12 @@ class RLConfigData:
 
     # Distributional C51
     # Robotron per-frame rewards: grunt=100, brain=500, human rescue=1000-5000.
-    # With obj_reward_scale=0.01, these become 1-50. Support [-250,250] gives
-    # headroom for n-step=3 accumulation (max ~150) and multi-episode Q growth.
+    # With obj_reward_scale=0.02 and reward_clip=20, per-step targets stay within
+    # a range compatible with n-step=12 and this support.
     use_distributional: bool = True
     num_atoms: int = 51
-    v_min: float = -250.0
-    v_max: float = 250.0
+    v_min: float = -300.0
+    v_max: float = 300.0
 
     use_dueling: bool = True
 
@@ -119,8 +120,8 @@ class RLConfigData:
     lr_cosine_period: int = 3_000_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
-    n_step: int = 3
-    max_samples_per_frame: float = 10
+    n_step: int = 12
+    max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
     memory_size: int = 20_000_000
@@ -134,8 +135,8 @@ class RLConfigData:
     priority_beta_frames: int = 10_000_000
     priority_eps: float = 1e-6
     per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
-    # Start training earlier during bring-up so end-to-end control learns quickly.
-    min_replay_to_train: int = 1_024
+    # Delay training until replay has enough diversity for stable updates.
+    min_replay_to_train: int = 25_000
 
     # Target network (periodic hard sync; moderate refresh for stable learning)
     target_update_period: int = 2_500
@@ -147,36 +148,36 @@ class RLConfigData:
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
     epsilon_end: float = 0.02
-    epsilon_decay_frames: int = 35_000_000
+    epsilon_decay_frames: int = 8_000_000
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000
     epsilon: float = 1.0
 
     # Expert guidance
-    expert_ratio_start: float = 0.0
-    expert_ratio_end: float = 0.0
-    expert_ratio_decay_frames: int = 5_000_000
-    expert_ratio: float = 0.0
-    # For the Robotron baseline there is no expert policy yet; keep disabled.
+    expert_ratio_start: float = 0.20
+    expert_ratio_end: float = 0.02
+    expert_ratio_decay_frames: int = 8_000_000
+    expert_ratio: float = 0.20
+    # No special zoom handling for Robotron; keep multipliers neutral.
     expert_ratio_zoom_multiplier: float = 1.0
     expert_ratio_zoom_gamestate: int = 0x00
     epsilon_zoom_multiplier: float = 1.0
 
-    # Expert BC disabled for Robotron bring-up (no expert policy yet).
-    expert_bc_weight: float = 0.0
+    # Moderate BC anchor from heuristic expert transitions.
+    expert_bc_weight: float = 0.2
     expert_bc_decay_start: int = 500_000
-    expert_bc_decay_frames: int = 2_000_000
-    expert_bc_min_weight: float = 0.0
+    expert_bc_decay_frames: int = 4_000_000
+    expert_bc_min_weight: float = 0.01
 
     # ── reward ──────────────────────────────────────────────────────────
-    # Scale objective rewards to fit C51 support. Human rescue (5000) → 50,
-    # grunt kill (100) → 1. Preserves relative importance while fitting support.
-    obj_reward_scale: float = 0.1
-    point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
+    # Scale objective rewards to fit C51 support while keeping TD targets stable.
+    # Human rescue (5000) -> 100 before clip; clipped by reward_clip=20.
+    obj_reward_scale: float = 0.02
+    point_reward_scale: float = 1.0 / obj_reward_scale
     subj_reward_scale: float = 0.001
-    reward_clip: float = 100.0          # Post-scaling: 10000 raw pts → 100
-    death_reward_clip: float = 100.0
+    reward_clip: float = 20.0
+    death_reward_clip: float = 20.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
@@ -406,7 +407,7 @@ class MetricsData:
     manual_pulse_frames_remaining: int = 0
     training_enabled: bool = True
     verbose_mode: bool = False
-    saved_expert_ratio: float = 0.0
+    saved_expert_ratio: float = RL_CONFIG.expert_ratio_start
 
     global_server: object = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -473,16 +474,20 @@ class MetricsData:
 
     def get_expert_ratio(self):
         with self.lock:
-            return 0.0
+            if self.override_expert:
+                return 0.0
+            xp = game_settings.expert_pct
+            if xp >= 0:
+                return xp / 100.0
+            return float(self.expert_ratio)
 
     def update_expert_ratio(self):
         with self.lock:
-            # Robotron currently runs without any expert policy.
-            self.expert_mode = False
-            self.override_expert = False
-            self.manual_expert_override = False
-            self.expert_ratio = 0.0
-            return 0.0
+            if self.expert_mode or self.override_expert or self.manual_expert_override:
+                return self.expert_ratio
+            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.expert_ratio_decay_frames))
+            self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
+            return self.expert_ratio
 
     def add_episode_reward(self, total, dqn, expert, subj=None, obj=None, length=0):
         with self.lock:
@@ -525,15 +530,21 @@ class MetricsData:
     # ── UI toggle methods ───────────────────────────────────────────────
     def toggle_override(self, kb=None):
         with self.lock:
-            self.override_expert = False
-            self.saved_expert_ratio = 0.0
-            self.expert_ratio = 0.0
+            self.override_expert = not self.override_expert
+            if self.override_expert:
+                self.saved_expert_ratio = self.expert_ratio
+                self.expert_ratio = 0.0
+            else:
+                self.expert_ratio = self.saved_expert_ratio
 
     def toggle_expert_mode(self, kb=None):
         with self.lock:
-            self.expert_mode = False
-            self.saved_expert_ratio = 0.0
-            self.expert_ratio = 0.0
+            self.expert_mode = not self.expert_mode
+            if self.expert_mode:
+                self.saved_expert_ratio = self.expert_ratio
+                self.expert_ratio = 1.0
+            else:
+                self.expert_ratio = self.saved_expert_ratio
 
     def toggle_training_mode(self, kb=None):
         with self.lock:
@@ -561,18 +572,23 @@ class MetricsData:
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:
-            self.expert_ratio = 0.0
-            self.manual_expert_override = False
+            p = int(self.expert_ratio * 100)
+            p = min(100, p + (1 if p < 10 else 5))
+            self.expert_ratio = p / 100.0
+            self.manual_expert_override = True
 
     def decrease_expert_ratio(self, kb=None):
         with self.lock:
-            self.expert_ratio = 0.0
-            self.manual_expert_override = False
+            p = int(self.expert_ratio * 100)
+            p = max(0, p - (1 if p <= 10 else 5))
+            self.expert_ratio = p / 100.0
+            self.manual_expert_override = True
 
     def restore_natural_expert_ratio(self, kb=None):
         with self.lock:
             self.manual_expert_override = False
-            self.expert_ratio = 0.0
+            progress = min(1.0, self.frame_count / max(1, RL_CONFIG.expert_ratio_decay_frames))
+            self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
 
     def increase_epsilon(self, kb=None):
         with self.lock:

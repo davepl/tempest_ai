@@ -10,7 +10,7 @@
         + 9 per-type entity categories, each: 1 occupancy + N slots × 4 features
           Per-slot features: present, x, y, distance
           Slots sorted by distance to player (nearest first).
-      - Receives dual 8-way joystick commands: movement_dir, firing_dir
+      - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
 
     Entity categories (type is implicit in category position):
       0. grunt      (40 slots) - grunts                          peak 80
@@ -28,7 +28,7 @@
     unique per type.  Classification is auto-discovered at runtime.
 --]]
 
-local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "127.0.0.1:9998"
+local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
 local SOCKET_ADDRESS = RAW_SOCKET_ADDRESS
 if string.sub(SOCKET_ADDRESS, 1, 7) ~= "socket." then
     SOCKET_ADDRESS = "socket." .. SOCKET_ADDRESS
@@ -1254,8 +1254,8 @@ local DIR_NEUTRAL = {0, 0, 0, 0}
 
 local function apply_direction(up_field, down_field, left_field, right_field, dir_idx)
     local axis = DIR_NEUTRAL
-    if dir_idx ~= nil and dir_idx >= 0 then
-        axis = DIR_AXES[math.max(0, math.min(7, dir_idx))] or DIR_NEUTRAL
+    if dir_idx ~= nil and dir_idx >= 0 and dir_idx <= 7 then
+        axis = DIR_AXES[dir_idx] or DIR_NEUTRAL
     end
 
     if up_field then up_field:set_value(axis[1]) end

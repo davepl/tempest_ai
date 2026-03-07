@@ -30,16 +30,10 @@ if [[ "$COUNT" -gt 1 ]]; then
     SOUND_FLAG="-sound none"
 fi
 
-WARNING_FLAG=""
-if mame -showusage 2>&1 | rg -q -- "-skip_warnings"; then
-    WARNING_FLAG="-skip_warnings"
-else
-    echo "Note: this MAME build does not support -skip_warnings; continuing without it."
-fi
-
 echo "Launching $COUNT MAME instance(s)..."
 for i in $(seq 1 "$COUNT"); do
-    mame tempest1 -window -nothrottle $SOUND_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+    mame tempest1 -video none -nothrottle $SOUND_FLAG -skip_gameinfo -autoboot_script "$LUA_SCRIPT" &
     echo "  Started instance $i (PID $!)"
 done
 echo "All instances launched."
+
