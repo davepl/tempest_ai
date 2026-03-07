@@ -160,7 +160,7 @@ def get_expert_action(*_args, **_kwargs):
 
 # ── Enemy-Slot Self-Attention ───────────────────────────────────────────────
 class EnemyAttention(nn.Module):
-    """Multi-head self-attention over 7 enemy slots, producing a fixed-size summary."""
+    """Multi-head self-attention over entity slots, producing a fixed-size summary."""
 
     def __init__(self, slot_features: int, embed_dim: int, num_heads: int):
         super().__init__()
@@ -275,14 +275,15 @@ class RainbowNet(nn.Module):
 
         # ── Object-Slot Self-Attention ──────────────────────────────────
         # 9 per-type entity categories with variable slots, 144 tokens total.
-        # Each token gets 4 features for attention: x, y, dist, category_id_norm.
+        # Each token gets 5 features: dx, dy, dist, category_id_norm, present.
+        # dx/dy are player-relative (already in state vector from Lua).
         # Type is implicit in category position — no noisy type pointer needed.
         self.use_attn = cfg.use_enemy_attention
         attn_out_dim = 0
         if self.use_attn:
             self.num_object_slots = getattr(cfg, 'object_slots', 144)
-            self.object_token_features = getattr(cfg, 'object_token_features', 4)
-            self.slot_state_features = getattr(cfg, 'slot_state_features', 4)  # present, x, y, dist
+            self.object_token_features = getattr(cfg, 'object_token_features', 5)
+            self.slot_state_features = getattr(cfg, 'slot_state_features', 4)  # present, dx, dy, dist
 
             # Category layout: (slots, category_id) — must match Lua ENTITY_CATEGORIES order.
             cat_defs = getattr(cfg, 'entity_categories', [
@@ -352,12 +353,15 @@ class RainbowNet(nn.Module):
     def _build_object_tokens(self, state: torch.Tensor):
         """Build 144 object tokens from 9 per-type entity categories.
 
-        Each token gets 4 features: [x, y, dist, category_id_norm]
+        Each token gets 5 features: [dx, dy, dist, category_id_norm, present]
+        State vector already contains player-relative dx/dy (computed by Lua),
+        so no subtraction is needed here.
+
         Slots are sorted by distance (nearest first) per category.
         Type is implicit in category position — no noisy type pointer.
 
         Returns:
-          tokens: (B, 144, 4)
+          tokens: (B, 144, 5)
           mask:   (B, 144) bool — True where slot is EMPTY
         """
         B = state.shape[0]
@@ -367,14 +371,14 @@ class RainbowNet(nn.Module):
         all_masks = []
 
         for base, slots, cat_id in self._cat_info:
-            # Each category: [occupancy, slot0_present, slot0_x, slot0_y, slot0_dist, ...]
+            # Each category: [occupancy, slot0_present, slot0_dx, slot0_dy, slot0_dist, ...]
             # Skip occupancy (+1), extract slots × 4 state features
             slot_data = state[:, base + 1 : base + 1 + slots * self.slot_state_features]
             slot_data = slot_data.reshape(B, slots, self.slot_state_features)  # (B, slots, 4)
 
             present = slot_data[:, :, 0]            # (B, slots) — used as mask
-            x       = slot_data[:, :, 1:2]          # (B, slots, 1)
-            y       = slot_data[:, :, 2:3]          # (B, slots, 1)
+            dx      = slot_data[:, :, 1:2]          # (B, slots, 1) — relative to player
+            dy      = slot_data[:, :, 2:3]          # (B, slots, 1) — relative to player
             dist    = slot_data[:, :, 3:4]          # (B, slots, 1)
 
             # Category identity as normalised scalar
@@ -382,11 +386,12 @@ class RainbowNet(nn.Module):
                                   cat_id / max(1, self._num_categories - 1),
                                   device=device, dtype=state.dtype)
 
-            tokens = torch.cat([x, y, dist, cat_norm], dim=2)  # (B, slots, 4)
+            # Include present flag so attention can see slot occupancy
+            tokens = torch.cat([dx, dy, dist, cat_norm, present.unsqueeze(2)], dim=2)  # (B, slots, 5)
             all_tokens.append(tokens)
             all_masks.append(present < 0.5)  # True = empty slot
 
-        tokens = torch.cat(all_tokens, dim=1)   # (B, 144, 4)
+        tokens = torch.cat(all_tokens, dim=1)   # (B, 144, 5)
         mask = torch.cat(all_masks, dim=1)       # (B, 144)
 
         # If ALL slots empty (e.g. between waves), unmask all to avoid NaN
@@ -424,6 +429,9 @@ class RainbowNet(nn.Module):
             q_atoms = self.q_out(q).view(B, self.num_actions, self.num_atoms)
 
         if self.use_dist:
+            # Keep distribution logits math in fp32 even under autocast to
+            # avoid fp16 underflow/overflow in softmax/log_softmax.
+            q_atoms = q_atoms.float()
             if log:
                 return F.log_softmax(q_atoms, dim=2)
             else:
@@ -585,7 +593,7 @@ class RainbowAgent:
         self.state_size = state_size
         self.device = device
         cfg = RL_CONFIG
-        self.factored_greedy_action = bool(getattr(cfg, "factored_greedy_action", True))
+        self.factored_greedy_action = bool(getattr(cfg, "factored_greedy_action", False))
 
         # Counters and locks (must be created before _sync_inference)
         self.training_steps = 0
@@ -664,10 +672,24 @@ class RainbowAgent:
 
         # AMP
         self.use_amp = cfg.enable_amp and (self.device.type == "cuda")
-        try:
-            self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-        except Exception:
-            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.amp_dtype = torch.float16
+        if self.use_amp and self.device.type == "cuda":
+            try:
+                if torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+            except Exception:
+                self.amp_dtype = torch.float16
+        # GradScaler is needed only for fp16; bf16 does not require scaling.
+        self.grad_scaler = None
+        if self.use_amp and self.amp_dtype == torch.float16:
+            try:
+                self.grad_scaler = torch.amp.GradScaler("cuda", enabled=True)
+            except Exception:
+                self.grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+        if self.use_amp:
+            print(f"AMP enabled (dtype={self.amp_dtype})")
+        else:
+            print("AMP disabled")
 
         # Background training thread
         self._train_queue = queue.Queue(maxsize=8)

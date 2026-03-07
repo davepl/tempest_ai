@@ -29,14 +29,15 @@ class ServerConfigData:
     port: int = 9998
     max_clients: int = 36
     # State layout:
-    #   5 core (alive, score, replay, lasers, wave/level)
-    #   + 2 player position (x16, y16)
-    #   + 2 player velocity (xv, yv)
-    #   + 50 ELIST enemy state bytes
+    #   5 core (alive, score/1e6, replay/100, lasers/9, wave/40)
+    #   + 2 player position (norm_pos_x, norm_pos_y: 0..1 over playfield)
+    #   + 2 player velocity (frame-delta dx/range, dy/range: ~[-1,+1])
+    #   + 50 ELIST enemy state bytes (/255)
     #   + 9 per-type entity categories, each: 1 occupancy + N slots × 4 features
     #   = 9 + 50 + 585 = 644 floats
     #
-    # Per-slot features: present, x, y, distance_norm
+    # Per-slot features: present, dx, dy, distance_norm
+    # dx/dy are player-relative (entity - player), normalised over playfield range.
     # Type is implicit in category position (no type feature needed).
     # Slots sorted by distance to player (nearest first).
     #
@@ -64,11 +65,10 @@ class RLConfigData:
     #   movement_direction (0..7) × firing_direction (0..7) = 64 actions
     num_move_actions: int = 8
     num_fire_actions: int = 8
-    # Action selection uses per-axis greedy decoding from the joint Q table
-    # (move = argmax_m max_f Q[m,f], fire = argmax_f max_m Q[m,f]).
-    # This preserves 64-action training targets while making online behavior
-    # less coupled between movement and firing directions.
-    factored_greedy_action: bool = True
+    # Decode greedy action from the SAME joint Q head used for training.
+    # Factored greedy (axis-wise argmax) can pick a low-value pair that is
+    # not the joint argmax action actually optimized by C51.
+    factored_greedy_action: bool = False
 
     @property
     def num_joint_actions(self) -> int:
@@ -95,8 +95,8 @@ class RLConfigData:
         ("electrode",  16),
     ])
     object_slots: int = 144             # total slots across all 9 categories
-    object_token_features: int = 4      # x, y, dist, category_id_norm
-    slot_state_features: int = 4        # present, x, y, dist (in state vector)
+    object_token_features: int = 5      # dx, dy, dist, category_id_norm, present
+    slot_state_features: int = 4        # present, dx, dy, dist (in state vector)
     attn_heads: int = 8
     attn_dim: int = 128
 
@@ -120,7 +120,7 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 3
-    max_samples_per_frame: float = 20
+    max_samples_per_frame: float = 10
 
     # Replay (PER with proportional priorities)
     memory_size: int = 20_000_000
@@ -147,7 +147,7 @@ class RLConfigData:
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
     epsilon_end: float = 0.02
-    epsilon_decay_frames: int = 10_000_000
+    epsilon_decay_frames: int = 35_000_000
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000
@@ -172,9 +172,9 @@ class RLConfigData:
     # ── reward ──────────────────────────────────────────────────────────
     # Scale objective rewards to fit C51 support. Human rescue (5000) → 50,
     # grunt kill (100) → 1. Preserves relative importance while fitting support.
-    obj_reward_scale: float = 0.01
+    obj_reward_scale: float = 0.1
     point_reward_scale: float = 1.0 / obj_reward_scale  # Derived: 100.0
-    subj_reward_scale: float = 0.0005
+    subj_reward_scale: float = 0.001
     reward_clip: float = 100.0          # Post-scaling: 10000 raw pts → 100
     death_reward_clip: float = 100.0
 

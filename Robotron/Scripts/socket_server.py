@@ -47,6 +47,24 @@ except Exception:
     _ACTION_DIAG_INTERVAL = 5000
 _FORCE_RANDOM_ACTIONS = os.getenv("ROBOTRON_FORCE_RANDOM_ACTIONS", "").strip().lower() not in {"", "0", "false", "off", "no"}
 
+# ── Fire-hold (keeps fire direction stable for N frames so game's LSPROC registers a shot)
+FIRE_HOLD_FRAMES = 4     # must be ≥3 (game needs 3 stable frames to fire)
+
+def _apply_fire_hold(cs: dict, raw_fire: int) -> int:
+    """Fixed-cadence fire hold: direction changes at most every FIRE_HOLD_FRAMES.
+    Between cadence ticks the held direction is emitted unchanged.
+    On each tick the most-recently-commanded direction is adopted.
+    This guarantees LSPROC's 3-stable-frame requirement while letting
+    the model's latest intent always win on the next boundary."""
+    count = cs.get("fire_hold_count", 0)
+    if count > 0:
+        cs["fire_hold_count"] = count - 1
+        return cs.get("fire_hold_dir", raw_fire)
+    # Cadence tick: adopt the model's current (latest) request
+    cs["fire_hold_dir"] = raw_fire
+    cs["fire_hold_count"] = FIRE_HOLD_FRAMES - 1
+    return raw_fire
+
 
 # ── Async buffer (queues step() calls to avoid blocking frame loop) ─────────
 class AsyncReplayBuffer:
@@ -425,6 +443,9 @@ class SocketServer:
 
                 # ── Terminal ────────────────────────────────────────────
                 if frame.done:
+                    # Reset fire hold on death
+                    cs["fire_hold_dir"] = -1
+                    cs["fire_hold_count"] = 0
                     # Boost priorities of the last N frames for this client
                     if self.async_buffer is not None:
                         self.async_buffer.boost_pre_death(cid)
@@ -468,6 +489,9 @@ class SocketServer:
                     cs["last_state"] = cs["last_action"] = None
                     cs["last_player_alive"] = False
                     cs["last_action_source"] = cs["prev_action_source"] = None
+                    # Reset fire hold when player is dead
+                    cs["fire_hold_dir"] = -1
+                    cs["fire_hold_count"] = 0
                     try:
                         sock.sendall(struct.pack("bb", -1, -1))
                     except Exception:
@@ -547,13 +571,19 @@ class SocketServer:
                         )
                         cs["act_last_diag_total"] = total
 
+                # Apply fire hold so the replay stores the EFFECTIVE fire
+                # direction, not the model's raw request.  This is critical:
+                # the game needs 3 stable frames to register a shot (LSPROC),
+                # and the reward reflects the effective direction, not the raw.
+                effective_fire = _apply_fire_hold(cs, fire_idx)
+
                 cs["last_state"] = frame.state
-                cs["last_action"] = (move_idx, fire_idx)
+                cs["last_action"] = (move_idx, effective_fire)
                 cs["last_player_alive"] = bool(frame.player_alive)
                 cs["prev_action_source"] = action_source
                 cs["last_action_source"] = action_source
 
-                move_cmd, fire_cmd = encode_action_to_game(move_idx, fire_idx)
+                move_cmd, fire_cmd = encode_action_to_game(move_idx, effective_fire)
                 try:
                     sock.sendall(struct.pack("bb", move_cmd, fire_cmd))
                 except Exception:

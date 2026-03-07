@@ -96,7 +96,8 @@ def train_step(agent, prefetched_batch=None) -> float | None:
 
     use_amp = agent.use_amp and device.type == "cuda"
     scaler = agent.grad_scaler
-    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+    amp_dtype = getattr(agent, "amp_dtype", torch.float16)
+    amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
 
     # ── C51 distributional update ───────────────────────────────────────
     num_atoms = cfg.num_atoms
@@ -146,7 +147,12 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             m.view(-1).index_add_(0, (l + offset).view(-1), (target_p_a * eq_mask.float()).view(-1))
 
         # Cross-entropy loss (weighted by IS weights)
-        ce_loss = -(m * log_p_a).sum(dim=1)             # (B,)
+        # Clamp log_p_a to prevent -inf × nonzero target mass from producing
+        # inf gradients.  log_softmax can hit -inf when an atom's probability
+        # collapses toward zero (e.g. death transitions with extreme rewards).
+        # -30 ≈ log(1e-13), well below any meaningful probability.
+        log_p_a_safe = log_p_a.clamp(min=-30.0)
+        ce_loss = -(m * log_p_a_safe).sum(dim=1)        # (B,)
         weighted_loss = (weights_t * ce_loss).mean()
 
     # ── Optional BC loss on expert transitions ─────────────────────────
@@ -176,20 +182,43 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         agent.optimizer.zero_grad()
 
     clip_norm = cfg.grad_clip_norm
+    grad_norm = None
     if use_amp and scaler is not None:
         scaler.scale(weighted_loss).backward()
         scaler.unscale_(agent.optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(agent.online_net.parameters(), clip_norm)
+        if not torch.isfinite(grad_norm):
+            print(f"[WARN] Non-finite grad norm detected ({float(grad_norm):.4g}), skipping step")
+            try:
+                agent.optimizer.zero_grad(set_to_none=True)
+            except TypeError:
+                agent.optimizer.zero_grad()
+            try:
+                cur = float(scaler.get_scale())
+                scaler.update(new_scale=max(1.0, cur * 0.5))
+            except Exception:
+                pass
+            return None
         scaler.step(agent.optimizer)
         scaler.update()
     else:
         weighted_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(agent.online_net.parameters(), clip_norm)
+        if not torch.isfinite(grad_norm):
+            print(f"[WARN] Non-finite grad norm detected ({float(grad_norm):.4g}), skipping step")
+            try:
+                agent.optimizer.zero_grad(set_to_none=True)
+            except TypeError:
+                agent.optimizer.zero_grad()
+            return None
         agent.optimizer.step()
 
     # ── Update priorities ───────────────────────────────────────────────
     td_errors = ce_loss.detach().cpu().numpy()
-    agent.memory.update_priorities(indices, td_errors)
+    if np.isfinite(td_errors).all():
+        agent.memory.update_priorities(indices, td_errors)
+    else:
+        print("[WARN] Non-finite TD errors detected, skipping priority update")
 
     # ── Target network update ───────────────────────────────────────────
     agent.training_steps += 1

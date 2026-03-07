@@ -46,12 +46,12 @@ local DEBUG_TRACE_FILE = "logs/startup_trace.log"
 local DEBUG_FORCE_ACTION_FRAMES = 0
 local DEBUG_FORCE_MOVE_DIR = 2  -- right
 local DEBUG_FORCE_FIRE_DIR = 2  -- right
-local DEATH_PENALTY_POINTS = 1000
+local DEATH_PENALTY_POINTS = 400
 -- Subjective shaping rewards (raw points; scaled in Python by subj_reward_scale).
 -- Goal: densify survival signal without dominating objective score rewards.
-local SUBJ_ENEMY_WEIGHT = 20.0
+local SUBJ_ENEMY_WEIGHT = 8.0
 local SUBJ_HUMAN_WEIGHT = 12.0
-local SUBJ_SURVIVAL_BONUS = 5.0
+local SUBJ_SURVIVAL_BONUS = 2.0
 local SUBJ_DEATH_PENALTY = 25.0
 local SUBJ_ENEMY_NEAR_NORM = 0.035
 local SUBJ_ENEMY_FAR_NORM = 0.200
@@ -67,16 +67,17 @@ local AIM_TARGET_CATS = {
     spawner = true, enforcer = true, projectile = true, electrode = true,
 }
 -- Direction unit vectors for 8-way fire (dx, dy in x16 coordinates).
--- y-up: 0=up (+y), 1=up-right, 2=right, 3=down-right, 4=down, 5=down-left, 6=left, 7=up-left
+-- Screen/world coordinates are y-down (larger y = lower on screen):
+-- 0=up (-y), 1=up-right, 2=right, 3=down-right, 4=down (+y), 5=down-left, 6=left, 7=up-left
 local FIRE_DIR_VEC = {
-    [0] = { 0,  1},   -- up
-    [1] = { 1,  1},   -- up-right
+    [0] = { 0, -1},   -- up
+    [1] = { 1, -1},   -- up-right
     [2] = { 1,  0},   -- right
-    [3] = { 1, -1},   -- down-right
-    [4] = { 0, -1},   -- down
-    [5] = {-1, -1},   -- down-left
+    [3] = { 1,  1},   -- down-right
+    [4] = { 0,  1},   -- down
+    [5] = {-1,  1},   -- down-left
     [6] = {-1,  0},   -- left
-    [7] = {-1,  1},   -- up-left
+    [7] = {-1, -1},   -- up-left
 }
 -- Evasion reward: bonus for moving away from nearest enemy when close.
 local SUBJ_EVADE_WEIGHT = 10.0       -- reward when moving away from nearest threat
@@ -338,6 +339,16 @@ local function clamp01(v)
     return v
 end
 
+local function clamp11(v)
+    if v <= -1.0 then
+        return -1.0
+    end
+    if v >= 1.0 then
+        return 1.0
+    end
+    return v
+end
+
 -- Game playfield bounds from RRF.ASM.  Coordinates are 8.8 fixed-point
 -- (high byte = screen pixel, low byte = sub-pixel fraction).  Positions
 -- are UNSIGNED 16-bit values; treating them as signed creates a discontinuity
@@ -361,6 +372,16 @@ local function norm_pos_y(u16)
     return clamp01(((u16 or 0) - POS_Y_MIN) / POS_Y_RANGE)
 end
 
+-- Relative position: (entity - player) normalised to [-1, +1] over playfield.
+-- Enemies to the right/below the player are positive; left/above are negative.
+local function rel_pos_x(entity_u16, player_u16)
+    return clamp11(((entity_u16 or 0) - (player_u16 or 0)) / POS_X_RANGE)
+end
+
+local function rel_pos_y(entity_u16, player_u16)
+    return clamp11(((entity_u16 or 0) - (player_u16 or 0)) / POS_Y_RANGE)
+end
+
 local function dist_norm(x1, y1, x2, y2)
     local dx = (x2 or 0) - (x1 or 0)
     local dy = (y2 or 0) - (y1 or 0)
@@ -368,7 +389,7 @@ local function dist_norm(x1, y1, x2, y2)
     if d2 <= 0 then
         return 0.0
     end
-    return math.sqrt(d2) / POS_MAX_DIAG
+    return clamp01(math.sqrt(d2) / POS_MAX_DIAG)
 end
 
 local function enemy_spacing_score(nearest_dist_norm)
@@ -466,12 +487,12 @@ end
 
 local function read_player_position(memory)
     -- Positions are UNSIGNED 8.8 fixed-point (high byte = screen pixel).
-    -- Velocities are truly signed.
+    -- Velocity fields (OXV/OYV at PLOBJ+$0E/+$10) are never written by
+    -- PLAYRV, so they are always zero.  Velocity is computed as frame-to-
+    -- frame position delta in serialize_frame() instead.
     local px16 = read_u16_be(memory, PX16_ADDR)   -- unsigned
     local py16 = read_u16_be(memory, PY16_ADDR)   -- unsigned
-    local pxv = u16_to_i16(read_u16_be(memory, PXV_ADDR))
-    local pyv = u16_to_i16(read_u16_be(memory, PYV_ADDR))
-    return px16, py16, pxv, pyv
+    return px16, py16
 end
 
 -- ── Per-Type Entity Classification ──────────────────────────────────────
@@ -771,8 +792,11 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
             local obj = bucket[i]
             if obj then
                 features[#features + 1] = 1.0
-                features[#features + 1] = norm_pos_x(obj.x16)
-                features[#features + 1] = norm_pos_y(obj.y16)
+                -- Relative position: (entity - player), normalised over playfield range.
+                -- Gives direct player-relative direction without the network having
+                -- to learn to subtract player_pos from every slot.  Ranges ~[-1,+1].
+                features[#features + 1] = rel_pos_x(obj.x16, player_x16)
+                features[#features + 1] = rel_pos_y(obj.y16, player_y16)
                 features[#features + 1] = obj.dist_norm
             else
                 features[#features + 1] = 0.0
@@ -1267,9 +1291,10 @@ end
 
 function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
     apply_direction(self.move_up, self.move_down, self.move_left, self.move_right, move_dir)
-    -- Apply fire hold so the game's LSPROC sees a stable direction long enough to fire
-    local effective_fire = apply_fire_hold(fire_dir)
-    apply_direction(self.fire_up, self.fire_down, self.fire_left, self.fire_right, effective_fire)
+    -- Fire hold is now applied Python-side (socket_server.py) so the replay
+    -- buffer stores the effective action, not the model's raw request.
+    -- The fire_dir received here IS the effective (held) direction.
+    apply_direction(self.fire_up, self.fire_down, self.fire_left, self.fire_right, fire_dir)
 
     if self.p1_start then
         self.p1_start:set_value(start_cmd)
@@ -1277,31 +1302,45 @@ function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
     if self.coin_1 then
         self.coin_1:set_value(coin_cmd)
     end
-    return effective_fire   -- caller uses this for reward attribution
+    return fire_dir   -- already the effective direction from Python
 end
 
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
-                               player_x16, player_y16, player_xv, player_yv,
+                               player_x16, player_y16,
                                enemy_state, list_state_values,
                                done, subj_reward, obj_reward, save_signal)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
     local replay_u32 = math.max(0, math.min(4294967295, math.floor(replay_level or 0)))
     local lasers_u8 = math.max(0, math.min(255, math.floor(num_lasers or 0)))
     local wave_u8 = math.max(0, math.min(255, math.floor(wave_number or 0)))
+    -- Keep scalar core features tightly bounded to avoid dominating slot signals.
+    -- Replay is an 8-digit BCD field; map to ~[0,1] even if game-specific semantics vary.
+    local replay_norm = math.min(1.0, replay_u32 / 99999999.0)
+    -- Laser and wave counters can exceed expected gameplay ranges transiently.
+    local lasers_norm = math.min(1.0, lasers_u8 / 9.0)
+    local wave_norm = math.min(1.0, wave_u8 / 40.0)
 
     local state_values = {}
     -- 5 core stats
     state_values[#state_values + 1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
-    state_values[#state_values + 1] = score_u32 / 99999999.0
-    state_values[#state_values + 1] = replay_u32 / 99999999.0
-    state_values[#state_values + 1] = lasers_u8 / 9.0
-    state_values[#state_values + 1] = wave_u8 / 255.0
-    -- 2 player position values (unsigned 8.8 fixed-point, screen-bound normalized)
+    state_values[#state_values + 1] = score_u32 / 1000000.0
+    state_values[#state_values + 1] = replay_norm
+    state_values[#state_values + 1] = lasers_norm
+    state_values[#state_values + 1] = wave_norm
+    -- 2 player position values (unsigned 8.8 fixed-point, screen-bound normalized 0..1)
     state_values[#state_values + 1] = norm_pos_x(player_x16 or 0)
     state_values[#state_values + 1] = norm_pos_y(player_y16 or 0)
-    -- 2 player velocity values (normalized 16-bit signed)
-    state_values[#state_values + 1] = norm_i16(player_xv or 0)
-    state_values[#state_values + 1] = norm_i16(player_yv or 0)
+    -- 2 player velocity values: frame-to-frame position delta, normalised over
+    -- playfield range.  ~[-1,+1] with typical per-frame deltas near ±0.004 (X)
+    -- and ±0.005 (Y).  Zero on first frame or after death.
+    local vel_x = 0.0
+    local vel_y = 0.0
+    if prev_player_x16 and prev_player_y16 and player_alive ~= 0 then
+        vel_x = clamp11(((player_x16 or 0) - prev_player_x16) / POS_X_RANGE)
+        vel_y = clamp11(((player_y16 or 0) - prev_player_y16) / POS_Y_RANGE)
+    end
+    state_values[#state_values + 1] = vel_x
+    state_values[#state_values + 1] = vel_y
     -- 50 ELIST enemy state bytes
     for i = 1, ZP1ENM_SIZE do
         state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
@@ -1451,12 +1490,12 @@ local function frame_callback()
     local enemy_state = enemy_or_err
     trace_log(frame_counter, "read_enemy_state", "bytes=" .. tostring(#enemy_state.raw))
 
-    local ok_player_pos, player_x16, player_y16, player_xv, player_yv = pcall(read_player_position, mem)
+    local ok_player_pos, player_x16, player_y16 = pcall(read_player_position, mem)
     if not ok_player_pos then
         trace_log(frame_counter, "read_player_position_error", tostring(player_x16), true)
         return true
     end
-    trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d xv=%d yv=%d", player_x16 or 0, player_y16 or 0, player_xv or 0, player_yv or 0))
+    trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d", player_x16 or 0, player_y16 or 0))
 
     local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16 = pcall(
         extract_typed_entities, mem, player_x16, player_y16, enemy_state
@@ -1522,7 +1561,7 @@ local function frame_callback()
     local ok_payload, payload_or_err = pcall(
         serialize_frame,
         player_alive, score, replay_level, num_lasers, wave_number,
-        player_x16, player_y16, player_xv, player_yv,
+        player_x16, player_y16,
         enemy_state, list_state_values,
         done, subj_reward, obj_reward, save_signal
     )
@@ -1581,6 +1620,15 @@ local function frame_callback()
 
     previous_player_alive = player_alive
     previous_score = score
+
+    -- Stash position for next-frame velocity computation
+    if player_alive == 1 then
+        prev_player_x16 = player_x16
+        prev_player_y16 = player_y16
+    else
+        prev_player_x16 = nil
+        prev_player_y16 = nil
+    end
 
     -- Stash aim-reward data for use on the NEXT frame (reward for this frame's action).
     -- Use effective_fire (the direction actually sent to the game after hold) for correct
