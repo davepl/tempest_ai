@@ -100,6 +100,7 @@ local previous_score = 0
 local prev_fire_cmd = -1          -- fire direction from previous frame
 local prev_move_cmd = -1          -- move direction from previous frame
 local prev_aim_objects = nil      -- classified objects from previous frame
+local last_action_source = 0      -- 0=none, 1=dqn, 2=epsilon, 3=expert, 4=forced_random
 
 -- Fire-hold state:  The game's LSPROC laser routine (RRG23.ASM) requires
 -- the fire joystick to stay in the SAME direction for 3 consecutive frames
@@ -918,13 +919,22 @@ local function draw_debug_hud()
     local PAD = 2   -- extra pixels of clearance around the sprite
 
     -- Player ring (player sprite is roughly 5×13 pixels)
+    -- Color by action source: green=DQN, red=epsilon, blue=expert, white=other
+    local player_color = HUD_PLAYER_COLOR
+    if last_action_source == 1 then
+        player_color = 0xFF00FF00   -- green: DQN
+    elseif last_action_source == 2 or last_action_source == 4 then
+        player_color = 0xFFFF0000   -- red: epsilon / forced random
+    elseif last_action_source == 3 then
+        player_color = 0xFF4488FF   -- blue: expert
+    end
     if hud_player_x16 and hud_player_y16 then
         local px = ((hud_player_x16 >> 8) & 0xFF) * 2
         local py = (hud_player_y16 >> 8) & 0xFF
         -- Use known player sprite 5×13
         local prx = 5 + PAD
         local pry = math.floor((13 + PAD) / 2)
-        pcall(function() draw_diamond(px, py, prx, pry, HUD_PLAYER_COLOR) end)
+        pcall(function() draw_diamond(px, py, prx, pry, player_color) end)
     end
 
     -- Entity rings + rank numbers
@@ -1401,14 +1411,14 @@ local function process_frame_via_socket(frame_payload, frame_idx)
     trace_log(frame_idx, "socket_write_ok", "payload sent")
 
     local read_ok, read_result = pcall(function()
-        trace_log(frame_idx, "socket_read_begin", "waiting for 2-byte action")
+        trace_log(frame_idx, "socket_read_begin", "waiting for 3-byte action")
         local started = os.clock()
         while (os.clock() - started) < SOCKET_READ_TIMEOUT_S do
-            local action_bytes = current_socket:read(2)
-            if action_bytes and #action_bytes == 2 then
-                local move_dir, fire_dir = string.unpack("bb", action_bytes)
-                trace_log(frame_idx, "socket_read_ok", string.format("move=%d fire=%d", move_dir, fire_dir))
-                return {move_dir, fire_dir}
+            local action_bytes = current_socket:read(3)
+            if action_bytes and #action_bytes == 3 then
+                local move_dir, fire_dir, source = string.unpack("bbb", action_bytes)
+                trace_log(frame_idx, "socket_read_ok", string.format("move=%d fire=%d src=%d", move_dir, fire_dir, source))
+                return {move_dir, fire_dir, source}
             end
         end
         trace_log(frame_idx, "socket_read_timeout", "using neutral action")
@@ -1422,7 +1432,8 @@ local function process_frame_via_socket(frame_payload, frame_idx)
         return -1, -1, false
     end
 
-    local move_dir, fire_dir = unpack(read_result)
+    local move_dir, fire_dir, source = unpack(read_result)
+    last_action_source = source or 0
     return move_dir or -1, fire_dir or -1, true
 end
 

@@ -378,7 +378,7 @@ class SocketServer:
 
                 frame = parse_frame_data(data)
                 if not frame:
-                    sock.sendall(struct.pack("bb", -1, -1))
+                    sock.sendall(struct.pack("bbb", -1, -1, 0))
                     continue
 
                 with self.client_lock:
@@ -386,7 +386,10 @@ class SocketServer:
                         break
                     cs = self.client_states[cid]
                     cs["frames"] += 1
-                    cs["level_number"] = frame.level_number
+                    # Only trust RAM-read level/score while player is alive;
+                    # during attract/death the byte can hold garbage.
+                    if frame.player_alive:
+                        cs["level_number"] = frame.level_number
                     # Ignore attract/menu/transient frames for high-score tracking.
                     if frame.player_alive and frame.game_score > self.metrics.peak_game_score:
                         self.metrics.peak_game_score = frame.game_score
@@ -476,7 +479,7 @@ class SocketServer:
                             pass
                     cs["was_done"] = True
                     try:
-                        sock.sendall(struct.pack("bb", -1, -1))
+                        sock.sendall(struct.pack("bbb", -1, -1, 0))
                     except Exception:
                         break
                     cs["last_state"] = cs["last_action"] = None
@@ -506,7 +509,7 @@ class SocketServer:
                     cs["fire_hold_count"] = 0
                     cs["fire_pending_dir"] = -1
                     try:
-                        sock.sendall(struct.pack("bb", -1, -1))
+                        sock.sendall(struct.pack("bbb", -1, -1, 0))
                     except Exception:
                         break
                     continue
@@ -636,8 +639,19 @@ class SocketServer:
                 cs["last_action_source"] = action_source
 
                 move_cmd, fire_cmd = encode_action_to_game(move_idx, effective_fire)
+                # Action source byte: 0=none, 1=dqn, 2=epsilon, 3=expert, 4=forced_random
+                if action_source == "expert":
+                    source_byte = 3
+                elif is_epsilon:
+                    source_byte = 2
+                elif action_source == "dqn":
+                    source_byte = 1
+                elif action_source == "forced_random":
+                    source_byte = 4
+                else:
+                    source_byte = 0
                 try:
-                    sock.sendall(struct.pack("bb", move_cmd, fire_cmd))
+                    sock.sendall(struct.pack("bbb", move_cmd, fire_cmd, source_byte))
                 except Exception:
                     break
 
