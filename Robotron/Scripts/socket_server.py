@@ -539,7 +539,7 @@ class SocketServer:
                     action_source = "forced_random"
                 elif self.agent:
                     expert_ratio = self.metrics.get_expert_ratio()
-                    use_expert = (random.random() < expert_ratio) and not self.metrics.override_expert
+                    use_expert = (random.random() < expert_ratio)
                     if use_expert:
                         move_idx, fire_idx = get_expert_action(frame.state, locked_fire=locked_fire)
                         is_epsilon = False
