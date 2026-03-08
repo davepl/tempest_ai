@@ -232,7 +232,7 @@ local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
 local PREVIEW_FORMAT_RGB565_LZSS = 2
-local PREVIEW_CAPTURE_EVERY_N_FRAMES = 4
+local PREVIEW_MIN_INTERVAL_S = (1.0 / 30.0)
 -- Allow native-resolution snapshots; compression handles wire size.
 local PREVIEW_MAX_WIDTH = 4096
 local PREVIEW_MAX_HEIGHT = 4096
@@ -243,7 +243,7 @@ local pending_preview_blob = nil
 local pending_preview_w = 0
 local pending_preview_h = 0
 local pending_preview_fmt = PREVIEW_FORMAT_RGB565
-local last_preview_capture_frame = -1000000
+local last_preview_capture_time_s = -1000000.0
 
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
@@ -1095,10 +1095,11 @@ local function capture_game_preview()
         clear_pending_preview()
         return
     end
-    if (frame_counter - last_preview_capture_frame) < PREVIEW_CAPTURE_EVERY_N_FRAMES then
+    local now_s = os.clock()
+    if (now_s - last_preview_capture_time_s) < PREVIEW_MIN_INTERVAL_S then
         return
     end
-    last_preview_capture_frame = frame_counter
+    last_preview_capture_time_s = now_s
 
     local ok, result = pcall(function()
         local vw, vh = manager.machine.video:snapshot_size()
