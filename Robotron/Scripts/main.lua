@@ -87,8 +87,7 @@ local MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
 -- Wall-hugging penalty: per-axis penalty when within 16 px of a wall.
 -- Stacks additively so a corner costs double.
 local SUBJ_WALL_PENALTY  = 5.0       -- penalty per wall axis per frame
-local WALL_MARGIN_NORM_X = 4096.0 / POS_X_RANGE  -- 16 px normalised (~0.118)
-local WALL_MARGIN_NORM_Y = 4096.0 / POS_Y_RANGE  -- 16 px normalised (~0.076)
+-- WALL_MARGIN_NORM_X/Y defined after POS_X/Y_RANGE (see below).
 
 local mainCpu = nil
 local mem = nil
@@ -370,6 +369,9 @@ local POS_Y_MIN   = GAME_YMIN * 256                        -- 6144
 local POS_Y_RANGE = (GAME_YMAX - GAME_YMIN) * 256          -- 53760
 local POS_MAX_DIAG = math.sqrt(POS_X_RANGE * POS_X_RANGE
                              + POS_Y_RANGE * POS_Y_RANGE)  -- ≈64022
+
+local WALL_MARGIN_NORM_X = 4096.0 / POS_X_RANGE  -- 16 px normalised (~0.118)
+local WALL_MARGIN_NORM_Y = 4096.0 / POS_Y_RANGE  -- 16 px normalised (~0.076)
 
 local function norm_pos_x(u16)
     return clamp01(((u16 or 0) - POS_X_MIN) / POS_X_RANGE)
