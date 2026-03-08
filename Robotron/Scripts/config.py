@@ -183,7 +183,7 @@ class RLConfigData:
     # accommodates the full rescue signal.
     obj_reward_scale: float = 0.02
     point_reward_scale: float = 1.0 / obj_reward_scale
-    subj_reward_scale: float = 0.005
+    subj_reward_scale: float = 0.0025
     reward_clip: float = 100.0
     death_reward_clip: float = 100.0
 
@@ -412,6 +412,13 @@ class MetricsData:
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
     loaded_frame_count: int = 0
+    game_preview_seq: int = 0
+    game_preview_client_id: int = -1
+    game_preview_width: int = 0
+    game_preview_height: int = 0
+    game_preview_format: str = ""
+    game_preview_data_b64: str = ""
+    game_preview_updated_ts: float = 0.0
 
     # UI toggles
     override_expert: bool = False

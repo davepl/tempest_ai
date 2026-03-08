@@ -303,6 +303,10 @@ class _DashboardState:
             expert_ratio = (_xprt_ov / 100.0) if _xprt_ov >= 0 else float(self.metrics.expert_ratio)
             client_count = int(self.metrics.client_count)
             web_client_count = int(self.metrics.web_client_count)
+            game_preview_seq = int(getattr(self.metrics, "game_preview_seq", 0))
+            game_preview_width = int(getattr(self.metrics, "game_preview_width", 0))
+            game_preview_height = int(getattr(self.metrics, "game_preview_height", 0))
+            game_preview_format = str(getattr(self.metrics, "game_preview_format", "") or "")
             average_level = float(self.metrics.average_level)
             memory_buffer_size = int(self.metrics.memory_buffer_size)
             memory_buffer_k = int(memory_buffer_size // 1000)
@@ -377,6 +381,10 @@ class _DashboardState:
             "expert_ratio": expert_ratio,
             "client_count": client_count,
             "web_client_count": web_client_count,
+            "game_preview_seq": game_preview_seq,
+            "game_preview_width": game_preview_width,
+            "game_preview_height": game_preview_height,
+            "game_preview_format": game_preview_format,
             "average_level": average_level,
             "memory_buffer_size": memory_buffer_size,
             "memory_buffer_k": memory_buffer_k,
@@ -464,6 +472,19 @@ class _DashboardState:
     def now_body(self) -> bytes:
         with self.lock:
             return self._cached_now_body
+
+    def game_preview_body(self) -> bytes:
+        with self.metrics.lock:
+            payload = {
+                "seq": int(getattr(self.metrics, "game_preview_seq", 0)),
+                "client_id": int(getattr(self.metrics, "game_preview_client_id", -1)),
+                "width": int(getattr(self.metrics, "game_preview_width", 0)),
+                "height": int(getattr(self.metrics, "game_preview_height", 0)),
+                "format": str(getattr(self.metrics, "game_preview_format", "") or ""),
+                "ts": float(getattr(self.metrics, "game_preview_updated_ts", 0.0)),
+                "data": str(getattr(self.metrics, "game_preview_data_b64", "") or ""),
+            }
+        return json.dumps(payload).encode("utf-8")
 
 
 def _render_dashboard_html() -> str:
@@ -913,6 +934,53 @@ def _render_dashboard_html() -> str:
       grid-row: span 2;
       min-height: 200px;
     }
+    .preview-card {
+      grid-column: span 4;
+      grid-row: span 2;
+      min-height: 200px;
+      gap: 6px;
+    }
+    .preview-wrap {
+      position: relative;
+      flex: 1 1 auto;
+      min-height: 0;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid rgba(80, 160, 255, 0.35);
+      background:
+        radial-gradient(120% 120% at 10% 0%, rgba(0, 229, 255, 0.16), transparent 60%),
+        radial-gradient(120% 120% at 95% 100%, rgba(57, 255, 20, 0.13), transparent 60%),
+        rgba(2, 6, 23, 0.95);
+      box-shadow: inset 0 0 18px rgba(0, 229, 255, 0.16), 0 0 16px rgba(0, 229, 255, 0.14);
+    }
+    .preview-canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #020617;
+      box-shadow: none;
+      image-rendering: pixelated;
+    }
+    .preview-msg {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 8px;
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 16px;
+      color: #c8e8ff;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45);
+      background: linear-gradient(180deg, rgba(2, 6, 23, 0.28), rgba(2, 6, 23, 0.50));
+      pointer-events: none;
+    }
     .card-narrow {
       grid-column: span 1;
       min-height: 0;
@@ -1063,12 +1131,14 @@ def _render_dashboard_html() -> str:
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
       .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
+      .preview-card { grid-column: span 4; grid-row: span 2; min-height: 180px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
+      .preview-card { grid-column: span 4; grid-row: span 2; }
       .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
@@ -1094,6 +1164,15 @@ def _render_dashboard_html() -> str:
           <div class="label">STEPS PER SECOND</div>
         </div>
         <canvas id="cStepGauge"></canvas>
+      </article>
+      <article class="card preview-card" style="--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
+        <div class="gauge-head">
+          <div class="label">CLIENT 0 PREVIEW</div>
+        </div>
+        <div class="preview-wrap">
+          <canvas id="cGamePreview" class="preview-canvas"></canvas>
+          <div id="mGamePreviewMsg" class="preview-msg">No Clients</div>
+        </div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
         <div class="label">AVG REWARD 1M</div>
@@ -1376,6 +1455,7 @@ def _render_dashboard_html() -> str:
       episodes: document.getElementById("mEpisodes"),
       epRate: document.getElementById("mEpRate"),
       agreePanel: document.getElementById("mAgreePanel"),
+      previewMsg: document.getElementById("mGamePreviewMsg"),
     };
     /* Game-settings controls */
     const gsAdvancedEl = document.getElementById("gsAdvanced");
@@ -1459,6 +1539,12 @@ def _render_dashboard_html() -> str:
     const EP_RATE_WINDOW = 30; /* seconds */
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
+    const gamePreviewCanvas = document.getElementById("cGamePreview");
+    const _previewSrcCanvas = document.createElement("canvas");
+    const _previewSrcCtx = _previewSrcCanvas.getContext("2d");
+    let _previewSeqLoaded = -1;
+    let _previewFetchInFlight = false;
+    let _previewHasFrame = false;
 
     // ── Gauge needle damping ────────────────────────────────────────
     // Time-constant in seconds: the needle closes ~63% of the gap
@@ -1502,6 +1588,115 @@ def _render_dashboard_html() -> str:
     drawFpsGauge(fpsGaugeCanvas, 0, null);
     drawStepGauge(stepGaugeCanvas, 0, null);
     requestAnimationFrame(gaugeAnimationLoop);
+
+    function setPreviewMessage(text) {
+      if (!cards.previewMsg) return;
+      if (text) {
+        cards.previewMsg.textContent = text;
+        cards.previewMsg.style.display = "flex";
+      } else {
+        cards.previewMsg.style.display = "none";
+      }
+    }
+
+    function clearPreviewCanvas() {
+      if (!gamePreviewCanvas) return;
+      const width = gamePreviewCanvas.clientWidth || 320;
+      const height = gamePreviewCanvas.clientHeight || 180;
+      const dpr = window.devicePixelRatio || 1;
+      gamePreviewCanvas.width = Math.floor(width * dpr);
+      gamePreviewCanvas.height = Math.floor(height * dpr);
+      const ctx = gamePreviewCanvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#020617";
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = "rgba(100, 160, 255, 0.20)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0.5, 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
+    }
+
+    function drawPreviewToCard() {
+      if (!gamePreviewCanvas || !_previewHasFrame) return;
+      const sw = _previewSrcCanvas.width || 0;
+      const sh = _previewSrcCanvas.height || 0;
+      if (sw <= 0 || sh <= 0) return;
+      const width = gamePreviewCanvas.clientWidth || 320;
+      const height = gamePreviewCanvas.clientHeight || 180;
+      const dpr = window.devicePixelRatio || 1;
+      gamePreviewCanvas.width = Math.floor(width * dpr);
+      gamePreviewCanvas.height = Math.floor(height * dpr);
+      const ctx = gamePreviewCanvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#020617";
+      ctx.fillRect(0, 0, width, height);
+      const scale = Math.min(width / sw, height / sh);
+      const dw = Math.max(1, Math.floor(sw * scale));
+      const dh = Math.max(1, Math.floor(sh * scale));
+      const dx = Math.floor((width - dw) * 0.5);
+      const dy = Math.floor((height - dh) * 0.5);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(_previewSrcCanvas, 0, 0, sw, sh, dx, dy, dw, dh);
+    }
+
+    function _base64ToBytes(b64) {
+      const bin = atob(String(b64 || ""));
+      const len = bin.length;
+      const out = new Uint8Array(len);
+      for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    function _decodeRgb565ToSource(width, height, b64data) {
+      if (!_previewSrcCtx) return false;
+      const w = Math.max(0, Number(width) || 0);
+      const h = Math.max(0, Number(height) || 0);
+      if (w > 512 || h > 512) return false;
+      if (w <= 0 || h <= 0 || !b64data) return false;
+      const bytes = _base64ToBytes(b64data);
+      const pxCount = w * h;
+      if (bytes.length !== pxCount * 2) return false;
+      _previewSrcCanvas.width = w;
+      _previewSrcCanvas.height = h;
+      const img = _previewSrcCtx.createImageData(w, h);
+      const dst = img.data;
+      let si = 0;
+      for (let i = 0, di = 0; i < pxCount; i++, di += 4) {
+        const v = (bytes[si] << 8) | bytes[si + 1];
+        si += 2;
+        dst[di] = ((v >> 11) & 0x1f) * 255 / 31;
+        dst[di + 1] = ((v >> 5) & 0x3f) * 255 / 63;
+        dst[di + 2] = (v & 0x1f) * 255 / 31;
+        dst[di + 3] = 255;
+      }
+      _previewSrcCtx.putImageData(img, 0, 0);
+      _previewHasFrame = true;
+      return true;
+    }
+
+    async function fetchGamePreview() {
+      if (_previewFetchInFlight) return;
+      _previewFetchInFlight = true;
+      try {
+        const res = await fetch(`/api/game_preview?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("bad preview response");
+        const payload = await res.json();
+        const seq = Number(payload && payload.seq);
+        if (Number.isFinite(seq) && seq > 0) _previewSeqLoaded = seq;
+        const fmt = String(payload && payload.format || "");
+        const ok = (fmt === "rgb565be") && _decodeRgb565ToSource(payload.width, payload.height, payload.data);
+        if (ok) {
+          drawPreviewToCard();
+          setPreviewMessage("");
+        }
+      } catch (_) {
+        /* ignore transient preview failures */
+      } finally {
+        _previewFetchInFlight = false;
+      }
+    }
+    clearPreviewCanvas();
 
     const charts = {
       throughput: {
@@ -3423,6 +3618,19 @@ def _render_dashboard_html() -> str:
         ? fmtFloat(now.agreement_1m * 100, 1) + "%"
         : "0.0%";
 
+      const previewSeq = Number(now.game_preview_seq || 0);
+      if ((now.client_count || 0) <= 0) {
+        setPreviewMessage("No Clients");
+        _previewHasFrame = false;
+        clearPreviewCanvas();
+      } else if (!Number.isFinite(previewSeq) || previewSeq <= 0) {
+        setPreviewMessage("Waiting For Client 0");
+        if (!_previewHasFrame) clearPreviewCanvas();
+      } else {
+        if (previewSeq > _previewSeqLoaded) fetchGamePreview();
+        setPreviewMessage(_previewHasFrame ? "" : "Loading Preview");
+      }
+
       // ── Record highs ──────────────────────────────────────────────
       const recPairs = [
         ["rwrd", now.peak_game_score, fmtInt],
@@ -3592,6 +3800,8 @@ def _render_dashboard_html() -> str:
       // Force gauge repaint since canvas dimensions changed
       drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
       drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+      if (_previewHasFrame) drawPreviewToCard();
+      else clearPreviewCanvas();
     });
   </script>
 </body>
@@ -3700,7 +3910,7 @@ def _make_handler(state: _DashboardState):
             path = parsed.path
             query = parse_qs(parsed.query)
             client_id = (query.get("cid") or [None])[0]
-            if path in ("/api/ping", "/api/now", "/api/history"):
+            if path in ("/api/ping", "/api/now", "/api/history", "/api/game_preview"):
                 state.touch_web_client(client_id)
             if path == "/":
                 self._send(page, "text/html; charset=utf-8")
@@ -3715,6 +3925,9 @@ def _make_handler(state: _DashboardState):
             if path == "/api/history":
                 body = json.dumps(state.payload()).encode("utf-8")
                 self._send(body, "application/json")
+                return
+            if path == "/api/game_preview":
+                self._send(state.game_preview_body(), "application/json")
                 return
             if path == "/api/audio_playlist":
                 tracks = _list_audio_files()

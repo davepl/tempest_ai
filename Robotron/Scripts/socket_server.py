@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ==================================================================================================================
 # ||  ROBOTRON AI v2 • SOCKET BRIDGE SERVER                                                                      ||
-# ||  TCP server bridging Lua (MAME) ↔ Python.  Protocol unchanged from v1.                                     ||
+# ||  TCP server bridging Lua (MAME) ↔ Python.                                                                    ||
 # ==================================================================================================================
 """Socket server bridging Lua (MAME) and Python for Robotron training."""
 
@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, time, socket, select, struct, threading, traceback, queue, random
+import os, time, socket, select, struct, threading, traceback, queue, random, base64
 import numpy as np
 from collections import deque
 
@@ -309,6 +309,50 @@ class SocketServer:
                 cid += 1
             return cid
 
+    @staticmethod
+    def _source_preview_flag(enabled: bool) -> int:
+        return 0x40 if enabled else 0x00
+
+    @classmethod
+    def _pack_action(cls, move_cmd: int, fire_cmd: int, source_code: int, preview_enabled: bool) -> bytes:
+        source_u8 = (int(source_code) & 0x0F) | cls._source_preview_flag(bool(preview_enabled))
+        return struct.pack("bbb", int(move_cmd), int(fire_cmd), int(source_u8))
+
+    @staticmethod
+    def _preview_enabled_for_client(cid: int) -> bool:
+        if int(cid) != 0:
+            return False
+        with metrics.lock:
+            return int(getattr(metrics, "web_client_count", 0) or 0) > 0
+
+    @staticmethod
+    def _cache_client_preview(cid: int, frame) -> None:
+        if int(cid) != 0:
+            return
+        pixels = getattr(frame, "preview_pixels", None)
+        width = int(getattr(frame, "preview_width", 0) or 0)
+        height = int(getattr(frame, "preview_height", 0) or 0)
+        fmt = int(getattr(frame, "preview_format", 0) or 0)
+        if not pixels or width <= 0 or height <= 0:
+            return
+        if fmt != 1:  # 1 = RGB565BE packed 16-bit pixels
+            return
+        expected_len = width * height * 2
+        if expected_len <= 0 or len(pixels) != expected_len:
+            return
+        try:
+            b64 = base64.b64encode(pixels).decode("ascii")
+        except Exception:
+            return
+        with metrics.lock:
+            metrics.game_preview_seq = int(getattr(metrics, "game_preview_seq", 0)) + 1
+            metrics.game_preview_client_id = int(cid)
+            metrics.game_preview_width = width
+            metrics.game_preview_height = height
+            metrics.game_preview_format = "rgb565be"
+            metrics.game_preview_data_b64 = b64
+            metrics.game_preview_updated_ts = time.time()
+
     def _init_client(self, cid):
         n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
@@ -382,6 +426,7 @@ class SocketServer:
                 sock.settimeout(None)
 
             while self.running and not self.shutdown_event.is_set():
+                preview_enabled = self._preview_enabled_for_client(cid)
                 ready = select.select([sock], [], [], 0.002)
                 if not ready[0]:
                     continue
@@ -407,8 +452,9 @@ class SocketServer:
 
                 frame = parse_frame_data(data)
                 if not frame:
-                    sock.sendall(struct.pack("bbb", -1, -1, 0))
+                    sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
                     continue
+                self._cache_client_preview(cid, frame)
 
                 with self.client_lock:
                     if cid not in self.client_states:
@@ -518,7 +564,7 @@ class SocketServer:
                             pass
                     cs["was_done"] = True
                     try:
-                        sock.sendall(struct.pack("bbb", -1, -1, 0))
+                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
                     except Exception:
                         break
                     cs["last_state"] = cs["last_action"] = None
@@ -549,7 +595,7 @@ class SocketServer:
                     cs["fire_hold_count"] = 0
                     cs["fire_pending_dir"] = -1
                     try:
-                        sock.sendall(struct.pack("bbb", -1, -1, 0))
+                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
                     except Exception:
                         break
                     continue
@@ -679,7 +725,8 @@ class SocketServer:
                 cs["last_action_source"] = action_source
 
                 move_cmd, fire_cmd = encode_action_to_game(move_idx, effective_fire)
-                # Action source byte: 0=none, 1=dqn, 2=epsilon, 3=expert, 4=forced_random
+                # Action source byte (low nibble): 0=none, 1=dqn, 2=epsilon, 3=expert, 4=forced_random.
+                # Bit 0x40 flags the Lua client to send game-preview snapshots.
                 if action_source == "expert":
                     source_byte = 3
                 elif is_epsilon:
@@ -691,7 +738,7 @@ class SocketServer:
                 else:
                     source_byte = 0
                 try:
-                    sock.sendall(struct.pack("bbb", move_cmd, fire_cmd, source_byte))
+                    sock.sendall(self._pack_action(move_cmd, fire_cmd, source_byte, preview_enabled))
                 except Exception:
                     break
 

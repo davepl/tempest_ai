@@ -230,6 +230,16 @@ local hud_player_y16 = nil
 local DEBUG_HUD_ENABLED = true         -- set false to disable overlay
 local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
+local PREVIEW_FORMAT_RGB565 = 1
+local PREVIEW_CAPTURE_EVERY_N_FRAMES = 4
+local PREVIEW_MAX_WIDTH = 160
+local PREVIEW_MAX_HEIGHT = 112
+local PREVIEW_MAX_BYTES = 58000
+local preview_stream_enabled = false
+local pending_preview_blob = nil
+local pending_preview_w = 0
+local pending_preview_h = 0
+local last_preview_capture_frame = -1000000
 
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
@@ -979,6 +989,75 @@ local function draw_debug_hud()
     end
 end
 
+local function clear_pending_preview()
+    pending_preview_blob = nil
+    pending_preview_w = 0
+    pending_preview_h = 0
+end
+
+local function capture_game_preview()
+    if not preview_stream_enabled then
+        clear_pending_preview()
+        return
+    end
+    if (frame_counter - last_preview_capture_frame) < PREVIEW_CAPTURE_EVERY_N_FRAMES then
+        return
+    end
+    last_preview_capture_frame = frame_counter
+
+    local ok, result = pcall(function()
+        local vw, vh = manager.machine.video:snapshot_size()
+        if not vw or not vh or vw <= 0 or vh <= 0 then
+            return nil
+        end
+        local src = manager.machine.video:snapshot_pixels()
+        if not src or #src < (vw * vh * 4) then
+            return nil
+        end
+
+        local scale = math.min(1.0, PREVIEW_MAX_WIDTH / vw, PREVIEW_MAX_HEIGHT / vh)
+        local tw = math.max(1, math.floor(vw * scale + 0.5))
+        local th = math.max(1, math.floor(vh * scale + 0.5))
+
+        local out = {}
+        local oi = 1
+        for ty = 0, th - 1 do
+            local sy = math.floor(((ty + 0.5) * vh) / th)
+            if sy >= vh then sy = vh - 1 end
+            local row_base = sy * vw
+            for tx = 0, tw - 1 do
+                local sx = math.floor(((tx + 0.5) * vw) / tw)
+                if sx >= vw then sx = vw - 1 end
+                local px_off = ((row_base + sx) * 4) + 1
+                local px = string.unpack("=I4", src, px_off)
+                local r = (px >> 16) & 0xFF
+                local g = (px >> 8) & 0xFF
+                local b = px & 0xFF
+                local rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                out[oi] = string.pack(">I2", rgb565)
+                oi = oi + 1
+            end
+        end
+
+        local blob = table.concat(out)
+        if #blob <= 0 or #blob > PREVIEW_MAX_BYTES then
+            return nil
+        end
+        return {w = tw, h = th, blob = blob}
+    end)
+
+    if ok and result and result.blob then
+        pending_preview_w = result.w
+        pending_preview_h = result.h
+        pending_preview_blob = result.blob
+    end
+end
+
+local function frame_done_callback()
+    draw_debug_hud()
+    capture_game_preview()
+end
+
 local function initialize_mame_interface()
     local success, err = pcall(function()
         if not manager or not manager.machine then
@@ -1008,6 +1087,7 @@ local function close_socket()
         current_socket:close()
         current_socket = nil
     end
+    preview_stream_enabled = false
 end
 
 local function open_socket()
@@ -1333,7 +1413,8 @@ end
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
                                player_x16, player_y16,
                                enemy_state, list_state_values,
-                               done, subj_reward, obj_reward, save_signal)
+                               done, subj_reward, obj_reward, save_signal,
+                               preview_w, preview_h, preview_fmt, preview_blob)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
     local replay_u32 = math.max(0, math.min(4294967295, math.floor(replay_level or 0)))
     local lasers_u8 = math.max(0, math.min(255, math.floor(num_lasers or 0)))
@@ -1398,7 +1479,16 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
         state_payload_parts[#state_payload_parts + 1] = string.pack(">f", state_values[i])
     end
     local state_payload = table.concat(state_payload_parts)
-    return header .. state_payload
+
+    local preview_chunk = ""
+    local pw = math.max(0, math.floor(preview_w or 0))
+    local ph = math.max(0, math.floor(preview_h or 0))
+    local pf = math.max(0, math.min(255, math.floor(preview_fmt or PREVIEW_FORMAT_RGB565)))
+    if preview_blob and pw > 0 and ph > 0 and #preview_blob > 0 and #preview_blob <= PREVIEW_MAX_BYTES then
+        preview_chunk = string.pack(">HHB", pw, ph, pf) .. preview_blob
+    end
+    local preview_len = #preview_chunk
+    return header .. state_payload .. string.pack(">I4", preview_len) .. preview_chunk
 end
 
 local function process_frame_via_socket(frame_payload, frame_idx)
@@ -1448,7 +1538,9 @@ local function process_frame_via_socket(frame_payload, frame_idx)
     end
 
     local move_dir, fire_dir, source = unpack(read_result)
-    last_action_source = source or 0
+    local source_u8 = (source or 0) & 0xFF
+    preview_stream_enabled = (source_u8 & 0x40) ~= 0
+    last_action_source = source_u8 & 0x0F
     return move_dir or -1, fire_dir or -1, true
 end
 
@@ -1613,12 +1705,24 @@ local function frame_callback()
         last_save_time = now
     end
 
+    local preview_w = 0
+    local preview_h = 0
+    local preview_fmt = PREVIEW_FORMAT_RGB565
+    local preview_blob = nil
+    if preview_stream_enabled and pending_preview_blob then
+        preview_w = pending_preview_w
+        preview_h = pending_preview_h
+        preview_blob = pending_preview_blob
+        clear_pending_preview()
+    end
+
     local ok_payload, payload_or_err = pcall(
         serialize_frame,
         player_alive, score, replay_level, num_lasers, wave_number,
         player_x16, player_y16,
         enemy_state, list_state_values,
-        done, subj_reward, obj_reward, save_signal
+        done, subj_reward, obj_reward, save_signal,
+        preview_w, preview_h, preview_fmt, preview_blob
     )
     if not ok_payload then
         trace_log(frame_counter, "serialize_frame_error", tostring(payload_or_err), true)
@@ -1699,9 +1803,6 @@ local function frame_callback()
     prev_nearest_enemy_y16 = nearest_enemy_y16
     prev_nearest_enemy_dist = nearest_enemy_dist
 
-    -- Draw debug HUD overlay (entity letters on screen)
-    draw_debug_hud()
-
     trace_log(frame_counter, "frame_end", "done=" .. tostring(done))
     frame_counter = frame_counter + 1
 
@@ -1738,8 +1839,8 @@ previous_wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
 global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
 
 -- Register HUD drawing AFTER video rendering so our overlay is not overwritten.
-emu.register_frame_done(draw_debug_hud)
-print("[HUD] Registered frame_done callback for debug overlay")
+emu.register_frame_done(frame_done_callback)
+print("[HUD] Registered frame_done callback for debug overlay + preview capture")
 
 emu.add_machine_stop_notifier(on_mame_exit)
 

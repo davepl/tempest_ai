@@ -140,6 +140,10 @@ class FrameData:
     game_score: int = 0
     next_replay_level: int = 0
     num_lasers: int = 0
+    preview_width: int = 0
+    preview_height: int = 0
+    preview_format: int = 0
+    preview_pixels: Optional[bytes] = None
 
 def parse_frame_data(data: bytes) -> Optional[FrameData]:
     try:
@@ -149,12 +153,39 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             return None
         vals = struct.unpack(fmt, data[:hdr])
         (n, subj, obj, done, score, player_alive, save, replay_level, num_lasers, wave_number) = vals
-        expected_len = hdr + (int(n) * 4)
-        if len(data) != expected_len:
+        base_len = hdr + (int(n) * 4)
+        if len(data) < base_len:
             return None
-        state = np.frombuffer(data[hdr:], dtype=">f4", count=n).astype(np.float32)
+        state = np.frombuffer(data[hdr:base_len], dtype=">f4", count=n).astype(np.float32)
         if state.shape[0] != int(n):
             return None
+
+        preview_width = 0
+        preview_height = 0
+        preview_format = 0
+        preview_pixels = None
+
+        if len(data) > base_len:
+            if len(data) < (base_len + 4):
+                return None
+            preview_len = struct.unpack(">I", data[base_len:base_len + 4])[0]
+            tail_start = base_len + 4
+            tail_end = tail_start + int(preview_len)
+            if tail_end != len(data):
+                return None
+            if preview_len > 0 and preview_len < 5:
+                return None
+            if preview_len >= 5:
+                preview_width, preview_height, preview_format = struct.unpack(">HHB", data[tail_start:tail_start + 5])
+                pixels = data[tail_start + 5:tail_end]
+                if preview_width <= 0 or preview_height <= 0 or len(pixels) <= 0:
+                    return None
+                if int(preview_format) == 1:
+                    expected_px_bytes = int(preview_width) * int(preview_height) * 2
+                    if len(pixels) != expected_px_bytes:
+                        return None
+                preview_pixels = bytes(pixels)
+
         return FrameData(
             state=state, subjreward=float(subj), objreward=float(obj),
             done=bool(done), save_signal=bool(save),
@@ -163,6 +194,10 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             game_score=int(score),
             next_replay_level=int(replay_level),
             num_lasers=int(num_lasers),
+            preview_width=int(preview_width),
+            preview_height=int(preview_height),
+            preview_format=int(preview_format),
+            preview_pixels=preview_pixels,
         )
     except Exception as e:
         print(f"Parse error: {e}")
