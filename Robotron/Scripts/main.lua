@@ -232,8 +232,8 @@ local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
 local PREVIEW_FORMAT_RGB565_LZSS = 2
--- Temporary hard disable for preview capture/transmit.
-local PREVIEW_CAPTURE_ENABLED = false
+-- Enable preview support; server controls streaming per-client via action source flags.
+local PREVIEW_CAPTURE_ENABLED = true
 local PREVIEW_MIN_INTERVAL_S = (1.0 / 30.0)
 -- Allow native-resolution snapshots; compression handles wire size.
 local PREVIEW_MAX_WIDTH = 4096
