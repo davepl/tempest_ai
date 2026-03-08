@@ -1134,13 +1134,8 @@ local function capture_game_preview()
             end
         end
 
-        local raw_blob = table.concat(out)
-        local blob = lzss_compress_bytes(raw_blob)
-        local fmt = PREVIEW_FORMAT_RGB565_LZSS
-        if #blob <= 0 or #blob >= #raw_blob then
-            blob = raw_blob
-            fmt = PREVIEW_FORMAT_RGB565
-        end
+        local blob = table.concat(out)
+        local fmt = PREVIEW_FORMAT_RGB565
         if #blob <= 0 or #blob > PREVIEW_MAX_BYTES then
             return nil
         end
