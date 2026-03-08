@@ -71,6 +71,25 @@ Interpretation guide:
 - Failure after `apply_action`:
   - likely game runtime/ROM/input interaction issue.
 
+## Remote Preview (WebRTC TURN/STUN)
+
+The dashboard preview card can use WebRTC video streaming when `aiortc`, `av`, and `numpy` are installed.
+For reliable mobile/remote viewing (5G, cross-country/international), configure TURN/STUN via:
+
+- `ROBOTRON_WEBRTC_ICE_SERVERS` (JSON array of ICE server objects)
+
+Example:
+
+```bash
+export ROBOTRON_WEBRTC_ICE_SERVERS='[
+  {"urls":["stun:stun.l.google.com:19302"]},
+  {"urls":["turn:turn.example.com:3478?transport=udp","turn:turn.example.com:3478?transport=tcp"],"username":"robotron","credential":"YOUR_SECRET"}
+]'
+```
+
+If unset or invalid, dashboard uses built-in ICE defaults from
+`Robotron/Scripts/config.py` (`WEBRTC_ICE_SERVERS`).
+
 ## TODO (Known Missing Robotron Wiring)
 
 - Exact MAME input field names for:

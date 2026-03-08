@@ -1,6 +1,8 @@
 # Core runtime
 numpy
 torch
+aiortc
+av
 
 # Testing
 pytest

@@ -145,7 +145,7 @@ class FrameData:
     preview_format: int = 0
     preview_pixels: Optional[bytes] = None
 
-def parse_frame_data(data: bytes) -> Optional[FrameData]:
+def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameData]:
     try:
         fmt = ">HddBIBBIBB"
         hdr = struct.calcsize(fmt)
@@ -173,7 +173,10 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
             tail_end = tail_start + int(preview_len)
             if tail_end != len(data):
                 return None
-            if preview_len > 0 and preview_len < 5:
+            if (not parse_preview) and preview_len > 0:
+                # Fast path for non-preview clients: validate framing only.
+                preview_len = 0
+            elif preview_len > 0 and preview_len < 5:
                 return None
             if preview_len >= 5:
                 preview_width, preview_height, preview_format = struct.unpack(">HHB", data[tail_start:tail_start + 5])

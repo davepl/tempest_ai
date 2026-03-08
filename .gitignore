@@ -35,3 +35,12 @@ Robotron/models/robotron_model_latest_replay/is_expert.dat
 Robotron/models/robotron_model_latest_replay/next_states.dat
 Robotron/models/robotron_model_latest_replay/rewards.dat
 Robotron/models/robotron_model_latest_replay/states.dat
+models/robotron_model_latest_replay/_meta.npy
+models/robotron_model_latest_replay/actions.dat
+models/robotron_model_latest_replay/dones.dat
+models/robotron_model_latest_replay/horizons.dat
+models/robotron_model_latest_replay/is_expert.dat
+models/robotron_model_latest_replay/next_states.dat
+models/robotron_model_latest_replay/priorities.npy
+models/robotron_model_latest_replay/rewards.dat
+models/robotron_model_latest_replay/states.dat

@@ -10,6 +10,8 @@ if __name__ == "__main__":
     raise SystemExit(1)
 
 import atexit
+import asyncio
+import base64
 import json
 import math
 import mimetypes
@@ -21,15 +23,45 @@ import tempfile
 import threading
 import time
 import webbrowser
+import sys
+from fractions import Fraction
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
-    from config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except Exception:
+    np = None
+    _NUMPY_AVAILABLE = False
+
+try:
+    from aiortc import (
+        RTCPeerConnection,
+        RTCSessionDescription,
+        RTCConfiguration,
+        RTCIceServer,
+        VideoStreamTrack,
+    )
+    from av import VideoFrame
+    _WEBRTC_AVAILABLE = True
+    _WEBRTC_IMPORT_ERROR = ""
+except Exception as e:
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    RTCConfiguration = None
+    RTCIceServer = None
+    VideoStreamTrack = object
+    VideoFrame = None
+    _WEBRTC_AVAILABLE = False
+    _WEBRTC_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+try:
+    from config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings, WEBRTC_ICE_SERVERS
 except ImportError:
-    from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings
+    from Scripts.config import RL_CONFIG, plateau_pulser, PlateauPulser, game_settings, WEBRTC_ICE_SERVERS
 
 try:
     from metrics_display import get_dqn_window_averages, get_total_window_averages, get_eplen_1m_average, get_eplen_100k_average
@@ -65,6 +97,10 @@ DASH_HISTORY_LIMIT = 40_000
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".webm", ".ogv"}
+
+
+_FALLBACK_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
+_WEBRTC_ICE_SERVERS = WEBRTC_ICE_SERVERS if isinstance(WEBRTC_ICE_SERVERS, list) and WEBRTC_ICE_SERVERS else _FALLBACK_ICE_SERVERS
 
 
 def _audio_dir() -> str:
@@ -495,7 +531,312 @@ class _DashboardState:
         return json.dumps(payload).encode("utf-8")
 
 
-def _render_dashboard_html() -> str:
+class _PreviewVideoTrack(VideoStreamTrack):
+    """Pull latest cached preview frame and expose as a WebRTC video track."""
+
+    def __init__(self, metrics_obj, fps: float = 30.0, max_width: int = 0, max_height: int = 0):
+        super().__init__()
+        self.metrics = metrics_obj
+        self.fps = max(1.0, float(fps))
+        self.max_width = max(0, int(max_width))
+        self.max_height = max(0, int(max_height))
+        self._tb = Fraction(1, 90000)
+        self._last_seq = -1
+        self._last_rgb = None
+        self._last_w = 320
+        self._last_h = 224
+        self._frames_sent = 0
+        self._last_log_ts = 0.0
+        self._frame_interval_s = 1.0 / self.fps
+        self._next_emit_ts = 0.0
+
+    @staticmethod
+    def _rgb565_to_rgb24(raw: bytes, width: int, height: int):
+        if np is None:
+            return None
+        px = int(width) * int(height)
+        arr = np.frombuffer(raw, dtype=np.dtype(">u2"), count=px)
+        if arr.size != px:
+            return None
+        arr = arr.reshape((height, width))
+        r = ((arr >> 11) & 0x1F).astype(np.uint8)
+        g = ((arr >> 5) & 0x3F).astype(np.uint8)
+        b = (arr & 0x1F).astype(np.uint8)
+        rgb = np.empty((height, width, 3), dtype=np.uint8)
+        # Widen before scaling to avoid uint8 overflow (which produces near-black output).
+        rgb[..., 0] = ((r.astype(np.uint16) * 255) // 31).astype(np.uint8)
+        rgb[..., 1] = ((g.astype(np.uint16) * 255) // 63).astype(np.uint8)
+        rgb[..., 2] = ((b.astype(np.uint16) * 255) // 31).astype(np.uint8)
+        return rgb
+
+    def _snapshot_rgb_frame(self):
+        with self.metrics.lock:
+            seq = int(getattr(self.metrics, "game_preview_seq", 0))
+            w = int(getattr(self.metrics, "game_preview_width", 0))
+            h = int(getattr(self.metrics, "game_preview_height", 0))
+            fmt = str(getattr(self.metrics, "game_preview_format", "") or "")
+            raw_b64 = getattr(self.metrics, "game_preview_data_b64", "") or ""
+
+        if isinstance(raw_b64, bytes):
+            try:
+                data_b64 = raw_b64.decode("ascii", errors="ignore")
+            except Exception:
+                data_b64 = ""
+        else:
+            data_b64 = str(raw_b64)
+
+        if seq <= 0 or w <= 0 or h <= 0 or fmt != "rgb565be" or not data_b64:
+            return None, None, None, f"missing seq={seq} w={w} h={h} fmt={fmt} b64={len(data_b64)}"
+
+        if seq == self._last_seq and self._last_rgb is not None:
+            return self._last_rgb, self._last_w, self._last_h, ""
+
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except Exception as e:
+            return None, None, None, f"b64decode:{type(e).__name__}"
+
+        expected = int(w) * int(h) * 2
+        if len(raw) != expected:
+            return None, None, None, f"len_mismatch got={len(raw)} expected={expected}"
+
+        rgb = self._rgb565_to_rgb24(raw, w, h)
+        if rgb is None:
+            return None, None, None, "rgb_convert_failed"
+
+        self._last_seq = seq
+        self._last_rgb = rgb
+        self._last_w = int(w)
+        self._last_h = int(h)
+        return rgb, w, h, ""
+
+    @staticmethod
+    def _debug_pattern(width: int, height: int, tick: int):
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        t = int(tick) & 0xFF
+        rgb[..., 0] = (32 + t) & 0xFF
+        rgb[..., 1] = (80 + (t * 3)) & 0xFF
+        rgb[..., 2] = (160 + (t * 5)) & 0xFF
+        # Bright border so "frame exists" is obvious.
+        rgb[0:4, :, :] = 255
+        rgb[-4:, :, :] = 255
+        rgb[:, 0:4, :] = 255
+        rgb[:, -4:, :] = 255
+        return rgb
+
+    def _downscale_if_needed(self, rgb):
+        if rgb is None:
+            return rgb
+        h, w = rgb.shape[0], rgb.shape[1]
+        if w <= 0 or h <= 0:
+            return rgb
+        if self.max_width <= 0 and self.max_height <= 0:
+            return rgb
+        sx = (float(w) / float(self.max_width)) if self.max_width > 0 else 1.0
+        sy = (float(h) / float(self.max_height)) if self.max_height > 0 else 1.0
+        scale = max(1.0, sx, sy)
+        if scale <= 1.0:
+            return rgb
+        step = max(2, int(math.ceil(scale)))
+        return rgb[::step, ::step, :].copy()
+
+    async def recv(self):
+        now_emit = time.perf_counter()
+        if self._next_emit_ts <= 0.0:
+            self._next_emit_ts = now_emit
+        sleep_s = self._next_emit_ts - now_emit
+        if sleep_s > 0.0:
+            await asyncio.sleep(sleep_s)
+        self._next_emit_ts = max(self._next_emit_ts + self._frame_interval_s, time.perf_counter())
+
+        pts, _ = await self.next_timestamp()
+        rgb, w, h, err = self._snapshot_rgb_frame()
+        self._frames_sent += 1
+        now = time.time()
+        if rgb is None:
+            if np is None:
+                raise RuntimeError("numpy is required for WebRTC preview streaming")
+            w = int(self._last_w or 320)
+            h = int(self._last_h or 224)
+            rgb = self._debug_pattern(w, h, self._frames_sent)
+            if (now - self._last_log_ts) >= 1.0:
+                print(f"[preview] track fallback frame: {err}", flush=True)
+                self._last_log_ts = now
+        rgb = self._downscale_if_needed(rgb)
+        out_h = int(rgb.shape[0]) if rgb is not None else 0
+        out_w = int(rgb.shape[1]) if rgb is not None else 0
+        if (now - self._last_log_ts) >= 2.0:
+            print(
+                f"[preview] track frame ok: seq={self._last_seq} src={w}x{h} out={out_w}x{out_h} fps={self.fps:.1f}",
+                flush=True,
+            )
+            self._last_log_ts = now
+        frame = VideoFrame.from_ndarray(rgb, format="rgb24")
+        frame.pts = int(pts)
+        frame.time_base = self._tb
+        return frame
+
+
+class _PreviewWebRTCBridge:
+    def __init__(self, metrics_obj, ice_servers: list[dict[str, Any]] | None = None):
+        self.metrics = metrics_obj
+        self.enabled = bool(_WEBRTC_AVAILABLE and np is not None)
+        self.ice_servers = list(ice_servers) if ice_servers else list(_WEBRTC_ICE_SERVERS)
+        print(
+            f"[preview] bridge init: enabled={self.enabled} "
+            f"numpy={_NUMPY_AVAILABLE} webrtc={_WEBRTC_AVAILABLE} "
+            f"py={sys.executable}",
+            flush=True,
+        )
+        if not _WEBRTC_AVAILABLE:
+            print(f"[preview] aiortc/av import error: {_WEBRTC_IMPORT_ERROR}", flush=True)
+        if not _NUMPY_AVAILABLE:
+            print("[preview] numpy import unavailable", flush=True)
+        if self.enabled:
+            self.error_reason = ""
+        else:
+            missing = []
+            if not _NUMPY_AVAILABLE:
+                missing.append("numpy")
+            if not _WEBRTC_AVAILABLE:
+                missing.append("aiortc/av")
+            if missing and _WEBRTC_IMPORT_ERROR:
+                self.error_reason = f"missing_deps:{','.join(missing)} ({_WEBRTC_IMPORT_ERROR})"
+            else:
+                self.error_reason = f"missing_deps:{','.join(missing)}" if missing else "webrtc_unavailable"
+        self._thread = None
+        self._loop = None
+        self._pcs = set()
+        self._lock = threading.Lock()
+
+    def start(self):
+        if not self.enabled:
+            return
+        if self._thread is not None:
+            return
+
+        def _runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            loop.run_forever()
+            try:
+                loop.run_until_complete(self._shutdown_async())
+            finally:
+                loop.close()
+
+        self._thread = threading.Thread(target=_runner, daemon=True, name="PreviewWebRTC")
+        self._thread.start()
+        for _ in range(200):
+            if self._loop is not None:
+                return
+            time.sleep(0.01)
+        self.enabled = False
+
+    async def _shutdown_async(self):
+        pcs = list(self._pcs)
+        self._pcs.clear()
+        for pc in pcs:
+            try:
+                await pc.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        if not self.enabled:
+            return
+        loop = self._loop
+        if loop is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
+                fut.result(timeout=3.0)
+            except Exception:
+                pass
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        self._thread = None
+        self._loop = None
+
+    def _pc_configuration(self):
+        if RTCConfiguration is None or RTCIceServer is None:
+            return None
+        ice_servers = []
+        for item in self.ice_servers:
+            if not isinstance(item, dict):
+                continue
+            urls = item.get("urls")
+            if isinstance(urls, str):
+                urls = [urls]
+            if not isinstance(urls, list) or not urls:
+                continue
+            kwargs = {"urls": urls}
+            username = item.get("username")
+            credential = item.get("credential")
+            if isinstance(username, str):
+                kwargs["username"] = username
+            if isinstance(credential, str):
+                kwargs["credential"] = credential
+            try:
+                ice_servers.append(RTCIceServer(**kwargs))
+            except Exception:
+                continue
+        return RTCConfiguration(iceServers=ice_servers)
+
+    async def _create_answer_async(self, offer_sdp: str, offer_type: str, profile: str = "default"):
+        if not self.enabled:
+            return {"ok": False, "error": "webrtc_unavailable"}
+        pc = RTCPeerConnection(configuration=self._pc_configuration())
+        self._pcs.add(pc)
+
+        @pc.on("connectionstatechange")
+        async def _on_state_change():
+            if pc.connectionState in {"closed", "failed", "disconnected"}:
+                self._pcs.discard(pc)
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+
+        profile_norm = str(profile or "default").strip().lower()
+        if profile_norm == "mobile":
+            track = _PreviewVideoTrack(self.metrics, fps=12.0, max_width=160, max_height=132)
+        else:
+            profile_norm = "default"
+            track = _PreviewVideoTrack(self.metrics, fps=30.0)
+        print(f"[preview] create_answer profile={profile_norm}", flush=True)
+        pc.addTrack(track)
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type=offer_type))
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        return {
+            "ok": True,
+            "type": pc.localDescription.type,
+            "sdp": pc.localDescription.sdp,
+        }
+
+    def create_answer(self, offer_sdp: str, offer_type: str, timeout_s: float = 10.0, profile: str = "default") -> dict[str, Any]:
+        if not self.enabled or self._loop is None:
+            print(f"[preview] create_answer unavailable: enabled={self.enabled} loop={self._loop is not None} reason={self.error_reason}", flush=True)
+            return {"ok": False, "error": self.error_reason or "webrtc_unavailable"}
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._create_answer_async(offer_sdp, offer_type, profile=profile),
+                self._loop,
+            )
+            answer = fut.result(timeout=max(1.0, float(timeout_s)))
+            print(f"[preview] create_answer ok={bool(answer.get('ok'))} type={answer.get('type','')} sdp_len={len(str(answer.get('sdp','')))}", flush=True)
+            return answer
+        except Exception as e:
+            print(f"[preview] create_answer exception: {e}", flush=True)
+            return {"ok": False, "error": f"webrtc_offer_failed: {e}"}
+
+
+def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = None) -> str:
+    _ice_json = json.dumps(webrtc_ice_servers if webrtc_ice_servers else _WEBRTC_ICE_SERVERS)
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -970,6 +1311,13 @@ def _render_dashboard_html() -> str:
       box-shadow: none;
       image-rendering: pixelated;
     }
+    .preview-video {
+      display: none;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #020617;
+    }
     .preview-msg {
       position: absolute;
       inset: 0;
@@ -1139,14 +1487,14 @@ def _render_dashboard_html() -> str:
     @media (max-width: 1300px) {
       .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
       .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
-      .preview-card { grid-column: span 4; grid-row: span 2; min-height: 180px; }
+      .preview-card { grid-column: span 4; grid-row: span 1; min-height: 124px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
-      .preview-card { grid-column: span 4; grid-row: span 2; }
+      .preview-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
@@ -1178,6 +1526,7 @@ def _render_dashboard_html() -> str:
           <div class="label">CLIENT 0 PREVIEW</div>
         </div>
         <div class="preview-wrap">
+          <video id="vGamePreview" class="preview-video" autoplay muted playsinline></video>
           <canvas id="cGamePreview" class="preview-canvas"></canvas>
           <div id="mGamePreviewMsg" class="preview-msg">No Clients</div>
         </div>
@@ -1548,12 +1897,20 @@ def _render_dashboard_html() -> str:
     const fpsGaugeCanvas = document.getElementById("cFpsGauge");
     const stepGaugeCanvas = document.getElementById("cStepGauge");
     const gamePreviewCanvas = document.getElementById("cGamePreview");
+    const gamePreviewVideo = document.getElementById("vGamePreview");
     const _previewSrcCanvas = document.createElement("canvas");
     const _previewSrcCtx = _previewSrcCanvas.getContext("2d");
     let _previewSeqLoaded = -1;
     let _previewFetchInFlight = false;
     let _previewHasFrame = false;
     let _previewPumpRunning = false;
+    let _previewRtcPc = null;
+    let _previewRtcConnected = false;
+    let _previewRtcEnabled = false;
+    let _previewRtcError = "";
+    let _previewRtcRetryTimer = null;
+    let _previewRtcConnecting = false;
+    let _previewVideoHasFrame = false;
 
     // ── Gauge needle damping ────────────────────────────────────────
     // Time-constant in seconds: the needle closes ~63% of the gap
@@ -1608,8 +1965,15 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    function setPreviewRenderMode(mode) {
+      const useVideo = (mode === "video");
+      if (gamePreviewVideo) gamePreviewVideo.style.display = useVideo ? "block" : "none";
+      if (gamePreviewCanvas) gamePreviewCanvas.style.display = useVideo ? "none" : "block";
+    }
+
     function clearPreviewCanvas() {
       if (!gamePreviewCanvas) return;
+      setPreviewRenderMode("canvas");
       const width = gamePreviewCanvas.clientWidth || 320;
       const height = gamePreviewCanvas.clientHeight || 180;
       const dpr = window.devicePixelRatio || 1;
@@ -1706,10 +2070,198 @@ def _render_dashboard_html() -> str:
       }
     }
 
+    const WEBRTC_ICE_SERVERS = __WEBRTC_ICE_SERVERS_JSON__;
+    const PREVIEW_PROFILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ? "mobile" : "default";
+    function _previewLog(...args) {
+      try { console.log("[preview]", ...args); } catch (_) {}
+    }
+    function _previewWarn(...args) {
+      try { console.warn("[preview]", ...args); } catch (_) {}
+    }
+    if (gamePreviewVideo) {
+      const _onVideoFrame = () => {
+        _previewVideoHasFrame = true;
+        setPreviewRenderMode("video");
+        setPreviewMessage("");
+      };
+      gamePreviewVideo.addEventListener("loadeddata", () => {
+        _previewLog("video loadeddata", { w: gamePreviewVideo.videoWidth || 0, h: gamePreviewVideo.videoHeight || 0 });
+      });
+      gamePreviewVideo.addEventListener("playing", () => {
+        _previewLog("video playing");
+        _onVideoFrame();
+      });
+      gamePreviewVideo.addEventListener("stalled", () => {
+        _previewWarn("video stalled");
+      });
+      gamePreviewVideo.addEventListener("waiting", () => {
+        _previewWarn("video waiting");
+      });
+      if (typeof gamePreviewVideo.requestVideoFrameCallback === "function") {
+        const _pumpVideoFrame = () => {
+          gamePreviewVideo.requestVideoFrameCallback(() => {
+            _onVideoFrame();
+            _pumpVideoFrame();
+          });
+        };
+        _pumpVideoFrame();
+      }
+    }
+
+    function _schedulePreviewWebRTCRetry(delayMs = 1500) {
+      if (_previewRtcRetryTimer) return;
+      _previewRtcRetryTimer = setTimeout(() => {
+        _previewRtcRetryTimer = null;
+        _ensurePreviewWebRTC();
+      }, Math.max(250, Number(delayMs) || 1500));
+    }
+
+    function _waitForIceGatheringComplete(pc, timeoutMs = 1200) {
+      return new Promise((resolve) => {
+        if (!pc || pc.iceGatheringState === "complete") {
+          resolve();
+          return;
+        }
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          try { pc.removeEventListener("icegatheringstatechange", onState); } catch (_) {}
+          clearTimeout(tid);
+          resolve();
+        };
+        const onState = () => {
+          if (pc.iceGatheringState === "complete") finish();
+        };
+        const tid = setTimeout(finish, Math.max(300, Number(timeoutMs) || 1200));
+        try { pc.addEventListener("icegatheringstatechange", onState); } catch (_) { finish(); }
+      });
+    }
+
+    async function _startPreviewWebRTC() {
+      if (!window.RTCPeerConnection || !gamePreviewVideo) return false;
+      if (_previewRtcConnecting) return false;
+      if (_previewRtcPc) return _previewRtcConnected;
+      _previewRtcConnecting = true;
+      _previewLog("starting WebRTC offer", { iceServers: WEBRTC_ICE_SERVERS });
+      const pc = new RTCPeerConnection({
+        iceServers: Array.isArray(WEBRTC_ICE_SERVERS) && WEBRTC_ICE_SERVERS.length
+          ? WEBRTC_ICE_SERVERS
+          : [{ urls: ["stun:stun.l.google.com:19302"] }],
+      });
+      _previewRtcPc = pc;
+      _previewRtcConnected = false;
+
+      pc.ontrack = (ev) => {
+        _previewLog("ontrack received", { trackKind: ev && ev.track ? ev.track.kind : "unknown" });
+        const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+        gamePreviewVideo.srcObject = stream;
+        // Show video element immediately; some mobile browsers will not
+        // reliably start decode/render while the element is display:none.
+        setPreviewRenderMode("video");
+        try {
+          const p = gamePreviewVideo.play();
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } catch (_) {}
+        _previewRtcConnected = true;
+        _previewRtcEnabled = true;
+        _previewRtcError = "";
+        setPreviewMessage("Loading Preview");
+      };
+
+      pc.onconnectionstatechange = () => {
+        const st = pc.connectionState || "";
+        _previewLog("connectionState", st);
+        if (st === "failed" || st === "closed" || st === "disconnected") {
+          _previewRtcConnected = false;
+          _previewRtcEnabled = false;
+          setPreviewRenderMode("canvas");
+          try { pc.close(); } catch (_) {}
+          if (_previewRtcPc === pc) _previewRtcPc = null;
+          _schedulePreviewWebRTCRetry(1000);
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        _previewLog("iceConnectionState", pc.iceConnectionState || "");
+      };
+      pc.onicegatheringstatechange = () => {
+        _previewLog("iceGatheringState", pc.iceGatheringState || "");
+      };
+
+      try {
+        const vtx = pc.addTransceiver("video", { direction: "recvonly" });
+        try {
+          if (vtx && typeof vtx.setCodecPreferences === "function" && window.RTCRtpReceiver && typeof RTCRtpReceiver.getCapabilities === "function") {
+            const caps = RTCRtpReceiver.getCapabilities("video");
+            const codecs = (caps && Array.isArray(caps.codecs)) ? caps.codecs.filter((c) => c && c.mimeType && !/rtx|red|ulpfec/i.test(c.mimeType)) : [];
+            if (codecs.length) {
+              const rank = (c) => {
+                const m = String(c.mimeType || "").toLowerCase();
+                if (m.includes("vp8")) return 0;
+                if (m.includes("h264")) return 1;
+                if (m.includes("vp9")) return 2;
+                return 3;
+              };
+              codecs.sort((a, b) => rank(a) - rank(b));
+              vtx.setCodecPreferences(codecs);
+              _previewLog("codec prefs set", codecs.map((c) => c.mimeType));
+            }
+          }
+        } catch (e) {
+          _previewWarn("setCodecPreferences failed", (e && e.message) ? e.message : e);
+        }
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await _waitForIceGatheringComplete(pc, 1200);
+        const res = await fetch("/api/game_preview_offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: (pc.localDescription && pc.localDescription.sdp) ? pc.localDescription.sdp : offer.sdp,
+            type: (pc.localDescription && pc.localDescription.type) ? pc.localDescription.type : offer.type,
+            profile: PREVIEW_PROFILE,
+          }),
+        });
+        _previewLog("offer POST status", res.status);
+        let ans = null;
+        try { ans = await res.json(); } catch (_) { ans = null; }
+        if (!res.ok) throw new Error(ans && ans.error ? ans.error : "offer rejected");
+        if (!ans || !ans.ok || !ans.sdp || !ans.type) throw new Error(ans && ans.error ? ans.error : "invalid answer");
+        _previewLog("answer accepted", { type: ans.type, sdpLen: ans.sdp ? ans.sdp.length : 0 });
+        await pc.setRemoteDescription({ type: ans.type, sdp: ans.sdp });
+        _previewRtcEnabled = true;
+        _previewRtcError = "";
+        return true;
+      } catch (err) {
+        _previewRtcError = (err && err.message) ? String(err.message) : "webrtc init failed";
+        _previewWarn("start failed", _previewRtcError);
+        _previewRtcConnected = false;
+        _previewRtcEnabled = false;
+        setPreviewRenderMode("canvas");
+        try { pc.close(); } catch (_) {}
+        if (_previewRtcPc === pc) _previewRtcPc = null;
+        _schedulePreviewWebRTCRetry(1500);
+        return false;
+      } finally {
+        _previewRtcConnecting = false;
+      }
+    }
+
+    async function _ensurePreviewWebRTC() {
+      if (_previewRtcConnected || _previewRtcConnecting) return;
+      _previewLog("ensure WebRTC requested");
+      await _startPreviewWebRTC();
+    }
+
     async function previewPumpLoop() {
       if (_previewPumpRunning) return;
       _previewPumpRunning = true;
       while (true) {
+        if (_previewRtcEnabled && _previewRtcConnected) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
+        }
         try {
           const since = Math.max(0, Number(_previewSeqLoaded) || 0);
           const res = await fetch(
@@ -3656,15 +4208,18 @@ def _render_dashboard_html() -> str:
         : "0.0%";
 
       const previewSeq = Number(now.game_preview_seq || 0);
-      if ((now.client_count || 0) <= 0) {
+      if (_previewRtcEnabled && _previewRtcConnected) {
+        setPreviewRenderMode("video");
+        setPreviewMessage(_previewVideoHasFrame ? "" : "Loading Preview");
+      } else if ((now.client_count || 0) <= 0) {
         setPreviewMessage("No Clients");
         _previewHasFrame = false;
         clearPreviewCanvas();
       } else if (!Number.isFinite(previewSeq) || previewSeq <= 0) {
-        setPreviewMessage("Waiting For Client 0");
+        setPreviewMessage(_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Waiting For Client 0");
         if (!_previewHasFrame) clearPreviewCanvas();
       } else {
-        setPreviewMessage(_previewHasFrame ? "" : "Loading Preview");
+        setPreviewMessage(_previewHasFrame ? "" : (_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Loading Preview"));
       }
 
       // ── Record highs ──────────────────────────────────────────────
@@ -3828,7 +4383,7 @@ def _render_dashboard_html() -> str:
     }
     loadAudioPlaylist().catch(() => {});
 
-    previewPumpLoop();
+    _ensurePreviewWebRTC().finally(() => { previewPumpLoop(); });
     fetchHistory().then(() => fetchNow()).catch(() => {});
     setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
@@ -3837,17 +4392,20 @@ def _render_dashboard_html() -> str:
       // Force gauge repaint since canvas dimensions changed
       drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
       drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
-      if (_previewHasFrame) drawPreviewToCard();
+      if (_previewRtcEnabled && _previewRtcConnected) {
+        setPreviewRenderMode("video");
+      } else if (_previewHasFrame) drawPreviewToCard();
       else clearPreviewCanvas();
     });
   </script>
 </body>
 </html>
-"""
+""".replace("__WEBRTC_ICE_SERVERS_JSON__", _ice_json)
 
 
-def _make_handler(state: _DashboardState):
-    page = _render_dashboard_html().encode("utf-8")
+def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | None = None):
+    _ice = rtc_bridge.ice_servers if rtc_bridge is not None else _WEBRTC_ICE_SERVERS
+    page = _render_dashboard_html(_ice).encode("utf-8")
     audio_root = os.path.abspath(_audio_dir())
     fonts_root = os.path.abspath(_fonts_dir())
     html_root = os.path.abspath(_html_dir())
@@ -4023,6 +4581,31 @@ def _make_handler(state: _DashboardState):
         def do_POST(self):
             parsed = urlparse(self.path)
             path = parsed.path
+            if path == "/api/game_preview_offer":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    data = json.loads(raw)
+                    sdp = str(data.get("sdp", "") or "")
+                    typ = str(data.get("type", "offer") or "offer")
+                    profile = str(data.get("profile", "default") or "default").strip().lower()
+                    if profile not in {"default", "mobile"}:
+                        profile = "default"
+                    print(f"[preview] offer recv: content_len={length} type={typ} sdp_len={len(sdp)} profile={profile}", flush=True)
+                    if not sdp:
+                        raise ValueError("missing_sdp")
+                    if rtc_bridge is None:
+                        raise RuntimeError("webrtc_bridge_unavailable")
+                    answer = rtc_bridge.create_answer(sdp, typ, timeout_s=10.0, profile=profile)
+                    body = json.dumps(answer).encode("utf-8")
+                    status = 200 if bool(answer.get("ok")) else 503
+                    print(f"[preview] offer reply: status={status} ok={bool(answer.get('ok'))} err={answer.get('error','')}", flush=True)
+                    self._send(body, "application/json", status=status)
+                except Exception as e:
+                    print(f"[preview] offer exception: {e}", flush=True)
+                    body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+                    self._send(body, "application/json", status=400)
+                return
             if path == "/api/game_settings":
                 try:
                     length = int(self.headers.get("Content-Length", 0))
@@ -4089,6 +4672,7 @@ class MetricsDashboard:
         self.open_browser = open_browser
 
         self.state = _DashboardState(metrics_obj, agent_obj, history_limit=history_limit)
+        self.rtc_bridge = _PreviewWebRTCBridge(metrics_obj, _WEBRTC_ICE_SERVERS)
         self.stop_event = threading.Event()
         self.httpd: ThreadingHTTPServer | None = None
         self.server_thread: threading.Thread | None = None
@@ -4118,7 +4702,7 @@ class MetricsDashboard:
             self.stop_event.wait(self.sample_interval)
 
     def _bind_server(self):
-        handler_cls = _make_handler(self.state)
+        handler_cls = _make_handler(self.state, self.rtc_bridge)
         last_err = None
         for p in range(self.port, self.port + 40):
             try:
@@ -4195,6 +4779,7 @@ class MetricsDashboard:
 
     def start(self) -> str:
         self.state.sample()
+        self.rtc_bridge.start()
         self._bind_server()
         self.url = f"http://{self.host}:{self.port}"
 
@@ -4240,6 +4825,12 @@ class MetricsDashboard:
             except Exception:
                 pass
         self.sampler_thread = None
+
+        try:
+            if self.rtc_bridge is not None:
+                self.rtc_bridge.stop()
+        except Exception:
+            pass
 
         if self.browser_proc and self.browser_proc.poll() is None:
             try:

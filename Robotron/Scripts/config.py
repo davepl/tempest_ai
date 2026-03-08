@@ -22,6 +22,57 @@ MODEL_DIR = "models"
 LATEST_MODEL_PATH = f"{MODEL_DIR}/robotron_model_latest.pt"
 SETTINGS_PATH = f"{MODEL_DIR}/game_settings.json"
 
+
+def _default_webrtc_ice_servers() -> list[dict]:
+    """Built-in ICE defaults for dashboard WebRTC preview."""
+    return [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {
+            "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turn:turn.example.com:3478?transport=tcp",
+            ],
+            "username": "robotron",
+            "credential": "b7K2q9VxM4pN8tR1yL6cZ3wH5dF0sJ",
+        },
+    ]
+
+
+def _parse_webrtc_ice_servers_env() -> list[dict]:
+    """Parse ROBOTRON_WEBRTC_ICE_SERVERS JSON env override, else defaults."""
+    raw = (os.getenv("ROBOTRON_WEBRTC_ICE_SERVERS") or "").strip()
+    if not raw:
+        return _default_webrtc_ice_servers()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return _default_webrtc_ice_servers()
+    if not isinstance(data, list):
+        return _default_webrtc_ice_servers()
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        urls = item.get("urls")
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list) or not urls:
+            continue
+        urls_norm = [str(u).strip() for u in urls if isinstance(u, str) and str(u).strip()]
+        if not urls_norm:
+            continue
+        ent = {"urls": urls_norm}
+        if isinstance(item.get("username"), str):
+            ent["username"] = str(item.get("username"))
+        if isinstance(item.get("credential"), str):
+            ent["credential"] = str(item.get("credential"))
+        out.append(ent)
+    return out if out else _default_webrtc_ice_servers()
+
+
+# Dashboard WebRTC ICE server list (TURN/STUN). Env override takes precedence.
+WEBRTC_ICE_SERVERS = _parse_webrtc_ice_servers_env()
+
 # ---------------------------------------------------------------------------
 @dataclass
 class ServerConfigData:

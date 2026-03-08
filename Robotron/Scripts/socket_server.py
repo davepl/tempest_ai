@@ -354,6 +354,20 @@ class SocketServer:
             metrics.game_preview_data_b64 = b64
             metrics.game_preview_updated_ts = time.time()
 
+    @staticmethod
+    def _peek_preview_len(payload: bytes) -> int:
+        """Read preview_len tail field without decoding payload preview blob."""
+        try:
+            if not payload or len(payload) < 2:
+                return 0
+            n = struct.unpack(">H", payload[:2])[0]
+            base_len = struct.calcsize(">HddBIBBIBB") + (int(n) * 4)
+            if len(payload) < (base_len + 4):
+                return 0
+            return int(struct.unpack(">I", payload[base_len:base_len + 4])[0] or 0)
+        except Exception:
+            return 0
+
     def _init_client(self, cid):
         n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
@@ -453,7 +467,21 @@ class SocketServer:
                 else:
                     break
 
-                frame = parse_frame_data(data)
+                preview_parse_allowed = bool(int(cid) == 0 and preview_enabled)
+                if not preview_parse_allowed:
+                    pl = self._peek_preview_len(data)
+                    if pl > 0:
+                        now_t = time.time()
+                        with self.client_lock:
+                            cs = self.client_states.get(cid, {})
+                            last = float(cs.get("last_nonzero_preview_warn_ts", 0.0) or 0.0)
+                            if (now_t - last) >= 5.0:
+                                print(f"[preview] WARNING non-cid0 client {cid} sent preview_len={pl}", flush=True)
+                                cs["last_nonzero_preview_warn_ts"] = now_t
+
+                # Hard gate preview parsing to client 0 only.
+                # Even if another client sends preview bytes, skip decode cost.
+                frame = parse_frame_data(data, parse_preview=preview_parse_allowed)
                 if not frame:
                     sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
                     continue

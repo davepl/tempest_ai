@@ -227,11 +227,13 @@ local mame_screen = nil                -- MAME screen device for draw_text
 local hud_objects = nil                -- last frame's classified object list (reference)
 local hud_player_x16 = nil
 local hud_player_y16 = nil
-local DEBUG_HUD_ENABLED = true         -- set false to disable overlay
+local DEBUG_HUD_ENABLED = false        -- default OFF; toggle on with H hotkey
 local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
 local PREVIEW_FORMAT_RGB565_LZSS = 2
+-- Temporary hard disable for preview capture/transmit.
+local PREVIEW_CAPTURE_ENABLED = false
 local PREVIEW_MIN_INTERVAL_S = (1.0 / 30.0)
 -- Allow native-resolution snapshots; compression handles wire size.
 local PREVIEW_MAX_WIDTH = 4096
@@ -1091,7 +1093,7 @@ local function lzss_compress_bytes(data)
 end
 
 local function capture_game_preview()
-    if not preview_stream_enabled then
+    if (not PREVIEW_CAPTURE_ENABLED) or (not preview_stream_enabled) then
         clear_pending_preview()
         return
     end
@@ -1153,7 +1155,11 @@ end
 
 local function frame_done_callback()
     draw_debug_hud()
-    capture_game_preview()
+    if PREVIEW_CAPTURE_ENABLED then
+        capture_game_preview()
+    else
+        clear_pending_preview()
+    end
 end
 
 local function initialize_mame_interface()
@@ -1641,7 +1647,11 @@ local function process_frame_via_socket(frame_payload, frame_idx)
 
     local move_dir, fire_dir, source = unpack(read_result)
     local source_u8 = (source or 0) & 0xFF
-    preview_stream_enabled = (source_u8 & 0x40) ~= 0
+    if PREVIEW_CAPTURE_ENABLED then
+        preview_stream_enabled = (source_u8 & 0x40) ~= 0
+    else
+        preview_stream_enabled = false
+    end
     last_action_source = source_u8 & 0x0F
     return move_dir or -1, fire_dir or -1, true
 end
