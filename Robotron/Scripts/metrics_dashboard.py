@@ -473,17 +473,25 @@ class _DashboardState:
         with self.lock:
             return self._cached_now_body
 
-    def game_preview_body(self) -> bytes:
-        with self.metrics.lock:
-            payload = {
-                "seq": int(getattr(self.metrics, "game_preview_seq", 0)),
-                "client_id": int(getattr(self.metrics, "game_preview_client_id", -1)),
-                "width": int(getattr(self.metrics, "game_preview_width", 0)),
-                "height": int(getattr(self.metrics, "game_preview_height", 0)),
-                "format": str(getattr(self.metrics, "game_preview_format", "") or ""),
-                "ts": float(getattr(self.metrics, "game_preview_updated_ts", 0.0)),
-                "data": str(getattr(self.metrics, "game_preview_data_b64", "") or ""),
-            }
+    def game_preview_body(self, since_seq: int | None = None, wait_timeout_s: float = 0.0) -> bytes:
+        since = None if since_seq is None else int(max(0, since_seq))
+        timeout = max(0.0, float(wait_timeout_s))
+        deadline = time.time() + timeout
+        while True:
+            with self.metrics.lock:
+                seq = int(getattr(self.metrics, "game_preview_seq", 0))
+                payload = {
+                    "seq": seq,
+                    "client_id": int(getattr(self.metrics, "game_preview_client_id", -1)),
+                    "width": int(getattr(self.metrics, "game_preview_width", 0)),
+                    "height": int(getattr(self.metrics, "game_preview_height", 0)),
+                    "format": str(getattr(self.metrics, "game_preview_format", "") or ""),
+                    "ts": float(getattr(self.metrics, "game_preview_updated_ts", 0.0)),
+                    "data": str(getattr(self.metrics, "game_preview_data_b64", "") or ""),
+                }
+            if since is None or seq != since or timeout <= 0.0 or time.time() >= deadline:
+                break
+            time.sleep(0.01)
         return json.dumps(payload).encode("utf-8")
 
 
@@ -1545,6 +1553,7 @@ def _render_dashboard_html() -> str:
     let _previewSeqLoaded = -1;
     let _previewFetchInFlight = false;
     let _previewHasFrame = false;
+    let _previewPumpRunning = false;
 
     // ── Gauge needle damping ────────────────────────────────────────
     // Time-constant in seconds: the needle closes ~63% of the gap
@@ -1694,6 +1703,34 @@ def _render_dashboard_html() -> str:
         /* ignore transient preview failures */
       } finally {
         _previewFetchInFlight = false;
+      }
+    }
+
+    async function previewPumpLoop() {
+      if (_previewPumpRunning) return;
+      _previewPumpRunning = true;
+      while (true) {
+        try {
+          const since = Math.max(0, Number(_previewSeqLoaded) || 0);
+          const res = await fetch(
+            `/api/game_preview?cid=${encodeURIComponent(CLIENT_ID)}&since=${since}&wait=1&timeout=1.2&t=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (!res.ok) throw new Error("bad preview stream response");
+          const payload = await res.json();
+          const seq = Number(payload && payload.seq);
+          if (Number.isFinite(seq) && seq > _previewSeqLoaded) {
+            _previewSeqLoaded = seq;
+            const fmt = String(payload && payload.format || "");
+            const ok = (fmt === "rgb565be") && _decodeRgb565ToSource(payload.width, payload.height, payload.data);
+            if (ok) {
+              drawPreviewToCard();
+              setPreviewMessage("");
+            }
+          }
+        } catch (_) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
       }
     }
     clearPreviewCanvas();
@@ -3627,7 +3664,6 @@ def _render_dashboard_html() -> str:
         setPreviewMessage("Waiting For Client 0");
         if (!_previewHasFrame) clearPreviewCanvas();
       } else {
-        if (previewSeq > _previewSeqLoaded) fetchGamePreview();
         setPreviewMessage(_previewHasFrame ? "" : "Loading Preview");
       }
 
@@ -3792,6 +3828,7 @@ def _render_dashboard_html() -> str:
     }
     loadAudioPlaylist().catch(() => {});
 
+    previewPumpLoop();
     fetchHistory().then(() => fetchNow()).catch(() => {});
     setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
@@ -3927,7 +3964,21 @@ def _make_handler(state: _DashboardState):
                 self._send(body, "application/json")
                 return
             if path == "/api/game_preview":
-                self._send(state.game_preview_body(), "application/json")
+                since_seq = None
+                wait_timeout_s = 0.0
+                try:
+                    if "since" in query:
+                        since_seq = int((query.get("since") or [0])[0])
+                except Exception:
+                    since_seq = None
+                try:
+                    wait_raw = (query.get("wait") or ["0"])[0]
+                    if str(wait_raw).strip().lower() in {"1", "true", "yes", "on"}:
+                        t_raw = (query.get("timeout") or ["1.0"])[0]
+                        wait_timeout_s = max(0.0, min(5.0, float(t_raw)))
+                except Exception:
+                    wait_timeout_s = 0.0
+                self._send(state.game_preview_body(since_seq=since_seq, wait_timeout_s=wait_timeout_s), "application/json")
                 return
             if path == "/api/audio_playlist":
                 tracks = _list_audio_files()
