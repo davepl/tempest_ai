@@ -180,11 +180,60 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
                 pixels = data[tail_start + 5:tail_end]
                 if preview_width <= 0 or preview_height <= 0 or len(pixels) <= 0:
                     return None
-                if int(preview_format) == 1:
-                    expected_px_bytes = int(preview_width) * int(preview_height) * 2
+                expected_px_bytes = int(preview_width) * int(preview_height) * 2
+                pf = int(preview_format)
+                if pf == 1:
                     if len(pixels) != expected_px_bytes:
                         return None
-                preview_pixels = bytes(pixels)
+                    preview_pixels = bytes(pixels)
+                elif pf == 2:
+                    # LZSS stream: flag byte + 8 tokens (literal or 2-byte match)
+                    # Match token: [len_minus_3:4 | dist_hi:4], [dist_lo:8].
+                    out = bytearray(expected_px_bytes)
+                    oi = 0
+                    si = 0
+                    plen = len(pixels)
+                    ok = True
+                    while oi < expected_px_bytes and si < plen:
+                        flags = pixels[si]
+                        si += 1
+                        for bit in range(8):
+                            if oi >= expected_px_bytes:
+                                break
+                            if (flags >> bit) & 1:
+                                if (si + 1) >= plen:
+                                    ok = False
+                                    break
+                                b1 = pixels[si]
+                                b2 = pixels[si + 1]
+                                si += 2
+                                mlen = ((b1 >> 4) & 0x0F) + 3
+                                dist = ((b1 & 0x0F) << 8) | b2
+                                if dist <= 0 or dist > oi:
+                                    ok = False
+                                    break
+                                src_idx = oi - dist
+                                for _ in range(mlen):
+                                    if oi >= expected_px_bytes:
+                                        break
+                                    out[oi] = out[src_idx]
+                                    oi += 1
+                                    src_idx += 1
+                            else:
+                                if si >= plen:
+                                    ok = False
+                                    break
+                                out[oi] = pixels[si]
+                                oi += 1
+                                si += 1
+                        if not ok:
+                            break
+                    if (not ok) or (oi != expected_px_bytes):
+                        return None
+                    preview_pixels = bytes(out)
+                    preview_format = 1
+                else:
+                    return None
 
         return FrameData(
             state=state, subjreward=float(subj), objreward=float(obj),

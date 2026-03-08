@@ -47,6 +47,7 @@ try:
 except Exception:
     _ACTION_DIAG_INTERVAL = 5000
 _FORCE_RANDOM_ACTIONS = os.getenv("ROBOTRON_FORCE_RANDOM_ACTIONS", "").strip().lower() not in {"", "0", "false", "off", "no"}
+_MAX_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024
 
 # ── Fire-hold (keeps fire direction stable for N frames so game's LSPROC registers a shot)
 FIRE_HOLD_FRAMES = 4     # must be ≥3 (game needs 3 stable frames to fire)
@@ -432,10 +433,12 @@ class SocketServer:
                     continue
 
                 # Read length header
-                hdr = self._recv_exact(sock, 2, timeout_s=0.25)
-                if hdr is None or len(hdr) < 2:
+                hdr = self._recv_exact(sock, 4, timeout_s=0.25)
+                if hdr is None or len(hdr) < 4:
                     raise ConnectionError("EOF")
-                dlen = struct.unpack(">H", hdr)[0]
+                dlen = struct.unpack(">I", hdr)[0]
+                if dlen <= 0 or dlen > _MAX_FRAME_PAYLOAD_BYTES:
+                    raise ConnectionError(f"Invalid payload length: {dlen}")
 
                 # Read payload
                 data = self._recv_exact(sock, dlen, timeout_s=0.5)

@@ -231,17 +231,18 @@ local DEBUG_HUD_ENABLED = true         -- set false to disable overlay
 local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
+local PREVIEW_FORMAT_RGB565_LZSS = 2
 local PREVIEW_CAPTURE_EVERY_N_FRAMES = 4
--- Socket framing uses a 16-bit payload length (>H), so full 2x preview
--- (320x224 RGB565) cannot fit.  These caps are near the largest safe size.
-local PREVIEW_MAX_WIDTH = 212
-local PREVIEW_MAX_HEIGHT = 149
-local PREVIEW_MAX_BYTES = 62000
-local SOCKET_MAX_PAYLOAD_BYTES = 65535
+-- Allow native-resolution snapshots; compression handles wire size.
+local PREVIEW_MAX_WIDTH = 4096
+local PREVIEW_MAX_HEIGHT = 4096
+local PREVIEW_MAX_BYTES = 2000000
+local SOCKET_MAX_PAYLOAD_BYTES = 4194304
 local preview_stream_enabled = false
 local pending_preview_blob = nil
 local pending_preview_w = 0
 local pending_preview_h = 0
+local pending_preview_fmt = PREVIEW_FORMAT_RGB565
 local last_preview_capture_frame = -1000000
 
 local function trace_enabled_for_frame(frame_idx)
@@ -996,6 +997,97 @@ local function clear_pending_preview()
     pending_preview_blob = nil
     pending_preview_w = 0
     pending_preview_h = 0
+    pending_preview_fmt = PREVIEW_FORMAT_RGB565
+end
+
+local function lzss_compress_bytes(data)
+    local n = #data
+    if n <= 0 then
+        return ""
+    end
+    local src = {string.byte(data, 1, n)}
+    local dict = {}
+    local out = {}
+    local i = 1
+
+    local function dict_push(pos)
+        if (pos + 2) > n then
+            return
+        end
+        local k = src[pos] * 65536 + src[pos + 1] * 256 + src[pos + 2]
+        local bucket = dict[k]
+        if not bucket then
+            dict[k] = {pos}
+            return
+        end
+        bucket[#bucket + 1] = pos
+        if #bucket > 32 then
+            table.remove(bucket, 1)
+        end
+    end
+
+    while i <= n do
+        local flag_idx = #out + 1
+        out[flag_idx] = string.char(0)
+        local flags = 0
+
+        for bit = 0, 7 do
+            if i > n then
+                break
+            end
+
+            local best_len = 0
+            local best_dist = 0
+            if (i + 2) <= n then
+                local k = src[i] * 65536 + src[i + 1] * 256 + src[i + 2]
+                local bucket = dict[k]
+                if bucket then
+                    local checks = 0
+                    for bi = #bucket, 1, -1 do
+                        local p = bucket[bi]
+                        local dist = i - p
+                        if dist > 0 and dist <= 4095 then
+                            local ml = 0
+                            local maxl = math.min(18, n - i + 1)
+                            while ml < maxl and src[p + ml] == src[i + ml] do
+                                ml = ml + 1
+                            end
+                            if ml > best_len and ml >= 3 then
+                                best_len = ml
+                                best_dist = dist
+                                if best_len >= 18 then
+                                    break
+                                end
+                            end
+                            checks = checks + 1
+                            if checks >= 16 then
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+
+            if best_len >= 3 then
+                flags = flags | (1 << bit)
+                local b1 = ((best_len - 3) << 4) | ((best_dist >> 8) & 0x0F)
+                local b2 = best_dist & 0xFF
+                out[#out + 1] = string.char(b1, b2)
+                for p = i, (i + best_len - 1) do
+                    dict_push(p)
+                end
+                i = i + best_len
+            else
+                out[#out + 1] = string.char(src[i])
+                dict_push(i)
+                i = i + 1
+            end
+        end
+
+        out[flag_idx] = string.char(flags)
+    end
+
+    return table.concat(out)
 end
 
 local function capture_game_preview()
@@ -1042,16 +1134,23 @@ local function capture_game_preview()
             end
         end
 
-        local blob = table.concat(out)
+        local raw_blob = table.concat(out)
+        local blob = lzss_compress_bytes(raw_blob)
+        local fmt = PREVIEW_FORMAT_RGB565_LZSS
+        if #blob <= 0 or #blob >= #raw_blob then
+            blob = raw_blob
+            fmt = PREVIEW_FORMAT_RGB565
+        end
         if #blob <= 0 or #blob > PREVIEW_MAX_BYTES then
             return nil
         end
-        return {w = tw, h = th, blob = blob}
+        return {w = tw, h = th, fmt = fmt, blob = blob}
     end)
 
     if ok and result and result.blob then
         pending_preview_w = result.w
         pending_preview_h = result.h
+        pending_preview_fmt = result.fmt or PREVIEW_FORMAT_RGB565
         pending_preview_blob = result.blob
     end
 end
@@ -1510,7 +1609,7 @@ local function process_frame_via_socket(frame_payload, frame_idx)
 
     local write_ok, write_err = pcall(function()
         trace_log(frame_idx, "socket_write_begin", "payload_bytes=" .. tostring(#frame_payload))
-        local length_header = string.pack(">H", #frame_payload)
+        local length_header = string.pack(">I4", #frame_payload)
         current_socket:write(length_header .. frame_payload)
     end)
 
@@ -1719,6 +1818,7 @@ local function frame_callback()
     if preview_stream_enabled and pending_preview_blob then
         preview_w = pending_preview_w
         preview_h = pending_preview_h
+        preview_fmt = pending_preview_fmt or PREVIEW_FORMAT_RGB565
         preview_blob = pending_preview_blob
         clear_pending_preview()
     end
