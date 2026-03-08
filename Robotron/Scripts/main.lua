@@ -232,9 +232,12 @@ local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
 local PREVIEW_CAPTURE_EVERY_N_FRAMES = 4
-local PREVIEW_MAX_WIDTH = 320
-local PREVIEW_MAX_HEIGHT = 224
-local PREVIEW_MAX_BYTES = 180000
+-- Socket framing uses a 16-bit payload length (>H), so full 2x preview
+-- (320x224 RGB565) cannot fit.  These caps are near the largest safe size.
+local PREVIEW_MAX_WIDTH = 212
+local PREVIEW_MAX_HEIGHT = 149
+local PREVIEW_MAX_BYTES = 62000
+local SOCKET_MAX_PAYLOAD_BYTES = 65535
 local preview_stream_enabled = false
 local pending_preview_blob = nil
 local pending_preview_w = 0
@@ -1488,7 +1491,11 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
         preview_chunk = string.pack(">HHB", pw, ph, pf) .. preview_blob
     end
     local preview_len = #preview_chunk
-    return header .. state_payload .. string.pack(">I4", preview_len) .. preview_chunk
+    local payload = header .. state_payload .. string.pack(">I4", preview_len) .. preview_chunk
+    if #payload > SOCKET_MAX_PAYLOAD_BYTES then
+        payload = header .. state_payload .. string.pack(">I4", 0)
+    end
+    return payload
 end
 
 local function process_frame_via_socket(frame_payload, frame_idx)
