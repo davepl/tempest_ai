@@ -183,7 +183,7 @@ class RLConfigData:
     # accommodates the full rescue signal.
     obj_reward_scale: float = 0.02
     point_reward_scale: float = 1.0 / obj_reward_scale
-    subj_reward_scale: float = 0.001
+    subj_reward_scale: float = 0.005
     reward_clip: float = 100.0
     death_reward_clip: float = 100.0
 

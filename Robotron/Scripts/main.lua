@@ -75,7 +75,7 @@ local FIRE_DIR_VEC = {
     [2] = { 1,  0},   -- right
     [3] = { 1,  1},   -- down-right
     [4] = { 0,  1},   -- down
-    [5] = {-1,  1},   -- down-left
+    [5] = {-1,  1},   -- down-leftf
     [6] = {-1,  0},   -- left
     [7] = {-1, -1},   -- up-left
 }
@@ -88,6 +88,10 @@ local MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
 -- Stacks additively so a corner costs double.
 local SUBJ_WALL_PENALTY  = 5.0       -- penalty per wall axis per frame
 -- WALL_MARGIN_NORM_X/Y defined after POS_X/Y_RANGE (see below).
+
+-- Abandoned-human penalty: one-shot penalty per surviving human when a wave
+-- is cleared.  Encourages the AI to rescue first, kill last.
+local SUBJ_ABANDONED_HUMAN = 15.0     -- penalty per unrescued human on wave end
 
 local mainCpu = nil
 local mem = nil
@@ -102,6 +106,8 @@ local dead_frame_counter = 0
 local last_save_time = 0
 local previous_player_alive = 1
 local previous_score = 0
+local previous_wave_number = 0
+local prev_num_humans = 0
 local prev_fire_cmd = -1          -- fire direction from previous frame
 local prev_move_cmd = -1          -- move direction from previous frame
 local prev_aim_objects = nil      -- classified objects from previous frame
@@ -832,7 +838,8 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
     hud_player_x16 = player_x16
     hud_player_y16 = player_y16
 
-    return features, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16
+    local num_humans = #buckets["human"]
+    return features, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16, num_humans
 end
 
 -- ── Debug HUD: draw coloured rings + rank numbers on MAME screen ────────
@@ -1516,7 +1523,7 @@ local function frame_callback()
     end
     trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d", player_x16 or 0, player_y16 or 0))
 
-    local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16 = pcall(
+    local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16, num_humans = pcall(
         extract_typed_entities, mem, player_x16, player_y16, enemy_state
     )
     if not ok_entities then
@@ -1524,6 +1531,7 @@ local function frame_callback()
         return true
     end
     local list_state_values = entity_features_or_err
+    num_humans = num_humans or 0
     trace_log(frame_counter, "extract_typed_entities", "features=" .. tostring(#list_state_values))
 
     local done = (previous_player_alive == 1 and player_alive == 0)
@@ -1561,12 +1569,25 @@ local function frame_callback()
         end
     end
 
+    -- Abandoned-human penalty: on successful wave clear, penalise each
+    -- human that was still alive on the previous frame (the last frame of
+    -- the old wave).  Do NOT apply on death (already penalised separately).
+    local abandoned_penalty = 0.0
+    if player_alive == 1 and wave_number > previous_wave_number
+       and previous_wave_number > 0 and prev_num_humans > 0 then
+        abandoned_penalty = prev_num_humans * SUBJ_ABANDONED_HUMAN
+        trace_log(frame_counter, "abandoned_humans",
+            string.format("wave %d->%d humans_left=%d penalty=%.1f",
+                previous_wave_number, wave_number, prev_num_humans, abandoned_penalty))
+    end
+
     local subj_reward = survival_bonus
         + (spacing_score * SUBJ_ENEMY_WEIGHT)
         + (rescue_score * SUBJ_HUMAN_WEIGHT)
         + (aim_score * SUBJ_AIM_WEIGHT)
         + (evade_score * SUBJ_EVADE_WEIGHT)
         - wall_penalty
+        - abandoned_penalty
     if done then
         subj_reward = subj_reward - SUBJ_DEATH_PENALTY
     end
@@ -1654,6 +1675,8 @@ local function frame_callback()
 
     previous_player_alive = player_alive
     previous_score = score
+    previous_wave_number = wave_number
+    prev_num_humans = num_humans or 0
 
     -- Stash position for next-frame velocity computation
     if player_alive == 1 then
@@ -1710,6 +1733,7 @@ trace_log(nil, "session_start", "robotron lua init", true)
 last_save_time = os.time()
 previous_player_alive = (read_player_alive(mem) ~= 0) and 1 or 0
 previous_score = math.max(0, math.floor(read_player_score(mem) or 0))
+previous_wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
 
 global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
 

@@ -356,9 +356,12 @@ class PrioritizedReplayBuffer:
         if verbose:
             self._progress_bar("  Replay save", 0.05)
 
-        # Flush dirty pages to disk.
-        for arr in (self.states, self.next_states, self.actions,
-                    self.rewards, self.dones, self.horizons, self.is_expert):
+        # Skip explicit flush of large memmap arrays (states, next_states).
+        # The OS lazily writes dirty pages in the background via the page cache.
+        # Only flush the small arrays (actions, rewards, dones, horizons,
+        # is_expert) which are negligible in size.
+        for arr in (self.actions, self.rewards, self.dones,
+                    self.horizons, self.is_expert):
             if hasattr(arr, "flush"):
                 arr.flush()
         if verbose:
@@ -614,19 +617,10 @@ class PrioritizedReplayBuffer:
             self.tree = SumTree(self.capacity)
             self.size = 0
             self._n_expert = 0
-            # Zero the storage arrays so stale data can't leak
-            self.states.fill(0)
-            self.next_states.fill(0)
-            self.actions.fill(0)
-            self.rewards.fill(0)
-            self.dones.fill(0)
-            self.horizons.fill(1)
-            self.is_expert.fill(0)
+            # No need to zero the storage arrays — resetting size/tree makes
+            # old data unreachable.  Zeroing + flushing memmaps would write
+            # ~100 GB of zeros to disk for no benefit.
             if self._memmap_dir:
-                for arr in (self.states, self.next_states, self.actions,
-                            self.rewards, self.dones, self.horizons, self.is_expert):
-                    if hasattr(arr, "flush"):
-                        arr.flush()
                 # Clear persisted metadata so next startup does not restore stale entries.
                 for name in ("_meta.npy", "priorities.npy"):
                     p = os.path.join(self._memmap_dir, name)
