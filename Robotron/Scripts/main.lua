@@ -46,7 +46,7 @@ local DEBUG_TRACE_FILE = "logs/startup_trace.log"
 local DEBUG_FORCE_ACTION_FRAMES = 0
 local DEBUG_FORCE_MOVE_DIR = 2  -- right
 local DEBUG_FORCE_FIRE_DIR = 2  -- right
-local DEATH_PENALTY_POINTS = 400
+local DEATH_PENALTY_POINTS = 2500
 -- Subjective shaping rewards (raw points; scaled in Python by subj_reward_scale).
 -- Goal: densify survival signal without dominating objective score rewards.
 local SUBJ_ENEMY_WEIGHT = 8.0
@@ -83,6 +83,12 @@ local FIRE_DIR_VEC = {
 local SUBJ_EVADE_WEIGHT = 10.0       -- reward when moving away from nearest threat
 local EVADE_DANGER_NORM  = 0.08      -- only reward evasion when enemy within this normalised dist
 local MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
+
+-- Wall-hugging penalty: per-axis penalty when within 16 px of a wall.
+-- Stacks additively so a corner costs double.
+local SUBJ_WALL_PENALTY  = 5.0       -- penalty per wall axis per frame
+local WALL_MARGIN_NORM_X = 4096.0 / POS_X_RANGE  -- 16 px normalised (~0.118)
+local WALL_MARGIN_NORM_Y = 4096.0 / POS_Y_RANGE  -- 16 px normalised (~0.076)
 
 local mainCpu = nil
 local mem = nil
@@ -1539,11 +1545,26 @@ local function frame_callback()
     local evade_score = compute_evasion_reward(prev_move_cmd, prev_aim_px16, prev_aim_py16,
         prev_nearest_enemy_x16, prev_nearest_enemy_y16, prev_nearest_enemy_dist)
     local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
+
+    -- Wall penalty: penalise each axis independently; corners stack.
+    local wall_penalty = 0.0
+    if player_alive == 1 and player_x16 then
+        local px = norm_pos_x(player_x16)
+        local py = norm_pos_y(player_y16)
+        if px < WALL_MARGIN_NORM_X or px > (1.0 - WALL_MARGIN_NORM_X) then
+            wall_penalty = wall_penalty + SUBJ_WALL_PENALTY
+        end
+        if py < WALL_MARGIN_NORM_Y or py > (1.0 - WALL_MARGIN_NORM_Y) then
+            wall_penalty = wall_penalty + SUBJ_WALL_PENALTY
+        end
+    end
+
     local subj_reward = survival_bonus
         + (spacing_score * SUBJ_ENEMY_WEIGHT)
         + (rescue_score * SUBJ_HUMAN_WEIGHT)
         + (aim_score * SUBJ_AIM_WEIGHT)
         + (evade_score * SUBJ_EVADE_WEIGHT)
+        - wall_penalty
     if done then
         subj_reward = subj_reward - SUBJ_DEATH_PENALTY
     end

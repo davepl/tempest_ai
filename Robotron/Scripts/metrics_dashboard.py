@@ -417,6 +417,8 @@ class _DashboardState:
             "peak_level": float(self.metrics.peak_level),
             "peak_episode_reward": float(self.metrics.peak_episode_reward) * _prs,
             "peak_game_score": int(self.metrics.peak_game_score),
+            "avg_game_score": float(self.metrics.avg_game_score),
+            "game_count": int(self.metrics.total_games_played),
             "episodes_this_run": int(self.metrics.episodes_this_run),
             "agreement": last_agreement,
             "agreement_1m": agreement_1m,
@@ -1162,6 +1164,18 @@ def _render_dashboard_html() -> str:
         </div>
         <div id="mPulseStatus" style="font-size:0.55em;color:#888;margin-top:-2px;min-height:1.1em;"></div>
       </article>
+      <article class="card card-half" style="--card-border:rgba(255,160,60,0.66);--card-glow:rgba(255,140,40,0.26)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div>
+            <div class="label">AVG SCORE</div>
+            <div class="value" id="mAvgScore">0</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="label">GAMES</div>
+            <div class="value" id="mGameCount">0</div>
+          </div>
+        </div>
+      </article>
       <article class="card mini-metric-card card-half" style="--card-border:rgba(100,160,255,0.66);--card-glow:rgba(80,140,255,0.26)">
         <div class="label">LEARNING RATE</div>
         <div class="mini-inline" style="overflow:hidden;min-height:0;flex:1;">
@@ -1181,7 +1195,7 @@ def _render_dashboard_html() -> str:
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
-      <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
+      <article class="card" style="display:none;--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
         <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
         <div class="game-settings-row">
           <label>Level:
@@ -1245,6 +1259,7 @@ def _render_dashboard_html() -> str:
           <span><span class="sw" style="background:#00c8ff;"></span>Agreement 1M</span>
           <span><span class="sw" style="background:#0090cc55;"></span>Agreement Raw</span>
           <span><span class="sw" style="background:#ef4444;"></span>Avg Lvl</span>
+          <span><span class="sw" style="background:#ff9f43;"></span>Avg Score</span>
         </div>
         <canvas id="cAgreement"></canvas>
       </article>
@@ -1347,6 +1362,8 @@ def _render_dashboard_html() -> str:
       eps: document.getElementById("mEps"),
       pulseStatus: document.getElementById("mPulseStatus"),
       xprt: document.getElementById("mXprt"),
+      avgScore: document.getElementById("mAvgScore"),
+      gameCount: document.getElementById("mGameCount"),
       rwrd: document.getElementById("mRwrd"),
       dqnRwrd: null,
       loss: document.getElementById("mLoss"),
@@ -1604,6 +1621,9 @@ def _render_dashboard_html() -> str:
           { key: "agreement", color: "#0090cc55", axis_ref: "agreement_1m", smooth_alpha: 0.10 },
           { key: "level_100k", color: "#ef4444", smooth_alpha: 0.20,
             axis: { side: "right", min_range: 1.0, label_pad: 40, group_keys: ["level_100k"], tick_decimals: 1 }
+          },
+          { key: "avg_game_score", color: "#ff9f43", smooth_alpha: 0.25,
+            axis: { side: "right", min: 0, min_range: 500, label_pad: 52, group_keys: ["avg_game_score"], tick_decimals: 0 }
           }
         ]
       }
@@ -3369,6 +3389,8 @@ def _render_dashboard_html() -> str:
       }
 
       if (!_gsIgnoreSync) cards.xprt.textContent = fmtPct(now.expert_ratio);
+      cards.avgScore.textContent = fmtInt(now.avg_game_score || 0);
+      cards.gameCount.textContent = fmtInt(now.game_count || 0);
       cards.rwrd.textContent = fmtInt(now.total_1m || 0);
       cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
@@ -3748,8 +3770,17 @@ def _make_handler(state: _DashboardState):
                         game_settings.start_level_min = int(data["start_level_min"])
                     if "epsilon_pct" in data:
                         game_settings.epsilon_pct = int(data["epsilon_pct"])
+                        # Dashboard wins → clear keyboard epsilon overrides
+                        with state.metrics.lock:
+                            state.metrics.manual_epsilon_override = False
+                            state.metrics.override_epsilon = False
                     if "expert_pct" in data:
                         game_settings.expert_pct = int(data["expert_pct"])
+                        # Dashboard wins → clear keyboard expert overrides
+                        with state.metrics.lock:
+                            state.metrics.manual_expert_override = False
+                            state.metrics.override_expert = False
+                            state.metrics.expert_mode = False
                     if "auto_curriculum" in data:
                         game_settings.auto_curriculum = bool(data["auto_curriculum"])
                     game_settings.save()

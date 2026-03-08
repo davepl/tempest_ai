@@ -258,7 +258,7 @@ def print_network_info(agent):
     tr = sum(p.numel() for p in net.parameters() if p.requires_grad)
 
     print(f"\n📐 Architecture:")
-    print(f"   State size:       {agent.state_size}")
+    print(f"   State size:       {agent.state_size} ({RL_CONFIG.frame_stack} × {RL_CONFIG.base_state_size})")
     print(f"   Actions:          {RL_CONFIG.num_move_actions} move dirs × {RL_CONFIG.num_fire_actions} fire dirs = {RL_CONFIG.num_joint_actions}")
     print(f"   Trunk:            {RL_CONFIG.trunk_layers} layers × {RL_CONFIG.trunk_hidden} hidden")
     print(f"   Enemy attention:  {'ON' if RL_CONFIG.use_enemy_attention else 'OFF'} ({RL_CONFIG.attn_heads} heads, dim={RL_CONFIG.attn_dim})")

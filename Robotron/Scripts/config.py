@@ -59,7 +59,12 @@ SERVER_CONFIG = ServerConfigData()
 @dataclass
 class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
-    state_size: int = SERVER_CONFIG.params_count
+    # Base per-frame state from Lua wire protocol (644 floats).
+    base_state_size: int = SERVER_CONFIG.params_count
+    # Temporal context window fed to the network.
+    frame_stack: int = 4
+    # Effective model input width after stacking.
+    state_size: int = SERVER_CONFIG.params_count * 4
 
     # Factored action space for Robotron dual sticks:
     #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
@@ -76,8 +81,8 @@ class RLConfigData:
         return self.num_move_actions * self.num_fire_actions
 
     # ── network architecture ────────────────────────────────────────────
-    trunk_hidden: int = 384
-    trunk_layers: int = 2
+    trunk_hidden: int = 512
+    trunk_layers: int = 3
     use_layer_norm: bool = True
     dropout: float = 0.0
 
@@ -96,24 +101,26 @@ class RLConfigData:
         ("electrode",  16),
     ])
     object_slots: int = 144             # total slots across all 9 categories
-    object_token_features: int = 5      # dx, dy, dist, category_id_norm, present
+    # Token features: dx, dy, dist, ddx, ddy, category_id_norm, present
+    object_token_features: int = 7
     slot_state_features: int = 4        # present, dx, dy, dist (in state vector)
     attn_heads: int = 8
     attn_dim: int = 128
 
     # Distributional C51
     # Robotron per-frame rewards: grunt=100, brain=500, human rescue=1000-5000.
-    # With obj_reward_scale=0.02 and reward_clip=20, per-step targets stay within
-    # a range compatible with n-step=12 and this support.
+    # With obj_reward_scale=0.02 and reward_clip=100, a 5000-pt rescue scales
+    # to 100 and passes through unclipped.  Widened support accommodates
+    # n-step=12 returns (worst-case ~1136).
     use_distributional: bool = True
     num_atoms: int = 51
-    v_min: float = -300.0
-    v_max: float = 300.0
+    v_min: float = -1200.0
+    v_max: float = 1200.0
 
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 768
+    batch_size: int = 512
     lr: float = 1e-4
     lr_min: float = 4e-5
     lr_warmup_steps: int = 5_000
@@ -155,10 +162,10 @@ class RLConfigData:
     epsilon: float = 1.0
 
     # Expert guidance
-    expert_ratio_start: float = 0.20
-    expert_ratio_end: float = 0.02
-    expert_ratio_decay_frames: int = 8_000_000
-    expert_ratio: float = 0.20
+    expert_ratio_start: float = 0.80
+    expert_ratio_end: float = 0.00
+    expert_ratio_decay_frames: int = 10_000_000
+    expert_ratio: float = 0.80
     # No special zoom handling for Robotron; keep multipliers neutral.
     expert_ratio_zoom_multiplier: float = 1.0
     expert_ratio_zoom_gamestate: int = 0x00
@@ -172,12 +179,13 @@ class RLConfigData:
 
     # ── reward ──────────────────────────────────────────────────────────
     # Scale objective rewards to fit C51 support while keeping TD targets stable.
-    # Human rescue (5000) -> 100 before clip; clipped by reward_clip=20.
+    # Human rescue (5000) -> 100; no longer clipped.  reward_clip=100
+    # accommodates the full rescue signal.
     obj_reward_scale: float = 0.02
     point_reward_scale: float = 1.0 / obj_reward_scale
     subj_reward_scale: float = 0.001
-    reward_clip: float = 20.0
-    death_reward_clip: float = 20.0
+    reward_clip: float = 100.0
+    death_reward_clip: float = 100.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
@@ -204,6 +212,11 @@ class RLConfigData:
     save_interval: int = 10_000
 
     enable_amp: bool = True
+
+    def __post_init__(self):
+        self.frame_stack = max(1, int(self.frame_stack))
+        self.base_state_size = int(self.base_state_size)
+        self.state_size = self.base_state_size * self.frame_stack
 
 
 RL_CONFIG = RLConfigData()
@@ -392,6 +405,9 @@ class MetricsData:
     peak_level: int = 0
     peak_episode_reward: float = 0.0
     peak_game_score: int = 0
+    game_scores: Deque[int] = field(default_factory=lambda: deque(maxlen=100))
+    avg_game_score: float = 0.0
+    total_games_played: int = 0
     episodes_this_run: int = 0
     last_target_update_step: int = 0
     last_target_update_time: float = 0.0
@@ -515,6 +531,14 @@ class MetricsData:
             if float(total) > self.peak_episode_reward:
                 self.peak_episode_reward = float(total)
 
+    def add_game_score(self, score: int):
+        """Record a completed full-game score (all lives) into rolling window."""
+        with self.lock:
+            self.game_scores.append(int(score))
+            self.total_games_played += 1
+            if self.game_scores:
+                self.avg_game_score = float(sum(self.game_scores)) / len(self.game_scores)
+
     def increment_total_controls(self):
         with self.lock:
             self.total_controls += 1
@@ -536,6 +560,7 @@ class MetricsData:
                 self.expert_ratio = 0.0
             else:
                 self.expert_ratio = self.saved_expert_ratio
+            game_settings.expert_pct = -1   # keyboard wins → clear dashboard
 
     def toggle_expert_mode(self, kb=None):
         with self.lock:
@@ -545,6 +570,7 @@ class MetricsData:
                 self.expert_ratio = 1.0
             else:
                 self.expert_ratio = self.saved_expert_ratio
+            game_settings.expert_pct = -1   # keyboard wins → clear dashboard
 
     def toggle_training_mode(self, kb=None):
         with self.lock:
@@ -553,6 +579,7 @@ class MetricsData:
     def toggle_epsilon_override(self, kb=None):
         with self.lock:
             self.override_epsilon = not self.override_epsilon
+            game_settings.epsilon_pct = -1   # keyboard wins → clear dashboard
 
     def toggle_verbose_mode(self, kb=None):
         with self.lock:
@@ -569,6 +596,7 @@ class MetricsData:
                 # Start a new pulse
                 self.manual_pulse_active = True
                 self.manual_pulse_frames_remaining = int(RL_CONFIG.manual_pulse_duration_frames)
+            game_settings.epsilon_pct = -1   # keyboard wins → clear dashboard
 
     def increase_expert_ratio(self, kb=None):
         with self.lock:
@@ -576,6 +604,7 @@ class MetricsData:
             p = min(100, p + (1 if p < 10 else 5))
             self.expert_ratio = p / 100.0
             self.manual_expert_override = True
+            game_settings.expert_pct = -1   # keyboard wins → clear dashboard
 
     def decrease_expert_ratio(self, kb=None):
         with self.lock:
@@ -583,12 +612,14 @@ class MetricsData:
             p = max(0, p - (1 if p <= 10 else 5))
             self.expert_ratio = p / 100.0
             self.manual_expert_override = True
+            game_settings.expert_pct = -1   # keyboard wins → clear dashboard
 
     def restore_natural_expert_ratio(self, kb=None):
         with self.lock:
             self.manual_expert_override = False
             progress = min(1.0, self.frame_count / max(1, RL_CONFIG.expert_ratio_decay_frames))
             self.expert_ratio = RL_CONFIG.expert_ratio_start + progress * (RL_CONFIG.expert_ratio_end - RL_CONFIG.expert_ratio_start)
+            game_settings.expert_pct = -1   # keyboard wins → clear dashboard
 
     def increase_epsilon(self, kb=None):
         with self.lock:
@@ -596,6 +627,7 @@ class MetricsData:
             p = min(100, p + (1 if p < 10 else 5))
             self.epsilon = p / 100.0
             self.manual_epsilon_override = True
+            game_settings.epsilon_pct = -1   # keyboard wins → clear dashboard
 
     def decrease_epsilon(self, kb=None):
         with self.lock:
@@ -603,11 +635,13 @@ class MetricsData:
             p = max(0, p - (1 if p <= 10 else 5))
             self.epsilon = p / 100.0
             self.manual_epsilon_override = True
+            game_settings.epsilon_pct = -1   # keyboard wins → clear dashboard
 
     def restore_natural_epsilon(self, kb=None):
         with self.lock:
             self.manual_epsilon_override = False
             self.epsilon = self._natural_epsilon_for_frame(int(self.frame_count))
+            game_settings.epsilon_pct = -1   # keyboard wins → clear dashboard
 
 
 metrics = MetricsData()

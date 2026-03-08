@@ -168,6 +168,16 @@ def parse_frame_data(data: bytes) -> Optional[FrameData]:
         print(f"Parse error: {e}")
         return None
 
+
+def _latest_frame_state(state: np.ndarray) -> np.ndarray:
+    """Return the most recent base-frame slice from a possibly stacked state vector."""
+    s = np.asarray(state, dtype=np.float32).reshape(-1)
+    base_state_size = int(getattr(RL_CONFIG, "base_state_size", SERVER_CONFIG.params_count))
+    if base_state_size > 0 and s.size > base_state_size:
+        s = s[-base_state_size:]
+    return s
+
+
 # ── Expert system (heuristic) ───────────────────────────────────────────────
 _DIR8_VECTORS: tuple[tuple[float, float], ...] = (
     (0.0, -1.0),                     # up
@@ -185,6 +195,53 @@ _DIR8_VECTORS: tuple[tuple[float, float], ...] = (
 # Re-scale before direction quantisation so 8-way aiming uses true geometry.
 _REL_POS_X_RANGE = 34816.0
 _REL_POS_Y_RANGE = 53760.0
+_POS_MAX_DIAG = 64022.0  # sqrt(34816² + 53760²)
+
+# "Safe" distance: 1/8 screen height = 26.25 px = 6720 x16-units.
+# Enemies beyond this are not an immediate threat.
+_SAFE_DIST = 6720.0 / _POS_MAX_DIAG  # ~0.105
+
+# 16 screen-pixels = 4096 x16-units, normalised per axis.
+# The outer 16 px of the playfield is "lava" — never move into it.
+_LAVA_X = 4096.0 / _REL_POS_X_RANGE  # ~0.118
+_LAVA_Y = 4096.0 / _REL_POS_Y_RANGE  # ~0.076
+
+# Direction index → (x_sign, y_sign) components.
+_DIR8_COMPONENTS: tuple[tuple[int, int], ...] = (
+    ( 0, -1),  # 0 up
+    ( 1, -1),  # 1 up-right
+    ( 1,  0),  # 2 right
+    ( 1,  1),  # 3 down-right
+    ( 0,  1),  # 4 down
+    (-1,  1),  # 5 down-left
+    (-1,  0),  # 6 left
+    (-1, -1),  # 7 up-left
+)
+
+
+def _forbid_lava(move_dir: int, px: float, py: float) -> int:
+    """Prevent the player from moving into the outer-16-px lava zone.
+
+    If the chosen direction has a component pointing into a lava wall,
+    that component is stripped.  If both axes are blocked (corner) the
+    direction is returned unchanged — the player is already in lava and
+    any movement is acceptable.
+    """
+    if move_dir < 0 or move_dir >= 8:
+        return move_dir
+    cx, cy = _DIR8_COMPONENTS[move_dir]
+    block_x = (cx < 0 and px <= _LAVA_X) or (cx > 0 and px >= 1.0 - _LAVA_X)
+    block_y = (cy < 0 and py <= _LAVA_Y) or (cy > 0 and py >= 1.0 - _LAVA_Y)
+    if not block_x and not block_y:
+        return move_dir
+    if block_x and block_y:
+        return move_dir  # cornered — can't make it worse
+    nx = 0 if block_x else cx
+    ny = 0 if block_y else cy
+    if nx == 0 and ny == 0:
+        return move_dir
+    # Convert remaining component to a cardinal/diagonal direction.
+    return _closest_dir8(float(nx), float(ny))
 
 
 def _closest_dir8(vx: float, vy: float, default_dir: int = 0) -> int:
@@ -205,11 +262,7 @@ def _closest_dir8(vx: float, vy: float, default_dir: int = 0) -> int:
 
 def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
     """Return (dx, dy, dist) for nearest non-human object in typed slot state."""
-    s = np.asarray(state, dtype=np.float32).reshape(-1)
-    state_size = int(getattr(RL_CONFIG, "state_size", 0))
-    if state_size > 0 and s.size > state_size:
-        # If future state stacking is enabled, use the most recent frame slice.
-        s = s[-state_size:]
+    s = _latest_frame_state(state)
     if s.size < 60:
         return None
 
@@ -251,27 +304,91 @@ def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float,
     return best
 
 
+def _nearest_human_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    """Return (dx, dy, dist) for nearest human in typed slot state."""
+    s = _latest_frame_state(state)
+    if s.size < 60:
+        return None
+
+    cat_defs = getattr(RL_CONFIG, "entity_categories", [])
+    if not cat_defs:
+        return None
+
+    base = 59  # 9 core + 50 ELIST
+    for name, slots in cat_defs:
+        n_slots = int(slots)
+        if n_slots <= 0:
+            continue
+        slot_base = base + 1  # skip occupancy
+        if name == "human":
+            for j in range(n_slots):
+                i = slot_base + j * 4
+                if i + 3 >= s.size:
+                    break
+                present = float(s[i])
+                if present < 0.5:
+                    continue
+                dx = float(s[i + 1])
+                dy = float(s[i + 2])
+                dist = float(s[i + 3])
+                if not np.isfinite(dist):
+                    continue
+                return (dx, dy, dist)
+            return None
+        base += 1 + n_slots * 4
+
+    return None
+
+
 def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> Tuple[int, int]:
     """Heuristic Robotron expert.
 
-    - Move away from nearest enemy vector.
-    - Fire toward nearest enemy vector.
-    - If locked_fire is set (fire hold cadence), keep that fire direction.
+    Fire:  Always toward nearest enemy.
+    Move:  1. Human closer than nearest enemy → move toward human.
+           2. All enemies beyond safe distance → move toward human.
+           3. Otherwise → move away from nearest enemy.
     """
-    nearest = _nearest_enemy_vector_from_state(state)
-    if nearest is None:
-        fire_dir = 0
-        if locked_fire is not None and int(locked_fire) >= 0:
-            fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
-        return _move_idle_action_index(), fire_dir
+    nearest_enemy = _nearest_enemy_vector_from_state(state)
+    nearest_human = _nearest_human_vector_from_state(state)
 
-    ex, ey, _ = nearest
-    ex_world = ex * _REL_POS_X_RANGE
-    ey_world = ey * _REL_POS_Y_RANGE
-    move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
-    fire_dir = _closest_dir8(ex_world, ey_world, default_dir=0)
+    # ── Fire direction (always at nearest enemy) ────────────────────
+    if nearest_enemy is not None:
+        fx, fy, _ = nearest_enemy
+        fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+    else:
+        fire_dir = 0
     if locked_fire is not None and int(locked_fire) >= 0:
         fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
+
+    # ── Movement ────────────────────────────────────────────────────
+    if nearest_enemy is not None:
+        ex, ey, enemy_dist = nearest_enemy
+        ex_world = ex * _REL_POS_X_RANGE
+        ey_world = ey * _REL_POS_Y_RANGE
+
+        # Human closer than nearest enemy → seek human
+        if nearest_human is not None and nearest_human[2] < enemy_dist:
+            hx, hy, _ = nearest_human
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        # All enemies at safe distance → seek human
+        elif enemy_dist > _SAFE_DIST and nearest_human is not None:
+            hx, hy, _ = nearest_human
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        else:
+            # Flee from nearest enemy
+            move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
+    elif nearest_human is not None:
+        hx, hy, _ = nearest_human
+        move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+    else:
+        move_dir = _move_idle_action_index()
+
+    # ── Lava guard: never move into the outer 16 px ─────────────────
+    s = _latest_frame_state(state)
+    px = float(s[5]) if s.size > 6 else 0.5
+    py = float(s[6]) if s.size > 6 else 0.5
+    move_dir = _forbid_lava(move_dir, px, py)
+
     return move_dir, fire_dir
 
 # ── Enemy-Slot Self-Attention ───────────────────────────────────────────────
@@ -283,28 +400,35 @@ class EnemyAttention(nn.Module):
         self.embed = nn.Linear(slot_features, embed_dim)
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(embed_dim)
+        # Learned query token for stronger "critical-threat" readout than mean-pooling.
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.out_dim = embed_dim
 
     def forward(self, slots: torch.Tensor, mask: torch.Tensor = None,
                 return_weights: bool = False):
         """slots: (B, num_slots, slot_features) → (B, embed_dim)
-        mask: (B, num_slots) bool tensor — True = slot is EMPTY (will be ignored).
-        If return_weights=True, also returns (B, num_heads, S, S) attention weights."""
+        mask: (B, num_slots) bool tensor — True = slot is EMPTY (ignored in attention).
+        If return_weights=True, also returns (B, num_heads, S+1, S+1) attention weights."""
         x = self.embed(slots)                   # (B, S, D)
         x = self.norm(x)
-        # key_padding_mask: True positions are excluded from attention
+
+        # Prepend a learned CLS token and read it back after self-attention.
+        bsz = x.shape[0]
+        cls = self.cls_token.expand(bsz, -1, -1)   # (B, 1, D)
+        x = torch.cat([cls, x], dim=1)             # (B, S+1, D)
+
+        key_padding_mask = None
+        if mask is not None:
+            cls_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=mask.device)
+            key_padding_mask = torch.cat([cls_mask, mask], dim=1)  # (B, S+1)
+
         attn_out, attn_weights = self.attn(
             x, x, x,
-            key_padding_mask=mask,
+            key_padding_mask=key_padding_mask,
             average_attn_weights=False,
-        )  # (B, S, D), (B, H, S, S)
-        # Mean-pool over ACTIVE slots only
-        if mask is not None:
-            active = (~mask).unsqueeze(2).float()          # (B, S, 1)
-            n_active = active.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1, 1)
-            pooled = (attn_out * active).sum(dim=1) / n_active.squeeze(2)  # (B, D)
-        else:
-            pooled = attn_out.mean(dim=1)                  # (B, D)
+        )  # (B, S+1, D), (B, H, S+1, S+1)
+
+        pooled = attn_out[:, 0, :]  # CLS output
         if return_weights:
             return pooled, attn_weights
         return pooled
@@ -391,14 +515,16 @@ class RainbowNet(nn.Module):
 
         # ── Object-Slot Self-Attention ──────────────────────────────────
         # 9 per-type entity categories with variable slots, 144 tokens total.
-        # Each token gets 5 features: dx, dy, dist, category_id_norm, present.
+        # Each token gets 7 features:
+        #   dx, dy, dist, ddx, ddy, category_id_norm, present.
         # dx/dy are player-relative (already in state vector from Lua).
         # Type is implicit in category position — no noisy type pointer needed.
         self.use_attn = cfg.use_enemy_attention
         attn_out_dim = 0
         if self.use_attn:
+            self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
             self.num_object_slots = getattr(cfg, 'object_slots', 144)
-            self.object_token_features = getattr(cfg, 'object_token_features', 5)
+            self.object_token_features = getattr(cfg, 'object_token_features', 7)
             self.slot_state_features = getattr(cfg, 'slot_state_features', 4)  # present, dx, dy, dist
 
             # Category layout: (slots, category_id) — must match Lua ENTITY_CATEGORIES order.
@@ -469,19 +595,24 @@ class RainbowNet(nn.Module):
     def _build_object_tokens(self, state: torch.Tensor):
         """Build 144 object tokens from 9 per-type entity categories.
 
-        Each token gets 5 features: [dx, dy, dist, category_id_norm, present]
-        State vector already contains player-relative dx/dy (computed by Lua),
-        so no subtraction is needed here.
+        Each token gets 7 features:
+          [dx, dy, dist, ddx, ddy, category_id_norm, present]
+        where ddx/ddy are frame-to-frame deltas from the previous stacked frame.
 
         Slots are sorted by distance (nearest first) per category.
         Type is implicit in category position — no noisy type pointer.
 
         Returns:
-          tokens: (B, 144, 5)
+          tokens: (B, 144, 7)
           mask:   (B, 144) bool — True where slot is EMPTY
         """
         B = state.shape[0]
         device = state.device
+        base_state_size = max(1, int(getattr(self, "base_state_size", SERVER_CONFIG.params_count)))
+        total_dim = int(state.shape[1])
+        stack_depth = max(1, total_dim // base_state_size)
+        latest_off = (stack_depth - 1) * base_state_size
+        prev_off = (stack_depth - 2) * base_state_size if stack_depth >= 2 else latest_off
 
         all_tokens = []
         all_masks = []
@@ -489,13 +620,22 @@ class RainbowNet(nn.Module):
         for base, slots, cat_id in self._cat_info:
             # Each category: [occupancy, slot0_present, slot0_dx, slot0_dy, slot0_dist, ...]
             # Skip occupancy (+1), extract slots × 4 state features
-            slot_data = state[:, base + 1 : base + 1 + slots * self.slot_state_features]
-            slot_data = slot_data.reshape(B, slots, self.slot_state_features)  # (B, slots, 4)
+            latest = state[:, latest_off + base + 1 : latest_off + base + 1 + slots * self.slot_state_features]
+            latest = latest.reshape(B, slots, self.slot_state_features)  # (B, slots, 4)
+            prev = state[:, prev_off + base + 1 : prev_off + base + 1 + slots * self.slot_state_features]
+            prev = prev.reshape(B, slots, self.slot_state_features)      # (B, slots, 4)
 
-            present = slot_data[:, :, 0]            # (B, slots) — used as mask
-            dx      = slot_data[:, :, 1:2]          # (B, slots, 1) — relative to player
-            dy      = slot_data[:, :, 2:3]          # (B, slots, 1) — relative to player
-            dist    = slot_data[:, :, 3:4]          # (B, slots, 1)
+            present = latest[:, :, 0]            # (B, slots) — used as mask
+            dx      = latest[:, :, 1:2]          # (B, slots, 1) — relative to player
+            dy      = latest[:, :, 2:3]          # (B, slots, 1) — relative to player
+            dist    = latest[:, :, 3:4]          # (B, slots, 1)
+
+            prev_present = prev[:, :, 0]
+            prev_dx = prev[:, :, 1:2]
+            prev_dy = prev[:, :, 2:3]
+            vel_valid = ((present > 0.5) & (prev_present > 0.5)).unsqueeze(2).to(dtype=state.dtype)
+            ddx = (dx - prev_dx) * vel_valid
+            ddy = (dy - prev_dy) * vel_valid
 
             # Category identity as normalised scalar
             cat_norm = torch.full((B, slots, 1),
@@ -503,11 +643,11 @@ class RainbowNet(nn.Module):
                                   device=device, dtype=state.dtype)
 
             # Include present flag so attention can see slot occupancy
-            tokens = torch.cat([dx, dy, dist, cat_norm, present.unsqueeze(2)], dim=2)  # (B, slots, 5)
+            tokens = torch.cat([dx, dy, dist, ddx, ddy, cat_norm, present.unsqueeze(2)], dim=2)  # (B, slots, 7)
             all_tokens.append(tokens)
             all_masks.append(present < 0.5)  # True = empty slot
 
-        tokens = torch.cat(all_tokens, dim=1)   # (B, 144, 5)
+        tokens = torch.cat(all_tokens, dim=1)   # (B, 144, 7)
         mask = torch.cat(all_masks, dim=1)       # (B, 144)
 
         # If ALL slots empty (e.g. between waves), unmask all to avoid NaN
@@ -526,7 +666,7 @@ class RainbowNet(nn.Module):
 
         # Object-slot self-attention
         if self.use_attn:
-            obj_tokens, obj_mask = self._build_object_tokens(state)  # (B, 144, 4), (B, 144)
+            obj_tokens, obj_mask = self._build_object_tokens(state)  # (B, 144, 7), (B, 144)
             attn_out = self.object_attn(obj_tokens, obj_mask)       # (B, attn_dim)
             trunk_in = torch.cat([state, attn_out], dim=1)
         else:
@@ -696,6 +836,9 @@ class SafeMetrics:
     @peak_game_score.setter
     def peak_game_score(self, v):
         self.metrics.peak_game_score = v
+
+    def add_game_score(self, score):
+        self.metrics.add_game_score(score)
 
     @property
     def episodes_this_run(self):

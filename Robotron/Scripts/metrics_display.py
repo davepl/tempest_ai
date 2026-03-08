@@ -184,7 +184,7 @@ def display_metrics_header():
     global row_counter
     row_counter = 0
     hdr = (
-        f"{'Frame':>11} {'FPS':>7} {'Epsi':>7} {'Xprt':>7} "
+        f"{'Frame':>11} {'FPS':>7} {'Epsi':>7} {'Xprt':>7} {'AvgScr':>7} "
         f"{'Rwrd':>9} {'Obj':>9} {'Subj':>9} {'DQN100K':>9} {'DQN1M':>9} {'DQN5M':>9} "
         f"{'Loss':>10} {'Agree%':>7} "
         f"{'EpLen':>8} {'BCLoss':>8} "
@@ -312,7 +312,7 @@ def display_metrics_row(agent, kb_handler):
     replay_ratio = (steps_per_sec * float(RL_CONFIG.batch_size)) / max(1e-6, float(metrics.fps))
 
     row = (
-        f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_pct} {xprt_pct} "
+        f"{metrics.frame_count:>11,} {metrics.fps:>7.1f} {eps_pct} {xprt_pct} {metrics.avg_game_score:>7.0f} "
         f"{_fr(mean_reward*_prs)} {_fr(mean_obj*_prs)} {_fr(mean_subj*_prs)} {_fr(dqn100k*_prs)} "
         f"{_fr(dqn1m*_prs)} {_fr(dqn5m*_prs)} "
         f"{loss_avg:>10.6f} {agree_avg*100:>6.1f}% "

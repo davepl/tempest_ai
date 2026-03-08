@@ -50,6 +50,33 @@ _FORCE_RANDOM_ACTIONS = os.getenv("ROBOTRON_FORCE_RANDOM_ACTIONS", "").strip().l
 
 # ── Fire-hold (keeps fire direction stable for N frames so game's LSPROC registers a shot)
 FIRE_HOLD_FRAMES = 4     # must be ≥3 (game needs 3 stable frames to fire)
+FRAME_STACK = max(1, int(getattr(RL_CONFIG, "frame_stack", 1)))
+
+
+def _reset_state_stack(cs: dict):
+    st = cs.get("state_stack")
+    if st is not None:
+        st.clear()
+
+
+def _push_stacked_state(cs: dict, frame_state: np.ndarray) -> np.ndarray:
+    """Push one base-frame state and return stacked state (oldest→latest)."""
+    st = cs.get("state_stack")
+    if st is None or getattr(st, "maxlen", None) != FRAME_STACK:
+        st = deque(maxlen=FRAME_STACK)
+        cs["state_stack"] = st
+
+    cur = np.asarray(frame_state, dtype=np.float32).copy()
+    if len(st) == 0:
+        for _ in range(FRAME_STACK):
+            st.append(cur.copy())
+    else:
+        st.append(cur)
+
+    if FRAME_STACK == 1:
+        return st[-1]
+    return np.concatenate(list(st), axis=0).astype(np.float32, copy=False)
+
 
 def _apply_fire_hold(cs: dict, raw_fire: int) -> int:
     """Fixed-cadence fire hold: direction changes at most every FIRE_HOLD_FRAMES.
@@ -304,7 +331,9 @@ class SocketServer:
                 "total_reward": 0.0, "ep_dqn_reward": 0.0, "ep_expert_reward": 0.0,
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
+                "state_stack": deque(maxlen=FRAME_STACK),
                 "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
+                "last_alive_game_score": 0, "prev_game_final_score": 0,
             }
             metrics.client_count = len(self.client_states)
 
@@ -393,6 +422,14 @@ class SocketServer:
                     # Ignore attract/menu/transient frames for high-score tracking.
                     if frame.player_alive and frame.game_score > self.metrics.peak_game_score:
                         self.metrics.peak_game_score = frame.game_score
+                    # Track per-game score: detect new game when score drops.
+                    if frame.player_alive:
+                        if frame.game_score < cs.get("last_alive_game_score", 0):
+                            # Score dropped → new game started; record previous game total.
+                            prev_final = cs.get("last_alive_game_score", 0)
+                            if prev_final > 0:
+                                self.metrics.add_game_score(prev_final)
+                        cs["last_alive_game_score"] = frame.game_score
                     now = time.time()
                     el = now - cs["last_time"]
                     if el >= 1.0:
@@ -411,6 +448,7 @@ class SocketServer:
                     self.metrics.update_expert_ratio()
                 self._calc_avg_level()
                 self.metrics.update_game_state(0, False)
+                stacked_state = _push_stacked_state(cs, frame.state)
 
                 # ── Process previous step ───────────────────────────────
                 if (
@@ -432,7 +470,7 @@ class SocketServer:
                         if nstep is not None:
                             joint = combine_action_indices(move_i, fire_i)
                             matured = nstep.add(cs["last_state"], joint, total_r,
-                                                frame.state, bool(frame.done),
+                                                stacked_state, bool(frame.done),
                                                 actor=tag, priority_reward=total_r)
                             for s0, a, Rn, pR, sn, dn, h, act in matured:
                                 move_n, fire_n = split_joint_action(a)
@@ -442,7 +480,7 @@ class SocketServer:
                         else:
                             self.async_buffer.step_async(
                                 cs["last_state"], (move_i, fire_i), total_r,
-                                frame.state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
+                                stacked_state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
                                 priority_reward=total_r)
 
                     cs["total_reward"] += total_r
@@ -457,6 +495,7 @@ class SocketServer:
 
                 # ── Terminal ────────────────────────────────────────────
                 if frame.done:
+                    _reset_state_stack(cs)
                     # Reset fire hold on death
                     cs["fire_hold_dir"] = -1
                     cs["fire_hold_count"] = 0
@@ -498,6 +537,7 @@ class SocketServer:
 
                 # Do not let dead/attract frames pollute replay; actions are ignored there.
                 if not frame.player_alive:
+                    _reset_state_stack(cs)
                     nstep = cs.get("nstep")
                     if nstep is not None:
                         nstep.reset()
@@ -542,20 +582,20 @@ class SocketServer:
                     action_source = "forced_random"
                 elif self.agent:
                     expert_ratio = self.metrics.get_expert_ratio()
-                    use_expert = (random.random() < expert_ratio)
+                    use_expert = (random.random() < expert_ratio) and not metrics.override_expert
                     if use_expert:
-                        move_idx, fire_idx = get_expert_action(frame.state, locked_fire=locked_fire)
+                        move_idx, fire_idx = get_expert_action(stacked_state, locked_fire=locked_fire)
                         is_epsilon = False
                         action_source = "expert"
                     else:
                         t0 = time.perf_counter()
                         if self.inference_batcher is not None:
                             move_idx, fire_idx, is_epsilon = self.inference_batcher.infer(
-                                frame.state, epsilon, locked_fire=locked_fire
+                                stacked_state, epsilon, locked_fire=locked_fire
                             )
                         else:
                             move_idx, fire_idx, is_epsilon = self.agent.act(
-                                frame.state, epsilon, locked_fire=locked_fire
+                                stacked_state, epsilon, locked_fire=locked_fire
                             )
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         action_source = "dqn"
@@ -632,7 +672,7 @@ class SocketServer:
                 # LSPROC's 3-stable-frame requirement.
                 effective_fire = _apply_fire_hold(cs, fire_idx)
 
-                cs["last_state"] = frame.state
+                cs["last_state"] = stacked_state
                 cs["last_action"] = (move_idx, effective_fire)
                 cs["last_player_alive"] = bool(frame.player_alive)
                 cs["prev_action_source"] = action_source
@@ -685,7 +725,8 @@ class SocketServer:
     def _calc_avg_level(self):
         try:
             with self.client_lock:
-                lvls = [s.get("level_number", 0) for s in self.client_states.values() if s.get("level_number", 0) >= 0]
+                lvls = [s.get("level_number", 0) for s in self.client_states.values()
+                        if 0 < s.get("level_number", 0) <= 40]
                 metrics.average_level = sum(lvls) / len(lvls) if lvls else 0
                 for lv in lvls:
                     if lv > metrics.peak_level:
