@@ -105,7 +105,8 @@ _WEBRTC_ICE_SERVERS = WEBRTC_ICE_SERVERS if isinstance(WEBRTC_ICE_SERVERS, list)
 
 def _audio_dir() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(os.path.dirname(script_dir), "audio")
+    # Audio folder is at workspace root, not game directory
+    return os.path.join(os.path.dirname(os.path.dirname(script_dir)), "audio")
 
 
 def _fonts_dir() -> str:

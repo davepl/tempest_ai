@@ -182,7 +182,7 @@ class RLConfigData:
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 20_000_000
+    memory_size: int = 5_000_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
@@ -250,7 +250,7 @@ class RLConfigData:
     inference_on_cpu: bool = False
     # Device placement (CUDA only): useful on multi-GPU hosts.
     train_cuda_device_index: int = 0
-    inference_cuda_device_index: int = 0
+    inference_cuda_device_index: int = 1
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True

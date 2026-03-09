@@ -69,7 +69,8 @@ VIDEO_EXTENSIONS = {".mov", ".mp4", ".webm", ".ogv"}
 
 def _audio_dir() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(os.path.dirname(script_dir), "audio")
+    # Audio folder is at workspace root, not game directory
+    return os.path.join(os.path.dirname(os.path.dirname(script_dir)), "audio")
 
 
 def _fonts_dir() -> str:

@@ -157,7 +157,7 @@ class RLConfigData:
     inference_on_cpu: bool = False
     # Device placement (CUDA only): useful on multi-GPU hosts.
     train_cuda_device_index: int = 0
-    inference_cuda_device_index: int = 0
+    inference_cuda_device_index: int = 1
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True

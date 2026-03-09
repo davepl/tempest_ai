@@ -86,7 +86,7 @@ local MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
 
 -- Wall-hugging penalty: per-axis penalty when within 16 px of a wall.
 -- Stacks additively so a corner costs double.
-local SUBJ_WALL_PENALTY  = 5.0       -- penalty per wall axis per frame
+local SUBJ_WALL_PENALTY  = 15.0      -- penalty per wall axis per frame
 -- WALL_MARGIN_NORM_X/Y defined after POS_X/Y_RANGE (see below).
 
 -- Abandoned-human penalty: one-shot penalty per surviving human when a wave
