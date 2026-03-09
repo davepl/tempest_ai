@@ -46,7 +46,7 @@ local DEBUG_TRACE_FILE = "logs/startup_trace.log"
 local DEBUG_FORCE_ACTION_FRAMES = 0
 local DEBUG_FORCE_MOVE_DIR = 2  -- right
 local DEBUG_FORCE_FIRE_DIR = 2  -- right
-local DEATH_PENALTY_POINTS = 2500
+local DEATH_PENALTY_POINTS = 7500
 -- Subjective shaping rewards (raw points; scaled in Python by subj_reward_scale).
 -- Goal: densify survival signal without dominating objective score rewards.
 local SUBJ_ENEMY_WEIGHT = 8.0
@@ -234,7 +234,7 @@ local PREVIEW_FORMAT_RGB565 = 1
 local PREVIEW_FORMAT_RGB565_LZSS = 2
 local PREVIEW_FORMAT_RGB565_RLE = 3
 -- Enable preview support; server controls streaming per-client via action source flags.
-local PREVIEW_CAPTURE_ENABLED = true
+local PREVIEW_CAPTURE_ENABLED = false
 local PREVIEW_MIN_INTERVAL_S = (1.0 / 30.0)
 -- Allow native-resolution snapshots; compression handles wire size.
 local PREVIEW_MAX_WIDTH = 4096

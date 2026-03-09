@@ -669,18 +669,9 @@ class _PreviewVideoTrack(VideoStreamTrack):
             w = int(self._last_w or 320)
             h = int(self._last_h or 224)
             rgb = self._debug_pattern(w, h, self._frames_sent)
-            if (now - self._last_log_ts) >= 1.0:
-                print(f"[preview] track fallback frame: {err}", flush=True)
-                self._last_log_ts = now
         rgb = self._downscale_if_needed(rgb)
         out_h = int(rgb.shape[0]) if rgb is not None else 0
         out_w = int(rgb.shape[1]) if rgb is not None else 0
-        if (now - self._last_log_ts) >= 2.0:
-            print(
-                f"[preview] track frame ok: seq={self._last_seq} src={w}x{h} out={out_w}x{out_h} fps={self.fps:.1f}",
-                flush=True,
-            )
-            self._last_log_ts = now
         frame = VideoFrame.from_ndarray(rgb, format="rgb24")
         frame.pts = int(pts)
         frame.time_base = self._tb
@@ -692,16 +683,6 @@ class _PreviewWebRTCBridge:
         self.metrics = metrics_obj
         self.enabled = bool(_WEBRTC_AVAILABLE and np is not None)
         self.ice_servers = list(ice_servers) if ice_servers else list(_WEBRTC_ICE_SERVERS)
-        print(
-            f"[preview] bridge init: enabled={self.enabled} "
-            f"numpy={_NUMPY_AVAILABLE} webrtc={_WEBRTC_AVAILABLE} "
-            f"py={sys.executable}",
-            flush=True,
-        )
-        if not _WEBRTC_AVAILABLE:
-            print(f"[preview] aiortc/av import error: {_WEBRTC_IMPORT_ERROR}", flush=True)
-        if not _NUMPY_AVAILABLE:
-            print("[preview] numpy import unavailable", flush=True)
         if self.enabled:
             self.error_reason = ""
         else:
@@ -817,7 +798,6 @@ class _PreviewWebRTCBridge:
         else:
             profile_norm = "default"
             track = _PreviewVideoTrack(self.metrics, fps=30.0)
-        print(f"[preview] create_answer profile={profile_norm}", flush=True)
         pc.addTrack(track)
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type=offer_type))
         answer = await pc.createAnswer()
@@ -830,7 +810,6 @@ class _PreviewWebRTCBridge:
 
     def create_answer(self, offer_sdp: str, offer_type: str, timeout_s: float = 10.0, profile: str = "default") -> dict[str, Any]:
         if not self.enabled or self._loop is None:
-            print(f"[preview] create_answer unavailable: enabled={self.enabled} loop={self._loop is not None} reason={self.error_reason}", flush=True)
             return {"ok": False, "error": self.error_reason or "webrtc_unavailable"}
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -838,10 +817,8 @@ class _PreviewWebRTCBridge:
                 self._loop,
             )
             answer = fut.result(timeout=max(1.0, float(timeout_s)))
-            print(f"[preview] create_answer ok={bool(answer.get('ok'))} type={answer.get('type','')} sdp_len={len(str(answer.get('sdp','')))}", flush=True)
             return answer
         except Exception as e:
-            print(f"[preview] create_answer exception: {e}", flush=True)
             return {"ok": False, "error": f"webrtc_offer_failed: {e}"}
 
 
@@ -1531,7 +1508,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         </div>
         <canvas id="cStepGauge"></canvas>
       </article>
-      <article class="card preview-card" style="--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
+      <article class="card preview-card" style="display:none;--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
         <div class="gauge-head">
           <div class="label" id="mPreviewLabel">CLIENT 0 PREVIEW</div>
         </div>
@@ -1922,6 +1899,9 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     let _previewRtcRetryTimer = null;
     let _previewRtcConnecting = false;
     let _previewVideoHasFrame = false;
+    // Temporary kill-switch for Client0 preview networking.
+    // Flip to true to restore WebRTC + long-poll preview behavior.
+    const ENABLE_CLIENT0_PREVIEW = false;
 
     // ── Gauge needle damping ────────────────────────────────────────
     // Time-constant in seconds: the needle closes ~63% of the gap
@@ -2084,10 +2064,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const WEBRTC_ICE_SERVERS = __WEBRTC_ICE_SERVERS_JSON__;
     const PREVIEW_PROFILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ? "mobile" : "default";
     function _previewLog(...args) {
-      try { console.log("[preview]", ...args); } catch (_) {}
+      return;
     }
     function _previewWarn(...args) {
-      try { console.warn("[preview]", ...args); } catch (_) {}
+      return;
     }
 
     function _parseFmtpParams(fmtpLine) {
@@ -4333,36 +4313,42 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         ? fmtFloat(now.agreement_1m * 100, 1) + "%"
         : "0.0%";
 
-      const previewSeq = Number(now.game_preview_seq || 0);
-      const previewFps = Number(now.game_preview_fps || 0);
-      const previewFmt = String(now.game_preview_source_format || "").toUpperCase();
-      const previewRatio = Number(now.game_preview_compression_ratio || 1);
-      if (cards.previewLabel) {
-        let statText = "";
-        if (previewFmt === "RLE" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
-          statText = `RLE ${previewRatio.toFixed(2)}x`;
-        } else if (previewFmt === "LZSS" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
-          statText = `LZSS ${previewRatio.toFixed(2)}x`;
-        } else if (previewFmt === "RAW") {
-          statText = "RAW";
-        }
-        if (Number.isFinite(previewFps) && previewFps > 0.1) {
-          statText = statText ? `${statText} @ ${previewFps.toFixed(1)}fps` : `${previewFps.toFixed(1)}fps`;
-        }
-        cards.previewLabel.textContent = statText ? `CLIENT 0 PREVIEW ${statText}` : "CLIENT 0 PREVIEW";
-      }
-      if (_previewRtcEnabled && _previewRtcConnected) {
-        setPreviewRenderMode("video");
-        setPreviewMessage(_previewVideoHasFrame ? "" : "Loading Preview");
-      } else if ((now.client_count || 0) <= 0) {
-        setPreviewMessage("No Clients");
-        _previewHasFrame = false;
-        clearPreviewCanvas();
-      } else if (!Number.isFinite(previewSeq) || previewSeq <= 0) {
-        setPreviewMessage(_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Waiting For Client 0");
-        if (!_previewHasFrame) clearPreviewCanvas();
+      if (!ENABLE_CLIENT0_PREVIEW) {
+        if (cards.previewLabel) cards.previewLabel.textContent = "CLIENT 0 PREVIEW (DISABLED)";
+        setPreviewRenderMode("canvas");
+        setPreviewMessage("Preview Disabled");
       } else {
-        setPreviewMessage(_previewHasFrame ? "" : (_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Loading Preview"));
+        const previewSeq = Number(now.game_preview_seq || 0);
+        const previewFps = Number(now.game_preview_fps || 0);
+        const previewFmt = String(now.game_preview_source_format || "").toUpperCase();
+        const previewRatio = Number(now.game_preview_compression_ratio || 1);
+        if (cards.previewLabel) {
+          let statText = "";
+          if (previewFmt === "RLE" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
+            statText = `RLE ${previewRatio.toFixed(2)}x`;
+          } else if (previewFmt === "LZSS" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
+            statText = `LZSS ${previewRatio.toFixed(2)}x`;
+          } else if (previewFmt === "RAW") {
+            statText = "RAW";
+          }
+          if (Number.isFinite(previewFps) && previewFps > 0.1) {
+            statText = statText ? `${statText} @ ${previewFps.toFixed(1)}fps` : `${previewFps.toFixed(1)}fps`;
+          }
+          cards.previewLabel.textContent = statText ? `CLIENT 0 PREVIEW ${statText}` : "CLIENT 0 PREVIEW";
+        }
+        if (_previewRtcEnabled && _previewRtcConnected) {
+          setPreviewRenderMode("video");
+          setPreviewMessage(_previewVideoHasFrame ? "" : "Loading Preview");
+        } else if ((now.client_count || 0) <= 0) {
+          setPreviewMessage("No Clients");
+          _previewHasFrame = false;
+          clearPreviewCanvas();
+        } else if (!Number.isFinite(previewSeq) || previewSeq <= 0) {
+          setPreviewMessage(_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Waiting For Client 0");
+          if (!_previewHasFrame) clearPreviewCanvas();
+        } else {
+          setPreviewMessage(_previewHasFrame ? "" : (_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Loading Preview"));
+        }
       }
 
       // ── Record highs ──────────────────────────────────────────────
@@ -4526,7 +4512,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
     loadAudioPlaylist().catch(() => {});
 
-    _ensurePreviewWebRTC().finally(() => { previewPumpLoop(); });
+    if (ENABLE_CLIENT0_PREVIEW) {
+      _ensurePreviewWebRTC().finally(() => { previewPumpLoop(); });
+    } else {
+      _previewRtcEnabled = false;
+      _previewRtcConnected = false;
+      _previewHasFrame = false;
+      setPreviewRenderMode("canvas");
+      clearPreviewCanvas();
+      setPreviewMessage("Preview Disabled");
+    }
     fetchHistory().then(() => fetchNow()).catch(() => {});
     setInterval(fetchNow, DASH_REFRESH_MS);
     setInterval(heartbeat, 1000);
@@ -4535,7 +4530,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       // Force gauge repaint since canvas dimensions changed
       drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
       drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
-      if (_previewRtcEnabled && _previewRtcConnected) {
+      if (!ENABLE_CLIENT0_PREVIEW) {
+        clearPreviewCanvas();
+        setPreviewMessage("Preview Disabled");
+      } else if (_previewRtcEnabled && _previewRtcConnected) {
         setPreviewRenderMode("video");
       } else if (_previewHasFrame) drawPreviewToCard();
       else clearPreviewCanvas();
@@ -4734,7 +4732,6 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                     profile = str(data.get("profile", "default") or "default").strip().lower()
                     if profile not in {"default", "mobile"}:
                         profile = "default"
-                    print(f"[preview] offer recv: content_len={length} type={typ} sdp_len={len(sdp)} profile={profile}", flush=True)
                     if not sdp:
                         raise ValueError("missing_sdp")
                     if rtc_bridge is None:
@@ -4742,10 +4739,8 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                     answer = rtc_bridge.create_answer(sdp, typ, timeout_s=10.0, profile=profile)
                     body = json.dumps(answer).encode("utf-8")
                     status = 200 if bool(answer.get("ok")) else 503
-                    print(f"[preview] offer reply: status={status} ok={bool(answer.get('ok'))} err={answer.get('error','')}", flush=True)
                     self._send(body, "application/json", status=status)
                 except Exception as e:
-                    print(f"[preview] offer exception: {e}", flush=True)
                     body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
                     self._send(body, "application/json", status=400)
                 return

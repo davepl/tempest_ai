@@ -236,7 +236,7 @@ class RLConfigData:
     point_reward_scale: float = 1.0 / obj_reward_scale
     subj_reward_scale: float = 0.0025
     reward_clip: float = 100.0
-    death_reward_clip: float = 100.0
+    death_reward_clip: float = 200.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails

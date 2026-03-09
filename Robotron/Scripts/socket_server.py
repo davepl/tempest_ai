@@ -494,7 +494,6 @@ class SocketServer:
                             cs = self.client_states.get(cid, {})
                             last = float(cs.get("last_nonzero_preview_warn_ts", 0.0) or 0.0)
                             if (now_t - last) >= 5.0:
-                                print(f"[preview] WARNING non-cid0 client {cid} sent preview_len={pl}", flush=True)
                                 cs["last_nonzero_preview_warn_ts"] = now_t
 
                 # Hard gate preview parsing to client 0 only.
@@ -514,13 +513,6 @@ class SocketServer:
                             last_t = float(cs.get("last_preview_ingest_log_ts", 0.0) or 0.0)
                             last_fmt = int(cs.get("last_preview_ingest_fmt", -1))
                             if (enc_fmt != last_fmt) or ((now_t - last_t) >= 5.0):
-                                fmt_name = {1: "raw", 2: "lzss", 3: "rle"}.get(enc_fmt, f"fmt{enc_fmt}")
-                                ratio = float(raw_bytes) / float(max(1, enc_bytes))
-                                print(
-                                    f"[preview] ingest client={cid} fmt={fmt_name} "
-                                    f"encoded={enc_bytes} raw={raw_bytes} ratio={ratio:.2f}x",
-                                    flush=True,
-                                )
                                 cs["last_preview_ingest_log_ts"] = now_t
                                 cs["last_preview_ingest_fmt"] = enc_fmt
                 self._cache_client_preview(cid, frame)
