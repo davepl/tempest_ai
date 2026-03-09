@@ -343,6 +343,11 @@ class _DashboardState:
             game_preview_width = int(getattr(self.metrics, "game_preview_width", 0))
             game_preview_height = int(getattr(self.metrics, "game_preview_height", 0))
             game_preview_format = str(getattr(self.metrics, "game_preview_format", "") or "")
+            game_preview_source_format = str(getattr(self.metrics, "game_preview_source_format", "") or "")
+            game_preview_encoded_bytes = int(getattr(self.metrics, "game_preview_encoded_bytes", 0) or 0)
+            game_preview_raw_bytes = int(getattr(self.metrics, "game_preview_raw_bytes", 0) or 0)
+            game_preview_compression_ratio = float(getattr(self.metrics, "game_preview_compression_ratio", 1.0) or 1.0)
+            game_preview_fps = float(getattr(self.metrics, "game_preview_fps", 0.0) or 0.0)
             average_level = float(self.metrics.average_level)
             memory_buffer_size = int(self.metrics.memory_buffer_size)
             memory_buffer_k = int(memory_buffer_size // 1000)
@@ -421,6 +426,11 @@ class _DashboardState:
             "game_preview_width": game_preview_width,
             "game_preview_height": game_preview_height,
             "game_preview_format": game_preview_format,
+            "game_preview_source_format": game_preview_source_format,
+            "game_preview_encoded_bytes": game_preview_encoded_bytes,
+            "game_preview_raw_bytes": game_preview_raw_bytes,
+            "game_preview_compression_ratio": game_preview_compression_ratio,
+            "game_preview_fps": game_preview_fps,
             "average_level": average_level,
             "memory_buffer_size": memory_buffer_size,
             "memory_buffer_k": memory_buffer_k,
@@ -1523,7 +1533,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       </article>
       <article class="card preview-card" style="--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
         <div class="gauge-head">
-          <div class="label">CLIENT 0 PREVIEW</div>
+          <div class="label" id="mPreviewLabel">CLIENT 0 PREVIEW</div>
         </div>
         <div class="preview-wrap">
           <video id="vGamePreview" class="preview-video" autoplay muted playsinline></video>
@@ -1813,6 +1823,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       epRate: document.getElementById("mEpRate"),
       agreePanel: document.getElementById("mAgreePanel"),
       previewMsg: document.getElementById("mGamePreviewMsg"),
+      previewLabel: document.getElementById("mPreviewLabel"),
     };
     /* Game-settings controls */
     const gsAdvancedEl = document.getElementById("gsAdvanced");
@@ -2078,6 +2089,124 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     function _previewWarn(...args) {
       try { console.warn("[preview]", ...args); } catch (_) {}
     }
+
+    function _parseFmtpParams(fmtpLine) {
+      const out = {};
+      const src = String(fmtpLine || "");
+      if (!src) return out;
+      const parts = src.split(";");
+      for (let i = 0; i < parts.length; i++) {
+        const kv = String(parts[i] || "").trim();
+        if (!kv) continue;
+        const eq = kv.indexOf("=");
+        if (eq <= 0) {
+          out[kv.toLowerCase()] = "";
+          continue;
+        }
+        const k = kv.slice(0, eq).trim().toLowerCase();
+        const v = kv.slice(eq + 1).trim();
+        out[k] = v;
+      }
+      return out;
+    }
+
+    function _fmtpHasBaselinePm1(codec) {
+      const p = _parseFmtpParams(codec && codec.sdpFmtpLine ? codec.sdpFmtpLine : "");
+      const pm = String(p["packetization-mode"] || "");
+      const prof = String(p["profile-level-id"] || "").toLowerCase();
+      return (pm === "1") && (prof === "42e01f" || prof.startsWith("42e0"));
+    }
+
+    function _preferH264BaselineCodecs(codecs) {
+      const arr = Array.isArray(codecs) ? codecs.slice() : [];
+      const rank = (c) => {
+        const m = String(c && c.mimeType ? c.mimeType : "").toLowerCase();
+        if (!m.includes("h264")) {
+          if (m.includes("vp8")) return 20;
+          if (m.includes("vp9")) return 30;
+          return 40;
+        }
+        if (_fmtpHasBaselinePm1(c)) return 0;
+        const p = _parseFmtpParams(c && c.sdpFmtpLine ? c.sdpFmtpLine : "");
+        if (String(p["packetization-mode"] || "") === "1") return 1;
+        return 2;
+      };
+      arr.sort((a, b) => rank(a) - rank(b));
+      return arr;
+    }
+
+    function _mungeOfferSdpForH264BaselinePm1(sdp) {
+      const text = String(sdp || "");
+      if (!text) return text;
+      const lines = text.split(/\\r\\n/);
+      let mVideoIdx = -1;
+      for (let i = 0; i < lines.length; i++) {
+        if (String(lines[i] || "").startsWith("m=video ")) {
+          mVideoIdx = i;
+          break;
+        }
+      }
+      if (mVideoIdx < 0) return text;
+
+      const h264Pts = new Set();
+      const fmtpIdxByPt = {};
+      const fmtpByPt = {};
+
+      for (let i = 0; i < lines.length; i++) {
+        const ln = String(lines[i] || "");
+        let m = ln.match(/^a=rtpmap:(\d+)\s+H264\/\d+/i);
+        if (m) {
+          h264Pts.add(m[1]);
+          continue;
+        }
+        m = ln.match(/^a=fmtp:(\d+)\s+(.+)$/i);
+        if (m) {
+          const pt = m[1];
+          fmtpIdxByPt[pt] = i;
+          fmtpByPt[pt] = m[2];
+        }
+      }
+
+      const h264PtList = Array.from(h264Pts);
+      if (!h264PtList.length) return text;
+
+      const scorePt = (pt) => {
+        const p = _parseFmtpParams(fmtpByPt[pt] || "");
+        const pm1 = String(p["packetization-mode"] || "") === "1";
+        const prof = String(p["profile-level-id"] || "").toLowerCase();
+        if (pm1 && prof === "42e01f") return 0;
+        if (pm1 && prof.startsWith("42e0")) return 1;
+        if (pm1) return 2;
+        return 3;
+      };
+      h264PtList.sort((a, b) => scorePt(a) - scorePt(b));
+      const chosenPt = h264PtList[0];
+
+      const p = _parseFmtpParams(fmtpByPt[chosenPt] || "");
+      p["packetization-mode"] = "1";
+      p["profile-level-id"] = "42e01f";
+      if (!p["level-asymmetry-allowed"]) p["level-asymmetry-allowed"] = "1";
+      const keys = Object.keys(p).sort();
+      const fmtpNew = keys.map((k) => `${k}=${p[k]}`).join(";");
+      if (Object.prototype.hasOwnProperty.call(fmtpIdxByPt, chosenPt)) {
+        lines[fmtpIdxByPt[chosenPt]] = `a=fmtp:${chosenPt} ${fmtpNew}`;
+      } else {
+        lines.push(`a=fmtp:${chosenPt} ${fmtpNew}`);
+      }
+
+      const mParts = String(lines[mVideoIdx] || "").trim().split(/\s+/);
+      if (mParts.length > 3) {
+        const hdr = mParts.slice(0, 3);
+        const pts = mParts.slice(3);
+        const reordered = [chosenPt];
+        for (let i = 0; i < pts.length; i++) {
+          if (pts[i] !== chosenPt) reordered.push(pts[i]);
+        }
+        lines[mVideoIdx] = hdr.concat(reordered).join(" ");
+      }
+
+      return lines.join("\\r\\n");
+    }
     if (gamePreviewVideo) {
       const _onVideoFrame = () => {
         _previewVideoHasFrame = true;
@@ -2196,23 +2325,20 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
             const caps = RTCRtpReceiver.getCapabilities("video");
             const codecs = (caps && Array.isArray(caps.codecs)) ? caps.codecs.filter((c) => c && c.mimeType && !/rtx|red|ulpfec/i.test(c.mimeType)) : [];
             if (codecs.length) {
-              const rank = (c) => {
-                const m = String(c.mimeType || "").toLowerCase();
-                if (m.includes("vp8")) return 0;
-                if (m.includes("h264")) return 1;
-                if (m.includes("vp9")) return 2;
-                return 3;
-              };
-              codecs.sort((a, b) => rank(a) - rank(b));
-              vtx.setCodecPreferences(codecs);
-              _previewLog("codec prefs set", codecs.map((c) => c.mimeType));
+              const preferred = _preferH264BaselineCodecs(codecs);
+              vtx.setCodecPreferences(preferred);
+              _previewLog("codec prefs set", preferred.map((c) => `${c.mimeType}${c.sdpFmtpLine ? `;${c.sdpFmtpLine}` : ""}`));
             }
           }
         } catch (e) {
           _previewWarn("setCodecPreferences failed", (e && e.message) ? e.message : e);
         }
         const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        const mungedOfferSdp = _mungeOfferSdpForH264BaselinePm1(offer && offer.sdp ? offer.sdp : "");
+        await pc.setLocalDescription({
+          type: (offer && offer.type) ? offer.type : "offer",
+          sdp: mungedOfferSdp || ((offer && offer.sdp) ? offer.sdp : ""),
+        });
         await _waitForIceGatheringComplete(pc, 1200);
         const res = await fetch("/api/game_preview_offer", {
           method: "POST",
@@ -4208,6 +4334,23 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         : "0.0%";
 
       const previewSeq = Number(now.game_preview_seq || 0);
+      const previewFps = Number(now.game_preview_fps || 0);
+      const previewFmt = String(now.game_preview_source_format || "").toUpperCase();
+      const previewRatio = Number(now.game_preview_compression_ratio || 1);
+      if (cards.previewLabel) {
+        let statText = "";
+        if (previewFmt === "RLE" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
+          statText = `RLE ${previewRatio.toFixed(2)}x`;
+        } else if (previewFmt === "LZSS" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
+          statText = `LZSS ${previewRatio.toFixed(2)}x`;
+        } else if (previewFmt === "RAW") {
+          statText = "RAW";
+        }
+        if (Number.isFinite(previewFps) && previewFps > 0.1) {
+          statText = statText ? `${statText} @ ${previewFps.toFixed(1)}fps` : `${previewFps.toFixed(1)}fps`;
+        }
+        cards.previewLabel.textContent = statText ? `CLIENT 0 PREVIEW ${statText}` : "CLIENT 0 PREVIEW";
+      }
       if (_previewRtcEnabled && _previewRtcConnected) {
         setPreviewRenderMode("video");
         setPreviewMessage(_previewVideoHasFrame ? "" : "Loading Preview");

@@ -334,6 +334,9 @@ class SocketServer:
         width = int(getattr(frame, "preview_width", 0) or 0)
         height = int(getattr(frame, "preview_height", 0) or 0)
         fmt = int(getattr(frame, "preview_format", 0) or 0)
+        enc_fmt = int(getattr(frame, "preview_encoded_format", 0) or 0)
+        enc_bytes = int(getattr(frame, "preview_encoded_bytes", 0) or 0)
+        raw_bytes = int(getattr(frame, "preview_raw_bytes", 0) or 0)
         if not pixels or width <= 0 or height <= 0:
             return
         if fmt != 1:  # 1 = RGB565BE packed 16-bit pixels
@@ -346,13 +349,28 @@ class SocketServer:
         except Exception:
             return
         with metrics.lock:
-            metrics.game_preview_seq = int(getattr(metrics, "game_preview_seq", 0)) + 1
+            prev_seq = int(getattr(metrics, "game_preview_seq", 0) or 0)
+            prev_ts = float(getattr(metrics, "game_preview_updated_ts", 0.0) or 0.0)
+            now_ts = time.time()
+            next_seq = prev_seq + 1
+            if prev_ts > 0.0 and next_seq > prev_seq:
+                dt = max(1e-6, now_ts - prev_ts)
+                dseq = max(1, next_seq - prev_seq)
+                metrics.game_preview_fps = float(dseq) / dt
             metrics.game_preview_client_id = int(cid)
+            metrics.game_preview_seq = next_seq
             metrics.game_preview_width = width
             metrics.game_preview_height = height
             metrics.game_preview_format = "rgb565be"
             metrics.game_preview_data_b64 = b64
-            metrics.game_preview_updated_ts = time.time()
+            metrics.game_preview_updated_ts = now_ts
+            metrics.game_preview_source_format = {1: "raw", 2: "lzss", 3: "rle"}.get(enc_fmt, "unknown")
+            metrics.game_preview_encoded_bytes = int(enc_bytes)
+            metrics.game_preview_raw_bytes = int(raw_bytes if raw_bytes > 0 else expected_len)
+            if enc_bytes > 0 and raw_bytes > 0:
+                metrics.game_preview_compression_ratio = float(raw_bytes) / float(enc_bytes)
+            else:
+                metrics.game_preview_compression_ratio = 1.0
 
     @staticmethod
     def _peek_preview_len(payload: bytes) -> int:
@@ -485,6 +503,26 @@ class SocketServer:
                 if not frame:
                     sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
                     continue
+                if int(cid) == 0 and preview_parse_allowed:
+                    enc_fmt = int(getattr(frame, "preview_encoded_format", 0) or 0)
+                    enc_bytes = int(getattr(frame, "preview_encoded_bytes", 0) or 0)
+                    raw_bytes = int(getattr(frame, "preview_raw_bytes", 0) or 0)
+                    if enc_fmt > 0 and enc_bytes > 0 and raw_bytes > 0:
+                        now_t = time.time()
+                        with self.client_lock:
+                            cs = self.client_states.get(cid, {})
+                            last_t = float(cs.get("last_preview_ingest_log_ts", 0.0) or 0.0)
+                            last_fmt = int(cs.get("last_preview_ingest_fmt", -1))
+                            if (enc_fmt != last_fmt) or ((now_t - last_t) >= 5.0):
+                                fmt_name = {1: "raw", 2: "lzss", 3: "rle"}.get(enc_fmt, f"fmt{enc_fmt}")
+                                ratio = float(raw_bytes) / float(max(1, enc_bytes))
+                                print(
+                                    f"[preview] ingest client={cid} fmt={fmt_name} "
+                                    f"encoded={enc_bytes} raw={raw_bytes} ratio={ratio:.2f}x",
+                                    flush=True,
+                                )
+                                cs["last_preview_ingest_log_ts"] = now_t
+                                cs["last_preview_ingest_fmt"] = enc_fmt
                 self._cache_client_preview(cid, frame)
 
                 with self.client_lock:

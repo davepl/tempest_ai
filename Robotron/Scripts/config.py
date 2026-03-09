@@ -470,6 +470,11 @@ class MetricsData:
     game_preview_format: str = ""
     game_preview_data_b64: str = ""
     game_preview_updated_ts: float = 0.0
+    game_preview_source_format: str = ""
+    game_preview_encoded_bytes: int = 0
+    game_preview_raw_bytes: int = 0
+    game_preview_compression_ratio: float = 1.0
+    game_preview_fps: float = 0.0
 
     # UI toggles
     override_expert: bool = False

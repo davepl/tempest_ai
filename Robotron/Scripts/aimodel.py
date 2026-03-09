@@ -144,6 +144,9 @@ class FrameData:
     preview_height: int = 0
     preview_format: int = 0
     preview_pixels: Optional[bytes] = None
+    preview_encoded_format: int = 0
+    preview_encoded_bytes: int = 0
+    preview_raw_bytes: int = 0
 
 def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameData]:
     try:
@@ -164,6 +167,9 @@ def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameD
         preview_height = 0
         preview_format = 0
         preview_pixels = None
+        preview_encoded_format = 0
+        preview_encoded_bytes = 0
+        preview_raw_bytes = 0
 
         if len(data) > base_len:
             if len(data) < (base_len + 4):
@@ -185,6 +191,9 @@ def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameD
                     return None
                 expected_px_bytes = int(preview_width) * int(preview_height) * 2
                 pf = int(preview_format)
+                preview_encoded_format = pf
+                preview_encoded_bytes = int(len(pixels))
+                preview_raw_bytes = int(expected_px_bytes)
                 if pf == 1:
                     if len(pixels) != expected_px_bytes:
                         return None
@@ -235,6 +244,47 @@ def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameD
                         return None
                     preview_pixels = bytes(out)
                     preview_format = 1
+                elif pf == 3:
+                    # Simple word-RLE on RGB565BE:
+                    #  ctrl (1B): high bit=run/literal, low 7 bits = count-1 (1..128 words)
+                    #  run:   [ctrl][word_hi][word_lo]
+                    #  lit:   [ctrl][count*2 bytes literal words]
+                    out = bytearray(expected_px_bytes)
+                    oi = 0
+                    si = 0
+                    plen = len(pixels)
+                    ok = True
+                    while si < plen and oi < expected_px_bytes:
+                        ctrl = pixels[si]
+                        si += 1
+                        words = (ctrl & 0x7F) + 1
+                        if (ctrl & 0x80) != 0:
+                            if (si + 1) >= plen:
+                                ok = False
+                                break
+                            b0 = pixels[si]
+                            b1 = pixels[si + 1]
+                            si += 2
+                            need = words * 2
+                            if (oi + need) > expected_px_bytes:
+                                ok = False
+                                break
+                            for _ in range(words):
+                                out[oi] = b0
+                                out[oi + 1] = b1
+                                oi += 2
+                        else:
+                            need = words * 2
+                            if (si + need) > plen or (oi + need) > expected_px_bytes:
+                                ok = False
+                                break
+                            out[oi:oi + need] = pixels[si:si + need]
+                            oi += need
+                            si += need
+                    if (not ok) or (oi != expected_px_bytes) or (si != plen):
+                        return None
+                    preview_pixels = bytes(out)
+                    preview_format = 1
                 else:
                     return None
 
@@ -250,6 +300,9 @@ def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameD
             preview_height=int(preview_height),
             preview_format=int(preview_format),
             preview_pixels=preview_pixels,
+            preview_encoded_format=int(preview_encoded_format),
+            preview_encoded_bytes=int(preview_encoded_bytes),
+            preview_raw_bytes=int(preview_raw_bytes),
         )
     except Exception as e:
         print(f"Parse error: {e}")

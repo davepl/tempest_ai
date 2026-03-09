@@ -232,6 +232,7 @@ local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
 local PREVIEW_FORMAT_RGB565_LZSS = 2
+local PREVIEW_FORMAT_RGB565_RLE = 3
 -- Enable preview support; server controls streaming per-client via action source flags.
 local PREVIEW_CAPTURE_ENABLED = true
 local PREVIEW_MIN_INTERVAL_S = (1.0 / 30.0)
@@ -1092,6 +1093,54 @@ local function lzss_compress_bytes(data)
     return table.concat(out)
 end
 
+local function rle_compress_rgb565_words(blob)
+    if not blob or #blob < 4 or (#blob % 2) ~= 0 then
+        return nil
+    end
+    local n = #blob
+    local out = {}
+    local oi = 1
+    local i = 1
+
+    while i <= n do
+        local word = string.sub(blob, i, i + 1)
+        local run_words = 1
+        local j = i + 2
+        while run_words < 128 and j <= n do
+            if string.sub(blob, j, j + 1) ~= word then
+                break
+            end
+            run_words = run_words + 1
+            j = j + 2
+        end
+
+        if run_words >= 2 then
+            out[oi] = string.char(0x80 | (run_words - 1))
+            oi = oi + 1
+            out[oi] = word
+            oi = oi + 1
+            i = i + (run_words * 2)
+        else
+            local lit_start = i
+            local lit_words = 1
+            i = i + 2
+            while lit_words < 128 and i <= n do
+                if (i + 3) <= n and string.sub(blob, i, i + 1) == string.sub(blob, i + 2, i + 3) then
+                    break
+                end
+                lit_words = lit_words + 1
+                i = i + 2
+            end
+            out[oi] = string.char(lit_words - 1)
+            oi = oi + 1
+            out[oi] = string.sub(blob, lit_start, lit_start + (lit_words * 2) - 1)
+            oi = oi + 1
+        end
+    end
+
+    return table.concat(out)
+end
+
 local function capture_game_preview()
     if (not PREVIEW_CAPTURE_ENABLED) or (not preview_stream_enabled) then
         clear_pending_preview()
@@ -1139,6 +1188,11 @@ local function capture_game_preview()
 
         local blob = table.concat(out)
         local fmt = PREVIEW_FORMAT_RGB565
+        local rle = rle_compress_rgb565_words(blob)
+        if rle and #rle > 0 and #rle < (#blob - 8) then
+            fmt = PREVIEW_FORMAT_RGB565_RLE
+            blob = rle
+        end
         if #blob <= 0 or #blob > PREVIEW_MAX_BYTES then
             return nil
         end
