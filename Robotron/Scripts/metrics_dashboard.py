@@ -16,6 +16,7 @@ import json
 import math
 import mimetypes
 import os
+import stat
 import shutil
 import signal
 import subprocess
@@ -24,6 +25,7 @@ import threading
 import time
 import webbrowser
 import sys
+import queue
 from fractions import Fraction
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,8 +46,9 @@ try:
         RTCConfiguration,
         RTCIceServer,
         VideoStreamTrack,
+        AudioStreamTrack,
     )
-    from av import VideoFrame
+    from av import VideoFrame, AudioFrame
     _WEBRTC_AVAILABLE = True
     _WEBRTC_IMPORT_ERROR = ""
 except Exception as e:
@@ -54,7 +57,9 @@ except Exception as e:
     RTCConfiguration = None
     RTCIceServer = None
     VideoStreamTrack = object
+    AudioStreamTrack = object
     VideoFrame = None
+    AudioFrame = None
     _WEBRTC_AVAILABLE = False
     _WEBRTC_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
@@ -102,10 +107,8 @@ VIDEO_EXTENSIONS = {".mov", ".mp4", ".webm", ".ogv"}
 _FALLBACK_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
 _WEBRTC_ICE_SERVERS = WEBRTC_ICE_SERVERS if isinstance(WEBRTC_ICE_SERVERS, list) and WEBRTC_ICE_SERVERS else _FALLBACK_ICE_SERVERS
 
-
 def _audio_dir() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Audio folder is at workspace root, not game directory
     return os.path.join(os.path.dirname(os.path.dirname(script_dir)), "audio")
 
 
@@ -680,6 +683,250 @@ class _PreviewVideoTrack(VideoStreamTrack):
         return frame
 
 
+class _PreviewAudioSource:
+    """Persistent FIFO reader that fan-outs 20 ms PCM frames to subscribers."""
+
+    _FRAME_PTIME_S = 0.02
+    _MAX_SOURCE_LATENCY_S = 0.20
+    _IDLE_KEEP_FRAMES = 1
+    _SUBSCRIBER_QUEUE_FRAMES = 6
+
+    def __init__(self, audio_path: str = "/tmp/robotron_audio_client0.wav"):
+        self.audio_path = audio_path
+        self._sample_rate = 48000
+        self._channels = 2
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._audio_ready = False
+        self._stop_event = threading.Event()
+        self._reader_thread_obj = None
+        self._subscribers: dict[int, queue.Queue] = {}
+        self._next_subscriber_id = 1
+        self._start_reader()
+
+    def _find_audio_fifo(self) -> str | None:
+        import glob
+
+        def _is_fifo(path: str) -> bool:
+            try:
+                return stat.S_ISFIFO(os.stat(path).st_mode)
+            except Exception:
+                return False
+
+        if "*" in self.audio_path:
+            paths = [p for p in glob.glob(self.audio_path) if _is_fifo(p)]
+            return sorted(paths)[-1] if paths else None
+        if os.path.exists(self.audio_path) and _is_fifo(self.audio_path):
+            return self.audio_path
+        return None
+
+    def _parse_wav_header(self, header: bytes) -> tuple[int, int] | None:
+        if len(header) < 44:
+            return None
+        try:
+            import struct
+            if header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+                return None
+            channels = int(struct.unpack("<H", header[22:24])[0])
+            sample_rate = int(struct.unpack("<I", header[24:28])[0])
+            bits_per_sample = int(struct.unpack("<H", header[34:36])[0])
+            if channels not in (1, 2):
+                return None
+            if sample_rate <= 0:
+                return None
+            if bits_per_sample != 16:
+                return None
+            return sample_rate, channels
+        except Exception:
+            return None
+
+    def _frame_params_locked(self) -> tuple[int, int]:
+        samples_per_frame = max(1, int(round(self._sample_rate * self._FRAME_PTIME_S)))
+        bytes_per_frame = samples_per_frame * self._channels * 2
+        return samples_per_frame, bytes_per_frame
+
+    def _drop_queue_head(self, q: queue.Queue):
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+    def _dispatch_ready_frames_locked(self):
+        samples_per_frame, bytes_per_frame = self._frame_params_locked()
+        if bytes_per_frame <= 0:
+            return
+        if not self._subscribers:
+            keep_bytes = max(bytes_per_frame * self._IDLE_KEEP_FRAMES, self._channels * 2)
+            if len(self._buffer) > keep_bytes:
+                del self._buffer[:-keep_bytes]
+            return
+        while len(self._buffer) >= bytes_per_frame:
+            payload = bytes(self._buffer[:bytes_per_frame])
+            del self._buffer[:bytes_per_frame]
+            packet = (payload, self._sample_rate, self._channels, samples_per_frame)
+            for q in list(self._subscribers.values()):
+                try:
+                    q.put_nowait(packet)
+                except queue.Full:
+                    self._drop_queue_head(q)
+                    try:
+                        q.put_nowait(packet)
+                    except queue.Full:
+                        pass
+
+    def _reset_subscribers_locked(self):
+        for q in self._subscribers.values():
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _reader_thread(self):
+        retry_count = 0
+        while not self._stop_event.is_set():
+            try:
+                path = self._find_audio_fifo()
+                if not path:
+                    retry_count += 1
+                    time.sleep(0.1)
+                    continue
+                retry_count = 0
+                with open(path, "rb", buffering=0) as f:
+                    header = f.read(44)
+                    parsed = self._parse_wav_header(header)
+                    if parsed is None:
+                        time.sleep(0.1)
+                        continue
+                    sample_rate, channels = parsed
+                    with self._lock:
+                        self._sample_rate = sample_rate
+                        self._channels = channels
+                        self._buffer.clear()
+                        self._audio_ready = True
+                        self._reset_subscribers_locked()
+                    while not self._stop_event.is_set():
+                        chunk = f.read(4096)
+                        if not chunk:
+                            break
+                        with self._lock:
+                            self._buffer.extend(chunk)
+                            max_buffer_bytes = int(
+                                self._sample_rate * self._channels * 2 * self._MAX_SOURCE_LATENCY_S
+                            )
+                            if len(self._buffer) > max_buffer_bytes:
+                                drop = len(self._buffer) - max_buffer_bytes
+                                sample_bytes = self._channels * 2
+                                drop -= drop % max(1, sample_bytes)
+                                if drop > 0:
+                                    del self._buffer[:drop]
+                            self._dispatch_ready_frames_locked()
+                with self._lock:
+                    self._audio_ready = False
+                    self._buffer.clear()
+                    self._reset_subscribers_locked()
+                time.sleep(0.1)
+            except Exception:
+                with self._lock:
+                    self._audio_ready = False
+                    self._buffer.clear()
+                    self._reset_subscribers_locked()
+                time.sleep(0.25)
+
+    def _start_reader(self):
+        if self._reader_thread_obj is not None and self._reader_thread_obj.is_alive():
+            return
+        self._reader_thread_obj = threading.Thread(target=self._reader_thread, daemon=True, name="AudioReader")
+        self._reader_thread_obj.start()
+
+    def subscribe(self) -> tuple[int, queue.Queue]:
+        self._start_reader()
+        q: queue.Queue = queue.Queue(maxsize=self._SUBSCRIBER_QUEUE_FRAMES)
+        with self._lock:
+            subscriber_id = self._next_subscriber_id
+            self._next_subscriber_id += 1
+            self._subscribers[subscriber_id] = q
+            _, bytes_per_frame = self._frame_params_locked()
+            keep_bytes = max(bytes_per_frame, self._channels * 2)
+            if len(self._buffer) > keep_bytes:
+                del self._buffer[:-keep_bytes]
+        return subscriber_id, q
+
+    def unsubscribe(self, subscriber_id: int | None):
+        if subscriber_id is None:
+            return
+        with self._lock:
+            self._subscribers.pop(int(subscriber_id), None)
+
+    def get_format(self) -> tuple[int, int]:
+        with self._lock:
+            return int(self._sample_rate), int(self._channels)
+
+    def close(self):
+        self._stop_event.set()
+        if self._reader_thread_obj is not None:
+            self._reader_thread_obj.join(timeout=1.0)
+        with self._lock:
+            self._subscribers.clear()
+            self._buffer.clear()
+            self._audio_ready = False
+
+
+class _PreviewAudioTrack(AudioStreamTrack):
+    """WebRTC audio track backed by a persistent FIFO reader."""
+
+    _FRAME_PTIME_S = 0.02
+
+    def __init__(self, source: _PreviewAudioSource):
+        super().__init__()
+        self._source = source
+        self._subscriber_id, self._queue = self._source.subscribe()
+
+    def stop(self):
+        self._source.unsubscribe(self._subscriber_id)
+        self._subscriber_id = None
+        super().stop()
+
+    async def recv(self):
+        sample_rate, channels = self._source.get_format()
+        samples_per_frame = max(1, int(round(sample_rate * self._FRAME_PTIME_S)))
+        if hasattr(self, "_timestamp"):
+            self._timestamp += samples_per_frame
+            wait = self._start + (self._timestamp / sample_rate) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            self._start = time.time()
+            self._timestamp = 0
+
+        latest = None
+        while True:
+            try:
+                latest = self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest is not None:
+            frame_data, sample_rate, channels, samples_per_frame = latest
+        else:
+            frame_data = b"\x00" * (samples_per_frame * channels * 2)
+
+        expected_bytes = samples_per_frame * channels * 2
+        if len(frame_data) != expected_bytes:
+            if len(frame_data) > expected_bytes:
+                frame_data = frame_data[:expected_bytes]
+            else:
+                frame_data = frame_data + (b"\x00" * (expected_bytes - len(frame_data)))
+
+        layout = "mono" if int(channels) == 1 else "stereo"
+        frame = AudioFrame(format="s16", layout=layout, samples=samples_per_frame)
+        frame.planes[0].update(frame_data)
+        frame.pts = self._timestamp
+        frame.sample_rate = sample_rate
+        frame.time_base = Fraction(1, sample_rate)
+        return frame
+
+
 class _PreviewWebRTCBridge:
     def __init__(self, metrics_obj, ice_servers: list[dict[str, Any]] | None = None):
         self.metrics = metrics_obj
@@ -701,12 +948,15 @@ class _PreviewWebRTCBridge:
         self._loop = None
         self._pcs = set()
         self._lock = threading.Lock()
+        self._audio_source = _PreviewAudioSource() if self.enabled else None
 
     def start(self):
         if not self.enabled:
             return
         if self._thread is not None:
             return
+        if self._audio_source is None:
+            self._audio_source = _PreviewAudioSource()
 
         def _runner():
             loop = asyncio.new_event_loop()
@@ -753,6 +1003,9 @@ class _PreviewWebRTCBridge:
             self._thread.join(timeout=3.0)
         self._thread = None
         self._loop = None
+        if self._audio_source is not None:
+            self._audio_source.close()
+            self._audio_source = None
 
     def _pc_configuration(self):
         if RTCConfiguration is None or RTCIceServer is None:
@@ -784,11 +1037,17 @@ class _PreviewWebRTCBridge:
             return {"ok": False, "error": "webrtc_unavailable"}
         pc = RTCPeerConnection(configuration=self._pc_configuration())
         self._pcs.add(pc)
+        audio_track = None
 
         @pc.on("connectionstatechange")
         async def _on_state_change():
             if pc.connectionState in {"closed", "failed", "disconnected"}:
                 self._pcs.discard(pc)
+                if audio_track is not None:
+                    try:
+                        audio_track.stop()
+                    except Exception:
+                        pass
                 try:
                     await pc.close()
                 except Exception:
@@ -801,6 +1060,20 @@ class _PreviewWebRTCBridge:
             profile_norm = "default"
             track = _PreviewVideoTrack(self.metrics, fps=30.0)
         pc.addTrack(track)
+
+        if self._audio_source is None:
+            try:
+                self._audio_source = _PreviewAudioSource()
+            except Exception:
+                self._audio_source = None
+
+        if self._audio_source is not None:
+            try:
+                audio_track = _PreviewAudioTrack(self._audio_source)
+                pc.addTrack(audio_track)
+            except Exception:
+                audio_track = None
+
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type=offer_type))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
@@ -1535,11 +1808,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
             <input type="checkbox" id="chkPreviewEnabled" style="display:none;" checked>
             <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
-            <div class="label" id="mPreviewLabel">CLIENT 0 PREVIEW</div>
+            <div class="label" id="mPreviewLabel">PREVIEW</div>
           </label>
         </div>
         <div class="preview-wrap">
-          <video id="vGamePreview" class="preview-video" autoplay muted playsinline></video>
+          <video id="vGamePreview" class="preview-video" autoplay playsinline></video>
           <canvas id="cGamePreview" class="preview-canvas"></canvas>
           <div id="mGamePreviewMsg" class="preview-msg">No Clients</div>
         </div>
@@ -1948,6 +2221,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     let _previewRtcRetryTimer = null;
     let _previewRtcConnecting = false;
     let _previewVideoHasFrame = false;
+    let _previewRtcStream = null;
     // Preview is controlled via checkbox; start enabled by default.
     const ENABLE_CLIENT0_PREVIEW = true;
 
@@ -2008,6 +2282,26 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       const useVideo = (mode === "video");
       if (gamePreviewVideo) gamePreviewVideo.style.display = useVideo ? "block" : "none";
       if (gamePreviewCanvas) gamePreviewCanvas.style.display = useVideo ? "none" : "block";
+    }
+
+    function _videoElementHasTrack() {
+      if (!gamePreviewVideo || !gamePreviewVideo.srcObject) return false;
+      try {
+        const tracks = gamePreviewVideo.srcObject.getVideoTracks();
+        return Array.isArray(tracks) ? tracks.length > 0 : !!(tracks && tracks.length > 0);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function _ensurePreviewVideoAudio() {
+      if (!gamePreviewVideo) return;
+      gamePreviewVideo.muted = false;
+      gamePreviewVideo.volume = 1.0;
+      try {
+        const p = gamePreviewVideo.play();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch (_) {}
     }
 
     function clearPreviewCanvas() {
@@ -2308,33 +2602,57 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       });
       _previewRtcPc = pc;
       _previewRtcConnected = false;
+      _previewRtcStream = null;
 
       pc.ontrack = (ev) => {
         _previewLog("ontrack received", { trackKind: ev && ev.track ? ev.track.kind : "unknown" });
-        const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
-        gamePreviewVideo.srcObject = stream;
+        if (!_previewRtcStream) {
+          _previewRtcStream = new MediaStream();
+        }
+        const incomingStream = ev.streams && ev.streams[0] ? ev.streams[0] : null;
+        if (incomingStream) {
+          const incomingTracks = incomingStream.getTracks();
+          for (let i = 0; i < incomingTracks.length; i++) {
+            const t = incomingTracks[i];
+            if (!_previewRtcStream.getTracks().some((x) => x && t && x.id === t.id)) {
+              _previewRtcStream.addTrack(t);
+            }
+          }
+        } else if (ev.track) {
+          if (!_previewRtcStream.getTracks().some((x) => x && ev.track && x.id === ev.track.id)) {
+            _previewRtcStream.addTrack(ev.track);
+          }
+        }
+        gamePreviewVideo.srcObject = _previewRtcStream;
         // Show video element immediately; some mobile browsers will not
         // reliably start decode/render while the element is display:none.
         setPreviewRenderMode("video");
-        try {
-          const p = gamePreviewVideo.play();
-          if (p && typeof p.catch === "function") p.catch(() => {});
-        } catch (_) {}
-        _previewRtcConnected = true;
+        _ensurePreviewVideoAudio();
+        const hasVideo = !!(_previewRtcStream && _previewRtcStream.getVideoTracks().length > 0);
+        _previewRtcConnected = hasVideo;
         _previewRtcEnabled = true;
         _previewRtcError = "";
-        setPreviewMessage("Loading Preview");
+        setPreviewMessage(hasVideo ? "Loading Preview" : "Waiting For Video Track");
       };
 
       pc.onconnectionstatechange = () => {
         const st = pc.connectionState || "";
         _previewLog("connectionState", st);
-        if (st === "failed" || st === "closed" || st === "disconnected") {
+        if (st === "failed" || st === "closed") {
           _previewRtcConnected = false;
           _previewRtcEnabled = false;
+          _previewRtcStream = null;
           setPreviewRenderMode("canvas");
           try { pc.close(); } catch (_) {}
           if (_previewRtcPc === pc) _previewRtcPc = null;
+          _schedulePreviewWebRTCRetry(1000);
+        } else if (st === "disconnected") {
+          _previewRtcConnected = false;
+          _previewRtcEnabled = false;
+          _previewRtcStream = null;
+          if (!_videoElementHasTrack()) {
+            setPreviewRenderMode("canvas");
+          }
           _schedulePreviewWebRTCRetry(1000);
         }
       };
@@ -2348,6 +2666,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
       try {
         const vtx = pc.addTransceiver("video", { direction: "recvonly" });
+        pc.addTransceiver("audio", { direction: "recvonly" });
         try {
           if (vtx && typeof vtx.setCodecPreferences === "function" && window.RTCRtpReceiver && typeof RTCRtpReceiver.getCapabilities === "function") {
             const caps = RTCRtpReceiver.getCapabilities("video");
@@ -4362,7 +4681,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         : "0.0%";
 
       if (!ENABLE_CLIENT0_PREVIEW) {
-        if (cards.previewLabel) cards.previewLabel.textContent = "CLIENT 0 PREVIEW (DISABLED)";
+        if (cards.previewLabel) cards.previewLabel.textContent = "PREVIEW (DISABLED)";
         setPreviewRenderMode("canvas");
         setPreviewMessage("Preview Disabled");
       } else {
@@ -4370,6 +4689,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         const previewFps = Number(now.game_preview_fps || 0);
         const previewFmt = String(now.game_preview_source_format || "").toUpperCase();
         const previewRatio = Number(now.game_preview_compression_ratio || 1);
+        const previewClientId = Number(now.game_preview_client_id);
+        const previewLabelBase = Number.isFinite(previewClientId) && previewClientId >= 0
+          ? `CLIENT ${previewClientId} PREVIEW`
+          : "PREVIEW";
         if (cards.previewLabel) {
           let statText = "";
           if (previewFmt === "RLE" && Number.isFinite(previewRatio) && previewRatio > 1.0) {
@@ -4382,9 +4705,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           if (Number.isFinite(previewFps) && previewFps > 0.1) {
             statText = statText ? `${statText} @ ${previewFps.toFixed(1)}fps` : `${previewFps.toFixed(1)}fps`;
           }
-          cards.previewLabel.textContent = statText ? `CLIENT 0 PREVIEW ${statText}` : "CLIENT 0 PREVIEW";
+          cards.previewLabel.textContent = statText ? `${previewLabelBase} ${statText}` : previewLabelBase;
         }
-        if (_previewRtcEnabled && _previewRtcConnected) {
+        const hasVideoTrack = _videoElementHasTrack();
+        if ((_previewRtcEnabled && _previewRtcConnected) || hasVideoTrack) {
           setPreviewRenderMode("video");
           setPreviewMessage(_previewVideoHasFrame ? "" : "Loading Preview");
         } else if ((now.client_count || 0) <= 0) {
@@ -4392,7 +4716,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           _previewHasFrame = false;
           clearPreviewCanvas();
         } else if (!Number.isFinite(previewSeq) || previewSeq <= 0) {
-          setPreviewMessage(_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Waiting For Client 0");
+          setPreviewMessage(_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Waiting For Preview Client");
           if (!_previewHasFrame) clearPreviewCanvas();
         } else {
           setPreviewMessage(_previewHasFrame ? "" : (_previewRtcError ? `WebRTC off: ${_previewRtcError}` : "Loading Preview"));
@@ -4541,6 +4865,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     setAudioToggle(audioEnabled, false);
     const kickAudioStart = () => {
       if (audioEnabled) ensureAudioPlaying();
+      _ensurePreviewVideoAudio();
     };
     document.addEventListener("pointerdown", kickAudioStart, { passive: true });
     document.addEventListener("keydown", kickAudioStart);

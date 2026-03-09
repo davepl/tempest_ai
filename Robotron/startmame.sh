@@ -72,9 +72,23 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-SOUND_FLAG=""
-if [[ "$COUNT" -gt 1 ]]; then
-    SOUND_FLAG="-sound none"
+# Set up stable audio FIFO for client 0 (WebRTC streaming)
+AUDIO_FIFO="/tmp/robotron_audio_client0.wav"
+
+# Check if MAME is already running with audio output to this FIFO
+if pgrep -f "mame.*robotron.*wavwrite" > /dev/null 2>&1; then
+    echo "ERROR: MAME with audio output is already running!"
+    echo "Kill existing instances with: killall mame"
+    exit 1
+fi
+
+# Only recreate FIFO if it doesn't exist or isn't a FIFO
+if [[ ! -p "$AUDIO_FIFO" ]]; then
+    rm -f "$AUDIO_FIFO" 2>/dev/null || true
+    mkfifo "$AUDIO_FIFO"
+    echo "Created audio FIFO: $AUDIO_FIFO"
+else
+    echo "Using existing audio FIFO: $AUDIO_FIFO"
 fi
 
 WARNING_FLAG=""
@@ -97,18 +111,39 @@ fi
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
     echo "Mode: foreground"
-    echo "Launching 1 MAME instance (attached)..."
-    exec "$MAME_BIN" robotron -rompath "$ROMPATH" -nothrottle $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
+    echo "Launching 1 MAME instance (attached) with audio streaming, throttled to real time..."
+    SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
+    THROTTLE_FLAG="-throttle -speed 1.0"
+    exec env ROBOTRON_PREVIEW_CLIENT=1 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
 fi
 
 echo "Mode: background"
-echo "Launching $COUNT MAME instance(s)..."
+if [[ "$COUNT" -eq 1 ]]; then
+    echo "Launching 1 MAME instance (client 0) with audio streaming, throttled to real time..."
+else
+    echo "Launching $COUNT MAME instance(s): client 0 throttled with audio/video, others unthrottled..."
+fi
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
-    "$MAME_BIN" robotron -rompath "$ROMPATH" -nothrottle $SOUND_FLAG -video none -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+    if [[ $i -eq 1 ]]; then
+        SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
+        THROTTLE_FLAG="-throttle -speed 1.0"
+        VIDEO_FLAG="-video soft"  # Need video backend for audio to work
+        PREVIEW_CLIENT_FLAG="1"
+    else
+        SOUND_FLAG="-sound none"
+        THROTTLE_FLAG="-nothrottle"
+        VIDEO_FLAG="-video none"
+        PREVIEW_CLIENT_FLAG="0"
+    fi
+    ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
     pid=$!
     PIDS+=("$pid")
-    echo "  Started instance $i (PID $pid)"
+    if [[ $i -eq 1 ]]; then
+        echo "  Started instance $i (client 0 - audio/video, throttled) PID $pid"
+    else
+        echo "  Started instance $i (unthrottled training) PID $pid"
+    fi
 done
 
 echo "All instances launched. Checking process liveness..."

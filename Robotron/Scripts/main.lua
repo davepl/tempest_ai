@@ -29,6 +29,7 @@
 --]]
 
 local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
+local PREVIEW_CLIENT_FLAG = (os.getenv("ROBOTRON_PREVIEW_CLIENT") == "1") and 1 or 0
 local SOCKET_ADDRESS = RAW_SOCKET_ADDRESS
 if string.sub(SOCKET_ADDRESS, 1, 7) ~= "socket." then
     SOCKET_ADDRESS = "socket." .. SOCKET_ADDRESS
@@ -1258,7 +1259,7 @@ local function open_socket()
         local result = sock:open(SOCKET_ADDRESS)
         if result == nil then
             -- Required 2-byte handshake.
-            sock:write(string.pack(">H", 0))
+            sock:write(string.pack(">H", PREVIEW_CLIENT_FLAG))
             current_socket = sock
         else
             open_result = tostring(result)

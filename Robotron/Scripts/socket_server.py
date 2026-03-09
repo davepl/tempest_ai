@@ -302,6 +302,7 @@ class SocketServer:
         self.clients = {}
         self.client_states = {}
         self.client_lock = threading.Lock()
+        self.preview_cid = None
 
     def _alloc_id(self):
         with self.client_lock:
@@ -320,8 +321,46 @@ class SocketServer:
         return struct.pack("bbb", int(move_cmd), int(fire_cmd), int(source_u8))
 
     @staticmethod
-    def _preview_enabled_for_client(cid: int) -> bool:
-        if int(cid) != 0:
+    def _clear_preview_cache() -> None:
+        with metrics.lock:
+            metrics.game_preview_client_id = -1
+            metrics.game_preview_seq = 0
+            metrics.game_preview_width = 0
+            metrics.game_preview_height = 0
+            metrics.game_preview_format = ""
+            metrics.game_preview_data_b64 = ""
+            metrics.game_preview_updated_ts = 0.0
+            metrics.game_preview_source_format = ""
+            metrics.game_preview_encoded_bytes = 0
+            metrics.game_preview_raw_bytes = 0
+            metrics.game_preview_compression_ratio = 1.0
+            metrics.game_preview_fps = 0.0
+
+    def _is_preview_client(self, cid: int) -> bool:
+        with self.client_lock:
+            preview_cid = self.preview_cid
+        if preview_cid is not None:
+            return int(cid) == int(preview_cid)
+        return int(cid) == 0
+
+    def _maybe_claim_preview_client(self, cid: int, handshake_value: int) -> bool:
+        wants_preview = int(handshake_value or 0) != 0
+        with self.client_lock:
+            if wants_preview and (self.preview_cid is None or int(self.preview_cid) == int(cid)):
+                if self.preview_cid is None or int(self.preview_cid) != int(cid):
+                    self._clear_preview_cache()
+                self.preview_cid = int(cid)
+                cs = self.client_states.get(cid)
+                if isinstance(cs, dict):
+                    cs["preview_claimed"] = True
+                return True
+            cs = self.client_states.get(cid)
+            if isinstance(cs, dict):
+                cs["preview_claimed"] = False
+        return False
+
+    def _preview_enabled_for_client(self, cid: int) -> bool:
+        if not self._is_preview_client(cid):
             return False
         with metrics.lock:
             # Check if preview is enabled via dashboard checkbox
@@ -330,9 +369,8 @@ class SocketServer:
             # Only enable if web clients are connected
             return int(getattr(metrics, "web_client_count", 0) or 0) > 0
 
-    @staticmethod
-    def _cache_client_preview(cid: int, frame) -> None:
-        if int(cid) != 0:
+    def _cache_client_preview(self, cid: int, frame) -> None:
+        if not self._is_preview_client(cid):
             return
         pixels = getattr(frame, "preview_pixels", None)
         width = int(getattr(frame, "preview_width", 0) or 0)
@@ -415,6 +453,7 @@ class SocketServer:
                 "state_stack": deque(maxlen=FRAME_STACK),
                 "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
                 "last_alive_game_score": 0, "prev_game_final_score": 0,
+                "preview_claimed": False,
             }
             metrics.client_count = len(self.client_states)
 
@@ -458,9 +497,12 @@ class SocketServer:
                 ping = sock.recv(2)
                 if not ping or len(ping) < 2:
                     raise ConnectionError("No handshake")
+                handshake_value = int(struct.unpack(">H", ping[:2])[0])
             finally:
                 sock.setblocking(False)
                 sock.settimeout(None)
+
+            self._maybe_claim_preview_client(cid, handshake_value)
 
             while self.running and not self.shutdown_event.is_set():
                 preview_enabled = self._preview_enabled_for_client(cid)
@@ -489,7 +531,7 @@ class SocketServer:
                 else:
                     break
 
-                preview_parse_allowed = bool(int(cid) == 0 and preview_enabled)
+                preview_parse_allowed = bool(self._is_preview_client(cid) and preview_enabled)
                 if not preview_parse_allowed:
                     pl = self._peek_preview_len(data)
                     if pl > 0:
@@ -500,13 +542,13 @@ class SocketServer:
                             if (now_t - last) >= 5.0:
                                 cs["last_nonzero_preview_warn_ts"] = now_t
 
-                # Hard gate preview parsing to client 0 only.
+                # Hard gate preview parsing to the designated preview client only.
                 # Even if another client sends preview bytes, skip decode cost.
                 frame = parse_frame_data(data, parse_preview=preview_parse_allowed)
                 if not frame:
                     sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
                     continue
-                if int(cid) == 0 and preview_parse_allowed:
+                if self._is_preview_client(cid) and preview_parse_allowed:
                     enc_fmt = int(getattr(frame, "preview_encoded_format", 0) or 0)
                     enc_bytes = int(getattr(frame, "preview_encoded_bytes", 0) or 0)
                     raw_bytes = int(getattr(frame, "preview_raw_bytes", 0) or 0)
@@ -831,6 +873,9 @@ class SocketServer:
             except Exception:
                 pass
             with self.client_lock:
+                if self.preview_cid is not None and int(self.preview_cid) == int(cid):
+                    self.preview_cid = None
+                    self._clear_preview_cache()
                 self.client_states.pop(cid, None)
                 self.clients[cid] = None
                 metrics.client_count = sum(1 for v in self.clients.values() if v is not None)
