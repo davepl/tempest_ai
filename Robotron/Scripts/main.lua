@@ -235,7 +235,7 @@ local PREVIEW_FORMAT_RGB565_LZSS = 2
 local PREVIEW_FORMAT_RGB565_RLE = 3
 -- Enable preview support; server controls streaming per-client via action source flags.
 local PREVIEW_CAPTURE_ENABLED = true
-local PREVIEW_MIN_INTERVAL_S = (1.0 / 30.0)
+local PREVIEW_MIN_INTERVAL_S = (1.0 / 60.0)
 -- Allow native-resolution snapshots; compression handles wire size.
 local PREVIEW_MAX_WIDTH = 4096
 local PREVIEW_MAX_HEIGHT = 4096
