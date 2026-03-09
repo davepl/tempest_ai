@@ -483,6 +483,7 @@ class _DashboardState:
             "pulse_count": plateau_pulser.total_pulses,
             "pulse_enabled": True,  # manual pulse is always available
             "game_settings": game_settings.snapshot(),
+            "preview_capture_enabled": bool(getattr(self.metrics, "preview_capture_enabled", True)),
         }
 
     @staticmethod
@@ -1392,6 +1393,26 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     .toggle-switch input:checked + .slider { background: rgba(0, 200, 255, 0.45); }
     .toggle-switch input:checked + .slider::before { transform: translateX(14px); background: #00c8ff; }
     .toggle-switch input:disabled + .slider { opacity: 0.4; cursor: default; }
+    /* Preview checkbox indicator */
+    .preview-checkbox-indicator::after {
+      content: "✓";
+      position: absolute;
+      color: #00c8ff;
+      font-size: 10px;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0);
+      transition: transform 0.2s;
+      text-shadow: 0 0 4px rgba(0, 200, 255, 0.8);
+    }
+    #chkPreviewEnabled:checked + .preview-checkbox-indicator {
+      background: rgba(0, 200, 255, 0.35);
+      border-color: rgba(0, 200, 255, 0.7);
+      box-shadow: 0 0 6px rgba(0, 200, 255, 0.4);
+    }
+    #chkPreviewEnabled:checked + .preview-checkbox-indicator::after {
+      transform: translate(-50%, -50%) scale(1);
+    }
     /* Up/down override controls for Epsilon / Expert */
     .ud-col { display:flex; flex-direction:column; gap:0; line-height:1; }
     .ud-btn {
@@ -1509,9 +1530,13 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         </div>
         <canvas id="cStepGauge"></canvas>
       </article>
-      <article class="card preview-card" style="display:none;--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
+      <article class="card preview-card" style="--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
         <div class="gauge-head">
-          <div class="label" id="mPreviewLabel">CLIENT 0 PREVIEW</div>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+            <input type="checkbox" id="chkPreviewEnabled" style="display:none;" checked>
+            <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
+            <div class="label" id="mPreviewLabel">CLIENT 0 PREVIEW</div>
+          </label>
         </div>
         <div class="preview-wrap">
           <video id="vGamePreview" class="preview-video" autoplay muted playsinline></video>
@@ -1807,8 +1832,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const gsAdvancedEl = document.getElementById("gsAdvanced");
     const gsLevelEl = document.getElementById("gsLevel");
     const gsAutoCurrEl = document.getElementById("gsAutoCurriculum");
+    const chkPreviewEl = document.getElementById("chkPreviewEnabled");
     const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
-    if (!_gsAdmin) { gsAdvancedEl.disabled = true; gsLevelEl.disabled = true; gsAutoCurrEl.disabled = true; }
+    if (!_gsAdmin) { 
+      gsAdvancedEl.disabled = true; 
+      gsLevelEl.disabled = true; 
+      gsAutoCurrEl.disabled = true;
+      if (chkPreviewEl && chkPreviewEl.parentElement) {
+        chkPreviewEl.parentElement.style.display = "none";
+      }
+    }
     /* Epsilon / Expert up-down buttons — admin gate */
     document.querySelectorAll('#epsUD .ud-btn, #xprtUD .ud-btn').forEach(btn => {
       if (!_gsAdmin) { btn.disabled = true; return; }
@@ -1873,6 +1906,21 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       }
     }
 
+    /* Preview enable/disable checkbox — admin only */
+    if (_gsAdmin && chkPreviewEl) {
+      chkPreviewEl.addEventListener("change", async () => {
+        try {
+          await fetch("/api/preview_settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: chkPreviewEl.checked }),
+          });
+        } catch (e) {
+          console.error("Failed to update preview settings:", e);
+        }
+      });
+    }
+
     const recEls = {
       rwrd: document.getElementById("recRwrd"),
       level: document.getElementById("recLevel"),
@@ -1900,9 +1948,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     let _previewRtcRetryTimer = null;
     let _previewRtcConnecting = false;
     let _previewVideoHasFrame = false;
-    // Temporary kill-switch for Client0 preview networking.
-    // Flip to true to restore WebRTC + long-poll preview behavior.
-    const ENABLE_CLIENT0_PREVIEW = false;
+    // Preview is controlled via checkbox; start enabled by default.
+    const ENABLE_CLIENT0_PREVIEW = true;
 
     // ── Gauge needle damping ────────────────────────────────────────
     // Time-constant in seconds: the needle closes ~63% of the gap
@@ -4378,6 +4425,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         if (gsAdvancedEl.checked !== gs.start_advanced) gsAdvancedEl.checked = gs.start_advanced;
         if (parseInt(gsLevelEl.value, 10) !== gs.start_level_min) gsLevelEl.value = String(gs.start_level_min);
       }
+      // ── Preview checkbox sync from server ────────────────────────
+      if (_gsAdmin && chkPreviewEl && typeof now.preview_capture_enabled !== "undefined") {
+        chkPreviewEl.checked = !!now.preview_capture_enabled;
+      }
       // ── Auto-curriculum: continuously recompute level each tick ──
       if (gsAutoCurrEl.checked && now.average_level != null) {
         const lv = _computeAutoLevel(now.average_level);
@@ -4772,6 +4823,22 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                     game_settings.save()
                     body = json.dumps(game_settings.snapshot()).encode("utf-8")
                     self._send(body, "application/json")
+                except Exception:
+                    self._send(b'{"error":"bad request"}', "application/json", status=400)
+                return
+            if path == "/api/preview_settings":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    data = json.loads(raw)
+                    if "enabled" in data:
+                        enabled = bool(data["enabled"])
+                        with state.metrics.lock:
+                            state.metrics.preview_capture_enabled = enabled
+                        body = json.dumps({"ok": True, "enabled": enabled}).encode("utf-8")
+                        self._send(body, "application/json")
+                    else:
+                        self._send(b'{"error":"missing enabled field"}', "application/json", status=400)
                 except Exception:
                     self._send(b'{"error":"bad request"}', "application/json", status=400)
                 return

@@ -449,6 +449,9 @@ class MetricsData:
     last_loss: float = 0.0
     last_q_mean: float = 0.0
     last_bc_loss: float = 0.0
+
+    # Preview capture control (admin-controlled via dashboard)
+    preview_capture_enabled: bool = True
     last_priority_mean: float = 0.0
     last_agreement: float = 0.0
 

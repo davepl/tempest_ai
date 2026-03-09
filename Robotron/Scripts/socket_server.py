@@ -324,6 +324,10 @@ class SocketServer:
         if int(cid) != 0:
             return False
         with metrics.lock:
+            # Check if preview is enabled via dashboard checkbox
+            if not getattr(metrics, "preview_capture_enabled", True):
+                return False
+            # Only enable if web clients are connected
             return int(getattr(metrics, "web_client_count", 0) or 0) > 0
 
     @staticmethod
@@ -399,7 +403,7 @@ class SocketServer:
                 "level_number": 0, "last_state": None, "last_action": None,
                 "last_player_alive": False,
                 "last_action_source": None, "prev_action_source": None,
-                "act_total": 0, "act_eps": 0, "act_last_diag_total": 0,
+                "act_total": 0, "act_eps": 0, "act_xprt": 0, "act_last_diag_total": 0,
                 "act_same": 0, "act_diff": 0,
                 "act_move_hist": [0] * move_bins, "act_fire_hist": [0] * fire_bins,
                 "act_pair_hist": [0] * pair_bins,
@@ -666,7 +670,10 @@ class SocketServer:
                 move_idx = fire_idx = 0
                 action_source = "none"
                 is_epsilon = False
-                epsilon = self.metrics.get_effective_epsilon()
+                epsilon = float(self.metrics.get_effective_epsilon())
+                if not np.isfinite(epsilon):
+                    epsilon = 0.0
+                epsilon = max(0.0, min(1.0, epsilon))
                 # Fire updates only on cadence boundaries; between boundaries
                 # we keep fire fixed so decisions are not silently overwritten.
                 fire_update_open = int(cs.get("fire_hold_count", 0)) <= 0
@@ -688,8 +695,11 @@ class SocketServer:
                     is_epsilon = True
                     action_source = "forced_random"
                 elif self.agent:
-                    expert_ratio = self.metrics.get_expert_ratio()
-                    use_expert = (random.random() < expert_ratio) and not metrics.override_expert
+                    expert_ratio = float(self.metrics.get_expert_ratio())
+                    if not np.isfinite(expert_ratio):
+                        expert_ratio = 0.0
+                    expert_ratio = max(0.0, min(1.0, expert_ratio))
+                    use_expert = random.random() < expert_ratio
                     if use_expert:
                         move_idx, fire_idx = get_expert_action(stacked_state, locked_fire=locked_fire)
                         is_epsilon = False
@@ -739,6 +749,8 @@ class SocketServer:
                         pair_idx = int(move_idx) * fire_bins + int(fire_idx)
                         if 0 <= pair_idx < len(pair_hist_eps):
                             pair_hist_eps[pair_idx] += 1
+                if action_source == "expert":
+                    cs["act_xprt"] = int(cs.get("act_xprt", 0)) + 1
                 if _ACTION_DIAGNOSTICS:
                     last_diag = int(cs.get("act_last_diag_total", 0))
                     total = int(cs.get("act_total", 0))
@@ -759,12 +771,15 @@ class SocketServer:
 
                         eps_used = int(cs.get("act_eps", 0))
                         eps_rate = eps_used / max(1, total)
+                        xprt_used = int(cs.get("act_xprt", 0))
+                        xprt_rate = xprt_used / max(1, total)
                         same = int(cs.get("act_same", 0))
                         diff = int(cs.get("act_diff", 0))
                         diff_rate = diff / max(1, (same + diff))
                         print(
-                            f"[actdiag] client={cid} eps_eff={float(epsilon):.3f} "
+                            f"[actdiag] client={cid} eps_eff={float(epsilon):.3f} xprt_eff={float(expert_ratio):.3f} "
                             f"eps_used={eps_used}/{total} ({eps_rate:.1%}) "
+                            f"xprt_used={xprt_used}/{total} ({xprt_rate:.1%}) "
                             f"same={same} diff={diff} ({diff_rate:.1%} diff) "
                             f"move_all={cs.get('act_move_hist')} "
                             f"fire_all={cs.get('act_fire_hist')} "

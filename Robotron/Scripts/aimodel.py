@@ -340,6 +340,10 @@ _POS_MAX_DIAG = 64022.0  # sqrt(34816² + 53760²)
 # "Safe" distance: 1/8 screen height = 26.25 px = 6720 x16-units.
 # Enemies beyond this are not an immediate threat.
 _SAFE_DIST = 6720.0 / _POS_MAX_DIAG  # ~0.105
+# Alignment safe distance: ~12 px = 3072 x16-units.
+# When nearest enemy is beyond this, expert aligns on one axis before engaging.
+_ALIGN_SAFE_DIST = 3072.0 / _POS_MAX_DIAG  # ~0.048
+_ALIGN_ROBOT_CATEGORIES = {"grunt", "brain", "tank", "spawner", "enforcer"}
 
 # 16 screen-pixels = 4096 x16-units, normalised per axis.
 # The outer 16 px of the playfield is "lava" — never move into it.
@@ -400,6 +404,17 @@ def _closest_dir8(vx: float, vy: float, default_dir: int = 0) -> int:
     return best_idx
 
 
+def _axis_align_toward_enemy(ex_world: float, ey_world: float) -> int:
+    """Move toward enemy on the smaller-offset axis (x or y)."""
+    if abs(ex_world) <= abs(ey_world):
+        vx = 1.0 if ex_world >= 0.0 else -1.0
+        vy = 0.0
+    else:
+        vx = 0.0
+        vy = 1.0 if ey_world >= 0.0 else -1.0
+    return _closest_dir8(vx, vy, default_dir=0)
+
+
 def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
     """Return (dx, dy, dist) for nearest non-human object in typed slot state."""
     s = _latest_frame_state(state)
@@ -434,6 +449,48 @@ def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float,
             dist = float(s[i + 3])
             if not np.isfinite(dist):
                 # Keep scanning this category for a valid nearest entry.
+                continue
+            if best is None or dist < best[2]:
+                best = (dx, dy, dist)
+            break
+
+        base += 1 + n_slots * 4
+
+    return best
+
+
+def _nearest_align_robot_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    """Return nearest robot candidate for axis alignment (non-grunt, non-obstacle)."""
+    s = _latest_frame_state(state)
+    if s.size < 60:
+        return None
+
+    cat_defs = getattr(RL_CONFIG, "entity_categories", [])
+    if not cat_defs:
+        return None
+
+    base = 59  # 9 core + 50 ELIST
+    best: Optional[Tuple[float, float, float]] = None
+    for name, slots in cat_defs:
+        n_slots = int(slots)
+        if n_slots <= 0:
+            continue
+        slot_base = base + 1  # skip occupancy
+        if name not in _ALIGN_ROBOT_CATEGORIES:
+            base += 1 + n_slots * 4
+            continue
+
+        for j in range(n_slots):
+            i = slot_base + j * 4
+            if i + 3 >= s.size:
+                break
+            present = float(s[i])
+            if present < 0.5:
+                continue
+            dx = float(s[i + 1])
+            dy = float(s[i + 2])
+            dist = float(s[i + 3])
+            if not np.isfinite(dist):
                 continue
             if best is None or dist < best[2]:
                 best = (dx, dy, dist)
@@ -484,11 +541,15 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
     """Heuristic Robotron expert.
 
     Fire:  Always toward nearest enemy.
-    Move:  1. Human closer than nearest enemy → move toward human.
-           2. All enemies beyond safe distance → move toward human.
-           3. Otherwise → move away from nearest enemy.
+     Move priority:
+        1) Rescue humans when safe (no close threat within ~12 px).
+        2) Flee close threats (including hulks) when enemy is within ~12 px.
+        3) If still safe and no human rescue target, align to nearest non-hulk
+            robot (brain/tank/spawner/enforcer) on the smaller axis offset.
+        4) Otherwise, fallback to fleeing nearest enemy.
     """
     nearest_enemy = _nearest_enemy_vector_from_state(state)
+    nearest_align_robot = _nearest_align_robot_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
 
     # ── Fire direction (always at nearest enemy) ────────────────────
@@ -506,16 +567,21 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
         ex_world = ex * _REL_POS_X_RANGE
         ey_world = ey * _REL_POS_Y_RANGE
 
-        # Human closer than nearest enemy → seek human
-        if nearest_human is not None and nearest_human[2] < enemy_dist:
+        is_close_threat = enemy_dist < _ALIGN_SAFE_DIST
+
+        # 1) Flee close threats first (including hulks).
+        if is_close_threat:
+            move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
+        # 2) Safe to rescue: prioritize humans when available.
+        elif nearest_human is not None:
             hx, hy, _ = nearest_human
             move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
-        # All enemies at safe distance → seek human
-        elif enemy_dist > _SAFE_DIST and nearest_human is not None:
-            hx, hy, _ = nearest_human
-            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        # 3) Safe standoff: align on one axis with nearest non-hulk robot.
+        elif nearest_align_robot is not None:
+            ax, ay, _ = nearest_align_robot
+            move_dir = _axis_align_toward_enemy(ax * _REL_POS_X_RANGE, ay * _REL_POS_Y_RANGE)
         else:
-            # Flee from nearest enemy
+            # 4) Fallback: flee nearest enemy.
             move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
     elif nearest_human is not None:
         hx, hy, _ = nearest_human
