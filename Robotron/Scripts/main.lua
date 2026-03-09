@@ -1188,11 +1188,12 @@ local function capture_game_preview()
 
         local blob = table.concat(out)
         local fmt = PREVIEW_FORMAT_RGB565
-        local rle = rle_compress_rgb565_words(blob)
-        if rle and #rle > 0 and #rle < (#blob - 8) then
-            fmt = PREVIEW_FORMAT_RGB565_RLE
-            blob = rle
-        end
+        -- Compression disabled for performance
+        -- local rle = rle_compress_rgb565_words(blob)
+        -- if rle and #rle > 0 and #rle < (#blob - 8) then
+        --     fmt = PREVIEW_FORMAT_RGB565_RLE
+        --     blob = rle
+        -- end
         if #blob <= 0 or #blob > PREVIEW_MAX_BYTES then
             return nil
         end

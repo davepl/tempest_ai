@@ -427,6 +427,7 @@ def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float,
 
     base = 59  # 9 core + 50 ELIST
     best: Optional[Tuple[float, float, float]] = None
+    best_category: Optional[str] = None
     for name, slots in cat_defs:
         n_slots = int(slots)
         if n_slots <= 0:
@@ -452,9 +453,16 @@ def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float,
                 continue
             if best is None or dist < best[2]:
                 best = (dx, dy, dist)
+                best_category = name
             break
 
         base += 1 + n_slots * 4
+
+    # Debug: log electrode detections
+    if best_category == "electrode" and best is not None:
+        import os
+        if os.getenv("ROBOTRON_LOG_OBSTACLES", "").strip().lower() not in {"", "0", "false", "off", "no"}:
+            print(f"[OBSTACLE] Nearest enemy is electrode at dist={best[2]:.4f} ({best[2]*64.0:.1f}px), dx={best[0]:.3f}, dy={best[1]:.3f}")
 
     return best
 
