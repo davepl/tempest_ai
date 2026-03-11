@@ -2,30 +2,11 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a 644-value state vector:
-        5 core stats (alive, score, replay, lasers, wave)
-        + 2 player position (x16, y16)
-        + 2 player velocity (xv, yv)
-        + 50 ELIST enemy state bytes
-        + 9 per-type entity categories, each: 1 occupancy + N slots × 4 features
-          Per-slot features: present, x, y, distance
-          Slots sorted by distance to player (nearest first).
+      - Sends a hybrid 2210-value state vector:
+        + 98 global features
+        + 12x12x8 egocentric spatial grid
+        + 64 object tokens x 15 features
       - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
-
-    Entity categories (type is implicit in category position):
-      0. grunt      (40 slots) - grunts                          peak 80
-      1. hulk       (16 slots) - indestructible hulks             peak 25
-      2. brain      (16 slots) - brains                          peak 25
-      3. tank       ( 8 slots) - tanks (growing + full)          peak ~14
-      4. spawner    ( 8 slots) - circles, squares/quarks         peak 14
-      5. enforcer   (12 slots) - enforcers                       peak ~10
-      6. projectile (12 slots) - sparks, shells, cruise, progs
-      7. human      (16 slots) - mom, dad, kid                   peak 30
-      8. electrode  (16 slots) - electrodes/posts                peak 25
-
-    Entity type is determined by OCVECT (collision handler address at
-    object offset $08), which is stable for an entity's lifetime and
-    unique per type.  Classification is auto-discovered at runtime.
 --]]
 
 local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
@@ -183,6 +164,7 @@ local OBJX_OFF = 0x04
 local OBJY_OFF = 0x05
 local OX16_OFF = 0x0A
 local OY16_OFF = 0x0C
+FONIPC_OFF = 0x16
 
 local MAX_LIST_WALK = 256
 local OCVECT_OFF = 0x08  -- collision routine address (stable per entity type)
@@ -195,27 +177,57 @@ local ACTIVE_LISTS = {
     {name = "pptr", addr = PPTR_ADDR},   -- fatal: electrodes
 }
 
--- Per-type entity categories.  Order MUST match Python config/aimodel.py.
+-- Per-type entity categories. Order MUST match Python config/aimodel.py.
 local ENTITY_CATEGORIES = {
-    {name = "grunt",      slots = 40},
-    {name = "hulk",       slots = 16},
-    {name = "brain",      slots = 16},
-    {name = "tank",       slots =  8},
-    {name = "spawner",    slots =  8},
-    {name = "enforcer",   slots = 12},
-    {name = "projectile", slots = 12},
-    {name = "human",      slots = 16},
-    {name = "electrode",  slots = 16},
+    {name = "grunt",      slots = 40, peak = 80},
+    {name = "hulk",       slots = 16, peak = 25},
+    {name = "brain",      slots = 16, peak = 25},
+    {name = "tank",       slots =  8, peak = 14},
+    {name = "spawner",    slots =  8, peak = 14},
+    {name = "enforcer",   slots = 12, peak = 10},
+    {name = "projectile", slots = 12, peak = 20},
+    {name = "human",      slots = 16, peak = 30},
+    {name = "electrode",  slots = 16, peak = 25},
 }
-local ENTITY_FEATURES_PER_SLOT = 4          -- present, x, y, distance
-local ENTITY_TOTAL_SLOTS = 0
-local ENTITY_TOTAL_FEATURES = 0
-for _, cat in ipairs(ENTITY_CATEGORIES) do
-    ENTITY_TOTAL_SLOTS = ENTITY_TOTAL_SLOTS + cat.slots
-    ENTITY_TOTAL_FEATURES = ENTITY_TOTAL_FEATURES + 1 + cat.slots * ENTITY_FEATURES_PER_SLOT
+local ENTITY_CATEGORY_INDEX = {}
+for idx, cat in ipairs(ENTITY_CATEGORIES) do
+    ENTITY_CATEGORY_INDEX[cat.name] = idx - 1
 end
--- State vector: 9 core + 50 ELIST + entity features (585) = 644 floats
-local EXPECTED_STATE_VALUES = 9 + ZP1ENM_SIZE + ENTITY_TOTAL_FEATURES
+
+local OBJECT_TOKEN_LIMIT = 64
+local OBJECT_TOKEN_FEATURES = 15
+local GRID_W = 12
+local GRID_H = 12
+local GRID_CHANNELS = 8
+local GRID_HALF_RANGE_X = 12288.0   -- +/-48 px in x16 units
+local GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
+local GLOBAL_FEATURES = 98
+local GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
+local TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
+local EXPECTED_STATE_VALUES = GLOBAL_FEATURES + GRID_FEATURES + TOKEN_FEATURES
+
+local CATEGORY_THREAT_WEIGHT = {
+    grunt = 0.55,
+    hulk = 1.00,
+    brain = 0.95,
+    tank = 0.95,
+    spawner = 0.85,
+    enforcer = 0.85,
+    projectile = 0.90,
+    human = 0.35,
+    electrode = 0.75,
+}
+
+local CATEGORY_IS_DANGEROUS = {
+    grunt = true, hulk = true, brain = true, tank = true,
+    spawner = true, enforcer = true, projectile = true, electrode = true,
+}
+
+local CATEGORY_IS_STATIC = {
+    electrode = true,
+}
+
+local prev_object_samples = {}
 
 -- OCVECT-based entity classification (auto-discovered at runtime).
 local ocvect_category_cache = {}       -- OCVECT address → category name | "skip"
@@ -228,7 +240,8 @@ local mame_screen = nil                -- MAME screen device for draw_text
 local hud_objects = nil                -- last frame's classified object list (reference)
 local hud_player_x16 = nil
 local hud_player_y16 = nil
-local DEBUG_HUD_ENABLED = false        -- default OFF; toggle on with H hotkey
+hud_player_box = nil
+local DEBUG_HUD_ENABLED = true         -- default ON; toggle with H hotkey
 local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
 local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
 local PREVIEW_FORMAT_RGB565 = 1
@@ -248,6 +261,7 @@ local pending_preview_w = 0
 local pending_preview_h = 0
 local pending_preview_fmt = PREVIEW_FORMAT_RGB565
 local last_preview_capture_time_s = -1000000.0
+picture_bounds_cache = {}
 
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
@@ -569,6 +583,63 @@ local function classify_by_heuristic(list_name, width, height)
     return "skip"
 end
 
+function picture_collision_bounds(memory, pict_ptr)
+    if pict_ptr == nil or pict_ptr <= 0 then
+        return 0, 0, 1, 1
+    end
+    local cached = picture_bounds_cache[pict_ptr]
+    if cached then
+        return cached[1], cached[2], cached[3], cached[4]
+    end
+
+    local width = memory:read_u8(pict_ptr) or 0
+    local height = memory:read_u8(pict_ptr + 1) or 0
+    local data_ptr = read_u16_be(memory, pict_ptr + 2)
+    local off_x = 0
+    local off_y = 0
+    local box_w = math.max(1, width * HUD_SCREEN_X_SCALE)
+    local box_h = math.max(1, height)
+
+    if width > 0 and height > 0 and data_ptr and data_ptr > 0 then
+        local found = false
+        local min_col = width * HUD_SCREEN_X_SCALE
+        local max_col = -1
+        local min_row = height
+        local max_row = 0
+        for row = 0, height - 1 do
+            local row_base = data_ptr + (row * width)
+            for col = 0, width - 1 do
+                local byte = memory:read_u8(row_base + col) or 0
+                local x0 = col * HUD_SCREEN_X_SCALE
+                if ((byte >> 4) & 0x0F) ~= 0 then
+                    found = true
+                    if x0 < min_col then min_col = x0 end
+                    if x0 > max_col then max_col = x0 end
+                    if row < min_row then min_row = row end
+                    if row > max_row then max_row = row end
+                end
+                if (byte & 0x0F) ~= 0 then
+                    local x1 = x0 + 1
+                    found = true
+                    if x1 < min_col then min_col = x1 end
+                    if x1 > max_col then max_col = x1 end
+                    if row < min_row then min_row = row end
+                    if row > max_row then max_row = row end
+                end
+            end
+        end
+        if found then
+            off_x = min_col
+            off_y = min_row
+            box_w = (max_col - min_col) + 1
+            box_h = (max_row - min_row) + 1
+        end
+    end
+
+    picture_bounds_cache[pict_ptr] = {off_x, off_y, box_w, box_h}
+    return off_x, off_y, box_w, box_h
+end
+
 local function try_resolve_7x16(all_objects, enemy_state)
     -- Try to resolve ambiguous 7×16 RPTR objects (hulk / brain / tank)
     -- by matching per-OCVECT counts to ELIST counters.
@@ -701,11 +772,30 @@ local function try_resolve_7x16(all_objects, enemy_state)
     return changed
 end
 
-local function extract_typed_entities(memory, player_x16, player_y16, enemy_state)
-    -- Walk all 4 linked lists, classify each object by OCVECT into 9 typed
-    -- categories, sort each by distance, and produce a flat feature vector.
+local function _grid_index(ix, iy, ch)
+    return ((ch * GRID_H + iy) * GRID_W + ix) + 1
+end
 
-    -- Phase 1: collect raw objects ------------------------------------------
+local function _clamp_grid(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function _object_threat_score(obj)
+    local base = CATEGORY_THREAT_WEIGHT[obj.category] or 0.4
+    local proximity = 1.0 - clamp01(obj.dist_norm or 1.0)
+    local approach = clamp01((obj.approach or 0.0 + 1.0) * 0.5)
+    if obj.category == "human" then
+        return base * (0.35 + proximity)
+    end
+    return clamp01(base * (0.55 + 0.45 * proximity) + (0.25 * approach))
+end
+
+local function extract_world_features(memory, player_x16, player_y16, enemy_state)
+    -- Walk object lists, classify entities, compute per-object motion, and emit:
+    --   globals (98), local grid (12x12x8), tokens (64x15)
+
     local all_objects = {}
     for _, list_def in ipairs(ACTIVE_LISTS) do
         local ptr = read_u16_be(memory, list_def.addr)
@@ -718,43 +808,49 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
             if not is_valid_object_ptr(ptr) then break end
 
             local ocvect = read_u16_be(memory, ptr + OCVECT_OFF)
-            -- Skip objects with zero OCVECT (transient/uninitialized)
             if ocvect == 0 then
                 ptr = read_u16_be(memory, ptr + OLINK_OFF)
             else
+                local x16 = read_u16_be(memory, ptr + OX16_OFF)
+                local y16 = read_u16_be(memory, ptr + OY16_OFF)
+                local objx = memory:read_u8(ptr + OBJX_OFF)
+                local objy = memory:read_u8(ptr + OBJY_OFF)
+                local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
+                local fonipc_ptr = read_u16_be(memory, ptr + FONIPC_OFF)
+                local width, height = 0, 0
+                if pict_ptr > 0 then
+                    width = memory:read_u8(pict_ptr)
+                    height = memory:read_u8(pict_ptr + 1)
+                end
+                local collision_pict_ptr = (fonipc_ptr ~= nil and fonipc_ptr ~= 0) and fonipc_ptr or pict_ptr
+                local hit_off_x, hit_off_y, hit_w, hit_h = picture_collision_bounds(memory, collision_pict_ptr)
 
-            local x16 = read_u16_be(memory, ptr + OX16_OFF)   -- unsigned 8.8 fixed-point
-            local y16 = read_u16_be(memory, ptr + OY16_OFF)
-            local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
+                local dnorm = 1.0
+                if player_x16 and player_y16 then
+                    dnorm = dist_norm(player_x16, player_y16, x16, y16)
+                end
 
-            local width, height = 0, 0
-            if pict_ptr > 0 then
-                width = memory:read_u8(pict_ptr)
-                height = memory:read_u8(pict_ptr + 1)
+                all_objects[#all_objects + 1] = {
+                    ptr = ptr,
+                    list_name = list_def.name,
+                    x16 = x16,
+                    y16 = y16,
+                    objx = objx,
+                    objy = objy,
+                    ocvect = ocvect,
+                    width = width,
+                    height = height,
+                    hit_off_x = hit_off_x,
+                    hit_off_y = hit_off_y,
+                    hit_w = hit_w,
+                    hit_h = hit_h,
+                    dist_norm = dnorm,
+                }
+                ptr = read_u16_be(memory, ptr + OLINK_OFF)
             end
-
-            local dnorm = 1.0
-            if player_x16 and player_y16 then
-                dnorm = dist_norm(player_x16, player_y16, x16, y16)
-            end
-
-            all_objects[#all_objects + 1] = {
-                list_name = list_def.name,
-                x16 = x16,
-                y16 = y16,
-                ocvect = ocvect,
-                width = width,
-                height = height,
-                dist_norm = dnorm,
-            }
-
-            ptr = read_u16_be(memory, ptr + OLINK_OFF)
-
-            end  -- end of ocvect ~= 0 guard
         end
     end
 
-    -- Phase 2: classify each object -----------------------------------------
     for _, obj in ipairs(all_objects) do
         local cat = ocvect_category_cache[obj.ocvect]
         if cat == nil then
@@ -764,9 +860,9 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
                 if cat == "tank" and obj.width ~= 7 then
                     discovered_tank_ocvect = obj.ocvect
                 end
-                if cat ~= "skip" then
-                    if DEBUG_LOG_DISCOVERY then print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
-                                        obj.ocvect, cat, obj.list_name, obj.width, obj.height)) end
+                if cat ~= "skip" and DEBUG_LOG_DISCOVERY then
+                    print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
+                        obj.ocvect, cat, obj.list_name, obj.width, obj.height))
                 end
             else
                 unresolved_7x16[obj.ocvect] = true
@@ -775,7 +871,6 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
         obj.category = ocvect_category_cache[obj.ocvect]
     end
 
-    -- Phase 3: resolve pending 7×16 ambiguities -----------------------------
     if next(unresolved_7x16) then
         if try_resolve_7x16(all_objects, enemy_state) then
             for _, obj in ipairs(all_objects) do
@@ -785,84 +880,253 @@ local function extract_typed_entities(memory, player_x16, player_y16, enemy_stat
             end
         end
     end
-    -- Any still-unresolved 7×16 → treat as hulk (conservative: avoid)
+
+    local buckets = {}
+    local counts = {}
+    local nearest_by_category = {}
+    local quadrant_threat = {0.0, 0.0, 0.0, 0.0}
+    local quadrant_human = {0.0, 0.0, 0.0, 0.0}
+    local nearest_enemy_dist = nil
+    local nearest_human_dist = nil
+    local nearest_enemy_x16 = nil
+    local nearest_enemy_y16 = nil
+    local grid = {}
+    for i = 1, GRID_FEATURES do
+        grid[i] = 0.0
+    end
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        buckets[cat.name] = {}
+        counts[cat.name] = 0
+        nearest_by_category[cat.name] = 1.0
+    end
+
+    local current_samples = {}
     for _, obj in ipairs(all_objects) do
         if obj.category == nil and obj.list_name == "rptr" then
             obj.category = "hulk"
         end
-    end
-
-    -- Phase 4: bucket, sort, and build features ----------------------------
-    local buckets = {}
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        buckets[cat.name] = {}
-    end
-    for _, obj in ipairs(all_objects) do
         if obj.category and obj.category ~= "skip" and buckets[obj.category] then
+            local prev = prev_object_samples[obj.ptr]
+            local vx = 0.0
+            local vy = 0.0
+            if prev ~= nil then
+                vx = clamp11((obj.x16 - prev.x16) / POS_X_RANGE)
+                vy = clamp11((obj.y16 - prev.y16) / POS_Y_RANGE)
+            end
+            obj.vx = vx
+            obj.vy = vy
+            obj.dx = rel_pos_x(obj.x16, player_x16)
+            obj.dy = rel_pos_y(obj.y16, player_y16)
+            local dist_world = math.sqrt(((obj.x16 or 0) - (player_x16 or 0)) ^ 2 + ((obj.y16 or 0) - (player_y16 or 0)) ^ 2)
+            if dist_world > 1.0 then
+                obj.dir_x = clamp11(((obj.x16 or 0) - (player_x16 or 0)) / dist_world)
+                obj.dir_y = clamp11(((obj.y16 or 0) - (player_y16 or 0)) / dist_world)
+            else
+                obj.dir_x = 0.0
+                obj.dir_y = 0.0
+            end
+            local radial = -((obj.vx * obj.dir_x) + (obj.vy * obj.dir_y))
+            obj.approach = clamp11(radial * 2.0)
+            obj.threat = _object_threat_score(obj)
+            obj.is_dangerous = CATEGORY_IS_DANGEROUS[obj.category] and 1.0 or 0.0
+            obj.is_human = (obj.category == "human") and 1.0 or 0.0
+            obj.is_static = CATEGORY_IS_STATIC[obj.category] and 1.0 or 0.0
+
+            counts[obj.category] = counts[obj.category] + 1
+            current_samples[obj.ptr] = {x16 = obj.x16, y16 = obj.y16}
             local bucket = buckets[obj.category]
             bucket[#bucket + 1] = obj
+
+            if obj.dist_norm < nearest_by_category[obj.category] then
+                nearest_by_category[obj.category] = obj.dist_norm
+            end
+            if obj.category == "human" then
+                if nearest_human_dist == nil or obj.dist_norm < nearest_human_dist then
+                    nearest_human_dist = obj.dist_norm
+                end
+            elseif CATEGORY_IS_DANGEROUS[obj.category] then
+                if nearest_enemy_dist == nil or obj.dist_norm < nearest_enemy_dist then
+                    nearest_enemy_dist = obj.dist_norm
+                    nearest_enemy_x16 = obj.x16
+                    nearest_enemy_y16 = obj.y16
+                end
+            end
+
+            local q = 1
+            if obj.dx >= 0.0 and obj.dy < 0.0 then
+                q = 2
+            elseif obj.dx < 0.0 and obj.dy >= 0.0 then
+                q = 3
+            elseif obj.dx >= 0.0 and obj.dy >= 0.0 then
+                q = 4
+            end
+            if obj.category == "human" then
+                quadrant_human[q] = quadrant_human[q] + (1.0 - obj.dist_norm)
+            elseif CATEGORY_IS_DANGEROUS[obj.category] then
+                quadrant_threat[q] = quadrant_threat[q] + obj.threat
+            end
+
+            local gx = math.floor(((obj.x16 - player_x16) + GRID_HALF_RANGE_X) * GRID_W / (2.0 * GRID_HALF_RANGE_X))
+            local gy = math.floor(((obj.y16 - player_y16) + GRID_HALF_RANGE_Y) * GRID_H / (2.0 * GRID_HALF_RANGE_Y))
+            if gx >= 0 and gx < GRID_W and gy >= 0 and gy < GRID_H then
+                local threat = obj.threat
+                grid[_grid_index(gx, gy, 6)] = clamp01(grid[_grid_index(gx, gy, 6)] + 0.12)
+                if CATEGORY_IS_DANGEROUS[obj.category] then
+                    grid[_grid_index(gx, gy, 0)] = clamp01(grid[_grid_index(gx, gy, 0)] + threat * 0.6)
+                    grid[_grid_index(gx, gy, 7)] = clamp01(grid[_grid_index(gx, gy, 7)] + clamp01(obj.approach * 0.5 + 0.5) * 0.2)
+                end
+                if obj.category == "grunt" then
+                    grid[_grid_index(gx, gy, 3)] = clamp01(grid[_grid_index(gx, gy, 3)] + threat * 0.8)
+                elseif obj.category == "projectile" then
+                    grid[_grid_index(gx, gy, 1)] = clamp01(grid[_grid_index(gx, gy, 1)] + threat)
+                elseif obj.category == "human" then
+                    grid[_grid_index(gx, gy, 4)] = clamp01(grid[_grid_index(gx, gy, 4)] + (1.0 - obj.dist_norm) * 0.8)
+                elseif obj.category == "electrode" then
+                    grid[_grid_index(gx, gy, 5)] = clamp01(grid[_grid_index(gx, gy, 5)] + 0.9)
+                else
+                    grid[_grid_index(gx, gy, 2)] = clamp01(grid[_grid_index(gx, gy, 2)] + threat * 0.9)
+                end
+            end
         end
     end
+
+    prev_object_samples = current_samples
+
     for _, cat in ipairs(ENTITY_CATEGORIES) do
         table.sort(buckets[cat.name], function(a, b)
-            return a.dist_norm < b.dist_norm
+            if a.threat == b.threat then
+                return a.dist_norm < b.dist_norm
+            end
+            return a.threat > b.threat
         end)
-        -- Stamp 1-based distance rank so the HUD can display it.
         for i, obj in ipairs(buckets[cat.name]) do
             obj.rank = i
         end
     end
 
-    -- Phase 5: emit feature vector ------------------------------------------
-    local features = {}
-    local nearest_enemy_dist = nil
-    local nearest_human_dist = nil
-
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        local bucket = buckets[cat.name]
-        features[#features + 1] = math.min(1.0, #bucket / cat.slots)
-        for i = 1, cat.slots do
-            local obj = bucket[i]
-            if obj then
-                features[#features + 1] = 1.0
-                -- Relative position: (entity - player), normalised over playfield range.
-                -- Gives direct player-relative direction without the network having
-                -- to learn to subtract player_pos from every slot.  Ranges ~[-1,+1].
-                features[#features + 1] = rel_pos_x(obj.x16, player_x16)
-                features[#features + 1] = rel_pos_y(obj.y16, player_y16)
-                features[#features + 1] = obj.dist_norm
-            else
-                features[#features + 1] = 0.0
-                features[#features + 1] = 0.0
-                features[#features + 1] = 0.0
-                features[#features + 1] = 0.0
-            end
-        end
-        -- Track nearest distances for reward shaping
-        if #bucket > 0 then
-            local nd = bucket[1].dist_norm
-            if cat.name == "human" then
-                nearest_human_dist = nd
-            elseif nearest_enemy_dist == nil or nd < nearest_enemy_dist then
-                nearest_enemy_dist = nd
-                nearest_enemy_x16 = bucket[1].x16
-                nearest_enemy_y16 = bucket[1].y16
+    -- Encode walls/lava into channel 5.
+    for gy = 0, GRID_H - 1 do
+        for gx = 0, GRID_W - 1 do
+            local cx = ((gx + 0.5) / GRID_W) * (2.0 * GRID_HALF_RANGE_X) - GRID_HALF_RANGE_X
+            local cy = ((gy + 0.5) / GRID_H) * (2.0 * GRID_HALF_RANGE_Y) - GRID_HALF_RANGE_Y
+            local world_x = player_x16 + cx
+            local world_y = player_y16 + cy
+            if world_x <= (POS_X_MIN + 4096) or world_x >= (POS_X_MIN + POS_X_RANGE - 4096)
+               or world_y <= (POS_Y_MIN + 4096) or world_y >= (POS_Y_MIN + POS_Y_RANGE - 4096) then
+                grid[_grid_index(gx, gy, 5)] = math.max(grid[_grid_index(gx, gy, 5)], 0.6)
             end
         end
     end
 
-    -- Stash classified objects for the debug HUD (zero-alloc reference swap).
-    hud_objects = all_objects
-    hud_player_x16 = player_x16
-    hud_player_y16 = player_y16
+    local globals = {}
+    globals[#globals + 1] = ((previous_player_alive or 0) ~= 0) and 1.0 or 0.0
+    globals[#globals + 1] = 0.0  -- score placeholder; filled in serialize_frame
+    globals[#globals + 1] = 0.0  -- replay placeholder; filled in serialize_frame
+    globals[#globals + 1] = 0.0  -- lasers placeholder; filled in serialize_frame
+    globals[#globals + 1] = 0.0  -- wave placeholder; filled in serialize_frame
+    globals[#globals + 1] = norm_pos_x(player_x16 or 0)
+    globals[#globals + 1] = norm_pos_y(player_y16 or 0)
+    globals[#globals + 1] = 0.0  -- player vx placeholder; filled in serialize_frame
+    globals[#globals + 1] = 0.0  -- player vy placeholder; filled in serialize_frame
+    for i = 1, ZP1ENM_SIZE do
+        globals[#globals + 1] = (enemy_state.raw[i] or 0) / 255.0
+    end
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        globals[#globals + 1] = clamp01((counts[cat.name] or 0) / math.max(1, cat.peak or cat.slots))
+    end
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        globals[#globals + 1] = ((counts[cat.name] or 0) > 0) and 1.0 or 0.0
+    end
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        globals[#globals + 1] = nearest_by_category[cat.name] or 1.0
+    end
+    for i = 1, 4 do
+        globals[#globals + 1] = clamp01(quadrant_threat[i] / 3.0)
+    end
+    for i = 1, 4 do
+        globals[#globals + 1] = clamp01(quadrant_human[i] / 2.0)
+    end
+    local pxn = norm_pos_x(player_x16 or 0)
+    local pyn = norm_pos_y(player_y16 or 0)
+    globals[#globals + 1] = clamp01((WALL_MARGIN_NORM_X - pxn) / math.max(1e-6, WALL_MARGIN_NORM_X))
+    globals[#globals + 1] = clamp01((pxn - (1.0 - WALL_MARGIN_NORM_X)) / math.max(1e-6, WALL_MARGIN_NORM_X))
+    globals[#globals + 1] = clamp01((WALL_MARGIN_NORM_Y - pyn) / math.max(1e-6, WALL_MARGIN_NORM_Y))
+    globals[#globals + 1] = clamp01((pyn - (1.0 - WALL_MARGIN_NORM_Y)) / math.max(1e-6, WALL_MARGIN_NORM_Y))
+    while #globals < GLOBAL_FEATURES do
+        globals[#globals + 1] = 0.0
+    end
 
-    local num_humans = #buckets["human"]
-    return features, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16, num_humans
+    local token_source = {}
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        local bucket = buckets[cat.name]
+        for i = 1, #bucket do
+            token_source[#token_source + 1] = bucket[i]
+        end
+    end
+    table.sort(token_source, function(a, b)
+        if a.category == "human" and b.category ~= "human" then
+            return (a.threat + 0.1) > b.threat
+        end
+        if b.category == "human" and a.category ~= "human" then
+            return a.threat > (b.threat + 0.1)
+        end
+        if a.threat == b.threat then
+            return a.dist_norm < b.dist_norm
+        end
+        return a.threat > b.threat
+    end)
+
+    local tokens = {}
+    for i = 1, OBJECT_TOKEN_LIMIT do
+        local obj = token_source[i]
+        if obj then
+            tokens[#tokens + 1] = 1.0
+            tokens[#tokens + 1] = obj.dx
+            tokens[#tokens + 1] = obj.dy
+            tokens[#tokens + 1] = obj.vx
+            tokens[#tokens + 1] = obj.vy
+            tokens[#tokens + 1] = obj.dist_norm
+            tokens[#tokens + 1] = obj.dir_x
+            tokens[#tokens + 1] = obj.dir_y
+            tokens[#tokens + 1] = obj.threat
+            tokens[#tokens + 1] = clamp01(obj.width / 16.0)
+            tokens[#tokens + 1] = clamp01(obj.height / 16.0)
+            tokens[#tokens + 1] = (ENTITY_CATEGORY_INDEX[obj.category] or 0) / math.max(1, #ENTITY_CATEGORIES - 1)
+            tokens[#tokens + 1] = obj.is_human
+            tokens[#tokens + 1] = obj.is_dangerous
+            tokens[#tokens + 1] = clamp01((obj.approach + 1.0) * 0.5)
+        else
+            for _ = 1, OBJECT_TOKEN_FEATURES do
+                tokens[#tokens + 1] = 0.0
+            end
+        end
+    end
+
+    hud_objects = token_source
+    hud_player_x16 = memory:read_u8(PLOBJ_ADDR + OBJX_OFF)
+    hud_player_y16 = memory:read_u8(PLOBJ_ADDR + OBJY_OFF)
+    do
+        local player_pict_ptr = read_u16_be(memory, PLOBJ_ADDR + OPICT_OFF)
+        local px_off, py_off, pw, ph = picture_collision_bounds(memory, player_pict_ptr)
+        hud_player_box = {x = px_off, y = py_off, w = pw, h = ph}
+    end
+
+    local num_humans = counts["human"] or 0
+    return {
+        globals = globals,
+        grid = grid,
+        tokens = tokens,
+        nearest_enemy_dist = nearest_enemy_dist,
+        nearest_human_dist = nearest_human_dist,
+        nearest_enemy_x16 = nearest_enemy_x16,
+        nearest_enemy_y16 = nearest_enemy_y16,
+        num_humans = num_humans,
+    }
 end
 
 -- ── Debug HUD: draw coloured rings + rank numbers on MAME screen ────────
 
-local CAT_HUD_COLOR = {
+CAT_HUD_COLOR = {
     grunt      = 0xFFFF0000,   -- red
     hulk       = 0xFF00FF00,   -- green
     brain      = 0xFFFFFF00,   -- yellow
@@ -873,10 +1137,12 @@ local CAT_HUD_COLOR = {
     human      = 0xFF4080FF,   -- blue
     electrode  = 0xFF808080,   -- grey
 }
-local HUD_PLAYER_COLOR = 0xFFFFFFFF   -- white ring for player
-local HUD_RING_RADIUS  = 8           -- half-size of ring box in screen pixels
+HUD_PLAYER_COLOR = 0xFFFFFFFF   -- white box for player
+HUD_PLAYER_BOX_W = 4           -- matches expert collision box width in pixels
+HUD_PLAYER_BOX_H = 12          -- matches expert collision box height in pixels
+HUD_SCREEN_X_SCALE = 2         -- Robotron pixels are doubled horizontally on screen
 
-local function draw_debug_hud()
+function draw_debug_hud()
     -- Toggle HUD on/off with the 'H' key (edge-triggered).
     local ok_input, inp = pcall(function() return manager.machine.input end)
     if ok_input and inp then
@@ -938,20 +1204,19 @@ local function draw_debug_hud()
         end)
     end
 
-    local r = HUD_RING_RADIUS
-
-    -- Helper: draw a diamond (4 lines) to approximate a circle outline.
-    -- Draw a diamond with separate horizontal/vertical radii to match sprite aspect ratio.
-    local function draw_diamond(cx, cy, rx, ry, color)
-        mame_screen:draw_line(cx, cy - ry, cx + rx, cy, color)   -- top to right
-        mame_screen:draw_line(cx + rx, cy, cx, cy + ry, color)   -- right to bottom
-        mame_screen:draw_line(cx, cy + ry, cx - rx, cy, color)   -- bottom to left
-        mame_screen:draw_line(cx - rx, cy, cx, cy - ry, color)   -- left to top
+    -- Helper: draw the tight non-zero bitmap bounds used by collision art.
+    local function draw_hitbox(x_px, y_px, off_x_px, off_y_px, w_px, h_px, color)
+        local left = (x_px * HUD_SCREEN_X_SCALE) + off_x_px - 6
+        local top = y_px + off_y_px - 7
+        local right = left + math.max(1, w_px) - 1
+        local bottom = top + math.max(1, h_px) - 1
+        mame_screen:draw_line(left, top, right, top, color)
+        mame_screen:draw_line(right, top, right, bottom, color)
+        mame_screen:draw_line(right, bottom, left, bottom, color)
+        mame_screen:draw_line(left, bottom, left, top, color)
     end
 
-    local PAD = 2   -- extra pixels of clearance around the sprite
-
-    -- Player ring (player sprite is roughly 5×13 pixels)
+    -- Player hit box
     -- Color by action source: green=DQN, red=epsilon, blue=expert, white=other
     local player_color = HUD_PLAYER_COLOR
     if last_action_source == 1 then
@@ -962,32 +1227,28 @@ local function draw_debug_hud()
         player_color = 0xFF4488FF   -- blue: expert
     end
     if hud_player_x16 and hud_player_y16 then
-        local px = ((hud_player_x16 >> 8) & 0xFF) * 2
-        local py = (hud_player_y16 >> 8) & 0xFF
-        -- Use known player sprite 5×13
-        local prx = 5 + PAD
-        local pry = math.floor((13 + PAD) / 2)
-        pcall(function() draw_diamond(px, py, prx, pry, player_color) end)
+        local px = hud_player_x16
+        local py = hud_player_y16
+        local player_box = hud_player_box or {x = 0, y = 0, w = HUD_PLAYER_BOX_W, h = HUD_PLAYER_BOX_H}
+        pcall(function() draw_hitbox(px, py, player_box.x or 0, player_box.y or 0, player_box.w or HUD_PLAYER_BOX_W, player_box.h or HUD_PLAYER_BOX_H, player_color) end)
     end
 
-    -- Entity rings + rank numbers
+    -- Entity hit boxes + rank numbers
     if hud_objects then
         for _, obj in ipairs(hud_objects) do
             if obj.category and obj.category ~= "skip" then
                 local color = CAT_HUD_COLOR[obj.category]
                 if color then
-                    local sx = ((obj.x16 >> 8) & 0xFF) * 2
-                    local sy = (obj.y16 >> 8) & 0xFF
-                    -- Size diamond to sprite dimensions
-                    local w = math.max(obj.width or 4, 4)
-                    local h = math.max(obj.height or 4, 4)
-                    local rx = w + PAD
-                    local ry = math.floor((h + PAD) / 2)
-                    pcall(function() draw_diamond(sx, sy, rx, ry, color) end)
-                    -- Distance rank number just below the diamond
+                    local sx = obj.objx or 0
+                    local sy = obj.objy or 0
+                    local off_x = obj.hit_off_x or 0
+                    local off_y = obj.hit_off_y or 0
+                    local w = math.max(obj.hit_w or obj.width or 1, 1)
+                    local h = math.max(obj.hit_h or obj.height or 1, 1)
+                    pcall(function() draw_hitbox(sx, sy, off_x, off_y, w, h, color) end)
                     if obj.rank then
                         pcall(function()
-                            mame_screen:draw_text(sx - 3, sy + ry + 1,
+                            mame_screen:draw_text((sx * HUD_SCREEN_X_SCALE) + off_x - 9, sy + off_y + h - 7,
                                                   tostring(obj.rank), color, 0x00000000)
                         end)
                     end
@@ -997,7 +1258,7 @@ local function draw_debug_hud()
     end
 end
 
-local function clear_pending_preview()
+function clear_pending_preview()
     pending_preview_blob = nil
     pending_preview_w = 0
     pending_preview_h = 0
@@ -1572,7 +1833,7 @@ end
 
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
                                player_x16, player_y16,
-                               enemy_state, list_state_values,
+                               global_values, grid_values, token_values,
                                done, subj_reward, obj_reward, save_signal,
                                preview_w, preview_h, preview_fmt, preview_blob)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
@@ -1587,33 +1848,31 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     local wave_norm = math.min(1.0, wave_u8 / 40.0)
 
     local state_values = {}
-    -- 5 core stats
-    state_values[#state_values + 1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
-    state_values[#state_values + 1] = score_u32 / 1000000.0
-    state_values[#state_values + 1] = replay_norm
-    state_values[#state_values + 1] = lasers_norm
-    state_values[#state_values + 1] = wave_norm
-    -- 2 player position values (unsigned 8.8 fixed-point, screen-bound normalized 0..1)
-    state_values[#state_values + 1] = norm_pos_x(player_x16 or 0)
-    state_values[#state_values + 1] = norm_pos_y(player_y16 or 0)
-    -- 2 player velocity values: frame-to-frame position delta, normalised over
-    -- playfield range.  ~[-1,+1] with typical per-frame deltas near ±0.004 (X)
-    -- and ±0.005 (Y).  Zero on first frame or after death.
+    for i = 1, #global_values do
+        state_values[#state_values + 1] = global_values[i]
+    end
+    -- Fill the core/global header fields in-place.
+    state_values[1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
+    state_values[2] = score_u32 / 1000000.0
+    state_values[3] = replay_norm
+    state_values[4] = lasers_norm
+    state_values[5] = wave_norm
+    state_values[6] = norm_pos_x(player_x16 or 0)
+    state_values[7] = norm_pos_y(player_y16 or 0)
     local vel_x = 0.0
     local vel_y = 0.0
     if prev_player_x16 and prev_player_y16 and player_alive ~= 0 then
         vel_x = clamp11(((player_x16 or 0) - prev_player_x16) / POS_X_RANGE)
         vel_y = clamp11(((player_y16 or 0) - prev_player_y16) / POS_Y_RANGE)
     end
-    state_values[#state_values + 1] = vel_x
-    state_values[#state_values + 1] = vel_y
-    -- 50 ELIST enemy state bytes
-    for i = 1, ZP1ENM_SIZE do
-        state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
+    state_values[8] = vel_x
+    state_values[9] = vel_y
+
+    for i = 1, #grid_values do
+        state_values[#state_values + 1] = grid_values[i]
     end
-    -- 4 active lists × 65 features each
-    for i = 1, #list_state_values do
-        state_values[#state_values + 1] = list_state_values[i]
+    for i = 1, #token_values do
+        state_values[#state_values + 1] = token_values[i]
     end
     local num_values = #state_values
     if num_values ~= EXPECTED_STATE_VALUES then
@@ -1685,7 +1944,7 @@ local function process_frame_via_socket(frame_payload, frame_idx)
         while (os.clock() - started) < SOCKET_READ_TIMEOUT_S do
             local action_bytes = current_socket:read(3)
             if action_bytes and #action_bytes == 3 then
-                local move_dir, fire_dir, source = string.unpack("bbb", action_bytes)
+                local move_dir, fire_dir, source = string.unpack("bbB", action_bytes)
                 trace_log(frame_idx, "socket_read_ok", string.format("move=%d fire=%d src=%d", move_dir, fire_dir, source))
                 return {move_dir, fire_dir, source}
             end
@@ -1708,6 +1967,11 @@ local function process_frame_via_socket(frame_payload, frame_idx)
     else
         preview_stream_enabled = false
     end
+    -- Source byte bits:
+    --   low nibble = action source
+    --   0x40 = preview enabled
+    --   0x80 = HUD enabled
+    DEBUG_HUD_ENABLED = (source_u8 & 0x80) ~= 0
     last_action_source = source_u8 & 0x0F
     return move_dir or -1, fire_dir or -1, true
 end
@@ -1731,17 +1995,10 @@ local function determine_meta_commands(dead_frames, player_alive)
     return start_cmd, coin_cmd
 end
 
-local function frame_callback()
-    if not mem or not controls then
-        return true
-    end
-
-    trace_log(frame_counter, "frame_begin", "callback entered")
-
+function read_frame_observation()
     local ok_alive, alive_or_err = pcall(read_player_alive, mem)
     if not ok_alive then
-        trace_log(frame_counter, "read_player_alive_error", tostring(alive_or_err), true)
-        return true
+        return nil, "read_player_alive_error", tostring(alive_or_err)
     end
     local player_alive = (alive_or_err ~= 0) and 1 or 0
     trace_log(frame_counter, "read_player_alive", "alive=" .. tostring(player_alive))
@@ -1749,53 +2006,59 @@ local function frame_callback()
     local ok_core, score, replay_level, num_lasers, wave_number = pcall(function()
         local raw_score = read_player_score(mem)
         if raw_score == nil then
-            -- Keep previous score on transient invalid BCD reads to avoid reward spikes.
             raw_score = previous_score
         end
-        local score = math.max(0, math.floor(raw_score or 0))
-        local replay_level = math.max(0, math.floor(read_next_replay_level(mem) or 0))
-        local num_lasers = math.max(0, math.floor(read_num_lasers(mem) or 0))
-        local wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
-        return score, replay_level, num_lasers, wave_number
+        return math.max(0, math.floor(raw_score or 0)),
+               math.max(0, math.floor(read_next_replay_level(mem) or 0)),
+               math.max(0, math.floor(read_num_lasers(mem) or 0)),
+               math.max(0, math.floor(read_wave_number(mem) or 0))
     end)
     if not ok_core then
-        trace_log(frame_counter, "read_core_stats_error", tostring(score), true)
-        return true
+        return nil, "read_core_stats_error", tostring(score)
     end
-    trace_log(
-        frame_counter,
-        "read_core_stats",
-        string.format("score=%d replay=%d lasers=%d wave=%d", score, replay_level, num_lasers, wave_number)
-    )
+    trace_log(frame_counter, "read_core_stats",
+        string.format("score=%d replay=%d lasers=%d wave=%d", score, replay_level, num_lasers, wave_number))
 
     local ok_enemy, enemy_or_err = pcall(read_enemy_state, mem)
     if not ok_enemy then
-        trace_log(frame_counter, "read_enemy_state_error", tostring(enemy_or_err), true)
-        return true
+        return nil, "read_enemy_state_error", tostring(enemy_or_err)
     end
     local enemy_state = enemy_or_err
     trace_log(frame_counter, "read_enemy_state", "bytes=" .. tostring(#enemy_state.raw))
 
     local ok_player_pos, player_x16, player_y16 = pcall(read_player_position, mem)
     if not ok_player_pos then
-        trace_log(frame_counter, "read_player_position_error", tostring(player_x16), true)
-        return true
+        return nil, "read_player_position_error", tostring(player_x16)
     end
     trace_log(frame_counter, "read_player_position", string.format("x16=%d y16=%d", player_x16 or 0, player_y16 or 0))
 
-    local ok_entities, entity_features_or_err, nearest_enemy_dist, nearest_human_dist, nearest_enemy_x16, nearest_enemy_y16, num_humans = pcall(
-        extract_typed_entities, mem, player_x16, player_y16, enemy_state
-    )
+    local ok_entities, obs_or_err = pcall(extract_world_features, mem, player_x16, player_y16, enemy_state)
     if not ok_entities then
-        trace_log(frame_counter, "extract_typed_entities_error", tostring(entity_features_or_err), true)
-        return true
+        return nil, "extract_world_features_error", tostring(obs_or_err)
     end
-    local list_state_values = entity_features_or_err
-    num_humans = num_humans or 0
-    trace_log(frame_counter, "extract_typed_entities", "features=" .. tostring(#list_state_values))
+    local obs = obs_or_err
+    trace_log(frame_counter, "extract_world_features",
+        string.format("globals=%d grid=%d tokens=%d", #(obs.globals or {}), #(obs.grid or {}), #(obs.tokens or {})))
 
+    return {
+        player_alive = player_alive,
+        score = score,
+        replay_level = replay_level,
+        num_lasers = num_lasers,
+        wave_number = wave_number,
+        player_x16 = player_x16,
+        player_y16 = player_y16,
+        obs = obs,
+        num_humans = obs.num_humans or 0,
+    }
+end
+
+function compute_frame_rewards(frame)
+    local player_alive = frame.player_alive
+    local wave_number = frame.wave_number
+    local player_x16 = frame.player_x16
     local done = (previous_player_alive == 1 and player_alive == 0)
-    local score_delta = score - previous_score
+    local score_delta = frame.score - previous_score
     if score_delta < 0 then
         score_delta = 0
     end
@@ -1803,24 +2066,18 @@ local function frame_callback()
     if done then
         obj_reward = obj_reward - DEATH_PENALTY_POINTS
     end
-    if player_alive == 0 then
-        dead_frame_counter = dead_frame_counter + 1
-    else
-        dead_frame_counter = 0
-    end
 
-    local spacing_score = enemy_spacing_score(nearest_enemy_dist)
-    local rescue_score = human_proximity_score(nearest_human_dist)
+    local spacing_score = enemy_spacing_score(frame.obs.nearest_enemy_dist)
+    local rescue_score = human_proximity_score(frame.obs.nearest_human_dist)
     local aim_score = compute_aim_reward(prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects)
     local evade_score = compute_evasion_reward(prev_move_cmd, prev_aim_px16, prev_aim_py16,
         prev_nearest_enemy_x16, prev_nearest_enemy_y16, prev_nearest_enemy_dist)
     local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
 
-    -- Wall penalty: penalise each axis independently; corners stack.
     local wall_penalty = 0.0
     if player_alive == 1 and player_x16 then
         local px = norm_pos_x(player_x16)
-        local py = norm_pos_y(player_y16)
+        local py = norm_pos_y(frame.player_y16)
         if px < WALL_MARGIN_NORM_X or px > (1.0 - WALL_MARGIN_NORM_X) then
             wall_penalty = wall_penalty + SUBJ_WALL_PENALTY
         end
@@ -1829,9 +2086,6 @@ local function frame_callback()
         end
     end
 
-    -- Abandoned-human penalty: on successful wave clear, penalise each
-    -- human that was still alive on the previous frame (the last frame of
-    -- the old wave).  Do NOT apply on death (already penalised separately).
     local abandoned_penalty = 0.0
     if player_alive == 1 and wave_number > previous_wave_number
        and previous_wave_number > 0 and prev_num_humans > 0 then
@@ -1852,19 +2106,53 @@ local function frame_callback()
         subj_reward = subj_reward - SUBJ_DEATH_PENALTY
     end
 
-    trace_log(
-        frame_counter,
-        "reward_calc",
-        string.format(
-            "score_delta=%d done=%s obj_reward=%.1f subj_reward=%.2f enemy_dist=%s human_dist=%s",
-            score_delta,
-            tostring(done),
-            obj_reward,
-            subj_reward,
-            nearest_enemy_dist and string.format("%.4f", nearest_enemy_dist) or "nil",
-            nearest_human_dist and string.format("%.4f", nearest_human_dist) or "nil"
-        )
-    )
+    trace_log(frame_counter, "reward_calc",
+        string.format("score_delta=%d done=%s obj_reward=%.1f subj_reward=%.2f enemy_dist=%s human_dist=%s",
+            score_delta, tostring(done), obj_reward, subj_reward,
+            frame.obs.nearest_enemy_dist and string.format("%.4f", frame.obs.nearest_enemy_dist) or "nil",
+            frame.obs.nearest_human_dist and string.format("%.4f", frame.obs.nearest_human_dist) or "nil"))
+
+    return {
+        done = done,
+        obj_reward = obj_reward,
+        subj_reward = subj_reward,
+    }
+end
+
+function capture_preview_payload()
+    if preview_stream_enabled and pending_preview_blob then
+        local out = {
+            w = pending_preview_w,
+            h = pending_preview_h,
+            fmt = pending_preview_fmt or PREVIEW_FORMAT_RGB565,
+            blob = pending_preview_blob,
+        }
+        clear_pending_preview()
+        return out
+    end
+    return {w = 0, h = 0, fmt = PREVIEW_FORMAT_RGB565, blob = nil}
+end
+
+function frame_callback()
+    if not mem or not controls then
+        return true
+    end
+
+    trace_log(frame_counter, "frame_begin", "callback entered")
+
+    local frame, err_phase, err_detail = read_frame_observation()
+    if not frame then
+        trace_log(frame_counter, err_phase or "frame_read_error", tostring(err_detail), true)
+        return true
+    end
+
+    local player_alive = frame.player_alive
+    local rewards = compute_frame_rewards(frame)
+    if player_alive == 0 then
+        dead_frame_counter = dead_frame_counter + 1
+    else
+        dead_frame_counter = 0
+    end
 
     local now = os.time()
     local save_signal = 0
@@ -1873,32 +2161,22 @@ local function frame_callback()
         last_save_time = now
     end
 
-    local preview_w = 0
-    local preview_h = 0
-    local preview_fmt = PREVIEW_FORMAT_RGB565
-    local preview_blob = nil
-    if preview_stream_enabled and pending_preview_blob then
-        preview_w = pending_preview_w
-        preview_h = pending_preview_h
-        preview_fmt = pending_preview_fmt or PREVIEW_FORMAT_RGB565
-        preview_blob = pending_preview_blob
-        clear_pending_preview()
-    end
+    local preview = capture_preview_payload()
 
     local ok_payload, payload_or_err = pcall(
         serialize_frame,
-        player_alive, score, replay_level, num_lasers, wave_number,
-        player_x16, player_y16,
-        enemy_state, list_state_values,
-        done, subj_reward, obj_reward, save_signal,
-        preview_w, preview_h, preview_fmt, preview_blob
+        frame.player_alive, frame.score, frame.replay_level, frame.num_lasers, frame.wave_number,
+        frame.player_x16, frame.player_y16,
+        frame.obs.globals, frame.obs.grid, frame.obs.tokens,
+        rewards.done, rewards.subj_reward, rewards.obj_reward, save_signal,
+        preview.w, preview.h, preview.fmt, preview.blob
     )
     if not ok_payload then
         trace_log(frame_counter, "serialize_frame_error", tostring(payload_or_err), true)
         return true
     end
     local payload = payload_or_err
-    local payload_count = 9 + ZP1ENM_SIZE + #list_state_values
+    local payload_count = #(frame.obs.globals or {}) + #(frame.obs.grid or {}) + #(frame.obs.tokens or {})
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
     local move_cmd, fire_cmd = -1, -1
@@ -1947,14 +2225,14 @@ local function frame_callback()
     )
 
     previous_player_alive = player_alive
-    previous_score = score
-    previous_wave_number = wave_number
-    prev_num_humans = num_humans or 0
+    previous_score = frame.score
+    previous_wave_number = frame.wave_number
+    prev_num_humans = frame.num_humans or 0
 
     -- Stash position for next-frame velocity computation
     if player_alive == 1 then
-        prev_player_x16 = player_x16
-        prev_player_y16 = player_y16
+        prev_player_x16 = frame.player_x16
+        prev_player_y16 = frame.player_y16
     else
         prev_player_x16 = nil
         prev_player_y16 = nil
@@ -1965,20 +2243,20 @@ local function frame_callback()
     -- aim-reward attribution.
     prev_fire_cmd = effective_fire
     prev_move_cmd = move_cmd
-    prev_aim_objects = hud_objects   -- reuse the same reference (set in extract_typed_entities)
-    prev_aim_px16 = player_x16
-    prev_aim_py16 = player_y16
-    prev_nearest_enemy_x16 = nearest_enemy_x16
-    prev_nearest_enemy_y16 = nearest_enemy_y16
-    prev_nearest_enemy_dist = nearest_enemy_dist
+    prev_aim_objects = hud_objects   -- reuse the same reference (set in extract_world_features)
+    prev_aim_px16 = frame.player_x16
+    prev_aim_py16 = frame.player_y16
+    prev_nearest_enemy_x16 = frame.obs.nearest_enemy_x16
+    prev_nearest_enemy_y16 = frame.obs.nearest_enemy_y16
+    prev_nearest_enemy_dist = frame.obs.nearest_enemy_dist
 
-    trace_log(frame_counter, "frame_end", "done=" .. tostring(done))
+    trace_log(frame_counter, "frame_end", "done=" .. tostring(rewards.done))
     frame_counter = frame_counter + 1
 
     return true
 end
 
-local function on_mame_exit()
+function on_mame_exit()
     shutdown_requested = true
     trace_log(frame_counter, "session_stop", "machine stop notifier", true)
     close_socket()

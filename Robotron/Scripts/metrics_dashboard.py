@@ -294,23 +294,34 @@ class _DashboardState:
             if self.agent is not None and hasattr(self.agent, 'online_net'):
                 param_count = sum(p.numel() for p in self.agent.online_net.parameters())
             else:
+                gg = int(getattr(cfg, "global_feature_count", 98))
+                gc = int(getattr(cfg, "grid_channels", 8))
+                gh = int(getattr(cfg, "grid_height", 12))
+                gw = int(getattr(cfg, "grid_width", 12))
+                tk = int(getattr(cfg, "object_token_count", 64))
+                tf = int(getattr(cfg, "object_token_features", 15))
                 ad = cfg.attn_dim
                 th = cfg.trunk_hidden
                 tl = cfg.trunk_layers
-                ss = cfg.state_size
                 na = cfg.num_move_actions * cfg.num_fire_actions
                 n_atoms = cfg.num_atoms if cfg.use_distributional else 1
                 hm = th // 2
-                attn_p = (5 * ad + ad) + 2 * ad + (14 * ad + ad) + 2 * ad + 4 * (ad * ad + ad) + 2 * ad
-                trunk_p = (ss + ad) * th + th + 2 * th
+                global_p = (gg * cfg.global_hidden + cfg.global_hidden) + (cfg.global_hidden * cfg.global_hidden + cfg.global_hidden)
+                grid_p = (gc * cfg.grid_hidden_channels * 9 + cfg.grid_hidden_channels)
+                grid_p += (cfg.grid_hidden_channels * (cfg.grid_hidden_channels * 2) * 9 + (cfg.grid_hidden_channels * 2))
+                grid_p += ((cfg.grid_hidden_channels * 2) * (cfg.grid_hidden_channels * 3) * 9 + (cfg.grid_hidden_channels * 3))
+                grid_p += ((cfg.grid_hidden_channels * 3) * 4 * ad + ad)
+                token_p = (tf * ad + ad) + (4 * ad * ad * cfg.attn_layers)
+                trunk_in = cfg.global_hidden + ad + ad
+                trunk_p = (trunk_in * th + th)
                 for _ in range(1, tl):
-                    trunk_p += th * th + th + 2 * th
+                    trunk_p += th * th + th
                 heads_p = 2 * (th * hm + hm) + hm * n_atoms + n_atoms + hm * (na * n_atoms) + na * n_atoms
-                param_count = attn_p + trunk_p + heads_p
+                param_count = global_p + grid_p + token_p + trunk_p + heads_p
         except Exception:
             param_count = 0
-        trunk_in = cfg.state_size + (cfg.attn_dim if cfg.use_enemy_attention else 0)
-        layers = [str(trunk_in)]
+        trunk_in = int(getattr(cfg, "global_hidden", 192)) + int(getattr(cfg, "attn_dim", 192)) * 2
+        layers = [f"g{cfg.global_feature_count}", f"grid{cfg.grid_width}x{cfg.grid_height}x{cfg.grid_channels}", f"tok{cfg.object_token_count}x{cfg.object_token_features}", str(trunk_in)]
         for _ in range(cfg.trunk_layers):
             layers.append(str(cfg.trunk_hidden))
         layers.append(str(cfg.trunk_hidden // 2))
@@ -487,6 +498,7 @@ class _DashboardState:
             "pulse_enabled": True,  # manual pulse is always available
             "game_settings": game_settings.snapshot(),
             "preview_capture_enabled": bool(getattr(self.metrics, "preview_capture_enabled", True)),
+            "hud_enabled": bool(getattr(self.metrics, "hud_enabled", True)),
         }
 
     @staticmethod
@@ -1599,6 +1611,27 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       background: linear-gradient(180deg, rgba(2, 6, 23, 0.28), rgba(2, 6, 23, 0.50));
       pointer-events: none;
     }
+    .preview-head-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .preview-quality-select {
+      background: rgba(10, 20, 40, 0.85);
+      color: #c8e8ff;
+      border: 1px solid rgba(100, 180, 255, 0.35);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+    }
+    .preview-quality-select:focus {
+      border-color: rgba(100, 180, 255, 0.7);
+      box-shadow: 0 0 6px rgba(100, 180, 255, 0.3);
+    }
     .card-narrow {
       grid-column: span 1;
       min-height: 0;
@@ -1805,11 +1838,24 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       </article>
       <article class="card preview-card" style="--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
         <div class="gauge-head">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-            <input type="checkbox" id="chkPreviewEnabled" style="display:none;" checked>
-            <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <label id="previewToggleWrap" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="chkPreviewEnabled" style="display:none;" checked>
+              <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
+            </label>
             <div class="label" id="mPreviewLabel">PREVIEW</div>
-          </label>
+            <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#b0c8e8;cursor:pointer;">
+              <input type="checkbox" id="chkHudEnabled" checked>
+              <span>HUD</span>
+            </label>
+          </div>
+          <div class="preview-head-controls">
+            <select id="selPreviewQuality" class="preview-quality-select" aria-label="Preview quality">
+              <option value="auto" selected>Auto</option>
+              <option value="default">High</option>
+              <option value="mobile">Low</option>
+            </select>
+          </div>
         </div>
         <div class="preview-wrap">
           <video id="vGamePreview" class="preview-video" autoplay playsinline></video>
@@ -2106,13 +2152,19 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const gsLevelEl = document.getElementById("gsLevel");
     const gsAutoCurrEl = document.getElementById("gsAutoCurriculum");
     const chkPreviewEl = document.getElementById("chkPreviewEnabled");
+    const chkHudEl = document.getElementById("chkHudEnabled");
+    const previewToggleWrap = document.getElementById("previewToggleWrap");
     const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
     if (!_gsAdmin) { 
       gsAdvancedEl.disabled = true; 
       gsLevelEl.disabled = true; 
       gsAutoCurrEl.disabled = true;
-      if (chkPreviewEl && chkPreviewEl.parentElement) {
-        chkPreviewEl.parentElement.style.display = "none";
+      if (chkPreviewEl) {
+        chkPreviewEl.disabled = true;
+      }
+      if (previewToggleWrap) {
+        previewToggleWrap.style.cursor = "default";
+        previewToggleWrap.style.opacity = "0.65";
       }
     }
     /* Epsilon / Expert up-down buttons — admin gate */
@@ -2193,6 +2245,19 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         }
       });
     }
+    if (chkHudEl) {
+      chkHudEl.addEventListener("change", async () => {
+        try {
+          await fetch("/api/preview_settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ hud_enabled: chkHudEl.checked }),
+          });
+        } catch (e) {
+          console.error("Failed to update HUD settings:", e);
+        }
+      });
+    }
 
     const recEls = {
       rwrd: document.getElementById("recRwrd"),
@@ -2208,6 +2273,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const stepGaugeCanvas = document.getElementById("cStepGauge");
     const gamePreviewCanvas = document.getElementById("cGamePreview");
     const gamePreviewVideo = document.getElementById("vGamePreview");
+    const previewQualitySelect = document.getElementById("selPreviewQuality");
     const _previewSrcCanvas = document.createElement("canvas");
     const _previewSrcCtx = _previewSrcCanvas.getContext("2d");
     let _previewSeqLoaded = -1;
@@ -2404,7 +2470,24 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
 
     const WEBRTC_ICE_SERVERS = __WEBRTC_ICE_SERVERS_JSON__;
-    const PREVIEW_PROFILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ? "mobile" : "default";
+    const PREVIEW_PROFILE_STORAGE_KEY = "robotron.preview_quality";
+    const PREVIEW_PROFILE_AUTO = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ? "mobile" : "default";
+    function _loadStoredPreviewQuality() {
+      try {
+        const raw = String(window.localStorage.getItem(PREVIEW_PROFILE_STORAGE_KEY) || "").trim().toLowerCase();
+        if (raw === "auto" || raw === "default" || raw === "mobile") return raw;
+      } catch (_) {}
+      return _gsAdmin ? "default" : "mobile";
+    }
+    function _saveStoredPreviewQuality(value) {
+      try {
+        window.localStorage.setItem(PREVIEW_PROFILE_STORAGE_KEY, String(value || "auto"));
+      } catch (_) {}
+    }
+    let _previewProfileMode = _loadStoredPreviewQuality();
+    function _currentPreviewProfile() {
+      return _previewProfileMode === "auto" ? PREVIEW_PROFILE_AUTO : _previewProfileMode;
+    }
     function _previewLog(...args) {
       return;
     }
@@ -2567,6 +2650,41 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       }, Math.max(250, Number(delayMs) || 1500));
     }
 
+    function _cancelPreviewWebRTCRetry() {
+      if (_previewRtcRetryTimer) {
+        clearTimeout(_previewRtcRetryTimer);
+        _previewRtcRetryTimer = null;
+      }
+    }
+
+    function _resetPreviewRtcState() {
+      _previewRtcConnected = false;
+      _previewRtcEnabled = false;
+      _previewRtcConnecting = false;
+      _previewRtcStream = null;
+      _previewVideoHasFrame = false;
+      if (gamePreviewVideo) {
+        try { gamePreviewVideo.pause(); } catch (_) {}
+        gamePreviewVideo.srcObject = null;
+      }
+    }
+
+    async function _restartPreviewWebRTC() {
+      _cancelPreviewWebRTCRetry();
+      const pc = _previewRtcPc;
+      _previewRtcPc = null;
+      _resetPreviewRtcState();
+      if (pc) {
+        try { await pc.close(); } catch (_) {}
+      }
+      if (ENABLE_CLIENT0_PREVIEW) {
+        setPreviewRenderMode("canvas");
+        if (_previewHasFrame) drawPreviewToCard();
+        else clearPreviewCanvas();
+        await _ensurePreviewWebRTC();
+      }
+    }
+
     function _waitForIceGatheringComplete(pc, timeoutMs = 1200) {
       return new Promise((resolve) => {
         if (!pc || pc.iceGatheringState === "complete") {
@@ -2594,7 +2712,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       if (_previewRtcConnecting) return false;
       if (_previewRtcPc) return _previewRtcConnected;
       _previewRtcConnecting = true;
-      _previewLog("starting WebRTC offer", { iceServers: WEBRTC_ICE_SERVERS });
+      const previewProfile = _currentPreviewProfile();
+      _previewLog("starting WebRTC offer", { iceServers: WEBRTC_ICE_SERVERS, profile: previewProfile });
       const pc = new RTCPeerConnection({
         iceServers: Array.isArray(WEBRTC_ICE_SERVERS) && WEBRTC_ICE_SERVERS.length
           ? WEBRTC_ICE_SERVERS
@@ -2693,7 +2812,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           body: JSON.stringify({
             sdp: (pc.localDescription && pc.localDescription.sdp) ? pc.localDescription.sdp : offer.sdp,
             type: (pc.localDescription && pc.localDescription.type) ? pc.localDescription.type : offer.type,
-            profile: PREVIEW_PROFILE,
+            profile: previewProfile,
           }),
         });
         _previewLog("offer POST status", res.status);
@@ -4750,8 +4869,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         if (parseInt(gsLevelEl.value, 10) !== gs.start_level_min) gsLevelEl.value = String(gs.start_level_min);
       }
       // ── Preview checkbox sync from server ────────────────────────
-      if (_gsAdmin && chkPreviewEl && typeof now.preview_capture_enabled !== "undefined") {
+      if (chkPreviewEl && typeof now.preview_capture_enabled !== "undefined") {
         chkPreviewEl.checked = !!now.preview_capture_enabled;
+      }
+      if (chkHudEl && typeof now.hud_enabled !== "undefined") {
+        chkHudEl.checked = !!now.hud_enabled;
       }
       // ── Auto-curriculum: continuously recompute level each tick ──
       if (gsAutoCurrEl.checked && now.average_level != null) {
@@ -4858,6 +4980,17 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           try { window.close(); } catch (_) {}
         }
       }
+    }
+
+    if (previewQualitySelect) {
+      previewQualitySelect.value = _previewProfileMode;
+      previewQualitySelect.addEventListener("change", () => {
+        const nextMode = String(previewQualitySelect.value || "auto").trim().toLowerCase();
+        _previewProfileMode = (nextMode === "default" || nextMode === "mobile") ? nextMode : "auto";
+        previewQualitySelect.value = _previewProfileMode;
+        _saveStoredPreviewQuality(_previewProfileMode);
+        _restartPreviewWebRTC().catch(() => {});
+      });
     }
 
     const cookiePref = getCookieValue(AUDIO_PREF_COOKIE);
@@ -5156,14 +5289,22 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                     length = int(self.headers.get("Content-Length", 0))
                     raw = self.rfile.read(length) if length > 0 else b"{}"
                     data = json.loads(raw)
+                    updates = {}
                     if "enabled" in data:
                         enabled = bool(data["enabled"])
                         with state.metrics.lock:
                             state.metrics.preview_capture_enabled = enabled
-                        body = json.dumps({"ok": True, "enabled": enabled}).encode("utf-8")
+                            updates["enabled"] = enabled
+                    if "hud_enabled" in data:
+                        hud_enabled = bool(data["hud_enabled"])
+                        with state.metrics.lock:
+                            state.metrics.hud_enabled = hud_enabled
+                            updates["hud_enabled"] = hud_enabled
+                    if updates:
+                        body = json.dumps({"ok": True, **updates}).encode("utf-8")
                         self._send(body, "application/json")
                     else:
-                        self._send(b'{"error":"missing enabled field"}', "application/json", status=400)
+                        self._send(b'{"error":"missing settings field"}', "application/json", status=400)
                 except Exception:
                     self._send(b'{"error":"bad request"}', "application/json", status=400)
                 return

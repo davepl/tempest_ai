@@ -336,6 +336,7 @@ _DIR8_VECTORS: tuple[tuple[float, float], ...] = (
 _REL_POS_X_RANGE = 34816.0
 _REL_POS_Y_RANGE = 53760.0
 _POS_MAX_DIAG = 64022.0  # sqrt(34816² + 53760²)
+_WORLD_UNITS_PER_PIXEL = 256.0  # Robotron positions are stored as 8.8 fixed-point.
 
 # "Safe" distance: 1/8 screen height = 26.25 px = 6720 x16-units.
 # Enemies beyond this are not an immediate threat.
@@ -343,7 +344,30 @@ _SAFE_DIST = 6720.0 / _POS_MAX_DIAG  # ~0.105
 # Alignment safe distance: ~12 px = 3072 x16-units.
 # When nearest enemy is beyond this, expert aligns on one axis before engaging.
 _ALIGN_SAFE_DIST = 3072.0 / _POS_MAX_DIAG  # ~0.048
+_PROJECTILE_DANGER_DIST = 6144.0 / _POS_MAX_DIAG  # ~24 px
+_ALIGN_HALF_WINDOW_PX = 8.0
+_ALIGN_HALF_WINDOW_WORLD = _ALIGN_HALF_WINDOW_PX * _WORLD_UNITS_PER_PIXEL
 _ALIGN_ROBOT_CATEGORIES = {"grunt", "brain", "tank", "spawner", "enforcer"}
+_ALIGNED_FIRE_CATEGORIES = _ALIGN_ROBOT_CATEGORIES | {"projectile"}
+_PLAYER_BOX_W_PX = 4.0
+_PLAYER_BOX_H_PX = 12.0
+_PLAYER_BOX_W_WORLD = _PLAYER_BOX_W_PX * _WORLD_UNITS_PER_PIXEL
+_PLAYER_BOX_H_WORLD = _PLAYER_BOX_H_PX * _WORLD_UNITS_PER_PIXEL
+_AVOIDANCE_BASE_PADDING_PX = 1.0
+_AVOIDANCE_PADDING_PX_BY_CATEGORY = {
+    "grunt": 0.5,
+    "hulk": 1.0,
+    "brain": 1.0,
+    "tank": 1.0,
+    "spawner": 1.0,
+    "enforcer": 1.0,
+    "projectile": 0.5,
+    "electrode": 0.5,
+}
+_MOVE_SAFETY_LOOKAHEAD_PX = 10.0
+_MOVE_SAFETY_PATH_RADIUS_PX = 2.0
+_MOVE_SAFETY_LOOKAHEAD_WORLD = _MOVE_SAFETY_LOOKAHEAD_PX * _WORLD_UNITS_PER_PIXEL
+_MOVE_SAFETY_PATH_RADIUS_WORLD = _MOVE_SAFETY_PATH_RADIUS_PX * _WORLD_UNITS_PER_PIXEL
 
 # 16 screen-pixels = 4096 x16-units, normalised per axis.
 # The outer 16 px of the playfield is "lava" — never move into it.
@@ -415,140 +439,562 @@ def _axis_align_toward_enemy(ex_world: float, ey_world: float) -> int:
     return _closest_dir8(vx, vy, default_dir=0)
 
 
-def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
-    """Return (dx, dy, dist) for nearest non-human object in typed slot state."""
+def _move_dir_vector(move_dir: int) -> tuple[float, float]:
+    if 0 <= move_dir < len(_DIR8_VECTORS):
+        return _DIR8_VECTORS[move_dir]
+    return 0.0, 0.0
+
+
+def _move_dir_endpoint_world(move_dir: int) -> tuple[float, float]:
+    vx, vy = _move_dir_vector(move_dir)
+    return vx * _MOVE_SAFETY_LOOKAHEAD_WORLD, vy * _MOVE_SAFETY_LOOKAHEAD_WORLD
+
+
+def _point_to_segment_distance(
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> float:
+    abx = bx - ax
+    aby = by - ay
+    ab_len2 = (abx * abx) + (aby * aby)
+    if ab_len2 <= 1e-10:
+        return math.hypot(px - ax, py - ay)
+    apx = px - ax
+    apy = py - ay
+    t = max(0.0, min(1.0, ((apx * abx) + (apy * aby)) / ab_len2))
+    closest_x = ax + (abx * t)
+    closest_y = ay + (aby * t)
+    return math.hypot(px - closest_x, py - closest_y)
+
+
+def _aabb_clearance_top_left(
+    ax: float,
+    ay: float,
+    aw: float,
+    ah: float,
+    bx: float,
+    by: float,
+    bw: float,
+    bh: float,
+) -> float:
+    """Signed clearance between two top-left anchored AABBs.
+
+    Positive when separated, negative when overlapping.
+    """
+    dx1 = bx - (ax + aw)
+    dx2 = ax - (bx + bw)
+    dy1 = by - (ay + ah)
+    dy2 = ay - (by + bh)
+    sep_x = max(dx1, dx2)
+    sep_y = max(dy1, dy2)
+    if sep_x > 0.0 or sep_y > 0.0:
+        return math.hypot(max(sep_x, 0.0), max(sep_y, 0.0))
+    overlap_x = min((ax + aw) - bx, (bx + bw) - ax)
+    overlap_y = min((ay + ah) - by, (by + bh) - ay)
+    return -min(overlap_x, overlap_y)
+
+
+def _player_box_center(ax: float = 0.0, ay: float = 0.0) -> tuple[float, float]:
+    return ax + (0.5 * _PLAYER_BOX_W_WORLD), ay + (0.5 * _PLAYER_BOX_H_WORLD)
+
+
+def _closest_point_on_aabb(px: float, py: float, bx: float, by: float, bw: float, bh: float) -> tuple[float, float]:
+    return (
+        min(max(px, bx), bx + bw),
+        min(max(py, by), by + bh),
+    )
+
+
+def _hazard_repulsion_vector(
+    bx: float,
+    by: float,
+    bw: float,
+    bh: float,
+    pad_world: float,
+) -> tuple[float, float, float]:
+    hazard_x = bx - pad_world
+    hazard_y = by - pad_world
+    hazard_w = bw + (2.0 * pad_world)
+    hazard_h = bh + (2.0 * pad_world)
+    clearance = _aabb_clearance_top_left(
+        0.0,
+        0.0,
+        _PLAYER_BOX_W_WORLD,
+        _PLAYER_BOX_H_WORLD,
+        hazard_x,
+        hazard_y,
+        hazard_w,
+        hazard_h,
+    )
+    player_cx, player_cy = _player_box_center()
+    nearest_x, nearest_y = _closest_point_on_aabb(player_cx, player_cy, hazard_x, hazard_y, hazard_w, hazard_h)
+    repulse_x = player_cx - nearest_x
+    repulse_y = player_cy - nearest_y
+    if abs(repulse_x) <= 1e-6 and abs(repulse_y) <= 1e-6:
+        hazard_cx = hazard_x + (0.5 * hazard_w)
+        hazard_cy = hazard_y + (0.5 * hazard_h)
+        repulse_x = player_cx - hazard_cx
+        repulse_y = player_cy - hazard_cy
+    return repulse_x, repulse_y, clearance
+
+
+_CATEGORY_NAMES = tuple(name for name, _ in getattr(RL_CONFIG, "entity_categories", ()))
+
+
+def _state_layout() -> tuple[int, int, int, int, int]:
+    cfg = RL_CONFIG
+    g = int(getattr(cfg, "global_feature_count", 98))
+    gw = int(getattr(cfg, "grid_width", 12))
+    gh = int(getattr(cfg, "grid_height", 12))
+    gc = int(getattr(cfg, "grid_channels", 8))
+    tc = int(getattr(cfg, "object_token_count", 64))
+    tf = int(getattr(cfg, "object_token_features", 15))
+    return g, gw * gh * gc, tc, tf, gc
+
+
+def _split_latest_sections(state: np.ndarray):
     s = _latest_frame_state(state)
-    if s.size < 60:
+    g, grid_n, tc, tf, gc = _state_layout()
+    need = g + grid_n + (tc * tf)
+    if s.size < need:
+        return None, None, None
+    globals_ = s[:g]
+    grid = s[g:g + grid_n].reshape(gc, int(getattr(RL_CONFIG, "grid_height", 12)), int(getattr(RL_CONFIG, "grid_width", 12)))
+    tokens = s[g + grid_n:g + grid_n + (tc * tf)].reshape(tc, tf)
+    return globals_, grid, tokens
+
+
+def _active_tokens_from_state(state: np.ndarray) -> np.ndarray:
+    _, _, tokens = _split_latest_sections(state)
+    if tokens is None or tokens.size == 0:
+        return np.zeros((0, int(getattr(RL_CONFIG, "object_token_features", 15))), dtype=np.float32)
+    active = tokens[tokens[:, 0] > 0.5]
+    if active.size == 0:
+        return np.zeros((0, tokens.shape[1]), dtype=np.float32)
+    return active
+
+
+def _token_category_name(tok: np.ndarray) -> str:
+    if tok.shape[0] < 12 or not _CATEGORY_NAMES:
+        return ""
+    idx = int(round(float(tok[11]) * max(1, len(_CATEGORY_NAMES) - 1)))
+    idx = max(0, min(len(_CATEGORY_NAMES) - 1, idx))
+    return _CATEGORY_NAMES[idx]
+
+
+def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
         return None
-
-    cat_defs = getattr(RL_CONFIG, "entity_categories", [])
-    if not cat_defs:
-        return None
-
-    base = 59  # 9 core + 50 ELIST
-    best: Optional[Tuple[float, float, float]] = None
-    best_category: Optional[str] = None
-    for name, slots in cat_defs:
-        n_slots = int(slots)
-        if n_slots <= 0:
+    best = None
+    best_cat = None
+    for tok in toks:
+        if tok[12] > 0.5 or tok[13] < 0.5:
             continue
-        slot_base = base + 1  # skip occupancy
-        if name == "human":
-            base += 1 + n_slots * 4
+        dist = float(tok[5])
+        if not np.isfinite(dist):
             continue
-
-        # Slots are nearest-first within each category; scan until first present.
-        for j in range(n_slots):
-            i = slot_base + j * 4
-            if i + 3 >= s.size:
-                break
-            present = float(s[i])
-            if present < 0.5:
-                continue
-            dx = float(s[i + 1])
-            dy = float(s[i + 2])
-            dist = float(s[i + 3])
-            if not np.isfinite(dist):
-                # Keep scanning this category for a valid nearest entry.
-                continue
-            if best is None or dist < best[2]:
-                best = (dx, dy, dist)
-                best_category = name
-            break
-
-        base += 1 + n_slots * 4
-
-    # Debug: log electrode detections
-    if best_category == "electrode" and best is not None:
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
+            best_cat = _token_category_name(tok)
+    if best_cat == "electrode" and best is not None:
         import os
         if os.getenv("ROBOTRON_LOG_OBSTACLES", "").strip().lower() not in {"", "0", "false", "off", "no"}:
             print(f"[OBSTACLE] Nearest enemy is electrode at dist={best[2]:.4f} ({best[2]*64.0:.1f}px), dx={best[0]:.3f}, dy={best[1]:.3f}")
-
     return best
 
 
 def _nearest_align_robot_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
     """Return nearest robot candidate for axis alignment (non-grunt, non-obstacle)."""
-    s = _latest_frame_state(state)
-    if s.size < 60:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
         return None
-
-    cat_defs = getattr(RL_CONFIG, "entity_categories", [])
-    if not cat_defs:
-        return None
-
-    base = 59  # 9 core + 50 ELIST
     best: Optional[Tuple[float, float, float]] = None
-    for name, slots in cat_defs:
-        n_slots = int(slots)
-        if n_slots <= 0:
-            continue
-        slot_base = base + 1  # skip occupancy
+    for tok in toks:
+        name = _token_category_name(tok)
         if name not in _ALIGN_ROBOT_CATEGORIES:
-            base += 1 + n_slots * 4
             continue
-
-        for j in range(n_slots):
-            i = slot_base + j * 4
-            if i + 3 >= s.size:
-                break
-            present = float(s[i])
-            if present < 0.5:
-                continue
-            dx = float(s[i + 1])
-            dy = float(s[i + 2])
-            dist = float(s[i + 3])
-            if not np.isfinite(dist):
-                continue
-            if best is None or dist < best[2]:
-                best = (dx, dy, dist)
-            break
-
-        base += 1 + n_slots * 4
-
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
     return best
 
 
 def _nearest_human_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
-    """Return (dx, dy, dist) for nearest human in typed slot state."""
-    s = _latest_frame_state(state)
-    if s.size < 60:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
         return None
-
-    cat_defs = getattr(RL_CONFIG, "entity_categories", [])
-    if not cat_defs:
-        return None
-
-    base = 59  # 9 core + 50 ELIST
-    for name, slots in cat_defs:
-        n_slots = int(slots)
-        if n_slots <= 0:
+    best = None
+    for tok in toks:
+        if tok[12] < 0.5:
             continue
-        slot_base = base + 1  # skip occupancy
-        if name == "human":
-            for j in range(n_slots):
-                i = slot_base + j * 4
-                if i + 3 >= s.size:
-                    break
-                present = float(s[i])
-                if present < 0.5:
-                    continue
-                dx = float(s[i + 1])
-                dy = float(s[i + 2])
-                dist = float(s[i + 3])
-                if not np.isfinite(dist):
-                    continue
-                return (dx, dy, dist)
-            return None
-        base += 1 + n_slots * 4
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
+    return best
 
-    return None
+
+def _nearest_projectile_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+    best = None
+    for tok in toks:
+        if _token_category_name(tok) != "projectile":
+            continue
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
+    return best
+
+
+def _nearby_avoidance_vectors_from_state(
+    state: np.ndarray,
+) -> list[tuple[float, float, float, float, float, float, float]]:
+    """Return hazards close enough to intersect the player's short swept path."""
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return []
+    nearby: list[tuple[float, float, float, float, float, float, float]] = []
+    for tok in toks:
+        name = _token_category_name(tok)
+        if tok[12] > 0.5:
+            continue
+        dx = float(tok[1])
+        dy = float(tok[2])
+        dist = float(tok[5])
+        if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(dist)):
+            continue
+        box_x = dx * _REL_POS_X_RANGE
+        box_y = dy * _REL_POS_Y_RANGE
+        width_px = max(1.0, float(tok[9]) * 16.0)
+        height_px = max(1.0, float(tok[10]) * 16.0)
+        box_w = width_px * _WORLD_UNITS_PER_PIXEL
+        box_h = height_px * _WORLD_UNITS_PER_PIXEL
+        pad_px = _AVOIDANCE_BASE_PADDING_PX + _AVOIDANCE_PADDING_PX_BY_CATEGORY.get(name, 0.5)
+        pad_world = pad_px * _WORLD_UNITS_PER_PIXEL
+        center_x = box_x + (0.5 * box_w)
+        center_y = box_y + (0.5 * box_h)
+        clearance_now = _aabb_clearance_top_left(
+            0.0,
+            0.0,
+            _PLAYER_BOX_W_WORLD,
+            _PLAYER_BOX_H_WORLD,
+            box_x - pad_world,
+            box_y - pad_world,
+            box_w + (2.0 * pad_world),
+            box_h + (2.0 * pad_world),
+        )
+        if clearance_now <= (_MOVE_SAFETY_LOOKAHEAD_WORLD + _MOVE_SAFETY_PATH_RADIUS_WORLD):
+            nearby.append((box_x, box_y, box_w, box_h, pad_world, center_x, center_y))
+    return nearby
+
+
+def _move_candidate_hazard_score(
+    move_dir: int,
+    hazards: list[tuple[float, float, float, float, float, float, float]],
+) -> tuple[float, float]:
+    end_x, end_y = _move_dir_endpoint_world(move_dir)
+    is_idle = move_dir == _move_idle_action_index()
+
+    total_penalty = 0.0
+    min_clearance = float("inf")
+    for bx, by, bw, bh, pad_world, _cx, _cy in hazards:
+        hazard_x = bx - pad_world
+        hazard_y = by - pad_world
+        hazard_w = bw + (2.0 * pad_world)
+        hazard_h = bh + (2.0 * pad_world)
+        if is_idle:
+            samples = ((0.0, 0.0),)
+        else:
+            samples = ((0.0, 0.0), (end_x * 0.5, end_y * 0.5), (end_x, end_y))
+        clearances = [
+            _aabb_clearance_top_left(
+                px,
+                py,
+                _PLAYER_BOX_W_WORLD,
+                _PLAYER_BOX_H_WORLD,
+                hazard_x,
+                hazard_y,
+                hazard_w,
+                hazard_h,
+            )
+            for px, py in samples
+        ]
+        clearance = min(clearances)
+        if clearance < min_clearance:
+            min_clearance = clearance
+
+        if clearance < 0.0:
+            total_penalty += 1.0 + ((-clearance) / max(1.0, min(hazard_w, hazard_h)))
+            end_clearance = clearances[-1]
+            if end_clearance < clearances[0]:
+                total_penalty += (clearances[0] - end_clearance) / max(1.0, min(hazard_w, hazard_h))
+
+    return total_penalty, min_clearance
+
+
+def _hazard_escape_vector(
+    hazards: list[tuple[float, float, float, float, float, float, float]],
+) -> tuple[float, float]:
+    escape_x = 0.0
+    escape_y = 0.0
+    nearest: Optional[tuple[float, float, float]] = None
+
+    for bx, by, bw, bh, pad_world, cx, cy in hazards:
+        repulse_x, repulse_y, clearance = _hazard_repulsion_vector(bx, by, bw, bh, pad_world)
+        repulse_len = math.hypot(repulse_x, repulse_y)
+        if nearest is None or clearance < nearest[2]:
+            nearest = (repulse_x, repulse_y, clearance)
+
+        weight = max(0.0, (_MOVE_SAFETY_LOOKAHEAD_WORLD + _MOVE_SAFETY_PATH_RADIUS_WORLD) - clearance)
+        if weight <= 0.0:
+            continue
+        scale = weight / max(1.0, repulse_len)
+        escape_x += repulse_x * scale
+        escape_y += repulse_y * scale
+
+    if ((escape_x * escape_x) + (escape_y * escape_y)) > 1e-10:
+        return escape_x, escape_y
+    if nearest is not None:
+        return nearest[0], nearest[1]
+    return 0.0, 0.0
+
+
+def _blocking_hazard_fire_direction(
+    intended_move_dir: int,
+    hazards: list[tuple[float, float, float, float, float, float, float]],
+) -> Optional[int]:
+    """Return fire dir toward the hazard most responsible for blocking intended movement."""
+    if not hazards:
+        return None
+    end_x, end_y = _move_dir_endpoint_world(intended_move_dir)
+    is_idle = intended_move_dir == _move_idle_action_index()
+    best_key: Optional[tuple[float, float]] = None
+    best_center: Optional[tuple[float, float]] = None
+    for bx, by, bw, bh, pad_world, cx, cy in hazards:
+        hazard_x = bx - pad_world
+        hazard_y = by - pad_world
+        hazard_w = bw + (2.0 * pad_world)
+        hazard_h = bh + (2.0 * pad_world)
+        samples = ((0.0, 0.0),) if is_idle else ((0.0, 0.0), (end_x * 0.5, end_y * 0.5), (end_x, end_y))
+        clearance = min(
+            _aabb_clearance_top_left(
+                px, py,
+                _PLAYER_BOX_W_WORLD, _PLAYER_BOX_H_WORLD,
+                hazard_x, hazard_y, hazard_w, hazard_h,
+            )
+            for px, py in samples
+        )
+        if clearance >= 0.0:
+            continue
+        center_dist = math.hypot(cx, cy)
+        key = (clearance, center_dist)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_center = (cx, cy)
+    if best_center is None:
+        return None
+    return _closest_dir8(best_center[0], best_center[1], default_dir=0)
+
+
+def _primary_blocking_hazard(
+    intended_move_dir: int,
+    hazards: list[tuple[float, float, float, float, float, float, float]],
+) -> Optional[tuple[float, float, float, float, float, float, float]]:
+    if not hazards:
+        return None
+    end_x, end_y = _move_dir_endpoint_world(intended_move_dir)
+    is_idle = intended_move_dir == _move_idle_action_index()
+    best_hazard: Optional[tuple[float, float, float, float, float, float, float]] = None
+    best_key: Optional[tuple[float, float]] = None
+    for hazard in hazards:
+        bx, by, bw, bh, pad_world, cx, cy = hazard
+        hazard_x = bx - pad_world
+        hazard_y = by - pad_world
+        hazard_w = bw + (2.0 * pad_world)
+        hazard_h = bh + (2.0 * pad_world)
+        samples = ((0.0, 0.0),) if is_idle else ((0.0, 0.0), (end_x * 0.5, end_y * 0.5), (end_x, end_y))
+        clearance = min(
+            _aabb_clearance_top_left(
+                px,
+                py,
+                _PLAYER_BOX_W_WORLD,
+                _PLAYER_BOX_H_WORLD,
+                hazard_x,
+                hazard_y,
+                hazard_w,
+                hazard_h,
+            )
+            for px, py in samples
+        )
+        if clearance >= 0.0:
+            continue
+        center_dist = math.hypot(cx, cy)
+        key = (clearance, center_dist)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_hazard = hazard
+    return best_hazard
+
+
+def _slide_candidate_dirs(
+    intended_move_dir: int,
+    hazard: tuple[float, float, float, float, float, float, float],
+) -> list[int]:
+    bx, by, bw, bh, pad_world, _cx, _cy = hazard
+    hazard_x = bx - pad_world
+    hazard_y = by - pad_world
+    hazard_w = bw + (2.0 * pad_world)
+    hazard_h = bh + (2.0 * pad_world)
+    desired_vx, desired_vy = _move_dir_vector(intended_move_dir)
+    if abs(desired_vx) <= 1e-6 and abs(desired_vy) <= 1e-6:
+        return []
+
+    player_cx, player_cy = _player_box_center()
+    hazard_cx = hazard_x + (0.5 * hazard_w)
+    hazard_cy = hazard_y + (0.5 * hazard_h)
+    rel_x = player_cx - hazard_cx
+    rel_y = player_cy - hazard_cy
+
+    candidates: list[int] = []
+    if abs(desired_vx) >= abs(desired_vy):
+        go_above = rel_y <= 0.0
+        primary_vy = -1.0 if go_above else 1.0
+        secondary_vy = -primary_vy
+        if hazard_h <= hazard_w:
+            candidates.append(_closest_dir8(desired_vx, primary_vy, default_dir=intended_move_dir))
+            candidates.append(_closest_dir8(0.0, primary_vy))
+            candidates.append(_closest_dir8(desired_vx, secondary_vy, default_dir=intended_move_dir))
+            candidates.append(_closest_dir8(0.0, secondary_vy))
+        else:
+            candidates.append(_closest_dir8(0.0, primary_vy))
+            candidates.append(_closest_dir8(desired_vx, primary_vy, default_dir=intended_move_dir))
+            candidates.append(_closest_dir8(0.0, secondary_vy))
+            candidates.append(_closest_dir8(desired_vx, secondary_vy, default_dir=intended_move_dir))
+    else:
+        go_left = rel_x <= 0.0
+        primary_vx = -1.0 if go_left else 1.0
+        secondary_vx = -primary_vx
+        if hazard_w <= hazard_h:
+            candidates.append(_closest_dir8(primary_vx, desired_vy, default_dir=intended_move_dir))
+            candidates.append(_closest_dir8(primary_vx, 0.0))
+            candidates.append(_closest_dir8(secondary_vx, desired_vy, default_dir=intended_move_dir))
+            candidates.append(_closest_dir8(secondary_vx, 0.0))
+        else:
+            candidates.append(_closest_dir8(primary_vx, 0.0))
+            candidates.append(_closest_dir8(primary_vx, desired_vy, default_dir=intended_move_dir))
+            candidates.append(_closest_dir8(secondary_vx, 0.0))
+            candidates.append(_closest_dir8(secondary_vx, desired_vy, default_dir=intended_move_dir))
+
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for cand in candidates:
+        cand = int(max(0, min(NUM_MOVE - 1, cand)))
+        if cand not in seen:
+            seen.add(cand)
+            ordered.append(cand)
+    return ordered
+
+
+def _apply_final_hazard_move_check(
+    intended_move_dir: int,
+    hazards: list[tuple[float, float, float, float, float, float, float]],
+) -> int:
+    if not hazards:
+        return intended_move_dir
+
+    intended_penalty, intended_clearance = _move_candidate_hazard_score(intended_move_dir, hazards)
+    if intended_penalty <= 1e-6 and intended_clearance >= 0.0:
+        return intended_move_dir
+
+    desired_vx, desired_vy = _move_dir_vector(intended_move_dir)
+    escape_x, escape_y = _hazard_escape_vector(hazards)
+    primary_hazard = _primary_blocking_hazard(intended_move_dir, hazards)
+    slide_dirs = _slide_candidate_dirs(intended_move_dir, primary_hazard) if primary_hazard is not None else []
+    best_dir = intended_move_dir
+    best_key: Optional[tuple[float, float, float, float]] = None
+
+    for slide_rank, cand_dir in enumerate(slide_dirs):
+        cand_penalty, cand_clearance = _move_candidate_hazard_score(cand_dir, hazards)
+        if cand_penalty > 1e-6 or cand_clearance < 0.0:
+            continue
+        cand_vx, cand_vy = _move_dir_vector(cand_dir)
+        slide_alignment = (desired_vx * cand_vx) + (desired_vy * cand_vy)
+        return cand_dir if slide_alignment >= -0.25 else cand_dir
+
+    for cand_dir in range(min(8, NUM_MOVE)):
+        cand_penalty, cand_clearance = _move_candidate_hazard_score(cand_dir, hazards)
+        cand_vx, cand_vy = _move_dir_vector(cand_dir)
+        escape_alignment = (escape_x * cand_vx) + (escape_y * cand_vy)
+        alignment = (desired_vx * cand_vx) + (desired_vy * cand_vy)
+        key = (cand_penalty, -escape_alignment, -cand_clearance, -alignment)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_dir = cand_dir
+
+    return best_dir
+
+
+def _nearest_aligned_fire_direction_from_state(state: np.ndarray) -> Optional[int]:
+    """Return fire direction for the closest non-human target aligned to any 8-way shot."""
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+
+    per_direction: list[Optional[tuple[float, int]]] = [None] * len(_DIR8_VECTORS)
+    for tok in toks:
+        name = _token_category_name(tok)
+        if name not in _ALIGNED_FIRE_CATEGORIES:
+            continue
+        dx = float(tok[1])
+        dy = float(tok[2])
+        dist = float(tok[5])
+        if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(dist)):
+            continue
+
+        world_dx = dx * _REL_POS_X_RANGE
+        world_dy = dy * _REL_POS_Y_RANGE
+        world_dist = math.hypot(world_dx, world_dy)
+        for fire_dir, (dir_x, dir_y) in enumerate(_DIR8_VECTORS):
+            forward = (world_dx * dir_x) + (world_dy * dir_y)
+            if forward <= 0.0:
+                continue
+            perp = abs((world_dx * dir_y) - (world_dy * dir_x))
+            if perp > _ALIGN_HALF_WINDOW_WORLD:
+                continue
+            best_dir = per_direction[fire_dir]
+            if best_dir is None or world_dist < best_dir[0]:
+                per_direction[fire_dir] = (world_dist, fire_dir)
+
+    best_aligned: Optional[tuple[float, int]] = None
+    for candidate in per_direction:
+        if candidate is None:
+            continue
+        if best_aligned is None or candidate[0] < best_aligned[0]:
+            best_aligned = candidate
+    if best_aligned is None:
+        return None
+    return int(best_aligned[1])
 
 
 def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> Tuple[int, int]:
     """Heuristic Robotron expert.
 
-    Fire:  Always toward nearest enemy.
+    Fire:
+        1) If any enemy/projectile is aligned with one of the 8 fire directions
+           within an 8 px half-window, shoot the closest aligned target.
+        2) Otherwise, fallback to shooting the nearest enemy.
      Move priority:
         1) Rescue humans when safe (no close threat within ~12 px).
         2) Flee close threats (including hulks) when enemy is within ~12 px.
@@ -557,11 +1003,21 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
         4) Otherwise, fallback to fleeing nearest enemy.
     """
     nearest_enemy = _nearest_enemy_vector_from_state(state)
+    nearest_projectile = _nearest_projectile_vector_from_state(state)
     nearest_align_robot = _nearest_align_robot_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
+    nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
+    aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
 
-    # ── Fire direction (always at nearest enemy) ────────────────────
-    if nearest_enemy is not None:
+    # ── Fire direction ───────────────────────────────────────────────
+    if aligned_fire_dir is not None:
+        fire_dir = int(aligned_fire_dir)
+    elif nearest_projectile is not None and (
+        nearest_enemy is None or nearest_projectile[2] <= max(nearest_enemy[2], _PROJECTILE_DANGER_DIST)
+    ):
+        fx, fy, _ = nearest_projectile
+        fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+    elif nearest_enemy is not None:
         fx, fy, _ = nearest_enemy
         fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
     else:
@@ -576,6 +1032,11 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
         ey_world = ey * _REL_POS_Y_RANGE
 
         is_close_threat = enemy_dist < _ALIGN_SAFE_DIST
+        if nearest_projectile is not None and nearest_projectile[2] < _PROJECTILE_DANGER_DIST:
+            ex, ey, enemy_dist = nearest_projectile
+            ex_world = ex * _REL_POS_X_RANGE
+            ey_world = ey * _REL_POS_Y_RANGE
+            is_close_threat = True
 
         # 1) Flee close threats first (including hulks).
         if is_close_threat:
@@ -596,6 +1057,16 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
         move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
     else:
         move_dir = _move_idle_action_index()
+
+    # ── Final nearby-object collision check ─────────────────────────
+    intended_move_dir = move_dir
+    move_dir = _apply_final_hazard_move_check(move_dir, nearby_avoidance)
+    if (
+        locked_fire is None or int(locked_fire) < 0
+    ) and move_dir != intended_move_dir:
+        blocked_fire_dir = _blocking_hazard_fire_direction(intended_move_dir, nearby_avoidance)
+        if blocked_fire_dir is not None:
+            fire_dir = int(blocked_fire_dir)
 
     # ── Lava guard: never move into the outer 16 px ─────────────────
     s = _latest_frame_state(state)
@@ -706,15 +1177,83 @@ class LaneCrossAttentionEncoder(nn.Module):
             return pooled, weights
         return pooled
 
+class GlobalEncoder(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+        self.out_dim = hidden_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class SpatialGridEncoder(nn.Module):
+    def __init__(self, channels: int, hidden_channels: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, hidden_channels * 2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels * 2, hidden_channels * 3, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+        )
+        flat_dim = (hidden_channels * 3) * 2 * 2
+        self.proj = nn.Sequential(
+            nn.Linear(flat_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(),
+        )
+        self.out_dim = out_dim
+
+    def forward(self, grid: torch.Tensor) -> torch.Tensor:
+        h = self.net(grid)
+        return self.proj(h.flatten(start_dim=1))
+
+
+class EntitySetEncoder(nn.Module):
+    def __init__(self, token_features: int, embed_dim: int, num_heads: int, num_layers: int):
+        super().__init__()
+        self.embed = nn.Linear(token_features, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.out_norm = nn.LayerNorm(embed_dim)
+        self.out_dim = embed_dim
+
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.norm(self.embed(tokens))
+        bsz = x.shape[0]
+        cls = self.cls_token.expand(bsz, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        key_padding_mask = None
+        if mask is not None:
+            cls_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=mask.device)
+            key_padding_mask = torch.cat([cls_mask, mask], dim=1)
+        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        return self.out_norm(x[:, 0, :])
+
+
 # ── Distributional Dueling Network ─────────────────────────────────────────
 class RainbowNet(nn.Module):
-    """
-    C51 distributional network with:
-      - Lane-cross-attention encoder (16-lane spatial + 7-enemy cross-attention)
-      - Shared trunk
-      - Dueling value + advantage streams
-      - Factored action heads (move direction × fire direction)
-    """
+    """Hybrid Robotron network with global, spatial, and token encoders."""
 
     def __init__(self, state_size: int):
         super().__init__()
@@ -726,50 +1265,35 @@ class RainbowNet(nn.Module):
         self.v_max = cfg.v_max
         self.use_dueling = cfg.use_dueling
         self.num_actions = NUM_JOINT
+        self.use_attn = bool(getattr(cfg, "use_enemy_attention", True))
+        self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
+        self.global_feature_count = int(getattr(cfg, "global_feature_count", 98))
+        self.grid_width = int(getattr(cfg, "grid_width", 12))
+        self.grid_height = int(getattr(cfg, "grid_height", 12))
+        self.grid_channels = int(getattr(cfg, "grid_channels", 8))
+        self.object_token_count = int(getattr(cfg, "object_token_count", 64))
+        self.object_token_features = int(getattr(cfg, "object_token_features", 15))
+        self.grid_feature_count = self.grid_width * self.grid_height * self.grid_channels
+        self.token_feature_count = self.object_token_count * self.object_token_features
 
-        # ── Object-Slot Self-Attention ──────────────────────────────────
-        # 9 per-type entity categories with variable slots, 144 tokens total.
-        # Each token gets 7 features:
-        #   dx, dy, dist, ddx, ddy, category_id_norm, present.
-        # dx/dy are player-relative (already in state vector from Lua).
-        # Type is implicit in category position — no noisy type pointer needed.
-        self.use_attn = cfg.use_enemy_attention
-        attn_out_dim = 0
-        if self.use_attn:
-            self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
-            self.num_object_slots = getattr(cfg, 'object_slots', 144)
-            self.object_token_features = getattr(cfg, 'object_token_features', 7)
-            self.slot_state_features = getattr(cfg, 'slot_state_features', 4)  # present, dx, dy, dist
+        self.global_encoder = GlobalEncoder(self.global_feature_count, int(getattr(cfg, "global_hidden", 192)))
+        self.grid_encoder = SpatialGridEncoder(
+            self.grid_channels,
+            int(getattr(cfg, "grid_hidden_channels", 32)),
+            int(getattr(cfg, "attn_dim", 192)),
+        )
+        self.entity_encoder = EntitySetEncoder(
+            self.object_token_features,
+            int(getattr(cfg, "attn_dim", 192)),
+            int(getattr(cfg, "attn_heads", 8)),
+            int(getattr(cfg, "attn_layers", 3)),
+        )
 
-            # Category layout: (slots, category_id) — must match Lua ENTITY_CATEGORIES order.
-            cat_defs = getattr(cfg, 'entity_categories', [
-                ("grunt", 16), ("hulk", 8), ("brain", 4), ("tank", 4),
-                ("spawner", 4), ("enforcer", 8), ("projectile", 8),
-                ("human", 8), ("electrode", 8),
-            ])
-            # Pre-compute base index in state vector for each category.
-            # State: 9 core + 50 ELIST = 59, then per-category blocks.
-            self._cat_info = []   # [(base, slots, cat_id), ...]
-            offset = 59
-            for cat_id, (name, slots) in enumerate(cat_defs):
-                self._cat_info.append((offset, slots, cat_id))
-                offset += 1 + slots * self.slot_state_features
-            self._num_categories = len(cat_defs)
-
-            self.object_attn = EnemyAttention(
-                slot_features=self.object_token_features,
-                embed_dim=cfg.attn_dim,
-                num_heads=cfg.attn_heads,
-            )
-            attn_out_dim = cfg.attn_dim
-
-        # ── Trunk ──────────────────────────────────────────────────────
-        # Input: full state concatenated with attention output
-        trunk_in = state_size + attn_out_dim
+        trunk_in = self.global_encoder.out_dim + self.grid_encoder.out_dim + self.entity_encoder.out_dim
         layers = []
-        for i in range(cfg.trunk_layers):
-            out_dim = cfg.trunk_hidden
-            layers.append(nn.Linear(trunk_in if i == 0 else cfg.trunk_hidden, out_dim))
+        for i in range(int(cfg.trunk_layers)):
+            out_dim = int(cfg.trunk_hidden)
+            layers.append(nn.Linear(trunk_in if i == 0 else out_dim, out_dim))
             if cfg.use_layer_norm:
                 layers.append(nn.LayerNorm(out_dim))
             layers.append(nn.ReLU())
@@ -777,15 +1301,11 @@ class RainbowNet(nn.Module):
                 layers.append(nn.Dropout(cfg.dropout))
         self.trunk = nn.Sequential(*layers)
 
-        # ── Heads ──────────────────────────────────────────────────────
-        head_in = cfg.trunk_hidden
-        head_mid = head_in // 2
-
+        head_in = int(cfg.trunk_hidden)
+        head_mid = max(64, head_in // 2)
         if self.use_dueling:
-            # Value stream → (num_atoms,)
             self.val_fc = nn.Linear(head_in, head_mid)
             self.val_out = nn.Linear(head_mid, self.num_atoms)
-            # Advantage stream → (num_actions × num_atoms)
             self.adv_fc = nn.Linear(head_in, head_mid)
             self.adv_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
         else:
@@ -793,8 +1313,6 @@ class RainbowNet(nn.Module):
             self.q_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
 
         self._init_weights()
-
-        # Register support as buffer (not a parameter)
         if self.use_dist:
             support = torch.linspace(self.v_min, self.v_max, self.num_atoms)
             self.register_buffer("support", support)
@@ -802,91 +1320,44 @@ class RainbowNet(nn.Module):
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Linear):
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
-                nn.init.constant_(m.bias, 0.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+    def _split_state_sections(self, state: torch.Tensor):
+        B = state.shape[0]
+        total_dim = int(state.shape[1])
+        stack_depth = max(1, total_dim // max(1, self.base_state_size))
+        latest_off = (stack_depth - 1) * self.base_state_size
+        latest = state[:, latest_off: latest_off + self.base_state_size]
+        globals_ = latest[:, :self.global_feature_count]
+        grid_start = self.global_feature_count
+        grid_end = grid_start + self.grid_feature_count
+        grid = latest[:, grid_start:grid_end].reshape(B, self.grid_channels, self.grid_height, self.grid_width)
+        tokens = latest[:, grid_end:grid_end + self.token_feature_count].reshape(
+            B, self.object_token_count, self.object_token_features
+        )
+        return globals_, grid, tokens
 
     def _build_object_tokens(self, state: torch.Tensor):
-        """Build 144 object tokens from 9 per-type entity categories.
-
-        Each token gets 7 features:
-          [dx, dy, dist, ddx, ddy, category_id_norm, present]
-        where ddx/ddy are frame-to-frame deltas from the previous stacked frame.
-
-        Slots are sorted by distance (nearest first) per category.
-        Type is implicit in category position — no noisy type pointer.
-
-        Returns:
-          tokens: (B, 144, 7)
-          mask:   (B, 144) bool — True where slot is EMPTY
-        """
-        B = state.shape[0]
-        device = state.device
-        base_state_size = max(1, int(getattr(self, "base_state_size", SERVER_CONFIG.params_count)))
-        total_dim = int(state.shape[1])
-        stack_depth = max(1, total_dim // base_state_size)
-        latest_off = (stack_depth - 1) * base_state_size
-        prev_off = (stack_depth - 2) * base_state_size if stack_depth >= 2 else latest_off
-
-        all_tokens = []
-        all_masks = []
-
-        for base, slots, cat_id in self._cat_info:
-            # Each category: [occupancy, slot0_present, slot0_dx, slot0_dy, slot0_dist, ...]
-            # Skip occupancy (+1), extract slots × 4 state features
-            latest = state[:, latest_off + base + 1 : latest_off + base + 1 + slots * self.slot_state_features]
-            latest = latest.reshape(B, slots, self.slot_state_features)  # (B, slots, 4)
-            prev = state[:, prev_off + base + 1 : prev_off + base + 1 + slots * self.slot_state_features]
-            prev = prev.reshape(B, slots, self.slot_state_features)      # (B, slots, 4)
-
-            present = latest[:, :, 0]            # (B, slots) — used as mask
-            dx      = latest[:, :, 1:2]          # (B, slots, 1) — relative to player
-            dy      = latest[:, :, 2:3]          # (B, slots, 1) — relative to player
-            dist    = latest[:, :, 3:4]          # (B, slots, 1)
-
-            prev_present = prev[:, :, 0]
-            prev_dx = prev[:, :, 1:2]
-            prev_dy = prev[:, :, 2:3]
-            vel_valid = ((present > 0.5) & (prev_present > 0.5)).unsqueeze(2).to(dtype=state.dtype)
-            ddx = (dx - prev_dx) * vel_valid
-            ddy = (dy - prev_dy) * vel_valid
-
-            # Category identity as normalised scalar
-            cat_norm = torch.full((B, slots, 1),
-                                  cat_id / max(1, self._num_categories - 1),
-                                  device=device, dtype=state.dtype)
-
-            # Include present flag so attention can see slot occupancy
-            tokens = torch.cat([dx, dy, dist, ddx, ddy, cat_norm, present.unsqueeze(2)], dim=2)  # (B, slots, 7)
-            all_tokens.append(tokens)
-            all_masks.append(present < 0.5)  # True = empty slot
-
-        tokens = torch.cat(all_tokens, dim=1)   # (B, 144, 7)
-        mask = torch.cat(all_masks, dim=1)       # (B, 144)
-
-        # If ALL slots empty (e.g. between waves), unmask all to avoid NaN
+        _, _, tokens = self._split_state_sections(state)
+        mask = tokens[:, :, 0] < 0.5
         all_empty = mask.all(dim=1, keepdim=True)
         mask = mask & ~all_empty
-
         return tokens, mask
 
     def forward(self, state: torch.Tensor, log: bool = False):
-        """
-        Returns:
-          - If distributional: (B, num_actions, num_atoms) log-probabilities or probabilities
-          - If scalar: (B, num_actions) Q-values
-        """
         B = state.shape[0]
+        globals_, grid, tokens = self._split_state_sections(state)
+        token_mask = tokens[:, :, 0] < 0.5
+        all_empty = token_mask.all(dim=1, keepdim=True)
+        token_mask = token_mask & ~all_empty
 
-        # Object-slot self-attention
-        if self.use_attn:
-            obj_tokens, obj_mask = self._build_object_tokens(state)  # (B, 144, 7), (B, 144)
-            attn_out = self.object_attn(obj_tokens, obj_mask)       # (B, attn_dim)
-            trunk_in = torch.cat([state, attn_out], dim=1)
-        else:
-            trunk_in = state
-
-        h = self.trunk(trunk_in)
+        global_h = self.global_encoder(globals_)
+        grid_h = self.grid_encoder(grid)
+        entity_h = self.entity_encoder(tokens, token_mask) if self.use_attn else tokens.mean(dim=1)
+        h = self.trunk(torch.cat([global_h, grid_h, entity_h], dim=1))
 
         if self.use_dueling:
             val = F.relu(self.val_fc(h))
@@ -899,23 +1370,17 @@ class RainbowNet(nn.Module):
             q_atoms = self.q_out(q).view(B, self.num_actions, self.num_atoms)
 
         if self.use_dist:
-            # Keep distribution logits math in fp32 even under autocast to
-            # avoid fp16 underflow/overflow in softmax/log_softmax.
             q_atoms = q_atoms.float()
             if log:
                 return F.log_softmax(q_atoms, dim=2)
-            else:
-                return F.softmax(q_atoms, dim=2)
-        else:
-            return q_atoms.squeeze(2)  # (B, num_actions)
+            return F.softmax(q_atoms, dim=2)
+        return q_atoms.squeeze(2)
 
     def q_values(self, state: torch.Tensor) -> torch.Tensor:
-        """Compute expected Q-values: (B, num_actions)."""
         if self.use_dist:
-            probs = self.forward(state, log=False)         # (B, A, N)
+            probs = self.forward(state, log=False)
             return (probs * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2)
-        else:
-            return self.forward(state, log=False)
+        return self.forward(state, log=False)
 
 # ── Keyboard handler ────────────────────────────────────────────────────────
 msvcrt = termios = tty = fcntl = None
@@ -1634,12 +2099,12 @@ class RainbowAgent:
         self.memory.flush()
 
     def reset_attention_weights(self):
-        """Reinitialize only the object self-attention weights, keeping trunk and heads intact."""
+        """Reinitialize only the entity transformer, keeping other encoders and heads intact."""
         if not self.online_net.use_attn:
             print("No attention layer to reset.")
             return
         for net in (self.online_net, self.target_net):
-            for m in net.object_attn.modules():
+            for m in net.entity_encoder.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight, gain=1.0)
                     nn.init.constant_(m.bias, 0.0)
@@ -1647,20 +2112,17 @@ class RainbowAgent:
                     nn.init.constant_(m.weight, 1.0)
                     nn.init.constant_(m.bias, 0.0)
         self._sync_inference(force=True)
-        # Reset optimizer state for attention parameters so momentum doesn't carry old bias
-        attn_param_ids = {id(p) for p in self.online_net.object_attn.parameters()}
+        attn_param_ids = {id(p) for p in self.online_net.entity_encoder.parameters()}
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if id(p) in attn_param_ids and p in self.optimizer.state:
                     del self.optimizer.state[p]
-        print("Object self-attention weights and optimizer state reset (trunk + heads preserved)")
+        print("Entity encoder weights and optimizer state reset (other modules preserved)")
 
     def diagnose_attention(self, num_samples: int = 256) -> str:
-        """Analyze object self-attention patterns to determine if they're meaningful."""
+        """Report token occupancy and salience stats for the hybrid observation."""
         if not self.online_net.use_attn:
             return "Attention is disabled in this model."
-        if not hasattr(self.online_net, 'object_attn'):
-            return "No object self-attention found."
         if len(self.memory) < num_samples:
             return f"Need {num_samples} samples in buffer, have {len(self.memory)}."
 
@@ -1669,112 +2131,29 @@ class RainbowAgent:
             return "Could not sample from buffer."
 
         states = torch.from_numpy(batch[0]).float().to(self.device)
-        self.online_net.eval()
         with torch.no_grad():
             obj_tokens, obj_mask = self.online_net._build_object_tokens(states)
-            _, attn_w = self.online_net.object_attn(
-                obj_tokens, obj_mask, return_weights=True
-            )
-        self.online_net.train()
-
-        import numpy as np
-        eps = 1e-8
-
-        # attn_w: (B, H, T, T) self-attention over T=144 object tokens
-        B, H, T, _ = attn_w.shape
-        aw = attn_w.cpu().numpy()
-        em = obj_mask.cpu().numpy()  # (B, T) bool — True = empty
-
-        # Category layout for labelling
-        cat_defs = getattr(RL_CONFIG, 'entity_categories', [])
-        cat_ranges = []
-        offset = 0
-        for name, slots in cat_defs:
-            cat_ranges.append((name, offset, offset + slots))
-            offset += slots
+        toks = obj_tokens.detach().cpu().numpy()
+        mask = obj_mask.detach().cpu().numpy()
+        active = ~mask
+        B, T, Fdim = toks.shape
+        active_counts = active.sum(axis=1)
+        threat = toks[:, :, 8]
+        humans = toks[:, :, 12]
+        dangerous = toks[:, :, 13]
 
         lines = []
         lines.append("\n" + "=" * 70)
-        lines.append("  OBJECT SELF-ATTENTION DIAGNOSTICS".center(70))
+        lines.append("  HYBRID OBSERVATION DIAGNOSTICS".center(70))
         lines.append("=" * 70)
-        lines.append(f"  Shape: {B} samples x {H} heads x {T} tokens (self-attn)")
-
-        # Per-category occupancy
-        lines.append(f"\n  Per-category slot occupancy:")
-        for name, lo, hi in cat_ranges:
-            occ = 1.0 - em[:, lo:hi].mean()
-            bar = "#" * int(occ * 20) + "." * (20 - int(occ * 20))
-            lines.append(f"    {name:12s} [{lo:3d}..{hi:3d}): {occ:.1%}  {bar}")
-
-        # Overall active tokens
-        avg_active = (~em).sum(axis=1).mean()
-        lines.append(f"    Avg active tokens: {avg_active:.1f} / {T}")
-
-        # 1. Entropy per head
-        max_entropy = np.log(T)
-        entropy = -(aw * np.log(aw + eps)).sum(axis=-1)  # (B, H, T)
-        mean_entropy_per_head = entropy.mean(axis=(0, 2))  # (H,)
-        overall_entropy = entropy.mean()
-        ratio = overall_entropy / max_entropy
-
-        lines.append(f"\n  Entropy per head (uniform = {max_entropy:.3f}):")
-        for h in range(H):
-            e = mean_entropy_per_head[h]
-            pct = e / max_entropy * 100
-            bar = "#" * int(pct / 5) + "." * (20 - int(pct / 5))
-            lines.append(f"    Head {h}: {e:.3f} ({pct:.0f}% uniform)  {bar}")
-        lines.append(f"    Overall: {overall_entropy:.3f} ({ratio*100:.0f}% uniform)")
-
-        if ratio > 0.95:
-            lines.append("    -> Near-uniform: not yet selective")
-        elif ratio > 0.80:
-            lines.append("    -> Mildly selective: some structure emerging")
-        elif ratio > 0.60:
-            lines.append("    -> Moderately selective: meaningful patterns forming")
-        else:
-            lines.append("    -> Highly selective: strong learned patterns")
-
-        # 2. Cross-category attention: do entities attend to other types?
-        lines.append(f"\n  Cross-category attention (avg weight given to other categories):")
-        for name_q, lo_q, hi_q in cat_ranges:
-            same_attn = aw[:, :, lo_q:hi_q, lo_q:hi_q].mean()
-            total_attn = aw[:, :, lo_q:hi_q, :].mean()
-            cross_attn = total_attn - same_attn if total_attn > 0 else 0
-            lines.append(f"    {name_q:12s}: same={same_attn:.4f}  cross={cross_attn:.4f}")
-
-        # 3. Empty-slot masking
-        if em.any():
-            # Average attention weight received by empty vs active tokens
-            recv_attn = aw.mean(axis=(1, 2))  # (B, T)
-            empty_recv = recv_attn[em].mean() if em.any() else 0
-            active_recv = recv_attn[~em].mean() if (~em).any() else 0
-            lines.append(f"\n  Empty-slot masking:")
-            lines.append(f"    Avg attention to active tokens: {active_recv:.4f}")
-            lines.append(f"    Avg attention to empty tokens:  {empty_recv:.4f}")
-            if empty_recv < 0.01:
-                lines.append("    -> Empty slots effectively masked")
-            elif empty_recv < active_recv * 0.1:
-                lines.append("    -> Minimal attention leakage")
-            else:
-                lines.append("    -> Significant attention to empty slots")
-
-        # 4. Head specialization
-        head_avg = aw.mean(axis=(0, 2))  # (H, T)
-        head_kls = []
-        for i in range(H):
-            for j in range(i + 1, H):
-                p, q = head_avg[i] + eps, head_avg[j] + eps
-                p, q = p / p.sum(), q / q.sum()
-                kl = (p * np.log(p / q)).sum()
-                head_kls.append(kl)
-        avg_kl = np.mean(head_kls) if head_kls else 0
-        lines.append(f"\n  Head specialization (avg KL between heads): {avg_kl:.4f}")
-        if avg_kl > 0.1:
-            lines.append("    -> Heads are specialized")
-        elif avg_kl > 0.01:
-            lines.append("    -> Mild specialization")
-        else:
-            lines.append("    -> Heads are redundant")
+        lines.append(f"  Shape: {B} samples x {T} tokens x {Fdim} features")
+        lines.append(f"  Avg active tokens: {active_counts.mean():.1f} / {T}")
+        lines.append(f"  Avg dangerous tokens: {(dangerous * active).sum() / max(1, active.sum()):.3f}")
+        lines.append(f"  Avg human tokens: {(humans * active).sum() / max(1, active.sum()):.3f}")
+        lines.append(f"  Avg token threat: {(threat * active).sum() / max(1, active.sum()):.3f}")
+        lines.append(f"  Max token threat: {(threat * active).max():.3f}")
+        lines.append("\n  Attention weights are not surfaced from the transformer encoder.")
+        lines.append("  Use this report to verify token occupancy and salience instead.")
 
         lines.append("\n" + "=" * 70)
         return "\n".join(lines)

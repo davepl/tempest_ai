@@ -80,29 +80,11 @@ class ServerConfigData:
     port: int = 9998
     max_clients: int = 36
     # State layout:
-    #   5 core (alive, score/1e6, replay/100, lasers/9, wave/40)
-    #   + 2 player position (norm_pos_x, norm_pos_y: 0..1 over playfield)
-    #   + 2 player velocity (frame-delta dx/range, dy/range: ~[-1,+1])
-    #   + 50 ELIST enemy state bytes (/255)
-    #   + 9 per-type entity categories, each: 1 occupancy + N slots × 4 features
-    #   = 9 + 50 + 585 = 644 floats
-    #
-    # Per-slot features: present, dx, dy, distance_norm
-    # dx/dy are player-relative (entity - player), normalised over playfield range.
-    # Type is implicit in category position (no type feature needed).
-    # Slots sorted by distance to player (nearest first).
-    #
-    # Entity categories (order matches Lua ENTITY_CATEGORIES):
-    #   0. grunt      (40 slots) - grunts                          peak 80
-    #   1. hulk       (16 slots) - indestructible hulks             peak 25
-    #   2. brain      (16 slots) - brains                          peak 25
-    #   3. tank       ( 8 slots) - tanks (growing + full)          peak ~14
-    #   4. spawner    ( 8 slots) - circles, squares/quarks         peak 14
-    #   5. enforcer   (12 slots) - enforcers                       peak ~10
-    #   6. projectile (12 slots) - sparks, shells, cruise, progs
-    #   7. human      (16 slots) - mom, dad, kid                   peak 30
-    #   8. electrode  (16 slots) - electrodes/posts                peak 25
-    params_count: int = 644
+    #   98 global features
+    #   + 12 x 12 x 8 egocentric spatial grid
+    #   + 64 object tokens x 15 features
+    #   = 98 + 1152 + 960 = 2210 floats
+    params_count: int = 2210
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -110,12 +92,12 @@ SERVER_CONFIG = ServerConfigData()
 @dataclass
 class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
-    # Base per-frame state from Lua wire protocol (644 floats).
+    # Base per-frame state from Lua wire protocol.
     base_state_size: int = SERVER_CONFIG.params_count
-    # Temporal context window fed to the network.
-    frame_stack: int = 4
+    # Lua now emits true per-object motion features, so temporal stacking is unnecessary.
+    frame_stack: int = 1
     # Effective model input width after stacking.
-    state_size: int = SERVER_CONFIG.params_count * 4
+    state_size: int = SERVER_CONFIG.params_count
 
     # Factored action space for Robotron dual sticks:
     #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
@@ -131,15 +113,24 @@ class RLConfigData:
     def num_joint_actions(self) -> int:
         return self.num_move_actions * self.num_fire_actions
 
-    # ── network architecture ────────────────────────────────────────────
+    # ── observation layout / network architecture ──────────────────────
+    global_feature_count: int = 98
+    grid_width: int = 12
+    grid_height: int = 12
+    grid_channels: int = 8
+    object_token_count: int = 64
+    # Token features:
+    #   present, dx, dy, vx, vy, dist, dir_x, dir_y, threat,
+    #   size_x, size_y, category_norm, is_human, is_dangerous, approach
+    object_token_features: int = 15
+
     trunk_hidden: int = 512
-    trunk_layers: int = 3
+    trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Object-slot self-attention over 9 typed categories = 144 tokens.
+    # Hybrid encoder: global MLP + local grid CNN + transformer over object tokens.
     use_enemy_attention: bool = True
-    # Per-type entity categories: name, slots — matches Lua ENTITY_CATEGORIES.
     entity_categories: list = field(default_factory=lambda: [
         ("grunt",      40),
         ("hulk",       16),
@@ -151,12 +142,11 @@ class RLConfigData:
         ("human",      16),
         ("electrode",  16),
     ])
-    object_slots: int = 144             # total slots across all 9 categories
-    # Token features: dx, dy, dist, ddx, ddy, category_id_norm, present
-    object_token_features: int = 7
-    slot_state_features: int = 4        # present, dx, dy, dist (in state vector)
     attn_heads: int = 8
-    attn_dim: int = 128
+    attn_dim: int = 192
+    attn_layers: int = 3
+    grid_hidden_channels: int = 32
+    global_hidden: int = 192
 
     # Distributional C51
     # Robotron per-frame rewards: grunt=100, brain=500, human rescue=1000-5000.
@@ -171,7 +161,7 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 512
+    batch_size: int = 256
     lr: float = 1e-4
     lr_min: float = 4e-5
     lr_warmup_steps: int = 5_000
@@ -452,6 +442,7 @@ class MetricsData:
 
     # Preview capture control (admin-controlled via dashboard)
     preview_capture_enabled: bool = True
+    hud_enabled: bool = True
     last_priority_mean: float = 0.0
     last_agreement: float = 0.0
 

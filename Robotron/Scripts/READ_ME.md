@@ -4,20 +4,19 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 
 ## Current Scope
 
-- Lua sends a **319-value state vector** each frame:
-  - `PlayerAlive` (real RAM-derived from `STATUS`)
-  - normalized score/replay/lasers/wave(level) values
-  - player position (`PX16`, `PY16` world coordinates)
-  - player velocity (`PXV`, `PYV`)
-  - `ZP1ENM` enemy-state bag (50 normalized bytes)
-  - active object-list features from `OPTR`, `HPTR`, `RPTR`, `PPTR`
-    - `OPTR` (0x9817): motion objects - enforcers, sparks, circles, squares, shells, player lasers
-    - `HPTR` (0x981F): humans - mom, dad, kid
-    - `RPTR` (0x9821): robots - grunts, brains, hulks, tanks, progs, cruise missiles
-    - `PPTR` (0x9823): fatal obstacles - electrodes
-    - per list: occupancy + 16 slots * (`present`, `x16`, `y16`, `canonical_type`)
-      - `canonical_type` is derived from `OPICT` and stabilized to descriptor base
-        so animation-frame pointer churn does not change semantic object identity
+- Lua sends a **2210-value hybrid state vector** each frame:
+  - 98 global features
+    - alive / score / replay / lasers / wave
+    - player position and velocity
+    - `ZP1ENM` enemy-state bag (50 normalized bytes)
+    - per-category counts / presence / nearest-distance summaries
+    - quadrant danger / rescue summaries
+    - wall proximity
+  - `12 x 12 x 8` player-centered spatial grid
+    - local danger, projectile, brute, human, obstacle, wall, density, and approach channels
+  - `64 x 15` object tokens
+    - salient objects from `OPTR`, `HPTR`, `RPTR`, `PPTR`
+    - relative position, true velocity, distance, direction, threat, size, type flags
 - Python returns **dual 8-way joystick actions**:
   - movement direction index `0..7`
   - firing direction index `0..7`
@@ -26,7 +25,7 @@ This `Robotron/Scripts` project is now a stripped baseline for Robotron-specific
 ## Protocol (Lua -> Python)
 
 - Header format: `>HddBIBBIBB`
-  - `H`: number of float state values (currently `319`)
+  - `H`: number of float state values (currently `2210`)
   - `d`: subjective reward
   - `d`: objective reward
   - `B`: done flag

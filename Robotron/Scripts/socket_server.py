@@ -315,10 +315,25 @@ class SocketServer:
     def _source_preview_flag(enabled: bool) -> int:
         return 0x40 if enabled else 0x00
 
+    @staticmethod
+    def _source_hud_flag(enabled: bool) -> int:
+        return 0x80 if enabled else 0x00
+
     @classmethod
-    def _pack_action(cls, move_cmd: int, fire_cmd: int, source_code: int, preview_enabled: bool) -> bytes:
-        source_u8 = (int(source_code) & 0x0F) | cls._source_preview_flag(bool(preview_enabled))
-        return struct.pack("bbb", int(move_cmd), int(fire_cmd), int(source_u8))
+    def _pack_action(
+        cls,
+        move_cmd: int,
+        fire_cmd: int,
+        source_code: int,
+        preview_enabled: bool,
+        hud_enabled: bool,
+    ) -> bytes:
+        source_u8 = (
+            (int(source_code) & 0x0F)
+            | cls._source_preview_flag(bool(preview_enabled))
+            | cls._source_hud_flag(bool(hud_enabled))
+        )
+        return struct.pack("bbB", int(move_cmd), int(fire_cmd), int(source_u8))
 
     @staticmethod
     def _clear_preview_cache() -> None:
@@ -368,6 +383,11 @@ class SocketServer:
                 return False
             # Only enable if web clients are connected
             return int(getattr(metrics, "web_client_count", 0) or 0) > 0
+
+    @staticmethod
+    def _hud_enabled() -> bool:
+        with metrics.lock:
+            return bool(getattr(metrics, "hud_enabled", True))
 
     def _cache_client_preview(self, cid: int, frame) -> None:
         if not self._is_preview_client(cid):
@@ -546,7 +566,7 @@ class SocketServer:
                 # Even if another client sends preview bytes, skip decode cost.
                 frame = parse_frame_data(data, parse_preview=preview_parse_allowed)
                 if not frame:
-                    sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
+                    sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, self._hud_enabled()))
                     continue
                 if self._is_preview_client(cid) and preview_parse_allowed:
                     enc_fmt = int(getattr(frame, "preview_encoded_format", 0) or 0)
@@ -671,7 +691,7 @@ class SocketServer:
                             pass
                     cs["was_done"] = True
                     try:
-                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
+                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, self._hud_enabled()))
                     except Exception:
                         break
                     cs["last_state"] = cs["last_action"] = None
@@ -702,7 +722,7 @@ class SocketServer:
                     cs["fire_hold_count"] = 0
                     cs["fire_pending_dir"] = -1
                     try:
-                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled))
+                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, self._hud_enabled()))
                     except Exception:
                         break
                     continue
@@ -856,7 +876,7 @@ class SocketServer:
                 else:
                     source_byte = 0
                 try:
-                    sock.sendall(self._pack_action(move_cmd, fire_cmd, source_byte, preview_enabled))
+                    sock.sendall(self._pack_action(move_cmd, fire_cmd, source_byte, preview_enabled, self._hud_enabled()))
                 except Exception:
                     break
 
