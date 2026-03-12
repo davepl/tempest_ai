@@ -136,13 +136,23 @@ for i in $(seq 1 "$COUNT"); do
         VIDEO_FLAG="-video none"
         PREVIEW_CLIENT_FLAG="0"
     fi
-    ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+    LOG_FILE="$LOG_DIR/mame_instance_$((i-1)).log"
+    if [[ $i -eq 1 ]]; then
+        # Preview client: no redirect — output stays on the terminal so a single
+        # clean set of init lines is visible.
+        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+    else
+        # Training-only clients: redirect entirely to a per-instance log file to
+        # keep the terminal clean (avoids duplicate init lines from N background
+        # processes sharing stdout).
+        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" >> "$LOG_FILE" 2>&1 &
+    fi
     pid=$!
     PIDS+=("$pid")
     if [[ $i -eq 1 ]]; then
-        echo "  Started instance $i (client 0 - audio/video, throttled) PID $pid"
+        echo "  Started instance $i (client 0 - audio/video, throttled) PID $pid  log: $LOG_FILE"
     else
-        echo "  Started instance $i (unthrottled training) PID $pid"
+        echo "  Started instance $i (unthrottled training) PID $pid  log: $LOG_FILE"
     fi
 done
 

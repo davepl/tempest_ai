@@ -102,10 +102,59 @@ DASH_HISTORY_LIMIT = 40_000
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 FONT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".webm", ".ogv"}
+PREVIEW_HTTP_DEFAULT_MAX_W = 320
+PREVIEW_HTTP_DEFAULT_MAX_H = 240
+PREVIEW_HTTP_MOBILE_MAX_W = 192
+PREVIEW_HTTP_MOBILE_MAX_H = 144
 
 
 _FALLBACK_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
 _WEBRTC_ICE_SERVERS = WEBRTC_ICE_SERVERS if isinstance(WEBRTC_ICE_SERVERS, list) and WEBRTC_ICE_SERVERS else _FALLBACK_ICE_SERVERS
+
+
+def _normalize_preview_profile(profile: str | None) -> str:
+    raw = str(profile or "default").strip().lower()
+    return "mobile" if raw == "mobile" else "default"
+
+
+def _preview_http_limits(profile: str | None) -> tuple[int, int]:
+    profile_norm = _normalize_preview_profile(profile)
+    if profile_norm == "mobile":
+        return PREVIEW_HTTP_MOBILE_MAX_W, PREVIEW_HTTP_MOBILE_MAX_H
+    return PREVIEW_HTTP_DEFAULT_MAX_W, PREVIEW_HTTP_DEFAULT_MAX_H
+
+
+def _downscale_rgb565_nearest(raw: bytes, width: int, height: int, max_width: int, max_height: int) -> tuple[bytes, int, int]:
+    w = max(0, int(width))
+    h = max(0, int(height))
+    mw = max(0, int(max_width))
+    mh = max(0, int(max_height))
+    if not raw or w <= 0 or h <= 0:
+        return b"", 0, 0
+    if (mw <= 0 and mh <= 0) or ((mw <= 0 or w <= mw) and (mh <= 0 or h <= mh)):
+        return raw, w, h
+
+    sx = (float(w) / float(mw)) if mw > 0 else 1.0
+    sy = (float(h) / float(mh)) if mh > 0 else 1.0
+    scale = max(1.0, sx, sy)
+    if scale <= 1.0:
+        return raw, w, h
+
+    tw = max(1, int(math.floor(w / scale)))
+    th = max(1, int(math.floor(h / scale)))
+    src_stride = w * 2
+    out = bytearray(tw * th * 2)
+    oi = 0
+    for ty in range(th):
+        sy_idx = min(h - 1, int(((ty + 0.5) * h) / th))
+        row_base = sy_idx * src_stride
+        for tx in range(tw):
+            sx_idx = min(w - 1, int(((tx + 0.5) * w) / tw))
+            si = row_base + (sx_idx * 2)
+            out[oi] = raw[si]
+            out[oi + 1] = raw[si + 1]
+            oi += 2
+    return bytes(out), tw, th
 
 def _audio_dir() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -536,26 +585,57 @@ class _DashboardState:
         with self.lock:
             return self._cached_now_body
 
-    def game_preview_body(self, since_seq: int | None = None, wait_timeout_s: float = 0.0) -> bytes:
+    def game_preview_body(self, since_seq: int | None = None, wait_timeout_s: float = 0.0, profile: str = "default") -> bytes:
         since = None if since_seq is None else int(max(0, since_seq))
         timeout = max(0.0, float(wait_timeout_s))
+        profile_norm = _normalize_preview_profile(profile)
         deadline = time.time() + timeout
+        seq = 0
+        client_id = -1
+        width = 0
+        height = 0
+        fmt = ""
+        ts = 0.0
+        data_b64 = ""
         while True:
             with self.metrics.lock:
                 seq = int(getattr(self.metrics, "game_preview_seq", 0))
-                payload = {
-                    "seq": seq,
-                    "client_id": int(getattr(self.metrics, "game_preview_client_id", -1)),
-                    "width": int(getattr(self.metrics, "game_preview_width", 0)),
-                    "height": int(getattr(self.metrics, "game_preview_height", 0)),
-                    "format": str(getattr(self.metrics, "game_preview_format", "") or ""),
-                    "ts": float(getattr(self.metrics, "game_preview_updated_ts", 0.0)),
-                    "data": str(getattr(self.metrics, "game_preview_data_b64", "") or ""),
-                }
+                client_id = int(getattr(self.metrics, "game_preview_client_id", -1))
+                width = int(getattr(self.metrics, "game_preview_width", 0))
+                height = int(getattr(self.metrics, "game_preview_height", 0))
+                fmt = str(getattr(self.metrics, "game_preview_format", "") or "")
+                ts = float(getattr(self.metrics, "game_preview_updated_ts", 0.0))
+                data_b64 = str(getattr(self.metrics, "game_preview_data_b64", "") or "")
             if since is None or seq != since or timeout <= 0.0 or time.time() >= deadline:
                 break
             time.sleep(0.01)
-        return json.dumps(payload).encode("utf-8")
+        changed = since is None or seq != since
+        out_w = width
+        out_h = height
+        out_data_b64 = ""
+        if changed and seq > 0 and width > 0 and height > 0 and fmt == "rgb565be" and data_b64:
+            try:
+                raw = base64.b64decode(data_b64, validate=True)
+                max_w, max_h = _preview_http_limits(profile_norm)
+                raw, out_w, out_h = _downscale_rgb565_nearest(raw, width, height, max_w, max_h)
+                out_data_b64 = base64.b64encode(raw).decode("ascii") if raw else ""
+            except Exception:
+                out_data_b64 = ""
+                out_w = 0
+                out_h = 0
+
+        payload = {
+            "seq": seq,
+            "client_id": client_id,
+            "width": out_w if changed else width,
+            "height": out_h if changed else height,
+            "format": fmt,
+            "ts": ts,
+            "profile": profile_norm,
+            "unchanged": not changed,
+            "data": out_data_b64,
+        }
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 class _PreviewVideoTrack(VideoStreamTrack):
@@ -1848,6 +1928,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
               <input type="checkbox" id="chkHudEnabled" checked>
               <span>HUD</span>
             </label>
+            <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#b0c8e8;cursor:pointer;">
+              <input type="checkbox" id="chkPreviewGameAudio" checked>
+              <span>GAME AUDIO</span>
+            </label>
           </div>
           <div class="preview-head-controls">
             <select id="selPreviewQuality" class="preview-quality-select" aria-label="Preview quality">
@@ -1963,22 +2047,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
-      <article class="card" style="display:none;--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
+      <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
         <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
         <div class="game-settings-row">
           <label>Level:
-            <select id="gsLevel">
-              <option value="1">1</option><option value="3">3</option><option value="5">5</option>
-              <option value="7">7</option><option value="9">9</option><option value="11">11</option>
-              <option value="13" selected>13</option><option value="15">15</option><option value="17">17</option>
-              <option value="20">20</option><option value="22">22</option><option value="24">24</option>
-              <option value="26">26</option><option value="28">28</option><option value="31">31</option>
-              <option value="33">33</option><option value="36">36</option><option value="40">40</option>
-              <option value="44">44</option><option value="47">47</option><option value="49">49</option>
-              <option value="52">52</option><option value="56">56</option><option value="60">60</option>
-              <option value="63">63</option><option value="65">65</option><option value="73">73</option>
-              <option value="81">81</option>
-            </select>
+            <select id="gsLevel"></select>
           </label>
           <label style="gap:6px;">Advanced <span class="toggle-switch"><input type="checkbox" id="gsAdvanced" checked><span class="slider"></span></span></label>
         </div>
@@ -2080,6 +2153,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const GAUGE_MIN_STEPS = 0;
     const GAUGE_MAX_STEPS = 120;
     const AUDIO_PREF_COOKIE = "robotron_dashboard_audio_enabled";
+    const PREVIEW_GAME_AUDIO_PREF_COOKIE = "robotron_preview_game_audio_enabled";
     const AUDIO_START_RETRY_MS = 800;
 
     /* ── Display FPS counter ──────────────────────────────────────────── */
@@ -2153,8 +2227,25 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const gsAutoCurrEl = document.getElementById("gsAutoCurriculum");
     const chkPreviewEl = document.getElementById("chkPreviewEnabled");
     const chkHudEl = document.getElementById("chkHudEnabled");
+    const chkPreviewGameAudioEl = document.getElementById("chkPreviewGameAudio");
     const previewToggleWrap = document.getElementById("previewToggleWrap");
     const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
+    function _ensureRobotronLevelOptions() {
+      if (!gsLevelEl) return;
+      const currentValue = parseInt(gsLevelEl.value, 10);
+      gsLevelEl.innerHTML = "";
+      for (let lv = 1; lv <= 81; lv += 1) {
+        const opt = document.createElement("option");
+        opt.value = String(lv);
+        opt.textContent = String(lv);
+        if ((Number.isFinite(currentValue) && currentValue === lv) || (!Number.isFinite(currentValue) && lv === 1)) {
+          opt.selected = true;
+        }
+        gsLevelEl.appendChild(opt);
+      }
+      if (!Number.isFinite(currentValue)) gsLevelEl.value = "1";
+    }
+    _ensureRobotronLevelOptions();
     if (!_gsAdmin) { 
       gsAdvancedEl.disabled = true; 
       gsLevelEl.disabled = true; 
@@ -2210,7 +2301,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
     const _selectableLevels = Array.from({ length: 81 }, (_, i) => i + 1);
     function _computeAutoLevel(avgLevel) {
-      const target = Math.floor(avgLevel) - 2;
+      const target = Math.floor(avgLevel) - 3;
       let best = _selectableLevels[0];
       for (const lv of _selectableLevels) { if (lv <= target) best = lv; else break; }
       return best;
@@ -2219,9 +2310,9 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       gsAdvancedEl.disabled = on || !_gsAdmin;
       gsLevelEl.disabled    = on || !_gsAdmin;
       if (on) {
-        if (gsAdvancedEl.checked) {
-          gsAdvancedEl.checked = false;
-          _postGameSettings({ start_advanced: false });
+        if (!gsAdvancedEl.checked) {
+          gsAdvancedEl.checked = true;
+          _postGameSettings({ start_advanced: true });
         }
         if (_lastNow) {
           const lv = _computeAutoLevel(_lastNow.average_level || 1);
@@ -2287,7 +2378,9 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     let _previewRtcRetryTimer = null;
     let _previewRtcConnecting = false;
     let _previewVideoHasFrame = false;
+    let _previewVideoLastFrameTs = 0;
     let _previewRtcStream = null;
+    let _previewGameAudioEnabled = true;
     // Preview is controlled via checkbox; start enabled by default.
     const ENABLE_CLIENT0_PREVIEW = true;
 
@@ -2360,10 +2453,36 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       }
     }
 
+    function _markPreviewVideoFrame() {
+      _previewVideoHasFrame = true;
+      _previewVideoLastFrameTs = (window.performance && typeof window.performance.now === "function")
+        ? window.performance.now()
+        : Date.now();
+      setPreviewRenderMode("video");
+      setPreviewMessage("");
+    }
+
+    function _previewVideoIsFresh(maxAgeMs = 1800) {
+      if (!_previewRtcEnabled || !_previewRtcConnected || !_previewVideoHasFrame) return false;
+      const now = (window.performance && typeof window.performance.now === "function")
+        ? window.performance.now()
+        : Date.now();
+      return (now - _previewVideoLastFrameTs) <= Math.max(250, Number(maxAgeMs) || 1800);
+    }
+
     function _ensurePreviewVideoAudio() {
       if (!gamePreviewVideo) return;
-      gamePreviewVideo.muted = false;
-      gamePreviewVideo.volume = 1.0;
+      const enableAudio = !!_previewGameAudioEnabled;
+      gamePreviewVideo.muted = !enableAudio;
+      gamePreviewVideo.volume = enableAudio ? 1.0 : 0.0;
+      try {
+        const audioTracks = gamePreviewVideo.srcObject ? gamePreviewVideo.srcObject.getAudioTracks() : [];
+        if (audioTracks && audioTracks.length) {
+          for (let i = 0; i < audioTracks.length; i++) {
+            audioTracks[i].enabled = enableAudio;
+          }
+        }
+      } catch (_) {}
       try {
         const p = gamePreviewVideo.play();
         if (p && typeof p.catch === "function") p.catch(() => {});
@@ -2451,7 +2570,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       if (_previewFetchInFlight) return;
       _previewFetchInFlight = true;
       try {
-        const res = await fetch(`/api/game_preview?cid=${encodeURIComponent(CLIENT_ID)}&t=${Date.now()}`, { cache: "no-store" });
+        const profile = encodeURIComponent(_currentPreviewProfile());
+        const res = await fetch(`/api/game_preview?cid=${encodeURIComponent(CLIENT_ID)}&profile=${profile}&t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad preview response");
         const payload = await res.json();
         const seq = Number(payload && payload.seq);
@@ -2613,11 +2733,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       return lines.join("\\r\\n");
     }
     if (gamePreviewVideo) {
-      const _onVideoFrame = () => {
-        _previewVideoHasFrame = true;
-        setPreviewRenderMode("video");
-        setPreviewMessage("");
-      };
+      const _onVideoFrame = () => { _markPreviewVideoFrame(); };
       gamePreviewVideo.addEventListener("loadeddata", () => {
         _previewLog("video loadeddata", { w: gamePreviewVideo.videoWidth || 0, h: gamePreviewVideo.videoHeight || 0 });
       });
@@ -2663,6 +2779,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       _previewRtcConnecting = false;
       _previewRtcStream = null;
       _previewVideoHasFrame = false;
+      _previewVideoLastFrameTs = 0;
       if (gamePreviewVideo) {
         try { gamePreviewVideo.pause(); } catch (_) {}
         gamePreviewVideo.srcObject = null;
@@ -2685,7 +2802,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       }
     }
 
-    function _waitForIceGatheringComplete(pc, timeoutMs = 1200) {
+    function _waitForIceGatheringComplete(pc, timeoutMs = 2500) {
       return new Promise((resolve) => {
         if (!pc || pc.iceGatheringState === "complete") {
           resolve();
@@ -2805,7 +2922,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           type: (offer && offer.type) ? offer.type : "offer",
           sdp: mungedOfferSdp || ((offer && offer.sdp) ? offer.sdp : ""),
         });
-        await _waitForIceGatheringComplete(pc, 1200);
+        await _waitForIceGatheringComplete(pc, 2500);
         const res = await fetch("/api/game_preview_offer", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2850,14 +2967,15 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       if (_previewPumpRunning) return;
       _previewPumpRunning = true;
       while (true) {
-        if (_previewRtcEnabled && _previewRtcConnected) {
+        if (_previewVideoIsFresh()) {
           await new Promise((resolve) => setTimeout(resolve, 200));
           continue;
         }
         try {
           const since = Math.max(0, Number(_previewSeqLoaded) || 0);
+          const profile = encodeURIComponent(_currentPreviewProfile());
           const res = await fetch(
-            `/api/game_preview?cid=${encodeURIComponent(CLIENT_ID)}&since=${since}&wait=1&timeout=1.2&t=${Date.now()}`,
+            `/api/game_preview?cid=${encodeURIComponent(CLIENT_ID)}&since=${since}&wait=1&timeout=4.0&profile=${profile}&t=${Date.now()}`,
             { cache: "no-store" }
           );
           if (!res.ok) throw new Error("bad preview stream response");
@@ -2868,6 +2986,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
             const fmt = String(payload && payload.format || "");
             const ok = (fmt === "rgb565be") && _decodeRgb565ToSource(payload.width, payload.height, payload.data);
             if (ok) {
+              if (!_previewVideoIsFresh()) setPreviewRenderMode("canvas");
               drawPreviewToCard();
               setPreviewMessage("");
             }
@@ -4827,9 +4946,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           cards.previewLabel.textContent = statText ? `${previewLabelBase} ${statText}` : previewLabelBase;
         }
         const hasVideoTrack = _videoElementHasTrack();
-        if ((_previewRtcEnabled && _previewRtcConnected) || hasVideoTrack) {
+        const freshVideo = _previewVideoIsFresh();
+        if (freshVideo) {
           setPreviewRenderMode("video");
-          setPreviewMessage(_previewVideoHasFrame ? "" : "Loading Preview");
+          setPreviewMessage("");
+        } else if (_previewHasFrame) {
+          setPreviewRenderMode("canvas");
+          setPreviewMessage("");
+        } else if ((_previewRtcEnabled && _previewRtcConnected) || hasVideoTrack) {
+          setPreviewRenderMode("video");
+          setPreviewMessage("Loading Preview");
         } else if ((now.client_count || 0) <= 0) {
           setPreviewMessage("No Clients");
           _previewHasFrame = false;
@@ -4996,6 +5122,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const cookiePref = getCookieValue(AUDIO_PREF_COOKIE);
     audioEnabled = (cookiePref === null) ? true : (cookiePref === "1");
     setAudioToggle(audioEnabled, false);
+    const previewAudioPref = getCookieValue(PREVIEW_GAME_AUDIO_PREF_COOKIE);
+    _previewGameAudioEnabled = (previewAudioPref === null) ? true : (previewAudioPref === "1");
+    if (chkPreviewGameAudioEl) {
+      chkPreviewGameAudioEl.checked = _previewGameAudioEnabled;
+      chkPreviewGameAudioEl.addEventListener("change", () => {
+        _previewGameAudioEnabled = !!chkPreviewGameAudioEl.checked;
+        setCookieValue(PREVIEW_GAME_AUDIO_PREF_COOKIE, _previewGameAudioEnabled ? "1" : "0");
+        _ensurePreviewVideoAudio();
+      });
+    }
     const kickAudioStart = () => {
       if (audioEnabled) ensureAudioPlaying();
       _ensurePreviewVideoAudio();
@@ -5175,6 +5311,7 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
             if path == "/api/game_preview":
                 since_seq = None
                 wait_timeout_s = 0.0
+                profile = "default"
                 try:
                     if "since" in query:
                         since_seq = int((query.get("since") or [0])[0])
@@ -5187,7 +5324,11 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                         wait_timeout_s = max(0.0, min(5.0, float(t_raw)))
                 except Exception:
                     wait_timeout_s = 0.0
-                self._send(state.game_preview_body(since_seq=since_seq, wait_timeout_s=wait_timeout_s), "application/json")
+                try:
+                    profile = _normalize_preview_profile((query.get("profile") or ["default"])[0])
+                except Exception:
+                    profile = "default"
+                self._send(state.game_preview_body(since_seq=since_seq, wait_timeout_s=wait_timeout_s, profile=profile), "application/json")
                 return
             if path == "/api/audio_playlist":
                 tracks = _list_audio_files()

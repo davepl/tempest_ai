@@ -67,7 +67,7 @@ def _add_entity(
 def test_aligned_fire_keeps_human_rescue_movement():
     state = _blank_state()
     _add_entity(state, "human", 0, 0, -20)
-    _add_entity(state, "grunt", 0, 40, 0)
+    _add_entity(state, "grunt", 1, 40, 0)
 
     move_dir, fire_dir = get_expert_action(state)
 
@@ -92,6 +92,16 @@ def test_axis_align_shortens_shorter_axis_once_no_humans_remain():
     move_dir, _ = get_expert_action(state)
 
     assert move_dir == 2
+
+
+def test_axis_align_keeps_vertical_alignment_when_enemy_directly_below():
+    state = _blank_state()
+    _add_entity(state, "grunt", 0, 0, 40)
+
+    move_dir, fire_dir = get_expert_action(state)
+
+    assert move_dir == 4
+    assert fire_dir == 4
 
 
 def test_final_hazard_repulsion_turns_move_away_from_close_hulk():

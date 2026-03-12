@@ -172,7 +172,7 @@ class RLConfigData:
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 5_000_000
+    memory_size: int = 15_000_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
@@ -203,10 +203,10 @@ class RLConfigData:
     epsilon: float = 1.0
 
     # Expert guidance
-    expert_ratio_start: float = 0.80
-    expert_ratio_end: float = 0.00
-    expert_ratio_decay_frames: int = 10_000_000
-    expert_ratio: float = 0.80
+    expert_ratio_start: float = 1.00
+    expert_ratio_end: float = 0.20
+    expert_ratio_decay_frames: int = 20_000_000
+    expert_ratio: float = 1.00
     # No special zoom handling for Robotron; keep multipliers neutral.
     expert_ratio_zoom_multiplier: float = 1.0
     expert_ratio_zoom_gamestate: int = 0x00
@@ -266,8 +266,17 @@ RL_CONFIG = RLConfigData()
 #  Game Settings (shared between dashboard, socket server, and LUA clients)
 # ---------------------------------------------------------------------------
 # Legacy dashboard list retained for compatibility with existing UI controls.
-# Robotron level-select mapping is not wired yet, so expose a simple placeholder range.
+# Robotron now accepts direct wave numbers 1..81 for curriculum/start-level control.
 ROBOTRON_SELECTABLE_LEVELS = list(range(1, 82))
+
+
+def compute_robotron_auto_curriculum_level(average_level: float) -> int:
+    """Map dashboard average level to the Robotron curriculum start wave."""
+    try:
+        avg = float(average_level)
+    except Exception:
+        avg = 1.0
+    return max(1, min(81, int(math.floor(avg)) - 3))
 
 class GameSettings:
     """Thread-safe container for operator-adjustable game settings."""

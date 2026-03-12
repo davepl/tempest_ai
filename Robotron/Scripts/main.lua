@@ -262,6 +262,36 @@ local pending_preview_h = 0
 local pending_preview_fmt = PREVIEW_FORMAT_RGB565
 local last_preview_capture_time_s = -1000000.0
 picture_bounds_cache = {}
+START_ADVANCED = false
+START_LEVEL_MIN = 1
+ACTION_RX_BUFFER = ""
+ROBOTRON_WAVE_FIELD_CSV = {
+    "20,15,15,15,15,15,15,15,15,15,14,14,14,14,14,13,13,13,13,13,14,14,14,14,14,14,13,13,13,13,13,13,12,12,12,12,12,12,15,12",
+    "9,7,6,5,5,5,5,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,3,3,4,3,3,3,3,3,3,3,3,3,4,3",
+    "10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11",
+    "30,28,26,24,22,20,18,18,16,14,14,14,14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,15,14,14,14,14,14,14,14,14,14,14,14",
+    "30,28,26,24,30,20,18,16,18,25,12,12,12,25,25,12,12,12,18,20,14,14,14,14,14,25,14,14,18,25,12,12,12,12,25,12,12,12,18,20",
+    "8,8,7,7,7,7,7,6,6,6,6,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5",
+    "64,64,64,64,64,40,40,38,38,38,38,38,38,38,38,38,36,36,36,36,32,32,32,32,32,32,32,30,30,30,30,30,25,25,25,25,25,25,25,25",
+    "8,8,8,8,8,7,7,7,7,7,7,7,7,7,7,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6",
+    "32,32,32,32,32,32,32,30,30,30,30,30,30,28,28,28,28,28,28,28,30,30,30,30,30,30,28,28,28,28,28,26,26,26,26,26,24,24,24,24",
+    "176,176,176,176,176,176,176,176,176,176,176,176,176,176,176,176,176,176,176,176,184,184,184,184,184,184,184,184,184,184,192,192,192,192,192,192,192,192,192,192",
+    "16,16,16,16,16,16,16,16,16,16,16,16,16,16,15,15,15,15,15,15,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14",
+    "50,50,50,50,50,50,50,50,50,50,50,50,56,56,56,56,56,56,56,56,56,56,56,56,56,56,56,56,60,60,60,60,60,60,60,60,60,60,60,60",
+}
+ROBOTRON_WAVE_COUNT_CSV = {
+    "15,17,22,34,20,32,0,35,60,25,35,0,35,27,25,35,0,35,70,25,35,0,35,0,25,35,0,35,75,25,35,0,35,30,27,35,0,35,80,30",
+    "5,15,25,25,20,25,0,25,0,20,25,0,25,5,20,25,0,25,0,20,25,0,25,0,20,25,0,25,0,20,25,0,25,0,15,25,0,25,0,15",
+    "1,1,2,2,15,3,4,3,3,0,3,3,3,5,0,3,3,3,3,8,3,3,3,3,25,3,3,3,3,0,3,3,3,3,0,3,3,3,3,10",
+    "1,1,2,2,0,3,4,3,3,22,3,3,3,5,0,3,3,3,3,8,3,3,3,3,0,3,3,3,3,25,3,3,3,3,0,3,3,3,3,10",
+    "0,1,2,2,1,3,4,3,3,0,3,3,3,5,22,3,3,3,3,8,3,3,3,3,1,3,3,3,3,0,3,3,3,3,25,3,3,3,3,10",
+    "0,5,6,7,0,7,12,8,4,0,8,13,8,20,2,3,14,8,3,2,8,15,8,13,1,8,16,8,4,1,8,16,8,25,2,8,16,8,6,2",
+    "0,0,0,0,15,0,0,0,0,20,0,0,0,0,20,0,0,0,0,20,0,0,0,0,21,0,0,0,0,22,0,0,0,0,23,0,0,0,0,25",
+    "0,1,3,4,1,4,0,5,5,1,5,0,5,2,1,5,0,5,5,2,5,0,5,6,1,5,0,5,5,1,5,0,5,2,1,5,0,5,5,1",
+    "0,0,0,0,0,0,10,0,0,0,0,12,0,0,0,0,12,0,0,0,0,12,0,7,0,0,12,1,1,1,1,13,1,2,2,2,14,2,1,1",
+}
+ROBOTRON_WAVE_FIELD_TABLES = nil
+ROBOTRON_WAVE_COUNT_TABLES = nil
 
 local function trace_enabled_for_frame(frame_idx)
     if not DEBUG_STARTUP_TRACE then
@@ -391,6 +421,99 @@ local function clamp11(v)
         return 1.0
     end
     return v
+end
+
+function parse_csv_u8_list(src)
+    local out = {}
+    if not src or src == "" then
+        return out
+    end
+    for token in string.gmatch(src, "([^,]+)") do
+        local value = math.floor(tonumber(token) or 0)
+        if value < 0 then
+            value = 0
+        elseif value > 255 then
+            value = 255
+        end
+        out[#out + 1] = value
+    end
+    return out
+end
+
+function ensure_robotron_wave_tables()
+    if ROBOTRON_WAVE_FIELD_TABLES and ROBOTRON_WAVE_COUNT_TABLES then
+        return
+    end
+
+    ROBOTRON_WAVE_FIELD_TABLES = {}
+    for i = 1, #ROBOTRON_WAVE_FIELD_CSV do
+        ROBOTRON_WAVE_FIELD_TABLES[i] = parse_csv_u8_list(ROBOTRON_WAVE_FIELD_CSV[i])
+    end
+
+    ROBOTRON_WAVE_COUNT_TABLES = {}
+    for i = 1, #ROBOTRON_WAVE_COUNT_CSV do
+        ROBOTRON_WAVE_COUNT_TABLES[i] = parse_csv_u8_list(ROBOTRON_WAVE_COUNT_CSV[i])
+    end
+end
+
+function robotron_wave_table_index(wave_number)
+    local wave = math.max(1, math.floor(tonumber(wave_number) or 1))
+    while wave > 40 do
+        wave = wave - 20
+    end
+    return wave
+end
+
+function robotron_build_enemy_bytes_for_wave(wave_number)
+    ensure_robotron_wave_tables()
+
+    local idx = robotron_wave_table_index(wave_number)
+    local bytes = {}
+
+    for table_idx = 1, #ROBOTRON_WAVE_FIELD_TABLES do
+        local values = ROBOTRON_WAVE_FIELD_TABLES[table_idx]
+        bytes[#bytes + 1] = values[idx] or values[#values] or 0
+    end
+
+    for table_idx = 1, #ROBOTRON_WAVE_COUNT_TABLES do
+        local values = ROBOTRON_WAVE_COUNT_TABLES[table_idx]
+        bytes[#bytes + 1] = values[idx] or values[#values] or 0
+    end
+
+    bytes[#bytes + 1] = 0
+    return bytes
+end
+
+function robotron_apply_start_wave_patch(memory, player_alive, score, wave_number)
+    if not START_ADVANCED then
+        return nil
+    end
+
+    local desired_wave = math.max(1, math.min(81, math.floor(tonumber(START_LEVEL_MIN) or 1)))
+    if desired_wave <= 1 then
+        return nil
+    end
+    if (player_alive or 0) ~= 0 then
+        return nil
+    end
+    if (score or 0) ~= 0 then
+        return nil
+    end
+    if math.floor(tonumber(wave_number) or 0) ~= 1 then
+        return nil
+    end
+
+    local bytes = robotron_build_enemy_bytes_for_wave(desired_wave)
+    if #bytes < 22 then
+        return nil
+    end
+
+    memory:write_u8(ZP1WAV_ADDR, desired_wave)
+    for i = 1, 22 do
+        memory:write_u8(ZP1ENM_ADDR + (i - 1), bytes[i])
+    end
+
+    return desired_wave
 end
 
 -- Game playfield bounds from RRF.ASM.  Coordinates are 8.8 fixed-point
@@ -1508,6 +1631,7 @@ local function close_socket()
         current_socket:close()
         current_socket = nil
     end
+    ACTION_RX_BUFFER = ""
     preview_stream_enabled = false
 end
 
@@ -1939,16 +2063,53 @@ local function process_frame_via_socket(frame_payload, frame_idx)
     trace_log(frame_idx, "socket_write_ok", "payload sent")
 
     local read_ok, read_result = pcall(function()
-        trace_log(frame_idx, "socket_read_begin", "waiting for 3-byte action")
+        trace_log(frame_idx, "socket_read_begin", "waiting for 3-byte or 5-byte action")
         local started = os.clock()
+        local legacy_buffer_ready_at = nil
+
         while (os.clock() - started) < SOCKET_READ_TIMEOUT_S do
-            local action_bytes = current_socket:read(3)
-            if action_bytes and #action_bytes == 3 then
-                local move_dir, fire_dir, source = string.unpack("bbB", action_bytes)
-                trace_log(frame_idx, "socket_read_ok", string.format("move=%d fire=%d src=%d", move_dir, fire_dir, source))
+            if #ACTION_RX_BUFFER >= 5 then
+                local action_bytes = string.sub(ACTION_RX_BUFFER, 1, 5)
+                ACTION_RX_BUFFER = string.sub(ACTION_RX_BUFFER, 6)
+                local move_dir, fire_dir, source, start_advanced, start_level_min = string.unpack("bbBBB", action_bytes)
+                START_ADVANCED = (start_advanced or 0) ~= 0
+                START_LEVEL_MIN = math.max(1, math.min(81, math.floor(start_level_min or 1)))
+                trace_log(
+                    frame_idx,
+                    "socket_read_ok",
+                    string.format(
+                        "move=%d fire=%d src=%d adv=%d level=%d",
+                        move_dir, fire_dir, source, start_advanced or 0, START_LEVEL_MIN
+                    )
+                )
                 return {move_dir, fire_dir, source}
             end
+
+            if #ACTION_RX_BUFFER == 3 then
+                if legacy_buffer_ready_at == nil then
+                    legacy_buffer_ready_at = os.clock() + 0.003
+                elseif os.clock() >= legacy_buffer_ready_at then
+                    local action_bytes = ACTION_RX_BUFFER
+                    ACTION_RX_BUFFER = ""
+                    local move_dir, fire_dir, source = string.unpack("bbB", action_bytes)
+                    trace_log(frame_idx, "socket_read_ok_legacy", string.format("move=%d fire=%d src=%d", move_dir, fire_dir, source))
+                    return {move_dir, fire_dir, source}
+                end
+            else
+                legacy_buffer_ready_at = nil
+            end
+
+            local need = 5 - #ACTION_RX_BUFFER
+            if need < 1 then
+                need = 1
+            end
+            local chunk = current_socket:read(need)
+            if chunk and #chunk > 0 then
+                ACTION_RX_BUFFER = ACTION_RX_BUFFER .. chunk
+            end
         end
+
+        ACTION_RX_BUFFER = ""
         trace_log(frame_idx, "socket_read_timeout", "using neutral action")
         return {-1, -1}
     end)
@@ -2146,6 +2307,20 @@ function frame_callback()
         return true
     end
 
+    local ok_patch, patched_wave_or_err = pcall(
+        robotron_apply_start_wave_patch,
+        mem,
+        frame.player_alive,
+        frame.score,
+        frame.wave_number
+    )
+    if not ok_patch then
+        trace_log(frame_counter, "curriculum_patch_error", tostring(patched_wave_or_err), true)
+    elseif patched_wave_or_err then
+        frame.wave_number = patched_wave_or_err
+        trace_log(frame_counter, "curriculum_patch", "applied start wave " .. tostring(patched_wave_or_err))
+    end
+
     local player_alive = frame.player_alive
     local rewards = compute_frame_rewards(frame)
     if player_alive == 0 then
@@ -2285,9 +2460,14 @@ previous_wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
 
 global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
 
--- Register HUD drawing AFTER video rendering so our overlay is not overwritten.
-emu.register_frame_done(frame_done_callback)
-print("[HUD] Registered frame_done callback for debug overlay + preview capture")
+-- Only the preview client needs the frame_done callback (HUD overlay + screenshot
+-- capture).  Training-only instances run with -video none, so registering this
+-- callback wastes CPU and would cause confusing duplicate log lines when many
+-- instances share a terminal.
+if PREVIEW_CLIENT_FLAG == 1 then
+    emu.register_frame_done(frame_done_callback)
+    print("[HUD] Registered frame_done callback for debug overlay + preview capture")
+end
 
 emu.add_machine_stop_notifier(on_mame_exit)
 

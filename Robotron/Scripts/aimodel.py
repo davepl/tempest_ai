@@ -430,6 +430,13 @@ def _closest_dir8(vx: float, vy: float, default_dir: int = 0) -> int:
 
 def _axis_align_toward_enemy(ex_world: float, ey_world: float) -> int:
     """Move toward enemy on the smaller-offset axis (x or y)."""
+    # If we are already aligned on one axis, move along the other axis
+    # instead of introducing unnecessary lateral drift.
+    if abs(ex_world) <= _ALIGN_HALF_WINDOW_WORLD:
+        return _closest_dir8(0.0, 1.0 if ey_world >= 0.0 else -1.0, default_dir=0)
+    if abs(ey_world) <= _ALIGN_HALF_WINDOW_WORLD:
+        return _closest_dir8(1.0 if ex_world >= 0.0 else -1.0, 0.0, default_dir=0)
+
     if abs(ex_world) <= abs(ey_world):
         vx = 1.0 if ex_world >= 0.0 else -1.0
         vy = 0.0

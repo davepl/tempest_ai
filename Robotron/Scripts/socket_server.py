@@ -21,7 +21,7 @@ from aimodel import (
     split_joint_action,
     SafeMetrics,
 )
-from config import RL_CONFIG, SERVER_CONFIG, metrics
+from config import RL_CONFIG, SERVER_CONFIG, metrics, game_settings
 
 try:
     from nstep_buffer import NStepReplayBuffer
@@ -328,12 +328,15 @@ class SocketServer:
         preview_enabled: bool,
         hud_enabled: bool,
     ) -> bytes:
+        gs = game_settings.snapshot()
+        start_advanced = 1 if bool(gs.get("start_advanced", False)) else 0
+        start_level_min = max(1, min(81, int(gs.get("start_level_min", 1) or 1)))
         source_u8 = (
             (int(source_code) & 0x0F)
             | cls._source_preview_flag(bool(preview_enabled))
             | cls._source_hud_flag(bool(hud_enabled))
         )
-        return struct.pack("bbB", int(move_cmd), int(fire_cmd), int(source_u8))
+        return struct.pack("bbBBB", int(move_cmd), int(fire_cmd), int(source_u8), int(start_advanced), int(start_level_min))
 
     @staticmethod
     def _clear_preview_cache() -> None:
@@ -914,7 +917,7 @@ class SocketServer:
         try:
             with self.client_lock:
                 lvls = [s.get("level_number", 0) for s in self.client_states.values()
-                        if 0 < s.get("level_number", 0) <= 40]
+                        if 0 < s.get("level_number", 0) <= 81]
                 metrics.average_level = sum(lvls) / len(lvls) if lvls else 0
                 for lv in lvls:
                     if lv > metrics.peak_level:
