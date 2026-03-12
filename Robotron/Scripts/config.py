@@ -185,6 +185,16 @@ class RLConfigData:
     per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
     # Delay training until replay has enough diversity for stable updates.
     min_replay_to_train: int = 25_000
+    # Wave-aware replay quotas: preserve frontier/high-wave DQN experience so
+    # it does not get drowned by abundant easy-wave traffic.
+    replay_wave_sampling_enabled: bool = True
+    replay_wave_frontier_frac: float = 0.35
+    replay_wave_high_frac: float = 0.15
+    replay_wave_frontier_margin: int = 1
+    replay_wave_high_offset: int = 2
+    replay_wave_candidate_multiplier: int = 10
+    replay_wave_min_frontier: int = 4
+    replay_expert_max_frac: float = 0.35
 
     # Target network (periodic hard sync; moderate refresh for stable learning)
     target_update_period: int = 2_500
@@ -200,6 +210,17 @@ class RLConfigData:
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000
+    # Automatic plateau pulser: temporarily raises epsilon and forces
+    # frontier starts when DQN reward and reached-wave metrics stop improving.
+    plateau_pulse_enabled: bool = True
+    plateau_pulse_epsilon: float = 0.14
+    plateau_pulse_frames: int = 300_000
+    plateau_confirm_frames: int = 1_000_000
+    plateau_cooldown_frames: int = 1_500_000
+    plateau_min_frame: int = 4_000_000
+    plateau_reward_delta: float = 0.75
+    plateau_level_delta: float = 0.25
+    plateau_curriculum_wave_offset: int = 1
     epsilon: float = 1.0
 
     # Expert guidance
@@ -552,6 +573,10 @@ class MetricsData:
                     self.epsilon = max(base, float(RL_CONFIG.manual_pulse_epsilon))
             else:
                 self.epsilon = base
+            try:
+                self.epsilon = max(self.epsilon, float(plateau_pulser.epsilon_floor()))
+            except Exception:
+                pass
             return self.epsilon
 
     def get_expert_ratio(self):
@@ -713,24 +738,150 @@ class MetricsData:
 metrics = MetricsData()
 
 
-# ── PlateauPulser stub ──────────────────────────────────────────────────────
-# Provides the interface expected by the dashboard, backed by our manual pulse.
 class PlateauPulser:
-    WATCHING   = "watching"
-    PULSING    = "pulsing"
+    WATCHING = "watching"
+    PULSING = "pulsing"
     RECOVERING = "recovering"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = self.WATCHING
+        self._total_pulses = 0
+        self._stall_start_frame = 0
+        self._best_reward = float("-inf")
+        self._best_level = 0.0
+        self._pulse_target_level = 1
+        self.pulse_start_frame = 0
+        self.pulse_end_frame = 0
+        self.recovery_end_frame = 0
+        self.cooldown_multiplier = 1.0
 
     @property
     def state(self) -> str:
-        return self.PULSING if metrics.manual_pulse_active else self.WATCHING
+        with self._lock:
+            state = self._state
+        if state == self.WATCHING and getattr(metrics, "manual_pulse_active", False):
+            return self.PULSING
+        return state
 
     @property
     def total_pulses(self) -> int:
-        return 0                       # manual pulse doesn't track lifetime count
+        with self._lock:
+            return int(self._total_pulses)
 
-    pulse_start_frame: int = 0
-    pulse_end_frame: int = 0
-    cooldown_multiplier: float = 1.0
+    def remaining_frames(self) -> int:
+        with self._lock:
+            auto_remaining = 0
+            if self._state == self.PULSING:
+                auto_remaining = max(0, int(self.pulse_end_frame - metrics.frame_count))
+        manual_remaining = int(getattr(metrics, "manual_pulse_frames_remaining", 0) or 0)
+        return max(auto_remaining, manual_remaining)
+
+    def epsilon_floor(self) -> float:
+        with self._lock:
+            if self._state != self.PULSING or not bool(getattr(RL_CONFIG, "plateau_pulse_enabled", False)):
+                return 0.0
+        return max(0.0, min(1.0, float(getattr(RL_CONFIG, "plateau_pulse_epsilon", 0.0))))
+
+    def overlay_game_settings(self, snapshot: dict, average_level: float) -> dict:
+        out = dict(snapshot or {})
+        with self._lock:
+            if self._state != self.PULSING or not bool(getattr(RL_CONFIG, "plateau_pulse_enabled", False)):
+                return out
+            pulse_level = int(self._pulse_target_level)
+        pulse_level = max(
+            pulse_level,
+            compute_robotron_auto_curriculum_level(float(average_level)) + int(getattr(RL_CONFIG, "plateau_curriculum_wave_offset", 1)),
+        )
+        pulse_level = max(int(getattr(RL_CONFIG, "replay_wave_min_frontier", 4)), pulse_level)
+        out["start_advanced"] = True
+        out["start_level_min"] = max(int(out.get("start_level_min", 1) or 1), max(1, min(81, pulse_level)))
+        return out
+
+    def _set_watch_baseline(self, frame_count: int, average_level: float, reward_1m: float) -> None:
+        self._best_reward = float(reward_1m)
+        self._best_level = float(average_level)
+        self._stall_start_frame = max(0, int(frame_count))
+
+    def update(self, frame_count: int, average_level: float, dqn100k: float, dqn1m: float, dqn5m: float) -> None:
+        del dqn100k, dqn5m  # The trigger currently uses the steadier 1M reward window plus reached-wave frontier.
+
+        cfg = RL_CONFIG
+        if not bool(getattr(cfg, "plateau_pulse_enabled", False)):
+            with self._lock:
+                self._state = self.WATCHING
+            return
+
+        fc = max(0, int(frame_count))
+        try:
+            avg = float(average_level)
+        except Exception:
+            avg = 0.0
+        try:
+            reward_1m = float(dqn1m)
+        except Exception:
+            reward_1m = 0.0
+        if not math.isfinite(avg):
+            avg = 0.0
+        if not math.isfinite(reward_1m):
+            reward_1m = 0.0
+        reward_delta = max(0.0, float(getattr(cfg, "plateau_reward_delta", 0.0)))
+        level_delta = max(0.0, float(getattr(cfg, "plateau_level_delta", 0.0)))
+
+        with self._lock:
+            if self._state == self.PULSING:
+                if fc >= self.pulse_end_frame:
+                    self._state = self.RECOVERING
+                    cooldown_frames = int(getattr(cfg, "plateau_cooldown_frames", 0))
+                    self.recovery_end_frame = fc + max(1, int(cooldown_frames * self.cooldown_multiplier))
+                    self._set_watch_baseline(fc, avg, reward_1m)
+                return
+
+            if self._state == self.RECOVERING:
+                if reward_1m >= (self._best_reward + reward_delta) or avg >= (self._best_level + level_delta):
+                    self.cooldown_multiplier = max(1.0, self.cooldown_multiplier * 0.85)
+                    self._set_watch_baseline(fc, avg, reward_1m)
+                if fc >= self.recovery_end_frame:
+                    self._state = self.WATCHING
+                    self._set_watch_baseline(fc, avg, reward_1m)
+                return
+
+            if self._stall_start_frame <= 0 or not math.isfinite(self._best_reward):
+                self._set_watch_baseline(fc, avg, reward_1m)
+                return
+
+            if fc < int(getattr(cfg, "plateau_min_frame", 0)):
+                if reward_1m >= (self._best_reward + reward_delta) or avg >= (self._best_level + level_delta):
+                    self._set_watch_baseline(fc, avg, reward_1m)
+                return
+
+            improved = False
+            if reward_1m >= (self._best_reward + reward_delta):
+                self._best_reward = reward_1m
+                improved = True
+            if avg >= (self._best_level + level_delta):
+                self._best_level = avg
+                improved = True
+            if improved:
+                self._stall_start_frame = fc
+                self.cooldown_multiplier = max(1.0, self.cooldown_multiplier * 0.95)
+                return
+
+            if (fc - self._stall_start_frame) < int(getattr(cfg, "plateau_confirm_frames", 0)):
+                return
+
+            self._state = self.PULSING
+            self._total_pulses += 1
+            self.pulse_start_frame = fc
+            self.pulse_end_frame = fc + max(1, int(getattr(cfg, "plateau_pulse_frames", 0)))
+            frontier_wave = max(1, min(81, int(math.floor(avg)) + int(getattr(cfg, "plateau_curriculum_wave_offset", 1))))
+            self._pulse_target_level = max(
+                int(getattr(cfg, "replay_wave_min_frontier", 4)),
+                frontier_wave,
+                compute_robotron_auto_curriculum_level(avg) + int(getattr(cfg, "plateau_curriculum_wave_offset", 1)),
+            )
+            self.cooldown_multiplier = min(3.0, self.cooldown_multiplier + 0.15)
+            self._stall_start_frame = fc
 
 
 plateau_pulser = PlateauPulser()

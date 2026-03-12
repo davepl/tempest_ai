@@ -542,9 +542,9 @@ class _DashboardState:
             "agreement_1m": agreement_1m,
             "model_desc": self._get_model_desc(),
             "pulse_state": plateau_pulser.state,
-            "pulse_remaining": int(self.metrics.manual_pulse_frames_remaining),
+            "pulse_remaining": int(plateau_pulser.remaining_frames()),
             "pulse_count": plateau_pulser.total_pulses,
-            "pulse_enabled": True,  # manual pulse is always available
+            "pulse_enabled": bool(getattr(RL_CONFIG, "plateau_pulse_enabled", False)),
             "game_settings": game_settings.snapshot(),
             "preview_capture_enabled": bool(getattr(self.metrics, "preview_capture_enabled", True)),
             "hud_enabled": bool(getattr(self.metrics, "hud_enabled", True)),
@@ -552,9 +552,9 @@ class _DashboardState:
 
     @staticmethod
     def _pulse_remaining(frame_count: int) -> int:
-        """Frames remaining in current manual pulse, 0 if idle."""
-        from config import metrics as _m
-        return int(_m.manual_pulse_frames_remaining)
+        """Frames remaining in current pulse, 0 if idle."""
+        del frame_count
+        return int(plateau_pulser.remaining_frames())
 
     def sample(self):
         with self.lock:

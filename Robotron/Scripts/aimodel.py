@@ -113,6 +113,29 @@ def _random_move_fire() -> Tuple[int, int]:
     return random.randrange(NUM_MOVE), random.randrange(NUM_FIRE)
 
 
+def compute_scheduled_lr(step: int, cfg=RL_CONFIG) -> float:
+    """Compute the optimizer LR for a given training step."""
+    step_i = max(0, int(step))
+    lr_max = max(0.0, float(getattr(cfg, "lr", 0.0)))
+    lr_min = max(0.0, float(getattr(cfg, "lr_min", 0.0)))
+    if lr_min > lr_max:
+        lr_min = lr_max
+
+    warmup_steps = max(0, int(getattr(cfg, "lr_warmup_steps", 0)))
+    if warmup_steps > 0 and step_i < warmup_steps:
+        frac = float(step_i + 1) / float(warmup_steps)
+        return lr_min + (lr_max - lr_min) * frac
+
+    decay_horizon = max(1, int(getattr(cfg, "lr_cosine_period", 1)))
+    after_warmup = max(0, step_i - warmup_steps)
+    if bool(getattr(cfg, "lr_use_restarts", False)):
+        t = after_warmup % decay_horizon
+    else:
+        t = min(after_warmup, decay_horizon)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * t / decay_horizon))
+    return lr_min + (lr_max - lr_min) * cosine
+
+
 def combine_action_indices(move_dir: int, fire_dir: int) -> int:
     move_dir = max(0, min(NUM_MOVE - 1, int(move_dir)))
     fire_dir = max(0, min(NUM_FIRE - 1, int(fire_dir)))
@@ -368,6 +391,22 @@ _MOVE_SAFETY_LOOKAHEAD_PX = 10.0
 _MOVE_SAFETY_PATH_RADIUS_PX = 2.0
 _MOVE_SAFETY_LOOKAHEAD_WORLD = _MOVE_SAFETY_LOOKAHEAD_PX * _WORLD_UNITS_PER_PIXEL
 _MOVE_SAFETY_PATH_RADIUS_WORLD = _MOVE_SAFETY_PATH_RADIUS_PX * _WORLD_UNITS_PER_PIXEL
+_HIGH_WAVE_THRESHOLD = 6
+_BRAIN_GUARD_WAVE = 4
+_LOCAL_PRESSURE_DIST = 0.13
+_LOCAL_PRESSURE_HEAVY = 1.55
+_CENTER_PULL_WALL_X = 0.16
+_CENTER_PULL_WALL_Y = 0.12
+_PRIORITY_TARGET_BONUS = {
+    "grunt": 0.20,
+    "hulk": -0.20,
+    "brain": 1.25,
+    "tank": 0.55,
+    "spawner": 0.65,
+    "enforcer": 0.80,
+    "projectile": 1.40,
+    "electrode": -0.65,
+}
 
 # 16 screen-pixels = 4096 x16-units, normalised per axis.
 # The outer 16 px of the playfield is "lava" — never move into it.
@@ -591,6 +630,190 @@ def _token_category_name(tok: np.ndarray) -> str:
     idx = int(round(float(tok[11]) * max(1, len(_CATEGORY_NAMES) - 1)))
     idx = max(0, min(len(_CATEGORY_NAMES) - 1, idx))
     return _CATEGORY_NAMES[idx]
+
+
+def _wave_number_from_state(state: np.ndarray) -> int:
+    globals_, _, _ = _split_latest_sections(state)
+    if globals_ is None or globals_.shape[0] < 5:
+        return 1
+    try:
+        wave_norm = float(globals_[4])
+    except Exception:
+        wave_norm = 0.0
+    if not np.isfinite(wave_norm):
+        wave_norm = 0.0
+    return max(1, min(40, int(round(max(0.0, min(1.0, wave_norm)) * 40.0))))
+
+
+def _player_position_from_state(state: np.ndarray) -> tuple[float, float]:
+    globals_, _, _ = _split_latest_sections(state)
+    if globals_ is None or globals_.shape[0] < 7:
+        return 0.5, 0.5
+    try:
+        px = float(globals_[5])
+        py = float(globals_[6])
+    except Exception:
+        return 0.5, 0.5
+    if not np.isfinite(px):
+        px = 0.5
+    if not np.isfinite(py):
+        py = 0.5
+    return max(0.0, min(1.0, px)), max(0.0, min(1.0, py))
+
+
+def _center_vector_from_state(state: np.ndarray) -> tuple[float, float]:
+    px, py = _player_position_from_state(state)
+    return (0.5 - px) * _REL_POS_X_RANGE, (0.5 - py) * _REL_POS_Y_RANGE
+
+
+def _category_count_from_state(state: np.ndarray, category: str) -> int:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return 0
+    total = 0
+    for tok in toks:
+        if _token_category_name(tok) == category:
+            total += 1
+    return total
+
+
+def _nearest_category_vector_from_state(
+    state: np.ndarray,
+    categories: set[str] | frozenset[str],
+) -> Optional[Tuple[float, float, float]]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+    best = None
+    for tok in toks:
+        if _token_category_name(tok) not in categories:
+            continue
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
+    return best
+
+
+def _local_pressure_from_state(state: np.ndarray) -> tuple[float, int]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return 0.0, 0
+    pressure = 0.0
+    danger_count = 0
+    for tok in toks:
+        if tok[12] > 0.5 or tok[13] < 0.5:
+            continue
+        dist = float(tok[5])
+        if not np.isfinite(dist) or dist > _LOCAL_PRESSURE_DIST:
+            continue
+        name = _token_category_name(tok)
+        threat = float(tok[8]) if np.isfinite(float(tok[8])) else 0.0
+        weight = threat
+        if name == "projectile":
+            weight += 0.55
+        elif name == "brain":
+            weight += 0.65
+        elif name == "enforcer":
+            weight += 0.35
+        elif name == "tank":
+            weight += 0.20
+        pressure += max(0.0, weight) * (1.0 - (dist / _LOCAL_PRESSURE_DIST))
+        danger_count += 1
+    return pressure, danger_count
+
+
+def _priority_target_vector_from_state(
+    state: np.ndarray,
+    wave_number: int,
+    num_humans: int,
+) -> Optional[Tuple[float, float, float, str]]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+    best = None
+    best_score = -1e30
+    for tok in toks:
+        if tok[12] > 0.5:
+            continue
+        name = _token_category_name(tok)
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        dx = float(tok[1])
+        dy = float(tok[2])
+        threat = float(tok[8]) if np.isfinite(float(tok[8])) else 0.0
+        approach = max(0.0, min(1.0, float(tok[14]) if np.isfinite(float(tok[14])) else 0.0))
+        score = (1.15 - min(1.0, dist)) + threat + _PRIORITY_TARGET_BONUS.get(name, 0.0)
+        score += 0.45 * approach
+        if name == "brain" and num_humans > 0:
+            score += 0.85
+        if name == "projectile" and dist <= (_PROJECTILE_DANGER_DIST * 1.6):
+            score += 0.90
+        if name == "enforcer" and wave_number >= _HIGH_WAVE_THRESHOLD:
+            score += 0.35
+        if name == "spawner" and wave_number >= (_HIGH_WAVE_THRESHOLD + 2):
+            score += 0.30
+        if best is None or score > best_score:
+            best = (dx, dy, dist, name)
+            best_score = score
+    return best
+
+
+def _priority_aligned_fire_direction_from_state(
+    state: np.ndarray,
+    wave_number: int,
+    num_humans: int,
+) -> Optional[int]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+
+    per_direction: list[Optional[tuple[float, int]]] = [None] * len(_DIR8_VECTORS)
+    for tok in toks:
+        name = _token_category_name(tok)
+        if name == "human":
+            continue
+        dx = float(tok[1])
+        dy = float(tok[2])
+        dist = float(tok[5])
+        if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(dist)):
+            continue
+
+        world_dx = dx * _REL_POS_X_RANGE
+        world_dy = dy * _REL_POS_Y_RANGE
+        world_dist = math.hypot(world_dx, world_dy)
+        threat = float(tok[8]) if np.isfinite(float(tok[8])) else 0.0
+        base_score = (1.10 - min(1.0, dist)) + threat + _PRIORITY_TARGET_BONUS.get(name, 0.0)
+        if name == "brain" and num_humans > 0:
+            base_score += 0.85
+        if name == "projectile" and dist <= (_PROJECTILE_DANGER_DIST * 1.6):
+            base_score += 0.90
+        if name == "enforcer" and wave_number >= _HIGH_WAVE_THRESHOLD:
+            base_score += 0.35
+
+        for fire_dir, (dir_x, dir_y) in enumerate(_DIR8_VECTORS):
+            forward = (world_dx * dir_x) + (world_dy * dir_y)
+            if forward <= 0.0:
+                continue
+            perp = abs((world_dx * dir_y) - (world_dy * dir_x))
+            if perp > _ALIGN_HALF_WINDOW_WORLD:
+                continue
+            score = base_score + (0.35 * (1.0 - min(1.0, world_dist / 32768.0)))
+            best_dir = per_direction[fire_dir]
+            if best_dir is None or score > best_dir[0]:
+                per_direction[fire_dir] = (score, fire_dir)
+
+    best_aligned: Optional[tuple[float, int]] = None
+    for candidate in per_direction:
+        if candidate is None:
+            continue
+        if best_aligned is None or candidate[0] > best_aligned[0]:
+            best_aligned = candidate
+    if best_aligned is None:
+        return None
+    return int(best_aligned[1])
 
 
 def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -999,26 +1222,47 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
     """Heuristic Robotron expert.
 
     Fire:
-        1) If any enemy/projectile is aligned with one of the 8 fire directions
-           within an 8 px half-window, shoot the closest aligned target.
-        2) Otherwise, fallback to shooting the nearest enemy.
+        1) Prefer aligned high-priority threats (projectiles, brains near humans,
+           enforcers/spawners on later waves).
+        2) Otherwise, fallback to the highest-priority visible threat.
      Move priority:
-        1) Rescue humans when safe (no close threat within ~12 px).
-        2) Flee close threats (including hulks) when enemy is within ~12 px.
-        3) If still safe and no human rescue target, align to nearest non-hulk
-            robot (brain/tank/spawner/enforcer) on the smaller axis offset.
-        4) Otherwise, fallback to fleeing nearest enemy.
+        1) Flee close threats, mixing in a center pull on hard/high-pressure waves.
+        2) Guard humans from brains before chasing rescues on later waves.
+        3) When safe, rescue humans or align to a firing lane on priority targets.
+        4) Bias back toward center when pressure rises near the walls.
     """
+    wave_number = _wave_number_from_state(state)
+    high_wave = wave_number >= _HIGH_WAVE_THRESHOLD
+    num_humans = _category_count_from_state(state, "human")
     nearest_enemy = _nearest_enemy_vector_from_state(state)
     nearest_projectile = _nearest_projectile_vector_from_state(state)
     nearest_align_robot = _nearest_align_robot_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
+    nearest_brain = _nearest_category_vector_from_state(state, {"brain"})
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
-    aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
+    aligned_fire_dir = _priority_aligned_fire_direction_from_state(state, wave_number, num_humans)
+    priority_target = _priority_target_vector_from_state(state, wave_number, num_humans)
+    pressure, _danger_count = _local_pressure_from_state(state)
+    center_x, center_y = _center_vector_from_state(state)
+    px, py = _player_position_from_state(state)
+    near_wall = (
+        px <= _CENTER_PULL_WALL_X
+        or px >= (1.0 - _CENTER_PULL_WALL_X)
+        or py <= _CENTER_PULL_WALL_Y
+        or py >= (1.0 - _CENTER_PULL_WALL_Y)
+    )
+    brain_guard_active = (
+        nearest_brain is not None
+        and num_humans > 0
+        and wave_number >= _BRAIN_GUARD_WAVE
+    )
 
     # ── Fire direction ───────────────────────────────────────────────
     if aligned_fire_dir is not None:
         fire_dir = int(aligned_fire_dir)
+    elif priority_target is not None:
+        fx, fy, _fd, _cat = priority_target
+        fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
     elif nearest_projectile is not None and (
         nearest_enemy is None or nearest_projectile[2] <= max(nearest_enemy[2], _PROJECTILE_DANGER_DIST)
     ):
@@ -1047,21 +1291,56 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
 
         # 1) Flee close threats first (including hulks).
         if is_close_threat:
-            move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
-        # 2) Safe to rescue: prioritize humans when available.
+            flee_x = -ex_world
+            flee_y = -ey_world
+            if high_wave or pressure >= _LOCAL_PRESSURE_HEAVY or near_wall:
+                flee_x += center_x * 0.75
+                flee_y += center_y * 0.75
+            move_dir = _closest_dir8(flee_x, flee_y, default_dir=0)
+        # 2) On harder waves, cut off brains before committing to rescues.
+        elif brain_guard_active and nearest_brain is not None and pressure < (_LOCAL_PRESSURE_HEAVY * 1.15):
+            bx, by, _ = nearest_brain
+            brain_x = bx * _REL_POS_X_RANGE
+            brain_y = by * _REL_POS_Y_RANGE
+            if near_wall:
+                brain_x += center_x * 0.35
+                brain_y += center_y * 0.35
+            move_dir = _axis_align_toward_enemy(brain_x, brain_y)
+        # 3) Safe to rescue: prioritize humans when available.
         elif nearest_human is not None:
             hx, hy, _ = nearest_human
-            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
-        # 3) Safe standoff: align on one axis with nearest non-hulk robot.
+            rescue_x = hx * _REL_POS_X_RANGE
+            rescue_y = hy * _REL_POS_Y_RANGE
+            if high_wave and near_wall:
+                rescue_x += center_x * 0.45
+                rescue_y += center_y * 0.45
+            move_dir = _closest_dir8(rescue_x, rescue_y)
+        # 4) Safe standoff: align on one axis with nearest non-hulk robot.
         elif nearest_align_robot is not None:
             ax, ay, _ = nearest_align_robot
-            move_dir = _axis_align_toward_enemy(ax * _REL_POS_X_RANGE, ay * _REL_POS_Y_RANGE)
+            align_x = ax * _REL_POS_X_RANGE
+            align_y = ay * _REL_POS_Y_RANGE
+            if high_wave and near_wall:
+                align_x += center_x * 0.35
+                align_y += center_y * 0.35
+            move_dir = _axis_align_toward_enemy(align_x, align_y)
         else:
-            # 4) Fallback: flee nearest enemy.
-            move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
+            # 5) Fallback: flee nearest enemy, but step back toward center when pressured.
+            flee_x = -ex_world
+            flee_y = -ey_world
+            if high_wave or pressure >= _LOCAL_PRESSURE_HEAVY or near_wall:
+                flee_x += center_x * 0.85
+                flee_y += center_y * 0.85
+            move_dir = _closest_dir8(flee_x, flee_y, default_dir=0)
     elif nearest_human is not None:
         hx, hy, _ = nearest_human
-        move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        if brain_guard_active and nearest_brain is not None:
+            bx, by, _ = nearest_brain
+            move_dir = _axis_align_toward_enemy(bx * _REL_POS_X_RANGE, by * _REL_POS_Y_RANGE)
+        else:
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+    elif (high_wave or pressure > 0.0) and near_wall:
+        move_dir = _closest_dir8(center_x, center_y, default_dir=_move_idle_action_index())
     else:
         move_dir = _move_idle_action_index()
 
@@ -1643,18 +1922,7 @@ class RainbowAgent:
 
     # ── LR schedule ─────────────────────────────────────────────────────
     def get_lr(self) -> float:
-        cfg = RL_CONFIG
-        step = self.training_steps
-        if step < cfg.lr_warmup_steps:
-            return cfg.lr * (step + 1) / max(1, cfg.lr_warmup_steps)
-        decay_horizon = max(1, cfg.lr_cosine_period)
-        if bool(getattr(cfg, "lr_use_restarts", False)):
-            t = (step - cfg.lr_warmup_steps) % decay_horizon
-        else:
-            # Monotonic cosine decay: reach lr_min, then stay there.
-            t = min(step - cfg.lr_warmup_steps, decay_horizon)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * t / decay_horizon))
-        return cfg.lr_min + (cfg.lr - cfg.lr_min) * cosine
+        return compute_scheduled_lr(self.training_steps, RL_CONFIG)
 
     def _update_lr(self):
         lr = self.get_lr()
@@ -1858,7 +2126,8 @@ class RainbowAgent:
         return actions
 
     # ── Step (add experience) ───────────────────────────────────────────
-    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None):
+    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1,
+             priority_reward=None, wave_number=1, start_wave=1):
         if isinstance(action, (tuple, list)) and len(action) >= 2:
             action_idx = combine_action_indices(action[0], action[1])
         else:
@@ -1870,7 +2139,18 @@ class RainbowAgent:
             boost = float(getattr(RL_CONFIG, 'death_priority_boost', 0.0))
             if boost > 0:
                 pri = max(abs(pri), boost) * (-1.0 if pri < 0 else 1.0)
-        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri)
+        self.memory.add(
+            state,
+            action_idx,
+            float(reward),
+            next_state,
+            bool(done),
+            int(horizon),
+            is_expert,
+            priority_hint=pri,
+            wave_number=int(wave_number),
+            start_wave=int(start_wave),
+        )
         # Return the index of the just-written transition for pre-death tracking
         try:
             return int(self.memory.tree.data_ptr - 1) % self.memory.capacity

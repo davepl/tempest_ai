@@ -77,7 +77,19 @@ def train_step(agent, prefetched_batch=None) -> float | None:
     if batch is None:
         return None
 
-    states, actions, rewards, next_states, dones, horizons, is_expert, indices, weights = batch
+    (
+        states,
+        actions,
+        rewards,
+        next_states,
+        dones,
+        horizons,
+        is_expert,
+        _wave_numbers,
+        _start_waves,
+        indices,
+        weights,
+    ) = batch
 
     states_t      = torch.from_numpy(states).float().to(device)
     actions_t     = torch.from_numpy(actions).long().to(device)

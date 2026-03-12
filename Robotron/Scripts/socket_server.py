@@ -21,7 +21,7 @@ from aimodel import (
     split_joint_action,
     SafeMetrics,
 )
-from config import RL_CONFIG, SERVER_CONFIG, metrics, game_settings
+from config import RL_CONFIG, SERVER_CONFIG, metrics, game_settings, plateau_pulser
 
 try:
     from nstep_buffer import NStepReplayBuffer
@@ -35,11 +35,13 @@ try:
         add_episode_to_dqn5m_window,
         add_episode_to_total_windows,
         add_episode_to_eplen_window,
+        get_dqn_window_averages,
     )
 except ImportError:
     add_episode_to_dqn100k_window = add_episode_to_dqn1m_window = add_episode_to_dqn5m_window = lambda *a: None
     add_episode_to_total_windows = lambda *a: None
     add_episode_to_eplen_window = lambda *a: None
+    get_dqn_window_averages = lambda: (0.0, 0.0, 0.0)
 
 _ACTION_DIAGNOSTICS = os.getenv("ROBOTRON_ACTION_DIAGNOSTICS", "").strip().lower() not in {"", "0", "false", "off", "no"}
 try:
@@ -329,6 +331,7 @@ class SocketServer:
         hud_enabled: bool,
     ) -> bytes:
         gs = game_settings.snapshot()
+        gs = plateau_pulser.overlay_game_settings(gs, float(getattr(metrics, "average_level", 0.0) or 0.0))
         start_advanced = 1 if bool(gs.get("start_advanced", False)) else 0
         start_level_min = max(1, min(81, int(gs.get("start_level_min", 1) or 1)))
         source_u8 = (
@@ -474,6 +477,7 @@ class SocketServer:
                 "ep_subj_reward": 0.0, "ep_obj_reward": 0.0, "ep_frames": 0,
                 "was_done": False, "nstep": nstep,
                 "state_stack": deque(maxlen=FRAME_STACK),
+                "episode_start_wave": 1, "last_wave_number": 1,
                 "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
                 "last_alive_game_score": 0, "prev_game_final_score": 0,
                 "preview_claimed": False,
@@ -619,10 +623,17 @@ class SocketServer:
                 # attract/death downtime does not decay epsilon.
                 active_delta = 1 if frame.player_alive else 0
                 self.metrics.update_frame_count(delta=active_delta)
+                self._calc_avg_level()
+                if frame.player_alive and not cs.get("last_player_alive", False):
+                    cs["episode_start_wave"] = max(1, int(frame.level_number or 1))
                 if active_delta:
+                    try:
+                        dqn100k, dqn1m, dqn5m = get_dqn_window_averages()
+                    except Exception:
+                        dqn100k = dqn1m = dqn5m = 0.0
+                    plateau_pulser.update(int(metrics.frame_count), float(metrics.average_level), dqn100k, dqn1m, dqn5m)
                     self.metrics.update_epsilon()
                     self.metrics.update_expert_ratio()
-                self._calc_avg_level()
                 self.metrics.update_game_state(0, False)
                 stacked_state = _push_stacked_state(cs, frame.state)
 
@@ -645,19 +656,26 @@ class SocketServer:
                         nstep = cs.get("nstep")
                         if nstep is not None:
                             joint = combine_action_indices(move_i, fire_i)
-                            matured = nstep.add(cs["last_state"], joint, total_r,
-                                                stacked_state, bool(frame.done),
-                                                actor=tag, priority_reward=total_r)
-                            for s0, a, Rn, pR, sn, dn, h, act in matured:
+                            matured = nstep.add(
+                                cs["last_state"], joint, total_r,
+                                stacked_state, bool(frame.done),
+                                actor=tag, priority_reward=total_r,
+                                wave_number=int(cs.get("last_wave_number", frame.level_number or 1)),
+                                start_wave=int(cs.get("episode_start_wave", 1)),
+                            )
+                            for s0, a, Rn, pR, sn, dn, h, act, wave_n, start_w in matured:
                                 move_n, fire_n = split_joint_action(a)
                                 self.async_buffer.step_async(
                                     s0, (move_n, fire_n), Rn, sn, bool(dn),
-                                    client_id=cid, actor=act, horizon=int(h), priority_reward=pR)
+                                    client_id=cid, actor=act, horizon=int(h), priority_reward=pR,
+                                    wave_number=int(wave_n), start_wave=int(start_w))
                         else:
                             self.async_buffer.step_async(
                                 cs["last_state"], (move_i, fire_i), total_r,
                                 stacked_state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
-                                priority_reward=total_r)
+                                priority_reward=total_r,
+                                wave_number=int(cs.get("last_wave_number", frame.level_number or 1)),
+                                start_wave=int(cs.get("episode_start_wave", 1)))
 
                     cs["total_reward"] += total_r
                     cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + subj_r
@@ -690,6 +708,8 @@ class SocketServer:
                             add_episode_to_dqn5m_window(cs["ep_dqn_reward"], cs.get("ep_frames", 0))
                             add_episode_to_total_windows(cs["total_reward"], cs.get("ep_frames", 0))
                             add_episode_to_eplen_window(cs.get("ep_frames", 0))
+                            dqn100k, dqn1m, dqn5m = get_dqn_window_averages()
+                            plateau_pulser.update(int(metrics.frame_count), float(metrics.average_level), dqn100k, dqn1m, dqn5m)
                         except Exception:
                             pass
                     cs["was_done"] = True
@@ -700,6 +720,8 @@ class SocketServer:
                     cs["last_state"] = cs["last_action"] = None
                     cs["last_player_alive"] = False
                     cs["last_action_source"] = cs["prev_action_source"] = None
+                    cs["episode_start_wave"] = 1
+                    cs["last_wave_number"] = 1
                     cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
                     cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
                     cs["ep_frames"] = 0
@@ -720,6 +742,8 @@ class SocketServer:
                     cs["last_state"] = cs["last_action"] = None
                     cs["last_player_alive"] = False
                     cs["last_action_source"] = cs["prev_action_source"] = None
+                    cs["episode_start_wave"] = 1
+                    cs["last_wave_number"] = 1
                     # Reset fire hold when player is dead
                     cs["fire_hold_dir"] = -1
                     cs["fire_hold_count"] = 0
@@ -862,6 +886,7 @@ class SocketServer:
                 cs["last_state"] = stacked_state
                 cs["last_action"] = (move_idx, effective_fire)
                 cs["last_player_alive"] = bool(frame.player_alive)
+                cs["last_wave_number"] = max(1, int(frame.level_number or 1))
                 cs["prev_action_source"] = action_source
                 cs["last_action_source"] = action_source
 
