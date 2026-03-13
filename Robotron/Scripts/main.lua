@@ -39,6 +39,16 @@ local SUBJ_DEATH_PENALTY = 25.0
 local SUBJ_ENEMY_NEAR_NORM = 0.035
 local SUBJ_ENEMY_FAR_NORM = 0.200
 local SUBJ_HUMAN_NEAR_NORM = 0.120
+local ADVANCED_SHAPING = {
+    priority_aim_weight = 10.0,
+    centering_weight = 7.0,
+    brain_guard_weight = 8.0,
+    high_wave_threshold = 6,
+    brain_guard_wave = 4,
+    center_pressure_norm = 0.13,
+    center_pull_margin_x = 0.16,
+    center_pull_margin_y = 0.12,
+}
 
 -- Aiming reward: bonus for firing toward aligned enemies/obstacles.
 local SUBJ_AIM_WEIGHT = 15.0        -- reward per frame when correctly aimed
@@ -48,6 +58,16 @@ local AIM_MIN_FORWARD = 1024         -- ~4 screen-pixels minimum forward distanc
 local AIM_TARGET_CATS = {
     grunt = true, hulk = true, brain = true, tank = true,
     spawner = true, enforcer = true, projectile = true, electrode = true,
+}
+ADVANCED_SHAPING.priority_aim_bonus = {
+    grunt = 1.00,
+    hulk = 0.85,
+    brain = 1.45,
+    tank = 1.15,
+    spawner = 1.20,
+    enforcer = 1.25,
+    projectile = 1.50,
+    electrode = 0.75,
 }
 -- Direction unit vectors for 8-way fire (dx, dy in x16 coordinates).
 -- Screen/world coordinates are y-down (larger y = lower on screen):
@@ -654,6 +674,163 @@ local function compute_evasion_reward(move_cmd, px16, py16, enemy_x16, enemy_y16
     -- Scale by proximity: closer = more reward for correct evasion
     local proximity = clamp01(1.0 - enemy_dist_norm / EVADE_DANGER_NORM)
     return score * proximity
+end
+
+function movement_alignment_score(move_cmd, target_x, target_y)
+    if move_cmd == nil or move_cmd < 0 or move_cmd > 7 then
+        return 0.0
+    end
+    local vec = MOVE_DIR_VEC[move_cmd]
+    if vec == nil then return 0.0 end
+    local len = math.sqrt((target_x * target_x) + (target_y * target_y))
+    if len < 1.0 then
+        return 0.0
+    end
+    local tx = target_x / len
+    local ty = target_y / len
+    return clamp01((vec[1] * tx + vec[2] * ty) / 1.414)
+end
+
+function priority_target_bonus(category, wave_number, num_humans, dist_norm)
+    local bonus = ADVANCED_SHAPING.priority_aim_bonus[category] or 1.0
+    local wave = math.max(0, math.floor(tonumber(wave_number) or 0))
+    local humans = math.max(0, math.floor(tonumber(num_humans) or 0))
+    local dist = tonumber(dist_norm) or 1.0
+    if category == "brain" and humans > 0 then
+        bonus = bonus + 0.25
+    elseif category == "projectile" and dist < 0.10 then
+        bonus = bonus + 0.20
+    elseif category == "enforcer" and wave >= ADVANCED_SHAPING.high_wave_threshold then
+        bonus = bonus + 0.15
+    elseif category == "spawner" and wave >= (ADVANCED_SHAPING.high_wave_threshold + 2) then
+        bonus = bonus + 0.10
+    end
+    return math.max(0.35, bonus)
+end
+
+function compute_priority_aim_reward(fire_cmd, px16, py16, objects, wave_number, num_humans)
+    if fire_cmd == nil or fire_cmd < 0 or fire_cmd > 7 then
+        return 0.0
+    end
+    if px16 == nil or py16 == nil or objects == nil then
+        return 0.0
+    end
+
+    local vec = FIRE_DIR_VEC[fire_cmd]
+    if vec == nil then return 0.0 end
+    local vx, vy = vec[1], vec[2]
+    local is_diagonal = (vx ~= 0 and vy ~= 0)
+    local cross_thresh = is_diagonal and (AIM_CROSS_THRESHOLD * 1.414) or AIM_CROSS_THRESHOLD
+
+    local best_score = 0.0
+    for _, obj in ipairs(objects) do
+        local cat = obj.category
+        if cat and AIM_TARGET_CATS[cat] then
+            local dx = obj.x16 - px16
+            local dy = obj.y16 - py16
+            local forward = dx * vx + dy * vy
+            local cross = math.abs(dx * vy - dy * vx)
+            if forward >= AIM_MIN_FORWARD and cross <= cross_thresh then
+                local dist = math.sqrt(dx * dx + dy * dy)
+                local base_score = clamp01(1.0 - dist / 32768.0)
+                local threat = clamp01(obj.threat or 0.0)
+                local bonus = priority_target_bonus(cat, wave_number, num_humans, obj.dist_norm)
+                local score = clamp01((0.55 * base_score + 0.45 * threat) * bonus)
+                if score > best_score then
+                    best_score = score
+                end
+            end
+        end
+    end
+    return best_score
+end
+
+function compute_centering_reward(move_cmd, px16, py16, objects, wave_number)
+    if move_cmd == nil or move_cmd < 0 or move_cmd > 7 then
+        return 0.0
+    end
+    if px16 == nil or py16 == nil or objects == nil then
+        return 0.0
+    end
+
+    local px = norm_pos_x(px16)
+    local py = norm_pos_y(py16)
+    local near_wall = math.max(
+        clamp01((ADVANCED_SHAPING.center_pull_margin_x - px) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_x)),
+        clamp01((px - (1.0 - ADVANCED_SHAPING.center_pull_margin_x)) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_x)),
+        clamp01((ADVANCED_SHAPING.center_pull_margin_y - py) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_y)),
+        clamp01((py - (1.0 - ADVANCED_SHAPING.center_pull_margin_y)) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_y))
+    )
+
+    local pressure = 0.0
+    for _, obj in ipairs(objects) do
+        if obj.is_dangerous and obj.category ~= "human" then
+            local dist = tonumber(obj.dist_norm) or 1.0
+            if dist < ADVANCED_SHAPING.center_pressure_norm then
+                pressure = pressure + ((tonumber(obj.threat) or 0.5) + 0.25) * (1.0 - dist / ADVANCED_SHAPING.center_pressure_norm)
+            end
+        end
+    end
+    pressure = clamp01(pressure / 2.0)
+
+    local wave = math.max(0, math.floor(tonumber(wave_number) or 0))
+    if wave < ADVANCED_SHAPING.high_wave_threshold and near_wall <= 0.0 and pressure <= 0.0 then
+        return 0.0
+    end
+    local weight = math.max(near_wall, pressure)
+    if weight <= 0.0 then
+        return 0.0
+    end
+
+    local center_x = (POS_X_MIN + (POS_X_RANGE * 0.5)) - px16
+    local center_y = (POS_Y_MIN + (POS_Y_RANGE * 0.5)) - py16
+    return movement_alignment_score(move_cmd, center_x, center_y) * weight
+end
+
+function compute_brain_guard_reward(move_cmd, fire_cmd, px16, py16, objects, wave_number, num_humans)
+    if px16 == nil or py16 == nil or objects == nil then
+        return 0.0
+    end
+    local wave = math.max(0, math.floor(tonumber(wave_number) or 0))
+    local humans = math.max(0, math.floor(tonumber(num_humans) or 0))
+    if wave < ADVANCED_SHAPING.brain_guard_wave or humans <= 0 then
+        return 0.0
+    end
+
+    local best = nil
+    local best_score = -1.0
+    for _, obj in ipairs(objects) do
+        if obj.category == "brain" then
+            local dist = tonumber(obj.dist_norm) or 1.0
+            local score = clamp01(1.0 - dist) + clamp01(obj.threat or 0.0)
+            if best == nil or score > best_score then
+                best = obj
+                best_score = score
+            end
+        end
+    end
+    if best == nil then
+        return 0.0
+    end
+
+    local move_score = movement_alignment_score(move_cmd, best.x16 - px16, best.y16 - py16)
+    local fire_score = 0.0
+    if fire_cmd ~= nil and fire_cmd >= 0 and fire_cmd <= 7 then
+        local vec = FIRE_DIR_VEC[fire_cmd]
+        if vec ~= nil then
+            local dx = best.x16 - px16
+            local dy = best.y16 - py16
+            local forward = dx * vec[1] + dy * vec[2]
+            local cross = math.abs(dx * vec[2] - dy * vec[1])
+            local cross_thresh = ((vec[1] ~= 0 and vec[2] ~= 0) and (AIM_CROSS_THRESHOLD * 1.414)) or AIM_CROSS_THRESHOLD
+            if forward >= AIM_MIN_FORWARD and cross <= cross_thresh then
+                local dist = math.sqrt(dx * dx + dy * dy)
+                fire_score = clamp01(1.0 - dist / 32768.0)
+            end
+        end
+    end
+
+    return math.max(move_score * 0.75, fire_score) * clamp01(1.15 - (tonumber(best.dist_norm) or 1.0))
 end
 
 local function read_player_position(memory)
@@ -2236,8 +2413,19 @@ function compute_frame_rewards(frame)
     local spacing_score = enemy_spacing_score(frame.obs.nearest_enemy_dist)
     local rescue_score = human_proximity_score(frame.obs.nearest_human_dist)
     local aim_score = compute_aim_reward(prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects)
+    local priority_aim_score = compute_priority_aim_reward(
+        prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects,
+        previous_wave_number, prev_num_humans
+    )
     local evade_score = compute_evasion_reward(prev_move_cmd, prev_aim_px16, prev_aim_py16,
         prev_nearest_enemy_x16, prev_nearest_enemy_y16, prev_nearest_enemy_dist)
+    local centering_score = compute_centering_reward(
+        prev_move_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects, previous_wave_number
+    )
+    local brain_guard_score = compute_brain_guard_reward(
+        prev_move_cmd, prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects,
+        previous_wave_number, prev_num_humans
+    )
     local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
 
     local wall_penalty = 0.0
@@ -2265,7 +2453,10 @@ function compute_frame_rewards(frame)
         + (spacing_score * SUBJ_ENEMY_WEIGHT)
         + (rescue_score * SUBJ_HUMAN_WEIGHT)
         + (aim_score * SUBJ_AIM_WEIGHT)
+        + (priority_aim_score * ADVANCED_SHAPING.priority_aim_weight)
         + (evade_score * SUBJ_EVADE_WEIGHT)
+        + (centering_score * ADVANCED_SHAPING.centering_weight)
+        + (brain_guard_score * ADVANCED_SHAPING.brain_guard_weight)
         - wall_penalty
         - abandoned_penalty
     if done then

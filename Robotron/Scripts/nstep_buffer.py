@@ -19,6 +19,8 @@ class _PendingStep:
     next_state: Any
     done: bool
     actor: str
+    wave_number: int
+    start_wave: int
 
 
 class NStepReplayBuffer:
@@ -44,6 +46,7 @@ class NStepReplayBuffer:
         last_next = None
         first = self._deque[0]
         s0, a0, actor0 = first.state, first.action, first.actor
+        wave0, start0 = first.wave_number, first.start_wave
         steps = 0
 
         for i in range(min(self.n_step, len(self._deque))):
@@ -59,7 +62,7 @@ class NStepReplayBuffer:
                 done_flag = True
                 break
 
-        return (s0, a0, R, priority_R, last_next, done_flag, max(1, steps), actor0)
+        return (s0, a0, R, priority_R, last_next, done_flag, max(1, steps), actor0, wave0, start0)
 
     def _should_emit(self) -> bool:
         if not self._deque:
@@ -74,11 +77,14 @@ class NStepReplayBuffer:
         return len(self._deque) >= self.n_step
 
     def add(self, state, action, reward, next_state, done,
-            actor: Optional[str] = None, priority_reward: Optional[float] = None):
+            actor: Optional[str] = None, priority_reward: Optional[float] = None,
+            wave_number: int = 1, start_wave: int = 1):
         pr = priority_reward if priority_reward is not None else reward
         self._deque.append(_PendingStep(state, int(action), float(reward),
                                          float(pr), next_state, bool(done),
-                                         actor or "dqn"))
+                                         actor or "dqn",
+                                         max(1, int(wave_number)),
+                                         max(1, int(start_wave))))
         results = []
         while self._should_emit():
             results.append(self._make_experience())
