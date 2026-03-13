@@ -1858,7 +1858,7 @@ class RainbowAgent:
         return actions
 
     # ── Step (add experience) ───────────────────────────────────────────
-    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None):
+    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None, wave_number=1):
         if isinstance(action, (tuple, list)) and len(action) >= 2:
             action_idx = combine_action_indices(action[0], action[1])
         else:
@@ -1870,7 +1870,15 @@ class RainbowAgent:
             boost = float(getattr(RL_CONFIG, 'death_priority_boost', 0.0))
             if boost > 0:
                 pri = max(abs(pri), boost) * (-1.0 if pri < 0 else 1.0)
-        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri)
+        # Log10 level-priority: later waves get higher initial sampling weight.
+        # mult = max(1.0, log10(wave) * scale)  →  wave 100 at scale=1 gives 2×,
+        # at scale=5 gives 10×.  Capped again inside memory.add().
+        level_scale = float(getattr(RL_CONFIG, "level_priority_log_scale", 0.0))
+        level_mult = 1.0
+        if level_scale > 0.0:
+            wave = max(1, int(wave_number or 1))
+            level_mult = max(1.0, math.log10(wave) * level_scale)
+        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri, level_mult=level_mult)
         # Return the index of the just-written transition for pre-death tracking
         try:
             return int(self.memory.tree.data_ptr - 1) % self.memory.capacity

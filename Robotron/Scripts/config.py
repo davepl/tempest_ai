@@ -233,6 +233,13 @@ class RLConfigData:
     pre_death_lookback: int = 120          # Boost priorities of N frames before each death
     pre_death_priority_boost: float = 2.0  # Multiplicative boost for pre-death frames
 
+    # ── level-based priority ─────────────────────────────────────────────
+    # Priority multiplier = max(1.0, log10(wave_number) * level_priority_log_scale).
+    # At scale=1.0: wave 10 → 1.0×, wave 100 → 2.0×, wave 1000 → 3.0×.
+    # At scale=5.0: wave 100 → 10.0×, matching a "10× at level 100" goal.
+    # Set to 0.0 to disable.
+    level_priority_log_scale: float = 3.0
+
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
     # Keep inference on GPU when available; CPU inference can become a bottleneck

@@ -72,23 +72,11 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-# Set up stable audio FIFO for client 0 (WebRTC streaming)
-AUDIO_FIFO="/tmp/robotron_audio_client0.wav"
-
-# Check if MAME is already running with audio output to this FIFO
+# Guard against stacking multiple wavwrite-enabled Robotron launches.
 if pgrep -f "mame.*robotron.*wavwrite" > /dev/null 2>&1; then
     echo "ERROR: MAME with audio output is already running!"
     echo "Kill existing instances with: killall mame"
     exit 1
-fi
-
-# Only recreate FIFO if it doesn't exist or isn't a FIFO
-if [[ ! -p "$AUDIO_FIFO" ]]; then
-    rm -f "$AUDIO_FIFO" 2>/dev/null || true
-    mkfifo "$AUDIO_FIFO"
-    echo "Created audio FIFO: $AUDIO_FIFO"
-else
-    echo "Using existing audio FIFO: $AUDIO_FIFO"
 fi
 
 WARNING_FLAG=""
@@ -110,25 +98,31 @@ if ! "$MAME_BIN" -rompath "$ROMPATH" -verifyroms robotron >/dev/null 2>&1; then
 fi
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
+    AUDIO_WAV="/tmp/robotron_audio_client0.wav"
+    rm -f "$AUDIO_WAV" 2>/dev/null || true
     echo "Mode: foreground"
-    echo "Launching 1 MAME instance (attached) with audio streaming, throttled to real time..."
-    SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
+    echo "Launching 1 MAME instance (attached) with preview audio/video enabled, throttled to real time..."
+    SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
     THROTTLE_FLAG="-throttle -speed 1.0"
-    exec env ROBOTRON_PREVIEW_CLIENT=1 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
+    VIDEO_FLAG="-video soft"
+    exec env ROBOTRON_PREVIEW_CLIENT=1 ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
 fi
 
 echo "Mode: background"
 if [[ "$COUNT" -eq 1 ]]; then
-    echo "Launching 1 MAME instance (client 0) with audio streaming, throttled to real time..."
+    echo "Launching 1 MAME instance (client 0) with preview audio/video enabled, throttled to real time..."
 else
-    echo "Launching $COUNT MAME instance(s): client 0 throttled with audio/video, others unthrottled..."
+    echo "Launching $COUNT MAME instance(s): client 0 preview-capable, others training-only..."
 fi
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
+    CLIENT_SLOT=$((i-1))
     if [[ $i -eq 1 ]]; then
-        SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
+        AUDIO_WAV="/tmp/robotron_audio_client${CLIENT_SLOT}.wav"
+        rm -f "$AUDIO_WAV" 2>/dev/null || true
+        SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
         THROTTLE_FLAG="-throttle -speed 1.0"
-        VIDEO_FLAG="-video soft"  # Need video backend for audio to work
+        VIDEO_FLAG="-video soft"
         PREVIEW_CLIENT_FLAG="1"
     else
         SOUND_FLAG="-sound none"
@@ -136,23 +130,20 @@ for i in $(seq 1 "$COUNT"); do
         VIDEO_FLAG="-video none"
         PREVIEW_CLIENT_FLAG="0"
     fi
-    LOG_FILE="$LOG_DIR/mame_instance_$((i-1)).log"
+    LOG_FILE="$LOG_DIR/mame_instance_${CLIENT_SLOT}.log"
     if [[ $i -eq 1 ]]; then
-        # Preview client: no redirect — output stays on the terminal so a single
-        # clean set of init lines is visible.
-        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+        # Keep the first instance attached to the terminal so one clean set of init lines stays visible.
+        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT="$CLIENT_SLOT" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
     else
-        # Training-only clients: redirect entirely to a per-instance log file to
-        # keep the terminal clean (avoids duplicate init lines from N background
-        # processes sharing stdout).
-        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" >> "$LOG_FILE" 2>&1 &
+        # Additional clients stay backgrounded and log to per-instance files.
+        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT="$CLIENT_SLOT" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" >> "$LOG_FILE" 2>&1 &
     fi
     pid=$!
     PIDS+=("$pid")
     if [[ $i -eq 1 ]]; then
-        echo "  Started instance $i (client 0 - audio/video, throttled) PID $pid  log: $LOG_FILE"
+        echo "  Started instance $i (client $CLIENT_SLOT - audio/video, throttled) PID $pid  log: $LOG_FILE"
     else
-        echo "  Started instance $i (unthrottled training) PID $pid  log: $LOG_FILE"
+        echo "  Started instance $i (client $CLIENT_SLOT - training-only, unthrottled) PID $pid  log: $LOG_FILE"
     fi
 done
 

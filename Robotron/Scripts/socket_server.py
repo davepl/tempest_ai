@@ -354,32 +354,68 @@ class SocketServer:
             metrics.game_preview_compression_ratio = 1.0
             metrics.game_preview_fps = 0.0
 
+    @staticmethod
+    def _parse_client_handshake(handshake_value: int) -> tuple[bool, int]:
+        raw = max(0, int(handshake_value or 0))
+        preview_capable = (raw & 0x01) != 0
+        client_slot = max(0, raw >> 1)
+        return preview_capable, client_slot
+
+    def _pick_default_preview_client_locked(self) -> int | None:
+        candidates = []
+        for cid, cs in self.client_states.items():
+            if not bool(cs.get("preview_capable", False)):
+                continue
+            try:
+                slot = max(0, int(cs.get("client_slot", cid)))
+            except Exception:
+                slot = int(cid)
+            candidates.append((slot, int(cid)))
+        if not candidates:
+            return None
+        candidates.sort()
+        return int(candidates[0][1])
+
+    def _ensure_preview_client_selected_locked(self) -> tuple[int | None, bool]:
+        selected = self.preview_cid
+        if selected is not None:
+            cs = self.client_states.get(int(selected))
+            if isinstance(cs, dict) and bool(cs.get("preview_capable", False)):
+                return int(selected), False
+        fallback = self._pick_default_preview_client_locked()
+        changed = self.preview_cid != fallback
+        self.preview_cid = fallback
+        return fallback, changed
+
     def _is_preview_client(self, cid: int) -> bool:
+        changed = False
         with self.client_lock:
-            preview_cid = self.preview_cid
-        if preview_cid is not None:
-            return int(cid) == int(preview_cid)
-        return int(cid) == 0
+            preview_cid, changed = self._ensure_preview_client_selected_locked()
+        if changed:
+            self._clear_preview_cache()
+        return preview_cid is not None and int(cid) == int(preview_cid)
 
     def _maybe_claim_preview_client(self, cid: int, handshake_value: int) -> bool:
-        wants_preview = int(handshake_value or 0) != 0
+        preview_capable, client_slot = self._parse_client_handshake(handshake_value)
+        changed = False
+        selected = None
         with self.client_lock:
-            if wants_preview and (self.preview_cid is None or int(self.preview_cid) == int(cid)):
-                if self.preview_cid is None or int(self.preview_cid) != int(cid):
-                    self._clear_preview_cache()
-                self.preview_cid = int(cid)
-                cs = self.client_states.get(cid)
-                if isinstance(cs, dict):
-                    cs["preview_claimed"] = True
-                return True
             cs = self.client_states.get(cid)
             if isinstance(cs, dict):
-                cs["preview_claimed"] = False
-        return False
+                cs["preview_capable"] = bool(preview_capable)
+                cs["client_slot"] = int(client_slot)
+            selected, changed = self._ensure_preview_client_selected_locked()
+        if changed:
+            self._clear_preview_cache()
+        return bool(preview_capable) and selected is not None and int(selected) == int(cid)
 
     def _preview_enabled_for_client(self, cid: int) -> bool:
         if not self._is_preview_client(cid):
             return False
+        with self.client_lock:
+            cs = self.client_states.get(int(cid))
+            if not isinstance(cs, dict) or not bool(cs.get("preview_capable", False)):
+                return False
         with metrics.lock:
             # Check if preview is enabled via dashboard checkbox
             if not getattr(metrics, "preview_capture_enabled", True):
@@ -387,10 +423,80 @@ class SocketServer:
             # Only enable if web clients are connected
             return int(getattr(metrics, "web_client_count", 0) or 0) > 0
 
-    @staticmethod
-    def _hud_enabled() -> bool:
+    def _hud_enabled_for_client(self, cid: int) -> bool:
+        if not self._is_preview_client(cid):
+            return False
         with metrics.lock:
             return bool(getattr(metrics, "hud_enabled", True))
+
+    def get_selected_preview_client_id(self) -> int | None:
+        changed = False
+        with self.client_lock:
+            selected, changed = self._ensure_preview_client_selected_locked()
+        if changed:
+            self._clear_preview_cache()
+        return None if selected is None else int(selected)
+
+    def get_selected_preview_client_slot(self) -> int | None:
+        selected = self.get_selected_preview_client_id()
+        if selected is None:
+            return None
+        with self.client_lock:
+            cs = self.client_states.get(int(selected))
+            if not isinstance(cs, dict):
+                return None
+            try:
+                return max(0, int(cs.get("client_slot", selected)))
+            except Exception:
+                return int(selected)
+
+    def set_preview_client(self, cid: int | None) -> tuple[bool, int | None]:
+        changed = False
+        selected = None
+        with self.client_lock:
+            if cid is None:
+                selected = self._pick_default_preview_client_locked()
+            else:
+                cs = self.client_states.get(int(cid))
+                if not isinstance(cs, dict) or not bool(cs.get("preview_capable", False)):
+                    return False, self.preview_cid
+                selected = int(cid)
+            changed = self.preview_cid != selected
+            self.preview_cid = selected
+        if changed:
+            self._clear_preview_cache()
+        return True, selected
+
+    def get_client_rows(self) -> list[dict]:
+        changed = False
+        with self.client_lock:
+            selected, changed = self._ensure_preview_client_selected_locked()
+            rows = []
+            for cid, cs in self.client_states.items():
+                try:
+                    lives = max(0, int(cs.get("num_lasers", 0) or 0))
+                except Exception:
+                    lives = 0
+                try:
+                    level = max(0, int(cs.get("level_number", 0) or 0))
+                except Exception:
+                    level = 0
+                try:
+                    score = max(0, int(cs.get("game_score", 0) or 0))
+                except Exception:
+                    score = 0
+                rows.append({
+                    "client_id": int(cid),
+                    "lives": lives,
+                    "level": level,
+                    "score": score,
+                    "selected_preview": (selected is not None and int(selected) == int(cid)),
+                    "preview_capable": bool(cs.get("preview_capable", False)),
+                })
+        if changed:
+            self._clear_preview_cache()
+        rows.sort(key=lambda row: int(row.get("client_id", 0)))
+        return rows
 
     def _cache_client_preview(self, cid: int, frame) -> None:
         if not self._is_preview_client(cid):
@@ -463,6 +569,9 @@ class SocketServer:
                 "frames": 0, "last_time": time.time(), "fps": 0.0,
                 "level_number": 0, "last_state": None, "last_action": None,
                 "last_player_alive": False,
+                "player_alive": False,
+                "game_score": 0,
+                "num_lasers": 0,
                 "last_action_source": None, "prev_action_source": None,
                 "act_total": 0, "act_eps": 0, "act_xprt": 0, "act_last_diag_total": 0,
                 "act_same": 0, "act_diff": 0,
@@ -476,7 +585,8 @@ class SocketServer:
                 "state_stack": deque(maxlen=FRAME_STACK),
                 "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
                 "last_alive_game_score": 0, "prev_game_final_score": 0,
-                "preview_claimed": False,
+                "preview_capable": False,
+                "client_slot": int(cid),
             }
             metrics.client_count = len(self.client_states)
 
@@ -529,6 +639,7 @@ class SocketServer:
 
             while self.running and not self.shutdown_event.is_set():
                 preview_enabled = self._preview_enabled_for_client(cid)
+                hud_enabled = self._hud_enabled_for_client(cid)
                 ready = select.select([sock], [], [], 0.002)
                 if not ready[0]:
                     continue
@@ -569,7 +680,7 @@ class SocketServer:
                 # Even if another client sends preview bytes, skip decode cost.
                 frame = parse_frame_data(data, parse_preview=preview_parse_allowed)
                 if not frame:
-                    sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, self._hud_enabled()))
+                    sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, hud_enabled))
                     continue
                 if self._is_preview_client(cid) and preview_parse_allowed:
                     enc_fmt = int(getattr(frame, "preview_encoded_format", 0) or 0)
@@ -591,10 +702,13 @@ class SocketServer:
                         break
                     cs = self.client_states[cid]
                     cs["frames"] += 1
+                    cs["player_alive"] = bool(frame.player_alive)
+                    cs["num_lasers"] = max(0, int(getattr(frame, "num_lasers", 0) or 0))
                     # Only trust RAM-read level/score while player is alive;
                     # during attract/death the byte can hold garbage.
                     if frame.player_alive:
                         cs["level_number"] = frame.level_number
+                        cs["game_score"] = max(0, int(getattr(frame, "game_score", 0) or 0))
                     # Ignore attract/menu/transient frames for high-score tracking.
                     if frame.player_alive and frame.game_score > self.metrics.peak_game_score:
                         self.metrics.peak_game_score = frame.game_score
@@ -648,16 +762,19 @@ class SocketServer:
                             matured = nstep.add(cs["last_state"], joint, total_r,
                                                 stacked_state, bool(frame.done),
                                                 actor=tag, priority_reward=total_r)
+                            wave = max(1, cs.get("level_number", 1) or 1)
                             for s0, a, Rn, pR, sn, dn, h, act in matured:
                                 move_n, fire_n = split_joint_action(a)
                                 self.async_buffer.step_async(
                                     s0, (move_n, fire_n), Rn, sn, bool(dn),
-                                    client_id=cid, actor=act, horizon=int(h), priority_reward=pR)
+                                    client_id=cid, actor=act, horizon=int(h),
+                                    priority_reward=pR, wave_number=wave)
                         else:
+                            wave = max(1, cs.get("level_number", 1) or 1)
                             self.async_buffer.step_async(
                                 cs["last_state"], (move_i, fire_i), total_r,
                                 stacked_state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
-                                priority_reward=total_r)
+                                priority_reward=total_r, wave_number=wave)
 
                     cs["total_reward"] += total_r
                     cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + subj_r
@@ -694,7 +811,7 @@ class SocketServer:
                             pass
                     cs["was_done"] = True
                     try:
-                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, self._hud_enabled()))
+                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, hud_enabled))
                     except Exception:
                         break
                     cs["last_state"] = cs["last_action"] = None
@@ -725,7 +842,7 @@ class SocketServer:
                     cs["fire_hold_count"] = 0
                     cs["fire_pending_dir"] = -1
                     try:
-                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, self._hud_enabled()))
+                        sock.sendall(self._pack_action(-1, -1, 0, preview_enabled, hud_enabled))
                     except Exception:
                         break
                     continue
@@ -879,7 +996,7 @@ class SocketServer:
                 else:
                     source_byte = 0
                 try:
-                    sock.sendall(self._pack_action(move_cmd, fire_cmd, source_byte, preview_enabled, self._hud_enabled()))
+                    sock.sendall(self._pack_action(move_cmd, fire_cmd, source_byte, preview_enabled, hud_enabled))
                 except Exception:
                     break
 
@@ -895,15 +1012,22 @@ class SocketServer:
                 sock.close()
             except Exception:
                 pass
+            changed = False
             with self.client_lock:
-                if self.preview_cid is not None and int(self.preview_cid) == int(cid):
-                    self.preview_cid = None
-                    self._clear_preview_cache()
+                was_selected = (self.preview_cid is not None and int(self.preview_cid) == int(cid))
                 self.client_states.pop(cid, None)
                 self.clients[cid] = None
                 metrics.client_count = sum(1 for v in self.clients.values() if v is not None)
+                if was_selected:
+                    self.preview_cid = None
+                    changed = True
+                if self.preview_cid is None:
+                    _selected, selected_changed = self._ensure_preview_client_selected_locked()
+                    changed = changed or selected_changed
             if self.async_buffer is not None:
                 self.async_buffer.remove_client(cid)
+            if changed:
+                self._clear_preview_cache()
             threading.Timer(1.0, self._cleanup).start()
 
     def _cleanup(self):

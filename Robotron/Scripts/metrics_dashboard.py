@@ -16,7 +16,6 @@ import json
 import math
 import mimetypes
 import os
-import stat
 import shutil
 import signal
 import subprocess
@@ -474,6 +473,19 @@ class _DashboardState:
             except Exception:
                 q_min = q_max = None
 
+        client_rows: list[dict[str, Any]] = []
+        preview_selected_client_id = -1
+        try:
+            srv = getattr(self.metrics, "global_server", None)
+            if srv is not None:
+                client_rows = list(srv.get_client_rows() or [])
+                selected_cid = srv.get_selected_preview_client_id()
+                if selected_cid is not None:
+                    preview_selected_client_id = int(selected_cid)
+        except Exception:
+            client_rows = []
+            preview_selected_client_id = -1
+
         return {
             "ts": now,
             "frame_count": frame_count,
@@ -545,6 +557,8 @@ class _DashboardState:
             "pulse_remaining": int(self.metrics.manual_pulse_frames_remaining),
             "pulse_count": plateau_pulser.total_pulses,
             "pulse_enabled": True,  # manual pulse is always available
+            "client_rows": client_rows,
+            "preview_selected_client_id": preview_selected_client_id,
             "game_settings": game_settings.snapshot(),
             "preview_capture_enabled": bool(getattr(self.metrics, "preview_capture_enabled", True)),
             "hud_enabled": bool(getattr(self.metrics, "hud_enabled", True)),
@@ -776,15 +790,17 @@ class _PreviewVideoTrack(VideoStreamTrack):
 
 
 class _PreviewAudioSource:
-    """Persistent FIFO reader that fan-outs 20 ms PCM frames to subscribers."""
+    """Tail the selected preview client's WAV file and fan-out 20 ms PCM frames."""
 
     _FRAME_PTIME_S = 0.02
     _MAX_SOURCE_LATENCY_S = 0.20
     _IDLE_KEEP_FRAMES = 1
     _SUBSCRIBER_QUEUE_FRAMES = 6
 
-    def __init__(self, audio_path: str = "/tmp/robotron_audio_client0.wav"):
-        self.audio_path = audio_path
+    def __init__(self, metrics_obj, audio_dir: str = "/tmp", file_template: str = "robotron_audio_client{slot}.wav"):
+        self.metrics = metrics_obj
+        self.audio_dir = str(audio_dir)
+        self.file_template = str(file_template)
         self._sample_rate = 48000
         self._channels = 2
         self._buffer = bytearray()
@@ -794,23 +810,27 @@ class _PreviewAudioSource:
         self._reader_thread_obj = None
         self._subscribers: dict[int, queue.Queue] = {}
         self._next_subscriber_id = 1
+        self._current_slot: int | None = None
+        self._current_path: str | None = None
+        self._current_file = None
+        self._current_inode: int | None = None
+        self._read_offset = 0
+        self._header_parsed = False
         self._start_reader()
 
-    def _find_audio_fifo(self) -> str | None:
-        import glob
-
-        def _is_fifo(path: str) -> bool:
-            try:
-                return stat.S_ISFIFO(os.stat(path).st_mode)
-            except Exception:
-                return False
-
-        if "*" in self.audio_path:
-            paths = [p for p in glob.glob(self.audio_path) if _is_fifo(p)]
-            return sorted(paths)[-1] if paths else None
-        if os.path.exists(self.audio_path) and _is_fifo(self.audio_path):
-            return self.audio_path
+    def _selected_slot(self) -> int | None:
+        try:
+            srv = getattr(self.metrics, "global_server", None)
+            if srv is not None:
+                slot = srv.get_selected_preview_client_slot()
+                if slot is not None:
+                    return max(0, int(slot))
+        except Exception:
+            pass
         return None
+
+    def _audio_path_for_slot(self, slot: int) -> str:
+        return os.path.join(self.audio_dir, self.file_template.format(slot=max(0, int(slot))))
 
     def _parse_wav_header(self, header: bytes) -> tuple[int, int] | None:
         if len(header) < 44:
@@ -874,56 +894,138 @@ class _PreviewAudioSource:
                 except queue.Empty:
                     break
 
+    def _reset_audio_state_locked(self):
+        self._audio_ready = False
+        self._buffer.clear()
+        self._reset_subscribers_locked()
+
+    def _close_current_source(self):
+        f = self._current_file
+        self._current_file = None
+        self._current_inode = None
+        self._current_path = None
+        self._current_slot = None
+        self._read_offset = 0
+        self._header_parsed = False
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+        with self._lock:
+            self._reset_audio_state_locked()
+
+    def _open_current_source(self, slot: int, path: str) -> bool:
+        try:
+            f = open(path, "rb", buffering=0)
+        except Exception:
+            return False
+        try:
+            st = os.fstat(f.fileno())
+            inode = int(getattr(st, "st_ino", 0) or 0)
+        except Exception:
+            inode = None
+        self._current_file = f
+        self._current_inode = inode
+        self._current_path = path
+        self._current_slot = int(slot)
+        self._read_offset = 0
+        self._header_parsed = False
+        with self._lock:
+            self._reset_audio_state_locked()
+        return True
+
+    def _source_rotated(self) -> bool:
+        path = self._current_path
+        if not path or self._current_file is None:
+            return False
+        try:
+            st = os.stat(path)
+        except Exception:
+            return True
+        inode = int(getattr(st, "st_ino", 0) or 0)
+        size = int(getattr(st, "st_size", 0) or 0)
+        if self._current_inode is not None and inode != self._current_inode:
+            return True
+        return size < self._read_offset
+
     def _reader_thread(self):
-        retry_count = 0
         while not self._stop_event.is_set():
             try:
-                path = self._find_audio_fifo()
-                if not path:
-                    retry_count += 1
-                    time.sleep(0.1)
+                desired_slot = self._selected_slot()
+                if desired_slot is None:
+                    if self._current_file is not None:
+                        self._close_current_source()
+                    time.sleep(0.05)
                     continue
-                retry_count = 0
-                with open(path, "rb", buffering=0) as f:
-                    header = f.read(44)
+
+                desired_path = self._audio_path_for_slot(desired_slot)
+                if desired_slot != self._current_slot or desired_path != self._current_path:
+                    if self._current_file is not None:
+                        self._close_current_source()
+
+                if self._current_file is None:
+                    if not os.path.exists(desired_path):
+                        time.sleep(0.05)
+                        continue
+                    if not self._open_current_source(desired_slot, desired_path):
+                        time.sleep(0.10)
+                        continue
+
+                if self._current_file is None:
+                    time.sleep(0.05)
+                    continue
+
+                if not self._header_parsed:
+                    try:
+                        size = os.path.getsize(desired_path)
+                    except Exception:
+                        size = 0
+                    if size < 44:
+                        time.sleep(0.02)
+                        continue
+                    self._current_file.seek(0)
+                    header = self._current_file.read(44)
                     parsed = self._parse_wav_header(header)
                     if parsed is None:
-                        time.sleep(0.1)
+                        time.sleep(0.05)
                         continue
                     sample_rate, channels = parsed
+                    self._header_parsed = True
+                    self._read_offset = 44
+                    self._current_file.seek(self._read_offset)
                     with self._lock:
                         self._sample_rate = sample_rate
                         self._channels = channels
                         self._buffer.clear()
                         self._audio_ready = True
                         self._reset_subscribers_locked()
-                    while not self._stop_event.is_set():
-                        chunk = f.read(4096)
-                        if not chunk:
-                            break
-                        with self._lock:
-                            self._buffer.extend(chunk)
-                            max_buffer_bytes = int(
-                                self._sample_rate * self._channels * 2 * self._MAX_SOURCE_LATENCY_S
-                            )
-                            if len(self._buffer) > max_buffer_bytes:
-                                drop = len(self._buffer) - max_buffer_bytes
-                                sample_bytes = self._channels * 2
-                                drop -= drop % max(1, sample_bytes)
-                                if drop > 0:
-                                    del self._buffer[:drop]
-                            self._dispatch_ready_frames_locked()
-                with self._lock:
-                    self._audio_ready = False
-                    self._buffer.clear()
-                    self._reset_subscribers_locked()
-                time.sleep(0.1)
+
+                chunk = self._current_file.read(4096)
+                if chunk:
+                    self._read_offset += len(chunk)
+                    with self._lock:
+                        self._buffer.extend(chunk)
+                        max_buffer_bytes = int(
+                            self._sample_rate * self._channels * 2 * self._MAX_SOURCE_LATENCY_S
+                        )
+                        if len(self._buffer) > max_buffer_bytes:
+                            drop = len(self._buffer) - max_buffer_bytes
+                            sample_bytes = self._channels * 2
+                            drop -= drop % max(1, sample_bytes)
+                            if drop > 0:
+                                del self._buffer[:drop]
+                        self._dispatch_ready_frames_locked()
+                    continue
+
+                if self._source_rotated():
+                    self._close_current_source()
+                    time.sleep(0.02)
+                    continue
+                time.sleep(0.01)
             except Exception:
-                with self._lock:
-                    self._audio_ready = False
-                    self._buffer.clear()
-                    self._reset_subscribers_locked()
-                time.sleep(0.25)
+                self._close_current_source()
+                time.sleep(0.10)
 
     def _start_reader(self):
         if self._reader_thread_obj is not None and self._reader_thread_obj.is_alive():
@@ -958,14 +1060,13 @@ class _PreviewAudioSource:
         self._stop_event.set()
         if self._reader_thread_obj is not None:
             self._reader_thread_obj.join(timeout=1.0)
+        self._close_current_source()
         with self._lock:
             self._subscribers.clear()
-            self._buffer.clear()
-            self._audio_ready = False
 
 
 class _PreviewAudioTrack(AudioStreamTrack):
-    """WebRTC audio track backed by a persistent FIFO reader."""
+    """WebRTC audio track backed by the selected preview WAV reader."""
 
     _FRAME_PTIME_S = 0.02
 
@@ -1040,7 +1141,7 @@ class _PreviewWebRTCBridge:
         self._loop = None
         self._pcs = set()
         self._lock = threading.Lock()
-        self._audio_source = _PreviewAudioSource() if self.enabled else None
+        self._audio_source = _PreviewAudioSource(self.metrics) if self.enabled else None
 
     def start(self):
         if not self.enabled:
@@ -1048,7 +1149,7 @@ class _PreviewWebRTCBridge:
         if self._thread is not None:
             return
         if self._audio_source is None:
-            self._audio_source = _PreviewAudioSource()
+            self._audio_source = _PreviewAudioSource(self.metrics)
 
         def _runner():
             loop = asyncio.new_event_loop()
@@ -1155,7 +1256,7 @@ class _PreviewWebRTCBridge:
 
         if self._audio_source is None:
             try:
-                self._audio_source = _PreviewAudioSource()
+                self._audio_source = _PreviewAudioSource(self.metrics)
             except Exception:
                 self._audio_source = None
 
@@ -1643,6 +1744,12 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       min-height: 200px;
       gap: 6px;
     }
+    .client-table-card {
+      grid-column: span 4;
+      grid-row: span 2;
+      min-height: 200px;
+      gap: 8px;
+    }
     .preview-wrap {
       position: relative;
       flex: 1 1 auto;
@@ -1696,6 +1803,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       align-items: center;
       gap: 8px;
       min-width: 0;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }
     .preview-quality-select {
       background: rgba(10, 20, 40, 0.85);
@@ -1711,6 +1820,132 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     .preview-quality-select:focus {
       border-color: rgba(100, 180, 255, 0.7);
       box-shadow: 0 0 6px rgba(100, 180, 255, 0.3);
+    }
+    .client-table-count {
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 16px;
+      color: #c8e8ff;
+      text-shadow:
+        0 0 5px rgba(100, 160, 255, 0.7),
+        0 0 14px rgba(60, 120, 255, 0.55),
+        0 0 28px rgba(40, 80, 255, 0.45);
+    }
+    .client-table-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      max-height: 420px;
+      overflow: auto;
+      border-radius: 10px;
+      border: 1px solid rgba(80, 160, 255, 0.35);
+      background:
+        radial-gradient(120% 120% at 10% 0%, rgba(0, 229, 255, 0.12), transparent 60%),
+        radial-gradient(120% 120% at 95% 100%, rgba(57, 255, 20, 0.10), transparent 60%),
+        rgba(2, 6, 23, 0.90);
+      box-shadow: inset 0 0 18px rgba(0, 229, 255, 0.12), 0 0 16px rgba(0, 229, 255, 0.10);
+      scrollbar-width: thin;
+      scrollbar-color: rgba(85, 120, 170, 0.95) rgba(4, 10, 20, 0.92);
+    }
+    .client-table-wrap::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    .client-table-wrap::-webkit-scrollbar-track {
+      background: rgba(4, 10, 20, 0.92);
+      border-left: 1px solid rgba(100, 180, 255, 0.10);
+      border-radius: 999px;
+    }
+    .client-table-wrap::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(85, 120, 170, 0.98), rgba(55, 80, 120, 0.98));
+      border: 1px solid rgba(120, 180, 255, 0.18);
+      border-radius: 999px;
+      box-shadow: inset 0 0 6px rgba(200, 230, 255, 0.08);
+    }
+    .client-table-wrap::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, rgba(105, 145, 200, 0.98), rgba(65, 95, 145, 0.98));
+    }
+    .client-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      color: #c8e8ff;
+      font-size: 13px;
+      letter-spacing: 0.1px;
+    }
+    .client-table thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 0;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #a5bfde;
+      background: rgba(7, 15, 32, 0.96);
+      text-align: left;
+      border-bottom: 1px solid rgba(100, 180, 255, 0.26);
+    }
+    .client-table-sort-btn {
+      width: 100%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 6px;
+      padding: 8px 10px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      letter-spacing: inherit;
+      text-transform: inherit;
+      cursor: pointer;
+    }
+    .client-table-sort-btn:hover {
+      color: #d8eeff;
+    }
+    .client-table th.num .client-table-sort-btn {
+      justify-content: flex-end;
+    }
+    .client-table-sort-btn.active {
+      color: #e9fbff;
+      text-shadow: 0 0 8px rgba(0, 200, 255, 0.25);
+    }
+    .client-table-sort-indicator {
+      min-width: 0.8em;
+      text-align: center;
+      color: #00c8ff;
+    }
+    .client-table th.num,
+    .client-table td.num {
+      text-align: right;
+    }
+    .client-table tbody tr {
+      border-top: 1px solid rgba(100, 180, 255, 0.14);
+      transition: background 0.15s ease;
+    }
+    .client-table tbody tr:hover {
+      background: rgba(100, 180, 255, 0.08);
+    }
+    .client-table tbody tr.selected {
+      background: linear-gradient(90deg, rgba(0, 200, 255, 0.16), rgba(57, 255, 20, 0.08));
+      box-shadow: inset 3px 0 0 rgba(0, 200, 255, 0.65);
+    }
+    .client-table tbody tr.preview-capable {
+      cursor: pointer;
+    }
+    .client-table tbody tr.inactive {
+      opacity: 0.72;
+      cursor: default;
+    }
+    .client-table td {
+      padding: 7px 10px;
+      white-space: nowrap;
+    }
+    .client-table-empty {
+      padding: 18px 10px;
+      color: #8fa9c9;
+      text-align: center;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
     }
     .card-narrow {
       grid-column: span 1;
@@ -1883,6 +2118,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
       .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
       .preview-card { grid-column: span 4; grid-row: span 1; min-height: 124px; }
+      .client-table-card { grid-column: span 4; grid-row: span 1; min-height: 124px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -1890,6 +2126,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; }
       .preview-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
+      .client-table-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
@@ -1945,6 +2182,27 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           <video id="vGamePreview" class="preview-video" autoplay playsinline></video>
           <canvas id="cGamePreview" class="preview-canvas"></canvas>
           <div id="mGamePreviewMsg" class="preview-msg">No Clients</div>
+        </div>
+      </article>
+      <article class="card client-table-card" style="--card-border:rgba(70,210,255,0.68);--card-glow:rgba(40,150,255,0.24)">
+        <div class="gauge-head">
+          <div class="label">CONNECTED CLIENTS</div>
+          <div class="client-table-count" id="mClientTableCount">0</div>
+        </div>
+        <div class="client-table-wrap">
+          <table class="client-table" aria-label="Connected clients">
+            <thead id="tblClientsHead">
+              <tr>
+                <th aria-sort="ascending"><button type="button" class="client-table-sort-btn active" data-sort-key="client_id">ClientID<span class="client-table-sort-indicator">▲</span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="lives">Lives<span class="client-table-sort-indicator"></span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="level">Level<span class="client-table-sort-indicator"></span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="score">Score<span class="client-table-sort-indicator"></span></button></th>
+              </tr>
+            </thead>
+            <tbody id="tblClientsBody">
+              <tr><td colspan="4" class="client-table-empty">No Clients</td></tr>
+            </tbody>
+          </table>
         </div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
@@ -2220,6 +2478,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       agreePanel: document.getElementById("mAgreePanel"),
       previewMsg: document.getElementById("mGamePreviewMsg"),
       previewLabel: document.getElementById("mPreviewLabel"),
+      clientTableCount: document.getElementById("mClientTableCount"),
     };
     /* Game-settings controls */
     const gsAdvancedEl = document.getElementById("gsAdvanced");
@@ -2365,6 +2624,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const gamePreviewCanvas = document.getElementById("cGamePreview");
     const gamePreviewVideo = document.getElementById("vGamePreview");
     const previewQualitySelect = document.getElementById("selPreviewQuality");
+    const clientTableHead = document.getElementById("tblClientsHead");
+    const clientTableBody = document.getElementById("tblClientsBody");
     const _previewSrcCanvas = document.createElement("canvas");
     const _previewSrcCtx = _previewSrcCanvas.getContext("2d");
     let _previewSeqLoaded = -1;
@@ -2381,6 +2642,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     let _previewVideoLastFrameTs = 0;
     let _previewRtcStream = null;
     let _previewGameAudioEnabled = true;
+    let _previewClientRequestInFlight = false;
+    let _previewPendingClientId = null;
+    let _clientTableSortKey = "client_id";
+    let _clientTableSortDir = "asc";
     // Preview is controlled via checkbox; start enabled by default.
     const ENABLE_CLIENT0_PREVIEW = true;
 
@@ -2505,6 +2770,220 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       ctx.strokeStyle = "rgba(100, 160, 255, 0.20)";
       ctx.lineWidth = 1;
       ctx.strokeRect(0.5, 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
+    }
+
+    function _normalizeClientRows(rows) {
+      if (!Array.isArray(rows)) return [];
+      return rows
+        .map((row) => {
+          const clientId = Number(row && row.client_id);
+          if (!Number.isFinite(clientId) || clientId < 0) return null;
+          return {
+            client_id: Math.trunc(clientId),
+            lives: Math.max(0, Math.trunc(Number(row && row.lives) || 0)),
+            level: Math.max(0, Math.trunc(Number(row && row.level) || 0)),
+            score: Math.max(0, Math.trunc(Number(row && row.score) || 0)),
+            selected_preview: !!(row && row.selected_preview),
+            preview_capable: !!(row && row.preview_capable),
+          };
+        })
+        .filter((row) => row !== null)
+        .sort((a, b) => a.client_id - b.client_id);
+    }
+
+    function _effectivePreviewClientId(rows, selectedId) {
+      const requestedId = (_previewPendingClientId !== null && Number.isFinite(_previewPendingClientId))
+        ? Math.trunc(_previewPendingClientId)
+        : null;
+      const snapshotId = Number.isFinite(selectedId) ? Math.trunc(selectedId) : -1;
+      if (requestedId !== null && rows.some((row) => row.preview_capable && row.client_id === requestedId)) {
+        return requestedId;
+      }
+      if (rows.some((row) => row.preview_capable && row.client_id === snapshotId)) {
+        return snapshotId;
+      }
+      const flagged = rows.find((row) => row.preview_capable && row.selected_preview);
+      if (flagged) return flagged.client_id;
+      const firstCapable = rows.find((row) => row.preview_capable);
+      return firstCapable ? firstCapable.client_id : -1;
+    }
+
+    function _sortClientRows(rows) {
+      const key = String(_clientTableSortKey || "client_id");
+      const dir = (_clientTableSortDir === "desc") ? -1 : 1;
+      return rows.slice().sort((a, b) => {
+        const av = Math.trunc(Number(a && a[key]) || 0);
+        const bv = Math.trunc(Number(b && b[key]) || 0);
+        if (av !== bv) return (av - bv) * dir;
+        return a.client_id - b.client_id;
+      });
+    }
+
+    function updateClientTableSortIndicators() {
+      if (!clientTableHead) return;
+      const buttons = clientTableHead.querySelectorAll("button[data-sort-key]");
+      for (const button of buttons) {
+        const sortKey = String(button.dataset.sortKey || "");
+        const active = sortKey === _clientTableSortKey;
+        button.classList.toggle("active", active);
+        const indicator = button.querySelector(".client-table-sort-indicator");
+        if (indicator) {
+          indicator.textContent = active ? (_clientTableSortDir === "desc" ? "▼" : "▲") : "";
+        }
+        const th = button.closest("th");
+        if (th) {
+          th.setAttribute("aria-sort", active ? (_clientTableSortDir === "desc" ? "descending" : "ascending") : "none");
+        }
+      }
+    }
+
+    function renderClientTable(rows, selectedId) {
+      const normalizedRows = _normalizeClientRows(rows);
+      const sortedRows = _sortClientRows(normalizedRows);
+      const effectiveSelectedId = _effectivePreviewClientId(normalizedRows, selectedId);
+      updateClientTableSortIndicators();
+      if (cards.clientTableCount) cards.clientTableCount.textContent = fmtInt(normalizedRows.length);
+      if (!clientTableBody) return;
+      if (!sortedRows.length) {
+        const existing = Array.from(clientTableBody.children);
+        let emptyRow = existing.find((child) =>
+          child instanceof HTMLTableRowElement && (
+            String(child.dataset.empty || "") === "1" ||
+            !!child.querySelector(".client-table-empty")
+          )
+        );
+        if (!(emptyRow instanceof HTMLTableRowElement)) {
+          emptyRow = document.createElement("tr");
+          emptyRow.dataset.empty = "1";
+          const td = document.createElement("td");
+          td.colSpan = 4;
+          td.className = "client-table-empty";
+          td.textContent = "No Clients";
+          emptyRow.appendChild(td);
+        }
+        for (const child of existing) {
+          if (child !== emptyRow && child.parentNode === clientTableBody) {
+            clientTableBody.removeChild(child);
+          }
+        }
+        if (clientTableBody.firstChild !== emptyRow) {
+          clientTableBody.insertBefore(emptyRow, clientTableBody.firstChild);
+        }
+        return;
+      }
+      const existingRows = new Map();
+      for (const child of Array.from(clientTableBody.children)) {
+        if (
+          child instanceof HTMLTableRowElement && (
+            String(child.dataset.empty || "") === "1" ||
+            !!child.querySelector(".client-table-empty")
+          )
+        ) {
+          if (child.parentNode === clientTableBody) clientTableBody.removeChild(child);
+          continue;
+        }
+        const key = child instanceof HTMLTableRowElement ? String(child.dataset.clientId || "") : "";
+        if (key) existingRows.set(key, child);
+      }
+      const orderedRows = [];
+      for (const row of sortedRows) {
+        const rowKey = String(row.client_id);
+        let tr = existingRows.get(rowKey);
+        if (!(tr instanceof HTMLTableRowElement)) {
+          tr = document.createElement("tr");
+          for (let i = 0; i < 4; i += 1) {
+            tr.appendChild(document.createElement("td"));
+          }
+        }
+        tr.dataset.clientId = String(row.client_id);
+        tr.dataset.previewCapable = row.preview_capable ? "1" : "0";
+        tr.classList.toggle("selected", row.client_id === effectiveSelectedId);
+        tr.classList.toggle("preview-capable", !!row.preview_capable);
+        tr.classList.toggle("inactive", !row.preview_capable);
+        const cellDefs = [
+          { value: fmtInt(row.client_id), className: "" },
+          { value: fmtInt(row.lives), className: "num" },
+          { value: fmtInt(row.level), className: "num" },
+          { value: fmtInt(row.score), className: "num" },
+        ];
+        const cells = tr.children;
+        for (let i = 0; i < cellDefs.length; i += 1) {
+          let td = cells[i];
+          if (!(td instanceof HTMLTableCellElement)) {
+            td = document.createElement("td");
+            tr.appendChild(td);
+          }
+          td.textContent = cellDefs[i].value;
+          td.className = cellDefs[i].className;
+        }
+        existingRows.delete(rowKey);
+        orderedRows.push(tr);
+      }
+      for (const staleRow of existingRows.values()) {
+        if (staleRow.parentNode === clientTableBody) {
+          clientTableBody.removeChild(staleRow);
+        }
+      }
+      for (let i = 0; i < orderedRows.length; i += 1) {
+        const tr = orderedRows[i];
+        const currentAtIndex = clientTableBody.children[i] || null;
+        if (currentAtIndex !== tr) {
+          clientTableBody.insertBefore(tr, currentAtIndex);
+        }
+      }
+    }
+
+    function syncPreviewClientSelection(rows, selectedId) {
+      const normalizedRows = _normalizeClientRows(rows);
+      const snapshotId = Number.isFinite(selectedId) ? Math.trunc(selectedId) : -1;
+      if (_previewPendingClientId !== null && snapshotId === Math.trunc(_previewPendingClientId)) {
+        _previewPendingClientId = null;
+      }
+      const firstCapable = normalizedRows.find((row) => row.preview_capable);
+      if (
+        snapshotId < 0 &&
+        _previewPendingClientId === null &&
+        !_previewClientRequestInFlight &&
+        firstCapable
+      ) {
+        _requestPreviewClientSelection(firstCapable.client_id, "Loading Preview");
+      }
+    }
+
+    async function _postPreviewClientSelection(clientId) {
+      const targetId = Number(clientId);
+      if (!Number.isFinite(targetId) || targetId < 0) return;
+      _previewClientRequestInFlight = true;
+      _previewPendingClientId = Math.trunc(targetId);
+      try {
+        const res = await fetch("/api/preview_settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_id: Math.trunc(targetId) }),
+        });
+        if (!res.ok) throw new Error("bad preview client response");
+        const payload = await res.json();
+        if (payload && Number.isFinite(Number(payload.client_id))) {
+          _previewPendingClientId = Math.trunc(Number(payload.client_id));
+        }
+      } catch (e) {
+        _previewPendingClientId = null;
+        console.error("Failed to update preview client:", e);
+      } finally {
+        _previewClientRequestInFlight = false;
+      }
+    }
+
+    function _requestPreviewClientSelection(clientId, messageText = "Switching Preview") {
+      const targetId = Number(clientId);
+      if (!Number.isFinite(targetId) || targetId < 0) return;
+      _previewSeqLoaded = -1;
+      _previewHasFrame = false;
+      _previewVideoHasFrame = false;
+      _previewVideoLastFrameTs = 0;
+      clearPreviewCanvas();
+      setPreviewMessage(messageText);
+      _postPreviewClientSelection(targetId);
     }
 
     function drawPreviewToCard() {
@@ -4858,6 +5337,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
      * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
       _lastNow = now;
+      const clientRows = _normalizeClientRows(now.client_rows);
+      const selectedPreviewClientId = Number(now.preview_selected_client_id);
+      renderClientTable(clientRows, selectedPreviewClientId);
+      syncPreviewClientSelection(clientRows, selectedPreviewClientId);
       cards.clients.textContent = fmtInt(now.client_count);
       cards.web.textContent = fmtInt(now.web_client_count);
       cards.level.textContent = fmtFloat(now.average_level, 2);
@@ -4928,8 +5411,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         const previewFmt = String(now.game_preview_source_format || "").toUpperCase();
         const previewRatio = Number(now.game_preview_compression_ratio || 1);
         const previewClientId = Number(now.game_preview_client_id);
-        const previewLabelBase = Number.isFinite(previewClientId) && previewClientId >= 0
-          ? `CLIENT ${previewClientId} PREVIEW`
+        const previewLabelClientId = Number.isFinite(selectedPreviewClientId) && selectedPreviewClientId >= 0
+          ? Math.trunc(selectedPreviewClientId)
+          : previewClientId;
+        const previewLabelBase = Number.isFinite(previewLabelClientId) && previewLabelClientId >= 0
+          ? `CLIENT ${previewLabelClientId} PREVIEW`
           : "PREVIEW";
         if (cards.previewLabel) {
           let statText = "";
@@ -5116,6 +5602,35 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         previewQualitySelect.value = _previewProfileMode;
         _saveStoredPreviewQuality(_previewProfileMode);
         _restartPreviewWebRTC().catch(() => {});
+      });
+    }
+    if (clientTableHead) {
+      clientTableHead.addEventListener("click", (ev) => {
+        const target = ev.target instanceof Element ? ev.target : null;
+        const button = target ? target.closest("button[data-sort-key]") : null;
+        if (!button) return;
+        const nextKey = String(button.dataset.sortKey || "client_id");
+        if (_clientTableSortKey === nextKey) {
+          _clientTableSortDir = (_clientTableSortDir === "asc") ? "desc" : "asc";
+        } else {
+          _clientTableSortKey = nextKey;
+          _clientTableSortDir = "asc";
+        }
+        updateClientTableSortIndicators();
+        if (_lastNow) {
+          renderClientTable(_lastNow.client_rows, _lastNow.preview_selected_client_id);
+        }
+      });
+    }
+    if (clientTableBody) {
+      clientTableBody.addEventListener("click", (ev) => {
+        const target = ev.target instanceof Element ? ev.target : null;
+        const row = target ? target.closest("tr[data-client-id]") : null;
+        if (!row || row.dataset.previewCapable !== "1" || _previewClientRequestInFlight) return;
+        if (row.classList.contains("selected") && _previewPendingClientId === null) return;
+        const nextClientId = Number(row.dataset.clientId);
+        if (!Number.isFinite(nextClientId) || nextClientId < 0) return;
+        _requestPreviewClientSelection(nextClientId, "Switching Preview");
       });
     }
 
@@ -5441,6 +5956,21 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                         with state.metrics.lock:
                             state.metrics.hud_enabled = hud_enabled
                             updates["hud_enabled"] = hud_enabled
+                    if "client_id" in data:
+                        preview_client_id = data.get("client_id")
+                        if preview_client_id in ("", None):
+                            target_cid = None
+                        else:
+                            target_cid = int(preview_client_id)
+                            if target_cid < 0:
+                                target_cid = None
+                        srv = getattr(state.metrics, "global_server", None)
+                        if srv is None:
+                            raise RuntimeError("preview routing server unavailable")
+                        ok, selected_cid = srv.set_preview_client(target_cid)
+                        if not ok:
+                            raise ValueError("invalid preview client")
+                        updates["client_id"] = -1 if selected_cid is None else int(selected_cid)
                     if updates:
                         body = json.dumps({"ok": True, **updates}).encode("utf-8")
                         self._send(body, "application/json")

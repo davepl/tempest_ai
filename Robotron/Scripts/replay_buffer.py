@@ -223,7 +223,8 @@ class PrioritizedReplayBuffer:
             sys.stdout.flush()
 
     def add(self, state, action: int, reward: float, next_state, done: bool,
-            horizon: int = 1, expert: int = 0, priority_hint: float = 0.0):
+            horizon: int = 1, expert: int = 0, priority_hint: float = 0.0,
+            level_mult: float = 1.0):
         with self.lock:
             priority = self.tree.max_priority
             cap_mult = float(getattr(RL_CONFIG, "per_new_priority_cap_multiplier", 0.0))
@@ -238,6 +239,12 @@ class PrioritizedReplayBuffer:
                     priority = hint_pri
             if cap_mult > 0.0 and mean_pri > 0.0:
                 priority = min(priority, mean_pri * cap_mult)
+            # Apply log10 level-priority multiplier, then re-apply the cap so a
+            # high-level transition can't starve the rest of the buffer forever.
+            if level_mult > 1.0:
+                priority *= level_mult
+                if cap_mult > 0.0 and mean_pri > 0.0:
+                    priority = min(priority, mean_pri * cap_mult)
             priority = max(1e-6, float(priority))
             # If buffer is full, undo the expert flag of the slot being recycled
             if self.tree.size >= self.capacity:

@@ -11,6 +11,7 @@
 
 local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
 local PREVIEW_CLIENT_FLAG = (os.getenv("ROBOTRON_PREVIEW_CLIENT") == "1") and 1 or 0
+local CLIENT_SLOT = math.max(0, math.floor(tonumber(os.getenv("ROBOTRON_CLIENT_SLOT") or "0") or 0))
 local SOCKET_ADDRESS = RAW_SOCKET_ADDRESS
 if string.sub(SOCKET_ADDRESS, 1, 7) ~= "socket." then
     SOCKET_ADDRESS = "socket." .. SOCKET_ADDRESS
@@ -1643,8 +1644,12 @@ local function open_socket()
         local sock = emu.file("rw")
         local result = sock:open(SOCKET_ADDRESS)
         if result == nil then
-            -- Required 2-byte handshake.
-            sock:write(string.pack(">H", PREVIEW_CLIENT_FLAG))
+            -- Required 2-byte handshake:
+            --   bit0     = preview-capable flag
+            --   bits1-15 = launcher slot (stable audio/video identity)
+            local preview_capable = (PREVIEW_CLIENT_FLAG ~= 0) and 1 or 0
+            local handshake_u16 = math.max(0, math.min(65535, (CLIENT_SLOT * 2) + preview_capable))
+            sock:write(string.pack(">H", handshake_u16))
             current_socket = sock
         else
             open_result = tostring(result)
@@ -2460,10 +2465,9 @@ previous_wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
 
 global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
 
--- Only the preview client needs the frame_done callback (HUD overlay + screenshot
--- capture).  Training-only instances run with -video none, so registering this
--- callback wastes CPU and would cause confusing duplicate log lines when many
--- instances share a terminal.
+-- All preview-capable instances register the frame_done callback.  The server
+-- decides per-frame which client should actually capture/stream preview data by
+-- toggling the preview flag in the action source byte.
 if PREVIEW_CLIENT_FLAG == 1 then
     emu.register_frame_done(frame_done_callback)
     print("[HUD] Registered frame_done callback for debug overlay + preview capture")
