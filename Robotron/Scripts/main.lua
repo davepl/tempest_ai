@@ -2688,8 +2688,7 @@ global_callback_ref = register_frame_callback(frame_callback)
 -- decides per-frame which client should actually capture/stream preview data by
 -- toggling the preview flag in the action source byte.
 if PREVIEW_CLIENT_FLAG == 1 then
-    local frame_done_ref = register_frame_done_callback(frame_done_callback)
-    if frame_done_ref ~= nil or emu.register_frame_done ~= nil then
+    if register_frame_done_callback(frame_done_callback) ~= nil or emu.register_frame_done ~= nil then
         print("[HUD] Registered frame_done callback for debug overlay + preview capture")
     else
         print("[HUD] Frame-done callback unavailable in this MAME build; preview capture disabled")
