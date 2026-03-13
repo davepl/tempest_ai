@@ -2634,6 +2634,34 @@ function on_mame_exit()
     print("Robotron AI Lua script shutting down.")
 end
 
+local function register_frame_callback(cb)
+    if emu.add_machine_frame_notifier then
+        return emu.add_machine_frame_notifier(cb)
+    end
+    if emu.register_frame then
+        return emu.register_frame(cb)
+    end
+    error("No supported frame callback API found (expected emu.add_machine_frame_notifier or emu.register_frame)")
+end
+
+local function register_frame_done_callback(cb)
+    if emu.register_frame_done then
+        return emu.register_frame_done(cb)
+    end
+    -- Older/minimal MAME builds may not expose a frame-done hook.
+    return nil
+end
+
+local function register_stop_callback(cb)
+    if emu.add_machine_stop_notifier then
+        return emu.add_machine_stop_notifier(cb)
+    end
+    if emu.register_stop then
+        return emu.register_stop(cb)
+    end
+    return nil
+end
+
 math.randomseed(os.time())
 
 if not initialize_mame_interface() then
@@ -2654,16 +2682,20 @@ previous_player_alive = (read_player_alive(mem) ~= 0) and 1 or 0
 previous_score = math.max(0, math.floor(read_player_score(mem) or 0))
 previous_wave_number = math.max(0, math.floor(read_wave_number(mem) or 0))
 
-global_callback_ref = emu.add_machine_frame_notifier(frame_callback)
+global_callback_ref = register_frame_callback(frame_callback)
 
 -- All preview-capable instances register the frame_done callback.  The server
 -- decides per-frame which client should actually capture/stream preview data by
 -- toggling the preview flag in the action source byte.
 if PREVIEW_CLIENT_FLAG == 1 then
-    emu.register_frame_done(frame_done_callback)
-    print("[HUD] Registered frame_done callback for debug overlay + preview capture")
+    local frame_done_ref = register_frame_done_callback(frame_done_callback)
+    if frame_done_ref ~= nil or emu.register_frame_done ~= nil then
+        print("[HUD] Registered frame_done callback for debug overlay + preview capture")
+    else
+        print("[HUD] Frame-done callback unavailable in this MAME build; preview capture disabled")
+    end
 end
 
-emu.add_machine_stop_notifier(on_mame_exit)
+register_stop_callback(on_mame_exit)
 
 print("Robotron AI Lua script initialized.")
