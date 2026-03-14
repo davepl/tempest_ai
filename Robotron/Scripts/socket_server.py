@@ -9,13 +9,14 @@ if __name__ == "__main__":
     print("This is not the main application, run 'main.py' instead")
     exit(1)
 
-import os, time, socket, select, struct, threading, traceback, queue, random, base64
+import os, time, socket, select, struct, threading, traceback, queue, random
 import numpy as np
 from collections import deque
 
 from aimodel import (
     parse_frame_data,
     get_expert_action,
+    get_cleanup_fire_override,
     encode_action_to_game,
     combine_action_indices,
     split_joint_action,
@@ -346,7 +347,7 @@ class SocketServer:
             metrics.game_preview_width = 0
             metrics.game_preview_height = 0
             metrics.game_preview_format = ""
-            metrics.game_preview_data_b64 = ""
+            metrics.game_preview_data = b""
             metrics.game_preview_updated_ts = 0.0
             metrics.game_preview_source_format = ""
             metrics.game_preview_encoded_bytes = 0
@@ -473,17 +474,22 @@ class SocketServer:
             selected, changed = self._ensure_preview_client_selected_locked()
             rows = []
             for cid, cs in self.client_states.items():
-                try:
-                    lives = max(0, int(cs.get("num_lasers", 0) or 0))
-                except Exception:
+                if bool(cs.get("gameplay_seen", False)):
+                    try:
+                        lives = max(0, int(cs.get("num_lasers", 0) or 0))
+                    except Exception:
+                        lives = 0
+                    try:
+                        level = max(0, int(cs.get("level_number", 0) or 0))
+                    except Exception:
+                        level = 0
+                    try:
+                        score = max(0, int(cs.get("game_score", 0) or 0))
+                    except Exception:
+                        score = 0
+                else:
                     lives = 0
-                try:
-                    level = max(0, int(cs.get("level_number", 0) or 0))
-                except Exception:
                     level = 0
-                try:
-                    score = max(0, int(cs.get("game_score", 0) or 0))
-                except Exception:
                     score = 0
                 rows.append({
                     "client_id": int(cid),
@@ -515,10 +521,6 @@ class SocketServer:
         expected_len = width * height * 2
         if expected_len <= 0 or len(pixels) != expected_len:
             return
-        try:
-            b64 = base64.b64encode(pixels).decode("ascii")
-        except Exception:
-            return
         with metrics.lock:
             prev_seq = int(getattr(metrics, "game_preview_seq", 0) or 0)
             prev_ts = float(getattr(metrics, "game_preview_updated_ts", 0.0) or 0.0)
@@ -533,7 +535,7 @@ class SocketServer:
             metrics.game_preview_width = width
             metrics.game_preview_height = height
             metrics.game_preview_format = "rgb565be"
-            metrics.game_preview_data_b64 = b64
+            metrics.game_preview_data = bytes(pixels)
             metrics.game_preview_updated_ts = now_ts
             metrics.game_preview_source_format = {1: "raw", 2: "lzss", 3: "rle"}.get(enc_fmt, "unknown")
             metrics.game_preview_encoded_bytes = int(enc_bytes)
@@ -572,6 +574,8 @@ class SocketServer:
                 "player_alive": False,
                 "game_score": 0,
                 "num_lasers": 0,
+                "alive_streak": 0,
+                "gameplay_seen": False,
                 "last_action_source": None, "prev_action_source": None,
                 "act_total": 0, "act_eps": 0, "act_xprt": 0, "act_last_diag_total": 0,
                 "act_same": 0, "act_diff": 0,
@@ -703,10 +707,17 @@ class SocketServer:
                     cs = self.client_states[cid]
                     cs["frames"] += 1
                     cs["player_alive"] = bool(frame.player_alive)
-                    cs["num_lasers"] = max(0, int(getattr(frame, "num_lasers", 0) or 0))
+                    if frame.player_alive:
+                        cs["alive_streak"] = int(cs.get("alive_streak", 0) or 0) + 1
+                    else:
+                        cs["alive_streak"] = 0
+                    if int(cs.get("alive_streak", 0) or 0) >= 15:
+                        cs["gameplay_seen"] = True
+                    if bool(cs.get("gameplay_seen", False)):
+                        cs["num_lasers"] = max(0, int(getattr(frame, "num_lasers", 0) or 0))
                     # Only trust RAM-read level/score while player is alive;
                     # during attract/death the byte can hold garbage.
-                    if frame.player_alive:
+                    if frame.player_alive and bool(cs.get("gameplay_seen", False)):
                         cs["level_number"] = frame.level_number
                         cs["game_score"] = max(0, int(getattr(frame, "game_score", 0) or 0))
                     # Ignore attract/menu/transient frames for high-score tracking.
@@ -749,10 +760,18 @@ class SocketServer:
                     move_i, fire_i = cs["last_action"]
                     subj_r = float(frame.subjreward) * RL_CONFIG.subj_reward_scale
                     obj_r = float(frame.objreward) * RL_CONFIG.obj_reward_scale
-                    total_r = obj_r + subj_r
+                    total_unclipped_r = obj_r + subj_r
                     # Use wider clip on terminal frames so death penalty passes through
                     clip = RL_CONFIG.death_reward_clip if frame.done else RL_CONFIG.reward_clip
-                    total_r = max(-clip, min(clip, total_r))
+                    total_r = max(-clip, min(clip, total_unclipped_r))
+                    eff_obj_r = obj_r
+                    eff_subj_r = subj_r
+                    if abs(total_unclipped_r) > 1e-9:
+                        # Display reward components after the same clip that the trainer sees
+                        # so Rwrd == Obj + Subj in the metrics table.
+                        scale = total_r / total_unclipped_r
+                        eff_obj_r = obj_r * scale
+                        eff_subj_r = subj_r * scale
 
                     if self.agent:
                         tag = cs.get("prev_action_source", "dqn")
@@ -763,12 +782,13 @@ class SocketServer:
                                                 stacked_state, bool(frame.done),
                                                 actor=tag, priority_reward=total_r)
                             wave = max(1, cs.get("level_number", 1) or 1)
-                            for s0, a, Rn, pR, sn, dn, h, act in matured:
+                            for s0, a, Rn, pR, sn, dn, h, act, wave_n, _start_wave in matured:
                                 move_n, fire_n = split_joint_action(a)
                                 self.async_buffer.step_async(
                                     s0, (move_n, fire_n), Rn, sn, bool(dn),
                                     client_id=cid, actor=act, horizon=int(h),
-                                    priority_reward=pR, wave_number=wave)
+                                    priority_reward=pR,
+                                    wave_number=max(1, int(wave_n or wave)))
                         else:
                             wave = max(1, cs.get("level_number", 1) or 1)
                             self.async_buffer.step_async(
@@ -777,8 +797,8 @@ class SocketServer:
                                 priority_reward=total_r, wave_number=wave)
 
                     cs["total_reward"] += total_r
-                    cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + subj_r
-                    cs["ep_obj_reward"] = cs.get("ep_obj_reward", 0) + obj_r
+                    cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + eff_subj_r
+                    cs["ep_obj_reward"] = cs.get("ep_obj_reward", 0) + eff_obj_r
                     cs["ep_frames"] = cs.get("ep_frames", 0) + 1
                     src = cs.get("prev_action_source")
                     if src == "dqn":
@@ -898,6 +918,13 @@ class SocketServer:
                             )
                         self.metrics.add_inference_time(time.perf_counter() - t0)
                         action_source = "dqn"
+
+                # When the wave is effectively over (no humans, <=2 cleanup targets),
+                # correct only the fire axis toward an obvious aligned kill shot.
+                if action_source == "dqn" and not is_epsilon:
+                    cleanup_fire = get_cleanup_fire_override(stacked_state, locked_fire=locked_fire)
+                    if cleanup_fire is not None:
+                        fire_idx = int(cleanup_fire)
 
                 move_hist = cs.get("act_move_hist", [])
                 fire_hist = cs.get("act_fire_hist", [])

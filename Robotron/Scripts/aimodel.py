@@ -53,6 +53,84 @@ warnings.filterwarnings("default")
 
 metrics = config_metrics
 
+
+def _export_metrics_snapshot() -> dict:
+    snap = {}
+    try:
+        with metrics.lock:
+            snap = {
+                "episode_rewards": list(metrics.episode_rewards),
+                "dqn_rewards": list(metrics.dqn_rewards),
+                "expert_rewards": list(metrics.expert_rewards),
+                "subj_rewards": list(metrics.subj_rewards),
+                "obj_rewards": list(metrics.obj_rewards),
+                "game_scores": list(metrics.game_scores),
+                "avg_game_score": float(metrics.avg_game_score),
+                "total_games_played": int(metrics.total_games_played),
+                "peak_level": int(metrics.peak_level),
+                "peak_episode_reward": float(metrics.peak_episode_reward),
+                "peak_game_score": int(metrics.peak_game_score),
+            }
+    except Exception:
+        snap = {}
+    try:
+        from metrics_display import export_window_state
+    except ImportError:
+        try:
+            from Scripts.metrics_display import export_window_state
+        except ImportError:
+            export_window_state = None
+    if export_window_state is not None:
+        try:
+            snap["display_windows"] = export_window_state()
+        except Exception:
+            pass
+    return snap
+
+
+def _restore_metrics_snapshot(snap: dict | None) -> None:
+    if not isinstance(snap, dict):
+        return
+    try:
+        with metrics.lock:
+            if "episode_rewards" in snap:
+                metrics.episode_rewards.clear()
+                metrics.episode_rewards.extend(float(x) for x in snap.get("episode_rewards", []))
+            if "dqn_rewards" in snap:
+                metrics.dqn_rewards.clear()
+                metrics.dqn_rewards.extend(float(x) for x in snap.get("dqn_rewards", []))
+            if "expert_rewards" in snap:
+                metrics.expert_rewards.clear()
+                metrics.expert_rewards.extend(float(x) for x in snap.get("expert_rewards", []))
+            if "subj_rewards" in snap:
+                metrics.subj_rewards.clear()
+                metrics.subj_rewards.extend(float(x) for x in snap.get("subj_rewards", []))
+            if "obj_rewards" in snap:
+                metrics.obj_rewards.clear()
+                metrics.obj_rewards.extend(float(x) for x in snap.get("obj_rewards", []))
+            if "game_scores" in snap:
+                metrics.game_scores.clear()
+                metrics.game_scores.extend(int(x) for x in snap.get("game_scores", []))
+            metrics.avg_game_score = float(snap.get("avg_game_score", metrics.avg_game_score))
+            metrics.total_games_played = int(snap.get("total_games_played", metrics.total_games_played))
+            metrics.peak_level = int(snap.get("peak_level", metrics.peak_level))
+            metrics.peak_episode_reward = float(snap.get("peak_episode_reward", metrics.peak_episode_reward))
+            metrics.peak_game_score = int(snap.get("peak_game_score", metrics.peak_game_score))
+    except Exception:
+        pass
+    try:
+        from metrics_display import import_window_state
+    except ImportError:
+        try:
+            from Scripts.metrics_display import import_window_state
+        except ImportError:
+            import_window_state = None
+    if import_window_state is not None:
+        try:
+            import_window_state(snap.get("display_windows"))
+        except Exception:
+            pass
+
 # ── Device selection ────────────────────────────────────────────────────────
 def _cuda_device(index_hint: int) -> torch.device:
     n = torch.cuda.device_count()
@@ -348,7 +426,8 @@ _PROJECTILE_DANGER_DIST = 6144.0 / _POS_MAX_DIAG  # ~24 px
 _ALIGN_HALF_WINDOW_PX = 8.0
 _ALIGN_HALF_WINDOW_WORLD = _ALIGN_HALF_WINDOW_PX * _WORLD_UNITS_PER_PIXEL
 _ALIGN_ROBOT_CATEGORIES = {"grunt", "brain", "tank", "spawner", "enforcer"}
-_ALIGNED_FIRE_CATEGORIES = _ALIGN_ROBOT_CATEGORIES | {"projectile"}
+_ENDGAME_CLEANUP_CATEGORIES = _ALIGN_ROBOT_CATEGORIES | {"hulk"}
+_ALIGNED_FIRE_CATEGORIES = _ENDGAME_CLEANUP_CATEGORIES | {"projectile"}
 _PLAYER_BOX_W_PX = 4.0
 _PLAYER_BOX_H_PX = 12.0
 _PLAYER_BOX_W_WORLD = _PLAYER_BOX_W_PX * _WORLD_UNITS_PER_PIXEL
@@ -616,7 +695,7 @@ def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float,
 
 
 def _nearest_align_robot_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
-    """Return nearest robot candidate for axis alignment (non-grunt, non-obstacle)."""
+    """Return nearest robot candidate for safe standoff alignment (non-hulk, non-obstacle)."""
     toks = _active_tokens_from_state(state)
     if toks.shape[0] == 0:
         return None
@@ -631,6 +710,38 @@ def _nearest_align_robot_vector_from_state(state: np.ndarray) -> Optional[Tuple[
         if best is None or dist < best[2]:
             best = (float(tok[1]), float(tok[2]), dist)
     return best
+
+
+def _nearest_endgame_cleanup_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+    best: Optional[Tuple[float, float, float]] = None
+    for tok in toks:
+        name = _token_category_name(tok)
+        if name not in _ENDGAME_CLEANUP_CATEGORIES:
+            continue
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
+    return best
+
+
+def _count_humans_and_cleanup_targets(state: np.ndarray) -> tuple[int, int]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return 0, 0
+    humans = 0
+    cleanup_targets = 0
+    for tok in toks:
+        if tok[12] > 0.5:
+            humans += 1
+            continue
+        if _token_category_name(tok) in _ENDGAME_CLEANUP_CATEGORIES:
+            cleanup_targets += 1
+    return humans, cleanup_targets
 
 
 def _nearest_human_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -953,16 +1064,20 @@ def _apply_final_hazard_move_check(
     return best_dir
 
 
-def _nearest_aligned_fire_direction_from_state(state: np.ndarray) -> Optional[int]:
+def _nearest_aligned_fire_direction_from_state(
+    state: np.ndarray,
+    categories: Optional[set[str]] = None,
+) -> Optional[int]:
     """Return fire direction for the closest non-human target aligned to any 8-way shot."""
     toks = _active_tokens_from_state(state)
     if toks.shape[0] == 0:
         return None
+    allowed_categories = _ALIGNED_FIRE_CATEGORIES if categories is None else set(categories)
 
     per_direction: list[Optional[tuple[float, int]]] = [None] * len(_DIR8_VECTORS)
     for tok in toks:
         name = _token_category_name(tok)
-        if name not in _ALIGNED_FIRE_CATEGORIES:
+        if name not in allowed_categories:
             continue
         dx = float(tok[1])
         dy = float(tok[2])
@@ -995,6 +1110,16 @@ def _nearest_aligned_fire_direction_from_state(state: np.ndarray) -> Optional[in
     return int(best_aligned[1])
 
 
+def get_cleanup_fire_override(state: np.ndarray, locked_fire: Optional[int] = None) -> Optional[int]:
+    """Return an obvious endgame cleanup shot, or None if no override is warranted."""
+    if locked_fire is not None and int(locked_fire) >= 0:
+        return None
+    humans, cleanup_targets = _count_humans_and_cleanup_targets(state)
+    if humans > 0 or cleanup_targets <= 0 or cleanup_targets > 2:
+        return None
+    return _nearest_aligned_fire_direction_from_state(state, categories=_ENDGAME_CLEANUP_CATEGORIES)
+
+
 def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> Tuple[int, int]:
     """Heuristic Robotron expert.
 
@@ -1012,9 +1137,11 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
     nearest_enemy = _nearest_enemy_vector_from_state(state)
     nearest_projectile = _nearest_projectile_vector_from_state(state)
     nearest_align_robot = _nearest_align_robot_vector_from_state(state)
+    nearest_endgame_cleanup = _nearest_endgame_cleanup_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
     aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
+    humans_remaining, _cleanup_targets = _count_humans_and_cleanup_targets(state)
 
     # ── Fire direction ───────────────────────────────────────────────
     if aligned_fire_dir is not None:
@@ -1055,6 +1182,9 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
         # 3) Safe standoff: align on one axis with nearest non-hulk robot.
         elif nearest_align_robot is not None:
             ax, ay, _ = nearest_align_robot
+            move_dir = _axis_align_toward_enemy(ax * _REL_POS_X_RANGE, ay * _REL_POS_Y_RANGE)
+        elif humans_remaining <= 0 and nearest_endgame_cleanup is not None:
+            ax, ay, _ = nearest_endgame_cleanup
             move_dir = _axis_align_toward_enemy(ax * _REL_POS_X_RANGE, ay * _REL_POS_Y_RANGE)
         else:
             # 4) Fallback: flee nearest enemy.
@@ -1753,8 +1883,7 @@ class RainbowAgent:
 
     def _infer_q_values(self, states_t: torch.Tensor) -> torch.Tensor:
         net = self.infer_net if self.use_separate_inference else self.online_net
-        net.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             if self._inference_stream is not None:
                 # Wait for any in-flight weight sync to finish, then run
                 # the forward pass on the dedicated inference stream.
@@ -2001,6 +2130,7 @@ class RainbowAgent:
             "total_training_steps": ts,
             "expert_ratio": er,
             "epsilon": ep,
+            "metrics_state": _export_metrics_snapshot(),
             "engine_version": 2,
         }
         if hasattr(self, "grad_scaler") and self.grad_scaler is not None:
@@ -2093,6 +2223,8 @@ class RainbowAgent:
             except Exception:
                 pass
 
+            _restore_metrics_snapshot(ckpt.get("metrics_state"))
+
             print(f"Loaded v2 model from {filepath}")
 
             # Load replay buffer if present alongside the model
@@ -2102,6 +2234,12 @@ class RainbowAgent:
                     print("  No replay buffer found — starting with empty buffer.")
             except Exception as e:
                 print(f"  Replay buffer load failed: {e}")
+
+            try:
+                with metrics.lock:
+                    metrics.memory_buffer_size = len(self.memory)
+            except Exception:
+                pass
 
             return True
         except Exception as e:
@@ -2180,12 +2318,9 @@ class RainbowAgent:
         if batch is None:
             return float("nan"), float("nan")
         states = batch[0]
-        st = torch.from_numpy(states).float().to(self.device)
-        self.online_net.eval()
-        with torch.no_grad():
-            q = self.online_net.q_values(st)
-            mn, mx = q.min().item(), q.max().item()
-        self.online_net.train()
+        st = torch.from_numpy(states).float().to(self.inference_device)
+        q = self._infer_q_values(st)
+        mn, mx = q.min().item(), q.max().item()
         return mn, mx
 
     def stop(self):

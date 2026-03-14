@@ -162,6 +162,68 @@ def get_eplen_1m_average() -> float:
         return _avg_window(_eplen1m) if _eplen1m else 0.0
 
 
+def export_window_state() -> dict:
+    with _dqn_windows_lock:
+        return {
+            "dqn100k": list(_dqn100k),
+            "dqn100k_frames": int(_dqn100k_frames),
+            "dqn1m": list(_dqn1m),
+            "dqn1m_frames": int(_dqn1m_frames),
+            "dqn5m": list(_dqn5m),
+            "dqn5m_frames": int(_dqn5m_frames),
+            "total100k": list(_total100k),
+            "total100k_frames": int(_total100k_frames),
+            "total1m": list(_total1m),
+            "total1m_frames": int(_total1m_frames),
+            "total5m": list(_total5m),
+            "total5m_frames": int(_total5m_frames),
+            "eplen100k": list(_eplen100k),
+            "eplen100k_frames": int(_eplen100k_frames),
+            "eplen1m": list(_eplen1m),
+            "eplen1m_frames": int(_eplen1m_frames),
+        }
+
+
+def import_window_state(state: dict | None) -> None:
+    global _dqn100k_frames, _dqn1m_frames, _dqn5m_frames
+    global _total100k_frames, _total1m_frames, _total5m_frames
+    global _eplen100k_frames, _eplen1m_frames
+    if not isinstance(state, dict):
+        return
+    with _dqn_windows_lock:
+        _dqn100k.clear()
+        _dqn100k.extend((float(r), int(l)) for r, l in state.get("dqn100k", []))
+        _dqn100k_frames = int(state.get("dqn100k_frames", 0))
+
+        _dqn1m.clear()
+        _dqn1m.extend((float(r), int(l)) for r, l in state.get("dqn1m", []))
+        _dqn1m_frames = int(state.get("dqn1m_frames", 0))
+
+        _dqn5m.clear()
+        _dqn5m.extend((float(r), int(l)) for r, l in state.get("dqn5m", []))
+        _dqn5m_frames = int(state.get("dqn5m_frames", 0))
+
+        _total100k.clear()
+        _total100k.extend((float(r), int(l)) for r, l in state.get("total100k", []))
+        _total100k_frames = int(state.get("total100k_frames", 0))
+
+        _total1m.clear()
+        _total1m.extend((float(r), int(l)) for r, l in state.get("total1m", []))
+        _total1m_frames = int(state.get("total1m_frames", 0))
+
+        _total5m.clear()
+        _total5m.extend((float(r), int(l)) for r, l in state.get("total5m", []))
+        _total5m_frames = int(state.get("total5m_frames", 0))
+
+        _eplen100k.clear()
+        _eplen100k.extend((float(r), int(l)) for r, l in state.get("eplen100k", []))
+        _eplen100k_frames = int(state.get("eplen100k_frames", 0))
+
+        _eplen1m.clear()
+        _eplen1m.extend((float(r), int(l)) for r, l in state.get("eplen1m", []))
+        _eplen1m_frames = int(state.get("eplen1m_frames", 0))
+
+
 def clear_screen():
     if IS_INTERACTIVE:
         sys.stdout.write("\033[2J\033[H")

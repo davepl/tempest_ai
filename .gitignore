@@ -51,3 +51,7 @@ Robotron/Scripts/models/robotron_model_latest_replay/is_expert.dat
 Robotron/Scripts/models/robotron_model_latest_replay/next_states.dat
 Robotron/Scripts/models/robotron_model_latest_replay/rewards.dat
 Robotron/Scripts/models/robotron_model_latest_replay/states.dat
+Robotron/models/game_settings.json
+Robotron/logs/dashboard_chat.jsonl
+models/game_settings.json
+

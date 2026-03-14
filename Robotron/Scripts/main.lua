@@ -2,44 +2,69 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a hybrid 2210-value state vector:
-        + 98 global features
+      - Sends a hybrid 2212-value state vector:
+        + 100 global features
         + 12x12x8 egocentric spatial grid
         + 64 object tokens x 15 features
       - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
 --]]
 
-local RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
-local PREVIEW_CLIENT_FLAG = (os.getenv("ROBOTRON_PREVIEW_CLIENT") == "1") and 1 or 0
-local CLIENT_SLOT = math.max(0, math.floor(tonumber(os.getenv("ROBOTRON_CLIENT_SLOT") or "0") or 0))
-local SOCKET_ADDRESS = RAW_SOCKET_ADDRESS
+RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
+PREVIEW_CLIENT_FLAG = (os.getenv("ROBOTRON_PREVIEW_CLIENT") == "1") and 1 or 0
+CLIENT_SLOT = math.max(0, math.floor(tonumber(os.getenv("ROBOTRON_CLIENT_SLOT") or "0") or 0))
+SOCKET_ADDRESS = RAW_SOCKET_ADDRESS
 if string.sub(SOCKET_ADDRESS, 1, 7) ~= "socket." then
     SOCKET_ADDRESS = "socket." .. SOCKET_ADDRESS
 end
-local SOCKET_READ_TIMEOUT_S = 3.5
-local CONNECTION_RETRY_INTERVAL_S = 1.0
-local SAVE_INTERVAL_S = 300
-local unpack = table.unpack or unpack
+SOCKET_READ_TIMEOUT_S = 3.5
+CONNECTION_RETRY_INTERVAL_S = 1.0
+SAVE_INTERVAL_S = 300
+unpack = table.unpack or unpack
+
+function env_number(name, default)
+    local raw = os.getenv(name)
+    if raw == nil or raw == "" then
+        return default
+    end
+    local val = tonumber(raw)
+    if val == nil then
+        return default
+    end
+    return val
+end
+
+function env_flag(name, default)
+    local raw = os.getenv(name)
+    if raw == nil or raw == "" then
+        return default
+    end
+    raw = string.lower(tostring(raw))
+    return not (raw == "0" or raw == "false" or raw == "off" or raw == "no")
+end
 
 -- Startup diagnostics (bounded, opt-in style flags kept local to script).
-local DEBUG_STARTUP_TRACE = false
-local DEBUG_TRACE_FRAMES = 10
-local DEBUG_BYPASS_SOCKET_FOR_FRAMES = 0
-local DEBUG_TRACE_FILE = "logs/startup_trace.log"
-local DEBUG_FORCE_ACTION_FRAMES = 0
-local DEBUG_FORCE_MOVE_DIR = 2  -- right
-local DEBUG_FORCE_FIRE_DIR = 2  -- right
-local DEATH_PENALTY_POINTS = 7500
+DEBUG_STARTUP_TRACE = false
+DEBUG_TRACE_FRAMES = 10
+DEBUG_BYPASS_SOCKET_FOR_FRAMES = 0
+DEBUG_TRACE_FILE = "logs/startup_trace.log"
+DEBUG_FORCE_ACTION_FRAMES = 0
+DEBUG_FORCE_MOVE_DIR = 2  -- right
+DEBUG_FORCE_FIRE_DIR = 2  -- right
+DEATH_PENALTY_POINTS = 25000
 -- Subjective shaping rewards (raw points; scaled in Python by subj_reward_scale).
 -- Goal: densify survival signal without dominating objective score rewards.
-local SUBJ_ENEMY_WEIGHT = 8.0
-local SUBJ_HUMAN_WEIGHT = 12.0
-local SUBJ_SURVIVAL_BONUS = 2.0
-local SUBJ_DEATH_PENALTY = 25.0
-local SUBJ_ENEMY_NEAR_NORM = 0.035
-local SUBJ_ENEMY_FAR_NORM = 0.200
-local SUBJ_HUMAN_NEAR_NORM = 0.120
-local ADVANCED_SHAPING = {
+SUBJ_ENEMY_WEIGHT = 8.0
+SUBJ_HUMAN_WEIGHT = 12.0
+SUBJ_SURVIVAL_BONUS = 2.0
+-- Survival shaping is only awarded while there are humans left to rescue.
+SUBJ_SURVIVAL_REQUIRE_HUMANS = true
+-- Per-frame penalty when alive but no humans remain; helps avoid end-of-wave stalling.
+SUBJ_NO_HUMANS_EXISTENCE_PENALTY = 2.0
+SUBJ_DEATH_PENALTY = 25.0
+SUBJ_ENEMY_NEAR_NORM = 0.035
+SUBJ_ENEMY_FAR_NORM = 0.200
+SUBJ_HUMAN_NEAR_NORM = 0.120
+ADVANCED_SHAPING = {
     priority_aim_weight = 10.0,
     centering_weight = 7.0,
     brain_guard_weight = 8.0,
@@ -51,11 +76,11 @@ local ADVANCED_SHAPING = {
 }
 
 -- Aiming reward: bonus for firing toward aligned enemies/obstacles.
-local SUBJ_AIM_WEIGHT = 15.0        -- reward per frame when correctly aimed
-local AIM_CROSS_THRESHOLD = 2048     -- 8 screen-pixels in x16 units (8 * 256)
-local AIM_MIN_FORWARD = 1024         -- ~4 screen-pixels minimum forward distance
+SUBJ_AIM_WEIGHT = 15.0        -- reward per frame when correctly aimed
+AIM_CROSS_THRESHOLD = 2048     -- 8 screen-pixels in x16 units (8 * 256)
+AIM_MIN_FORWARD = 1024         -- ~4 screen-pixels minimum forward distance
 -- Categories that count as "targets" for aim reward (everything but humans).
-local AIM_TARGET_CATS = {
+AIM_TARGET_CATS = {
     grunt = true, hulk = true, brain = true, tank = true,
     spawner = true, enforcer = true, projectile = true, electrode = true,
 }
@@ -72,7 +97,7 @@ ADVANCED_SHAPING.priority_aim_bonus = {
 -- Direction unit vectors for 8-way fire (dx, dy in x16 coordinates).
 -- Screen/world coordinates are y-down (larger y = lower on screen):
 -- 0=up (-y), 1=up-right, 2=right, 3=down-right, 4=down (+y), 5=down-left, 6=left, 7=up-left
-local FIRE_DIR_VEC = {
+FIRE_DIR_VEC = {
     [0] = { 0, -1},   -- up
     [1] = { 1, -1},   -- up-right
     [2] = { 1,  0},   -- right
@@ -83,66 +108,66 @@ local FIRE_DIR_VEC = {
     [7] = {-1, -1},   -- up-left
 }
 -- Evasion reward: bonus for moving away from nearest enemy when close.
-local SUBJ_EVADE_WEIGHT = 10.0       -- reward when moving away from nearest threat
-local EVADE_DANGER_NORM  = 0.08      -- only reward evasion when enemy within this normalised dist
-local MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
+SUBJ_EVADE_WEIGHT = 10.0       -- reward when moving away from nearest threat
+EVADE_DANGER_NORM  = 0.08      -- only reward evasion when enemy within this normalised dist
+MOVE_DIR_VEC = FIRE_DIR_VEC    -- same 8-way mapping for move directions
 
 -- Wall-hugging penalty: per-axis penalty when within 16 px of a wall.
 -- Stacks additively so a corner costs double.
-local SUBJ_WALL_PENALTY  = 15.0      -- penalty per wall axis per frame
+SUBJ_WALL_PENALTY  = 15.0      -- penalty per wall axis per frame
 -- WALL_MARGIN_NORM_X/Y defined after POS_X/Y_RANGE (see below).
 
 -- Abandoned-human penalty: one-shot penalty per surviving human when a wave
 -- is cleared.  Encourages the AI to rescue first, kill last.
-local SUBJ_ABANDONED_HUMAN = 15.0     -- penalty per unrescued human on wave end
+SUBJ_ABANDONED_HUMAN = 15.0     -- penalty per unrescued human on wave end
 
-local mainCpu = nil
-local mem = nil
-local controls = nil
+mainCpu = nil
+mem = nil
+controls = nil
 
-local current_socket = nil
-local last_connection_attempt_time = 0
-local shutdown_requested = false
+current_socket = nil
+last_connection_attempt_time = 0
+shutdown_requested = false
 
-local frame_counter = 0
-local dead_frame_counter = 0
-local last_save_time = 0
-local previous_player_alive = 1
-local previous_score = 0
-local previous_wave_number = 0
-local prev_num_humans = 0
-local prev_fire_cmd = -1          -- fire direction from previous frame
-local prev_move_cmd = -1          -- move direction from previous frame
-local prev_aim_objects = nil      -- classified objects from previous frame
-local last_action_source = 0      -- 0=none, 1=dqn, 2=epsilon, 3=expert, 4=forced_random
+frame_counter = 0
+dead_frame_counter = 0
+last_save_time = 0
+previous_player_alive = 1
+previous_score = 0
+previous_wave_number = 0
+prev_num_humans = 0
+prev_fire_cmd = -1          -- fire direction from previous frame
+prev_move_cmd = -1          -- move direction from previous frame
+prev_aim_objects = nil      -- classified objects from previous frame
+last_action_source = 0      -- 0=none, 1=dqn, 2=epsilon, 3=expert, 4=forced_random
 
 -- Fire-hold state:  The game's LSPROC laser routine (RRG23.ASM) requires
 -- the fire joystick to stay in the SAME direction for 3 consecutive frames
 -- before it creates a laser.  At high epsilon, random fire directions change
 -- every frame, so shots almost never fire.  We hold each fire direction for
 -- a minimum of FIRE_HOLD_FRAMES before accepting a new one.
-local FIRE_HOLD_FRAMES = 4       -- frames to lock each fire direction (3 = minimum for 1 shot)
-local fire_hold_dir   = -1       -- direction currently being held
-local fire_hold_count = 0        -- frames remaining in current hold
-local prev_aim_px16 = nil         -- player x16 from previous frame
-local prev_aim_py16 = nil         -- player y16 from previous frame
-local prev_nearest_enemy_x16 = nil
-local prev_nearest_enemy_y16 = nil
-local prev_nearest_enemy_dist = nil
+FIRE_HOLD_FRAMES = 4       -- frames to lock each fire direction (3 = minimum for 1 shot)
+fire_hold_dir   = -1       -- direction currently being held
+fire_hold_count = 0        -- frames remaining in current hold
+prev_aim_px16 = nil         -- player x16 from previous frame
+prev_aim_py16 = nil         -- player y16 from previous frame
+prev_nearest_enemy_x16 = nil
+prev_nearest_enemy_y16 = nil
+prev_nearest_enemy_dist = nil
 
 -- Autoboot input sequence (MAME input level, no game-specific memory logic required).
 -- Every cycle: pulse Coin 1, then pulse 1P Start shortly after.
-local AUTOBOOT_ENABLED = true
-local AUTOBOOT_CYCLE_FRAMES = 300
-local AUTOBOOT_COIN_PULSE_FRAMES = 3
-local AUTOBOOT_START_DELAY_FRAMES = 18
-local AUTOBOOT_START_PULSE_FRAMES = 3
+AUTOBOOT_ENABLED = true
+AUTOBOOT_CYCLE_FRAMES = 300
+AUTOBOOT_COIN_PULSE_FRAMES = 3
+AUTOBOOT_START_DELAY_FRAMES = 18
+AUTOBOOT_START_PULSE_FRAMES = 3
 
 -- Robotron RAM symbols (from Williams map):
 -- STATUS = 0x9859
 -- In PLAYRV, bit0 gates player control update; on player death PLEND sets STATUS to 0x1B.
-local STATUS_ADDR = 0x9859
-local STATUS_PLAYER_INACTIVE_MASK = 0x01
+STATUS_ADDR = 0x9859
+STATUS_PLAYER_INACTIVE_MASK = 0x01
 
 -- Player PLDATA symbols (from Williams map generated by lwasm):
 --   ZP1SCR = 0xBDE4 (4 bytes packed BCD, MSB first)
@@ -150,48 +175,48 @@ local STATUS_PLAYER_INACTIVE_MASK = 0x01
 --   ZP1LAS = 0xBDEC (1 byte)
 --   ZP1WAV = 0xBDED (1 byte)
 --   ZP1ENM = 0xBDEE (50 bytes; first 22 mirror ELIST fields, rest reserved)
-local ZP1SCR_ADDR = 0xBDE4
-local ZP1RP_ADDR = 0xBDE8
-local ZP1LAS_ADDR = 0xBDEC
-local ZP1WAV_ADDR = 0xBDED
-local ZP1ENM_ADDR = 0xBDEE
-local ZP1ENM_SIZE = 50
+ZP1SCR_ADDR = 0xBDE4
+ZP1RP_ADDR = 0xBDE8
+ZP1LAS_ADDR = 0xBDEC
+ZP1WAV_ADDR = 0xBDED
+ZP1ENM_ADDR = 0xBDEE
+ZP1ENM_SIZE = 50
 
 -- Active object-list heads (from Williams base-page RAM map / RRF.ASM).
 -- Address layout: OPTR($9817), OBPTR($9819), OFREE($981B), SPFREE($981D),
 --                 HPTR($981F), RPTR($9821), PPTR($9823)
-local OPTR_ADDR = 0x9817  -- motion objects (enforcers, sparks, circles, squares, shells, player lasers)
-local HPTR_ADDR = 0x981F  -- humans to rescue (mom, dad, kid)
-local RPTR_ADDR = 0x9821  -- robots/enemies (grunts, brains, hulks, tanks, progs, cruise missiles)
-local PPTR_ADDR = 0x9823  -- fatal obstacles (electrodes)
+OPTR_ADDR = 0x9817  -- motion objects (enforcers, sparks, circles, squares, shells, player lasers)
+HPTR_ADDR = 0x981F  -- humans to rescue (mom, dad, kid)
+RPTR_ADDR = 0x9821  -- robots/enemies (grunts, brains, hulks, tanks, progs, cruise missiles)
+PPTR_ADDR = 0x9823  -- fatal obstacles (electrodes)
 
 -- Player object structure (PLOBJ at $985A from RRF.ASM).
-local PLOBJ_ADDR = 0x985A
-local PX16_ADDR = 0x9864   -- player 16-bit X world coordinate
-local PY16_ADDR = 0x9866   -- player 16-bit Y world coordinate
-local PXV_ADDR = 0x9868    -- player X velocity
-local PYV_ADDR = 0x986A    -- player Y velocity
+PLOBJ_ADDR = 0x985A
+PX16_ADDR = 0x9864   -- player 16-bit X world coordinate
+PY16_ADDR = 0x9866   -- player 16-bit Y world coordinate
+PXV_ADDR = 0x9868    -- player X velocity
+PYV_ADDR = 0x986A    -- player Y velocity
 
 -- Object pool geometry (master list @ OLIST).
-local OLIST_START = 0x9900
-local OLIST_ENTRY_SIZE = 0x18
-local OLIST_CAPACITY = 180
-local OLIST_END = OLIST_START + (OLIST_ENTRY_SIZE * OLIST_CAPACITY)
+OLIST_START = 0x9900
+OLIST_ENTRY_SIZE = 0x18
+OLIST_CAPACITY = 180
+OLIST_END = OLIST_START + (OLIST_ENTRY_SIZE * OLIST_CAPACITY)
 
 -- Object entry offsets.
-local OLINK_OFF = 0x00
-local OPICT_OFF = 0x02
-local OBJX_OFF = 0x04
-local OBJY_OFF = 0x05
-local OX16_OFF = 0x0A
-local OY16_OFF = 0x0C
+OLINK_OFF = 0x00
+OPICT_OFF = 0x02
+OBJX_OFF = 0x04
+OBJY_OFF = 0x05
+OX16_OFF = 0x0A
+OY16_OFF = 0x0C
 FONIPC_OFF = 0x16
 
-local MAX_LIST_WALK = 256
-local OCVECT_OFF = 0x08  -- collision routine address (stable per entity type)
+MAX_LIST_WALK = 256
+OCVECT_OFF = 0x08  -- collision routine address (stable per entity type)
 
 -- Object list head pointers (used to walk linked lists).
-local ACTIVE_LISTS = {
+ACTIVE_LISTS = {
     {name = "optr", addr = OPTR_ADDR},   -- motion objects: enforcers, sparks, circles, squares, shells, lasers
     {name = "hptr", addr = HPTR_ADDR},   -- humans: mom, dad, kid
     {name = "rptr", addr = RPTR_ADDR},   -- robots: grunts, brains, hulks, tanks, progs, cruise missiles
@@ -199,7 +224,7 @@ local ACTIVE_LISTS = {
 }
 
 -- Per-type entity categories. Order MUST match Python config/aimodel.py.
-local ENTITY_CATEGORIES = {
+ENTITY_CATEGORIES = {
     {name = "grunt",      slots = 40, peak = 80},
     {name = "hulk",       slots = 16, peak = 25},
     {name = "brain",      slots = 16, peak = 25},
@@ -210,22 +235,22 @@ local ENTITY_CATEGORIES = {
     {name = "human",      slots = 16, peak = 30},
     {name = "electrode",  slots = 16, peak = 25},
 }
-local ENTITY_CATEGORY_INDEX = {}
+ENTITY_CATEGORY_INDEX = {}
 for idx, cat in ipairs(ENTITY_CATEGORIES) do
     ENTITY_CATEGORY_INDEX[cat.name] = idx - 1
 end
 
-local OBJECT_TOKEN_LIMIT = 64
-local OBJECT_TOKEN_FEATURES = 15
-local GRID_W = 12
-local GRID_H = 12
-local GRID_CHANNELS = 8
-local GRID_HALF_RANGE_X = 12288.0   -- +/-48 px in x16 units
-local GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
-local GLOBAL_FEATURES = 98
-local GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
-local TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
-local EXPECTED_STATE_VALUES = GLOBAL_FEATURES + GRID_FEATURES + TOKEN_FEATURES
+OBJECT_TOKEN_LIMIT = 64
+OBJECT_TOKEN_FEATURES = 15
+GRID_W = 12
+GRID_H = 12
+GRID_CHANNELS = 8
+GRID_HALF_RANGE_X = 12288.0   -- +/-48 px in x16 units
+GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
+GLOBAL_FEATURES = 100
+GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
+TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
+EXPECTED_STATE_VALUES = GLOBAL_FEATURES + GRID_FEATURES + TOKEN_FEATURES
 
 local CATEGORY_THREAT_WEIGHT = {
     grunt = 0.55,
@@ -257,31 +282,39 @@ local unresolved_7x16 = {}             -- {[ocvect] = true} for ambiguous 7×16 
 local DEBUG_LOG_DISCOVERY = false      -- set true to log OCVECT classification discoveries
 
 -- Debug HUD overlay state (draws entity letters on screen each frame).
-local mame_screen = nil                -- MAME screen device for draw_text
-local hud_objects = nil                -- last frame's classified object list (reference)
-local hud_player_x16 = nil
-local hud_player_y16 = nil
+mame_screen = nil                -- MAME screen device for draw_text
+hud_objects = nil                -- last frame's classified object list (reference)
+hud_player_x16 = nil
+hud_player_y16 = nil
 hud_player_box = nil
-local DEBUG_HUD_ENABLED = true         -- default ON; toggle with H hotkey
-local hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
-local hud_key_was_down = false         -- edge-detect so hold doesn't strobe
-local PREVIEW_FORMAT_RGB565 = 1
-local PREVIEW_FORMAT_RGB565_LZSS = 2
-local PREVIEW_FORMAT_RGB565_RLE = 3
+DEBUG_HUD_ENABLED = true         -- default ON; toggle with H hotkey
+hud_key_code = nil               -- MAME input code for 'H' key (lazy-init)
+hud_key_was_down = false         -- edge-detect so hold doesn't strobe
+PREVIEW_FORMAT_RGB565 = 1
+PREVIEW_FORMAT_RGB565_LZSS = 2
+PREVIEW_FORMAT_RGB565_RLE = 3
 -- Enable preview support; server controls streaming per-client via action source flags.
-local PREVIEW_CAPTURE_ENABLED = true
-local PREVIEW_MIN_INTERVAL_S = (1.0 / 60.0)
--- Allow native-resolution snapshots; compression handles wire size.
-local PREVIEW_MAX_WIDTH = 4096
-local PREVIEW_MAX_HEIGHT = 4096
-local PREVIEW_MAX_BYTES = 2000000
-local SOCKET_MAX_PAYLOAD_BYTES = 4194304
-local preview_stream_enabled = false
-local pending_preview_blob = nil
-local pending_preview_w = 0
-local pending_preview_h = 0
-local pending_preview_fmt = PREVIEW_FORMAT_RGB565
-local last_preview_capture_time_s = -1000000.0
+PREVIEW_CAPTURE_ENABLED = true
+PREVIEW_FPS = math.max(1, math.floor(env_number("ROBOTRON_PREVIEW_FPS", 15) or 15))
+PREVIEW_MIN_INTERVAL_S = (1.0 / PREVIEW_FPS)
+-- Capture near dashboard size at the source; sending full-resolution snapshots
+-- through Lua was the dominant cost for the preview client.
+PREVIEW_MAX_WIDTH = math.max(64, math.floor(env_number("ROBOTRON_PREVIEW_MAX_WIDTH", 320) or 320))
+PREVIEW_MAX_HEIGHT = math.max(64, math.floor(env_number("ROBOTRON_PREVIEW_MAX_HEIGHT", 240) or 240))
+PREVIEW_TRY_RLE = env_flag("ROBOTRON_PREVIEW_RLE", false)
+PREVIEW_RLE_MIN_SAVINGS_BYTES = math.max(64, math.floor(env_number("ROBOTRON_PREVIEW_RLE_MIN_SAVINGS", 256) or 256))
+PREVIEW_MAX_BYTES = 2000000
+SOCKET_MAX_PAYLOAD_BYTES = 4194304
+preview_stream_enabled = false
+pending_preview_blob = nil
+pending_preview_w = 0
+pending_preview_h = 0
+pending_preview_fmt = PREVIEW_FORMAT_RGB565
+last_preview_capture_time_s = -1000000.0
+preview_source_w = 0
+preview_source_h = 0
+preview_target_w = 0
+preview_target_h = 0
 picture_bounds_cache = {}
 START_ADVANCED = false
 START_LEVEL_MIN = 1
@@ -941,6 +974,16 @@ function picture_collision_bounds(memory, pict_ptr)
     return off_x, off_y, box_w, box_h
 end
 
+local function collision_center_x16(base_x16, off_x_px, box_w_px)
+    local shift_px = (tonumber(off_x_px) or 0.0) + (0.5 * math.max(1.0, tonumber(box_w_px) or 1.0)) - 6.0
+    return math.floor((tonumber(base_x16) or 0.0) + (shift_px * 256.0) + 0.5)
+end
+
+local function collision_center_y16(base_y16, off_y_px, box_h_px)
+    local shift_px = (tonumber(off_y_px) or 0.0) + (0.5 * math.max(1.0, tonumber(box_h_px) or 1.0)) - 7.0
+    return math.floor((tonumber(base_y16) or 0.0) + (shift_px * 256.0) + 0.5)
+end
+
 local function try_resolve_7x16(all_objects, enemy_state)
     -- Try to resolve ambiguous 7×16 RPTR objects (hulk / brain / tank)
     -- by matching per-OCVECT counts to ELIST counters.
@@ -1077,7 +1120,7 @@ local function _grid_index(ix, iy, ch)
     return ((ch * GRID_H + iy) * GRID_W + ix) + 1
 end
 
-local function _clamp_grid(v, lo, hi)
+function _clamp_grid(v, lo, hi)
     if v < lo then return lo end
     if v > hi then return hi end
     return v
@@ -1095,7 +1138,12 @@ end
 
 local function extract_world_features(memory, player_x16, player_y16, enemy_state)
     -- Walk object lists, classify entities, compute per-object motion, and emit:
-    --   globals (98), local grid (12x12x8), tokens (64x15)
+    --   globals (100), local grid (12x12x8), tokens (64x15)
+
+    local player_pict_ptr = read_u16_be(memory, PLOBJ_ADDR + OPICT_OFF)
+    local player_hit_off_x, player_hit_off_y, player_hit_w, player_hit_h = picture_collision_bounds(memory, player_pict_ptr)
+    local player_center_x16 = collision_center_x16(player_x16, player_hit_off_x, player_hit_w)
+    local player_center_y16 = collision_center_y16(player_y16, player_hit_off_y, player_hit_h)
 
     local all_objects = {}
     for _, list_def in ipairs(ACTIVE_LISTS) do
@@ -1112,8 +1160,8 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             if ocvect == 0 then
                 ptr = read_u16_be(memory, ptr + OLINK_OFF)
             else
-                local x16 = read_u16_be(memory, ptr + OX16_OFF)
-                local y16 = read_u16_be(memory, ptr + OY16_OFF)
+                local raw_x16 = read_u16_be(memory, ptr + OX16_OFF)
+                local raw_y16 = read_u16_be(memory, ptr + OY16_OFF)
                 local objx = memory:read_u8(ptr + OBJX_OFF)
                 local objy = memory:read_u8(ptr + OBJY_OFF)
                 local pict_ptr = read_u16_be(memory, ptr + OPICT_OFF)
@@ -1125,10 +1173,12 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
                 end
                 local collision_pict_ptr = (fonipc_ptr ~= nil and fonipc_ptr ~= 0) and fonipc_ptr or pict_ptr
                 local hit_off_x, hit_off_y, hit_w, hit_h = picture_collision_bounds(memory, collision_pict_ptr)
+                local x16 = collision_center_x16(raw_x16, hit_off_x, hit_w)
+                local y16 = collision_center_y16(raw_y16, hit_off_y, hit_h)
 
                 local dnorm = 1.0
-                if player_x16 and player_y16 then
-                    dnorm = dist_norm(player_x16, player_y16, x16, y16)
+                if player_center_x16 and player_center_y16 then
+                    dnorm = dist_norm(player_center_x16, player_center_y16, x16, y16)
                 end
 
                 all_objects[#all_objects + 1] = {
@@ -1216,12 +1266,12 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             end
             obj.vx = vx
             obj.vy = vy
-            obj.dx = rel_pos_x(obj.x16, player_x16)
-            obj.dy = rel_pos_y(obj.y16, player_y16)
-            local dist_world = math.sqrt(((obj.x16 or 0) - (player_x16 or 0)) ^ 2 + ((obj.y16 or 0) - (player_y16 or 0)) ^ 2)
+            obj.dx = rel_pos_x(obj.x16, player_center_x16)
+            obj.dy = rel_pos_y(obj.y16, player_center_y16)
+            local dist_world = math.sqrt(((obj.x16 or 0) - (player_center_x16 or 0)) ^ 2 + ((obj.y16 or 0) - (player_center_y16 or 0)) ^ 2)
             if dist_world > 1.0 then
-                obj.dir_x = clamp11(((obj.x16 or 0) - (player_x16 or 0)) / dist_world)
-                obj.dir_y = clamp11(((obj.y16 or 0) - (player_y16 or 0)) / dist_world)
+                obj.dir_x = clamp11(((obj.x16 or 0) - (player_center_x16 or 0)) / dist_world)
+                obj.dir_y = clamp11(((obj.y16 or 0) - (player_center_y16 or 0)) / dist_world)
             else
                 obj.dir_x = 0.0
                 obj.dir_y = 0.0
@@ -1267,8 +1317,8 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
                 quadrant_threat[q] = quadrant_threat[q] + obj.threat
             end
 
-            local gx = math.floor(((obj.x16 - player_x16) + GRID_HALF_RANGE_X) * GRID_W / (2.0 * GRID_HALF_RANGE_X))
-            local gy = math.floor(((obj.y16 - player_y16) + GRID_HALF_RANGE_Y) * GRID_H / (2.0 * GRID_HALF_RANGE_Y))
+            local gx = math.floor(((obj.x16 - player_center_x16) + GRID_HALF_RANGE_X) * GRID_W / (2.0 * GRID_HALF_RANGE_X))
+            local gy = math.floor(((obj.y16 - player_center_y16) + GRID_HALF_RANGE_Y) * GRID_H / (2.0 * GRID_HALF_RANGE_Y))
             if gx >= 0 and gx < GRID_W and gy >= 0 and gy < GRID_H then
                 local threat = obj.threat
                 grid[_grid_index(gx, gy, 6)] = clamp01(grid[_grid_index(gx, gy, 6)] + 0.12)
@@ -1347,6 +1397,9 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     for i = 1, 4 do
         globals[#globals + 1] = clamp01(quadrant_human[i] / 2.0)
     end
+    local num_humans = counts["human"] or 0
+    globals[#globals + 1] = clamp01(num_humans / 16.0)
+    globals[#globals + 1] = (num_humans <= 0) and 1.0 or 0.0
     local pxn = norm_pos_x(player_x16 or 0)
     local pyn = norm_pos_y(player_y16 or 0)
     globals[#globals + 1] = clamp01((WALL_MARGIN_NORM_X - pxn) / math.max(1e-6, WALL_MARGIN_NORM_X))
@@ -1406,13 +1459,8 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     hud_objects = token_source
     hud_player_x16 = memory:read_u8(PLOBJ_ADDR + OBJX_OFF)
     hud_player_y16 = memory:read_u8(PLOBJ_ADDR + OBJY_OFF)
-    do
-        local player_pict_ptr = read_u16_be(memory, PLOBJ_ADDR + OPICT_OFF)
-        local px_off, py_off, pw, ph = picture_collision_bounds(memory, player_pict_ptr)
-        hud_player_box = {x = px_off, y = py_off, w = pw, h = ph}
-    end
+    hud_player_box = {x = player_hit_off_x, y = player_hit_off_y, w = player_hit_w, h = player_hit_h}
 
-    local num_humans = counts["human"] or 0
     return {
         globals = globals,
         grid = grid,
@@ -1421,6 +1469,8 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         nearest_human_dist = nearest_human_dist,
         nearest_enemy_x16 = nearest_enemy_x16,
         nearest_enemy_y16 = nearest_enemy_y16,
+        player_center_x16 = player_center_x16,
+        player_center_y16 = player_center_y16,
         num_humans = num_humans,
     }
 end
@@ -1725,9 +1775,16 @@ local function capture_game_preview()
             return nil
         end
 
-        local scale = math.min(1.0, PREVIEW_MAX_WIDTH / vw, PREVIEW_MAX_HEIGHT / vh)
-        local tw = math.max(1, math.floor(vw * scale + 0.5))
-        local th = math.max(1, math.floor(vh * scale + 0.5))
+        if vw ~= preview_source_w or vh ~= preview_source_h or preview_target_w <= 0 or preview_target_h <= 0 then
+            preview_source_w = vw
+            preview_source_h = vh
+            local scale = math.min(1.0, PREVIEW_MAX_WIDTH / vw, PREVIEW_MAX_HEIGHT / vh)
+            preview_target_w = math.max(1, math.floor(vw * scale + 0.5))
+            preview_target_h = math.max(1, math.floor(vh * scale + 0.5))
+        end
+
+        local tw = preview_target_w
+        local th = preview_target_h
 
         local out = {}
         local oi = 1
@@ -1751,12 +1808,13 @@ local function capture_game_preview()
 
         local blob = table.concat(out)
         local fmt = PREVIEW_FORMAT_RGB565
-        -- Compression disabled for performance
-        -- local rle = rle_compress_rgb565_words(blob)
-        -- if rle and #rle > 0 and #rle < (#blob - 8) then
-        --     fmt = PREVIEW_FORMAT_RGB565_RLE
-        --     blob = rle
-        -- end
+        if PREVIEW_TRY_RLE and #blob >= 4096 then
+            local rle = rle_compress_rgb565_words(blob)
+            if rle and #rle > 0 and (#blob - #rle) >= PREVIEW_RLE_MIN_SAVINGS_BYTES then
+                fmt = PREVIEW_FORMAT_RGB565_RLE
+                blob = rle
+            end
+        end
         if #blob <= 0 or #blob > PREVIEW_MAX_BYTES then
             return nil
         end
@@ -2072,7 +2130,7 @@ function Controls:new(mame_manager)
     return self
 end
 
-local DIR_AXES = {
+DIR_AXES = {
     [0] = {1, 0, 0, 0}, -- up
     [1] = {1, 0, 0, 1}, -- up-right
     [2] = {0, 0, 0, 1}, -- right
@@ -2082,7 +2140,7 @@ local DIR_AXES = {
     [6] = {0, 0, 1, 0}, -- left
     [7] = {1, 0, 1, 0}, -- up-left
 }
-local DIR_NEUTRAL = {0, 0, 0, 0}
+DIR_NEUTRAL = {0, 0, 0, 0}
 
 local function apply_direction(up_field, down_field, left_field, right_field, dir_idx)
     local axis = DIR_NEUTRAL
@@ -2389,8 +2447,8 @@ function read_frame_observation()
         replay_level = replay_level,
         num_lasers = num_lasers,
         wave_number = wave_number,
-        player_x16 = player_x16,
-        player_y16 = player_y16,
+        player_x16 = obs.player_center_x16 or player_x16,
+        player_y16 = obs.player_center_y16 or player_y16,
         obs = obs,
         num_humans = obs.num_humans or 0,
     }
@@ -2426,7 +2484,13 @@ function compute_frame_rewards(frame)
         prev_move_cmd, prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects,
         previous_wave_number, prev_num_humans
     )
-    local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
+    local humans_now = math.max(0, math.floor(tonumber(frame.num_humans) or 0))
+    local reward_survival = (player_alive == 1)
+    if SUBJ_SURVIVAL_REQUIRE_HUMANS then
+        reward_survival = reward_survival and (humans_now > 0)
+    end
+    local survival_bonus = reward_survival and SUBJ_SURVIVAL_BONUS or 0.0
+    local no_humans_penalty = (player_alive == 1 and humans_now <= 0) and SUBJ_NO_HUMANS_EXISTENCE_PENALTY or 0.0
 
     local wall_penalty = 0.0
     if player_alive == 1 and player_x16 then
@@ -2457,6 +2521,7 @@ function compute_frame_rewards(frame)
         + (evade_score * SUBJ_EVADE_WEIGHT)
         + (centering_score * ADVANCED_SHAPING.centering_weight)
         + (brain_guard_score * ADVANCED_SHAPING.brain_guard_weight)
+        - no_humans_penalty
         - wall_penalty
         - abandoned_penalty
     if done then
@@ -2634,7 +2699,7 @@ function on_mame_exit()
     print("Robotron AI Lua script shutting down.")
 end
 
-local function register_frame_callback(cb)
+function register_frame_callback(cb)
     if emu.add_machine_frame_notifier then
         return emu.add_machine_frame_notifier(cb)
     end
@@ -2644,7 +2709,7 @@ local function register_frame_callback(cb)
     error("No supported frame callback API found (expected emu.add_machine_frame_notifier or emu.register_frame)")
 end
 
-local function register_frame_done_callback(cb)
+function register_frame_done_callback(cb)
     if emu.register_frame_done then
         return emu.register_frame_done(cb)
     end
@@ -2652,7 +2717,7 @@ local function register_frame_done_callback(cb)
     return nil
 end
 
-local function register_stop_callback(cb)
+function register_stop_callback(cb)
     if emu.add_machine_stop_notifier then
         return emu.add_machine_stop_notifier(cb)
     end
@@ -2688,6 +2753,10 @@ global_callback_ref = register_frame_callback(frame_callback)
 -- decides per-frame which client should actually capture/stream preview data by
 -- toggling the preview flag in the action source byte.
 if PREVIEW_CLIENT_FLAG == 1 then
+    print(string.format(
+        "[HUD] Preview capture configured: %dfps max=%dx%d rle=%s",
+        PREVIEW_FPS, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT, tostring(PREVIEW_TRY_RLE)
+    ))
     if register_frame_done_callback(frame_done_callback) ~= nil or emu.register_frame_done ~= nil then
         print("[HUD] Registered frame_done callback for debug overlay + preview capture")
     else

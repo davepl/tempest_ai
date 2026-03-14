@@ -77,19 +77,36 @@ def train_step(agent, prefetched_batch=None) -> float | None:
     if batch is None:
         return None
 
-    (
-        states,
-        actions,
-        rewards,
-        next_states,
-        dones,
-        horizons,
-        is_expert,
-        _wave_numbers,
-        _start_waves,
-        indices,
-        weights,
-    ) = batch
+    if len(batch) == 11:
+        (
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            horizons,
+            is_expert,
+            _wave_numbers,
+            _start_waves,
+            indices,
+            weights,
+        ) = batch
+    elif len(batch) == 9:
+        (
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            horizons,
+            is_expert,
+            indices,
+            weights,
+        ) = batch
+        _wave_numbers = None
+        _start_waves = None
+    else:
+        raise ValueError(f"Unexpected replay batch shape: expected 9 or 11 items, got {len(batch)}")
 
     states_t      = torch.from_numpy(states).float().to(device)
     actions_t     = torch.from_numpy(actions).long().to(device)

@@ -10,6 +10,7 @@ if __name__ == "__main__":
     exit(1)
 
 import os, sys, time, threading, math, json
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Deque
 from collections import deque
@@ -18,9 +19,54 @@ IS_INTERACTIVE = sys.stdin.isatty()
 RESET_METRICS = False
 FORCE_FRESH_MODEL = False
 
-MODEL_DIR = "models"
-LATEST_MODEL_PATH = f"{MODEL_DIR}/robotron_model_latest.pt"
-SETTINGS_PATH = f"{MODEL_DIR}/game_settings.json"
+_CONFIG_DIR = Path(__file__).resolve().parent
+_ROBOTRON_DIR = _CONFIG_DIR.parent
+_REPO_ROOT = _ROBOTRON_DIR.parent
+
+
+def _score_model_dir(path: Path) -> tuple[int, float]:
+    """Rank model directories by completeness, then recency."""
+    model_path = path / "robotron_model_latest.pt"
+    replay_meta = path / "robotron_model_latest_replay" / "_meta.npy"
+    replay_pri = path / "robotron_model_latest_replay" / "priorities.npy"
+    settings_path = path / "game_settings.json"
+    existing = [p for p in (model_path, replay_meta, replay_pri, settings_path) if p.exists()]
+    if not existing:
+        return (0, 0.0)
+    completeness = sum(int(p.exists()) for p in (model_path, replay_meta, replay_pri))
+    newest_mtime = max(p.stat().st_mtime for p in existing)
+    return (completeness, newest_mtime)
+
+
+def _resolve_model_dir() -> Path:
+    """Pick a stable model directory regardless of launch cwd.
+
+    Historically this project used a relative "models" path, which caused
+    separate checkpoint trees to appear under different working directories.
+    We now scan the known legacy locations and consistently pick the best one.
+    """
+    env_dir = (os.getenv("ROBOTRON_MODEL_DIR") or "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+
+    candidates = []
+    for cand in (
+        _ROBOTRON_DIR / "models",
+        _REPO_ROOT / "models",
+        _CONFIG_DIR / "models",
+    ):
+        if cand not in candidates:
+            candidates.append(cand)
+
+    populated = [cand for cand in candidates if _score_model_dir(cand)[0] > 0]
+    if populated:
+        return max(populated, key=_score_model_dir)
+    return _ROBOTRON_DIR / "models"
+
+
+MODEL_DIR = str(_resolve_model_dir())
+LATEST_MODEL_PATH = str(Path(MODEL_DIR) / "robotron_model_latest.pt")
+SETTINGS_PATH = str(Path(MODEL_DIR) / "game_settings.json")
 
 
 def _default_webrtc_ice_servers() -> list[dict]:
@@ -80,11 +126,11 @@ class ServerConfigData:
     port: int = 9998
     max_clients: int = 36
     # State layout:
-    #   98 global features
+    #   100 global features
     #   + 12 x 12 x 8 egocentric spatial grid
     #   + 64 object tokens x 15 features
-    #   = 98 + 1152 + 960 = 2210 floats
-    params_count: int = 2210
+    #   = 100 + 1152 + 960 = 2212 floats
+    params_count: int = 2212
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -114,7 +160,7 @@ class RLConfigData:
         return self.num_move_actions * self.num_fire_actions
 
     # ── observation layout / network architecture ──────────────────────
-    global_feature_count: int = 98
+    global_feature_count: int = 100
     grid_width: int = 12
     grid_height: int = 12
     grid_channels: int = 8
@@ -172,7 +218,7 @@ class RLConfigData:
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 15_000_000
+    memory_size: int = 5_000_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
@@ -247,7 +293,9 @@ class RLConfigData:
     point_reward_scale: float = 1.0 / obj_reward_scale
     subj_reward_scale: float = 0.0025
     reward_clip: float = 100.0
-    death_reward_clip: float = 200.0
+    # Death frames currently carry about -500 scaled objective reward after the
+    # larger Lua death penalty, so allow that signal through largely intact.
+    death_reward_clip: float = 600.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
@@ -267,8 +315,8 @@ class RLConfigData:
     # at higher frame rates even with low overall system utilization.
     inference_on_cpu: bool = False
     # Device placement (CUDA only): useful on multi-GPU hosts.
-    train_cuda_device_index: int = 0
-    inference_cuda_device_index: int = 1
+    train_cuda_device_index: int = 1
+    inference_cuda_device_index: int = 0
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True
@@ -499,7 +547,7 @@ class MetricsData:
     game_preview_width: int = 0
     game_preview_height: int = 0
     game_preview_format: str = ""
-    game_preview_data_b64: str = ""
+    game_preview_data: bytes = b""
     game_preview_updated_ts: float = 0.0
     game_preview_source_format: str = ""
     game_preview_encoded_bytes: int = 0

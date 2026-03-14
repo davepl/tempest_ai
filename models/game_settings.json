@@ -1,7 +1,7 @@
 {
-  "start_advanced": false,
-  "start_level_min": 1,
-  "epsilon_pct": -1,
-  "expert_pct": -1,
+  "start_advanced": true,
+  "start_level_min": 4,
+  "epsilon_pct": 2,
+  "expert_pct": 3,
   "auto_curriculum": false
 }

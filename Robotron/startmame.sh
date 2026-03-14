@@ -15,8 +15,9 @@ else
 fi
 
 usage() {
-    echo "Usage: $0 [COUNT] [--fg] [-kill]"
+    echo "Usage: $0 [COUNT] [novideo] [--fg] [-kill]"
     echo "  COUNT   Number of MAME instances to launch (default: 1, background mode only)"
+    echo "  novideo Launch MAME with -video none for faster operation"
     echo "  --fg    Run one MAME instance in foreground"
     echo "  -kill   Kill all running Robotron MAME instances"
 }
@@ -24,6 +25,7 @@ usage() {
 FOREGROUND=0
 COUNT="1"
 COUNT_SET=0
+NO_VIDEO=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +42,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --fg)
             FOREGROUND=1
+            shift
+            ;;
+        novideo)
+            NO_VIDEO=1
             shift
             ;;
         -h|--help)
@@ -97,38 +103,41 @@ if ! "$MAME_BIN" -rompath "$ROMPATH" -verifyroms robotron >/dev/null 2>&1; then
     exit 1
 fi
 
+if [[ "$NO_VIDEO" -eq 1 ]]; then
+    VIDEO_FLAG="-video none"
+    VIDEO_MODE_DESC="video disabled"
+else
+    VIDEO_FLAG="-video soft"
+    VIDEO_MODE_DESC="preview audio/video enabled"
+fi
+
 if [[ "$FOREGROUND" -eq 1 ]]; then
     AUDIO_WAV="/tmp/robotron_audio_client0.wav"
     rm -f "$AUDIO_WAV" 2>/dev/null || true
     echo "Mode: foreground"
-    echo "Launching 1 MAME instance (attached) with preview audio/video enabled, throttled to real time..."
+    echo "Launching 1 MAME instance (attached) with $VIDEO_MODE_DESC, throttled to real time..."
     SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
     THROTTLE_FLAG="-throttle -speed 1.0"
-    VIDEO_FLAG="-video soft"
     exec env ROBOTRON_PREVIEW_CLIENT=1 ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
 fi
 
 echo "Mode: background"
 if [[ "$COUNT" -eq 1 ]]; then
-    echo "Launching 1 MAME instance (client 0) with preview audio/video enabled, throttled to real time..."
+    echo "Launching 1 MAME instance (client 0) with $VIDEO_MODE_DESC, throttled to real time..."
 else
-    echo "Launching $COUNT MAME instance(s): client 0 preview-capable, others training-only..."
+    echo "Launching $COUNT MAME instance(s): all clients with $VIDEO_MODE_DESC; client 0 throttled, others unthrottled..."
 fi
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
     CLIENT_SLOT=$((i-1))
+    AUDIO_WAV="/tmp/robotron_audio_client${CLIENT_SLOT}.wav"
+    rm -f "$AUDIO_WAV" 2>/dev/null || true
+    SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
+    PREVIEW_CLIENT_FLAG="1"
     if [[ $i -eq 1 ]]; then
-        AUDIO_WAV="/tmp/robotron_audio_client${CLIENT_SLOT}.wav"
-        rm -f "$AUDIO_WAV" 2>/dev/null || true
-        SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
         THROTTLE_FLAG="-throttle -speed 1.0"
-        VIDEO_FLAG="-video soft"
-        PREVIEW_CLIENT_FLAG="1"
     else
-        SOUND_FLAG="-sound none"
         THROTTLE_FLAG="-nothrottle"
-        VIDEO_FLAG="-video none"
-        PREVIEW_CLIENT_FLAG="0"
     fi
     LOG_FILE="$LOG_DIR/mame_instance_${CLIENT_SLOT}.log"
     if [[ $i -eq 1 ]]; then
@@ -141,9 +150,9 @@ for i in $(seq 1 "$COUNT"); do
     pid=$!
     PIDS+=("$pid")
     if [[ $i -eq 1 ]]; then
-        echo "  Started instance $i (client $CLIENT_SLOT - audio/video, throttled) PID $pid  log: $LOG_FILE"
+        echo "  Started instance $i (client $CLIENT_SLOT - $VIDEO_MODE_DESC, throttled) PID $pid  log: $LOG_FILE"
     else
-        echo "  Started instance $i (client $CLIENT_SLOT - training-only, unthrottled) PID $pid  log: $LOG_FILE"
+        echo "  Started instance $i (client $CLIENT_SLOT - $VIDEO_MODE_DESC, unthrottled) PID $pid  log: $LOG_FILE"
     fi
 done
 

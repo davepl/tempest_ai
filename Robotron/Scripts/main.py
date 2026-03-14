@@ -295,6 +295,7 @@ def main():
     agent = RainbowAgent(state_size=RL_CONFIG.state_size)
     dev = getattr(agent.device, "type", "unknown")
     print(f"🧮 Device: {dev.upper()}")
+    print(f"💾 Model dir: {MODEL_DIR}")
 
     print_network_info(agent)
 

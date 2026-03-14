@@ -12,6 +12,7 @@ from aimodel import (  # noqa: E402
     _POS_MAX_DIAG,
     _REL_POS_X_RANGE,
     _REL_POS_Y_RANGE,
+    get_cleanup_fire_override,
     get_expert_action,
 )
 
@@ -102,6 +103,35 @@ def test_axis_align_keeps_vertical_alignment_when_enemy_directly_below():
 
     assert move_dir == 4
     assert fire_dir == 4
+
+
+def test_aligned_fire_includes_hulk_targets():
+    state = _blank_state()
+    _add_entity(state, "hulk", 0, 0, 30)
+
+    move_dir, fire_dir = get_expert_action(state)
+
+    assert move_dir == 4
+    assert fire_dir == 4
+
+
+def test_endgame_cleanup_aligns_to_last_hulk_once_humans_are_gone():
+    state = _blank_state()
+    _add_entity(state, "hulk", 0, 12, 36)
+
+    move_dir, _ = get_expert_action(state)
+
+    assert move_dir == 2
+
+
+def test_cleanup_fire_override_only_applies_with_no_humans_and_few_targets():
+    state = _blank_state()
+    _add_entity(state, "hulk", 0, 0, 20)
+
+    assert get_cleanup_fire_override(state) == 4
+
+    _add_entity(state, "human", 0, -10, 0)
+    assert get_cleanup_fire_override(state) is None
 
 
 def test_final_hazard_repulsion_turns_move_away_from_close_hulk():

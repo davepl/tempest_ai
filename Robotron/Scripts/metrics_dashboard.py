@@ -82,6 +82,11 @@ except ImportError:
         def get_eplen_100k_average():
             return 0.0
 
+try:
+    from chat_store import ChatStore
+except ImportError:
+    from Scripts.chat_store import ChatStore
+
 
 def _tail_mean(values, count: int = 20) -> float:
     if not values:
@@ -610,7 +615,7 @@ class _DashboardState:
         height = 0
         fmt = ""
         ts = 0.0
-        data_b64 = ""
+        raw = b""
         while True:
             with self.metrics.lock:
                 seq = int(getattr(self.metrics, "game_preview_seq", 0))
@@ -619,7 +624,7 @@ class _DashboardState:
                 height = int(getattr(self.metrics, "game_preview_height", 0))
                 fmt = str(getattr(self.metrics, "game_preview_format", "") or "")
                 ts = float(getattr(self.metrics, "game_preview_updated_ts", 0.0))
-                data_b64 = str(getattr(self.metrics, "game_preview_data_b64", "") or "")
+                raw = bytes(getattr(self.metrics, "game_preview_data", b"") or b"")
             if since is None or seq != since or timeout <= 0.0 or time.time() >= deadline:
                 break
             time.sleep(0.01)
@@ -627,9 +632,8 @@ class _DashboardState:
         out_w = width
         out_h = height
         out_data_b64 = ""
-        if changed and seq > 0 and width > 0 and height > 0 and fmt == "rgb565be" and data_b64:
+        if changed and seq > 0 and width > 0 and height > 0 and fmt == "rgb565be" and raw:
             try:
-                raw = base64.b64decode(data_b64, validate=True)
                 max_w, max_h = _preview_http_limits(profile_norm)
                 raw, out_w, out_h = _downscale_rgb565_nearest(raw, width, height, max_w, max_h)
                 out_data_b64 = base64.b64encode(raw).decode("ascii") if raw else ""
@@ -696,26 +700,13 @@ class _PreviewVideoTrack(VideoStreamTrack):
             w = int(getattr(self.metrics, "game_preview_width", 0))
             h = int(getattr(self.metrics, "game_preview_height", 0))
             fmt = str(getattr(self.metrics, "game_preview_format", "") or "")
-            raw_b64 = getattr(self.metrics, "game_preview_data_b64", "") or ""
+            raw = bytes(getattr(self.metrics, "game_preview_data", b"") or b"")
 
-        if isinstance(raw_b64, bytes):
-            try:
-                data_b64 = raw_b64.decode("ascii", errors="ignore")
-            except Exception:
-                data_b64 = ""
-        else:
-            data_b64 = str(raw_b64)
-
-        if seq <= 0 or w <= 0 or h <= 0 or fmt != "rgb565be" or not data_b64:
-            return None, None, None, f"missing seq={seq} w={w} h={h} fmt={fmt} b64={len(data_b64)}"
+        if seq <= 0 or w <= 0 or h <= 0 or fmt != "rgb565be" or not raw:
+            return None, None, None, f"missing seq={seq} w={w} h={h} fmt={fmt} raw={len(raw)}"
 
         if seq == self._last_seq and self._last_rgb is not None:
             return self._last_rgb, self._last_w, self._last_h, ""
-
-        try:
-            raw = base64.b64decode(data_b64, validate=True)
-        except Exception as e:
-            return None, None, None, f"b64decode:{type(e).__name__}"
 
         expected = int(w) * int(h) * 2
         if len(raw) != expected:
@@ -814,6 +805,7 @@ class _PreviewAudioSource:
         self._current_path: str | None = None
         self._current_file = None
         self._current_inode: int | None = None
+        self._source_generation = 0
         self._read_offset = 0
         self._header_parsed = False
         self._start_reader()
@@ -867,6 +859,8 @@ class _PreviewAudioSource:
         samples_per_frame, bytes_per_frame = self._frame_params_locked()
         if bytes_per_frame <= 0:
             return
+        source_slot = self._current_slot
+        source_generation = int(self._source_generation)
         if not self._subscribers:
             keep_bytes = max(bytes_per_frame * self._IDLE_KEEP_FRAMES, self._channels * 2)
             if len(self._buffer) > keep_bytes:
@@ -875,7 +869,7 @@ class _PreviewAudioSource:
         while len(self._buffer) >= bytes_per_frame:
             payload = bytes(self._buffer[:bytes_per_frame])
             del self._buffer[:bytes_per_frame]
-            packet = (payload, self._sample_rate, self._channels, samples_per_frame)
+            packet = (payload, self._sample_rate, self._channels, samples_per_frame, source_slot, source_generation)
             for q in list(self._subscribers.values()):
                 try:
                     q.put_nowait(packet)
@@ -896,6 +890,7 @@ class _PreviewAudioSource:
 
     def _reset_audio_state_locked(self):
         self._audio_ready = False
+        self._source_generation += 1
         self._buffer.clear()
         self._reset_subscribers_locked()
 
@@ -1056,6 +1051,10 @@ class _PreviewAudioSource:
         with self._lock:
             return int(self._sample_rate), int(self._channels)
 
+    def get_stream_identity(self) -> tuple[int | None, int]:
+        with self._lock:
+            return self._current_slot, int(self._source_generation)
+
     def close(self):
         self._stop_event.set()
         if self._reader_thread_obj is not None:
@@ -1074,6 +1073,7 @@ class _PreviewAudioTrack(AudioStreamTrack):
         super().__init__()
         self._source = source
         self._subscriber_id, self._queue = self._source.subscribe()
+        self._active_generation = None
 
     def stop(self):
         self._source.unsubscribe(self._subscriber_id)
@@ -1100,7 +1100,21 @@ class _PreviewAudioTrack(AudioStreamTrack):
                 break
 
         if latest is not None:
-            frame_data, sample_rate, channels, samples_per_frame = latest
+            frame_data, sample_rate, channels, samples_per_frame, source_slot, source_generation = latest
+            current_slot, current_generation = self._source.get_stream_identity()
+            if (
+                current_slot is None
+                or source_slot is None
+                or int(source_generation) != int(current_generation)
+                or int(source_slot) != int(current_slot)
+            ):
+                frame_data = b"\x00" * (samples_per_frame * channels * 2)
+            elif self._active_generation != int(source_generation):
+                # Restart RTP audio timing cleanly when preview ownership moves
+                # to a different client/source file.
+                self._start = time.time()
+                self._timestamp = 0
+                self._active_generation = int(source_generation)
         else:
             frame_data = b"\x00" * (samples_per_frame * channels * 2)
 
@@ -1743,12 +1757,151 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       grid-row: span 2;
       min-height: 200px;
       gap: 6px;
+      order: -30;
     }
     .client-table-card {
       grid-column: span 4;
       grid-row: span 2;
       min-height: 200px;
       gap: 8px;
+      order: -29;
+    }
+    .chat-card {
+      grid-column: span 4;
+      grid-row: span 2;
+      min-height: 200px;
+      gap: 8px;
+      order: -28;
+    }
+    .chat-window {
+      flex: 1 1 auto;
+      min-height: 0;
+      max-height: 420px;
+      overflow-y: auto;
+      border: 1px solid rgba(80, 160, 255, 0.35);
+      border-radius: 10px;
+      padding: 8px;
+      background: rgba(2, 6, 23, 0.78);
+      font-size: 12px;
+      line-height: 1.35;
+      color: #c8e8ff;
+      text-shadow: 0 0 6px rgba(60, 130, 255, 0.35);
+      scrollbar-width: thin;
+      scrollbar-color: rgba(85, 120, 170, 0.95) rgba(4, 10, 20, 0.92);
+    }
+    .chat-window::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    .chat-window::-webkit-scrollbar-track {
+      background: rgba(4, 10, 20, 0.92);
+      border-left: 1px solid rgba(100, 180, 255, 0.10);
+      border-radius: 999px;
+    }
+    .chat-window::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(85, 120, 170, 0.98), rgba(55, 80, 120, 0.98));
+      border: 1px solid rgba(120, 180, 255, 0.18);
+      border-radius: 999px;
+      box-shadow: inset 0 0 6px rgba(200, 230, 255, 0.08);
+    }
+    .chat-window::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, rgba(105, 145, 200, 0.98), rgba(65, 95, 145, 0.98));
+    }
+    .chat-row {
+      margin-bottom: 6px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+    .chat-row:last-child {
+      margin-bottom: 0;
+    }
+    .chat-ip {
+      color: #7dd3fc;
+      margin-right: 4px;
+    }
+    .chat-controls {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px;
+      align-items: center;
+    }
+    .chat-input {
+      width: 100%;
+      border: 1px solid rgba(80, 160, 255, 0.45);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: rgba(2, 6, 23, 0.88);
+      color: #e5f4ff;
+      font-size: 12px;
+      outline: none;
+    }
+    .chat-input:focus {
+      border-color: rgba(57, 255, 20, 0.55);
+      box-shadow: inset 0 0 12px rgba(57, 255, 20, 0.12), 0 0 12px rgba(57, 255, 20, 0.10);
+    }
+    .chat-submit {
+      border: 1px solid rgba(57, 255, 20, 0.42);
+      border-radius: 8px;
+      padding: 6px 10px;
+      background: rgba(15, 23, 42, 0.84);
+      color: #d9ffd0;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .chat-submit:disabled,
+    .chat-input:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .chat-status {
+      min-height: 1.1em;
+      font-size: 11px;
+      color: #93c5fd;
+    }
+    .dell-card {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 6px;
+    }
+    .dell-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 0;
+      border: 1px solid rgba(120, 190, 255, 0.35);
+      border-radius: 10px;
+      padding: 8px;
+      background:
+        radial-gradient(120% 130% at 0% 0%, rgba(0, 229, 255, 0.14), transparent 62%),
+        rgba(2, 6, 23, 0.80);
+      box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.10), 0 0 12px rgba(0, 229, 255, 0.08);
+    }
+    .dell-badge {
+      width: 44px;
+      height: 44px;
+      flex: 0 0 auto;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      border: 2px solid rgba(125, 211, 252, 0.75);
+      color: #bfe9ff;
+      font-family: "DotGothic16", "Courier New", monospace;
+      font-size: 11px;
+      letter-spacing: 0.4px;
+      text-shadow: 0 0 10px rgba(56, 189, 248, 0.65);
+      box-shadow: inset 0 0 12px rgba(56, 189, 248, 0.18), 0 0 14px rgba(56, 189, 248, 0.22);
+      background: rgba(8, 18, 38, 0.85);
+    }
+    .dell-meta {
+      min-width: 0;
+      display: grid;
+      gap: 2px;
+      color: #c8e8ff;
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      text-shadow: 0 0 8px rgba(96, 165, 250, 0.45);
+      font-size: 11px;
+      line-height: 1.25;
     }
     .preview-wrap {
       position: relative;
@@ -2119,6 +2272,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       .gauge-card { grid-column: span 2; grid-row: span 2; min-height: 180px; }
       .preview-card { grid-column: span 4; grid-row: span 1; min-height: 124px; }
       .client-table-card { grid-column: span 4; grid-row: span 1; min-height: 124px; }
+      .chat-card { grid-column: span 4; grid-row: span 1; min-height: 124px; }
     }
     @media (max-width: 950px) {
       .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -2127,6 +2281,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       .gauge-card { grid-column: span 2; }
       .preview-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .client-table-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
+      .chat-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .mini-metric-card .mini-canvas { height: 96px; }
     }
   </style>
@@ -2194,16 +2349,31 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
             <thead id="tblClientsHead">
               <tr>
                 <th aria-sort="ascending"><button type="button" class="client-table-sort-btn active" data-sort-key="client_id">ClientID<span class="client-table-sort-indicator">▲</span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="efficiency">Efficiency<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="lives">Lives<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="level">Level<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="score">Score<span class="client-table-sort-indicator"></span></button></th>
               </tr>
             </thead>
             <tbody id="tblClientsBody">
-              <tr><td colspan="4" class="client-table-empty">No Clients</td></tr>
+              <tr><td colspan="5" class="client-table-empty">No Clients</td></tr>
             </tbody>
           </table>
         </div>
+      </article>
+      <article class="card chat-card" style="--card-border:rgba(140,220,255,0.68);--card-glow:rgba(90,170,255,0.24)">
+        <div class="gauge-head">
+          <div class="label">CHAT</div>
+          <div class="client-table-count" id="mChatCount">0</div>
+        </div>
+        <div class="chat-window" id="chatWindow" aria-live="polite">
+          <div class="chat-row">Chat ready.</div>
+        </div>
+        <div class="chat-controls">
+          <input id="chatInput" class="chat-input" maxlength="240" placeholder="Say something (max 240 chars)" />
+          <button id="chatSubmit" class="chat-submit" type="button">Submit</button>
+        </div>
+        <div class="chat-status" id="chatStatus"></div>
       </article>
       <article class="card mini-metric-card" style="--card-border:rgba(50,220,80,0.66);--card-glow:rgba(40,200,60,0.26)">
         <div class="label">AVG REWARD 1M</div>
@@ -2305,6 +2475,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       </article>
       <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
       <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
+      <article class="card dell-card" style="--card-border:rgba(110,180,255,0.70);--card-glow:rgba(90,160,255,0.24)">
+        <div class="label" style="text-transform:none;">DELL 7875 Precision</div>
+        <div class="dell-wrap" aria-label="Dell system badge">
+          <div class="dell-badge">DELL</div>
+          <div class="dell-meta">
+            <div>Threadripper 9995WX</div>
+            <div>Dual RTX6000</div>
+          </div>
+        </div>
+      </article>
       <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
         <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
         <div class="game-settings-row">
@@ -2413,6 +2593,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const AUDIO_PREF_COOKIE = "robotron_dashboard_audio_enabled";
     const PREVIEW_GAME_AUDIO_PREF_COOKIE = "robotron_preview_game_audio_enabled";
     const AUDIO_START_RETRY_MS = 800;
+    const CHAT_POLL_MS = 5000;
 
     /* ── Display FPS counter ──────────────────────────────────────────── */
     let _dispFpsFrames = 0;
@@ -2479,6 +2660,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       previewMsg: document.getElementById("mGamePreviewMsg"),
       previewLabel: document.getElementById("mPreviewLabel"),
       clientTableCount: document.getElementById("mClientTableCount"),
+      chatWindow: document.getElementById("chatWindow"),
+      chatInput: document.getElementById("chatInput"),
+      chatSubmit: document.getElementById("chatSubmit"),
+      chatStatus: document.getElementById("chatStatus"),
+      chatCount: document.getElementById("mChatCount"),
     };
     /* Game-settings controls */
     const gsAdvancedEl = document.getElementById("gsAdvanced");
@@ -2489,6 +2675,115 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const chkPreviewGameAudioEl = document.getElementById("chkPreviewGameAudio");
     const previewToggleWrap = document.getElementById("previewToggleWrap");
     const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
+    const _chatEnabled = true;
+    let _chatRows = [];
+    let _chatReqInFlight = false;
+
+    function _setChatStatus(text, isError = false) {
+      if (!cards.chatStatus) return;
+      cards.chatStatus.textContent = text || "";
+      cards.chatStatus.style.color = isError ? "#fca5a5" : "#93c5fd";
+    }
+
+    function _maskChatIp(rawIp) {
+      const ip = String(rawIp || "unknown").trim();
+      const ipv4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+      if (!ipv4) return ip;
+      return `${ipv4[1]}.${ipv4[2]}.${ipv4[3]}.X`;
+    }
+
+    function _renderChatRows(rows) {
+      if (!cards.chatWindow) return;
+      cards.chatWindow.innerHTML = "";
+      if (!rows || rows.length <= 0) {
+        const empty = document.createElement("div");
+        empty.className = "chat-row";
+        empty.textContent = "No messages yet.";
+        cards.chatWindow.appendChild(empty);
+      } else {
+        for (const row of rows) {
+          const line = document.createElement("div");
+          line.className = "chat-row";
+          const ip = document.createElement("span");
+          ip.className = "chat-ip";
+          ip.textContent = `${_maskChatIp(row.ip)}:`;
+          const txt = document.createElement("span");
+          txt.textContent = ` ${String(row.text || "")}`;
+          line.appendChild(ip);
+          line.appendChild(txt);
+          cards.chatWindow.appendChild(line);
+        }
+      }
+      if (cards.chatCount) cards.chatCount.textContent = String(rows ? rows.length : 0);
+      cards.chatWindow.scrollTop = cards.chatWindow.scrollHeight;
+    }
+
+    async function _fetchChatRows() {
+      if (!_chatEnabled) return;
+      if (_chatReqInFlight) return;
+      _chatReqInFlight = true;
+      try {
+        const res = await fetch(`/api/chat?cid=${encodeURIComponent(CLIENT_ID)}&limit=120&t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("chat fetch failed");
+        const payload = await res.json();
+        const nextRows = Array.isArray(payload && payload.messages) ? payload.messages : [];
+        _chatRows = nextRows;
+        _renderChatRows(_chatRows);
+      } catch (_) {
+        _setChatStatus("Chat unavailable", true);
+      } finally {
+        _chatReqInFlight = false;
+      }
+    }
+
+    async function _submitChat() {
+      if (!_chatEnabled || !cards.chatInput) return;
+      const msg = String(cards.chatInput.value || "").replace(/[\\r\\n]+/g, " ").trim();
+      if (!msg) {
+        _setChatStatus("Type a message first.", true);
+        return;
+      }
+      if (msg.length > 240) {
+        _setChatStatus("Message too long (240 max).", true);
+        return;
+      }
+      try {
+        if (cards.chatSubmit) cards.chatSubmit.disabled = true;
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: msg }),
+        });
+        if (!res.ok) throw new Error("chat submit failed");
+        cards.chatInput.value = "";
+        _setChatStatus("Posted.");
+        await _fetchChatRows();
+      } catch (_) {
+        _setChatStatus("Could not post message.", true);
+      } finally {
+        if (cards.chatSubmit) cards.chatSubmit.disabled = !_chatEnabled;
+      }
+    }
+
+    if (cards.chatInput && cards.chatSubmit) {
+      if (!_chatEnabled) {
+        cards.chatInput.disabled = true;
+        cards.chatSubmit.disabled = true;
+        cards.chatInput.placeholder = "Chat disabled";
+        _setChatStatus("Read-only mode.");
+        const chatCard = cards.chatInput.closest(".chat-card");
+        if (chatCard) chatCard.style.display = "none";
+      } else {
+        cards.chatSubmit.disabled = false;
+        cards.chatSubmit.addEventListener("click", _submitChat);
+        cards.chatInput.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            _submitChat();
+          }
+        });
+      }
+    }
     function _ensureRobotronLevelOptions() {
       if (!gsLevelEl) return;
       const currentValue = parseInt(gsLevelEl.value, 10);
@@ -2778,11 +3073,15 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         .map((row) => {
           const clientId = Number(row && row.client_id);
           if (!Number.isFinite(clientId) || clientId < 0) return null;
+          const level = Math.max(0, Math.trunc(Number(row && row.level) || 0));
+          const score = Math.max(0, Math.trunc(Number(row && row.score) || 0));
+          const efficiency = level > 0 ? (score / level) : 0;
           return {
             client_id: Math.trunc(clientId),
             lives: Math.max(0, Math.trunc(Number(row && row.lives) || 0)),
-            level: Math.max(0, Math.trunc(Number(row && row.level) || 0)),
-            score: Math.max(0, Math.trunc(Number(row && row.score) || 0)),
+            level,
+            score,
+            efficiency,
             selected_preview: !!(row && row.selected_preview),
             preview_capable: !!(row && row.preview_capable),
           };
@@ -2812,8 +3111,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       const key = String(_clientTableSortKey || "client_id");
       const dir = (_clientTableSortDir === "desc") ? -1 : 1;
       return rows.slice().sort((a, b) => {
-        const av = Math.trunc(Number(a && a[key]) || 0);
-        const bv = Math.trunc(Number(b && b[key]) || 0);
+        const av = Number(a && a[key]) || 0;
+        const bv = Number(b && b[key]) || 0;
         if (av !== bv) return (av - bv) * dir;
         return a.client_id - b.client_id;
       });
@@ -2856,7 +3155,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           emptyRow = document.createElement("tr");
           emptyRow.dataset.empty = "1";
           const td = document.createElement("td");
-          td.colSpan = 4;
+          td.colSpan = 5;
           td.className = "client-table-empty";
           td.textContent = "No Clients";
           emptyRow.appendChild(td);
@@ -2891,7 +3190,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         let tr = existingRows.get(rowKey);
         if (!(tr instanceof HTMLTableRowElement)) {
           tr = document.createElement("tr");
-          for (let i = 0; i < 4; i += 1) {
+          for (let i = 0; i < 5; i += 1) {
             tr.appendChild(document.createElement("td"));
           }
         }
@@ -2902,6 +3201,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         tr.classList.toggle("inactive", !row.preview_capable);
         const cellDefs = [
           { value: fmtInt(row.client_id), className: "" },
+          { value: fmtInt(row.efficiency), className: "num" },
           { value: fmtInt(row.lives), className: "num" },
           { value: fmtInt(row.level), className: "num" },
           { value: fmtInt(row.score), className: "num" },
@@ -3158,12 +3458,12 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
       for (let i = 0; i < lines.length; i++) {
         const ln = String(lines[i] || "");
-        let m = ln.match(/^a=rtpmap:(\d+)\s+H264\/\d+/i);
+        let m = ln.match(/^a=rtpmap:(\\d+)\\s+H264\\/\\d+/i);
         if (m) {
           h264Pts.add(m[1]);
           continue;
         }
-        m = ln.match(/^a=fmtp:(\d+)\s+(.+)$/i);
+        m = ln.match(/^a=fmtp:(\\d+)\\s+(.+)$/i);
         if (m) {
           const pt = m[1];
           fmtpIdxByPt[pt] = i;
@@ -3198,7 +3498,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         lines.push(`a=fmtp:${chosenPt} ${fmtpNew}`);
       }
 
-      const mParts = String(lines[mVideoIdx] || "").trim().split(/\s+/);
+      const mParts = String(lines[mVideoIdx] || "").trim().split(/\\s+/);
       if (mParts.length > 3) {
         const hdr = mParts.slice(0, 3);
         const pts = mParts.slice(3);
@@ -5634,6 +5934,14 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       });
     }
 
+    if (_chatEnabled) {
+      _fetchChatRows();
+      setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        _fetchChatRows();
+      }, CHAT_POLL_MS);
+    }
+
     const cookiePref = getCookieValue(AUDIO_PREF_COOKIE);
     audioEnabled = (cookiePref === null) ? true : (cookiePref === "1");
     setAudioToggle(audioEnabled, false);
@@ -5708,6 +6016,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | None = None):
     _ice = rtc_bridge.ice_servers if rtc_bridge is not None else _WEBRTC_ICE_SERVERS
     page = _render_dashboard_html(_ice).encode("utf-8")
+    chat_store = ChatStore(max_messages=240)
     audio_root = os.path.abspath(_audio_dir())
     fonts_root = os.path.abspath(_fonts_dir())
     html_root = os.path.abspath(_html_dir())
@@ -5807,7 +6116,7 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
             path = parsed.path
             query = parse_qs(parsed.query)
             client_id = (query.get("cid") or [None])[0]
-            if path in ("/api/ping", "/api/now", "/api/history", "/api/game_preview"):
+            if path in ("/api/ping", "/api/now", "/api/history", "/api/game_preview", "/api/chat"):
                 state.touch_web_client(client_id)
             if path == "/":
                 self._send(page, "text/html; charset=utf-8")
@@ -5883,11 +6192,21 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                 body = json.dumps(game_settings.snapshot()).encode("utf-8")
                 self._send(body, "application/json")
                 return
+            if path == "/api/chat":
+                limit_raw = (query.get("limit") or ["120"])[0]
+                try:
+                    limit = max(1, min(240, int(limit_raw)))
+                except Exception:
+                    limit = 120
+                body = json.dumps({"messages": chat_store.snapshot(limit=limit)}).encode("utf-8")
+                self._send(body, "application/json")
+                return
             self._send(b"Not Found", "text/plain; charset=utf-8", status=404)
 
         def do_POST(self):
             parsed = urlparse(self.path)
             path = parsed.path
+            query = parse_qs(parsed.query)
             if path == "/api/game_preview_offer":
                 try:
                     length = int(self.headers.get("Content-Length", 0))
@@ -5976,6 +6295,44 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                         self._send(body, "application/json")
                     else:
                         self._send(b'{"error":"missing settings field"}', "application/json", status=400)
+                except Exception:
+                    self._send(b'{"error":"bad request"}', "application/json", status=400)
+                return
+            if path == "/api/chat":
+                try:
+                    ctype = str(self.headers.get("Content-Type", "") or "").lower()
+                    if "application/json" not in ctype:
+                        self._send(b'{"error":"content_type_must_be_json"}', "application/json", status=415)
+                        return
+                    length = int(self.headers.get("Content-Length", 0))
+                    if length <= 0 or length > 4096:
+                        self._send(b'{"error":"invalid_content_length"}', "application/json", status=400)
+                        return
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        self._send(b'{"error":"invalid_json_payload"}', "application/json", status=400)
+                        return
+                    message_raw = data.get("message", "")
+                    message = message_raw if isinstance(message_raw, str) else str(message_raw)
+
+                    peer_ip = str(self.client_address[0] if self.client_address else "unknown")
+                    # Only trust proxy-forwarded IP when request came from local loopback.
+                    if peer_ip in {"127.0.0.1", "::1", "localhost"}:
+                        forwarded = str(self.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
+                        ip = forwarded or peer_ip
+                    else:
+                        ip = peer_ip
+
+                    row = chat_store.add_message(ip, message)
+                    body = json.dumps({"ok": True, "message": row}).encode("utf-8")
+                    self._send(body, "application/json", status=200)
+                except ValueError as e:
+                    code = str(e)
+                    if code == "message_too_long":
+                        self._send(b'{"error":"message_too_long","max":240}', "application/json", status=400)
+                    else:
+                        self._send(b'{"error":"message_empty"}', "application/json", status=400)
                 except Exception:
                     self._send(b'{"error":"bad request"}', "application/json", status=400)
                 return
