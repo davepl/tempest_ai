@@ -11,8 +11,9 @@ TMP_AUDIO_GLOB="/tmp/robotron_audio_client"*.wav
 TMP_AUDIO_FIFO_GLOB="/tmp/robotron_audio_client"*.fifo
 AUDIO_BUFFER_BYTES="${ROBOTRON_AUDIO_BUFFER_BYTES:-2000000}"
 GAME_AUDIO_ENABLED_RAW="${ROBOTRON_GAME_AUDIO_ENABLED:-0}"
+GAME_AUDIO_ENABLED_NORM="$(printf '%s' "$GAME_AUDIO_ENABLED_RAW" | tr '[:upper:]' '[:lower:]')"
 
-case "${GAME_AUDIO_ENABLED_RAW,,}" in
+case "$GAME_AUDIO_ENABLED_NORM" in
     1|true|yes|on)
         GAME_AUDIO_ENABLED=1
         ;;
