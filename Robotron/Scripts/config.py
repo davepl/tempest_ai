@@ -126,11 +126,13 @@ class ServerConfigData:
     port: int = 9998
     max_clients: int = 36
     # State layout:
-    #   100 global features
-    #   + 12 x 12 x 8 egocentric spatial grid
-    #   + 64 object tokens x 15 features
-    #   = 100 + 1152 + 960 = 2212 floats
-    params_count: int = 2212
+    #   5 core (alive, score, replay, lasers, wave)
+    #   + 2 player position
+    #   + 2 player velocity
+    #   + 50 ELIST bytes
+    #   + 9 typed entity buckets, each: 1 occupancy + N slots x 4 features
+    #   = 644 floats total
+    params_count: int = 644
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -140,10 +142,10 @@ class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     # Base per-frame state from Lua wire protocol.
     base_state_size: int = SERVER_CONFIG.params_count
-    # Lua now emits true per-object motion features, so temporal stacking is unnecessary.
-    frame_stack: int = 1
+    # Legacy learner profile: use short temporal stacking over the compact slot state.
+    frame_stack: int = 4
     # Effective model input width after stacking.
-    state_size: int = SERVER_CONFIG.params_count
+    state_size: int = SERVER_CONFIG.params_count * 4
 
     # Factored action space for Robotron dual sticks:
     #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
@@ -160,6 +162,8 @@ class RLConfigData:
         return self.num_move_actions * self.num_fire_actions
 
     # ── observation layout / network architecture ──────────────────────
+    # These hybrid-shape fields are retained so expert/test tooling can still
+    # understand the newer 2212-float format when synthetic states use it.
     global_feature_count: int = 100
     grid_width: int = 12
     grid_height: int = 12
@@ -171,11 +175,11 @@ class RLConfigData:
     object_token_features: int = 15
 
     trunk_hidden: int = 512
-    trunk_layers: int = 2
+    trunk_layers: int = 3
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Hybrid encoder: global MLP + local grid CNN + transformer over object tokens.
+    # Legacy learner: compact slot-attention over typed entity buckets.
     use_enemy_attention: bool = True
     entity_categories: list = field(default_factory=lambda: [
         ("grunt",      40),
@@ -188,8 +192,11 @@ class RLConfigData:
         ("human",      16),
         ("electrode",  16),
     ])
+    object_slots: int = 144
+    slot_state_features: int = 4
+    legacy_slot_token_features: int = 7
     attn_heads: int = 8
-    attn_dim: int = 192
+    attn_dim: int = 128
     attn_layers: int = 3
     grid_hidden_channels: int = 32
     global_hidden: int = 192
@@ -207,7 +214,7 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 256
+    batch_size: int = 512
     lr: float = 1e-4
     lr_min: float = 4e-5
     lr_warmup_steps: int = 5_000
@@ -218,7 +225,7 @@ class RLConfigData:
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 5_000_000
+    memory_size: int = 20_000_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
@@ -233,7 +240,7 @@ class RLConfigData:
     min_replay_to_train: int = 25_000
     # Wave-aware replay quotas: preserve frontier/high-wave DQN experience so
     # it does not get drowned by abundant easy-wave traffic.
-    replay_wave_sampling_enabled: bool = True
+    replay_wave_sampling_enabled: bool = False
     replay_wave_frontier_frac: float = 0.35
     replay_wave_high_frac: float = 0.15
     replay_wave_frontier_margin: int = 1
@@ -258,7 +265,7 @@ class RLConfigData:
     manual_pulse_duration_frames: int = 750_000
     # Automatic plateau pulser: temporarily raises epsilon and forces
     # frontier starts when DQN reward and reached-wave metrics stop improving.
-    plateau_pulse_enabled: bool = True
+    plateau_pulse_enabled: bool = False
     plateau_pulse_epsilon: float = 0.14
     plateau_pulse_frames: int = 300_000
     plateau_confirm_frames: int = 1_000_000
@@ -270,10 +277,10 @@ class RLConfigData:
     epsilon: float = 1.0
 
     # Expert guidance
-    expert_ratio_start: float = 1.00
-    expert_ratio_end: float = 0.20
-    expert_ratio_decay_frames: int = 20_000_000
-    expert_ratio: float = 1.00
+    expert_ratio_start: float = 0.80
+    expert_ratio_end: float = 0.00
+    expert_ratio_decay_frames: int = 10_000_000
+    expert_ratio: float = 0.80
     # No special zoom handling for Robotron; keep multipliers neutral.
     expert_ratio_zoom_multiplier: float = 1.0
     expert_ratio_zoom_gamestate: int = 0x00
@@ -284,6 +291,8 @@ class RLConfigData:
     expert_bc_decay_start: int = 500_000
     expert_bc_decay_frames: int = 4_000_000
     expert_bc_min_weight: float = 0.01
+    expert_profile: str = "simple"
+    expert_hold_fire_for_last_enemy_rescue: bool = True
 
     # ── reward ──────────────────────────────────────────────────────────
     # Scale objective rewards to fit C51 support while keeping TD targets stable.
@@ -291,11 +300,9 @@ class RLConfigData:
     # accommodates the full rescue signal.
     obj_reward_scale: float = 0.02
     point_reward_scale: float = 1.0 / obj_reward_scale
-    subj_reward_scale: float = 0.0025
+    subj_reward_scale: float = 0.001
     reward_clip: float = 100.0
-    # Death frames currently carry about -500 scaled objective reward after the
-    # larger Lua death penalty, so allow that signal through largely intact.
-    death_reward_clip: float = 600.0
+    death_reward_clip: float = 100.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
@@ -307,7 +314,7 @@ class RLConfigData:
     # At scale=1.0: wave 10 → 1.0×, wave 100 → 2.0×, wave 1000 → 3.0×.
     # At scale=5.0: wave 100 → 10.0×, matching a "10× at level 100" goal.
     # Set to 0.0 to disable.
-    level_priority_log_scale: float = 3.0
+    level_priority_log_scale: float = 0.0
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True
@@ -315,7 +322,7 @@ class RLConfigData:
     # at higher frame rates even with low overall system utilization.
     inference_on_cpu: bool = False
     # Device placement (CUDA only): useful on multi-GPU hosts.
-    train_cuda_device_index: int = 1
+    train_cuda_device_index: int = 0
     inference_cuda_device_index: int = 0
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
@@ -352,7 +359,7 @@ def compute_robotron_auto_curriculum_level(average_level: float) -> int:
         avg = float(average_level)
     except Exception:
         avg = 1.0
-    return max(1, min(81, int(math.floor(avg)) - 3))
+    return max(1, min(81, int(math.floor(avg)) - 1))
 
 class GameSettings:
     """Thread-safe container for operator-adjustable game settings."""
@@ -527,7 +534,7 @@ class MetricsData:
 
     # Preview capture control (admin-controlled via dashboard)
     preview_capture_enabled: bool = True
-    hud_enabled: bool = True
+    hud_enabled: bool = False
     last_priority_mean: float = 0.0
     last_agreement: float = 0.0
 

@@ -26,6 +26,21 @@ _GLOBAL = int(getattr(RL_CONFIG, "global_feature_count", 98))
 _GRID = int(getattr(RL_CONFIG, "grid_width", 12)) * int(getattr(RL_CONFIG, "grid_height", 12)) * int(getattr(RL_CONFIG, "grid_channels", 8))
 _TOKEN_COUNT = int(getattr(RL_CONFIG, "object_token_count", 64))
 _TOKEN_FEATURES = int(getattr(RL_CONFIG, "object_token_features", 15))
+_HYBRID_BASE = _GLOBAL + _GRID + (_TOKEN_COUNT * _TOKEN_FEATURES)
+_LEGACY_SLOT_FEATURES = int(getattr(RL_CONFIG, "slot_state_features", 4))
+
+
+def _legacy_category_bases() -> dict[str, int]:
+    bases = {}
+    offset = 59
+    for name, slots in getattr(RL_CONFIG, "entity_categories", ()):
+        bases[name] = offset
+        offset += 1 + (int(slots) * _LEGACY_SLOT_FEATURES)
+    return bases
+
+
+_LEGACY_BASES = _legacy_category_bases()
+_LEGACY_SLOTS = {name: int(slots) for name, slots in getattr(RL_CONFIG, "entity_categories", ())}
 
 
 def _blank_state() -> np.ndarray:
@@ -43,26 +58,38 @@ def _add_entity(
     dx_px: float,
     dy_px: float,
 ) -> None:
-    assert 0 <= slot_index < _TOKEN_COUNT
     dx_world = float(dx_px) * 256.0
     dy_world = float(dy_px) * 256.0
     dist_world = math.hypot(dx_world, dy_world)
-    token_base = _GLOBAL + _GRID + slot_index * _TOKEN_FEATURES
-    cat_norm = _OFFSETS[category] / max(1, len(_OFFSETS) - 1)
+    if int(RL_CONFIG.base_state_size) >= _HYBRID_BASE:
+        assert 0 <= slot_index < _TOKEN_COUNT
+        token_base = _GLOBAL + _GRID + slot_index * _TOKEN_FEATURES
+        cat_norm = _OFFSETS[category] / max(1, len(_OFFSETS) - 1)
 
-    state[token_base + 0] = 1.0
-    state[token_base + 1] = dx_world / _REL_POS_X_RANGE
-    state[token_base + 2] = dy_world / _REL_POS_Y_RANGE
-    state[token_base + 5] = dist_world / _POS_MAX_DIAG
-    if dist_world > 1.0:
-        state[token_base + 6] = dx_world / dist_world
-        state[token_base + 7] = dy_world / dist_world
-    state[token_base + 8] = max(0.0, min(1.0, 1.0 - state[token_base + 5]))
-    state[token_base + 9] = 0.5
-    state[token_base + 10] = 0.5
-    state[token_base + 11] = cat_norm
-    state[token_base + 12] = 1.0 if category == "human" else 0.0
-    state[token_base + 13] = 0.0 if category == "human" else 1.0
+        state[token_base + 0] = 1.0
+        state[token_base + 1] = dx_world / _REL_POS_X_RANGE
+        state[token_base + 2] = dy_world / _REL_POS_Y_RANGE
+        state[token_base + 5] = dist_world / _POS_MAX_DIAG
+        if dist_world > 1.0:
+            state[token_base + 6] = dx_world / dist_world
+            state[token_base + 7] = dy_world / dist_world
+        state[token_base + 8] = max(0.0, min(1.0, 1.0 - state[token_base + 5]))
+        state[token_base + 9] = 0.5
+        state[token_base + 10] = 0.5
+        state[token_base + 11] = cat_norm
+        state[token_base + 12] = 1.0 if category == "human" else 0.0
+        state[token_base + 13] = 0.0 if category == "human" else 1.0
+        return
+
+    assert category in _LEGACY_BASES
+    assert 0 <= slot_index < _LEGACY_SLOTS[category]
+    block_base = _LEGACY_BASES[category]
+    state[block_base] = 1.0
+    slot_base = block_base + 1 + slot_index * _LEGACY_SLOT_FEATURES
+    state[slot_base + 0] = 1.0
+    state[slot_base + 1] = dx_world / _REL_POS_X_RANGE
+    state[slot_base + 2] = dy_world / _REL_POS_Y_RANGE
+    state[slot_base + 3] = dist_world / _POS_MAX_DIAG
 
 
 def test_aligned_fire_keeps_human_rescue_movement():

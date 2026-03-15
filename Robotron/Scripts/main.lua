@@ -2,10 +2,11 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a hybrid 2212-value state vector:
-        + 100 global features
-        + 12x12x8 egocentric spatial grid
-        + 64 object tokens x 15 features
+      - Sends a compact 644-value RL state vector:
+        + 9 core/player values
+        + 50 ELIST bytes
+        + 9 typed entity buckets with nearest-first slots
+      - Still computes richer object features internally for HUD/preview support
       - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
 --]]
 
@@ -66,7 +67,6 @@ SUBJ_ENEMY_FAR_NORM = 0.200
 SUBJ_HUMAN_NEAR_NORM = 0.120
 ADVANCED_SHAPING = {
     priority_aim_weight = 10.0,
-    centering_weight = 7.0,
     brain_guard_weight = 8.0,
     high_wave_threshold = 6,
     brain_guard_wave = 4,
@@ -250,7 +250,12 @@ GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
 GLOBAL_FEATURES = 100
 GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
 TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
-EXPECTED_STATE_VALUES = GLOBAL_FEATURES + GRID_FEATURES + TOKEN_FEATURES
+LEGACY_SLOT_STATE_FEATURES = 4
+LEGACY_ENTITY_TOTAL_FEATURES = 0
+for _, cat in ipairs(ENTITY_CATEGORIES) do
+    LEGACY_ENTITY_TOTAL_FEATURES = LEGACY_ENTITY_TOTAL_FEATURES + 1 + (cat.slots * LEGACY_SLOT_STATE_FEATURES)
+end
+EXPECTED_STATE_VALUES = 9 + ZP1ENM_SIZE + LEGACY_ENTITY_TOTAL_FEATURES
 
 local CATEGORY_THREAT_WEIGHT = {
     grunt = 0.55,
@@ -776,48 +781,6 @@ function compute_priority_aim_reward(fire_cmd, px16, py16, objects, wave_number,
         end
     end
     return best_score
-end
-
-function compute_centering_reward(move_cmd, px16, py16, objects, wave_number)
-    if move_cmd == nil or move_cmd < 0 or move_cmd > 7 then
-        return 0.0
-    end
-    if px16 == nil or py16 == nil or objects == nil then
-        return 0.0
-    end
-
-    local px = norm_pos_x(px16)
-    local py = norm_pos_y(py16)
-    local near_wall = math.max(
-        clamp01((ADVANCED_SHAPING.center_pull_margin_x - px) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_x)),
-        clamp01((px - (1.0 - ADVANCED_SHAPING.center_pull_margin_x)) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_x)),
-        clamp01((ADVANCED_SHAPING.center_pull_margin_y - py) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_y)),
-        clamp01((py - (1.0 - ADVANCED_SHAPING.center_pull_margin_y)) / math.max(1e-6, ADVANCED_SHAPING.center_pull_margin_y))
-    )
-
-    local pressure = 0.0
-    for _, obj in ipairs(objects) do
-        if obj.is_dangerous and obj.category ~= "human" then
-            local dist = tonumber(obj.dist_norm) or 1.0
-            if dist < ADVANCED_SHAPING.center_pressure_norm then
-                pressure = pressure + ((tonumber(obj.threat) or 0.5) + 0.25) * (1.0 - dist / ADVANCED_SHAPING.center_pressure_norm)
-            end
-        end
-    end
-    pressure = clamp01(pressure / 2.0)
-
-    local wave = math.max(0, math.floor(tonumber(wave_number) or 0))
-    if wave < ADVANCED_SHAPING.high_wave_threshold and near_wall <= 0.0 and pressure <= 0.0 then
-        return 0.0
-    end
-    local weight = math.max(near_wall, pressure)
-    if weight <= 0.0 then
-        return 0.0
-    end
-
-    local center_x = (POS_X_MIN + (POS_X_RANGE * 0.5)) - px16
-    local center_y = (POS_Y_MIN + (POS_Y_RANGE * 0.5)) - py16
-    return movement_alignment_score(move_cmd, center_x, center_y) * weight
 end
 
 function compute_brain_guard_reward(move_cmd, fire_cmd, px16, py16, objects, wave_number, num_humans)
@@ -1355,6 +1318,34 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         end
     end
 
+    local legacy_list_features = {}
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        local bucket = buckets[cat.name]
+        local by_dist = {}
+        for i = 1, #bucket do
+            by_dist[i] = bucket[i]
+        end
+        table.sort(by_dist, function(a, b)
+            return a.dist_norm < b.dist_norm
+        end)
+
+        legacy_list_features[#legacy_list_features + 1] = math.min(1.0, #by_dist / cat.slots)
+        for i = 1, cat.slots do
+            local obj = by_dist[i]
+            if obj then
+                legacy_list_features[#legacy_list_features + 1] = 1.0
+                legacy_list_features[#legacy_list_features + 1] = obj.dx
+                legacy_list_features[#legacy_list_features + 1] = obj.dy
+                legacy_list_features[#legacy_list_features + 1] = obj.dist_norm
+            else
+                legacy_list_features[#legacy_list_features + 1] = 0.0
+                legacy_list_features[#legacy_list_features + 1] = 0.0
+                legacy_list_features[#legacy_list_features + 1] = 0.0
+                legacy_list_features[#legacy_list_features + 1] = 0.0
+            end
+        end
+    end
+
     -- Encode walls/lava into channel 5.
     for gy = 0, GRID_H - 1 do
         for gx = 0, GRID_W - 1 do
@@ -1472,6 +1463,7 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         player_center_x16 = player_center_x16,
         player_center_y16 = player_center_y16,
         num_humans = num_humans,
+        legacy_list_features = legacy_list_features,
     }
 end
 
@@ -2197,7 +2189,7 @@ end
 
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
                                player_x16, player_y16,
-                               global_values, grid_values, token_values,
+                               enemy_state, legacy_list_values,
                                done, subj_reward, obj_reward, save_signal,
                                preview_w, preview_h, preview_fmt, preview_blob)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
@@ -2212,31 +2204,26 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     local wave_norm = math.min(1.0, wave_u8 / 40.0)
 
     local state_values = {}
-    for i = 1, #global_values do
-        state_values[#state_values + 1] = global_values[i]
-    end
-    -- Fill the core/global header fields in-place.
-    state_values[1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
-    state_values[2] = score_u32 / 1000000.0
-    state_values[3] = replay_norm
-    state_values[4] = lasers_norm
-    state_values[5] = wave_norm
-    state_values[6] = norm_pos_x(player_x16 or 0)
-    state_values[7] = norm_pos_y(player_y16 or 0)
+    state_values[#state_values + 1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
+    state_values[#state_values + 1] = score_u32 / 1000000.0
+    state_values[#state_values + 1] = replay_norm
+    state_values[#state_values + 1] = lasers_norm
+    state_values[#state_values + 1] = wave_norm
+    state_values[#state_values + 1] = norm_pos_x(player_x16 or 0)
+    state_values[#state_values + 1] = norm_pos_y(player_y16 or 0)
     local vel_x = 0.0
     local vel_y = 0.0
     if prev_player_x16 and prev_player_y16 and player_alive ~= 0 then
         vel_x = clamp11(((player_x16 or 0) - prev_player_x16) / POS_X_RANGE)
         vel_y = clamp11(((player_y16 or 0) - prev_player_y16) / POS_Y_RANGE)
     end
-    state_values[8] = vel_x
-    state_values[9] = vel_y
-
-    for i = 1, #grid_values do
-        state_values[#state_values + 1] = grid_values[i]
+    state_values[#state_values + 1] = vel_x
+    state_values[#state_values + 1] = vel_y
+    for i = 1, ZP1ENM_SIZE do
+        state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
     end
-    for i = 1, #token_values do
-        state_values[#state_values + 1] = token_values[i]
+    for i = 1, #(legacy_list_values or {}) do
+        state_values[#state_values + 1] = legacy_list_values[i]
     end
     local num_values = #state_values
     if num_values ~= EXPECTED_STATE_VALUES then
@@ -2447,6 +2434,7 @@ function read_frame_observation()
         replay_level = replay_level,
         num_lasers = num_lasers,
         wave_number = wave_number,
+        enemy_state = enemy_state,
         player_x16 = obs.player_center_x16 or player_x16,
         player_y16 = obs.player_center_y16 or player_y16,
         obs = obs,
@@ -2456,7 +2444,6 @@ end
 
 function compute_frame_rewards(frame)
     local player_alive = frame.player_alive
-    local wave_number = frame.wave_number
     local player_x16 = frame.player_x16
     local done = (previous_player_alive == 1 and player_alive == 0)
     local score_delta = frame.score - previous_score
@@ -2471,26 +2458,9 @@ function compute_frame_rewards(frame)
     local spacing_score = enemy_spacing_score(frame.obs.nearest_enemy_dist)
     local rescue_score = human_proximity_score(frame.obs.nearest_human_dist)
     local aim_score = compute_aim_reward(prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects)
-    local priority_aim_score = compute_priority_aim_reward(
-        prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects,
-        previous_wave_number, prev_num_humans
-    )
     local evade_score = compute_evasion_reward(prev_move_cmd, prev_aim_px16, prev_aim_py16,
         prev_nearest_enemy_x16, prev_nearest_enemy_y16, prev_nearest_enemy_dist)
-    local centering_score = compute_centering_reward(
-        prev_move_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects, previous_wave_number
-    )
-    local brain_guard_score = compute_brain_guard_reward(
-        prev_move_cmd, prev_fire_cmd, prev_aim_px16, prev_aim_py16, prev_aim_objects,
-        previous_wave_number, prev_num_humans
-    )
-    local humans_now = math.max(0, math.floor(tonumber(frame.num_humans) or 0))
-    local reward_survival = (player_alive == 1)
-    if SUBJ_SURVIVAL_REQUIRE_HUMANS then
-        reward_survival = reward_survival and (humans_now > 0)
-    end
-    local survival_bonus = reward_survival and SUBJ_SURVIVAL_BONUS or 0.0
-    local no_humans_penalty = (player_alive == 1 and humans_now <= 0) and SUBJ_NO_HUMANS_EXISTENCE_PENALTY or 0.0
+    local survival_bonus = (player_alive == 1) and SUBJ_SURVIVAL_BONUS or 0.0
 
     local wall_penalty = 0.0
     if player_alive == 1 and player_x16 then
@@ -2504,26 +2474,12 @@ function compute_frame_rewards(frame)
         end
     end
 
-    local abandoned_penalty = 0.0
-    if player_alive == 1 and wave_number > previous_wave_number
-       and previous_wave_number > 0 and prev_num_humans > 0 then
-        abandoned_penalty = prev_num_humans * SUBJ_ABANDONED_HUMAN
-        trace_log(frame_counter, "abandoned_humans",
-            string.format("wave %d->%d humans_left=%d penalty=%.1f",
-                previous_wave_number, wave_number, prev_num_humans, abandoned_penalty))
-    end
-
     local subj_reward = survival_bonus
         + (spacing_score * SUBJ_ENEMY_WEIGHT)
         + (rescue_score * SUBJ_HUMAN_WEIGHT)
         + (aim_score * SUBJ_AIM_WEIGHT)
-        + (priority_aim_score * ADVANCED_SHAPING.priority_aim_weight)
         + (evade_score * SUBJ_EVADE_WEIGHT)
-        + (centering_score * ADVANCED_SHAPING.centering_weight)
-        + (brain_guard_score * ADVANCED_SHAPING.brain_guard_weight)
-        - no_humans_penalty
         - wall_penalty
-        - abandoned_penalty
     if done then
         subj_reward = subj_reward - SUBJ_DEATH_PENALTY
     end
@@ -2603,7 +2559,7 @@ function frame_callback()
         serialize_frame,
         frame.player_alive, frame.score, frame.replay_level, frame.num_lasers, frame.wave_number,
         frame.player_x16, frame.player_y16,
-        frame.obs.globals, frame.obs.grid, frame.obs.tokens,
+        frame.enemy_state, frame.obs.legacy_list_features,
         rewards.done, rewards.subj_reward, rewards.obj_reward, save_signal,
         preview.w, preview.h, preview.fmt, preview.blob
     )
@@ -2612,7 +2568,7 @@ function frame_callback()
         return true
     end
     local payload = payload_or_err
-    local payload_count = #(frame.obs.globals or {}) + #(frame.obs.grid or {}) + #(frame.obs.tokens or {})
+    local payload_count = 9 + ZP1ENM_SIZE + #(frame.obs.legacy_list_features or {})
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
     local move_cmd, fire_cmd = -1, -1

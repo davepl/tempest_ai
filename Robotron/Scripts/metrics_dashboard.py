@@ -31,6 +31,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw not in {"0", "false", "off", "no"}
+
+
+_PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED = _env_flag("ROBOTRON_GAME_AUDIO_ENABLED", False)
+
 try:
     import numpy as np
     _NUMPY_AVAILABLE = True
@@ -213,6 +223,7 @@ class _DashboardState:
         self._web_clients: dict[str, float] = {}
         self._cached_now_body = b"{}"
         self._model_desc: str | None = None
+        self._model_desc_key: tuple[Any, ...] | None = None
         # Agreement 1M window (frame-weighted EMA)
         self._agree_window: deque = deque()  # [(agreement, frame_delta), ...]
         self._agree_window_frames: int = 0
@@ -340,54 +351,83 @@ class _DashboardState:
         return self._agree_window_weighted / max(1, self._agree_window_frames)
 
     def _get_model_desc(self) -> str:
-        if self._model_desc is not None:
-            return self._model_desc
-        cfg = RL_CONFIG
-        try:
-            if self.agent is not None and hasattr(self.agent, 'online_net'):
-                param_count = sum(p.numel() for p in self.agent.online_net.parameters())
-            else:
-                gg = int(getattr(cfg, "global_feature_count", 98))
-                gc = int(getattr(cfg, "grid_channels", 8))
-                gh = int(getattr(cfg, "grid_height", 12))
-                gw = int(getattr(cfg, "grid_width", 12))
-                tk = int(getattr(cfg, "object_token_count", 64))
-                tf = int(getattr(cfg, "object_token_features", 15))
-                ad = cfg.attn_dim
-                th = cfg.trunk_hidden
-                tl = cfg.trunk_layers
-                na = cfg.num_move_actions * cfg.num_fire_actions
-                n_atoms = cfg.num_atoms if cfg.use_distributional else 1
-                hm = th // 2
-                global_p = (gg * cfg.global_hidden + cfg.global_hidden) + (cfg.global_hidden * cfg.global_hidden + cfg.global_hidden)
-                grid_p = (gc * cfg.grid_hidden_channels * 9 + cfg.grid_hidden_channels)
-                grid_p += (cfg.grid_hidden_channels * (cfg.grid_hidden_channels * 2) * 9 + (cfg.grid_hidden_channels * 2))
-                grid_p += ((cfg.grid_hidden_channels * 2) * (cfg.grid_hidden_channels * 3) * 9 + (cfg.grid_hidden_channels * 3))
-                grid_p += ((cfg.grid_hidden_channels * 3) * 4 * ad + ad)
-                token_p = (tf * ad + ad) + (4 * ad * ad * cfg.attn_layers)
-                trunk_in = cfg.global_hidden + ad + ad
-                trunk_p = (trunk_in * th + th)
-                for _ in range(1, tl):
-                    trunk_p += th * th + th
-                heads_p = 2 * (th * hm + hm) + hm * n_atoms + n_atoms + hm * (na * n_atoms) + na * n_atoms
-                param_count = global_p + grid_p + token_p + trunk_p + heads_p
-        except Exception:
-            param_count = 0
-        trunk_in = int(getattr(cfg, "global_hidden", 192)) + int(getattr(cfg, "attn_dim", 192)) * 2
-        layers = [f"g{cfg.global_feature_count}", f"grid{cfg.grid_width}x{cfg.grid_height}x{cfg.grid_channels}", f"tok{cfg.object_token_count}x{cfg.object_token_features}", str(trunk_in)]
-        for _ in range(cfg.trunk_layers):
-            layers.append(str(cfg.trunk_hidden))
-        layers.append(str(cfg.trunk_hidden // 2))
-        arch_str = " \u00bb ".join(layers)
-        if param_count >= 1_000_000:
-            p_str = f"{param_count / 1_000_000:.1f}M"
-        elif param_count >= 1_000:
-            p_str = f"{param_count / 1_000:.0f}K"
+      cfg = RL_CONFIG
+      net = getattr(self.agent, "online_net", None) if self.agent is not None else None
+
+      gg = int(getattr(cfg, "global_feature_count", 98))
+      gc = int(getattr(cfg, "grid_channels", 8))
+      gh = int(getattr(cfg, "grid_height", 12))
+      gw = int(getattr(cfg, "grid_width", 12))
+      tk = int(getattr(cfg, "object_token_count", 64))
+      tf = int(getattr(cfg, "object_token_features", 15))
+      ad = int(getattr(cfg, "attn_dim", 192))
+      ghid = int(getattr(cfg, "global_hidden", 192))
+      trunk_in = ghid + ad + ad
+      trunk_widths: list[int] = [int(getattr(cfg, "trunk_hidden", 512))] * int(getattr(cfg, "trunk_layers", 1))
+      head_mid = max(64, int(getattr(cfg, "trunk_hidden", 512)) // 2)
+
+      if net is not None:
+        gg = int(getattr(net, "global_feature_count", gg))
+        gc = int(getattr(net, "grid_channels", gc))
+        gh = int(getattr(net, "grid_height", gh))
+        gw = int(getattr(net, "grid_width", gw))
+        tk = int(getattr(net, "object_token_count", tk))
+        tf = int(getattr(net, "object_token_features", tf))
+        trunk_in = int(
+          getattr(getattr(net, "global_encoder", None), "out_dim", ghid)
+          + getattr(getattr(net, "grid_encoder", None), "out_dim", ad)
+          + getattr(getattr(net, "entity_encoder", None), "out_dim", ad)
+        )
+        trunk_widths = [
+          int(layer.out_features)
+          for layer in getattr(net, "trunk", [])
+          if hasattr(layer, "out_features")
+        ]
+        head_fc = getattr(net, "val_fc", None) or getattr(net, "q_fc", None)
+        if head_fc is not None and hasattr(head_fc, "out_features"):
+          head_mid = int(head_fc.out_features)
+
+      model_desc_key = (id(net), gg, gw, gh, gc, tk, tf, trunk_in, tuple(trunk_widths), head_mid)
+      if self._model_desc is not None and self._model_desc_key == model_desc_key:
+        return self._model_desc
+
+      try:
+        if net is not None:
+          param_count = sum(p.numel() for p in net.parameters())
         else:
-            p_str = str(param_count)
-        desc = f"Model: {arch_str} \u00b7 {p_str} params"
-        self._model_desc = desc
-        return desc
+          th = int(getattr(cfg, "trunk_hidden", 512))
+          tl = int(getattr(cfg, "trunk_layers", 1))
+          na = cfg.num_move_actions * cfg.num_fire_actions
+          n_atoms = cfg.num_atoms if cfg.use_distributional else 1
+          hm = th // 2
+          global_p = (gg * cfg.global_hidden + cfg.global_hidden) + (cfg.global_hidden * cfg.global_hidden + cfg.global_hidden)
+          grid_p = (gc * cfg.grid_hidden_channels * 9 + cfg.grid_hidden_channels)
+          grid_p += (cfg.grid_hidden_channels * (cfg.grid_hidden_channels * 2) * 9 + (cfg.grid_hidden_channels * 2))
+          grid_p += ((cfg.grid_hidden_channels * 2) * (cfg.grid_hidden_channels * 3) * 9 + (cfg.grid_hidden_channels * 3))
+          grid_p += ((cfg.grid_hidden_channels * 3) * 4 * ad + ad)
+          token_p = (tf * ad + ad) + (4 * ad * ad * cfg.attn_layers)
+          trunk_p = (trunk_in * th + th)
+          for _ in range(1, tl):
+            trunk_p += th * th + th
+          heads_p = 2 * (th * hm + hm) + hm * n_atoms + n_atoms + hm * (na * n_atoms) + na * n_atoms
+          param_count = global_p + grid_p + token_p + trunk_p + heads_p
+      except Exception:
+        param_count = 0
+
+      layers = [f"g{gg}", f"grid{gw}x{gh}x{gc}", f"tok{tk}x{tf}", str(trunk_in)]
+      layers.extend(str(width) for width in trunk_widths)
+      layers.append(str(head_mid))
+      arch_str = " \u00bb ".join(layers)
+      if param_count >= 1_000_000:
+        p_str = f"{param_count / 1_000_000:.1f}M"
+      elif param_count >= 1_000:
+        p_str = f"{param_count / 1_000:.0f}K"
+      else:
+        p_str = str(param_count)
+      desc = f"Model: {arch_str} \u00b7 {p_str} params"
+      self._model_desc = desc
+      self._model_desc_key = model_desc_key
+      return desc
 
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -781,7 +821,7 @@ class _PreviewVideoTrack(VideoStreamTrack):
 
 
 class _PreviewAudioSource:
-    """Tail the selected preview client's WAV file and fan-out 20 ms PCM frames."""
+    """Tail the selected preview client's bounded relay WAV and fan-out 20 ms PCM frames."""
 
     _FRAME_PTIME_S = 0.02
     _MAX_SOURCE_LATENCY_S = 0.20
@@ -1155,14 +1195,14 @@ class _PreviewWebRTCBridge:
         self._loop = None
         self._pcs = set()
         self._lock = threading.Lock()
-        self._audio_source = _PreviewAudioSource(self.metrics) if self.enabled else None
+        self._audio_source = _PreviewAudioSource(self.metrics) if (self.enabled and _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED) else None
 
     def start(self):
         if not self.enabled:
             return
         if self._thread is not None:
             return
-        if self._audio_source is None:
+        if self._audio_source is None and _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED:
             self._audio_source = _PreviewAudioSource(self.metrics)
 
         def _runner():
@@ -1268,13 +1308,13 @@ class _PreviewWebRTCBridge:
             track = _PreviewVideoTrack(self.metrics, fps=30.0)
         pc.addTrack(track)
 
-        if self._audio_source is None:
+        if self._audio_source is None and _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED:
             try:
                 self._audio_source = _PreviewAudioSource(self.metrics)
             except Exception:
                 self._audio_source = None
 
-        if self._audio_source is not None:
+        if self._audio_source is not None and _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED:
             try:
                 audio_track = _PreviewAudioTrack(self._audio_source)
                 pc.addTrack(audio_track)
@@ -1306,6 +1346,9 @@ class _PreviewWebRTCBridge:
 
 def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = None) -> str:
     _ice_json = json.dumps(webrtc_ice_servers if webrtc_ice_servers else _WEBRTC_ICE_SERVERS)
+    _preview_game_audio_json = "true" if _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED else "false"
+    _preview_game_audio_checked = " checked" if _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED else ""
+    _preview_game_audio_disabled = "" if _PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED else " disabled"
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -1751,27 +1794,28 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       grid-column: span 2;
       grid-row: span 2;
       min-height: 200px;
+      order: -30;
     }
     .preview-card {
       grid-column: span 4;
       grid-row: span 2;
       min-height: 200px;
       gap: 6px;
-      order: -30;
+      order: -20;
     }
     .client-table-card {
       grid-column: span 4;
       grid-row: span 2;
       min-height: 200px;
       gap: 8px;
-      order: -29;
+      order: -19;
     }
     .chat-card {
       grid-column: span 4;
       grid-row: span 2;
       min-height: 200px;
       gap: 8px;
-      order: -28;
+      order: -18;
     }
     .chat-window {
       flex: 1 1 auto;
@@ -1808,6 +1852,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       background: linear-gradient(180deg, rgba(105, 145, 200, 0.98), rgba(65, 95, 145, 0.98));
     }
     .chat-row {
+      display: grid;
+      grid-template-columns: 11ch 10ch minmax(0, 1fr);
+      gap: 6px;
+      align-items: baseline;
       margin-bottom: 6px;
       overflow-wrap: anywhere;
       white-space: pre-wrap;
@@ -1815,15 +1863,42 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     .chat-row:last-child {
       margin-bottom: 0;
     }
-    .chat-ip {
+    .chat-columns {
+      display: grid;
+      grid-template-columns: 11ch 10ch minmax(0, 1fr);
+      gap: 6px;
+      padding: 0 2px;
       color: #7dd3fc;
-      margin-right: 4px;
+      font-size: 8.4px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      align-items: baseline;
+    }
+    .chat-columns > div:nth-child(2) {
+      text-align: left;
+    }
+    .chat-time {
+      color: #93c5fd;
+      white-space: nowrap;
+      font-size: 8.4px;
+      line-height: 1.15;
+      margin-top: 4px;
+    }
+    .chat-sender {
+      color: #7dd3fc;
+      font-weight: 600;
+      font-size: 8.4px;
+      line-height: 1.15;
+      margin-top: 4px;
+      white-space: nowrap;
+    }
+    .chat-text {
+      min-width: 0;
     }
     .chat-controls {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 6px;
+      display: flex;
       align-items: center;
+      gap: 6px;
     }
     .chat-input {
       width: 100%;
@@ -1839,7 +1914,19 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       border-color: rgba(57, 255, 20, 0.55);
       box-shadow: inset 0 0 12px rgba(57, 255, 20, 0.12), 0 0 12px rgba(57, 255, 20, 0.10);
     }
+    .chat-name-input {
+      flex: 0 0 16ch;
+      width: 16ch;
+      max-width: 16ch;
+      min-width: 16ch;
+      justify-self: start;
+    }
+    #chatInput {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
     .chat-submit {
+      flex: 0 0 auto;
       border: 1px solid rgba(57, 255, 20, 0.42);
       border-radius: 8px;
       padding: 6px 10px;
@@ -1858,6 +1945,21 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       min-height: 1.1em;
       font-size: 11px;
       color: #93c5fd;
+    }
+    @media (max-width: 720px) {
+      .chat-columns,
+      .chat-row {
+        grid-template-columns: 11ch 10ch minmax(0, 1fr);
+      }
+      .chat-controls {
+        flex-wrap: wrap;
+      }
+      .chat-name-input {
+        flex-basis: 16ch;
+      }
+      #chatInput {
+        flex-basis: min(100%, 20rem);
+      }
     }
     .dell-card {
       display: grid;
@@ -2100,6 +2202,20 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       text-transform: uppercase;
       letter-spacing: 0.5px;
     }
+    .preview-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      color: #b0c8e8;
+    }
+    .preview-toggle input {
+      display: none;
+    }
+    .summary-meter-card {
+      order: 10;
+    }
     .card-narrow {
       grid-column: span 1;
       min-height: 0;
@@ -2179,12 +2295,12 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       transition: transform 0.2s;
       text-shadow: 0 0 4px rgba(0, 200, 255, 0.8);
     }
-    #chkPreviewEnabled:checked + .preview-checkbox-indicator {
+    .preview-toggle input:checked + .preview-checkbox-indicator {
       background: rgba(0, 200, 255, 0.35);
       border-color: rgba(0, 200, 255, 0.7);
       box-shadow: 0 0 6px rgba(0, 200, 255, 0.4);
     }
-    #chkPreviewEnabled:checked + .preview-checkbox-indicator::after {
+    .preview-toggle input:checked + .preview-checkbox-indicator::after {
       transform: translate(-50%, -50%) scale(1);
     }
     /* Up/down override controls for Epsilon / Expert */
@@ -2278,7 +2394,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
-      .gauge-card { grid-column: span 2; }
+      .gauge-card { grid-column: span 2; order: -40; }
+      .summary-meter-card { grid-column: span 2; order: -40; }
       .preview-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .client-table-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .chat-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
@@ -2311,17 +2428,19 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       <article class="card preview-card" style="--card-border:rgba(80,170,255,0.72);--card-glow:rgba(60,150,255,0.30)">
         <div class="gauge-head">
           <div style="display:flex;align-items:center;gap:10px;">
-            <label id="previewToggleWrap" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-              <input type="checkbox" id="chkPreviewEnabled" style="display:none;" checked>
+            <label id="previewToggleWrap" class="preview-toggle">
+              <input type="checkbox" id="chkPreviewEnabled" checked>
               <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
             </label>
             <div class="label" id="mPreviewLabel">PREVIEW</div>
-            <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#b0c8e8;cursor:pointer;">
-              <input type="checkbox" id="chkHudEnabled" checked>
+            <label class="preview-toggle">
+              <input type="checkbox" id="chkHudEnabled">
+              <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
               <span>HUD</span>
             </label>
-            <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#b0c8e8;cursor:pointer;">
-              <input type="checkbox" id="chkPreviewGameAudio" checked>
+            <label class="preview-toggle">
+              <input type="checkbox" id="chkPreviewGameAudio"__PREVIEW_GAME_AUDIO_CHECKED____PREVIEW_GAME_AUDIO_DISABLED__>
+              <span class="preview-checkbox-indicator" style="display:inline-block;width:12px;height:12px;border:1px solid rgba(100,180,255,0.5);border-radius:3px;position:relative;background:rgba(0,200,255,0.15);transition:all 0.2s;"></span>
               <span>GAME AUDIO</span>
             </label>
           </div>
@@ -2349,6 +2468,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
             <thead id="tblClientsHead">
               <tr>
                 <th aria-sort="ascending"><button type="button" class="client-table-sort-btn active" data-sort-key="client_id">ClientID<span class="client-table-sort-indicator">▲</span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="duration_seconds">Duration<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="efficiency">Efficiency<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="lives">Lives<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="level">Level<span class="client-table-sort-indicator"></span></button></th>
@@ -2356,7 +2476,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
               </tr>
             </thead>
             <tbody id="tblClientsBody">
-              <tr><td colspan="5" class="client-table-empty">No Clients</td></tr>
+              <tr><td colspan="6" class="client-table-empty">No Clients</td></tr>
             </tbody>
           </table>
         </div>
@@ -2366,10 +2486,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           <div class="label">CHAT</div>
           <div class="client-table-count" id="mChatCount">0</div>
         </div>
+        <div class="chat-columns" aria-hidden="true">
+          <div>Date Time</div>
+          <div>Name</div>
+          <div>Message</div>
+        </div>
         <div class="chat-window" id="chatWindow" aria-live="polite">
           <div class="chat-row">Chat ready.</div>
         </div>
         <div class="chat-controls">
+          <input id="chatNameInput" class="chat-input chat-name-input" maxlength="16" placeholder="Name" />
           <input id="chatInput" class="chat-input" maxlength="240" placeholder="Say something (max 240 chars)" />
           <button id="chatSubmit" class="chat-submit" type="button">Submit</button>
         </div>
@@ -2463,8 +2589,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           <canvas id="lrMiniChart" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card card-half card-narrow" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card card-half card-narrow summary-meter-card" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow summary-meter-card" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
       <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
         <div class="label">AVG INFERENCE</div>
         <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
@@ -2592,6 +2718,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const GAUGE_MAX_STEPS = 120;
     const AUDIO_PREF_COOKIE = "robotron_dashboard_audio_enabled";
     const PREVIEW_GAME_AUDIO_PREF_COOKIE = "robotron_preview_game_audio_enabled";
+    const PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED = __PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED__;
     const AUDIO_START_RETRY_MS = 800;
     const CHAT_POLL_MS = 5000;
 
@@ -2661,6 +2788,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       previewLabel: document.getElementById("mPreviewLabel"),
       clientTableCount: document.getElementById("mClientTableCount"),
       chatWindow: document.getElementById("chatWindow"),
+      chatNameInput: document.getElementById("chatNameInput"),
       chatInput: document.getElementById("chatInput"),
       chatSubmit: document.getElementById("chatSubmit"),
       chatStatus: document.getElementById("chatStatus"),
@@ -2676,6 +2804,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const previewToggleWrap = document.getElementById("previewToggleWrap");
     const _gsAdmin = new URLSearchParams(window.location.search).get("admin") === "yes";
     const _chatEnabled = true;
+    const _chatNameStorageKey = "robotronChatDisplayName";
     let _chatRows = [];
     let _chatReqInFlight = false;
 
@@ -2685,11 +2814,17 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       cards.chatStatus.style.color = isError ? "#fca5a5" : "#93c5fd";
     }
 
-    function _maskChatIp(rawIp) {
-      const ip = String(rawIp || "unknown").trim();
-      const ipv4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-      if (!ipv4) return ip;
-      return `${ipv4[1]}.${ipv4[2]}.${ipv4[3]}.X`;
+    function _formatChatTimestamp(rawTs) {
+      const ts = Number(rawTs);
+      if (!Number.isFinite(ts) || ts <= 0) return "--/-- --:--";
+      const d = new Date(ts * 1000);
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mins = String(d.getMinutes()).padStart(2, "0");
+      const hrs24 = d.getHours();
+      const period = hrs24 >= 12 ? "PM" : "AM";
+      const hrs12 = (hrs24 % 12) || 12;
+      return `${mm}/${dd} ${hrs12}:${mins}${period}`;
     }
 
     function _renderChatRows(rows) {
@@ -2704,18 +2839,28 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         for (const row of rows) {
           const line = document.createElement("div");
           line.className = "chat-row";
-          const ip = document.createElement("span");
-          ip.className = "chat-ip";
-          ip.textContent = `${_maskChatIp(row.ip)}:`;
+          const time = document.createElement("span");
+          time.className = "chat-time";
+          time.textContent = _formatChatTimestamp(row.ts);
+          const sender = document.createElement("span");
+          sender.className = "chat-sender";
+          sender.textContent = String(row.sender || "unknown");
+          sender.title = String(row.display_ip || row.sender || "unknown");
           const txt = document.createElement("span");
-          txt.textContent = ` ${String(row.text || "")}`;
-          line.appendChild(ip);
+          txt.className = "chat-text";
+          txt.textContent = String(row.text || "");
+          line.appendChild(time);
+          line.appendChild(sender);
           line.appendChild(txt);
           cards.chatWindow.appendChild(line);
         }
       }
       if (cards.chatCount) cards.chatCount.textContent = String(rows ? rows.length : 0);
       cards.chatWindow.scrollTop = cards.chatWindow.scrollHeight;
+    }
+
+    function _sanitizeChatName(rawName) {
+      return String(rawName || "").replace(/[\\r\\n]+/g, " ").trim().slice(0, 16);
     }
 
     async function _fetchChatRows() {
@@ -2738,6 +2883,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
     async function _submitChat() {
       if (!_chatEnabled || !cards.chatInput) return;
+      const displayName = _sanitizeChatName((cards.chatNameInput && cards.chatNameInput.value) || "");
+      if (cards.chatNameInput) cards.chatNameInput.value = displayName;
       const msg = String(cards.chatInput.value || "").replace(/[\\r\\n]+/g, " ").trim();
       if (!msg) {
         _setChatStatus("Type a message first.", true);
@@ -2752,7 +2899,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: msg }),
+          body: JSON.stringify({ message: msg, display_name: displayName }),
         });
         if (!res.ok) throw new Error("chat submit failed");
         cards.chatInput.value = "";
@@ -2767,6 +2914,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
     if (cards.chatInput && cards.chatSubmit) {
       if (!_chatEnabled) {
+        if (cards.chatNameInput) cards.chatNameInput.disabled = true;
         cards.chatInput.disabled = true;
         cards.chatSubmit.disabled = true;
         cards.chatInput.placeholder = "Chat disabled";
@@ -2774,6 +2922,24 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         const chatCard = cards.chatInput.closest(".chat-card");
         if (chatCard) chatCard.style.display = "none";
       } else {
+        if (cards.chatNameInput) {
+          try {
+            cards.chatNameInput.value = _sanitizeChatName(window.localStorage.getItem(_chatNameStorageKey) || "");
+          } catch (_) {}
+          cards.chatNameInput.addEventListener("input", () => {
+            const nextName = _sanitizeChatName(cards.chatNameInput.value || "");
+            if (cards.chatNameInput.value !== nextName) cards.chatNameInput.value = nextName;
+            try {
+              window.localStorage.setItem(_chatNameStorageKey, nextName);
+            } catch (_) {}
+          });
+          cards.chatNameInput.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter") {
+              ev.preventDefault();
+              _submitChat();
+            }
+          });
+        }
         cards.chatSubmit.disabled = false;
         cards.chatSubmit.addEventListener("click", _submitChat);
         cards.chatInput.addEventListener("keydown", (ev) => {
@@ -2855,7 +3021,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
     const _selectableLevels = Array.from({ length: 81 }, (_, i) => i + 1);
     function _computeAutoLevel(avgLevel) {
-      const target = Math.floor(avgLevel) - 3;
+      const target = Math.floor(avgLevel) - 1;
       let best = _selectableLevels[0];
       for (const lv of _selectableLevels) { if (lv <= target) best = lv; else break; }
       return best;
@@ -2936,7 +3102,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     let _previewVideoHasFrame = false;
     let _previewVideoLastFrameTs = 0;
     let _previewRtcStream = null;
-    let _previewGameAudioEnabled = true;
+    let _previewGameAudioEnabled = PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED;
     let _previewClientRequestInFlight = false;
     let _previewPendingClientId = null;
     let _clientTableSortKey = "client_id";
@@ -3032,7 +3198,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
     function _ensurePreviewVideoAudio() {
       if (!gamePreviewVideo) return;
-      const enableAudio = !!_previewGameAudioEnabled;
+      const enableAudio = !!(PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED && _previewGameAudioEnabled);
       gamePreviewVideo.muted = !enableAudio;
       gamePreviewVideo.volume = enableAudio ? 1.0 : 0.0;
       try {
@@ -3078,6 +3244,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           const efficiency = level > 0 ? (score / level) : 0;
           return {
             client_id: Math.trunc(clientId),
+            duration_seconds: Math.max(0, Number(row && row.duration_seconds) || 0),
             lives: Math.max(0, Math.trunc(Number(row && row.lives) || 0)),
             level,
             score,
@@ -3143,7 +3310,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       updateClientTableSortIndicators();
       if (cards.clientTableCount) cards.clientTableCount.textContent = fmtInt(normalizedRows.length);
       if (!clientTableBody) return;
-      if (!sortedRows.length) {
+        if (!sortedRows.length) {
         const existing = Array.from(clientTableBody.children);
         let emptyRow = existing.find((child) =>
           child instanceof HTMLTableRowElement && (
@@ -3155,7 +3322,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           emptyRow = document.createElement("tr");
           emptyRow.dataset.empty = "1";
           const td = document.createElement("td");
-          td.colSpan = 5;
+          td.colSpan = 6;
           td.className = "client-table-empty";
           td.textContent = "No Clients";
           emptyRow.appendChild(td);
@@ -3190,7 +3357,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         let tr = existingRows.get(rowKey);
         if (!(tr instanceof HTMLTableRowElement)) {
           tr = document.createElement("tr");
-          for (let i = 0; i < 5; i += 1) {
+          for (let i = 0; i < 6; i += 1) {
             tr.appendChild(document.createElement("td"));
           }
         }
@@ -3201,6 +3368,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         tr.classList.toggle("inactive", !row.preview_capable);
         const cellDefs = [
           { value: fmtInt(row.client_id), className: "" },
+          { value: fmtGameDuration(row.duration_seconds), className: "num" },
           { value: fmtInt(row.efficiency), className: "num" },
           { value: fmtInt(row.lives), className: "num" },
           { value: fmtInt(row.level), className: "num" },
@@ -3681,7 +3849,9 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
       try {
         const vtx = pc.addTransceiver("video", { direction: "recvonly" });
-        pc.addTransceiver("audio", { direction: "recvonly" });
+        if (PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED) {
+          pc.addTransceiver("audio", { direction: "recvonly" });
+        }
         try {
           if (vtx && typeof vtx.setCodecPreferences === "function" && window.RTCRtpReceiver && typeof RTCRtpReceiver.getCapabilities === "function") {
             const caps = RTCRtpReceiver.getCapabilities("video");
@@ -4008,6 +4178,15 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     function fmtPct(v) {
       if (v === null || v === undefined || Number.isNaN(v)) return "0%";
       return `${(Number(v) * 100.0).toFixed(1)}%`;
+    }
+
+    function fmtGameDuration(v) {
+      const secs = Math.max(0, Math.round(Number(v) || 0));
+      const hrs = Math.floor(secs / 3600);
+      const mins = Math.floor((secs % 3600) / 60);
+      const rem = secs % 60;
+      if (hrs > 0) return `${hrs}:${String(mins).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
+      return `${mins}:${String(rem).padStart(2, "0")}`;
     }
 
     function setAudioToggle(enabled, hasTracks = true) {
@@ -5946,14 +6125,17 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     audioEnabled = (cookiePref === null) ? true : (cookiePref === "1");
     setAudioToggle(audioEnabled, false);
     const previewAudioPref = getCookieValue(PREVIEW_GAME_AUDIO_PREF_COOKIE);
-    _previewGameAudioEnabled = (previewAudioPref === null) ? true : (previewAudioPref === "1");
+    _previewGameAudioEnabled = PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED && ((previewAudioPref === null) ? true : (previewAudioPref === "1"));
     if (chkPreviewGameAudioEl) {
       chkPreviewGameAudioEl.checked = _previewGameAudioEnabled;
-      chkPreviewGameAudioEl.addEventListener("change", () => {
-        _previewGameAudioEnabled = !!chkPreviewGameAudioEl.checked;
-        setCookieValue(PREVIEW_GAME_AUDIO_PREF_COOKIE, _previewGameAudioEnabled ? "1" : "0");
-        _ensurePreviewVideoAudio();
-      });
+      chkPreviewGameAudioEl.disabled = !PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED;
+      if (PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED) {
+        chkPreviewGameAudioEl.addEventListener("change", () => {
+          _previewGameAudioEnabled = !!chkPreviewGameAudioEl.checked;
+          setCookieValue(PREVIEW_GAME_AUDIO_PREF_COOKIE, _previewGameAudioEnabled ? "1" : "0");
+          _ensurePreviewVideoAudio();
+        });
+      }
     }
     const kickAudioStart = () => {
       if (audioEnabled) ensureAudioPlaying();
@@ -6010,7 +6192,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
   </script>
 </body>
 </html>
-""".replace("__WEBRTC_ICE_SERVERS_JSON__", _ice_json)
+""".replace("__WEBRTC_ICE_SERVERS_JSON__", _ice_json) \
+    .replace("__PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED__", _preview_game_audio_json) \
+    .replace("__PREVIEW_GAME_AUDIO_CHECKED__", _preview_game_audio_checked) \
+    .replace("__PREVIEW_GAME_AUDIO_DISABLED__", _preview_game_audio_disabled)
 
 
 def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | None = None):
@@ -6315,6 +6500,8 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                         return
                     message_raw = data.get("message", "")
                     message = message_raw if isinstance(message_raw, str) else str(message_raw)
+                    display_name_raw = data.get("display_name", "")
+                    display_name = display_name_raw if isinstance(display_name_raw, str) else str(display_name_raw)
 
                     peer_ip = str(self.client_address[0] if self.client_address else "unknown")
                     # Only trust proxy-forwarded IP when request came from local loopback.
@@ -6324,7 +6511,7 @@ def _make_handler(state: _DashboardState, rtc_bridge: _PreviewWebRTCBridge | Non
                     else:
                         ip = peer_ip
 
-                    row = chat_store.add_message(ip, message)
+                    row = chat_store.add_message(ip, message, display_name=display_name)
                     body = json.dumps({"ok": True, "message": row}).encode("utf-8")
                     self._send(body, "application/json", status=200)
                 except ValueError as e:

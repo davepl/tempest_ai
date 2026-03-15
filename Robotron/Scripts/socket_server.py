@@ -493,6 +493,7 @@ class SocketServer:
                     score = 0
                 rows.append({
                     "client_id": int(cid),
+                    "duration_seconds": float(max(0, int(cs.get("game_frames", 0) or 0))) / 60.0,
                     "lives": lives,
                     "level": level,
                     "score": score,
@@ -589,6 +590,7 @@ class SocketServer:
                 "state_stack": deque(maxlen=FRAME_STACK),
                 "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
                 "last_alive_game_score": 0, "prev_game_final_score": 0,
+                "game_frames": 0,
                 "preview_capable": False,
                 "client_slot": int(cid),
             }
@@ -712,16 +714,24 @@ class SocketServer:
                     else:
                         cs["alive_streak"] = 0
                     if int(cs.get("alive_streak", 0) or 0) >= 15:
-                        cs["gameplay_seen"] = True
+                        if not bool(cs.get("gameplay_seen", False)):
+                            cs["gameplay_seen"] = True
+                            cs["game_frames"] = 0
                     if bool(cs.get("gameplay_seen", False)):
                         cs["num_lasers"] = max(0, int(getattr(frame, "num_lasers", 0) or 0))
+                        if frame.player_alive or frame.game_score > 0 or int(cs.get("game_score", 0) or 0) > 0:
+                            cs["game_frames"] = max(0, int(cs.get("game_frames", 0) or 0)) + 1
                     # Only trust RAM-read level/score while player is alive;
                     # during attract/death the byte can hold garbage.
                     if frame.player_alive and bool(cs.get("gameplay_seen", False)):
                         cs["level_number"] = frame.level_number
                         cs["game_score"] = max(0, int(getattr(frame, "game_score", 0) or 0))
-                    # Ignore attract/menu/transient frames for high-score tracking.
-                    if frame.player_alive and frame.game_score > self.metrics.peak_game_score:
+                    # Only accept a new peak while actively playing the last life.
+                    if (
+                        frame.player_alive
+                        and max(0, int(getattr(frame, "num_lasers", 0) or 0)) == 0
+                        and frame.game_score > self.metrics.peak_game_score
+                    ):
                         self.metrics.peak_game_score = frame.game_score
                     # Track per-game score: detect new game when score drops.
                     if frame.player_alive:
@@ -730,6 +740,7 @@ class SocketServer:
                             prev_final = cs.get("last_alive_game_score", 0)
                             if prev_final > 0:
                                 self.metrics.add_game_score(prev_final)
+                            cs["game_frames"] = 0
                         cs["last_alive_game_score"] = frame.game_score
                     now = time.time()
                     el = now - cs["last_time"]
@@ -903,7 +914,11 @@ class SocketServer:
                     expert_ratio = max(0.0, min(1.0, expert_ratio))
                     use_expert = random.random() < expert_ratio
                     if use_expert:
-                        move_idx, fire_idx = get_expert_action(stacked_state, locked_fire=locked_fire)
+                        move_idx, fire_idx = get_expert_action(
+                            stacked_state,
+                            locked_fire=locked_fire,
+                            wave_number=int(cs.get("level_number", 0) or 0),
+                        )
                         is_epsilon = False
                         action_source = "expert"
                     else:

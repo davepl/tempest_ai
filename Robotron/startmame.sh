@@ -3,9 +3,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LUA_SCRIPT="$SCRIPT_DIR/Scripts/main.lua"
+RELAY_SCRIPT="$SCRIPT_DIR/Scripts/audio_relay.py"
 LOG_DIR="$SCRIPT_DIR/logs"
 ROM_DIR="$SCRIPT_DIR/roms"
 MAME_BIN="${MAME_BIN:-mame}"
+TMP_AUDIO_GLOB="/tmp/robotron_audio_client"*.wav
+TMP_AUDIO_FIFO_GLOB="/tmp/robotron_audio_client"*.fifo
+AUDIO_BUFFER_BYTES="${ROBOTRON_AUDIO_BUFFER_BYTES:-2000000}"
+GAME_AUDIO_ENABLED_RAW="${ROBOTRON_GAME_AUDIO_ENABLED:-0}"
+
+case "${GAME_AUDIO_ENABLED_RAW,,}" in
+    1|true|yes|on)
+        GAME_AUDIO_ENABLED=1
+        ;;
+    *)
+        GAME_AUDIO_ENABLED=0
+        ;;
+esac
 
 # Default to project-local ROMs; allow callers to append/override via MAME_ROMPATH.
 if [[ -n "${MAME_ROMPATH:-}" ]]; then
@@ -20,6 +34,18 @@ usage() {
     echo "  novideo Launch MAME with -video none for faster operation"
     echo "  --fg    Run one MAME instance in foreground"
     echo "  -kill   Kill all running Robotron MAME instances"
+}
+
+cleanup_audio_wavs() {
+    rm -f $TMP_AUDIO_GLOB 2>/dev/null || true
+}
+
+cleanup_audio_fifos() {
+    rm -f $TMP_AUDIO_FIFO_GLOB 2>/dev/null || true
+}
+
+cleanup_audio_relays() {
+    pkill -f "$RELAY_SCRIPT" 2>/dev/null || true
 }
 
 FOREGROUND=0
@@ -38,6 +64,10 @@ while [[ $# -gt 0 ]]; do
             else
                 echo "No Robotron MAME instances found."
             fi
+            cleanup_audio_relays
+            cleanup_audio_wavs
+            cleanup_audio_fifos
+            echo "Removed stale audio capture files from /tmp."
             exit 0
             ;;
         --fg)
@@ -78,12 +108,19 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-# Guard against stacking multiple wavwrite-enabled Robotron launches.
-if pgrep -f "mame.*robotron.*wavwrite" > /dev/null 2>&1; then
-    echo "ERROR: MAME with audio output is already running!"
-    echo "Kill existing instances with: killall mame"
-    exit 1
+if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
+    # Guard against stacking multiple wavwrite-enabled Robotron launches.
+    if pgrep -f "mame.*robotron.*wavwrite" > /dev/null 2>&1; then
+        echo "ERROR: MAME with audio output is already running!"
+        echo "Kill existing instances with: killall mame"
+        exit 1
+    fi
 fi
+
+# No wavwrite-enabled Robotron process is active, so any prior capture files are stale.
+cleanup_audio_relays
+cleanup_audio_wavs
+cleanup_audio_fifos
 
 WARNING_FLAG=""
 if "$MAME_BIN" -showusage 2>&1 | grep -q -- "-skip_warnings"; then
@@ -108,17 +145,30 @@ if [[ "$NO_VIDEO" -eq 1 ]]; then
     VIDEO_MODE_DESC="video disabled"
 else
     VIDEO_FLAG="-video soft"
-    VIDEO_MODE_DESC="preview audio/video enabled"
+    if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
+        VIDEO_MODE_DESC="preview audio/video enabled"
+    else
+        VIDEO_MODE_DESC="preview video enabled"
+    fi
 fi
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
-    AUDIO_WAV="/tmp/robotron_audio_client0.wav"
-    rm -f "$AUDIO_WAV" 2>/dev/null || true
     echo "Mode: foreground"
     echo "Launching 1 MAME instance (attached) with $VIDEO_MODE_DESC, throttled to real time..."
-    SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
+    SOUND_FLAG=""
+    if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
+        AUDIO_FIFO="/tmp/robotron_audio_client0.fifo"
+        mkfifo "$AUDIO_FIFO"
+        python3 "$RELAY_SCRIPT" --slot-count 1 --audio-dir /tmp --max-bytes "$AUDIO_BUFFER_BYTES" \
+            >> "$LOG_DIR/audio_relay.log" 2>&1 &
+        SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
+    fi
     THROTTLE_FLAG="-throttle -speed 1.0"
-    exec env ROBOTRON_PREVIEW_CLIENT=1 ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
+    env ROBOTRON_PREVIEW_CLIENT=1 ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
+    status=$?
+    cleanup_audio_relays
+    cleanup_audio_fifos
+    exit "$status"
 fi
 
 echo "Mode: background"
@@ -127,12 +177,22 @@ if [[ "$COUNT" -eq 1 ]]; then
 else
     echo "Launching $COUNT MAME instance(s): all clients with $VIDEO_MODE_DESC; client 0 throttled, others unthrottled..."
 fi
+if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
+    for i in $(seq 1 "$COUNT"); do
+        CLIENT_SLOT=$((i-1))
+        mkfifo "/tmp/robotron_audio_client${CLIENT_SLOT}.fifo"
+    done
+    python3 "$RELAY_SCRIPT" --slot-count "$COUNT" --audio-dir /tmp --max-bytes "$AUDIO_BUFFER_BYTES" \
+        >> "$LOG_DIR/audio_relay.log" 2>&1 &
+fi
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
     CLIENT_SLOT=$((i-1))
-    AUDIO_WAV="/tmp/robotron_audio_client${CLIENT_SLOT}.wav"
-    rm -f "$AUDIO_WAV" 2>/dev/null || true
-    SOUND_FLAG="-wavwrite $AUDIO_WAV -samplerate 48000 -audio_latency 1"
+    SOUND_FLAG=""
+    if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
+        AUDIO_FIFO="/tmp/robotron_audio_client${CLIENT_SLOT}.fifo"
+        SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
+    fi
     PREVIEW_CLIENT_FLAG="1"
     if [[ $i -eq 1 ]]; then
         THROTTLE_FLAG="-throttle -speed 1.0"

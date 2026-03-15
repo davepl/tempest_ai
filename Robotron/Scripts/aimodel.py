@@ -389,11 +389,8 @@ def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameD
 
 def _latest_frame_state(state: np.ndarray) -> np.ndarray:
     """Return the most recent base-frame slice from a possibly stacked state vector."""
-    s = np.asarray(state, dtype=np.float32).reshape(-1)
-    base_state_size = int(getattr(RL_CONFIG, "base_state_size", SERVER_CONFIG.params_count))
-    if base_state_size > 0 and s.size > base_state_size:
-        s = s[-base_state_size:]
-    return s
+    latest, _prev, _base = _latest_prev_frame_state(state)
+    return latest
 
 
 # ── Expert system (heuristic) ───────────────────────────────────────────────
@@ -428,6 +425,13 @@ _ALIGN_HALF_WINDOW_WORLD = _ALIGN_HALF_WINDOW_PX * _WORLD_UNITS_PER_PIXEL
 _ALIGN_ROBOT_CATEGORIES = {"grunt", "brain", "tank", "spawner", "enforcer"}
 _ENDGAME_CLEANUP_CATEGORIES = _ALIGN_ROBOT_CATEGORIES | {"hulk"}
 _ALIGNED_FIRE_CATEGORIES = _ENDGAME_CLEANUP_CATEGORIES | {"projectile"}
+_PERIMETER_ORBIT_RING_MIN = 0.16
+_PERIMETER_ORBIT_RING_TARGET = 0.30
+_PERIMETER_ORBIT_PRESSURE_THRESHOLD = 6.0
+_PERIMETER_ORBIT_PROJECTILE_BONUS = 2.5
+_RESCUE_NEAR_DIST = 4608.0 / _POS_MAX_DIAG  # ~18 px
+_RESCUE_ABORT_PROJECTILES = 2
+_RESCUE_ABORT_PRESSURE = _PERIMETER_ORBIT_PRESSURE_THRESHOLD + 1.5
 _PLAYER_BOX_W_PX = 4.0
 _PLAYER_BOX_H_PX = 12.0
 _PLAYER_BOX_W_WORLD = _PLAYER_BOX_W_PX * _WORLD_UNITS_PER_PIXEL
@@ -629,6 +633,38 @@ def _hazard_repulsion_vector(
 
 
 _CATEGORY_NAMES = tuple(name for name, _ in getattr(RL_CONFIG, "entity_categories", ()))
+_LEGACY_CATEGORY_BOX_PX: dict[str, tuple[float, float]] = {
+    "grunt": (5.0, 13.0),
+    "hulk": (7.0, 16.0),
+    "brain": (7.0, 16.0),
+    "tank": (7.0, 16.0),
+    "spawner": (8.0, 15.0),
+    "enforcer": (8.0, 15.0),
+    "projectile": (4.0, 7.0),
+    "human": (5.0, 13.0),
+    "electrode": (6.0, 6.0),
+}
+_LEGACY_THREAT_WEIGHT: dict[str, float] = {
+    "grunt": 0.55,
+    "hulk": 1.00,
+    "brain": 0.95,
+    "tank": 0.95,
+    "spawner": 0.85,
+    "enforcer": 0.85,
+    "projectile": 0.90,
+    "human": 0.35,
+    "electrode": 0.75,
+}
+_LEGACY_DANGEROUS_CATEGORIES = {
+    "grunt",
+    "hulk",
+    "brain",
+    "tank",
+    "spawner",
+    "enforcer",
+    "projectile",
+    "electrode",
+}
 
 
 def _state_layout() -> tuple[int, int, int, int, int]:
@@ -642,8 +678,57 @@ def _state_layout() -> tuple[int, int, int, int, int]:
     return g, gw * gh * gc, tc, tf, gc
 
 
+def _hybrid_base_state_size() -> int:
+    g, grid_n, tc, tf, _gc = _state_layout()
+    return g + grid_n + (tc * tf)
+
+
+def _legacy_slot_layout() -> tuple[list[tuple[str, int, int, int]], int]:
+    slot_features = int(getattr(RL_CONFIG, "slot_state_features", 4))
+    offset = 59  # 9 core + 50 ELIST
+    info: list[tuple[str, int, int, int]] = []
+    for cat_idx, (name, slots) in enumerate(getattr(RL_CONFIG, "entity_categories", ())):
+        slots_i = int(slots)
+        info.append((str(name), offset, slots_i, cat_idx))
+        offset += 1 + (slots_i * slot_features)
+    return info, offset
+
+
+def _detect_base_state_size(total_size: int) -> int:
+    total = max(0, int(total_size))
+    if total <= 0:
+        return max(1, int(getattr(RL_CONFIG, "base_state_size", SERVER_CONFIG.params_count)))
+    candidates: list[int] = []
+    for cand in {
+        int(getattr(RL_CONFIG, "base_state_size", SERVER_CONFIG.params_count)),
+        _hybrid_base_state_size(),
+        _legacy_slot_layout()[1],
+    }:
+        if cand > 0 and total >= cand and (total % cand) == 0:
+            candidates.append(int(cand))
+    if candidates:
+        return max(candidates)
+    return max(1, int(getattr(RL_CONFIG, "base_state_size", SERVER_CONFIG.params_count)))
+
+
+def _latest_prev_frame_state(state: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    s = np.asarray(state, dtype=np.float32).reshape(-1)
+    base_state_size = _detect_base_state_size(s.size)
+    if base_state_size <= 0:
+        return s, s, max(1, s.size)
+    stack_depth = max(1, s.size // base_state_size)
+    latest_off = (stack_depth - 1) * base_state_size
+    latest = s[latest_off: latest_off + base_state_size]
+    if stack_depth >= 2:
+        prev_off = (stack_depth - 2) * base_state_size
+        prev = s[prev_off: prev_off + base_state_size]
+    else:
+        prev = latest
+    return latest, prev, base_state_size
+
+
 def _split_latest_sections(state: np.ndarray):
-    s = _latest_frame_state(state)
+    s, _prev, _base = _latest_prev_frame_state(state)
     g, grid_n, tc, tf, gc = _state_layout()
     need = g + grid_n + (tc * tf)
     if s.size < need:
@@ -654,7 +739,82 @@ def _split_latest_sections(state: np.ndarray):
     return globals_, grid, tokens
 
 
+def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
+    latest, prev, base_state_size = _latest_prev_frame_state(state)
+    cat_info, legacy_size = _legacy_slot_layout()
+    if base_state_size != legacy_size or latest.size < legacy_size:
+        return np.zeros((0, 15), dtype=np.float32)
+
+    slot_features = int(getattr(RL_CONFIG, "slot_state_features", 4))
+    rows: list[list[float]] = []
+    cat_den = max(1, len(cat_info) - 1)
+
+    for name, base, slots, cat_idx in cat_info:
+        latest_block = latest[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
+        prev_block = prev[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
+        size_x_px, size_y_px = _LEGACY_CATEGORY_BOX_PX.get(name, (8.0, 8.0))
+        threat_w = _LEGACY_THREAT_WEIGHT.get(name, 0.5)
+        is_human = 1.0 if name == "human" else 0.0
+        is_dangerous = 1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
+        cat_norm = float(cat_idx) / float(cat_den)
+
+        for slot_idx in range(slots):
+            if float(latest_block[slot_idx, 0]) < 0.5:
+                continue
+            dx = float(latest_block[slot_idx, 1])
+            dy = float(latest_block[slot_idx, 2])
+            dist = float(latest_block[slot_idx, 3])
+            if not np.isfinite(dist):
+                continue
+
+            prev_present = float(prev_block[slot_idx, 0]) >= 0.5
+            prev_dx = float(prev_block[slot_idx, 1]) if prev_present else dx
+            prev_dy = float(prev_block[slot_idx, 2]) if prev_present else dy
+            vx = dx - prev_dx if prev_present else 0.0
+            vy = dy - prev_dy if prev_present else 0.0
+
+            world_dx = dx * _REL_POS_X_RANGE
+            world_dy = dy * _REL_POS_Y_RANGE
+            world_dist = math.hypot(world_dx, world_dy)
+            if world_dist > 1e-6:
+                dir_x = world_dx / world_dist
+                dir_y = world_dy / world_dist
+            else:
+                dir_x = 0.0
+                dir_y = 0.0
+
+            proximity = max(0.0, 1.0 - min(1.0, dist))
+            threat = max(0.0, min(1.0, threat_w * (0.55 + (0.45 * proximity))))
+            approach_raw = -((vx * dir_x) + (vy * dir_y))
+            approach = max(0.0, min(1.0, (approach_raw + 1.0) * 0.5))
+
+            rows.append([
+                1.0,
+                dx,
+                dy,
+                vx,
+                vy,
+                dist,
+                dir_x,
+                dir_y,
+                threat,
+                max(0.0, min(1.0, size_x_px / 16.0)),
+                max(0.0, min(1.0, size_y_px / 16.0)),
+                cat_norm,
+                is_human,
+                is_dangerous,
+                approach,
+            ])
+
+    if not rows:
+        return np.zeros((0, 15), dtype=np.float32)
+    return np.asarray(rows, dtype=np.float32)
+
+
 def _active_tokens_from_state(state: np.ndarray) -> np.ndarray:
+    latest = _latest_frame_state(state)
+    if latest.size == _legacy_slot_layout()[1]:
+        return _legacy_slot_tokens_from_state(state)
     _, _, tokens = _split_latest_sections(state)
     if tokens is None or tokens.size == 0:
         return np.zeros((0, int(getattr(RL_CONFIG, "object_token_features", 15))), dtype=np.float32)
@@ -744,6 +904,91 @@ def _count_humans_and_cleanup_targets(state: np.ndarray) -> tuple[int, int]:
     return humans, cleanup_targets
 
 
+def _count_humans_and_destructible_enemies(state: np.ndarray) -> tuple[int, int]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return 0, 0
+    humans = 0
+    destructible = 0
+    for tok in toks:
+        if tok[12] > 0.5:
+            humans += 1
+            continue
+        if _token_category_name(tok) in _ALIGN_ROBOT_CATEGORIES:
+            destructible += 1
+    return humans, destructible
+
+
+def _defensive_fire_direction_from_state(state: np.ndarray) -> Optional[int]:
+    """Only return a shot for nearby threats that justify interrupting a rescue."""
+    close_projectile = _nearest_projectile_vector_from_state(state)
+    if close_projectile is not None and close_projectile[2] <= _PROJECTILE_DANGER_DIST:
+        px, py, _ = close_projectile
+        return _closest_dir8(px * _REL_POS_X_RANGE, py * _REL_POS_Y_RANGE, default_dir=0)
+
+    close_robot = _nearest_category_vector_from_state(state, _ENDGAME_CLEANUP_CATEGORIES)
+    if close_robot is not None and close_robot[2] <= _ALIGN_SAFE_DIST:
+        ex, ey, _ = close_robot
+        return _closest_dir8(ex * _REL_POS_X_RANGE, ey * _REL_POS_Y_RANGE, default_dir=0)
+    return None
+
+
+def _strategic_threat_pressure(state: np.ndarray) -> tuple[float, int]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return 0.0, 0
+    pressure = 0.0
+    projectile_count = 0
+    for tok in toks:
+        if tok[12] > 0.5:
+            continue
+        name = _token_category_name(tok)
+        if name in {"human", "electrode", ""}:
+            continue
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        prox = max(0.0, 1.0 - min(1.0, dist / max(_SAFE_DIST, 1e-6)))
+        weight = 1.0
+        if name == "projectile":
+            projectile_count += 1
+            weight = 1.75
+        elif name in {"brain", "tank", "enforcer", "spawner"}:
+            weight = 1.25
+        elif name == "hulk":
+            weight = 1.5
+        pressure += weight * (0.35 + prox)
+    return pressure, projectile_count
+
+
+def _perimeter_orbit_move(state: np.ndarray, fire_dir: int) -> int:
+    """Bias movement outward first, then tangentially around the arena edge."""
+    s = _latest_frame_state(state)
+    px = float(s[5]) if s.size > 6 else 0.5
+    py = float(s[6]) if s.size > 6 else 0.5
+
+    rel_x = px - 0.5
+    rel_y = py - 0.5
+    radial_len = math.hypot(rel_x, rel_y)
+    if radial_len <= 1e-6:
+        rel_x, rel_y = 0.0, 1.0
+        radial_len = 1.0
+    radial_x = rel_x / radial_len
+    radial_y = rel_y / radial_len
+
+    fire_dx, fire_dy = _move_dir_vector(int(fire_dir) % max(1, len(_DIR8_VECTORS)))
+    clockwise = ((radial_x * fire_dy) - (radial_y * fire_dx)) >= 0.0
+    tangent_x = radial_y if clockwise else -radial_y
+    tangent_y = -radial_x if clockwise else radial_x
+
+    ring_push = max(0.0, (_PERIMETER_ORBIT_RING_TARGET - radial_len) / max(_PERIMETER_ORBIT_RING_TARGET, 1e-6))
+    outward_w = 0.35 + (0.95 * ring_push)
+    tangent_w = 1.05 if radial_len >= _PERIMETER_ORBIT_RING_MIN else 0.45
+    move_vx = (radial_x * outward_w) + (tangent_x * tangent_w)
+    move_vy = (radial_y * outward_w) + (tangent_y * tangent_w)
+    return _closest_dir8(move_vx, move_vy, default_dir=0)
+
+
 def _nearest_human_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
     toks = _active_tokens_from_state(state)
     if toks.shape[0] == 0:
@@ -767,6 +1012,26 @@ def _nearest_projectile_vector_from_state(state: np.ndarray) -> Optional[Tuple[f
     best = None
     for tok in toks:
         if _token_category_name(tok) != "projectile":
+            continue
+        dist = float(tok[5])
+        if not np.isfinite(dist):
+            continue
+        if best is None or dist < best[2]:
+            best = (float(tok[1]), float(tok[2]), dist)
+    return best
+
+
+def _nearest_category_vector_from_state(
+    state: np.ndarray,
+    categories: set[str],
+) -> Optional[Tuple[float, float, float]]:
+    toks = _active_tokens_from_state(state)
+    if toks.shape[0] == 0:
+        return None
+    best = None
+    allowed = set(categories)
+    for tok in toks:
+        if _token_category_name(tok) not in allowed:
             continue
         dist = float(tok[5])
         if not np.isfinite(dist):
@@ -1120,19 +1385,24 @@ def get_cleanup_fire_override(state: np.ndarray, locked_fire: Optional[int] = No
     return _nearest_aligned_fire_direction_from_state(state, categories=_ENDGAME_CLEANUP_CATEGORIES)
 
 
-def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> Tuple[int, int]:
-    """Heuristic Robotron expert.
+def _get_simple_expert_action(
+    state: np.ndarray,
+    locked_fire: Optional[int] = None,
+    wave_number: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Simpler, more stable heuristic Robotron expert.
 
     Fire:
         1) If any enemy/projectile is aligned with one of the 8 fire directions
            within an 8 px half-window, shoot the closest aligned target.
         2) Otherwise, fallback to shooting the nearest enemy.
      Move priority:
-        1) Rescue humans when safe (no close threat within ~12 px).
-        2) Flee close threats (including hulks) when enemy is within ~12 px.
-        3) If still safe and no human rescue target, align to nearest non-hulk
-            robot (brain/tank/spawner/enforcer) on the smaller axis offset.
-        4) Otherwise, fallback to fleeing nearest enemy.
+        1) Rescue humans when safe.
+        2) Flee close threats (including hulks).
+        3) If configured, stop shooting the last distant enemy while rescuing
+           remaining humans, only firing defensively at close threats.
+        4) Otherwise, align to the short axis of the nearest non-hulk robot.
+        5) Fallback to fleeing the nearest threat.
     """
     nearest_enemy = _nearest_enemy_vector_from_state(state)
     nearest_projectile = _nearest_projectile_vector_from_state(state)
@@ -1142,20 +1412,34 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
     aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
     humans_remaining, _cleanup_targets = _count_humans_and_cleanup_targets(state)
+    humans_for_rescue_mode, destructible_enemies = _count_humans_and_destructible_enemies(state)
+    hold_fire_for_last_enemy = bool(getattr(RL_CONFIG, "expert_hold_fire_for_last_enemy_rescue", True))
+    last_enemy_rescue_mode = (
+        hold_fire_for_last_enemy
+        and humans_for_rescue_mode > 0
+        and destructible_enemies <= 1
+    )
+    s = _latest_frame_state(state)
+    px = float(s[5]) if s.size > 6 else 0.5
+    py = float(s[6]) if s.size > 6 else 0.5
 
     # ── Fire direction ───────────────────────────────────────────────
-    if aligned_fire_dir is not None:
-        fire_dir = int(aligned_fire_dir)
-    elif nearest_projectile is not None and (
-        nearest_enemy is None or nearest_projectile[2] <= max(nearest_enemy[2], _PROJECTILE_DANGER_DIST)
-    ):
-        fx, fy, _ = nearest_projectile
-        fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
-    elif nearest_enemy is not None:
-        fx, fy, _ = nearest_enemy
-        fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+    if last_enemy_rescue_mode:
+        defensive_fire_dir = _defensive_fire_direction_from_state(state)
+        fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else 0
     else:
-        fire_dir = 0
+        if aligned_fire_dir is not None:
+            fire_dir = int(aligned_fire_dir)
+        elif nearest_projectile is not None and (
+            nearest_enemy is None or nearest_projectile[2] <= max(nearest_enemy[2], _PROJECTILE_DANGER_DIST)
+        ):
+            fx, fy, _ = nearest_projectile
+            fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+        elif nearest_enemy is not None:
+            fx, fy, _ = nearest_enemy
+            fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+        else:
+            fire_dir = 0
     if locked_fire is not None and int(locked_fire) >= 0:
         fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
 
@@ -1206,12 +1490,152 @@ def get_expert_action(state: np.ndarray, locked_fire: Optional[int] = None) -> T
             fire_dir = int(blocked_fire_dir)
 
     # ── Lava guard: never move into the outer 16 px ─────────────────
-    s = _latest_frame_state(state)
-    px = float(s[5]) if s.size > 6 else 0.5
-    py = float(s[6]) if s.size > 6 else 0.5
     move_dir = _forbid_lava(move_dir, px, py)
 
     return move_dir, fire_dir
+
+
+def _get_strategic_expert_action(
+    state: np.ndarray,
+    locked_fire: Optional[int] = None,
+    wave_number: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Heuristic Robotron expert with strategic late-wave modes."""
+    nearest_enemy = _nearest_enemy_vector_from_state(state)
+    nearest_projectile = _nearest_projectile_vector_from_state(state)
+    nearest_brain_tank = _nearest_category_vector_from_state(state, {"brain", "tank"})
+    nearest_align_robot = _nearest_align_robot_vector_from_state(state)
+    nearest_endgame_cleanup = _nearest_endgame_cleanup_vector_from_state(state)
+    nearest_human = _nearest_human_vector_from_state(state)
+    nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
+    aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
+    humans_remaining, _cleanup_targets = _count_humans_and_cleanup_targets(state)
+    humans_for_rescue_mode, destructible_enemies = _count_humans_and_destructible_enemies(state)
+    threat_pressure, projectile_count = _strategic_threat_pressure(state)
+    wave = max(0, int(wave_number or 0))
+    rescue_wave = (wave > 0) and ((wave % 5) == 0)
+    tank_wave = (wave >= 7) and (((wave - 7) % 5) == 0)
+    protect_humans_wave = rescue_wave or tank_wave
+    hold_fire_for_last_enemy = bool(getattr(RL_CONFIG, "expert_hold_fire_for_last_enemy_rescue", True))
+    last_enemy_rescue_mode = (
+        hold_fire_for_last_enemy
+        and humans_for_rescue_mode > 0
+        and destructible_enemies <= 1
+    )
+    s = _latest_frame_state(state)
+    px = float(s[5]) if s.size > 6 else 0.5
+    py = float(s[6]) if s.size > 6 else 0.5
+    radial_dist = math.hypot(px - 0.5, py - 0.5)
+    near_human_rescue_ok = False
+    if nearest_human is not None:
+        _hx, _hy, human_dist = nearest_human
+        near_human_rescue_ok = (
+            human_dist <= _RESCUE_NEAR_DIST
+            and projectile_count <= _RESCUE_ABORT_PROJECTILES
+            and threat_pressure < _RESCUE_ABORT_PRESSURE
+        )
+
+    rescue_projectile_fire_dir = None
+    rescue_hunt_fire_dir = None
+    if last_enemy_rescue_mode:
+        defensive_fire_dir = _defensive_fire_direction_from_state(state)
+        fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else 0
+    else:
+        if protect_humans_wave:
+            if nearest_projectile is not None and nearest_projectile[2] <= _PROJECTILE_DANGER_DIST:
+                rescue_projectile_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"projectile"})
+            rescue_hunt_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"brain", "tank"})
+        if rescue_projectile_fire_dir is not None:
+            fire_dir = int(rescue_projectile_fire_dir)
+        elif rescue_hunt_fire_dir is not None:
+            fire_dir = int(rescue_hunt_fire_dir)
+        elif protect_humans_wave and nearest_brain_tank is not None:
+            fx, fy, _ = nearest_brain_tank
+            fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+        elif aligned_fire_dir is not None:
+            fire_dir = int(aligned_fire_dir)
+        elif nearest_projectile is not None and (
+            nearest_enemy is None or nearest_projectile[2] <= max(nearest_enemy[2], _PROJECTILE_DANGER_DIST)
+        ):
+            fx, fy, _ = nearest_projectile
+            fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+        elif nearest_enemy is not None:
+            fx, fy, _ = nearest_enemy
+            fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+        else:
+            fire_dir = 0
+    if locked_fire is not None and int(locked_fire) >= 0:
+        fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
+
+    if nearest_enemy is not None:
+        ex, ey, enemy_dist = nearest_enemy
+        ex_world = ex * _REL_POS_X_RANGE
+        ey_world = ey * _REL_POS_Y_RANGE
+
+        is_close_threat = enemy_dist < _ALIGN_SAFE_DIST
+        if nearest_projectile is not None and nearest_projectile[2] < _PROJECTILE_DANGER_DIST:
+            ex, ey, enemy_dist = nearest_projectile
+            ex_world = ex * _REL_POS_X_RANGE
+            ey_world = ey * _REL_POS_Y_RANGE
+            is_close_threat = True
+
+        if is_close_threat:
+            move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
+        elif nearest_human is not None and threat_pressure < (_PERIMETER_ORBIT_PRESSURE_THRESHOLD - 1.0):
+            hx, hy, _ = nearest_human
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        elif last_enemy_rescue_mode and nearest_human is not None:
+            hx, hy, _ = nearest_human
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        elif protect_humans_wave and nearest_human is not None:
+            hx, hy, _ = nearest_human
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        elif near_human_rescue_ok:
+            hx, hy, _ = nearest_human
+            move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+        elif (not protect_humans_wave) and (not last_enemy_rescue_mode) and (
+            (threat_pressure + (projectile_count * _PERIMETER_ORBIT_PROJECTILE_BONUS)) >= _PERIMETER_ORBIT_PRESSURE_THRESHOLD or (
+                threat_pressure >= _PERIMETER_ORBIT_PRESSURE_THRESHOLD and radial_dist < _PERIMETER_ORBIT_RING_MIN
+            )
+        ):
+            move_dir = _perimeter_orbit_move(state, fire_dir)
+        elif nearest_align_robot is not None:
+            ax, ay, _ = nearest_align_robot
+            move_dir = _axis_align_toward_enemy(ax * _REL_POS_X_RANGE, ay * _REL_POS_Y_RANGE)
+        elif humans_remaining <= 0 and nearest_endgame_cleanup is not None:
+            ax, ay, _ = nearest_endgame_cleanup
+            move_dir = _axis_align_toward_enemy(ax * _REL_POS_X_RANGE, ay * _REL_POS_Y_RANGE)
+        else:
+            move_dir = _closest_dir8(-ex_world, -ey_world, default_dir=0)
+    elif nearest_human is not None:
+        hx, hy, _ = nearest_human
+        move_dir = _closest_dir8(hx * _REL_POS_X_RANGE, hy * _REL_POS_Y_RANGE)
+    else:
+        move_dir = _move_idle_action_index()
+
+    intended_move_dir = move_dir
+    move_dir = _apply_final_hazard_move_check(move_dir, nearby_avoidance)
+    if (
+        locked_fire is None or int(locked_fire) < 0
+    ) and move_dir != intended_move_dir:
+        blocked_fire_dir = _blocking_hazard_fire_direction(intended_move_dir, nearby_avoidance)
+        if blocked_fire_dir is not None:
+            fire_dir = int(blocked_fire_dir)
+
+    move_dir = _forbid_lava(move_dir, px, py)
+
+    return move_dir, fire_dir
+
+
+def get_expert_action(
+    state: np.ndarray,
+    locked_fire: Optional[int] = None,
+    wave_number: Optional[int] = None,
+) -> Tuple[int, int]:
+    profile = str(getattr(RL_CONFIG, "expert_profile", "simple") or "simple").strip().lower()
+    if profile == "strategic":
+        return _get_strategic_expert_action(state, locked_fire=locked_fire, wave_number=wave_number)
+    return _get_simple_expert_action(state, locked_fire=locked_fire, wave_number=wave_number)
 
 # ── Enemy-Slot Self-Attention ───────────────────────────────────────────────
 class EnemyAttention(nn.Module):
@@ -1390,7 +1814,7 @@ class EntitySetEncoder(nn.Module):
 
 # ── Distributional Dueling Network ─────────────────────────────────────────
 class RainbowNet(nn.Module):
-    """Hybrid Robotron network with global, spatial, and token encoders."""
+    """Legacy Robotron network with object-slot self-attention."""
 
     def __init__(self, state_size: int):
         super().__init__()
@@ -1403,30 +1827,40 @@ class RainbowNet(nn.Module):
         self.use_dueling = cfg.use_dueling
         self.num_actions = NUM_JOINT
         self.use_attn = bool(getattr(cfg, "use_enemy_attention", True))
-        self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
-        self.global_feature_count = int(getattr(cfg, "global_feature_count", 98))
-        self.grid_width = int(getattr(cfg, "grid_width", 12))
-        self.grid_height = int(getattr(cfg, "grid_height", 12))
-        self.grid_channels = int(getattr(cfg, "grid_channels", 8))
-        self.object_token_count = int(getattr(cfg, "object_token_count", 64))
-        self.object_token_features = int(getattr(cfg, "object_token_features", 15))
-        self.grid_feature_count = self.grid_width * self.grid_height * self.grid_channels
-        self.token_feature_count = self.object_token_count * self.object_token_features
+        attn_out_dim = 0
+        if self.use_attn:
+            self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
+            self.num_object_slots = int(getattr(cfg, "object_slots", 144))
+            self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 7))
+            self.slot_state_features = int(getattr(cfg, "slot_state_features", 4))
 
-        self.global_encoder = GlobalEncoder(self.global_feature_count, int(getattr(cfg, "global_hidden", 192)))
-        self.grid_encoder = SpatialGridEncoder(
-            self.grid_channels,
-            int(getattr(cfg, "grid_hidden_channels", 32)),
-            int(getattr(cfg, "attn_dim", 192)),
-        )
-        self.entity_encoder = EntitySetEncoder(
-            self.object_token_features,
-            int(getattr(cfg, "attn_dim", 192)),
-            int(getattr(cfg, "attn_heads", 8)),
-            int(getattr(cfg, "attn_layers", 3)),
-        )
+            cat_defs = getattr(cfg, "entity_categories", [
+                ("grunt", 40),
+                ("hulk", 16),
+                ("brain", 16),
+                ("tank", 8),
+                ("spawner", 8),
+                ("enforcer", 12),
+                ("projectile", 12),
+                ("human", 16),
+                ("electrode", 16),
+            ])
+            self._cat_info = []
+            offset = 59  # 9 core + 50 ELIST
+            for cat_id, (_name, slots) in enumerate(cat_defs):
+                slots_i = int(slots)
+                self._cat_info.append((offset, slots_i, cat_id))
+                offset += 1 + (slots_i * self.slot_state_features)
+            self._num_categories = len(cat_defs)
 
-        trunk_in = self.global_encoder.out_dim + self.grid_encoder.out_dim + self.entity_encoder.out_dim
+            self.object_attn = EnemyAttention(
+                slot_features=self.object_token_features,
+                embed_dim=int(getattr(cfg, "attn_dim", 128)),
+                num_heads=int(getattr(cfg, "attn_heads", 8)),
+            )
+            attn_out_dim = int(getattr(cfg, "attn_dim", 128))
+
+        trunk_in = state_size + attn_out_dim
         layers = []
         for i in range(int(cfg.trunk_layers)):
             out_dim = int(cfg.trunk_hidden)
@@ -1457,44 +1891,68 @@ class RainbowNet(nn.Module):
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
+            if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def _split_state_sections(self, state: torch.Tensor):
-        B = state.shape[0]
-        total_dim = int(state.shape[1])
-        stack_depth = max(1, total_dim // max(1, self.base_state_size))
-        latest_off = (stack_depth - 1) * self.base_state_size
-        latest = state[:, latest_off: latest_off + self.base_state_size]
-        globals_ = latest[:, :self.global_feature_count]
-        grid_start = self.global_feature_count
-        grid_end = grid_start + self.grid_feature_count
-        grid = latest[:, grid_start:grid_end].reshape(B, self.grid_channels, self.grid_height, self.grid_width)
-        tokens = latest[:, grid_end:grid_end + self.token_feature_count].reshape(
-            B, self.object_token_count, self.object_token_features
-        )
-        return globals_, grid, tokens
-
     def _build_object_tokens(self, state: torch.Tensor):
-        _, _, tokens = self._split_state_sections(state)
-        mask = tokens[:, :, 0] < 0.5
+        """Build legacy object-slot tokens from stacked per-category state."""
+        B = state.shape[0]
+        device = state.device
+        base_state_size = max(1, int(getattr(self, "base_state_size", SERVER_CONFIG.params_count)))
+        total_dim = int(state.shape[1])
+        stack_depth = max(1, total_dim // base_state_size)
+        latest_off = (stack_depth - 1) * base_state_size
+        prev_off = (stack_depth - 2) * base_state_size if stack_depth >= 2 else latest_off
+
+        all_tokens = []
+        all_masks = []
+
+        for base, slots, cat_id in self._cat_info:
+            latest = state[:, latest_off + base + 1: latest_off + base + 1 + slots * self.slot_state_features]
+            latest = latest.reshape(B, slots, self.slot_state_features)
+            prev = state[:, prev_off + base + 1: prev_off + base + 1 + slots * self.slot_state_features]
+            prev = prev.reshape(B, slots, self.slot_state_features)
+
+            present = latest[:, :, 0]
+            dx = latest[:, :, 1:2]
+            dy = latest[:, :, 2:3]
+            dist = latest[:, :, 3:4]
+
+            prev_present = prev[:, :, 0]
+            prev_dx = prev[:, :, 1:2]
+            prev_dy = prev[:, :, 2:3]
+            vel_valid = ((present > 0.5) & (prev_present > 0.5)).unsqueeze(2).to(dtype=state.dtype)
+            ddx = (dx - prev_dx) * vel_valid
+            ddy = (dy - prev_dy) * vel_valid
+
+            cat_norm = torch.full(
+                (B, slots, 1),
+                cat_id / max(1, self._num_categories - 1),
+                device=device,
+                dtype=state.dtype,
+            )
+
+            tokens = torch.cat([dx, dy, dist, ddx, ddy, cat_norm, present.unsqueeze(2)], dim=2)
+            all_tokens.append(tokens)
+            all_masks.append(present < 0.5)
+
+        tokens = torch.cat(all_tokens, dim=1)
+        mask = torch.cat(all_masks, dim=1)
         all_empty = mask.all(dim=1, keepdim=True)
         mask = mask & ~all_empty
         return tokens, mask
 
     def forward(self, state: torch.Tensor, log: bool = False):
         B = state.shape[0]
-        globals_, grid, tokens = self._split_state_sections(state)
-        token_mask = tokens[:, :, 0] < 0.5
-        all_empty = token_mask.all(dim=1, keepdim=True)
-        token_mask = token_mask & ~all_empty
-
-        global_h = self.global_encoder(globals_)
-        grid_h = self.grid_encoder(grid)
-        entity_h = self.entity_encoder(tokens, token_mask) if self.use_attn else tokens.mean(dim=1)
-        h = self.trunk(torch.cat([global_h, grid_h, entity_h], dim=1))
+        if self.use_attn:
+            obj_tokens, obj_mask = self._build_object_tokens(state)
+            attn_out = self.object_attn(obj_tokens, obj_mask)
+            trunk_in = torch.cat([state, attn_out], dim=1)
+        else:
+            trunk_in = state
+        h = self.trunk(trunk_in)
 
         if self.use_dueling:
             val = F.relu(self.val_fc(h))
@@ -2252,12 +2710,12 @@ class RainbowAgent:
         self.memory.flush()
 
     def reset_attention_weights(self):
-        """Reinitialize only the entity transformer, keeping other encoders and heads intact."""
+        """Reinitialize only the object self-attention weights, keeping trunk and heads intact."""
         if not self.online_net.use_attn:
             print("No attention layer to reset.")
             return
         for net in (self.online_net, self.target_net):
-            for m in net.entity_encoder.modules():
+            for m in net.object_attn.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight, gain=1.0)
                     nn.init.constant_(m.bias, 0.0)
@@ -2265,17 +2723,19 @@ class RainbowAgent:
                     nn.init.constant_(m.weight, 1.0)
                     nn.init.constant_(m.bias, 0.0)
         self._sync_inference(force=True)
-        attn_param_ids = {id(p) for p in self.online_net.entity_encoder.parameters()}
+        attn_param_ids = {id(p) for p in self.online_net.object_attn.parameters()}
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if id(p) in attn_param_ids and p in self.optimizer.state:
                     del self.optimizer.state[p]
-        print("Entity encoder weights and optimizer state reset (other modules preserved)")
+        print("Object self-attention weights and optimizer state reset (trunk + heads preserved)")
 
     def diagnose_attention(self, num_samples: int = 256) -> str:
-        """Report token occupancy and salience stats for the hybrid observation."""
+        """Analyze object self-attention patterns to determine if they're meaningful."""
         if not self.online_net.use_attn:
             return "Attention is disabled in this model."
+        if not hasattr(self.online_net, "object_attn"):
+            return "No object self-attention found."
         if len(self.memory) < num_samples:
             return f"Need {num_samples} samples in buffer, have {len(self.memory)}."
 
@@ -2284,29 +2744,103 @@ class RainbowAgent:
             return "Could not sample from buffer."
 
         states = torch.from_numpy(batch[0]).float().to(self.device)
+        self.online_net.eval()
         with torch.no_grad():
             obj_tokens, obj_mask = self.online_net._build_object_tokens(states)
-        toks = obj_tokens.detach().cpu().numpy()
-        mask = obj_mask.detach().cpu().numpy()
-        active = ~mask
-        B, T, Fdim = toks.shape
-        active_counts = active.sum(axis=1)
-        threat = toks[:, :, 8]
-        humans = toks[:, :, 12]
-        dangerous = toks[:, :, 13]
+            _, attn_w = self.online_net.object_attn(
+                obj_tokens, obj_mask, return_weights=True
+            )
+        self.online_net.train()
+
+        import numpy as np
+        eps = 1e-8
+
+        B, H, T, _ = attn_w.shape
+        aw = attn_w.cpu().numpy()
+        em = obj_mask.cpu().numpy()
+
+        cat_defs = getattr(RL_CONFIG, "entity_categories", [])
+        cat_ranges = []
+        offset = 0
+        for name, slots in cat_defs:
+            cat_ranges.append((name, offset, offset + slots))
+            offset += slots
 
         lines = []
         lines.append("\n" + "=" * 70)
-        lines.append("  HYBRID OBSERVATION DIAGNOSTICS".center(70))
+        lines.append("  OBJECT SELF-ATTENTION DIAGNOSTICS".center(70))
         lines.append("=" * 70)
-        lines.append(f"  Shape: {B} samples x {T} tokens x {Fdim} features")
-        lines.append(f"  Avg active tokens: {active_counts.mean():.1f} / {T}")
-        lines.append(f"  Avg dangerous tokens: {(dangerous * active).sum() / max(1, active.sum()):.3f}")
-        lines.append(f"  Avg human tokens: {(humans * active).sum() / max(1, active.sum()):.3f}")
-        lines.append(f"  Avg token threat: {(threat * active).sum() / max(1, active.sum()):.3f}")
-        lines.append(f"  Max token threat: {(threat * active).max():.3f}")
-        lines.append("\n  Attention weights are not surfaced from the transformer encoder.")
-        lines.append("  Use this report to verify token occupancy and salience instead.")
+        lines.append(f"  Shape: {B} samples x {H} heads x {T} tokens (self-attn)")
+
+        lines.append(f"\n  Per-category slot occupancy:")
+        for name, lo, hi in cat_ranges:
+            occ = 1.0 - em[:, lo:hi].mean()
+            bar = "#" * int(occ * 20) + "." * (20 - int(occ * 20))
+            lines.append(f"    {name:12s} [{lo:3d}..{hi:3d}): {occ:.1%}  {bar}")
+
+        avg_active = (~em).sum(axis=1).mean()
+        lines.append(f"    Avg active tokens: {avg_active:.1f} / {T}")
+
+        max_entropy = np.log(T)
+        entropy = -(aw * np.log(aw + eps)).sum(axis=-1)
+        mean_entropy_per_head = entropy.mean(axis=(0, 2))
+        overall_entropy = entropy.mean()
+        ratio = overall_entropy / max_entropy
+
+        lines.append(f"\n  Entropy per head (uniform = {max_entropy:.3f}):")
+        for h in range(H):
+            e = mean_entropy_per_head[h]
+            pct = e / max_entropy * 100
+            bar = "#" * int(pct / 5) + "." * (20 - int(pct / 5))
+            lines.append(f"    Head {h}: {e:.3f} ({pct:.0f}% uniform)  {bar}")
+        lines.append(f"    Overall: {overall_entropy:.3f} ({ratio*100:.0f}% uniform)")
+
+        if ratio > 0.95:
+            lines.append("    -> Near-uniform: not yet selective")
+        elif ratio > 0.80:
+            lines.append("    -> Mildly selective: some structure emerging")
+        elif ratio > 0.60:
+            lines.append("    -> Moderately selective: meaningful patterns forming")
+        else:
+            lines.append("    -> Highly selective: strong learned patterns")
+
+        lines.append(f"\n  Cross-category attention (avg weight given to other categories):")
+        for name_q, lo_q, hi_q in cat_ranges:
+            same_attn = aw[:, :, lo_q:hi_q, lo_q:hi_q].mean()
+            total_attn = aw[:, :, lo_q:hi_q, :].mean()
+            cross_attn = total_attn - same_attn if total_attn > 0 else 0
+            lines.append(f"    {name_q:12s}: same={same_attn:.4f}  cross={cross_attn:.4f}")
+
+        if em.any():
+            recv_attn = aw.mean(axis=(1, 2))
+            empty_recv = recv_attn[em].mean() if em.any() else 0
+            active_recv = recv_attn[~em].mean() if (~em).any() else 0
+            lines.append(f"\n  Empty-slot masking:")
+            lines.append(f"    Avg attention to active tokens: {active_recv:.4f}")
+            lines.append(f"    Avg attention to empty tokens:  {empty_recv:.4f}")
+            if empty_recv < 0.01:
+                lines.append("    -> Empty slots effectively masked")
+            elif empty_recv < active_recv * 0.1:
+                lines.append("    -> Minimal attention leakage")
+            else:
+                lines.append("    -> Significant attention to empty slots")
+
+        head_avg = aw.mean(axis=(0, 2))
+        head_kls = []
+        for i in range(H):
+            for j in range(i + 1, H):
+                p, q = head_avg[i] + eps, head_avg[j] + eps
+                p, q = p / p.sum(), q / q.sum()
+                kl = (p * np.log(p / q)).sum()
+                head_kls.append(kl)
+        avg_kl = np.mean(head_kls) if head_kls else 0
+        lines.append(f"\n  Head specialization (avg KL between heads): {avg_kl:.4f}")
+        if avg_kl > 0.1:
+            lines.append("    -> Heads are specialized")
+        elif avg_kl > 0.01:
+            lines.append("    -> Mild specialization")
+        else:
+            lines.append("    -> Heads are redundant")
 
         lines.append("\n" + "=" * 70)
         return "\n".join(lines)

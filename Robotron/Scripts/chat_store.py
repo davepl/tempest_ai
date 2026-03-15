@@ -52,6 +52,39 @@ class ChatStore:
         safe = safe.strip("%")
         return (safe[:64] if safe else "unknown")
 
+    @staticmethod
+    def _sanitize_display_name(name: str) -> str:
+        cleaned = ChatStore._sanitize_text(name)
+        if not cleaned:
+            return ""
+        # Keep names compact and readable in the dashboard column.
+        return cleaned[:16]
+
+    @staticmethod
+    def _mask_ip_for_display(ip: str) -> str:
+        safe_ip = ChatStore._sanitize_ip(ip)
+        ipv4 = safe_ip.split(".")
+        if len(ipv4) == 4 and all(part.isdigit() for part in ipv4):
+            return f"{ipv4[0]}.{ipv4[1]}.{ipv4[2]}.X"
+        ipv6 = safe_ip.split(":")
+        if len(ipv6) > 1:
+            parts = ipv6[:-1] + ["X"]
+            return ":".join(parts)
+        return safe_ip
+
+    @classmethod
+    def _public_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        display_name = cls._sanitize_display_name(row.get("display_name", ""))
+        display_ip = cls._mask_ip_for_display(row.get("ip", "unknown"))
+        return {
+            "id": int(row.get("id", 0) or 0),
+            "ts": float(row.get("ts", 0.0) or 0.0),
+            "text": cls._sanitize_text(row.get("text", "")),
+            "display_name": display_name,
+            "display_ip": display_ip,
+            "sender": display_name or display_ip,
+        }
+
     def _load_from_disk(self) -> None:
         path = self._persist_path
         try:
@@ -73,6 +106,7 @@ class ChatStore:
                 if len(msg) > 240:
                     msg = msg[:240]
                 ip = self._sanitize_ip(row.get("ip", "unknown"))
+                display_name = self._sanitize_display_name(row.get("display_name", ""))
                 try:
                     ts = float(row.get("ts", 0.0) or 0.0)
                 except Exception:
@@ -85,7 +119,13 @@ class ChatStore:
                     rid = 0
                 if rid > max_seen_id:
                     max_seen_id = rid
-                self._rows.append({"id": rid, "ts": ts, "ip": ip, "text": msg})
+                self._rows.append({
+                    "id": rid,
+                    "ts": ts,
+                    "ip": ip,
+                    "display_name": display_name,
+                    "text": msg,
+                })
             self._next_id = max(1, max_seen_id + 1)
         except Exception:
             # Persistence is best-effort; runtime chat remains available.
@@ -101,7 +141,7 @@ class ChatStore:
             # Do not fail chat posting on storage errors.
             return
 
-    def add_message(self, ip: str, text: str) -> dict[str, Any]:
+    def add_message(self, ip: str, text: str, display_name: str = "") -> dict[str, Any]:
         msg = self._sanitize_text(text)
         if not msg:
             raise ValueError("message_empty")
@@ -112,16 +152,17 @@ class ChatStore:
                 "id": int(self._next_id),
                 "ts": float(time.time()),
                 "ip": self._sanitize_ip(ip),
+                "display_name": self._sanitize_display_name(display_name),
                 "text": msg,
             }
             self._next_id += 1
             self._rows.append(row)
             self._append_to_disk(row)
-            return dict(row)
+            return self._public_row(row)
 
     def snapshot(self, limit: int = 120) -> list[dict[str, Any]]:
         take = max(1, min(int(limit), self._max_messages))
         with self._lock:
             if not self._rows:
                 return []
-            return [dict(row) for row in list(self._rows)[-take:]]
+            return [self._public_row(row) for row in list(self._rows)[-take:]]

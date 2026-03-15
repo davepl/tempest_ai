@@ -55,3 +55,4 @@ Robotron/models/game_settings.json
 Robotron/logs/dashboard_chat.jsonl
 models/game_settings.json
 
+Tempest/models/tempest_model_latest.pt
