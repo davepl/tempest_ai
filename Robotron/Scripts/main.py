@@ -219,6 +219,16 @@ def keyboard_handler(agent, kb):
                 print_with_terminal_restore(kb, "\nResetting attention weights (keeping trunk + heads)...")
                 agent.reset_attention_weights()
                 display_metrics_row(agent, kb)
+            elif key == "R":
+                seq = metrics.reset_record_metrics()
+                persisted = False
+                try:
+                    persisted = bool(agent.persist_metrics_state_only(LATEST_MODEL_PATH))
+                except Exception:
+                    persisted = False
+                suffix = " (checkpoint updated)" if persisted else ""
+                print_with_terminal_restore(kb, f"\nRecord metrics reset{suffix}. seq={seq}")
+                display_metrics_row(agent, kb)
             elif key == "b":
                 print_buffer_stats(agent, kb)
             elif key == "f":

@@ -354,6 +354,54 @@ class _DashboardState:
       cfg = RL_CONFIG
       net = getattr(self.agent, "online_net", None) if self.agent is not None else None
 
+      # Prefer describing the active network structure rather than the older
+      # hybrid config fields that may still exist only for compatibility.
+      if net is not None and hasattr(net, "base_state_size") and hasattr(net, "object_attn"):
+        base_state = int(getattr(net, "base_state_size", int(getattr(cfg, "base_state_size", 0) or 0)))
+        stack_depth = int(getattr(net, "stack_depth", max(1, int(getattr(cfg, "frame_stack", 1) or 1))))
+        slot_count = int(getattr(net, "num_object_slots", int(getattr(cfg, "object_slots", 0) or 0)))
+        token_features = int(getattr(net, "object_token_features", int(getattr(cfg, "legacy_slot_token_features", 0) or 0)))
+        attn_dim = int(getattr(getattr(net, "object_attn", None), "out_dim", int(getattr(cfg, "attn_dim", 0) or 0)))
+        attn_layers = int(getattr(cfg, "attn_layers", 1) or 1)
+        trunk_widths = [int(getattr(cfg, "trunk_hidden", 256) or 256)] * int(getattr(cfg, "trunk_layers", 1) or 1)
+        head_fc = getattr(net, "val_fc", None) or getattr(net, "q_fc", None)
+        head_mid = int(head_fc.out_features) if (head_fc is not None and hasattr(head_fc, "out_features")) else max(64, trunk_widths[-1] // 2)
+        param_count = sum(p.numel() for p in net.parameters())
+
+        model_desc_key = (
+          id(net),
+          base_state,
+          stack_depth,
+          slot_count,
+          token_features,
+          attn_dim,
+          attn_layers,
+          tuple(trunk_widths),
+          head_mid,
+          param_count,
+        )
+        if self._model_desc is not None and self._model_desc_key == model_desc_key:
+          return self._model_desc
+
+        layers = [
+          f"base{base_state}x{stack_depth}",
+          f"slot{slot_count}x{token_features}",
+          f"set{attn_dim}x{attn_layers}",
+        ]
+        layers.extend(str(width) for width in trunk_widths)
+        layers.append(str(head_mid))
+        arch_str = " » ".join(layers)
+        if param_count >= 1_000_000:
+          p_str = f"{param_count / 1_000_000:.1f}M"
+        elif param_count >= 1_000:
+          p_str = f"{param_count / 1_000:.0f}K"
+        else:
+          p_str = str(param_count)
+        desc = f"Model: {arch_str} · {p_str} params"
+        self._model_desc = desc
+        self._model_desc_key = model_desc_key
+        return desc
+
       gg = int(getattr(cfg, "global_feature_count", 98))
       gc = int(getattr(cfg, "grid_channels", 8))
       gh = int(getattr(cfg, "grid_height", 12))
@@ -592,6 +640,7 @@ class _DashboardState:
             "peak_level": float(self.metrics.peak_level),
             "peak_episode_reward": float(self.metrics.peak_episode_reward) * _prs,
             "peak_game_score": int(self.metrics.peak_game_score),
+            "records_reset_seq": int(getattr(self.metrics, "records_reset_seq", 0) or 0),
             "avg_game_score": float(self.metrics.avg_game_score),
             "game_count": int(self.metrics.total_games_played),
             "episodes_this_run": int(self.metrics.episodes_this_run),
@@ -3128,6 +3177,16 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     };
     const modelDescEl = document.getElementById("modelDesc");
     const recordHighs = { rwrd: -Infinity, level: -Infinity, epLen: -Infinity };
+    let _recordsResetSeqSeen = -1;
+
+    function _clearRecordDisplays() {
+      recordHighs.rwrd = -Infinity;
+      recordHighs.level = -Infinity;
+      recordHighs.epLen = -Infinity;
+      if (recEls.rwrd) recEls.rwrd.textContent = "—";
+      if (recEls.level) recEls.level.textContent = "—";
+      if (recEls.epLen) recEls.epLen.textContent = "—";
+    }
     /* Episode rate: 30-second rolling window */
     const epRateHistory = [];  /* {ts, episodes} */
     const EP_RATE_WINDOW = 30; /* seconds */
@@ -5867,6 +5926,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
      * ══════════════════════════════════════════════════════════════ */
     function updateCards(now, smoothedSteps) {
       _lastNow = now;
+      const resetSeq = Number(now && now.records_reset_seq);
+      if (Number.isFinite(resetSeq) && resetSeq !== _recordsResetSeqSeen) {
+        _recordsResetSeqSeen = resetSeq;
+        _clearRecordDisplays();
+      }
       const clientRows = _normalizeClientRows(now.client_rows);
       const selectedPreviewClientId = Number(now.preview_selected_client_id);
       renderClientTable(clientRows, selectedPreviewClientId);

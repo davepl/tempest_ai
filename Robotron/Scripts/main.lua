@@ -5,7 +5,7 @@
       - Sends a compact 932-value RL state vector:
         + 9 core/player values
         + 50 ELIST bytes
-        + 9 typed entity buckets with nearest-first slots
+        + 9 typed entity buckets with nearest-K stable slots
           storing present, dx, dy, dist, hit_w, hit_h
       - Still computes richer object features internally for HUD/preview support
       - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
@@ -44,7 +44,7 @@ function env_flag(name, default)
     return not (raw == "0" or raw == "false" or raw == "off" or raw == "no")
 end
 
-RRCHRIS_PATCH_ENABLED = env_flag("ROBOTRON_ENABLE_RRCHRIS_PATCH", true)
+RRCHRIS_PATCH_ENABLED = env_flag("ROBOTRON_ENABLE_RRCHRIS_PATCH", false)
 RRCHRIS_PATCH_REGION = ":maincpu"
 ROMTAB_BASE_ADDR = 0xFFB5
 RRCHRIS_PATCH_CHUNKS = {
@@ -301,6 +301,64 @@ local CATEGORY_IS_STATIC = {
 }
 
 local prev_object_samples = {}
+local prev_category_slot_ptrs = {}
+
+local function _reset_legacy_slot_assignments()
+    prev_category_slot_ptrs = {}
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        local slots = {}
+        for i = 1, cat.slots do
+            slots[i] = 0
+        end
+        prev_category_slot_ptrs[cat.name] = slots
+    end
+end
+
+_reset_legacy_slot_assignments()
+
+local function _stable_assign_bucket_slots(cat_name, bucket, slot_count)
+    local assigned = {}
+    local selected = {}
+    local selected_by_ptr = {}
+    local selected_n = math.min(#bucket, slot_count)
+    local prev_slots = prev_category_slot_ptrs[cat_name] or {}
+    local next_slots = {}
+
+    for i = 1, selected_n do
+        local obj = bucket[i]
+        selected[i] = obj
+        selected_by_ptr[obj.ptr] = obj
+    end
+
+    -- Preserve any previously assigned slot whose object is still in the
+    -- nearest-K candidate set, then fill remaining holes by proximity.
+    for slot_idx = 1, slot_count do
+        local prev_ptr = prev_slots[slot_idx]
+        local obj = prev_ptr and selected_by_ptr[prev_ptr] or nil
+        if obj ~= nil then
+            assigned[slot_idx] = obj
+            selected_by_ptr[prev_ptr] = nil
+        end
+    end
+
+    local fill_idx = 1
+    for slot_idx = 1, slot_count do
+        if assigned[slot_idx] == nil then
+            while fill_idx <= selected_n do
+                local obj = selected[fill_idx]
+                fill_idx = fill_idx + 1
+                if obj ~= nil and selected_by_ptr[obj.ptr] ~= nil then
+                    assigned[slot_idx] = obj
+                    selected_by_ptr[obj.ptr] = nil
+                    break
+                end
+            end
+        end
+        next_slots[slot_idx] = assigned[slot_idx] and assigned[slot_idx].ptr or 0
+    end
+
+    return assigned, next_slots, selected_n
+end
 
 -- OCVECT-based entity classification (auto-discovered at runtime).
 local ocvect_category_cache = {}       -- OCVECT address → category name | "skip"
@@ -1287,6 +1345,17 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         end)
     end
 
+    local legacy_buckets = {}
+    local legacy_bucket_counts = {}
+    local next_category_slot_ptrs = {}
+    for _, cat in ipairs(ENTITY_CATEGORIES) do
+        local assigned, next_slots, assigned_count = _stable_assign_bucket_slots(cat.name, buckets[cat.name], cat.slots)
+        legacy_buckets[cat.name] = assigned
+        legacy_bucket_counts[cat.name] = assigned_count
+        next_category_slot_ptrs[cat.name] = next_slots
+    end
+    prev_category_slot_ptrs = next_category_slot_ptrs
+
     if DEBUG_HUD_ENABLED then
         for _, cat in ipairs(ENTITY_CATEGORIES) do
             local bucket = buckets[cat.name]
@@ -1314,8 +1383,9 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
 
     local legacy_list_features = {}
     for _, cat in ipairs(ENTITY_CATEGORIES) do
-        local bucket = buckets[cat.name]
-        legacy_list_features[#legacy_list_features + 1] = math.min(1.0, #bucket / cat.slots)
+        local bucket = legacy_buckets[cat.name] or {}
+        local bucket_count = legacy_bucket_counts[cat.name] or 0
+        legacy_list_features[#legacy_list_features + 1] = math.min(1.0, bucket_count / cat.slots)
         for i = 1, cat.slots do
             local obj = bucket[i]
             if obj then
@@ -2607,6 +2677,8 @@ function frame_callback()
     local rewards = compute_frame_rewards(frame)
     if player_alive == 0 then
         dead_frame_counter = dead_frame_counter + 1
+        prev_object_samples = {}
+        _reset_legacy_slot_assignments()
     else
         dead_frame_counter = 0
     end

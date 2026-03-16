@@ -160,10 +160,10 @@ class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     # Base per-frame state from Lua wire protocol.
     base_state_size: int = SERVER_CONFIG.params_count
-    # Structured slot encoder: only latest + previous frames are consumed directly.
-    frame_stack: int = 2
+    # Structured slot encoder: all stacked frames are consumed directly.
+    frame_stack: int = 4
     # Effective model input width after stacking.
-    state_size: int = SERVER_CONFIG.params_count * 2
+    state_size: int = SERVER_CONFIG.params_count * 4
 
     # Factored action space for Robotron dual sticks:
     #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
@@ -202,7 +202,9 @@ class RLConfigData:
     entity_categories: list = field(default_factory=lambda: list(LEGACY_ENTITY_CATEGORIES))
     object_slots: int = LEGACY_TOTAL_SLOTS
     slot_state_features: int = LEGACY_SLOT_STATE_FEATURES
-    legacy_slot_token_features: int = 10
+    # Per-object set-encoder features for the compact legacy slot state:
+    #   dx, dy, dist, hit_w, hit_h, category_norm, is_human, is_dangerous
+    legacy_slot_token_features: int = 8
     attn_heads: int = 4
     attn_dim: int = 96
     attn_layers: int = 1
@@ -224,7 +226,7 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 512
+    batch_size: int = 768
     lr: float = 1e-4
     lr_min: float = 4e-5
     lr_warmup_steps: int = 5_000
@@ -235,7 +237,7 @@ class RLConfigData:
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 10_000_000
+    memory_size: int = 2_500_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
@@ -333,7 +335,7 @@ class RLConfigData:
     inference_on_cpu: bool = False
     # Device placement (CUDA only): useful on multi-GPU hosts.
     train_cuda_device_index: int = 0
-    inference_cuda_device_index: int = 0
+    inference_cuda_device_index: int = 1
     inference_sync_steps: int = 100
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True
@@ -553,6 +555,7 @@ class MetricsData:
     peak_level_verified: bool = False
     peak_episode_reward: float = 0.0
     peak_game_score: int = 0
+    records_reset_seq: int = 0
     game_scores: Deque[int] = field(default_factory=lambda: deque(maxlen=100))
     avg_game_score: float = 0.0
     total_games_played: int = 0
@@ -702,6 +705,19 @@ class MetricsData:
             self.total_games_played += 1
             if self.game_scores:
                 self.avg_game_score = float(sum(self.game_scores)) / len(self.game_scores)
+
+    def reset_record_metrics(self) -> int:
+        """Clear dashboard/server record-style metrics and return the new reset sequence."""
+        with self.lock:
+            self.peak_level = 0
+            self.peak_level_verified = False
+            self.peak_episode_reward = 0.0
+            self.peak_game_score = 0
+            self.game_scores.clear()
+            self.avg_game_score = 0.0
+            self.total_games_played = 0
+            self.records_reset_seq += 1
+            return int(self.records_reset_seq)
 
     def increment_total_controls(self):
         with self.lock:

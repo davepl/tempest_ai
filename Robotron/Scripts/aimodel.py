@@ -71,6 +71,7 @@ def _export_metrics_snapshot() -> dict:
                 "peak_level_verified": bool(getattr(metrics, "peak_level_verified", False)),
                 "peak_episode_reward": float(metrics.peak_episode_reward),
                 "peak_game_score": int(metrics.peak_game_score),
+                "records_reset_seq": int(getattr(metrics, "records_reset_seq", 0)),
             }
     except Exception:
         snap = {}
@@ -118,6 +119,7 @@ def _restore_metrics_snapshot(snap: dict | None) -> None:
             metrics.peak_level = int(snap.get("peak_level", 0)) if metrics.peak_level_verified else 0
             metrics.peak_episode_reward = float(snap.get("peak_episode_reward", metrics.peak_episode_reward))
             metrics.peak_game_score = int(snap.get("peak_game_score", metrics.peak_game_score))
+            metrics.records_reset_seq = int(snap.get("records_reset_seq", getattr(metrics, "records_reset_seq", 0)))
     except Exception:
         pass
     try:
@@ -165,7 +167,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 3
+MODEL_ARCH_VERSION = 4
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -1846,6 +1848,18 @@ class EntitySetEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.out_norm = nn.LayerNorm(embed_dim)
         self.out_dim = embed_dim
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.norm(self.embed(tokens))
@@ -1862,7 +1876,7 @@ class EntitySetEncoder(nn.Module):
 
 # ── Distributional Dueling Network ─────────────────────────────────────────
 class RainbowNet(nn.Module):
-    """Structured Robotron network with explicit global and object-slot branches."""
+    """Structured Robotron network with explicit global and object-set branches."""
 
     def __init__(self, state_size: int):
         super().__init__()
@@ -1876,8 +1890,9 @@ class RainbowNet(nn.Module):
         self.num_actions = NUM_JOINT
         self.use_attn = bool(getattr(cfg, "use_enemy_attention", True))
         self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
+        self.stack_depth = max(1, int(self.state_size // max(1, self.base_state_size)))
         self.num_object_slots = int(getattr(cfg, "object_slots", 144))
-        self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 10))
+        self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 8))
         self.slot_state_features = int(getattr(cfg, "slot_state_features", 6))
         self.core_feature_count = 59  # 9 core + 50 ELIST
 
@@ -1905,24 +1920,21 @@ class RainbowNet(nn.Module):
         self._num_categories = len(cat_defs)
 
         attn_dim = int(getattr(cfg, "attn_dim", 96))
-        category_summary_dim = int(getattr(cfg, "category_summary_dim", 48))
         entity_hidden = int(getattr(cfg, "entity_hidden", 192))
         self.global_encoder = GlobalEncoder(
-            in_dim=(self.core_feature_count * 2) + (self._num_categories * 2),
+            in_dim=self.stack_depth * (self.core_feature_count + self._num_categories),
             hidden_dim=int(getattr(cfg, "global_hidden", 128)),
         )
-        self.object_attn = EnemyAttention(
-            slot_features=self.object_token_features,
+        # Encode each frame's visible object set independently, then fuse all
+        # stacked frame summaries so all temporal slices contribute to policy.
+        self.object_attn = EntitySetEncoder(
+            token_features=self.object_token_features,
             embed_dim=attn_dim,
             num_heads=int(getattr(cfg, "attn_heads", 4)),
-        )
-        self.category_proj = nn.Sequential(
-            nn.Linear((attn_dim * 2) + 1, category_summary_dim),
-            nn.LayerNorm(category_summary_dim),
-            nn.ReLU(),
+            num_layers=int(getattr(cfg, "attn_layers", 1)),
         )
         self.entity_proj = nn.Sequential(
-            nn.Linear(attn_dim + (category_summary_dim * self._num_categories), entity_hidden),
+            nn.Linear(attn_dim * self.stack_depth, entity_hidden),
             nn.LayerNorm(entity_hidden),
             nn.ReLU(),
         )
@@ -1965,56 +1977,36 @@ class RainbowNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def _frame_offsets(self, state: torch.Tensor) -> tuple[int, int]:
+    def _frame_offsets(self, state: torch.Tensor) -> list[int]:
         total_dim = int(state.shape[1])
         stack_depth = max(1, total_dim // self.base_state_size)
-        latest_off = (stack_depth - 1) * self.base_state_size
-        prev_off = (stack_depth - 2) * self.base_state_size if stack_depth >= 2 else latest_off
-        return latest_off, prev_off
+        return [i * self.base_state_size for i in range(stack_depth)]
 
     def _build_global_features(self, state: torch.Tensor) -> torch.Tensor:
-        latest_off, prev_off = self._frame_offsets(state)
-        latest_core = state[:, latest_off: latest_off + self.core_feature_count]
-        prev_core = state[:, prev_off: prev_off + self.core_feature_count]
-        latest_occ = []
-        prev_occ = []
-        for _name, base, _slots, _cat_id in self._cat_info:
-            latest_occ.append(state[:, latest_off + base: latest_off + base + 1])
-            prev_occ.append(state[:, prev_off + base: prev_off + base + 1])
-        return torch.cat([latest_core, prev_core, *latest_occ, *prev_occ], dim=1)
+        parts = []
+        for frame_off in self._frame_offsets(state):
+            parts.append(state[:, frame_off: frame_off + self.core_feature_count])
+            for _name, base, _slots, _cat_id in self._cat_info:
+                parts.append(state[:, frame_off + base: frame_off + base + 1])
+        return torch.cat(parts, dim=1)
 
-    def _build_object_context(self, state: torch.Tensor):
-        """Build typed slot tokens and masks from the stacked compact state."""
+    def _build_frame_object_tokens(self, state: torch.Tensor, frame_off: int):
+        """Build typed slot tokens and masks for one compact-state frame."""
         B = state.shape[0]
         device = state.device
-        latest_off, prev_off = self._frame_offsets(state)
 
         all_tokens = []
         all_masks = []
-        occupancies = []
-
         for name, base, slots, cat_id in self._cat_info:
-            latest_occ = state[:, latest_off + base: latest_off + base + 1]
-            occupancies.append(latest_occ)
+            block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
+            block = block.reshape(B, slots, self.slot_state_features)
 
-            latest = state[:, latest_off + base + 1: latest_off + base + 1 + slots * self.slot_state_features]
-            latest = latest.reshape(B, slots, self.slot_state_features)
-            prev = state[:, prev_off + base + 1: prev_off + base + 1 + slots * self.slot_state_features]
-            prev = prev.reshape(B, slots, self.slot_state_features)
-
-            present = latest[:, :, 0]
-            dx = latest[:, :, 1:2]
-            dy = latest[:, :, 2:3]
-            dist = latest[:, :, 3:4]
-            width = latest[:, :, 4:5] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
-            height = latest[:, :, 5:6] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
-
-            prev_present = prev[:, :, 0]
-            prev_dx = prev[:, :, 1:2]
-            prev_dy = prev[:, :, 2:3]
-            vel_valid = ((present > 0.5) & (prev_present > 0.5)).unsqueeze(2).to(dtype=state.dtype)
-            ddx = (dx - prev_dx) * vel_valid
-            ddy = (dy - prev_dy) * vel_valid
+            present = block[:, :, 0]
+            dx = block[:, :, 1:2]
+            dy = block[:, :, 2:3]
+            dist = block[:, :, 3:4]
+            width = block[:, :, 4:5] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
+            height = block[:, :, 5:6] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
 
             cat_norm = torch.full(
                 (B, slots, 1),
@@ -2031,7 +2023,7 @@ class RainbowNet(nn.Module):
             )
 
             tokens = torch.cat(
-                [dx, dy, dist, ddx, ddy, width, height, cat_norm, is_human, is_dangerous],
+                [dx, dy, dist, width, height, cat_norm, is_human, is_dangerous],
                 dim=2,
             )
             all_tokens.append(tokens)
@@ -2039,38 +2031,24 @@ class RainbowNet(nn.Module):
 
         tokens = torch.cat(all_tokens, dim=1)
         mask = torch.cat(all_masks, dim=1)
-        occupancies_t = torch.cat(occupancies, dim=1)
         all_empty = mask.all(dim=1, keepdim=True)
         mask = mask & ~all_empty
-        return tokens, mask, occupancies_t
+        return tokens, mask
 
     def _build_object_tokens(self, state: torch.Tensor):
-        tokens, mask, _ = self._build_object_context(state)
-        return tokens, mask
+        frame_offsets = self._frame_offsets(state)
+        return self._build_frame_object_tokens(state, frame_offsets[-1])
 
     def forward(self, state: torch.Tensor, log: bool = False):
         B = state.shape[0]
         global_in = self._build_global_features(state)
         global_out = self.global_encoder(global_in)
 
-        obj_tokens, obj_mask, occupancies = self._build_object_context(state)
-        encoded_slots = self.object_attn.encode(obj_tokens)
-        attn_out = self.object_attn(encoded_slots, obj_mask, encoded=True)
-
-        cat_summaries = []
-        for cat_idx, (_name, lo, hi) in enumerate(self._category_ranges):
-            cat_encoded = encoded_slots[:, lo:hi, :]
-            cat_mask = obj_mask[:, lo:hi]
-            active = (~cat_mask).unsqueeze(2).to(dtype=state.dtype)
-            active_any = (~cat_mask).any(dim=1, keepdim=True).to(dtype=state.dtype)
-            nearest = cat_encoded[:, 0, :] * active_any
-            mean = (cat_encoded * active).sum(dim=1) / active.sum(dim=1).clamp_min(1.0)
-            mean = mean * active_any
-            cat_feat = torch.cat([nearest, mean, occupancies[:, cat_idx:cat_idx + 1]], dim=1)
-            cat_summaries.append(self.category_proj(cat_feat))
-
-        entity_in = torch.cat([attn_out, *cat_summaries], dim=1)
-        entity_out = self.entity_proj(entity_in)
+        frame_summaries = []
+        for frame_off in self._frame_offsets(state):
+            obj_tokens, obj_mask = self._build_frame_object_tokens(state, frame_off)
+            frame_summaries.append(self.object_attn(obj_tokens, obj_mask))
+        entity_out = self.entity_proj(torch.cat(frame_summaries, dim=1))
         h = self.input_proj(torch.cat([global_out, entity_out], dim=1))
         h = self.trunk(h)
 
@@ -2689,6 +2667,35 @@ class RainbowAgent:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
+    def persist_metrics_state_only(self, filepath=LATEST_MODEL_PATH) -> bool:
+        """Update only the checkpoint's metrics snapshot without resaving replay."""
+        if not os.path.exists(filepath):
+            return False
+        try:
+            ckpt = torch.load(filepath, map_location="cpu", weights_only=False)
+            try:
+                with metrics.lock:
+                    ckpt["frame_count"] = int(metrics.frame_count)
+                    ckpt["total_training_steps"] = int(metrics.total_training_steps)
+                    ckpt["expert_ratio"] = float(metrics.expert_ratio)
+                    ckpt["epsilon"] = float(metrics.epsilon)
+            except Exception:
+                pass
+            ckpt["training_steps"] = int(getattr(self, "training_steps", ckpt.get("training_steps", 0)))
+            ckpt["metrics_state"] = _export_metrics_snapshot()
+
+            tmp_path = filepath + ".metrics.tmp"
+            torch.save(ckpt, tmp_path)
+            os.replace(tmp_path, filepath)
+            return True
+        except Exception:
+            try:
+                if os.path.exists(filepath + ".metrics.tmp"):
+                    os.remove(filepath + ".metrics.tmp")
+            except Exception:
+                pass
+            return False
+
     def save(self, filepath, is_forced_save=False, show_status=True):
         try:
             with metrics.lock:
@@ -2855,6 +2862,24 @@ class RainbowAgent:
             return "Attention is disabled in this model."
         if not hasattr(self.online_net, "object_attn"):
             return "No object self-attention found."
+        if isinstance(self.online_net.object_attn, EntitySetEncoder):
+            if len(self.memory) < num_samples:
+                return f"Need {num_samples} samples in buffer, have {len(self.memory)}."
+            batch = self.memory.sample(num_samples, beta=0.4)
+            if batch is None:
+                return "Could not sample from buffer."
+            states = torch.from_numpy(batch[0]).float().to(self.device)
+            self.online_net.eval()
+            with torch.no_grad():
+                obj_tokens, obj_mask = self.online_net._build_object_tokens(states)
+            self.online_net.train()
+            active = (~obj_mask).sum(dim=1).float()
+            avg_active = float(active.mean().item()) if active.numel() else 0.0
+            return (
+                "Object encoder is now a per-frame transformer set encoder.\n"
+                f"Latest-frame active tokens: {avg_active:.1f} / {obj_mask.shape[1]}.\n"
+                "Direct pooled-attention weight diagnostics are not available for this architecture."
+            )
         if len(self.memory) < num_samples:
             return f"Need {num_samples} samples in buffer, have {len(self.memory)}."
 
