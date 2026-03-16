@@ -90,6 +90,9 @@ def _add_entity(
     state[slot_base + 1] = dx_world / _REL_POS_X_RANGE
     state[slot_base + 2] = dy_world / _REL_POS_Y_RANGE
     state[slot_base + 3] = dist_world / _POS_MAX_DIAG
+    if _LEGACY_SLOT_FEATURES >= 6:
+        state[slot_base + 4] = 0.5
+        state[slot_base + 5] = 0.5
 
 
 def test_aligned_fire_keeps_human_rescue_movement():
@@ -100,7 +103,7 @@ def test_aligned_fire_keeps_human_rescue_movement():
     move_dir, fire_dir = get_expert_action(state)
 
     assert move_dir == 0
-    assert fire_dir == 2
+    assert fire_dir == 0
 
 
 def test_aligned_fire_picks_closest_aligned_target_across_directions():

@@ -1824,7 +1824,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       overflow-y: auto;
       border: 1px solid rgba(80, 160, 255, 0.35);
       border-radius: 10px;
-      padding: 8px;
+      padding: 0;
       background: rgba(2, 6, 23, 0.78);
       font-size: 12px;
       line-height: 1.35;
@@ -1832,6 +1832,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       text-shadow: 0 0 6px rgba(60, 130, 255, 0.35);
       scrollbar-width: thin;
       scrollbar-color: rgba(85, 120, 170, 0.95) rgba(4, 10, 20, 0.92);
+      scrollbar-gutter: stable;
     }
     .chat-window::-webkit-scrollbar {
       width: 10px;
@@ -1860,6 +1861,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       overflow-wrap: anywhere;
       white-space: pre-wrap;
     }
+    .chat-messages {
+      padding: 8px;
+      padding-top: 6px;
+    }
     .chat-row:last-child {
       margin-bottom: 0;
     }
@@ -1867,12 +1872,17 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       display: grid;
       grid-template-columns: 11ch 10ch minmax(0, 1fr);
       gap: 6px;
-      padding: 0 2px;
+      padding: 8px;
+      padding-bottom: 0;
       color: #7dd3fc;
       font-size: 8.4px;
       letter-spacing: 0.04em;
       text-transform: uppercase;
       align-items: baseline;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: rgba(2, 6, 23, 0.96);
     }
     .chat-columns > div:nth-child(2) {
       text-align: left;
@@ -2126,6 +2136,18 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       font-size: 13px;
       letter-spacing: 0.1px;
     }
+    .client-table col.client-col-id {
+      width: 5.2ch;
+    }
+    .client-table col.client-col-duration {
+      width: 6.2ch;
+    }
+    .client-table col.client-col-lives {
+      width: 3.6ch;
+    }
+    .client-table col.client-col-level {
+      width: 3.6ch;
+    }
     .client-table thead th {
       position: sticky;
       top: 0;
@@ -2159,6 +2181,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
     .client-table th.num .client-table-sort-btn {
       justify-content: flex-end;
+      text-align: right;
     }
     .client-table-sort-btn.active {
       color: #e9fbff;
@@ -2194,6 +2217,23 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     .client-table td {
       padding: 7px 10px;
       white-space: nowrap;
+    }
+    .client-table thead th:nth-child(1) .client-table-sort-btn,
+    .client-table tbody td:nth-child(1) {
+      padding-left: 7px;
+      padding-right: 6px;
+    }
+    .client-table thead th:nth-child(2) .client-table-sort-btn,
+    .client-table tbody td:nth-child(2) {
+      padding-left: 6px;
+      padding-right: 6px;
+    }
+    .client-table thead th:nth-child(4) .client-table-sort-btn,
+    .client-table tbody td:nth-child(4),
+    .client-table thead th:nth-child(5) .client-table-sort-btn,
+    .client-table tbody td:nth-child(5) {
+      padding-left: 5px;
+      padding-right: 5px;
     }
     .client-table-empty {
       padding: 18px 10px;
@@ -2465,13 +2505,21 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         </div>
         <div class="client-table-wrap">
           <table class="client-table" aria-label="Connected clients">
+            <colgroup>
+              <col class="client-col-id">
+              <col class="client-col-duration">
+              <col>
+              <col class="client-col-lives">
+              <col class="client-col-level">
+              <col>
+            </colgroup>
             <thead id="tblClientsHead">
               <tr>
-                <th aria-sort="ascending"><button type="button" class="client-table-sort-btn active" data-sort-key="client_id">ClientID<span class="client-table-sort-indicator">▲</span></button></th>
-                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="duration_seconds">Duration<span class="client-table-sort-indicator"></span></button></th>
+                <th aria-sort="ascending"><button type="button" class="client-table-sort-btn active" data-sort-key="client_id">CLNT<span class="client-table-sort-indicator">▲</span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="duration_seconds">DUR<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="efficiency">Efficiency<span class="client-table-sort-indicator"></span></button></th>
-                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="lives">Lives<span class="client-table-sort-indicator"></span></button></th>
-                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="level">Level<span class="client-table-sort-indicator"></span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="lives">LIV<span class="client-table-sort-indicator"></span></button></th>
+                <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="level">LVL<span class="client-table-sort-indicator"></span></button></th>
                 <th class="num" aria-sort="none"><button type="button" class="client-table-sort-btn" data-sort-key="score">Score<span class="client-table-sort-indicator"></span></button></th>
               </tr>
             </thead>
@@ -2486,13 +2534,15 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           <div class="label">CHAT</div>
           <div class="client-table-count" id="mChatCount">0</div>
         </div>
-        <div class="chat-columns" aria-hidden="true">
-          <div>Date Time</div>
-          <div>Name</div>
-          <div>Message</div>
-        </div>
-        <div class="chat-window" id="chatWindow" aria-live="polite">
-          <div class="chat-row">Chat ready.</div>
+        <div class="chat-window" id="chatWindow">
+          <div class="chat-columns" aria-hidden="true">
+            <div>Date Time</div>
+            <div>Name</div>
+            <div>Message</div>
+          </div>
+          <div class="chat-messages" id="chatMessages" aria-live="polite">
+            <div class="chat-row">Chat ready.</div>
+          </div>
         </div>
         <div class="chat-controls">
           <input id="chatNameInput" class="chat-input chat-name-input" maxlength="16" placeholder="Name" />
@@ -2788,6 +2838,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       previewLabel: document.getElementById("mPreviewLabel"),
       clientTableCount: document.getElementById("mClientTableCount"),
       chatWindow: document.getElementById("chatWindow"),
+      chatMessages: document.getElementById("chatMessages"),
       chatNameInput: document.getElementById("chatNameInput"),
       chatInput: document.getElementById("chatInput"),
       chatSubmit: document.getElementById("chatSubmit"),
@@ -2828,13 +2879,13 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
 
     function _renderChatRows(rows) {
-      if (!cards.chatWindow) return;
-      cards.chatWindow.innerHTML = "";
+      if (!cards.chatWindow || !cards.chatMessages) return;
+      cards.chatMessages.innerHTML = "";
       if (!rows || rows.length <= 0) {
         const empty = document.createElement("div");
         empty.className = "chat-row";
         empty.textContent = "No messages yet.";
-        cards.chatWindow.appendChild(empty);
+        cards.chatMessages.appendChild(empty);
       } else {
         for (const row of rows) {
           const line = document.createElement("div");
@@ -2852,7 +2903,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           line.appendChild(time);
           line.appendChild(sender);
           line.appendChild(txt);
-          cards.chatWindow.appendChild(line);
+          cards.chatMessages.appendChild(line);
         }
       }
       if (cards.chatCount) cards.chatCount.textContent = String(rows ? rows.length : 0);

@@ -2,10 +2,11 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a compact 644-value RL state vector:
+      - Sends a compact 932-value RL state vector:
         + 9 core/player values
         + 50 ELIST bytes
         + 9 typed entity buckets with nearest-first slots
+          storing present, dx, dy, dist, hit_w, hit_h
       - Still computes richer object features internally for HUD/preview support
       - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
 --]]
@@ -42,6 +43,27 @@ function env_flag(name, default)
     raw = string.lower(tostring(raw))
     return not (raw == "0" or raw == "false" or raw == "off" or raw == "no")
 end
+
+RRCHRIS_PATCH_ENABLED = env_flag("ROBOTRON_ENABLE_RRCHRIS_PATCH", true)
+RRCHRIS_PATCH_REGION = ":maincpu"
+ROMTAB_BASE_ADDR = 0xFFB5
+RRCHRIS_PATCH_CHUNKS = {
+    { addr = 0x4990, bytes = {0x7E, 0x4A, 0x97} },
+    { addr = 0x49B7, bytes = {0x7E, 0x4A, 0xA0} },
+    { addr = 0x49E2, bytes = {0x7E, 0x4A, 0xA9} },
+    {
+        addr = 0x4A97,
+        bytes = {
+            0x0A, 0xC2, 0x27, 0xBE, 0x0A, 0xB9, 0x7E, 0x49, 0x94,
+            0x0A, 0xC2, 0x27, 0xB5, 0x0C, 0xB8, 0x7E, 0x49, 0xBB,
+            0x0A, 0xC2, 0x27, 0xAC, 0x0C, 0xB8, 0x7E, 0x49, 0xE6,
+            0x30, 0x35, 0x2F, 0x31, 0x39, 0x38, 0x37, 0x20, 0x43,
+            0x48, 0x52, 0x2E, 0x47, 0x2E,
+        },
+    },
+    { addr = 0x4AD7, bytes = {0x4C} },
+}
+rrchris_patch_applied = false
 
 -- Startup diagnostics (bounded, opt-in style flags kept local to script).
 DEBUG_STARTUP_TRACE = false
@@ -250,7 +272,7 @@ GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
 GLOBAL_FEATURES = 100
 GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
 TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
-LEGACY_SLOT_STATE_FEATURES = 4
+LEGACY_SLOT_STATE_FEATURES = 6
 LEGACY_ENTITY_TOTAL_FEATURES = 0
 for _, cat in ipairs(ENTITY_CATEGORIES) do
     LEGACY_ENTITY_TOTAL_FEATURES = LEGACY_ENTITY_TOTAL_FEATURES + 1 + (cat.slots * LEGACY_SLOT_STATE_FEATURES)
@@ -1100,8 +1122,10 @@ local function _object_threat_score(obj)
 end
 
 local function extract_world_features(memory, player_x16, player_y16, enemy_state)
-    -- Walk object lists, classify entities, compute per-object motion, and emit:
-    --   globals (100), local grid (12x12x8), tokens (64x15)
+    -- Walk object lists, classify entities, compute per-object motion, and emit
+    -- only the compact legacy slot state consumed by the current Python model.
+    -- The older rich globals/grid/token observation is no longer serialized, so
+    -- rebuilding it every frame just burns Lua time on crowded waves.
 
     local player_pict_ptr = read_u16_be(memory, PLOBJ_ADDR + OPICT_OFF)
     local player_hit_off_x, player_hit_off_y, player_hit_w, player_hit_h = picture_collision_bounds(memory, player_pict_ptr)
@@ -1197,21 +1221,14 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
 
     local buckets = {}
     local counts = {}
-    local nearest_by_category = {}
-    local quadrant_threat = {0.0, 0.0, 0.0, 0.0}
-    local quadrant_human = {0.0, 0.0, 0.0, 0.0}
+    local classified_objects = {}
     local nearest_enemy_dist = nil
     local nearest_human_dist = nil
     local nearest_enemy_x16 = nil
     local nearest_enemy_y16 = nil
-    local grid = {}
-    for i = 1, GRID_FEATURES do
-        grid[i] = 0.0
-    end
     for _, cat in ipairs(ENTITY_CATEGORIES) do
         buckets[cat.name] = {}
         counts[cat.name] = 0
-        nearest_by_category[cat.name] = 1.0
     end
 
     local current_samples = {}
@@ -1242,18 +1259,12 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             local radial = -((obj.vx * obj.dir_x) + (obj.vy * obj.dir_y))
             obj.approach = clamp11(radial * 2.0)
             obj.threat = _object_threat_score(obj)
-            obj.is_dangerous = CATEGORY_IS_DANGEROUS[obj.category] and 1.0 or 0.0
-            obj.is_human = (obj.category == "human") and 1.0 or 0.0
-            obj.is_static = CATEGORY_IS_STATIC[obj.category] and 1.0 or 0.0
 
             counts[obj.category] = counts[obj.category] + 1
             current_samples[obj.ptr] = {x16 = obj.x16, y16 = obj.y16}
-            local bucket = buckets[obj.category]
-            bucket[#bucket + 1] = obj
+            buckets[obj.category][#buckets[obj.category] + 1] = obj
+            classified_objects[#classified_objects + 1] = obj
 
-            if obj.dist_norm < nearest_by_category[obj.category] then
-                nearest_by_category[obj.category] = obj.dist_norm
-            end
             if obj.category == "human" then
                 if nearest_human_dist == nil or obj.dist_norm < nearest_human_dist then
                     nearest_human_dist = obj.dist_norm
@@ -1265,42 +1276,6 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
                     nearest_enemy_y16 = obj.y16
                 end
             end
-
-            local q = 1
-            if obj.dx >= 0.0 and obj.dy < 0.0 then
-                q = 2
-            elseif obj.dx < 0.0 and obj.dy >= 0.0 then
-                q = 3
-            elseif obj.dx >= 0.0 and obj.dy >= 0.0 then
-                q = 4
-            end
-            if obj.category == "human" then
-                quadrant_human[q] = quadrant_human[q] + (1.0 - obj.dist_norm)
-            elseif CATEGORY_IS_DANGEROUS[obj.category] then
-                quadrant_threat[q] = quadrant_threat[q] + obj.threat
-            end
-
-            local gx = math.floor(((obj.x16 - player_center_x16) + GRID_HALF_RANGE_X) * GRID_W / (2.0 * GRID_HALF_RANGE_X))
-            local gy = math.floor(((obj.y16 - player_center_y16) + GRID_HALF_RANGE_Y) * GRID_H / (2.0 * GRID_HALF_RANGE_Y))
-            if gx >= 0 and gx < GRID_W and gy >= 0 and gy < GRID_H then
-                local threat = obj.threat
-                grid[_grid_index(gx, gy, 6)] = clamp01(grid[_grid_index(gx, gy, 6)] + 0.12)
-                if CATEGORY_IS_DANGEROUS[obj.category] then
-                    grid[_grid_index(gx, gy, 0)] = clamp01(grid[_grid_index(gx, gy, 0)] + threat * 0.6)
-                    grid[_grid_index(gx, gy, 7)] = clamp01(grid[_grid_index(gx, gy, 7)] + clamp01(obj.approach * 0.5 + 0.5) * 0.2)
-                end
-                if obj.category == "grunt" then
-                    grid[_grid_index(gx, gy, 3)] = clamp01(grid[_grid_index(gx, gy, 3)] + threat * 0.8)
-                elseif obj.category == "projectile" then
-                    grid[_grid_index(gx, gy, 1)] = clamp01(grid[_grid_index(gx, gy, 1)] + threat)
-                elseif obj.category == "human" then
-                    grid[_grid_index(gx, gy, 4)] = clamp01(grid[_grid_index(gx, gy, 4)] + (1.0 - obj.dist_norm) * 0.8)
-                elseif obj.category == "electrode" then
-                    grid[_grid_index(gx, gy, 5)] = clamp01(grid[_grid_index(gx, gy, 5)] + 0.9)
-                else
-                    grid[_grid_index(gx, gy, 2)] = clamp01(grid[_grid_index(gx, gy, 2)] + threat * 0.9)
-                end
-            end
         end
     end
 
@@ -1308,154 +1283,68 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
 
     for _, cat in ipairs(ENTITY_CATEGORIES) do
         table.sort(buckets[cat.name], function(a, b)
-            if a.threat == b.threat then
-                return a.dist_norm < b.dist_norm
-            end
-            return a.threat > b.threat
+            return a.dist_norm < b.dist_norm
         end)
-        for i, obj in ipairs(buckets[cat.name]) do
-            obj.rank = i
+    end
+
+    if DEBUG_HUD_ENABLED then
+        for _, cat in ipairs(ENTITY_CATEGORIES) do
+            local bucket = buckets[cat.name]
+            if #bucket > 0 then
+                local ranked = {}
+                for i = 1, #bucket do
+                    ranked[i] = bucket[i]
+                end
+                table.sort(ranked, function(a, b)
+                    if a.threat == b.threat then
+                        return a.dist_norm < b.dist_norm
+                    end
+                    return a.threat > b.threat
+                end)
+                for i, obj in ipairs(ranked) do
+                    obj.rank = i
+                end
+            end
+        end
+    else
+        for _, obj in ipairs(classified_objects) do
+            obj.rank = nil
         end
     end
 
     local legacy_list_features = {}
     for _, cat in ipairs(ENTITY_CATEGORIES) do
         local bucket = buckets[cat.name]
-        local by_dist = {}
-        for i = 1, #bucket do
-            by_dist[i] = bucket[i]
-        end
-        table.sort(by_dist, function(a, b)
-            return a.dist_norm < b.dist_norm
-        end)
-
-        legacy_list_features[#legacy_list_features + 1] = math.min(1.0, #by_dist / cat.slots)
+        legacy_list_features[#legacy_list_features + 1] = math.min(1.0, #bucket / cat.slots)
         for i = 1, cat.slots do
-            local obj = by_dist[i]
+            local obj = bucket[i]
             if obj then
                 legacy_list_features[#legacy_list_features + 1] = 1.0
                 legacy_list_features[#legacy_list_features + 1] = obj.dx
                 legacy_list_features[#legacy_list_features + 1] = obj.dy
                 legacy_list_features[#legacy_list_features + 1] = obj.dist_norm
+                legacy_list_features[#legacy_list_features + 1] = clamp01((obj.hit_w or obj.width or 0) / 16.0)
+                legacy_list_features[#legacy_list_features + 1] = clamp01((obj.hit_h or obj.height or 0) / 16.0)
             else
                 legacy_list_features[#legacy_list_features + 1] = 0.0
                 legacy_list_features[#legacy_list_features + 1] = 0.0
                 legacy_list_features[#legacy_list_features + 1] = 0.0
                 legacy_list_features[#legacy_list_features + 1] = 0.0
+                legacy_list_features[#legacy_list_features + 1] = 0.0
+                legacy_list_features[#legacy_list_features + 1] = 0.0
             end
         end
     end
 
-    -- Encode walls/lava into channel 5.
-    for gy = 0, GRID_H - 1 do
-        for gx = 0, GRID_W - 1 do
-            local cx = ((gx + 0.5) / GRID_W) * (2.0 * GRID_HALF_RANGE_X) - GRID_HALF_RANGE_X
-            local cy = ((gy + 0.5) / GRID_H) * (2.0 * GRID_HALF_RANGE_Y) - GRID_HALF_RANGE_Y
-            local world_x = player_x16 + cx
-            local world_y = player_y16 + cy
-            if world_x <= (POS_X_MIN + 4096) or world_x >= (POS_X_MIN + POS_X_RANGE - 4096)
-               or world_y <= (POS_Y_MIN + 4096) or world_y >= (POS_Y_MIN + POS_Y_RANGE - 4096) then
-                grid[_grid_index(gx, gy, 5)] = math.max(grid[_grid_index(gx, gy, 5)], 0.6)
-            end
-        end
-    end
-
-    local globals = {}
-    globals[#globals + 1] = ((previous_player_alive or 0) ~= 0) and 1.0 or 0.0
-    globals[#globals + 1] = 0.0  -- score placeholder; filled in serialize_frame
-    globals[#globals + 1] = 0.0  -- replay placeholder; filled in serialize_frame
-    globals[#globals + 1] = 0.0  -- lasers placeholder; filled in serialize_frame
-    globals[#globals + 1] = 0.0  -- wave placeholder; filled in serialize_frame
-    globals[#globals + 1] = norm_pos_x(player_x16 or 0)
-    globals[#globals + 1] = norm_pos_y(player_y16 or 0)
-    globals[#globals + 1] = 0.0  -- player vx placeholder; filled in serialize_frame
-    globals[#globals + 1] = 0.0  -- player vy placeholder; filled in serialize_frame
-    for i = 1, ZP1ENM_SIZE do
-        globals[#globals + 1] = (enemy_state.raw[i] or 0) / 255.0
-    end
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        globals[#globals + 1] = clamp01((counts[cat.name] or 0) / math.max(1, cat.peak or cat.slots))
-    end
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        globals[#globals + 1] = ((counts[cat.name] or 0) > 0) and 1.0 or 0.0
-    end
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        globals[#globals + 1] = nearest_by_category[cat.name] or 1.0
-    end
-    for i = 1, 4 do
-        globals[#globals + 1] = clamp01(quadrant_threat[i] / 3.0)
-    end
-    for i = 1, 4 do
-        globals[#globals + 1] = clamp01(quadrant_human[i] / 2.0)
-    end
     local num_humans = counts["human"] or 0
-    globals[#globals + 1] = clamp01(num_humans / 16.0)
-    globals[#globals + 1] = (num_humans <= 0) and 1.0 or 0.0
-    local pxn = norm_pos_x(player_x16 or 0)
-    local pyn = norm_pos_y(player_y16 or 0)
-    globals[#globals + 1] = clamp01((WALL_MARGIN_NORM_X - pxn) / math.max(1e-6, WALL_MARGIN_NORM_X))
-    globals[#globals + 1] = clamp01((pxn - (1.0 - WALL_MARGIN_NORM_X)) / math.max(1e-6, WALL_MARGIN_NORM_X))
-    globals[#globals + 1] = clamp01((WALL_MARGIN_NORM_Y - pyn) / math.max(1e-6, WALL_MARGIN_NORM_Y))
-    globals[#globals + 1] = clamp01((pyn - (1.0 - WALL_MARGIN_NORM_Y)) / math.max(1e-6, WALL_MARGIN_NORM_Y))
-    while #globals < GLOBAL_FEATURES do
-        globals[#globals + 1] = 0.0
-    end
 
-    local token_source = {}
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        local bucket = buckets[cat.name]
-        for i = 1, #bucket do
-            token_source[#token_source + 1] = bucket[i]
-        end
-    end
-    table.sort(token_source, function(a, b)
-        if a.category == "human" and b.category ~= "human" then
-            return (a.threat + 0.1) > b.threat
-        end
-        if b.category == "human" and a.category ~= "human" then
-            return a.threat > (b.threat + 0.1)
-        end
-        if a.threat == b.threat then
-            return a.dist_norm < b.dist_norm
-        end
-        return a.threat > b.threat
-    end)
-
-    local tokens = {}
-    for i = 1, OBJECT_TOKEN_LIMIT do
-        local obj = token_source[i]
-        if obj then
-            tokens[#tokens + 1] = 1.0
-            tokens[#tokens + 1] = obj.dx
-            tokens[#tokens + 1] = obj.dy
-            tokens[#tokens + 1] = obj.vx
-            tokens[#tokens + 1] = obj.vy
-            tokens[#tokens + 1] = obj.dist_norm
-            tokens[#tokens + 1] = obj.dir_x
-            tokens[#tokens + 1] = obj.dir_y
-            tokens[#tokens + 1] = obj.threat
-            tokens[#tokens + 1] = clamp01(obj.width / 16.0)
-            tokens[#tokens + 1] = clamp01(obj.height / 16.0)
-            tokens[#tokens + 1] = (ENTITY_CATEGORY_INDEX[obj.category] or 0) / math.max(1, #ENTITY_CATEGORIES - 1)
-            tokens[#tokens + 1] = obj.is_human
-            tokens[#tokens + 1] = obj.is_dangerous
-            tokens[#tokens + 1] = clamp01((obj.approach + 1.0) * 0.5)
-        else
-            for _ = 1, OBJECT_TOKEN_FEATURES do
-                tokens[#tokens + 1] = 0.0
-            end
-        end
-    end
-
-    hud_objects = token_source
+    hud_objects = classified_objects
     hud_player_x16 = memory:read_u8(PLOBJ_ADDR + OBJX_OFF)
     hud_player_y16 = memory:read_u8(PLOBJ_ADDR + OBJY_OFF)
     hud_player_box = {x = player_hit_off_x, y = player_hit_off_y, w = player_hit_w, h = player_hit_h}
 
     return {
-        globals = globals,
-        grid = grid,
-        tokens = tokens,
+        object_count = #classified_objects,
         nearest_enemy_dist = nearest_enemy_dist,
         nearest_human_dist = nearest_human_dist,
         nearest_enemy_x16 = nearest_enemy_x16,
@@ -1854,6 +1743,181 @@ local function initialize_mame_interface()
     return true
 end
 
+local function rom_region_offset_for_cpu_addr(addr)
+    if addr >= 0x0000 and addr <= 0x8FFF then
+        return 0x10000 + addr
+    end
+    if addr >= 0xD000 and addr <= 0xFFFF then
+        return addr
+    end
+    return nil
+end
+
+local function compute_rom_page_sum(rom, page_base_addr)
+    local region_base = rom_region_offset_for_cpu_addr(page_base_addr)
+    if region_base == nil then
+        error(string.format("unsupported ROMTAB page base $%04X", page_base_addr))
+    end
+    local total = 0
+    for i = 0, 0x0FFF do
+        total = (total + (rom:read_u8(region_base + i) or 0)) & 0xFF
+    end
+    return total
+end
+
+local function romtab_sum_addr_for_page(page_index)
+    return ROMTAB_BASE_ADDR + (page_index * 2) + 1
+end
+
+local function rebalance_f000_page_checksum(rom)
+    local f_page_index = 0xF
+    local f_page_base = f_page_index * 0x1000
+    local expected_sum_addr = romtab_sum_addr_for_page(f_page_index)
+    local expected_sum_region_addr = rom_region_offset_for_cpu_addr(expected_sum_addr)
+    local fudger_region_addr = rom_region_offset_for_cpu_addr(0xFFD6)
+    if expected_sum_region_addr == nil or fudger_region_addr == nil then
+        error("unable to locate F000 ROMTAB checksum fields")
+    end
+
+    local target_sum = rom:read_u8(expected_sum_region_addr) or 0
+    local current_sum = compute_rom_page_sum(rom, f_page_base)
+    local delta = (target_sum - current_sum) & 0xFF
+    if delta ~= 0 then
+        local old_fudger = rom:read_u8(fudger_region_addr) or 0
+        rom:write_u8(fudger_region_addr, (old_fudger + delta) & 0xFF)
+    end
+
+    local final_sum = compute_rom_page_sum(rom, f_page_base)
+    if final_sum ~= target_sum then
+        error(string.format(
+            "F000 checksum rebalance failed: sum=%02X target=%02X",
+            final_sum,
+            target_sum
+        ))
+    end
+
+    return delta ~= 0
+end
+
+local function apply_rrchris_patch()
+    if not RRCHRIS_PATCH_ENABLED then
+        print("[PATCH] RRCHRIS runtime ROM patch disabled.")
+        return true
+    end
+    if rrchris_patch_applied then
+        return true
+    end
+
+    local success, result = pcall(function()
+        local regions = manager.machine.memory.regions
+        if not regions then
+            error("MAME memory regions not available")
+        end
+        local rom = regions[RRCHRIS_PATCH_REGION]
+        if not rom then
+            error("ROM region not found: " .. RRCHRIS_PATCH_REGION)
+        end
+
+        local changed_bytes = 0
+        local already_applied = true
+
+        for _, chunk in ipairs(RRCHRIS_PATCH_CHUNKS) do
+            local base = rom_region_offset_for_cpu_addr(chunk.addr)
+            if base == nil then
+                error(string.format("unsupported CPU patch address $%04X", chunk.addr))
+            end
+            if (base + #chunk.bytes - 1) >= rom.size then
+                error(string.format("patch address $%04X exceeds region bounds", chunk.addr))
+            end
+            for i, expected in ipairs(chunk.bytes) do
+                local cur = rom:read_u8(base + i - 1)
+                if cur ~= expected then
+                    already_applied = false
+                    changed_bytes = changed_bytes + 1
+                end
+            end
+        end
+
+        if already_applied then
+            return { already_applied = true, changed_bytes = 0 }
+        end
+
+        for _, chunk in ipairs(RRCHRIS_PATCH_CHUNKS) do
+            local base = rom_region_offset_for_cpu_addr(chunk.addr)
+            for i, value in ipairs(chunk.bytes) do
+                rom:write_u8(base + i - 1, value)
+            end
+        end
+
+        local page_index = 0x4
+        local page_base_addr = page_index * 0x1000
+        local romtab_sum_addr = romtab_sum_addr_for_page(page_index)
+        local romtab_region_addr = rom_region_offset_for_cpu_addr(romtab_sum_addr)
+        if romtab_region_addr == nil then
+            error(string.format("unsupported ROMTAB sum address $%04X", romtab_sum_addr))
+        end
+        local expected_sum = compute_rom_page_sum(rom, page_base_addr)
+        if rom:read_u8(romtab_region_addr) ~= expected_sum then
+            changed_bytes = changed_bytes + 1
+            rom:write_u8(romtab_region_addr, expected_sum)
+        end
+        if rebalance_f000_page_checksum(rom) then
+            changed_bytes = changed_bytes + 1
+        end
+
+        for _, chunk in ipairs(RRCHRIS_PATCH_CHUNKS) do
+            local base = rom_region_offset_for_cpu_addr(chunk.addr)
+            for i, expected in ipairs(chunk.bytes) do
+                local actual = rom:read_u8(base + i - 1)
+                if actual ~= expected then
+                    error(string.format(
+                        "verification failed at $%04X: expected %02X got %02X",
+                        chunk.addr + i - 1, expected, actual
+                    ))
+                end
+            end
+        end
+
+        local page_sum_check = compute_rom_page_sum(rom, 0x4000)
+        local romtab_expected = rom:read_u8(romtab_region_addr)
+        if page_sum_check ~= romtab_expected then
+            error(string.format(
+                "ROMTAB verification failed for $4000 page: sum=%02X table=%02X",
+                page_sum_check,
+                romtab_expected
+            ))
+        end
+        local f000_expected = rom:read_u8(rom_region_offset_for_cpu_addr(0xFFD4))
+        local f000_sum_check = compute_rom_page_sum(rom, 0xF000)
+        if f000_sum_check ~= f000_expected then
+            error(string.format(
+                "ROMTAB verification failed for $F000 page: sum=%02X table=%02X",
+                f000_sum_check,
+                f000_expected
+            ))
+        end
+
+        return { already_applied = false, changed_bytes = changed_bytes }
+    end)
+
+    if not success then
+        print("[PATCH] RRCHRIS patch failed: " .. tostring(result))
+        return false
+    end
+
+    rrchris_patch_applied = true
+    if result.already_applied then
+        print("[PATCH] RRCHRIS enforcer fix already present in " .. RRCHRIS_PATCH_REGION .. ".")
+    else
+        print(string.format(
+            "[PATCH] Applied RRCHRIS enforcer fix to %s (%d byte updates).",
+            RRCHRIS_PATCH_REGION,
+            result.changed_bytes
+        ))
+    end
+    return true
+end
+
 local function close_socket()
     if current_socket then
         current_socket:close()
@@ -2190,7 +2254,7 @@ end
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
                                player_x16, player_y16,
                                enemy_state, legacy_list_values,
-                               done, subj_reward, obj_reward, save_signal,
+                               done, subj_reward, obj_reward, save_signal, start_cmd,
                                preview_w, preview_h, preview_fmt, preview_blob)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
     local replay_u32 = math.max(0, math.min(4294967295, math.floor(replay_level or 0)))
@@ -2231,7 +2295,7 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     end
 
     local header = string.pack(
-        ">HddBIBBIBB",
+        ">HddBIBBBIBB",
         num_values,
         subj_reward,
         obj_reward,
@@ -2239,6 +2303,7 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
         score_u32,
         player_alive,
         save_signal,
+        math.max(0, math.min(1, math.floor(start_cmd or 0))),
         replay_u32,
         lasers_u8,
         wave_u8
@@ -2426,7 +2491,7 @@ function read_frame_observation()
     end
     local obs = obs_or_err
     trace_log(frame_counter, "extract_world_features",
-        string.format("globals=%d grid=%d tokens=%d", #(obs.globals or {}), #(obs.grid or {}), #(obs.tokens or {})))
+        string.format("objects=%d legacy=%d", tonumber(obs.object_count or 0), #(obs.legacy_list_features or {})))
 
     return {
         player_alive = player_alive,
@@ -2545,6 +2610,7 @@ function frame_callback()
     else
         dead_frame_counter = 0
     end
+    local start_cmd, coin_cmd = determine_meta_commands(dead_frame_counter, player_alive)
 
     local now = os.time()
     local save_signal = 0
@@ -2560,7 +2626,7 @@ function frame_callback()
         frame.player_alive, frame.score, frame.replay_level, frame.num_lasers, frame.wave_number,
         frame.player_x16, frame.player_y16,
         frame.enemy_state, frame.obs.legacy_list_features,
-        rewards.done, rewards.subj_reward, rewards.obj_reward, save_signal,
+        rewards.done, rewards.subj_reward, rewards.obj_reward, save_signal, start_cmd,
         preview.w, preview.h, preview.fmt, preview.blob
     )
     if not ok_payload then
@@ -2601,7 +2667,6 @@ function frame_callback()
         )
     end
 
-    local start_cmd, coin_cmd = determine_meta_commands(dead_frame_counter, player_alive)
     local effective_fire = fire_cmd  -- fallback if pcall fails
     local ok_apply, apply_result = pcall(controls.apply_action, controls, move_cmd, fire_cmd, start_cmd, coin_cmd)
     if not ok_apply then
@@ -2686,6 +2751,11 @@ end
 math.randomseed(os.time())
 
 if not initialize_mame_interface() then
+    return
+end
+
+if not apply_rrchris_patch() then
+    print("Robotron AI Lua script aborted due to RRCHRIS patch failure.")
     return
 end
 

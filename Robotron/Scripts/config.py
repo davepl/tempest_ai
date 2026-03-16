@@ -119,6 +119,23 @@ def _parse_webrtc_ice_servers_env() -> list[dict]:
 # Dashboard WebRTC ICE server list (TURN/STUN). Env override takes precedence.
 WEBRTC_ICE_SERVERS = _parse_webrtc_ice_servers_env()
 
+LEGACY_ENTITY_CATEGORIES: tuple[tuple[str, int], ...] = (
+    ("grunt", 40),
+    ("hulk", 16),
+    ("brain", 16),
+    ("tank", 8),
+    ("spawner", 8),
+    ("enforcer", 12),
+    ("projectile", 12),
+    ("human", 16),
+    ("electrode", 16),
+)
+LEGACY_SLOT_STATE_FEATURES = 6
+LEGACY_ELIST_FEATURES = 50
+LEGACY_CORE_FEATURES = 9
+LEGACY_TOTAL_SLOTS = sum(int(slots) for _name, slots in LEGACY_ENTITY_CATEGORIES)
+LEGACY_PARAMS_COUNT = LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + len(LEGACY_ENTITY_CATEGORIES) + (LEGACY_TOTAL_SLOTS * LEGACY_SLOT_STATE_FEATURES)
+
 # ---------------------------------------------------------------------------
 @dataclass
 class ServerConfigData:
@@ -130,9 +147,10 @@ class ServerConfigData:
     #   + 2 player position
     #   + 2 player velocity
     #   + 50 ELIST bytes
-    #   + 9 typed entity buckets, each: 1 occupancy + N slots x 4 features
-    #   = 644 floats total
-    params_count: int = 644
+    #   + 9 typed entity buckets, each: 1 occupancy + N slots x 6 features
+    #     (present, dx, dy, dist, hit_w, hit_h)
+    #   = 932 floats total
+    params_count: int = LEGACY_PARAMS_COUNT
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -142,10 +160,10 @@ class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     # Base per-frame state from Lua wire protocol.
     base_state_size: int = SERVER_CONFIG.params_count
-    # Legacy learner profile: use short temporal stacking over the compact slot state.
-    frame_stack: int = 4
+    # Structured slot encoder: only latest + previous frames are consumed directly.
+    frame_stack: int = 2
     # Effective model input width after stacking.
-    state_size: int = SERVER_CONFIG.params_count * 4
+    state_size: int = SERVER_CONFIG.params_count * 2
 
     # Factored action space for Robotron dual sticks:
     #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
@@ -174,32 +192,24 @@ class RLConfigData:
     #   size_x, size_y, category_norm, is_human, is_dangerous, approach
     object_token_features: int = 15
 
-    trunk_hidden: int = 512
-    trunk_layers: int = 3
+    trunk_hidden: int = 256
+    trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Legacy learner: compact slot-attention over typed entity buckets.
+    # Structured learner: compact slot encoding over typed entity buckets.
     use_enemy_attention: bool = True
-    entity_categories: list = field(default_factory=lambda: [
-        ("grunt",      40),
-        ("hulk",       16),
-        ("brain",      16),
-        ("tank",        8),
-        ("spawner",     8),
-        ("enforcer",   12),
-        ("projectile", 12),
-        ("human",      16),
-        ("electrode",  16),
-    ])
-    object_slots: int = 144
-    slot_state_features: int = 4
-    legacy_slot_token_features: int = 7
-    attn_heads: int = 8
-    attn_dim: int = 128
-    attn_layers: int = 3
+    entity_categories: list = field(default_factory=lambda: list(LEGACY_ENTITY_CATEGORIES))
+    object_slots: int = LEGACY_TOTAL_SLOTS
+    slot_state_features: int = LEGACY_SLOT_STATE_FEATURES
+    legacy_slot_token_features: int = 10
+    attn_heads: int = 4
+    attn_dim: int = 96
+    attn_layers: int = 1
     grid_hidden_channels: int = 32
-    global_hidden: int = 192
+    global_hidden: int = 128
+    category_summary_dim: int = 48
+    entity_hidden: int = 192
 
     # Distributional C51
     # Robotron per-frame rewards: grunt=100, brain=500, human rescue=1000-5000.
@@ -225,17 +235,17 @@ class RLConfigData:
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 20_000_000
+    memory_size: int = 10_000_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
     # Empty string means derive from latest checkpoint path (<model>_replay).
     replay_memmap_dir: str = ""
-    priority_alpha: float = 0.7
-    priority_beta_start: float = 0.4
-    priority_beta_frames: int = 10_000_000
+    priority_alpha: float = 0.6
+    priority_beta_start: float = 0.55
+    priority_beta_frames: int = 5_000_000
     priority_eps: float = 1e-6
-    per_new_priority_cap_multiplier: float = 3.0  # Cap new-entry priority vs current mean to reduce recency runaway
+    per_new_priority_cap_multiplier: float = 2.0  # Cap new-entry priority vs current mean to reduce recency runaway
     # Delay training until replay has enough diversity for stable updates.
     min_replay_to_train: int = 25_000
     # Wave-aware replay quotas: preserve frontier/high-wave DQN experience so
@@ -540,6 +550,7 @@ class MetricsData:
 
     average_level: float = 0.0
     peak_level: int = 0
+    peak_level_verified: bool = False
     peak_episode_reward: float = 0.0
     peak_game_score: int = 0
     game_scores: Deque[int] = field(default_factory=lambda: deque(maxlen=100))

@@ -127,6 +127,7 @@ class PrioritizedReplayBuffer:
         self.alpha = float(alpha)
         self.lock = threading.Lock()
         self._memmap_dir = memmap_dir or None
+        self._memmap_layout_reused = True
 
         # Storage arrays — either RAM-backed (np.zeros) or disk-backed (np.memmap)
         if self._memmap_dir:
@@ -153,7 +154,10 @@ class PrioritizedReplayBuffer:
 
         # Auto-restore from memmap metadata if available.
         if self._memmap_dir:
-            self._try_restore_memmap_meta()
+            if self._memmap_layout_reused:
+                self._try_restore_memmap_meta()
+            else:
+                self._clear_memmap_meta()
 
     # ── Memmap helpers ───────────────────────────────────────────────────
 
@@ -164,6 +168,7 @@ class PrioritizedReplayBuffer:
         if os.path.isfile(path) and os.path.getsize(path) == expected_bytes:
             return np.memmap(path, dtype=dtype, mode="r+", shape=shape)
         # Wrong size or missing — (re)create.
+        self._memmap_layout_reused = False
         if os.path.exists(path):
             os.remove(path)
         mm = np.memmap(path, dtype=dtype, mode="w+", shape=shape)
@@ -171,6 +176,16 @@ class PrioritizedReplayBuffer:
             mm.fill(fill)
             mm.flush()
         return mm
+
+    def _clear_memmap_meta(self):
+        """Drop stale replay metadata when the on-disk layout was recreated."""
+        for name in ("_meta.npy", "priorities.npy"):
+            path = os.path.join(self._memmap_dir, name)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
     def _try_restore_memmap_meta(self):
         """Restore buffer state (size, SumTree) from memmap metadata."""
@@ -226,6 +241,8 @@ class PrioritizedReplayBuffer:
             horizon: int = 1, expert: int = 0, priority_hint: float = 0.0,
             level_mult: float = 1.0):
         with self.lock:
+            eps = max(0.0, float(getattr(RL_CONFIG, "priority_eps", 1e-6) or 0.0))
+            min_priority = max(1e-12, eps ** self.alpha if eps > 0.0 else 1e-12)
             priority = self.tree.max_priority
             cap_mult = float(getattr(RL_CONFIG, "per_new_priority_cap_multiplier", 0.0))
             mean_pri = 0.0
@@ -234,7 +251,7 @@ class PrioritizedReplayBuffer:
                 if mean_pri > 0.0:
                     priority = min(priority, mean_pri * cap_mult)
             if priority_hint != 0.0:
-                hint_pri = abs(priority_hint) ** self.alpha
+                hint_pri = (abs(priority_hint) + eps) ** self.alpha
                 if hint_pri > priority:
                     priority = hint_pri
             if cap_mult > 0.0 and mean_pri > 0.0:
@@ -245,7 +262,7 @@ class PrioritizedReplayBuffer:
                 priority *= level_mult
                 if cap_mult > 0.0 and mean_pri > 0.0:
                     priority = min(priority, mean_pri * cap_mult)
-            priority = max(1e-6, float(priority))
+            priority = max(min_priority, float(priority))
             # If buffer is full, undo the expert flag of the slot being recycled
             if self.tree.size >= self.capacity:
                 self._n_expert -= int(self.is_expert[self.tree.data_ptr])
@@ -280,7 +297,9 @@ class PrioritizedReplayBuffer:
             np.clip(indices, 0, self.size - 1, out=indices)
 
             # Gather priorities in one vectorised read
-            priorities = np.maximum(1e-10, self.tree.tree[indices + self.tree.capacity])
+            eps = max(0.0, float(getattr(RL_CONFIG, "priority_eps", 1e-6) or 0.0))
+            min_priority = max(1e-12, eps ** self.alpha if eps > 0.0 else 1e-12)
+            priorities = np.maximum(min_priority, self.tree.tree[indices + self.tree.capacity])
 
             # Importance-sampling weights
             probs = priorities / total
@@ -302,7 +321,8 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, indices, td_errors):
         """Update priorities based on TD errors (fully vectorised)."""
         with self.lock:
-            new_p = (np.abs(td_errors.astype(np.float64)) + 1e-6) ** self.alpha
+            eps = max(0.0, float(getattr(RL_CONFIG, "priority_eps", 1e-6) or 0.0))
+            new_p = (np.abs(td_errors.astype(np.float64)) + eps) ** self.alpha
             self.tree.batch_update(np.asarray(indices, dtype=np.int64), new_p)
 
     def boost_priorities(self, indices, factor: float):

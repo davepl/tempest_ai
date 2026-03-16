@@ -68,6 +68,7 @@ def _export_metrics_snapshot() -> dict:
                 "avg_game_score": float(metrics.avg_game_score),
                 "total_games_played": int(metrics.total_games_played),
                 "peak_level": int(metrics.peak_level),
+                "peak_level_verified": bool(getattr(metrics, "peak_level_verified", False)),
                 "peak_episode_reward": float(metrics.peak_episode_reward),
                 "peak_game_score": int(metrics.peak_game_score),
             }
@@ -113,7 +114,8 @@ def _restore_metrics_snapshot(snap: dict | None) -> None:
                 metrics.game_scores.extend(int(x) for x in snap.get("game_scores", []))
             metrics.avg_game_score = float(snap.get("avg_game_score", metrics.avg_game_score))
             metrics.total_games_played = int(snap.get("total_games_played", metrics.total_games_played))
-            metrics.peak_level = int(snap.get("peak_level", metrics.peak_level))
+            metrics.peak_level_verified = bool(snap.get("peak_level_verified", False))
+            metrics.peak_level = int(snap.get("peak_level", 0)) if metrics.peak_level_verified else 0
             metrics.peak_episode_reward = float(snap.get("peak_episode_reward", metrics.peak_episode_reward))
             metrics.peak_game_score = int(snap.get("peak_game_score", metrics.peak_game_score))
     except Exception:
@@ -163,6 +165,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
+MODEL_ARCH_VERSION = 3
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -214,6 +217,7 @@ class FrameData:
     done: bool
     save_signal: bool
     player_alive: bool
+    start_pressed: bool = False
     level_number: int = 0
     game_score: int = 0
     next_replay_level: int = 0
@@ -228,12 +232,12 @@ class FrameData:
 
 def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameData]:
     try:
-        fmt = ">HddBIBBIBB"
+        fmt = ">HddBIBBBIBB"
         hdr = struct.calcsize(fmt)
         if not data or len(data) < hdr:
             return None
         vals = struct.unpack(fmt, data[:hdr])
-        (n, subj, obj, done, score, player_alive, save, replay_level, num_lasers, wave_number) = vals
+        (n, subj, obj, done, score, player_alive, save, start_pressed, replay_level, num_lasers, wave_number) = vals
         base_len = hdr + (int(n) * 4)
         if len(data) < base_len:
             return None
@@ -370,6 +374,7 @@ def parse_frame_data(data: bytes, parse_preview: bool = True) -> Optional[FrameD
             state=state, subjreward=float(subj), objreward=float(obj),
             done=bool(done), save_signal=bool(save),
             player_alive=bool(player_alive),
+            start_pressed=bool(start_pressed),
             level_number=int(wave_number),
             game_score=int(score),
             next_replay_level=int(replay_level),
@@ -752,7 +757,7 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
     for name, base, slots, cat_idx in cat_info:
         latest_block = latest[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
         prev_block = prev[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
-        size_x_px, size_y_px = _LEGACY_CATEGORY_BOX_PX.get(name, (8.0, 8.0))
+        fallback_w_px, fallback_h_px = _LEGACY_CATEGORY_BOX_PX.get(name, (8.0, 8.0))
         threat_w = _LEGACY_THREAT_WEIGHT.get(name, 0.5)
         is_human = 1.0 if name == "human" else 0.0
         is_dangerous = 1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
@@ -764,6 +769,11 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
             dx = float(latest_block[slot_idx, 1])
             dy = float(latest_block[slot_idx, 2])
             dist = float(latest_block[slot_idx, 3])
+            size_x_px = fallback_w_px
+            size_y_px = fallback_h_px
+            if slot_features >= 6:
+                size_x_px = max(1.0, float(latest_block[slot_idx, 4]) * 16.0)
+                size_y_px = max(1.0, float(latest_block[slot_idx, 5]) * 16.0)
             if not np.isfinite(dist):
                 continue
 
@@ -870,6 +880,14 @@ def _nearest_align_robot_vector_from_state(state: np.ndarray) -> Optional[Tuple[
         if best is None or dist < best[2]:
             best = (float(tok[1]), float(tok[2]), dist)
     return best
+
+
+def _preferred_align_robot_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    """Prefer visible spheroids for alignment; otherwise fall back to nearest alignable robot."""
+    nearest_spheroid = _nearest_category_vector_from_state(state, {"spawner"})
+    if nearest_spheroid is not None:
+        return nearest_spheroid
+    return _nearest_align_robot_vector_from_state(state)
 
 
 def _nearest_endgame_cleanup_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -1058,16 +1076,16 @@ def _nearby_avoidance_vectors_from_state(
         dist = float(tok[5])
         if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(dist)):
             continue
-        box_x = dx * _REL_POS_X_RANGE
-        box_y = dy * _REL_POS_Y_RANGE
+        center_x = (0.5 * _PLAYER_BOX_W_WORLD) + (dx * _REL_POS_X_RANGE)
+        center_y = (0.5 * _PLAYER_BOX_H_WORLD) + (dy * _REL_POS_Y_RANGE)
         width_px = max(1.0, float(tok[9]) * 16.0)
         height_px = max(1.0, float(tok[10]) * 16.0)
         box_w = width_px * _WORLD_UNITS_PER_PIXEL
         box_h = height_px * _WORLD_UNITS_PER_PIXEL
+        box_x = center_x - (0.5 * box_w)
+        box_y = center_y - (0.5 * box_h)
         pad_px = _AVOIDANCE_BASE_PADDING_PX + _AVOIDANCE_PADDING_PX_BY_CATEGORY.get(name, 0.5)
         pad_world = pad_px * _WORLD_UNITS_PER_PIXEL
-        center_x = box_x + (0.5 * box_w)
-        center_y = box_y + (0.5 * box_h)
         clearance_now = _aabb_clearance_top_left(
             0.0,
             0.0,
@@ -1406,7 +1424,7 @@ def _get_simple_expert_action(
     """
     nearest_enemy = _nearest_enemy_vector_from_state(state)
     nearest_projectile = _nearest_projectile_vector_from_state(state)
-    nearest_align_robot = _nearest_align_robot_vector_from_state(state)
+    nearest_align_robot = _preferred_align_robot_vector_from_state(state)
     nearest_endgame_cleanup = _nearest_endgame_cleanup_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
@@ -1489,9 +1507,6 @@ def _get_simple_expert_action(
         if blocked_fire_dir is not None:
             fire_dir = int(blocked_fire_dir)
 
-    # ── Lava guard: never move into the outer 16 px ─────────────────
-    move_dir = _forbid_lava(move_dir, px, py)
-
     return move_dir, fire_dir
 
 
@@ -1504,7 +1519,7 @@ def _get_strategic_expert_action(
     nearest_enemy = _nearest_enemy_vector_from_state(state)
     nearest_projectile = _nearest_projectile_vector_from_state(state)
     nearest_brain_tank = _nearest_category_vector_from_state(state, {"brain", "tank"})
-    nearest_align_robot = _nearest_align_robot_vector_from_state(state)
+    nearest_align_robot = _preferred_align_robot_vector_from_state(state)
     nearest_endgame_cleanup = _nearest_endgame_cleanup_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
@@ -1622,8 +1637,6 @@ def _get_strategic_expert_action(
         if blocked_fire_dir is not None:
             fire_dir = int(blocked_fire_dir)
 
-    move_dir = _forbid_lava(move_dir, px, py)
-
     return move_dir, fire_dir
 
 
@@ -1637,44 +1650,62 @@ def get_expert_action(
         return _get_strategic_expert_action(state, locked_fire=locked_fire, wave_number=wave_number)
     return _get_simple_expert_action(state, locked_fire=locked_fire, wave_number=wave_number)
 
-# ── Enemy-Slot Self-Attention ───────────────────────────────────────────────
+# ── Enemy-Slot Attention Pooling ────────────────────────────────────────────
 class EnemyAttention(nn.Module):
-    """Multi-head self-attention over entity slots, producing a fixed-size summary."""
+    """Encode object slots, then pool them with a learned attention query."""
 
     def __init__(self, slot_features: int, embed_dim: int, num_heads: int):
         super().__init__()
-        self.embed = nn.Linear(slot_features, embed_dim)
+        self.embed = nn.Sequential(
+            nn.Linear(slot_features, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(),
+        )
+        self.query = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(embed_dim)
-        # Learned query token for stronger "critical-threat" readout than mean-pooling.
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.out_dim = embed_dim
+        self.reset_parameters()
 
-    def forward(self, slots: torch.Tensor, mask: torch.Tensor = None,
-                return_weights: bool = False):
-        """slots: (B, num_slots, slot_features) → (B, embed_dim)
-        mask: (B, num_slots) bool tensor — True = slot is EMPTY (ignored in attention).
-        If return_weights=True, also returns (B, num_heads, S+1, S+1) attention weights."""
-        x = self.embed(slots)                   # (B, S, D)
-        x = self.norm(x)
+    def reset_parameters(self):
+        for module in self.embed.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+        nn.init.normal_(self.query, mean=0.0, std=0.02)
+        try:
+            self.attn._reset_parameters()
+        except Exception:
+            pass
 
-        # Prepend a learned CLS token and read it back after self-attention.
+    def encode(self, slots: torch.Tensor) -> torch.Tensor:
+        return self.embed(slots)
+
+    def forward(
+        self,
+        slots: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        return_weights: bool = False,
+        encoded: bool = False,
+    ):
+        """slots: (B, num_slots, features or embed_dim) → (B, embed_dim)."""
+        x = slots if encoded else self.encode(slots)
         bsz = x.shape[0]
-        cls = self.cls_token.expand(bsz, -1, -1)   # (B, 1, D)
-        x = torch.cat([cls, x], dim=1)             # (B, S+1, D)
-
-        key_padding_mask = None
-        if mask is not None:
-            cls_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=mask.device)
-            key_padding_mask = torch.cat([cls_mask, mask], dim=1)  # (B, S+1)
-
+        query = self.query.expand(bsz, -1, -1)
         attn_out, attn_weights = self.attn(
-            x, x, x,
-            key_padding_mask=key_padding_mask,
+            query,
+            x,
+            x,
+            key_padding_mask=mask,
             average_attn_weights=False,
-        )  # (B, S+1, D), (B, H, S+1, S+1)
-
-        pooled = attn_out[:, 0, :]  # CLS output
+        )  # (B, 1, D), (B, H, 1, S)
+        pooled = attn_out[:, 0, :]
         if return_weights:
             return pooled, attn_weights
         return pooled
@@ -1755,6 +1786,23 @@ class GlobalEncoder(nn.Module):
         return self.net(x)
 
 
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.0, use_layer_norm: bool = True):
+        super().__init__()
+        hidden = dim * 2
+        self.norm1 = nn.LayerNorm(dim) if use_layer_norm else nn.Identity()
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        h = F.relu(self.fc1(h))
+        h = self.dropout(h)
+        h = self.fc2(h)
+        return x + h
+
+
 class SpatialGridEncoder(nn.Module):
     def __init__(self, channels: int, hidden_channels: int, out_dim: int):
         super().__init__()
@@ -1814,7 +1862,7 @@ class EntitySetEncoder(nn.Module):
 
 # ── Distributional Dueling Network ─────────────────────────────────────────
 class RainbowNet(nn.Module):
-    """Legacy Robotron network with object-slot self-attention."""
+    """Structured Robotron network with explicit global and object-slot branches."""
 
     def __init__(self, state_size: int):
         super().__init__()
@@ -1827,50 +1875,71 @@ class RainbowNet(nn.Module):
         self.use_dueling = cfg.use_dueling
         self.num_actions = NUM_JOINT
         self.use_attn = bool(getattr(cfg, "use_enemy_attention", True))
-        attn_out_dim = 0
-        if self.use_attn:
-            self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
-            self.num_object_slots = int(getattr(cfg, "object_slots", 144))
-            self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 7))
-            self.slot_state_features = int(getattr(cfg, "slot_state_features", 4))
+        self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
+        self.num_object_slots = int(getattr(cfg, "object_slots", 144))
+        self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 10))
+        self.slot_state_features = int(getattr(cfg, "slot_state_features", 6))
+        self.core_feature_count = 59  # 9 core + 50 ELIST
 
-            cat_defs = getattr(cfg, "entity_categories", [
-                ("grunt", 40),
-                ("hulk", 16),
-                ("brain", 16),
-                ("tank", 8),
-                ("spawner", 8),
-                ("enforcer", 12),
-                ("projectile", 12),
-                ("human", 16),
-                ("electrode", 16),
-            ])
-            self._cat_info = []
-            offset = 59  # 9 core + 50 ELIST
-            for cat_id, (_name, slots) in enumerate(cat_defs):
-                slots_i = int(slots)
-                self._cat_info.append((offset, slots_i, cat_id))
-                offset += 1 + (slots_i * self.slot_state_features)
-            self._num_categories = len(cat_defs)
+        cat_defs = getattr(cfg, "entity_categories", [
+            ("grunt", 40),
+            ("hulk", 16),
+            ("brain", 16),
+            ("tank", 8),
+            ("spawner", 8),
+            ("enforcer", 12),
+            ("projectile", 12),
+            ("human", 16),
+            ("electrode", 16),
+        ])
+        self._cat_info = []
+        self._category_ranges = []
+        offset = self.core_feature_count
+        slot_cursor = 0
+        for cat_id, (name, slots) in enumerate(cat_defs):
+            slots_i = int(slots)
+            self._cat_info.append((name, offset, slots_i, cat_id))
+            self._category_ranges.append((name, slot_cursor, slot_cursor + slots_i))
+            offset += 1 + (slots_i * self.slot_state_features)
+            slot_cursor += slots_i
+        self._num_categories = len(cat_defs)
 
-            self.object_attn = EnemyAttention(
-                slot_features=self.object_token_features,
-                embed_dim=int(getattr(cfg, "attn_dim", 128)),
-                num_heads=int(getattr(cfg, "attn_heads", 8)),
+        attn_dim = int(getattr(cfg, "attn_dim", 96))
+        category_summary_dim = int(getattr(cfg, "category_summary_dim", 48))
+        entity_hidden = int(getattr(cfg, "entity_hidden", 192))
+        self.global_encoder = GlobalEncoder(
+            in_dim=(self.core_feature_count * 2) + (self._num_categories * 2),
+            hidden_dim=int(getattr(cfg, "global_hidden", 128)),
+        )
+        self.object_attn = EnemyAttention(
+            slot_features=self.object_token_features,
+            embed_dim=attn_dim,
+            num_heads=int(getattr(cfg, "attn_heads", 4)),
+        )
+        self.category_proj = nn.Sequential(
+            nn.Linear((attn_dim * 2) + 1, category_summary_dim),
+            nn.LayerNorm(category_summary_dim),
+            nn.ReLU(),
+        )
+        self.entity_proj = nn.Sequential(
+            nn.Linear(attn_dim + (category_summary_dim * self._num_categories), entity_hidden),
+            nn.LayerNorm(entity_hidden),
+            nn.ReLU(),
+        )
+        fusion_in = self.global_encoder.out_dim + entity_hidden
+        self.input_proj = nn.Sequential(
+            nn.Linear(fusion_in, int(cfg.trunk_hidden)),
+            nn.LayerNorm(int(cfg.trunk_hidden)) if cfg.use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+        )
+        self.trunk = nn.Sequential(*[
+            ResidualMLPBlock(
+                int(cfg.trunk_hidden),
+                dropout=float(cfg.dropout),
+                use_layer_norm=bool(cfg.use_layer_norm),
             )
-            attn_out_dim = int(getattr(cfg, "attn_dim", 128))
-
-        trunk_in = state_size + attn_out_dim
-        layers = []
-        for i in range(int(cfg.trunk_layers)):
-            out_dim = int(cfg.trunk_hidden)
-            layers.append(nn.Linear(trunk_in if i == 0 else out_dim, out_dim))
-            if cfg.use_layer_norm:
-                layers.append(nn.LayerNorm(out_dim))
-            layers.append(nn.ReLU())
-            if cfg.dropout > 0:
-                layers.append(nn.Dropout(cfg.dropout))
-        self.trunk = nn.Sequential(*layers)
+            for _ in range(int(cfg.trunk_layers))
+        ])
 
         head_in = int(cfg.trunk_hidden)
         head_mid = max(64, head_in // 2)
@@ -1896,20 +1965,38 @@ class RainbowNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def _build_object_tokens(self, state: torch.Tensor):
-        """Build legacy object-slot tokens from stacked per-category state."""
+    def _frame_offsets(self, state: torch.Tensor) -> tuple[int, int]:
+        total_dim = int(state.shape[1])
+        stack_depth = max(1, total_dim // self.base_state_size)
+        latest_off = (stack_depth - 1) * self.base_state_size
+        prev_off = (stack_depth - 2) * self.base_state_size if stack_depth >= 2 else latest_off
+        return latest_off, prev_off
+
+    def _build_global_features(self, state: torch.Tensor) -> torch.Tensor:
+        latest_off, prev_off = self._frame_offsets(state)
+        latest_core = state[:, latest_off: latest_off + self.core_feature_count]
+        prev_core = state[:, prev_off: prev_off + self.core_feature_count]
+        latest_occ = []
+        prev_occ = []
+        for _name, base, _slots, _cat_id in self._cat_info:
+            latest_occ.append(state[:, latest_off + base: latest_off + base + 1])
+            prev_occ.append(state[:, prev_off + base: prev_off + base + 1])
+        return torch.cat([latest_core, prev_core, *latest_occ, *prev_occ], dim=1)
+
+    def _build_object_context(self, state: torch.Tensor):
+        """Build typed slot tokens and masks from the stacked compact state."""
         B = state.shape[0]
         device = state.device
-        base_state_size = max(1, int(getattr(self, "base_state_size", SERVER_CONFIG.params_count)))
-        total_dim = int(state.shape[1])
-        stack_depth = max(1, total_dim // base_state_size)
-        latest_off = (stack_depth - 1) * base_state_size
-        prev_off = (stack_depth - 2) * base_state_size if stack_depth >= 2 else latest_off
+        latest_off, prev_off = self._frame_offsets(state)
 
         all_tokens = []
         all_masks = []
+        occupancies = []
 
-        for base, slots, cat_id in self._cat_info:
+        for name, base, slots, cat_id in self._cat_info:
+            latest_occ = state[:, latest_off + base: latest_off + base + 1]
+            occupancies.append(latest_occ)
+
             latest = state[:, latest_off + base + 1: latest_off + base + 1 + slots * self.slot_state_features]
             latest = latest.reshape(B, slots, self.slot_state_features)
             prev = state[:, prev_off + base + 1: prev_off + base + 1 + slots * self.slot_state_features]
@@ -1919,6 +2006,8 @@ class RainbowNet(nn.Module):
             dx = latest[:, :, 1:2]
             dy = latest[:, :, 2:3]
             dist = latest[:, :, 3:4]
+            width = latest[:, :, 4:5] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
+            height = latest[:, :, 5:6] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
 
             prev_present = prev[:, :, 0]
             prev_dx = prev[:, :, 1:2]
@@ -1933,26 +2022,57 @@ class RainbowNet(nn.Module):
                 device=device,
                 dtype=state.dtype,
             )
+            is_human = torch.full((B, slots, 1), 1.0 if name == "human" else 0.0, device=device, dtype=state.dtype)
+            is_dangerous = torch.full(
+                (B, slots, 1),
+                1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0,
+                device=device,
+                dtype=state.dtype,
+            )
 
-            tokens = torch.cat([dx, dy, dist, ddx, ddy, cat_norm, present.unsqueeze(2)], dim=2)
+            tokens = torch.cat(
+                [dx, dy, dist, ddx, ddy, width, height, cat_norm, is_human, is_dangerous],
+                dim=2,
+            )
             all_tokens.append(tokens)
             all_masks.append(present < 0.5)
 
         tokens = torch.cat(all_tokens, dim=1)
         mask = torch.cat(all_masks, dim=1)
+        occupancies_t = torch.cat(occupancies, dim=1)
         all_empty = mask.all(dim=1, keepdim=True)
         mask = mask & ~all_empty
+        return tokens, mask, occupancies_t
+
+    def _build_object_tokens(self, state: torch.Tensor):
+        tokens, mask, _ = self._build_object_context(state)
         return tokens, mask
 
     def forward(self, state: torch.Tensor, log: bool = False):
         B = state.shape[0]
-        if self.use_attn:
-            obj_tokens, obj_mask = self._build_object_tokens(state)
-            attn_out = self.object_attn(obj_tokens, obj_mask)
-            trunk_in = torch.cat([state, attn_out], dim=1)
-        else:
-            trunk_in = state
-        h = self.trunk(trunk_in)
+        global_in = self._build_global_features(state)
+        global_out = self.global_encoder(global_in)
+
+        obj_tokens, obj_mask, occupancies = self._build_object_context(state)
+        encoded_slots = self.object_attn.encode(obj_tokens)
+        attn_out = self.object_attn(encoded_slots, obj_mask, encoded=True)
+
+        cat_summaries = []
+        for cat_idx, (_name, lo, hi) in enumerate(self._category_ranges):
+            cat_encoded = encoded_slots[:, lo:hi, :]
+            cat_mask = obj_mask[:, lo:hi]
+            active = (~cat_mask).unsqueeze(2).to(dtype=state.dtype)
+            active_any = (~cat_mask).any(dim=1, keepdim=True).to(dtype=state.dtype)
+            nearest = cat_encoded[:, 0, :] * active_any
+            mean = (cat_encoded * active).sum(dim=1) / active.sum(dim=1).clamp_min(1.0)
+            mean = mean * active_any
+            cat_feat = torch.cat([nearest, mean, occupancies[:, cat_idx:cat_idx + 1]], dim=1)
+            cat_summaries.append(self.category_proj(cat_feat))
+
+        entity_in = torch.cat([attn_out, *cat_summaries], dim=1)
+        entity_out = self.entity_proj(entity_in)
+        h = self.input_proj(torch.cat([global_out, entity_out], dim=1))
+        h = self.trunk(h)
 
         if self.use_dueling:
             val = F.relu(self.val_fc(h))
@@ -2590,6 +2710,7 @@ class RainbowAgent:
             "epsilon": ep,
             "metrics_state": _export_metrics_snapshot(),
             "engine_version": 2,
+            "model_arch_version": MODEL_ARCH_VERSION,
         }
         if hasattr(self, "grad_scaler") and self.grad_scaler is not None:
             ckpt["grad_scaler_state_dict"] = self.grad_scaler.state_dict()
@@ -2633,6 +2754,9 @@ class RainbowAgent:
             # Detect old engine (v1) checkpoints
             if "engine_version" not in ckpt:
                 print("⚠  Old engine checkpoint detected — starting fresh with new architecture.")
+                return False
+            if int(ckpt.get("model_arch_version", 0)) != MODEL_ARCH_VERSION:
+                print("⚠  Checkpoint architecture mismatch — starting fresh with structured slot encoder.")
                 return False
 
             m1, u1 = self._load_compatible(self.online_net, ckpt.get("online_state_dict", {}))
@@ -2710,25 +2834,20 @@ class RainbowAgent:
         self.memory.flush()
 
     def reset_attention_weights(self):
-        """Reinitialize only the object self-attention weights, keeping trunk and heads intact."""
+        """Reinitialize only the object-slot attention encoder, keeping trunk and heads intact."""
         if not self.online_net.use_attn:
             print("No attention layer to reset.")
             return
         for net in (self.online_net, self.target_net):
-            for m in net.object_attn.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=1.0)
-                    nn.init.constant_(m.bias, 0.0)
-                elif isinstance(m, nn.LayerNorm):
-                    nn.init.constant_(m.weight, 1.0)
-                    nn.init.constant_(m.bias, 0.0)
+            if hasattr(net.object_attn, "reset_parameters"):
+                net.object_attn.reset_parameters()
         self._sync_inference(force=True)
         attn_param_ids = {id(p) for p in self.online_net.object_attn.parameters()}
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if id(p) in attn_param_ids and p in self.optimizer.state:
                     del self.optimizer.state[p]
-        print("Object self-attention weights and optimizer state reset (trunk + heads preserved)")
+        print("Object-slot attention weights and optimizer state reset (trunk + heads preserved)")
 
     def diagnose_attention(self, num_samples: int = 256) -> str:
         """Analyze object self-attention patterns to determine if they're meaningful."""
@@ -2747,30 +2866,27 @@ class RainbowAgent:
         self.online_net.eval()
         with torch.no_grad():
             obj_tokens, obj_mask = self.online_net._build_object_tokens(states)
+            obj_encoded = self.online_net.object_attn.encode(obj_tokens)
             _, attn_w = self.online_net.object_attn(
-                obj_tokens, obj_mask, return_weights=True
+                obj_encoded, obj_mask, return_weights=True, encoded=True
             )
         self.online_net.train()
 
         import numpy as np
         eps = 1e-8
 
-        B, H, T, _ = attn_w.shape
+        B, H, Q, T = attn_w.shape
         aw = attn_w.cpu().numpy()
         em = obj_mask.cpu().numpy()
 
-        cat_defs = getattr(RL_CONFIG, "entity_categories", [])
-        cat_ranges = []
-        offset = 0
-        for name, slots in cat_defs:
-            cat_ranges.append((name, offset, offset + slots))
-            offset += slots
+        cat_ranges = list(getattr(self.online_net, "_category_ranges", []))
+        slot_w = aw[:, :, 0, :]
 
         lines = []
         lines.append("\n" + "=" * 70)
-        lines.append("  OBJECT SELF-ATTENTION DIAGNOSTICS".center(70))
+        lines.append("  OBJECT SLOT-ATTENTION DIAGNOSTICS".center(70))
         lines.append("=" * 70)
-        lines.append(f"  Shape: {B} samples x {H} heads x {T} tokens (self-attn)")
+        lines.append(f"  Shape: {B} samples x {H} heads x {T} source slots")
 
         lines.append(f"\n  Per-category slot occupancy:")
         for name, lo, hi in cat_ranges:
@@ -2782,8 +2898,8 @@ class RainbowAgent:
         lines.append(f"    Avg active tokens: {avg_active:.1f} / {T}")
 
         max_entropy = np.log(T)
-        entropy = -(aw * np.log(aw + eps)).sum(axis=-1)
-        mean_entropy_per_head = entropy.mean(axis=(0, 2))
+        entropy = -(slot_w * np.log(slot_w + eps)).sum(axis=-1)
+        mean_entropy_per_head = entropy.mean(axis=0)
         overall_entropy = entropy.mean()
         ratio = overall_entropy / max_entropy
 
@@ -2804,15 +2920,13 @@ class RainbowAgent:
         else:
             lines.append("    -> Highly selective: strong learned patterns")
 
-        lines.append(f"\n  Cross-category attention (avg weight given to other categories):")
+        lines.append(f"\n  Attention mass received by each category:")
         for name_q, lo_q, hi_q in cat_ranges:
-            same_attn = aw[:, :, lo_q:hi_q, lo_q:hi_q].mean()
-            total_attn = aw[:, :, lo_q:hi_q, :].mean()
-            cross_attn = total_attn - same_attn if total_attn > 0 else 0
-            lines.append(f"    {name_q:12s}: same={same_attn:.4f}  cross={cross_attn:.4f}")
+            recv = slot_w[:, :, lo_q:hi_q].sum(axis=-1).mean()
+            lines.append(f"    {name_q:12s}: {recv:.4f}")
 
         if em.any():
-            recv_attn = aw.mean(axis=(1, 2))
+            recv_attn = slot_w.mean(axis=1)
             empty_recv = recv_attn[em].mean() if em.any() else 0
             active_recv = recv_attn[~em].mean() if (~em).any() else 0
             lines.append(f"\n  Empty-slot masking:")
@@ -2825,7 +2939,7 @@ class RainbowAgent:
             else:
                 lines.append("    -> Significant attention to empty slots")
 
-        head_avg = aw.mean(axis=(0, 2))
+        head_avg = slot_w.mean(axis=0)
         head_kls = []
         for i in range(H):
             for j in range(i + 1, H):

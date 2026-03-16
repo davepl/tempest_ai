@@ -30,11 +30,62 @@ else
 fi
 
 usage() {
-    echo "Usage: $0 [COUNT] [novideo] [--fg] [-kill]"
-    echo "  COUNT   Number of MAME instances to launch (default: 1, background mode only)"
-    echo "  novideo Launch MAME with -video none for faster operation"
-    echo "  --fg    Run one MAME instance in foreground"
-    echo "  -kill   Kill all running Robotron MAME instances"
+    echo "Usage: $0 [COUNT] [novideo] [--fg] [--throttle-client0] [-kill]"
+    echo "       $0 kill CLIENT_ID"
+    echo "  COUNT              Number of MAME instances to launch (default: 1, background mode only)"
+    echo "  novideo            Launch MAME with -video none for faster operation"
+    echo "  --fg               Run one MAME instance in foreground"
+    echo "  --throttle-client0 Throttle client 0 to real-time speed (default: unthrottled)"
+    echo "  -kill              Kill all running Robotron MAME instances"
+    echo "  kill CLIENT_ID     Kill one Robotron MAME client by ROBOTRON_CLIENT_SLOT"
+}
+
+kill_client_by_id() {
+    local client_id="$1"
+    if ! [[ "$client_id" =~ ^[0-9]+$ ]]; then
+        echo "error: CLIENT_ID must be a non-negative integer" >&2
+        return 2
+    fi
+
+    local pids=""
+    local all_robotron_pids
+    all_robotron_pids=$(pgrep -f 'mame.*robotron' || true)
+
+    # Primary path (Linux): match the exported client slot from process env.
+    if [[ -d /proc ]]; then
+        local pid
+        for pid in $all_robotron_pids; do
+            if [[ -r "/proc/$pid/environ" ]] && tr '\0' '\n' < "/proc/$pid/environ" | grep -qx "ROBOTRON_CLIENT_SLOT=$client_id"; then
+                pids+="$pid "$'\n'
+            fi
+        done
+    fi
+
+    # Fallback: command-line marker (works only if launcher preserved it in argv).
+    if [[ -z "${pids//[[:space:]]/}" ]]; then
+        pids=$(ps ax -o pid= -o command= | awk -v cid="$client_id" '
+            index($0, "mame") && index($0, "robotron") && $0 ~ ("ROBOTRON_CLIENT_SLOT=" cid "([[:space:]]|$)") {
+                print $1
+            }
+        ')
+    fi
+
+    if [[ -z "${pids//[[:space:]]/}" ]]; then
+        echo "No Robotron MAME process found for client $client_id."
+        return 1
+    fi
+
+    echo "Killing Robotron MAME client $client_id..."
+    echo "$pids" | xargs kill -9
+    echo "Killed PIDs: $(echo "$pids" | tr '\n' ' ')"
+
+    if ! pgrep -f 'mame.*robotron' >/dev/null 2>&1; then
+        cleanup_audio_relays
+        cleanup_audio_wavs
+        cleanup_audio_fifos
+        echo "No Robotron clients remaining; removed stale audio capture files from /tmp."
+    fi
+    return 0
 }
 
 cleanup_audio_wavs() {
@@ -53,9 +104,19 @@ FOREGROUND=0
 COUNT="1"
 COUNT_SET=0
 NO_VIDEO=0
+THROTTLE_CLIENT0=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        kill)
+            if [[ $# -lt 2 ]]; then
+                echo "error: kill requires CLIENT_ID" >&2
+                usage >&2
+                exit 2
+            fi
+            kill_client_by_id "$2"
+            exit $?
+            ;;
         -kill)
             echo "Killing all running Robotron MAME instances..."
             pids=$(pgrep -f 'mame.*robotron' || true)
@@ -73,6 +134,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --fg)
             FOREGROUND=1
+            shift
+            ;;
+        --throttle-client0)
+            THROTTLE_CLIENT0=1
             shift
             ;;
         novideo)
@@ -155,7 +220,11 @@ fi
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
     echo "Mode: foreground"
-    echo "Launching 1 MAME instance (attached) with $VIDEO_MODE_DESC, throttled to real time..."
+    if [[ "$THROTTLE_CLIENT0" -eq 1 ]]; then
+        echo "Launching 1 MAME instance (attached) with $VIDEO_MODE_DESC, throttled to real time..."
+    else
+        echo "Launching 1 MAME instance (attached) with $VIDEO_MODE_DESC, unthrottled..."
+    fi
     SOUND_FLAG=""
     if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
         AUDIO_FIFO="/tmp/robotron_audio_client0.fifo"
@@ -164,7 +233,11 @@ if [[ "$FOREGROUND" -eq 1 ]]; then
             >> "$LOG_DIR/audio_relay.log" 2>&1 &
         SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
     fi
-    THROTTLE_FLAG="-throttle -speed 1.0"
+    if [[ "$THROTTLE_CLIENT0" -eq 1 ]]; then
+        THROTTLE_FLAG="-throttle -speed 1.0"
+    else
+        THROTTLE_FLAG="-nothrottle"
+    fi
     env ROBOTRON_PREVIEW_CLIENT=1 ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
     status=$?
     cleanup_audio_relays
@@ -174,9 +247,17 @@ fi
 
 echo "Mode: background"
 if [[ "$COUNT" -eq 1 ]]; then
-    echo "Launching 1 MAME instance (client 0) with $VIDEO_MODE_DESC, throttled to real time..."
+    if [[ "$THROTTLE_CLIENT0" -eq 1 ]]; then
+        echo "Launching 1 MAME instance (client 0) with $VIDEO_MODE_DESC, throttled to real time..."
+    else
+        echo "Launching 1 MAME instance (client 0) with $VIDEO_MODE_DESC, unthrottled..."
+    fi
 else
-    echo "Launching $COUNT MAME instance(s): all clients with $VIDEO_MODE_DESC; client 0 throttled, others unthrottled..."
+    if [[ "$THROTTLE_CLIENT0" -eq 1 ]]; then
+        echo "Launching $COUNT MAME instance(s): client 0 throttled, others unthrottled..."
+    else
+        echo "Launching $COUNT MAME instance(s): all clients with $VIDEO_MODE_DESC, unthrottled..."
+    fi
 fi
 if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
     for i in $(seq 1 "$COUNT"); do
@@ -195,7 +276,7 @@ for i in $(seq 1 "$COUNT"); do
         SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
     fi
     PREVIEW_CLIENT_FLAG="1"
-    if [[ $i -eq 1 ]]; then
+    if [[ $i -eq 1 && "$THROTTLE_CLIENT0" -eq 1 ]]; then
         THROTTLE_FLAG="-throttle -speed 1.0"
     else
         THROTTLE_FLAG="-nothrottle"
@@ -210,7 +291,7 @@ for i in $(seq 1 "$COUNT"); do
     fi
     pid=$!
     PIDS+=("$pid")
-    if [[ $i -eq 1 ]]; then
+    if [[ $i -eq 1 && "$THROTTLE_CLIENT0" -eq 1 ]]; then
         echo "  Started instance $i (client $CLIENT_SLOT - $VIDEO_MODE_DESC, throttled) PID $pid  log: $LOG_FILE"
     else
         echo "  Started instance $i (client $CLIENT_SLOT - $VIDEO_MODE_DESC, unthrottled) PID $pid  log: $LOG_FILE"

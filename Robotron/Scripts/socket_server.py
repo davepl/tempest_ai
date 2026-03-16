@@ -53,6 +53,9 @@ _MAX_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024
 # ── Fire-hold (keeps fire direction stable for N frames so game's LSPROC registers a shot)
 FIRE_HOLD_FRAMES = 4     # must be ≥3 (game needs 3 stable frames to fire)
 FRAME_STACK = max(1, int(getattr(RL_CONFIG, "frame_stack", 1)))
+_START_PULSE_VALID_FRAMES = 240
+_GAMEPLAY_RESET_DEAD_FRAMES = 180
+_GAMEPLAY_PLAUSIBLE_START_STREAK = 8
 
 
 def _reset_state_stack(cs: dict):
@@ -362,6 +365,30 @@ class SocketServer:
         client_slot = max(0, raw >> 1)
         return preview_capable, client_slot
 
+    @staticmethod
+    def _expected_start_wave() -> int:
+        try:
+            gs = game_settings.snapshot()
+            if bool(gs.get("start_advanced", False)):
+                return max(1, min(81, int(gs.get("start_level_min", 1) or 1)))
+        except Exception:
+            pass
+        return 1
+
+    @classmethod
+    def _looks_like_real_game_start(cls, frame) -> bool:
+        wave = max(0, int(getattr(frame, "level_number", 0) or 0))
+        if wave <= 0 or wave > 81:
+            return False
+        lives = max(0, int(getattr(frame, "num_lasers", 0) or 0))
+        if lives > 9:
+            return False
+        score = max(0, int(getattr(frame, "game_score", 0) or 0))
+        if score > 0:
+            return True
+        expected = cls._expected_start_wave()
+        return abs(wave - expected) <= 1
+
     def _pick_default_preview_client_locked(self) -> int | None:
         candidates = []
         for cid, cs in self.client_states.items():
@@ -576,7 +603,10 @@ class SocketServer:
                 "game_score": 0,
                 "num_lasers": 0,
                 "alive_streak": 0,
+                "dead_streak": 0,
+                "plausible_start_streak": 0,
                 "gameplay_seen": False,
+                "start_pulse_window": 0,
                 "last_action_source": None, "prev_action_source": None,
                 "act_total": 0, "act_eps": 0, "act_xprt": 0, "act_last_diag_total": 0,
                 "act_same": 0, "act_diff": 0,
@@ -708,15 +738,49 @@ class SocketServer:
                         break
                     cs = self.client_states[cid]
                     cs["frames"] += 1
+                    if bool(getattr(frame, "start_pressed", False)):
+                        cs["start_pulse_window"] = _START_PULSE_VALID_FRAMES
+                    elif int(cs.get("start_pulse_window", 0) or 0) > 0:
+                        cs["start_pulse_window"] = max(0, int(cs.get("start_pulse_window", 0) or 0) - 1)
                     cs["player_alive"] = bool(frame.player_alive)
                     if frame.player_alive:
                         cs["alive_streak"] = int(cs.get("alive_streak", 0) or 0) + 1
+                        cs["dead_streak"] = 0
                     else:
                         cs["alive_streak"] = 0
-                    if int(cs.get("alive_streak", 0) or 0) >= 15:
+                        cs["dead_streak"] = int(cs.get("dead_streak", 0) or 0) + 1
+                    if int(cs.get("dead_streak", 0) or 0) >= _GAMEPLAY_RESET_DEAD_FRAMES:
+                        cs["gameplay_seen"] = False
+                        cs["start_pulse_window"] = 0
+                        cs["plausible_start_streak"] = 0
+                        cs["level_number"] = 0
+                        cs["game_score"] = 0
+                        cs["num_lasers"] = 0
+                    plausible_start = self._looks_like_real_game_start(frame)
+                    if int(cs.get("start_pulse_window", 0) or 0) > 0 and frame.player_alive and plausible_start:
+                        cs["plausible_start_streak"] = int(cs.get("plausible_start_streak", 0) or 0) + 1
+                    elif not frame.player_alive or not plausible_start:
+                        cs["plausible_start_streak"] = 0
+                    if (
+                        int(cs.get("start_pulse_window", 0) or 0) > 0
+                        and int(cs.get("alive_streak", 0) or 0) >= 15
+                        and int(cs.get("plausible_start_streak", 0) or 0) >= _GAMEPLAY_PLAUSIBLE_START_STREAK
+                    ):
                         if not bool(cs.get("gameplay_seen", False)):
                             cs["gameplay_seen"] = True
                             cs["game_frames"] = 0
+                        cs["start_pulse_window"] = 0
+                    elif (
+                        not bool(cs.get("gameplay_seen", False))
+                        and frame.player_alive
+                        and plausible_start
+                        and int(cs.get("alive_streak", 0) or 0) >= 30
+                        and max(0, int(getattr(frame, "game_score", 0) or 0)) > 0
+                    ):
+                        if not bool(cs.get("gameplay_seen", False)):
+                            cs["gameplay_seen"] = True
+                            cs["game_frames"] = 0
+                        cs["start_pulse_window"] = 0
                     if bool(cs.get("gameplay_seen", False)):
                         cs["num_lasers"] = max(0, int(getattr(frame, "num_lasers", 0) or 0))
                         if frame.player_alive or frame.game_score > 0 or int(cs.get("game_score", 0) or 0) > 0:
@@ -729,6 +793,7 @@ class SocketServer:
                     # Only accept a new peak while actively playing the last life.
                     if (
                         frame.player_alive
+                        and bool(cs.get("gameplay_seen", False))
                         and max(0, int(getattr(frame, "num_lasers", 0) or 0)) == 0
                         and frame.game_score > self.metrics.peak_game_score
                     ):
@@ -741,6 +806,7 @@ class SocketServer:
                             if prev_final > 0:
                                 self.metrics.add_game_score(prev_final)
                             cs["game_frames"] = 0
+                            cs["start_pulse_window"] = 0
                         cs["last_alive_game_score"] = frame.game_score
                     now = time.time()
                     el = now - cs["last_time"]
@@ -1082,12 +1148,19 @@ class SocketServer:
     def _calc_avg_level(self):
         try:
             with self.client_lock:
-                lvls = [s.get("level_number", 0) for s in self.client_states.values()
-                        if 0 < s.get("level_number", 0) <= 81]
+                lvls = [
+                    s.get("level_number", 0)
+                    for s in self.client_states.values()
+                    if bool(s.get("gameplay_seen", False)) and 0 < s.get("level_number", 0) <= 81
+                ]
                 metrics.average_level = sum(lvls) / len(lvls) if lvls else 0
-                for lv in lvls:
-                    if lv > metrics.peak_level:
-                        metrics.peak_level = lv
+                if lvls:
+                    metrics.peak_level_verified = True
+                    best_level = max(int(lv) for lv in lvls)
+                    if best_level > metrics.peak_level:
+                        metrics.peak_level = best_level
+                elif not bool(getattr(metrics, "peak_level_verified", False)):
+                    metrics.peak_level = 0
         except Exception:
             pass
 
