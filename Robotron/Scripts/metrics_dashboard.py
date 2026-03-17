@@ -39,7 +39,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
-_PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED = _env_flag("ROBOTRON_GAME_AUDIO_ENABLED", False)
+_PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED = _env_flag("ROBOTRON_GAME_AUDIO_ENABLED", True)
 
 try:
     import numpy as np
@@ -232,6 +232,13 @@ class _DashboardState:
         # Skip initial samples to let values stabilize
         self._sample_count: int = 0
         self._first_sample_time: float | None = None
+        self._gpu_snapshot: list[dict[str, Any]] = []
+        self._gpu_last_poll_ts: float = 0.0
+        self._gpu_poll_interval_s: float = 1.0
+        self._cpu_last_totals: tuple[int, int] | None = None
+        self._cpu_snapshot: dict[str, float] = {"cpu_pct": 0.0, "mem_free_gb": 0.0, "disk_free_gb": 0.0}
+        self._cpu_last_poll_ts: float = 0.0
+        self._cpu_poll_interval_s: float = 1.0
 
     def _clear_level_windows(self):
         for win in self._level_windows.values():
@@ -356,13 +363,76 @@ class _DashboardState:
 
       # Prefer describing the active network structure rather than the older
       # hybrid config fields that may still exist only for compatibility.
-      if net is not None and hasattr(net, "base_state_size") and hasattr(net, "object_attn"):
+      if net is not None and hasattr(net, "base_state_size"):
+        if bool(getattr(net, "use_pure_mlp", False)):
+          base_state = int(getattr(net, "base_state_size", int(getattr(cfg, "base_state_size", 0) or 0)))
+          stack_depth = int(getattr(net, "stack_depth", max(1, int(getattr(cfg, "frame_stack", 1) or 1))))
+          hidden_layers = list(getattr(net, "mlp_hidden_layers", list(getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512])))
+          output_dim = int(getattr(net, "mlp_output_dim", int(getattr(cfg, "mlp_output_dim", 256) or 256)))
+          uses_attn = bool(getattr(net, "use_mlp_with_attention", False))
+          slot_count = int(getattr(net, "num_object_slots", int(getattr(cfg, "object_slots", 0) or 0)))
+          token_features = int(getattr(net, "object_token_features", int(getattr(cfg, "legacy_slot_token_features", 0) or 0)))
+          attn_dim = int(getattr(getattr(net, "object_attn", None), "out_dim", int(getattr(cfg, "attn_dim", 0) or 0)))
+          attn_layers = int(getattr(cfg, "attn_layers", 1) or 1)
+          attn_frame_count = int(getattr(net, "attn_frame_count", 1) or 1)
+          attn_scope = "all" if bool(getattr(net, "attn_all_frames", False)) else "latest"
+          head_fc = getattr(net, "val_fc", None) or getattr(net, "q_fc", None)
+          head_mid = int(head_fc.out_features) if (head_fc is not None and hasattr(head_fc, "out_features")) else max(64, output_dim // 2)
+          param_count = sum(p.numel() for p in net.parameters())
+
+          model_desc_key = (
+            id(net),
+            "mlp_with_attn" if uses_attn else "pure_mlp",
+            base_state,
+            stack_depth,
+            tuple(hidden_layers),
+            output_dim,
+            slot_count,
+            token_features,
+            attn_dim,
+            attn_layers,
+            attn_frame_count,
+            attn_scope,
+            head_mid,
+            bool(getattr(net, "use_factorized_action_heads", False)),
+            int(getattr(cfg, "num_move_actions", 0) or 0),
+            int(getattr(cfg, "num_fire_actions", 0) or 0),
+            param_count,
+          )
+          if self._model_desc is not None and self._model_desc_key == model_desc_key:
+            return self._model_desc
+
+          layers = [f"{base_state * stack_depth}", *[str(v) for v in hidden_layers]]
+          if uses_attn:
+            layers.extend([f"slot{slot_count}x{token_features}", f"set{attn_dim}x{attn_layers}@{attn_scope}{attn_frame_count}"])
+          layers.extend([str(output_dim), str(head_mid)])
+          head_style = (
+            f"mf({int(getattr(cfg, 'num_move_actions', 0) or 0)}+{int(getattr(cfg, 'num_fire_actions', 0) or 0)})"
+            if bool(getattr(net, "use_factorized_action_heads", False))
+            else f"joint{int(getattr(cfg, 'num_joint_actions', 0) or 0)}"
+          )
+          layers.append(head_style)
+          arch_str = " » ".join(layers)
+          if param_count >= 1_000_000:
+            p_str = f"{param_count / 1_000_000:.1f}M"
+          elif param_count >= 1_000:
+            p_str = f"{param_count / 1_000:.0f}K"
+          else:
+            p_str = str(param_count)
+          mode_label = "MLP+Attn" if uses_attn else "MLP"
+          desc = f"Model: {mode_label} · {arch_str} · {p_str} params"
+          self._model_desc = desc
+          self._model_desc_key = model_desc_key
+          return desc
+
         base_state = int(getattr(net, "base_state_size", int(getattr(cfg, "base_state_size", 0) or 0)))
         stack_depth = int(getattr(net, "stack_depth", max(1, int(getattr(cfg, "frame_stack", 1) or 1))))
         slot_count = int(getattr(net, "num_object_slots", int(getattr(cfg, "object_slots", 0) or 0)))
         token_features = int(getattr(net, "object_token_features", int(getattr(cfg, "legacy_slot_token_features", 0) or 0)))
         attn_dim = int(getattr(getattr(net, "object_attn", None), "out_dim", int(getattr(cfg, "attn_dim", 0) or 0)))
         attn_layers = int(getattr(cfg, "attn_layers", 1) or 1)
+        attn_frame_count = int(getattr(net, "attn_frame_count", 1) or 1)
+        attn_scope = "all" if bool(getattr(net, "attn_all_frames", False)) else "latest"
         trunk_widths = [int(getattr(cfg, "trunk_hidden", 256) or 256)] * int(getattr(cfg, "trunk_layers", 1) or 1)
         head_fc = getattr(net, "val_fc", None) or getattr(net, "q_fc", None)
         head_mid = int(head_fc.out_features) if (head_fc is not None and hasattr(head_fc, "out_features")) else max(64, trunk_widths[-1] // 2)
@@ -376,8 +446,13 @@ class _DashboardState:
           token_features,
           attn_dim,
           attn_layers,
+          attn_frame_count,
+          attn_scope,
           tuple(trunk_widths),
           head_mid,
+          bool(getattr(net, "use_factorized_action_heads", False)),
+          int(getattr(cfg, "num_move_actions", 0) or 0),
+          int(getattr(cfg, "num_fire_actions", 0) or 0),
           param_count,
         )
         if self._model_desc is not None and self._model_desc_key == model_desc_key:
@@ -386,10 +461,16 @@ class _DashboardState:
         layers = [
           f"base{base_state}x{stack_depth}",
           f"slot{slot_count}x{token_features}",
-          f"set{attn_dim}x{attn_layers}",
+          f"set{attn_dim}x{attn_layers}@{attn_scope}{attn_frame_count}",
         ]
         layers.extend(str(width) for width in trunk_widths)
         layers.append(str(head_mid))
+        head_style = (
+          f"mf({int(getattr(cfg, 'num_move_actions', 0) or 0)}+{int(getattr(cfg, 'num_fire_actions', 0) or 0)})"
+          if bool(getattr(net, "use_factorized_action_heads", False))
+          else f"joint{int(getattr(cfg, 'num_joint_actions', 0) or 0)}"
+        )
+        layers.append(head_style)
         arch_str = " » ".join(layers)
         if param_count >= 1_000_000:
           p_str = f"{param_count / 1_000_000:.1f}M"
@@ -397,7 +478,7 @@ class _DashboardState:
           p_str = f"{param_count / 1_000:.0f}K"
         else:
           p_str = str(param_count)
-        desc = f"Model: {arch_str} · {p_str} params"
+        desc = f"Model: SlotSet · {arch_str} · {p_str} params"
         self._model_desc = desc
         self._model_desc_key = model_desc_key
         return desc
@@ -472,10 +553,92 @@ class _DashboardState:
         p_str = f"{param_count / 1_000:.0f}K"
       else:
         p_str = str(param_count)
-      desc = f"Model: {arch_str} \u00b7 {p_str} params"
+      desc = f"Model: Legacy/Compat \u00b7 {arch_str} \u00b7 {p_str} params"
       self._model_desc = desc
       self._model_desc_key = model_desc_key
       return desc
+
+    def _sample_gpu_status(self, now_ts: float | None = None) -> list[dict[str, Any]]:
+        now = float(now_ts if now_ts is not None else time.time())
+        if self._gpu_snapshot and (now - self._gpu_last_poll_ts) < self._gpu_poll_interval_s:
+            return list(self._gpu_snapshot)
+        try:
+            res = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=0.75,
+                check=False,
+            )
+            rows: list[dict[str, Any]] = []
+            if res.returncode == 0:
+                for line in (res.stdout or "").splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        idx = int(parts[0])
+                        util = max(0.0, min(100.0, float(parts[2])))
+                        mem_used = max(0.0, float(parts[3]))
+                        mem_total = max(1.0, float(parts[4]))
+                    except Exception:
+                        continue
+                    rows.append({
+                        "index": idx,
+                        "name": parts[1],
+                        "util": util,
+                        "mem_used_mb": mem_used,
+                        "mem_total_mb": mem_total,
+                        "mem_pct": max(0.0, min(100.0, (mem_used / mem_total) * 100.0)),
+                    })
+            self._gpu_snapshot = rows
+            self._gpu_last_poll_ts = now
+        except Exception:
+            self._gpu_last_poll_ts = now
+        return list(self._gpu_snapshot)
+
+    def _sample_system_status(self, now_ts: float | None = None) -> dict[str, float]:
+        now = float(now_ts if now_ts is not None else time.time())
+        if (now - self._cpu_last_poll_ts) < self._cpu_poll_interval_s:
+            return dict(self._cpu_snapshot)
+        cpu_pct = float(self._cpu_snapshot.get("cpu_pct", 0.0) or 0.0)
+        mem_free_gb = float(self._cpu_snapshot.get("mem_free_gb", 0.0) or 0.0)
+        disk_free_gb = float(self._cpu_snapshot.get("disk_free_gb", 0.0) or 0.0)
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as fh:
+                first = fh.readline().strip().split()
+            if len(first) >= 5 and first[0] == "cpu":
+                vals = [int(v) for v in first[1:] if v.isdigit() or (v and v[0] == "-" and v[1:].isdigit())]
+                if vals:
+                    total = int(sum(vals))
+                    idle = int(vals[3] + (vals[4] if len(vals) > 4 else 0))
+                    prev = self._cpu_last_totals
+                    if prev is not None:
+                        dt = max(1, total - prev[0])
+                        didle = max(0, idle - prev[1])
+                        cpu_pct = max(0.0, min(100.0, (1.0 - (didle / dt)) * 100.0))
+                    self._cpu_last_totals = (total, idle)
+            mem_avail_kb = None
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            mem_avail_kb = int(parts[1])
+                        break
+            if mem_avail_kb is not None:
+                mem_free_gb = max(0.0, float(mem_avail_kb) / (1024.0 * 1024.0))
+            du = shutil.disk_usage("/")
+            disk_free_gb = max(0.0, float(du.free) / (1024.0 ** 3))
+        except Exception:
+            pass
+        self._cpu_snapshot = {"cpu_pct": cpu_pct, "mem_free_gb": mem_free_gb, "disk_free_gb": disk_free_gb}
+        self._cpu_last_poll_ts = now
+        return dict(self._cpu_snapshot)
 
     def _build_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -579,6 +742,11 @@ class _DashboardState:
             client_rows = []
             preview_selected_client_id = -1
 
+        gpu_rows = self._sample_gpu_status(now)
+        gpu0 = gpu_rows[0] if len(gpu_rows) >= 1 else {}
+        gpu1 = gpu_rows[1] if len(gpu_rows) >= 2 else {}
+        sys_status = self._sample_system_status(now)
+
         return {
             "ts": now,
             "frame_count": frame_count,
@@ -653,6 +821,16 @@ class _DashboardState:
             "pulse_enabled": True,  # manual pulse is always available
             "client_rows": client_rows,
             "preview_selected_client_id": preview_selected_client_id,
+            "gpu_rows": gpu_rows,
+            "gpu0_util": float(gpu0.get("util", 0.0) or 0.0),
+            "gpu0_mem_pct": float(gpu0.get("mem_pct", 0.0) or 0.0),
+            "gpu0_name": str(gpu0.get("name", "") or ""),
+            "gpu1_util": float(gpu1.get("util", 0.0) or 0.0),
+            "gpu1_mem_pct": float(gpu1.get("mem_pct", 0.0) or 0.0),
+            "gpu1_name": str(gpu1.get("name", "") or ""),
+            "cpu_pct": float(sys_status.get("cpu_pct", 0.0) or 0.0),
+            "mem_free_gb": float(sys_status.get("mem_free_gb", 0.0) or 0.0),
+            "disk_free_gb": float(sys_status.get("disk_free_gb", 0.0) or 0.0),
             "game_settings": game_settings.snapshot(),
             "preview_capture_enabled": bool(getattr(self.metrics, "preview_capture_enabled", True)),
             "hud_enabled": bool(getattr(self.metrics, "hud_enabled", True)),
@@ -873,9 +1051,9 @@ class _PreviewAudioSource:
     """Tail the selected preview client's bounded relay WAV and fan-out 20 ms PCM frames."""
 
     _FRAME_PTIME_S = 0.02
-    _MAX_SOURCE_LATENCY_S = 0.20
+    _MAX_SOURCE_LATENCY_S = 0.50
     _IDLE_KEEP_FRAMES = 1
-    _SUBSCRIBER_QUEUE_FRAMES = 6
+    _SUBSCRIBER_QUEUE_FRAMES = 16
 
     def __init__(self, metrics_obj, audio_dir: str = "/tmp", file_template: str = "robotron_audio_client{slot}.wav"):
         self.metrics = metrics_obj
@@ -1157,12 +1335,16 @@ class _PreviewAudioTrack(AudioStreamTrack):
     """WebRTC audio track backed by the selected preview WAV reader."""
 
     _FRAME_PTIME_S = 0.02
+    _QUEUE_WAIT_S = 0.03
+    _FRAME_HOLD_S = 0.18
 
     def __init__(self, source: _PreviewAudioSource):
         super().__init__()
         self._source = source
         self._subscriber_id, self._queue = self._source.subscribe()
         self._active_generation = None
+        self._last_frame_data = None
+        self._last_frame_wallclock = 0.0
 
     def stop(self):
         self._source.unsubscribe(self._subscriber_id)
@@ -1182,7 +1364,12 @@ class _PreviewAudioTrack(AudioStreamTrack):
             self._timestamp = 0
 
         latest = None
-        while True:
+        try:
+            latest = await asyncio.to_thread(self._queue.get, True, self._QUEUE_WAIT_S)
+        except queue.Empty:
+            latest = None
+
+        while latest is not None:
             try:
                 latest = self._queue.get_nowait()
             except queue.Empty:
@@ -1204,8 +1391,14 @@ class _PreviewAudioTrack(AudioStreamTrack):
                 self._start = time.time()
                 self._timestamp = 0
                 self._active_generation = int(source_generation)
+            self._last_frame_data = frame_data
+            self._last_frame_wallclock = time.time()
         else:
-            frame_data = b"\x00" * (samples_per_frame * channels * 2)
+            hold_age = time.time() - float(self._last_frame_wallclock or 0.0)
+            if self._last_frame_data is not None and hold_age <= self._FRAME_HOLD_S:
+                frame_data = self._last_frame_data
+            else:
+                frame_data = b"\x00" * (samples_per_frame * channels * 2)
 
         expected_bytes = samples_per_frame * channels * 2
         if len(frame_data) != expected_bytes:
@@ -1753,9 +1946,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       display: grid;
       grid-template-columns: minmax(0, 23fr) minmax(0, 37fr);
       grid-template-rows: auto 1fr;
-      align-items: start;
+      align-items: stretch;
       column-gap: 8px;
-      min-height: 18px;
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
     }
     .mini-metric-card .mini-inline .mini-canvas {
       grid-column: 2;
@@ -1818,7 +2013,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     .mini-metric-card .mini-canvas {
       width: 100%;
       max-width: 100%;
-      height: 116px;
+      height: auto;
+      min-height: 0;
+      max-height: 100%;
+      display: block;
       border-radius: 8px;
       border: none;
       background:
@@ -1827,8 +2025,15 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       box-shadow: inset 0 0 14px rgba(0, 229, 255, 0.10), 0 0 12px rgba(0, 229, 255, 0.09);
       position: relative;
       z-index: 2;
-      flex: 0 0 auto;
+      flex: 1 1 auto;
+      align-self: stretch;
       justify-self: end;
+    }
+    .mini-metric-card > .mini-canvas {
+      flex: 1 1 auto;
+      min-height: 0;
+      height: auto;
+      align-self: stretch;
     }
     /* Per-metric status LED (colored via JS) */
     .metric-led {
@@ -2302,7 +2507,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     .preview-toggle input {
       display: none;
     }
-    .summary-meter-card {
+    .mobile-summary-meter-card {
       order: 10;
     }
     .card-narrow {
@@ -2318,13 +2523,53 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
     .card-half.mini-metric-card .mini-inline {
       min-height: 0;
-      flex: 1;
+      flex: 1 1 auto;
     }
     .card-half.mini-metric-card .mini-canvas {
-      height: 36px;
-      min-height: 36px;
-      flex: 1;
+      height: auto;
+      min-height: 0;
+      flex: 1 1 auto;
       border-radius: 4px;
+    }
+    .system-mini-card .mini-inline {
+      min-height: 0;
+      align-items: stretch;
+    }
+    .system-mini-card .mini-canvas {
+      height: auto;
+      min-height: 0;
+    }
+    .system-mini-stack {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-width: 0;
+    }
+    .system-mini-stack .value {
+      line-height: 0.95;
+    }
+    .system-mini-sub {
+      margin-top: 4px;
+      font-size: 9px;
+      color: #adc4df;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      text-shadow: 0 0 6px rgba(0, 229, 255, 0.10);
+      position: relative;
+      z-index: 2;
+    }
+    .system-mini-subval {
+      margin-top: 1px;
+      font-family: "LED Dot-Matrix", "Dot Matrix", "DotGothic16", "Courier New", monospace;
+      font-size: 14px;
+      color: #c8e8ff;
+      text-shadow:
+        0 0 4px rgba(100, 160, 255, 0.6),
+        0 0 10px rgba(60, 120, 255, 0.45),
+        0 0 20px rgba(40, 80, 255, 0.3);
+      line-height: 1;
+      position: relative;
+      z-index: 2;
     }
     /* Game-settings card controls */
     .game-settings-row {
@@ -2484,11 +2729,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       .charts { grid-template-columns: 1fr; }
       .top { flex-direction: column; align-items: flex-start; }
       .gauge-card { grid-column: span 2; order: -40; }
-      .summary-meter-card { grid-column: span 2; order: -40; }
+      .mobile-summary-meter-card { grid-column: span 2; order: -40; }
       .preview-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .client-table-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
       .chat-card { grid-column: span 4; grid-row: span 1; min-height: 150px; }
-      .mini-metric-card .mini-canvas { height: 96px; }
+      .mini-metric-card .mini-canvas { height: auto; }
     }
   </style>
 </head>
@@ -2688,18 +2933,6 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           <canvas id="lrMiniChart" class="mini-canvas"></canvas>
         </div>
       </article>
-      <article class="card card-half card-narrow summary-meter-card" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
-      <article class="card card-half card-narrow summary-meter-card" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
-      <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
-        <div class="label">AVG INFERENCE</div>
-        <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
-      </article>
-      <article class="card" style="--card-border:rgba(220,180,255,0.66);--card-glow:rgba(200,150,255,0.26)">
-        <div class="label">REPLAYS PER FRAME</div>
-        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
-      </article>
-      <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
-      <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
       <article class="card dell-card" style="--card-border:rgba(110,180,255,0.70);--card-glow:rgba(90,160,255,0.24)">
         <div class="label" style="text-transform:none;">DELL 7875 Precision</div>
         <div class="dell-wrap" aria-label="Dell system badge">
@@ -2710,6 +2943,50 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           </div>
         </div>
       </article>
+      <article class="card mini-metric-card card-half system-mini-card" style="--card-border:rgba(80,230,255,0.66);--card-glow:rgba(60,210,255,0.24)">
+        <div class="label">GPU 0</div>
+        <div class="mini-inline">
+          <div class="system-mini-stack"><div class="value" id="mGpu0">0%</div></div>
+          <canvas id="cGpu0Mini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half system-mini-card" style="--card-border:rgba(255,120,220,0.66);--card-glow:rgba(255,90,200,0.24)">
+        <div class="label">GPU 1</div>
+        <div class="mini-inline">
+          <div class="system-mini-stack"><div class="value" id="mGpu1">0%</div></div>
+          <canvas id="cGpu1Mini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half system-mini-card" style="--card-border:rgba(120,255,160,0.66);--card-glow:rgba(90,240,130,0.24)">
+        <div class="label">CPU</div>
+        <div class="mini-inline">
+          <div class="system-mini-stack"><div class="value" id="mCpu">0%</div></div>
+          <canvas id="cCpuMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card mini-metric-card card-half system-mini-card" style="--card-border:rgba(255,215,90,0.66);--card-glow:rgba(255,195,60,0.24)">
+        <div class="label">Free Memory</div>
+        <div class="mini-inline">
+          <div class="system-mini-stack">
+            <div class="value" id="mMemFree">0.0G</div>
+            <div class="system-mini-sub">Disk Space</div>
+            <div class="system-mini-subval" id="mDiskFree">0.0G</div>
+          </div>
+          <canvas id="cMemFreeMini" class="mini-canvas"></canvas>
+        </div>
+      </article>
+      <article class="card card-half card-narrow mobile-summary-meter-card" style="--card-border:rgba(120,220,60,0.66);--card-glow:rgba(100,200,40,0.26)"><div class="label">Clnt</div><div class="value" id="mClients">0</div></article>
+      <article class="card card-half card-narrow mobile-summary-meter-card" style="--card-border:rgba(255,180,60,0.66);--card-glow:rgba(255,160,40,0.26)"><div class="label">Web</div><div class="value" id="mWeb">0</div></article>
+      <article class="card" style="--card-border:rgba(100,200,255,0.66);--card-glow:rgba(80,180,255,0.26)">
+        <div class="label">AVG INFERENCE</div>
+        <div class="value value-inline"><span class="metric-led" id="mInfLed"></span><span id="mInf">0.00ms</span></div>
+      </article>
+      <article class="card" style="--card-border:rgba(220,180,255,0.66);--card-glow:rgba(200,150,255,0.26)">
+        <div class="label">REPLAYS PER FRAME</div>
+        <div class="value value-inline"><span class="metric-led" id="mRplLed"></span><span id="mRplF">0.00</span></div>
+      </article>
+      <article class="card" style="--card-border:rgba(255,220,100,0.66);--card-glow:rgba(255,200,80,0.26)"><div class="label">BUFFER SIZE</div><div class="value" id="mBuf">0k (0%)</div></article>
+      <article class="card" style="--card-border:rgba(200,100,255,0.66);--card-glow:rgba(180,80,255,0.26)"><div class="label">Q Range</div><div class="value" id="mQ">-</div></article>
       <article class="card" style="--card-border:rgba(0,200,255,0.66);--card-glow:rgba(0,180,255,0.26)">
         <div class="label" style="display:flex;justify-content:space-between;align-items:center;">GAME SETTINGS<label style="font-size:10px;color:#b0c8e8;display:flex;align-items:center;gap:5px;font-weight:normal;cursor:pointer;">Automatic <span class="toggle-switch"><input type="checkbox" id="gsAutoCurriculum"><span class="slider"></span></span></label></div>
         <div class="game-settings-row">
@@ -2883,6 +3160,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       episodes: document.getElementById("mEpisodes"),
       epRate: document.getElementById("mEpRate"),
       agreePanel: document.getElementById("mAgreePanel"),
+      gpu0: document.getElementById("mGpu0"),
+      gpu1: document.getElementById("mGpu1"),
+      cpu: document.getElementById("mCpu"),
+      memFree: document.getElementById("mMemFree"),
+      diskFree: document.getElementById("mDiskFree"),
       previewMsg: document.getElementById("mGamePreviewMsg"),
       previewLabel: document.getElementById("mPreviewLabel"),
       clientTableCount: document.getElementById("mClientTableCount"),
@@ -4166,6 +4448,32 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           { key: "eplen_1m", color: "#ff9f43", axis: { min: 0 } }
         ]
       },
+      gpu0Mini: {
+        canvas: document.getElementById("cGpu0Mini"),
+        series: [
+          { key: "gpu0_util", color: "#22d3ee", axis: { min: 0, max: 100 } },
+          { key: "gpu0_mem_pct", color: "#38bdf8", axis_ref: "gpu0_util" }
+        ]
+      },
+      gpu1Mini: {
+        canvas: document.getElementById("cGpu1Mini"),
+        series: [
+          { key: "gpu1_util", color: "#f472b6", axis: { min: 0, max: 100 } },
+          { key: "gpu1_mem_pct", color: "#fb7185", axis_ref: "gpu1_util" }
+        ]
+      },
+      cpuMini: {
+        canvas: document.getElementById("cCpuMini"),
+        series: [
+          { key: "cpu_pct", color: "#4ade80", axis: { min: 0, max: 100 } }
+        ]
+      },
+      memFreeMini: {
+        canvas: document.getElementById("cMemFreeMini"),
+        series: [
+          { key: "mem_free_gb", color: "#facc15", axis: { min: 0, min_range: 1.0 } }
+        ]
+      },
       agreement: {
         canvas: document.getElementById("cAgreement"),
         series: [
@@ -5422,6 +5730,63 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     }
 
     /* ── Mini chart (sparkline) for inline card display ─────────── */
+    function _outerHeight(el) {
+      if (!(el instanceof HTMLElement)) return 0;
+      const rect = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      return rect.height + (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0);
+    }
+
+    function layoutMiniCharts() {
+      const cards = document.querySelectorAll(".mini-metric-card");
+      const MIN_MINI_CHART_HEIGHT = 32;
+      const MAX_MINI_CHART_HEIGHT = 180;
+      for (const card of cards) {
+        if (!(card instanceof HTMLElement)) continue;
+        const cardChildren = Array.from(card.children).filter((child) => child instanceof HTMLElement);
+        const cardStyle = getComputedStyle(card);
+        const cardGap = parseFloat(cardStyle.rowGap || cardStyle.gap) || 0;
+        const cardPadTop = parseFloat(cardStyle.paddingTop) || 0;
+        const cardPadBottom = parseFloat(cardStyle.paddingBottom) || 0;
+        // clientHeight includes card padding; subtract it so we compute the
+        // available content area and avoid feedback growth on each relayout.
+        const cardContentHeight = Math.max(0, card.clientHeight - cardPadTop - cardPadBottom);
+        const inline = card.querySelector(":scope > .mini-inline");
+        const directCanvas = card.querySelector(":scope > .mini-canvas");
+
+        if (inline instanceof HTMLElement) {
+          const nonInline = cardChildren.filter((child) => child !== inline);
+          const used = nonInline.reduce((sum, child) => sum + _outerHeight(child), 0);
+          const gaps = Math.max(0, cardChildren.length - 1) * cardGap;
+          const available = Math.max(
+            MIN_MINI_CHART_HEIGHT,
+            Math.min(MAX_MINI_CHART_HEIGHT, Math.floor(cardContentHeight - used - gaps))
+          );
+          inline.style.height = `${available}px`;
+          const inlineCanvases = inline.querySelectorAll(".mini-canvas");
+          for (const canvas of inlineCanvases) {
+            if (canvas instanceof HTMLElement) {
+              canvas.style.height = `${available}px`;
+              canvas.style.maxHeight = `${available}px`;
+            }
+          }
+          continue;
+        }
+
+        if (directCanvas instanceof HTMLElement) {
+          const nonCanvas = cardChildren.filter((child) => child !== directCanvas);
+          const used = nonCanvas.reduce((sum, child) => sum + _outerHeight(child), 0);
+          const gaps = Math.max(0, cardChildren.length - 1) * cardGap;
+          const available = Math.max(
+            MIN_MINI_CHART_HEIGHT,
+            Math.min(MAX_MINI_CHART_HEIGHT, Math.floor(cardContentHeight - used - gaps))
+          );
+          directCanvas.style.height = `${available}px`;
+          directCanvas.style.maxHeight = `${available}px`;
+        }
+      }
+    }
+
     function drawMiniChart(canvas, history, seriesDefs, fillBetween) {
       if (!canvas) return;
       const points = history.slice(-240);
@@ -5963,6 +6328,11 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       if (!_gsIgnoreSync) cards.xprt.textContent = fmtPct(now.expert_ratio);
       cards.avgScore.textContent = fmtInt(now.avg_game_score || 0);
       cards.gameCount.textContent = fmtInt(now.game_count || 0);
+      if (cards.gpu0) cards.gpu0.textContent = fmtInt(now.gpu0_util || 0) + "%";
+      if (cards.gpu1) cards.gpu1.textContent = fmtInt(now.gpu1_util || 0) + "%";
+      if (cards.cpu) cards.cpu.textContent = fmtInt(now.cpu_pct || 0) + "%";
+      if (cards.memFree) cards.memFree.textContent = fmtFloat(now.mem_free_gb || 0, 1) + "G";
+      if (cards.diskFree) cards.diskFree.textContent = fmtFloat(now.disk_free_gb || 0, 1) + "G";
       cards.rwrd.textContent = fmtInt(now.total_1m || 0);
       cards.loss.innerHTML = toFixedCharCells(fmtPaddedFloat(now.loss, 2, 2));
       cards.grad.innerHTML = toFixedCharCells(fmtPaddedFloat(now.grad_norm, 1, 3));
@@ -6104,6 +6474,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       const throughputHistory = buildThroughputHistory(chartHistory60m);
       const smoothedStepSpd = computeSmoothedStepSpd(payload.now, history60m);
       updateCards(payload.now, smoothedStepSpd);
+      layoutMiniCharts();
       gaugeState.fps.target  = payload.now.fps;
       gaugeState.step.target = smoothedStepSpd;
       latestRow = payload.now;
@@ -6117,6 +6488,10 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       drawMiniChart(charts.lossMini.canvas, history2m, charts.lossMini.series);
       drawMiniChart(charts.gradMini.canvas, history2m, charts.gradMini.series);
       drawMiniChart(charts.epLenMini.canvas, history60m, charts.epLenMini.series);
+      drawMiniChart(charts.gpu0Mini.canvas, history2m, charts.gpu0Mini.series);
+      drawMiniChart(charts.gpu1Mini.canvas, history2m, charts.gpu1Mini.series);
+      drawMiniChart(charts.cpuMini.canvas, history2m, charts.cpuMini.series);
+      drawMiniChart(charts.memFreeMini.canvas, history2m, charts.memFreeMini.series);
     }
 
     let historyCache = [];

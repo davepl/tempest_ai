@@ -130,7 +130,7 @@ LEGACY_ENTITY_CATEGORIES: tuple[tuple[str, int], ...] = (
     ("human", 16),
     ("electrode", 16),
 )
-LEGACY_SLOT_STATE_FEATURES = 6
+LEGACY_SLOT_STATE_FEATURES = 8
 LEGACY_ELIST_FEATURES = 50
 LEGACY_CORE_FEATURES = 9
 LEGACY_TOTAL_SLOTS = sum(int(slots) for _name, slots in LEGACY_ENTITY_CATEGORIES)
@@ -147,9 +147,9 @@ class ServerConfigData:
     #   + 2 player position
     #   + 2 player velocity
     #   + 50 ELIST bytes
-    #   + 9 typed entity buckets, each: 1 occupancy + N slots x 6 features
-    #     (present, dx, dy, dist, hit_w, hit_h)
-    #   = 932 floats total
+    #   + 9 typed entity buckets, each: 1 occupancy + N slots x 8 features
+    #     (present, dx, dy, dist, hit_w, hit_h, vx, vy)
+    #   = 1220 floats total
     params_count: int = LEGACY_PARAMS_COUNT
 
 SERVER_CONFIG = ServerConfigData()
@@ -170,10 +170,13 @@ class RLConfigData:
     #   = 9 × 8 = 72 joint actions
     num_move_actions: int = 9
     num_fire_actions: int = 8
-    # Decode greedy action from the SAME joint Q head used for training.
-    # Factored greedy (axis-wise argmax) can pick a low-value pair that is
-    # not the joint argmax action actually optimized by C51.
-    factored_greedy_action: bool = False
+    # Learn separate move/fire action heads and reconstruct the joint table
+    # from them. This matches Robotron's dual-stick structure better than a
+    # monolithic 72-way action head.
+    factorized_action_heads: bool = True
+    # With factorized move/fire heads, axis-wise greedy decode matches the
+    # optimized additive action head, so we enable it by default.
+    factored_greedy_action: bool = True
 
     @property
     def num_joint_actions(self) -> int:
@@ -192,6 +195,12 @@ class RLConfigData:
     #   size_x, size_y, category_norm, is_human, is_dangerous, approach
     object_token_features: int = 15
 
+    # MLP trunk over the full stacked flat state. When mlp_with_attention is
+    # enabled, a parallel object-set branch is fused in before the C51 head.
+    pure_mlp: bool = True
+    mlp_with_attention: bool = True
+    mlp_hidden_layers: list = field(default_factory=lambda: [1024, 512])
+    mlp_output_dim: int = 256
     trunk_hidden: int = 256
     trunk_layers: int = 2
     use_layer_norm: bool = True
@@ -203,11 +212,17 @@ class RLConfigData:
     object_slots: int = LEGACY_TOTAL_SLOTS
     slot_state_features: int = LEGACY_SLOT_STATE_FEATURES
     # Per-object set-encoder features for the compact legacy slot state:
-    #   dx, dy, dist, hit_w, hit_h, category_norm, is_human, is_dangerous
-    legacy_slot_token_features: int = 8
+    #   dx, dy, vx, vy, dist, hit_w, hit_h, category_norm, is_human, is_dangerous
+    legacy_slot_token_features: int = 10
     attn_heads: int = 4
     attn_dim: int = 96
     attn_layers: int = 1
+    # False = attention only on the most recent frame; the flat MLP still sees
+    # all stacked frames. This keeps the attention branch focused on "what
+    # matters now" while preserving temporal context in the dense path.
+    # Changing this alters the entity_proj input width, so it is an
+    # architecture change and requires a fresh checkpoint.
+    attn_all_frames: bool = False
     grid_hidden_channels: int = 32
     global_hidden: int = 128
     category_summary_dim: int = 48
@@ -226,18 +241,18 @@ class RLConfigData:
     use_dueling: bool = True
 
     # ── training ────────────────────────────────────────────────────────
-    batch_size: int = 768
+    batch_size: int = 512
     lr: float = 1e-4
     lr_min: float = 4e-5
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 3_000_000       # Longer period to prevent destructive restarts
+    lr_cosine_period: int = 250_000       # Longer period to prevent destructive restarts
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 12
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
-    memory_size: int = 2_500_000
+    memory_size: int = 10_000_000
     # True = keep replay arrays as persistent np.memmap files and only save
     # compact metadata/priorities on checkpoint (fast restart/save path).
     replay_use_memmap_storage: bool = True
@@ -252,14 +267,20 @@ class RLConfigData:
     min_replay_to_train: int = 25_000
     # Wave-aware replay quotas: preserve frontier/high-wave DQN experience so
     # it does not get drowned by abundant easy-wave traffic.
-    replay_wave_sampling_enabled: bool = False
+    replay_wave_sampling_enabled: bool = True
     replay_wave_frontier_frac: float = 0.35
     replay_wave_high_frac: float = 0.15
     replay_wave_frontier_margin: int = 1
     replay_wave_high_offset: int = 2
     replay_wave_candidate_multiplier: int = 10
-    replay_wave_min_frontier: int = 4
-    replay_expert_max_frac: float = 0.35
+    replay_wave_min_frontier: int = 8
+    # Guaranteed floor for expert transitions in a sampled batch when enough
+    # expert candidates exist in replay. These are reserved before the DQN-only
+    # wave quotas are filled.
+    replay_expert_min_frac: float = 0.25
+    # Cap, not floor: expert transitions may be below this fraction only if
+    # replay does not contain enough expert candidates.
+    replay_expert_max_frac: float = 0.25
 
     # Target network (periodic hard sync; moderate refresh for stable learning)
     target_update_period: int = 2_500
@@ -270,8 +291,8 @@ class RLConfigData:
 
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.02
-    epsilon_decay_frames: int = 8_000_000
+    epsilon_end: float = 0.00
+    epsilon_decay_frames: int = 10_000_000
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000
@@ -289,32 +310,37 @@ class RLConfigData:
     epsilon: float = 1.0
 
     # Expert guidance
-    expert_ratio_start: float = 0.80
-    expert_ratio_end: float = 0.00
-    expert_ratio_decay_frames: int = 10_000_000
-    expert_ratio: float = 0.80
+    expert_ratio_start: float = 0.99
+    expert_ratio_end: float = 0.20
+    expert_ratio_decay_frames: int = 30_000_000
+    expert_ratio: float = 0.99
+
     # No special zoom handling for Robotron; keep multipliers neutral.
     expert_ratio_zoom_multiplier: float = 1.0
     expert_ratio_zoom_gamestate: int = 0x00
     epsilon_zoom_multiplier: float = 1.0
 
-    # Moderate BC anchor from heuristic expert transitions.
-    expert_bc_weight: float = 0.2
-    expert_bc_decay_start: int = 500_000
-    expert_bc_decay_frames: int = 4_000_000
-    expert_bc_min_weight: float = 0.01
+    # Stronger BC anchor from heuristic expert transitions; keep it alive well
+    # into training so the learner does not lose competent aiming/movement
+    # before it can stand on its own.
+    expert_bc_weight: float = 0.4
+    expert_bc_decay_start: int = 10_000_000
+    # Decays from 10M to 30M frames.
+    expert_bc_decay_frames: int = 50_000_000
+    expert_bc_min_weight: float = 0.05
     expert_profile: str = "simple"
     expert_hold_fire_for_last_enemy_rescue: bool = True
 
     # ── reward ──────────────────────────────────────────────────────────
     # Scale objective rewards to fit C51 support while keeping TD targets stable.
-    # Human rescue (5000) -> 100; no longer clipped.  reward_clip=100
-    # accommodates the full rescue signal.
-    obj_reward_scale: float = 0.02
+    # At 0.03, a 5000-point rescue scales to 150 and is clipped to the
+    # reward_clip of 100. This intentionally boosts ordinary kill signal
+    # versus the earlier 0.02 setting, while still bounding very large events.
+    obj_reward_scale: float = 0.03
     point_reward_scale: float = 1.0 / obj_reward_scale
     subj_reward_scale: float = 0.001
     reward_clip: float = 100.0
-    death_reward_clip: float = 100.0
+    death_reward_clip: float = 60.0
 
     # ── death attribution ───────────────────────────────────────────────
     death_priority_boost: float = 5.0      # Lower terminal boost to reduce over-focusing on death tails
@@ -353,6 +379,7 @@ class RLConfigData:
         self.frame_stack = max(1, int(self.frame_stack))
         self.base_state_size = int(self.base_state_size)
         self.state_size = self.base_state_size * self.frame_stack
+        self.point_reward_scale = 1.0 / max(1e-12, float(self.obj_reward_scale))
 
 
 RL_CONFIG = RLConfigData()

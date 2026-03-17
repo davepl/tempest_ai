@@ -93,6 +93,9 @@ def _add_entity(
     if _LEGACY_SLOT_FEATURES >= 6:
         state[slot_base + 4] = 0.5
         state[slot_base + 5] = 0.5
+    if _LEGACY_SLOT_FEATURES >= 8:
+        state[slot_base + 6] = 0.0
+        state[slot_base + 7] = 0.0
 
 
 def test_aligned_fire_keeps_human_rescue_movement():

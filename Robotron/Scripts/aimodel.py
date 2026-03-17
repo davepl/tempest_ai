@@ -167,7 +167,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 4
+MODEL_ARCH_VERSION = 7
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -779,11 +779,15 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
             if not np.isfinite(dist):
                 continue
 
-            prev_present = float(prev_block[slot_idx, 0]) >= 0.5
-            prev_dx = float(prev_block[slot_idx, 1]) if prev_present else dx
-            prev_dy = float(prev_block[slot_idx, 2]) if prev_present else dy
-            vx = dx - prev_dx if prev_present else 0.0
-            vy = dy - prev_dy if prev_present else 0.0
+            if slot_features >= 8:
+                vx = float(latest_block[slot_idx, 6])
+                vy = float(latest_block[slot_idx, 7])
+            else:
+                prev_present = float(prev_block[slot_idx, 0]) >= 0.5
+                prev_dx = float(prev_block[slot_idx, 1]) if prev_present else dx
+                prev_dy = float(prev_block[slot_idx, 2]) if prev_present else dy
+                vx = dx - prev_dx if prev_present else 0.0
+                vy = dy - prev_dy if prev_present else 0.0
 
             world_dx = dx * _REL_POS_X_RANGE
             world_dy = dy * _REL_POS_Y_RANGE
@@ -1843,7 +1847,7 @@ class EntitySetEncoder(nn.Module):
             dropout=0.0,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.out_norm = nn.LayerNorm(embed_dim)
@@ -1876,7 +1880,7 @@ class EntitySetEncoder(nn.Module):
 
 # ── Distributional Dueling Network ─────────────────────────────────────────
 class RainbowNet(nn.Module):
-    """Structured Robotron network with explicit global and object-set branches."""
+    """Robotron network with configurable flat-MLP and object-set branches."""
 
     def __init__(self, state_size: int):
         super().__init__()
@@ -1887,14 +1891,30 @@ class RainbowNet(nn.Module):
         self.v_min = cfg.v_min
         self.v_max = cfg.v_max
         self.use_dueling = cfg.use_dueling
+        self.use_factorized_action_heads = bool(getattr(cfg, "factorized_action_heads", False))
         self.num_actions = NUM_JOINT
-        self.use_attn = bool(getattr(cfg, "use_enemy_attention", True))
+        self.use_pure_mlp = bool(getattr(cfg, "pure_mlp", False))
+        self.use_mlp_with_attention = (
+            self.use_pure_mlp
+            and bool(getattr(cfg, "mlp_with_attention", False))
+            and bool(getattr(cfg, "use_enemy_attention", True))
+        )
+        self.use_attn = (
+            ((not self.use_pure_mlp) or self.use_mlp_with_attention)
+            and bool(getattr(cfg, "use_enemy_attention", True))
+        )
         self.base_state_size = int(getattr(cfg, "base_state_size", SERVER_CONFIG.params_count))
         self.stack_depth = max(1, int(self.state_size // max(1, self.base_state_size)))
+        self.attn_all_frames = bool(getattr(cfg, "attn_all_frames", False))
+        self.attn_frame_count = self.stack_depth if self.attn_all_frames else 1
         self.num_object_slots = int(getattr(cfg, "object_slots", 144))
-        self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 8))
-        self.slot_state_features = int(getattr(cfg, "slot_state_features", 6))
+        self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 10))
+        self.slot_state_features = int(getattr(cfg, "slot_state_features", 8))
         self.core_feature_count = 59  # 9 core + 50 ELIST
+        self._cat_info = []
+        self._category_ranges = []
+        self._num_categories = 0
+        self._occupancy_offsets = []
 
         cat_defs = getattr(cfg, "entity_categories", [
             ("grunt", 40),
@@ -1907,17 +1927,77 @@ class RainbowNet(nn.Module):
             ("human", 16),
             ("electrode", 16),
         ])
-        self._cat_info = []
-        self._category_ranges = []
-        offset = self.core_feature_count
-        slot_cursor = 0
-        for cat_id, (name, slots) in enumerate(cat_defs):
-            slots_i = int(slots)
-            self._cat_info.append((name, offset, slots_i, cat_id))
-            self._category_ranges.append((name, slot_cursor, slot_cursor + slots_i))
-            offset += 1 + (slots_i * self.slot_state_features)
-            slot_cursor += slots_i
-        self._num_categories = len(cat_defs)
+        if self.use_attn:
+            offset = self.core_feature_count
+            slot_cursor = 0
+            for cat_id, (name, slots) in enumerate(cat_defs):
+                slots_i = int(slots)
+                self._cat_info.append((name, offset, slots_i, cat_id))
+                self._category_ranges.append((name, slot_cursor, slot_cursor + slots_i))
+                offset += 1 + (slots_i * self.slot_state_features)
+                slot_cursor += slots_i
+            self._num_categories = len(cat_defs)
+            self._occupancy_offsets = [base for _name, base, _slots, _cat_id in self._cat_info]
+            slot_meta = []
+            for cat_id, (name, slots) in enumerate(cat_defs):
+                cat_norm = cat_id / max(1, self._num_categories - 1)
+                is_human = 1.0 if name == "human" else 0.0
+                is_dangerous = 1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
+                for _ in range(int(slots)):
+                    slot_meta.append([cat_norm, is_human, is_dangerous])
+            self.register_buffer("slot_meta", torch.tensor(slot_meta, dtype=torch.float32), persistent=False)
+
+        if self.use_pure_mlp:
+            mlp_hidden = [int(v) for v in getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512]]
+            mlp_hidden = [max(1, int(v)) for v in mlp_hidden]
+            mlp_out = max(1, int(getattr(cfg, "mlp_output_dim", 256) or 256))
+            self.mlp_hidden_layers = list(mlp_hidden)
+            self.mlp_output_dim = mlp_out
+            layers = []
+            in_dim = int(state_size)
+            for width in mlp_hidden:
+                layers.append(nn.Linear(in_dim, width))
+                if cfg.use_layer_norm:
+                    layers.append(nn.LayerNorm(width))
+                layers.append(nn.ReLU())
+                if float(cfg.dropout) > 0.0:
+                    layers.append(nn.Dropout(float(cfg.dropout)))
+                in_dim = width
+            layers.append(nn.Linear(in_dim, mlp_out))
+            if cfg.use_layer_norm:
+                layers.append(nn.LayerNorm(mlp_out))
+            layers.append(nn.ReLU())
+            if float(cfg.dropout) > 0.0:
+                layers.append(nn.Dropout(float(cfg.dropout)))
+            self.trunk = nn.Sequential(*layers)
+            head_in = mlp_out
+            if self.use_mlp_with_attention:
+                attn_dim = int(getattr(cfg, "attn_dim", 96))
+                entity_hidden = int(getattr(cfg, "entity_hidden", 192))
+                self.object_attn = EntitySetEncoder(
+                    token_features=self.object_token_features,
+                    embed_dim=attn_dim,
+                    num_heads=int(getattr(cfg, "attn_heads", 4)),
+                    num_layers=int(getattr(cfg, "attn_layers", 1)),
+                )
+                self.entity_proj = nn.Sequential(
+                    nn.Linear(attn_dim * self.attn_frame_count, entity_hidden),
+                    nn.LayerNorm(entity_hidden),
+                    nn.ReLU(),
+                )
+                self.mlp_attn_fusion = nn.Sequential(
+                    nn.Linear(mlp_out + entity_hidden, mlp_out),
+                    nn.LayerNorm(mlp_out) if cfg.use_layer_norm else nn.Identity(),
+                    nn.ReLU(),
+                )
+            head_mid = max(64, head_in // 2)
+            self._build_action_heads(head_in, head_mid)
+            self._init_weights()
+            if self.use_dist:
+                support = torch.linspace(self.v_min, self.v_max, self.num_atoms)
+                self.register_buffer("support", support)
+                self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+            return
 
         attn_dim = int(getattr(cfg, "attn_dim", 96))
         entity_hidden = int(getattr(cfg, "entity_hidden", 192))
@@ -1934,7 +2014,7 @@ class RainbowNet(nn.Module):
             num_layers=int(getattr(cfg, "attn_layers", 1)),
         )
         self.entity_proj = nn.Sequential(
-            nn.Linear(attn_dim * self.stack_depth, entity_hidden),
+            nn.Linear(attn_dim * self.attn_frame_count, entity_hidden),
             nn.LayerNorm(entity_hidden),
             nn.ReLU(),
         )
@@ -1955,14 +2035,7 @@ class RainbowNet(nn.Module):
 
         head_in = int(cfg.trunk_hidden)
         head_mid = max(64, head_in // 2)
-        if self.use_dueling:
-            self.val_fc = nn.Linear(head_in, head_mid)
-            self.val_out = nn.Linear(head_mid, self.num_atoms)
-            self.adv_fc = nn.Linear(head_in, head_mid)
-            self.adv_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
-        else:
-            self.q_fc = nn.Linear(head_in, head_mid)
-            self.q_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
+        self._build_action_heads(head_in, head_mid)
 
         self._init_weights()
         if self.use_dist:
@@ -1977,6 +2050,64 @@ class RainbowNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
+    def _build_action_heads(self, head_in: int, head_mid: int):
+        self.head_mid = int(head_mid)
+        if self.use_factorized_action_heads:
+            if self.use_dueling:
+                self.val_fc = nn.Linear(head_in, head_mid)
+                self.val_out = nn.Linear(head_mid, self.num_atoms)
+                self.move_adv_fc = nn.Linear(head_in, head_mid)
+                self.move_adv_out = nn.Linear(head_mid, NUM_MOVE * self.num_atoms)
+                self.fire_adv_fc = nn.Linear(head_in, head_mid)
+                self.fire_adv_out = nn.Linear(head_mid, NUM_FIRE * self.num_atoms)
+            else:
+                self.move_q_fc = nn.Linear(head_in, head_mid)
+                self.move_q_out = nn.Linear(head_mid, NUM_MOVE * self.num_atoms)
+                self.fire_q_fc = nn.Linear(head_in, head_mid)
+                self.fire_q_out = nn.Linear(head_mid, NUM_FIRE * self.num_atoms)
+            return
+
+        if self.use_dueling:
+            self.val_fc = nn.Linear(head_in, head_mid)
+            self.val_out = nn.Linear(head_mid, self.num_atoms)
+            self.adv_fc = nn.Linear(head_in, head_mid)
+            self.adv_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
+        else:
+            self.q_fc = nn.Linear(head_in, head_mid)
+            self.q_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
+
+    def _action_head_q_atoms(self, h: torch.Tensor, B: int) -> torch.Tensor:
+        if self.use_factorized_action_heads:
+            if self.use_dueling:
+                val = F.relu(self.val_fc(h))
+                val = self.val_out(val).view(B, 1, 1, self.num_atoms)
+
+                move_adv = F.relu(self.move_adv_fc(h))
+                move_adv = self.move_adv_out(move_adv).view(B, NUM_MOVE, 1, self.num_atoms)
+                fire_adv = F.relu(self.fire_adv_fc(h))
+                fire_adv = self.fire_adv_out(fire_adv).view(B, 1, NUM_FIRE, self.num_atoms)
+
+                move_adv = move_adv - move_adv.mean(dim=1, keepdim=True)
+                fire_adv = fire_adv - fire_adv.mean(dim=2, keepdim=True)
+                q_atoms = val + move_adv + fire_adv
+            else:
+                move_q = F.relu(self.move_q_fc(h))
+                move_q = self.move_q_out(move_q).view(B, NUM_MOVE, 1, self.num_atoms)
+                fire_q = F.relu(self.fire_q_fc(h))
+                fire_q = self.fire_q_out(fire_q).view(B, 1, NUM_FIRE, self.num_atoms)
+                q_atoms = move_q + fire_q
+            return q_atoms.view(B, self.num_actions, self.num_atoms)
+
+        if self.use_dueling:
+            val = F.relu(self.val_fc(h))
+            val = self.val_out(val).view(B, 1, self.num_atoms)
+            adv = F.relu(self.adv_fc(h))
+            adv = self.adv_out(adv).view(B, self.num_actions, self.num_atoms)
+            return val + adv - adv.mean(dim=1, keepdim=True)
+
+        q = F.relu(self.q_fc(h))
+        return self.q_out(q).view(B, self.num_actions, self.num_atoms)
+
     def _frame_offsets(self, state: torch.Tensor) -> list[int]:
         total_dim = int(state.shape[1])
         stack_depth = max(1, total_dim // self.base_state_size)
@@ -1986,7 +2117,7 @@ class RainbowNet(nn.Module):
         parts = []
         for frame_off in self._frame_offsets(state):
             parts.append(state[:, frame_off: frame_off + self.core_feature_count])
-            for _name, base, _slots, _cat_id in self._cat_info:
+            for base in self._occupancy_offsets:
                 parts.append(state[:, frame_off + base: frame_off + base + 1])
         return torch.cat(parts, dim=1)
 
@@ -1997,6 +2128,7 @@ class RainbowNet(nn.Module):
 
         all_tokens = []
         all_masks = []
+        slot_cursor = 0
         for name, base, slots, cat_id in self._cat_info:
             block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
             block = block.reshape(B, slots, self.slot_state_features)
@@ -2007,23 +2139,15 @@ class RainbowNet(nn.Module):
             dist = block[:, :, 3:4]
             width = block[:, :, 4:5] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
             height = block[:, :, 5:6] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
+            vx = block[:, :, 6:7] if self.slot_state_features >= 8 else torch.zeros_like(dist)
+            vy = block[:, :, 7:8] if self.slot_state_features >= 8 else torch.zeros_like(dist)
 
-            cat_norm = torch.full(
-                (B, slots, 1),
-                cat_id / max(1, self._num_categories - 1),
-                device=device,
-                dtype=state.dtype,
-            )
-            is_human = torch.full((B, slots, 1), 1.0 if name == "human" else 0.0, device=device, dtype=state.dtype)
-            is_dangerous = torch.full(
-                (B, slots, 1),
-                1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0,
-                device=device,
-                dtype=state.dtype,
-            )
+            meta = self.slot_meta[slot_cursor: slot_cursor + slots].to(device=device, dtype=state.dtype)
+            meta = meta.unsqueeze(0).expand(B, -1, -1)
+            slot_cursor += slots
 
             tokens = torch.cat(
-                [dx, dy, dist, width, height, cat_norm, is_human, is_dangerous],
+                [dx, dy, vx, vy, dist, width, height, meta],
                 dim=2,
             )
             all_tokens.append(tokens)
@@ -2039,28 +2163,44 @@ class RainbowNet(nn.Module):
         frame_offsets = self._frame_offsets(state)
         return self._build_frame_object_tokens(state, frame_offsets[-1])
 
+    def _build_all_frame_object_tokens(self, state: torch.Tensor):
+        frame_offsets = self._frame_offsets(state)
+        if not self.attn_all_frames and frame_offsets:
+            frame_offsets = frame_offsets[-1:]
+        token_batches = []
+        mask_batches = []
+        for frame_off in frame_offsets:
+            tokens, mask = self._build_frame_object_tokens(state, frame_off)
+            token_batches.append(tokens)
+            mask_batches.append(mask)
+        return torch.cat(token_batches, dim=0), torch.cat(mask_batches, dim=0)
+
     def forward(self, state: torch.Tensor, log: bool = False):
         B = state.shape[0]
+        if self.use_pure_mlp:
+            h = self.trunk(state)
+            if self.use_mlp_with_attention:
+                all_tokens, all_masks = self._build_all_frame_object_tokens(state)
+                frame_summaries = self.object_attn(all_tokens, all_masks).view(B, self.attn_frame_count, -1)
+                entity_out = self.entity_proj(frame_summaries.reshape(B, -1))
+                h = self.mlp_attn_fusion(torch.cat([h, entity_out], dim=1))
+            q_atoms = self._action_head_q_atoms(h, B)
+            if self.use_dist:
+                q_atoms = q_atoms.float()
+                if log:
+                    return F.log_softmax(q_atoms, dim=2)
+                return F.softmax(q_atoms, dim=2)
+            return q_atoms.squeeze(2)
+
         global_in = self._build_global_features(state)
         global_out = self.global_encoder(global_in)
 
-        frame_summaries = []
-        for frame_off in self._frame_offsets(state):
-            obj_tokens, obj_mask = self._build_frame_object_tokens(state, frame_off)
-            frame_summaries.append(self.object_attn(obj_tokens, obj_mask))
-        entity_out = self.entity_proj(torch.cat(frame_summaries, dim=1))
+        all_tokens, all_masks = self._build_all_frame_object_tokens(state)
+        frame_summaries = self.object_attn(all_tokens, all_masks).view(B, self.attn_frame_count, -1)
+        entity_out = self.entity_proj(frame_summaries.reshape(B, -1))
         h = self.input_proj(torch.cat([global_out, entity_out], dim=1))
         h = self.trunk(h)
-
-        if self.use_dueling:
-            val = F.relu(self.val_fc(h))
-            val = self.val_out(val).view(B, 1, self.num_atoms)
-            adv = F.relu(self.adv_fc(h))
-            adv = self.adv_out(adv).view(B, self.num_actions, self.num_atoms)
-            q_atoms = val + adv - adv.mean(dim=1, keepdim=True)
-        else:
-            q = F.relu(self.q_fc(h))
-            q_atoms = self.q_out(q).view(B, self.num_actions, self.num_atoms)
+        q_atoms = self._action_head_q_atoms(h, B)
 
         if self.use_dist:
             q_atoms = q_atoms.float()
@@ -2543,7 +2683,8 @@ class RainbowAgent:
         return actions
 
     # ── Step (add experience) ───────────────────────────────────────────
-    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1, priority_reward=None, wave_number=1):
+    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1,
+             priority_reward=None, wave_number=1, start_wave=1):
         if isinstance(action, (tuple, list)) and len(action) >= 2:
             action_idx = combine_action_indices(action[0], action[1])
         else:
@@ -2563,7 +2704,19 @@ class RainbowAgent:
         if level_scale > 0.0:
             wave = max(1, int(wave_number or 1))
             level_mult = max(1.0, math.log10(wave) * level_scale)
-        self.memory.add(state, action_idx, float(reward), next_state, bool(done), int(horizon), is_expert, priority_hint=pri, level_mult=level_mult)
+        self.memory.add(
+            state,
+            action_idx,
+            float(reward),
+            next_state,
+            bool(done),
+            int(horizon),
+            is_expert,
+            priority_hint=pri,
+            level_mult=level_mult,
+            wave_number=max(1, int(wave_number or 1)),
+            start_wave=max(1, int(start_wave or 1)),
+        )
         # Return the index of the just-written transition for pre-death tracking
         try:
             return int(self.memory.tree.data_ptr - 1) % self.memory.capacity

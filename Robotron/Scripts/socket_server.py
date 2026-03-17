@@ -621,6 +621,7 @@ class SocketServer:
                 "fire_hold_dir": -1, "fire_hold_count": 0, "fire_pending_dir": -1,
                 "last_alive_game_score": 0, "prev_game_final_score": 0,
                 "game_frames": 0,
+                "start_wave": 1,
                 "preview_capable": False,
                 "client_slot": int(cid),
             }
@@ -754,6 +755,7 @@ class SocketServer:
                         cs["start_pulse_window"] = 0
                         cs["plausible_start_streak"] = 0
                         cs["level_number"] = 0
+                        cs["start_wave"] = 1
                         cs["game_score"] = 0
                         cs["num_lasers"] = 0
                     plausible_start = self._looks_like_real_game_start(frame)
@@ -769,6 +771,7 @@ class SocketServer:
                         if not bool(cs.get("gameplay_seen", False)):
                             cs["gameplay_seen"] = True
                             cs["game_frames"] = 0
+                            cs["start_wave"] = max(1, int(getattr(frame, "level_number", 1) or 1))
                         cs["start_pulse_window"] = 0
                     elif (
                         not bool(cs.get("gameplay_seen", False))
@@ -777,9 +780,9 @@ class SocketServer:
                         and int(cs.get("alive_streak", 0) or 0) >= 30
                         and max(0, int(getattr(frame, "game_score", 0) or 0)) > 0
                     ):
-                        if not bool(cs.get("gameplay_seen", False)):
-                            cs["gameplay_seen"] = True
-                            cs["game_frames"] = 0
+                        cs["gameplay_seen"] = True
+                        cs["game_frames"] = 0
+                        cs["start_wave"] = max(1, int(getattr(frame, "level_number", 1) or 1))
                         cs["start_pulse_window"] = 0
                     if bool(cs.get("gameplay_seen", False)):
                         cs["num_lasers"] = max(0, int(getattr(frame, "num_lasers", 0) or 0))
@@ -807,6 +810,7 @@ class SocketServer:
                                 self.metrics.add_game_score(prev_final)
                             cs["game_frames"] = 0
                             cs["start_pulse_window"] = 0
+                            cs["start_wave"] = max(1, int(getattr(frame, "level_number", 1) or 1))
                         cs["last_alive_game_score"] = frame.game_score
                     now = time.time()
                     el = now - cs["last_time"]
@@ -857,21 +861,26 @@ class SocketServer:
                             joint = combine_action_indices(move_i, fire_i)
                             matured = nstep.add(cs["last_state"], joint, total_r,
                                                 stacked_state, bool(frame.done),
-                                                actor=tag, priority_reward=total_r)
+                                                actor=tag, priority_reward=total_r,
+                                                wave_number=max(1, int(cs.get("level_number", 1) or 1)),
+                                                start_wave=max(1, int(cs.get("start_wave", 1) or 1)))
                             wave = max(1, cs.get("level_number", 1) or 1)
-                            for s0, a, Rn, pR, sn, dn, h, act, wave_n, _start_wave in matured:
+                            for s0, a, Rn, pR, sn, dn, h, act, wave_n, start_wave_n in matured:
                                 move_n, fire_n = split_joint_action(a)
                                 self.async_buffer.step_async(
                                     s0, (move_n, fire_n), Rn, sn, bool(dn),
                                     client_id=cid, actor=act, horizon=int(h),
                                     priority_reward=pR,
-                                    wave_number=max(1, int(wave_n or wave)))
+                                    wave_number=max(1, int(wave_n or wave)),
+                                    start_wave=max(1, int(start_wave_n or cs.get("start_wave", 1) or 1)))
                         else:
                             wave = max(1, cs.get("level_number", 1) or 1)
                             self.async_buffer.step_async(
                                 cs["last_state"], (move_i, fire_i), total_r,
                                 stacked_state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
-                                priority_reward=total_r, wave_number=wave)
+                                priority_reward=total_r,
+                                wave_number=wave,
+                                start_wave=max(1, int(cs.get("start_wave", 1) or 1)))
 
                     cs["total_reward"] += total_r
                     cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + eff_subj_r
@@ -1109,8 +1118,13 @@ class SocketServer:
                     break
 
         except Exception as e:
-            print(f"Client {cid} error: {e}")
-            traceback.print_exc()
+            msg = str(e or "").strip()
+            is_expected_disconnect = (
+                isinstance(e, ConnectionError) and msg in {"EOF", "Broken", "No handshake"}
+            ) or isinstance(e, (BrokenPipeError, ConnectionResetError, TimeoutError))
+            if not is_expected_disconnect:
+                print(f"Client {cid} error: {e}")
+                traceback.print_exc()
         finally:
             try:
                 sock.shutdown(socket.SHUT_RDWR)

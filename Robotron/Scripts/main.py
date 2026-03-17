@@ -270,6 +270,7 @@ def print_network_info(agent):
     print(f"\n📐 Architecture:")
     print(f"   State size:       {agent.state_size} ({RL_CONFIG.frame_stack} × {RL_CONFIG.base_state_size})")
     print(f"   Actions:          {RL_CONFIG.num_move_actions} move dirs × {RL_CONFIG.num_fire_actions} fire dirs = {RL_CONFIG.num_joint_actions}")
+    print(f"   Action head:      {'factorized move+fire' if RL_CONFIG.factorized_action_heads else 'joint 72-way'}")
     print(f"   Trunk:            {RL_CONFIG.trunk_layers} layers × {RL_CONFIG.trunk_hidden} hidden")
     print(f"   Globals/Grid/Tok: {RL_CONFIG.global_feature_count} + "
           f"{RL_CONFIG.grid_width}x{RL_CONFIG.grid_height}x{RL_CONFIG.grid_channels} + "

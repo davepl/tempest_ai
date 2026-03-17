@@ -5,7 +5,7 @@
 # ==================================================================================================================
 """Prioritized replay buffer using a sum-tree for O(log N) sampling."""
 
-import os, sys, time, shutil
+import os, sys, time, shutil, math
 import numpy as np
 import threading
 
@@ -139,6 +139,8 @@ class PrioritizedReplayBuffer:
             self.dones       = self._open_memmap("dones",       (self.capacity,), np.float32)
             self.horizons    = self._open_memmap("horizons",    (self.capacity,), np.int32, fill=1)
             self.is_expert   = self._open_memmap("is_expert",   (self.capacity,), np.uint8)
+            self.wave_numbers = self._open_memmap("wave_numbers", (self.capacity,), np.int16, fill=1)
+            self.start_waves  = self._open_memmap("start_waves",  (self.capacity,), np.int16, fill=1)
         else:
             self.states      = np.zeros((self.capacity, self.state_size), dtype=np.float32)
             self.next_states = np.zeros((self.capacity, self.state_size), dtype=np.float32)
@@ -147,6 +149,8 @@ class PrioritizedReplayBuffer:
             self.dones       = np.zeros(self.capacity, dtype=np.float32)
             self.horizons    = np.ones(self.capacity, dtype=np.int32)
             self.is_expert   = np.zeros(self.capacity, dtype=np.uint8)
+            self.wave_numbers = np.ones(self.capacity, dtype=np.int16)
+            self.start_waves  = np.ones(self.capacity, dtype=np.int16)
 
         self.tree = SumTree(self.capacity)
         self.size = 0
@@ -239,7 +243,7 @@ class PrioritizedReplayBuffer:
 
     def add(self, state, action: int, reward: float, next_state, done: bool,
             horizon: int = 1, expert: int = 0, priority_hint: float = 0.0,
-            level_mult: float = 1.0):
+            level_mult: float = 1.0, wave_number: int = 1, start_wave: int = 1):
         with self.lock:
             eps = max(0.0, float(getattr(RL_CONFIG, "priority_eps", 1e-6) or 0.0))
             min_priority = max(1e-12, eps ** self.alpha if eps > 0.0 else 1e-12)
@@ -274,12 +278,15 @@ class PrioritizedReplayBuffer:
             self.dones[idx]       = 1.0 if done else 0.0
             self.horizons[idx]    = max(1, int(horizon))
             self.is_expert[idx]   = int(expert)
+            self.wave_numbers[idx] = max(1, min(32767, int(wave_number)))
+            self.start_waves[idx]  = max(1, min(32767, int(start_wave)))
             self._n_expert += int(expert)
             self.size = self.tree.size
 
     def sample(self, batch_size: int, beta: float = 0.4):
         """Sample a prioritised batch. Returns (states, actions, rewards,
-        next_states, dones, horizons, is_expert, indices, weights)."""
+        next_states, dones, horizons, is_expert, wave_numbers, start_waves,
+        indices, weights)."""
         with self.lock:
             if self.size < batch_size:
                 return None
@@ -288,13 +295,132 @@ class PrioritizedReplayBuffer:
             if total <= 0:
                 return None
 
+            candidate_count = batch_size
+            max_expert_frac = float(getattr(RL_CONFIG, "replay_expert_max_frac", 1.0))
+            if 0.0 <= max_expert_frac < 1.0:
+                candidate_count = max(candidate_count, batch_size * 4)
+            if bool(getattr(RL_CONFIG, "replay_wave_sampling_enabled", False)):
+                candidate_mult = max(1, int(getattr(RL_CONFIG, "replay_wave_candidate_multiplier", 4) or 4))
+                candidate_count = max(candidate_count, batch_size * candidate_mult)
+
             # Stratified sampling — one uniform draw per segment (vectorised)
-            segment = total / batch_size
-            lows = np.arange(batch_size, dtype=np.float64) * segment
+            segment = total / candidate_count
+            lows = np.arange(candidate_count, dtype=np.float64) * segment
             highs = lows + segment
             values = np.random.uniform(lows, highs)
             indices = self.tree.batch_get(values)
             np.clip(indices, 0, self.size - 1, out=indices)
+            candidate_indices = np.asarray(indices, dtype=np.int64)
+
+            # Dedupe while preserving priority order so quota logic operates on
+            # real candidate transitions instead of repeated leaf hits.
+            unique_candidates = []
+            seen = set()
+            for idx in candidate_indices.tolist():
+                idx_i = int(idx)
+                if idx_i in seen:
+                    continue
+                seen.add(idx_i)
+                unique_candidates.append(idx_i)
+            if not unique_candidates:
+                return None
+
+            pool = np.asarray(unique_candidates, dtype=np.int64)
+            expert_flags = self.is_expert[pool].astype(np.bool_)
+            wave_numbers = self.wave_numbers[pool].astype(np.int32)
+            start_waves = self.start_waves[pool].astype(np.int32)
+
+            min_expert_frac = float(getattr(RL_CONFIG, "replay_expert_min_frac", 0.0))
+            min_expert = 0
+            if min_expert_frac > 0.0:
+                min_expert = max(0, min(batch_size, int(round(batch_size * min_expert_frac))))
+            max_expert = batch_size
+            if 0.0 <= max_expert_frac < 1.0:
+                max_expert = max(0, min(batch_size, int(math.floor(batch_size * max_expert_frac))))
+            max_expert = max(max_expert, min_expert)
+
+            selected = []
+            selected_set = set()
+            expert_used = 0
+
+            def _append_candidates(cands):
+                nonlocal expert_used
+                for raw_idx in np.asarray(cands, dtype=np.int64).tolist():
+                    idx_i = int(raw_idx)
+                    if idx_i in selected_set:
+                        continue
+                    is_exp = bool(self.is_expert[idx_i])
+                    if is_exp and expert_used >= max_expert:
+                        continue
+                    if is_exp:
+                        expert_used += 1
+                    selected.append(idx_i)
+                    selected_set.add(idx_i)
+                    if len(selected) >= batch_size:
+                        break
+
+            def _append_duplicates(cands, ignore_expert_cap: bool = False, stop_expert_at: int | None = None):
+                nonlocal expert_used
+                for raw_idx in np.asarray(cands, dtype=np.int64).tolist():
+                    idx_i = int(raw_idx)
+                    is_exp = bool(self.is_expert[idx_i])
+                    if is_exp and (not ignore_expert_cap) and expert_used >= max_expert:
+                        continue
+                    if is_exp and stop_expert_at is not None and expert_used >= stop_expert_at:
+                        continue
+                    if is_exp and not ignore_expert_cap:
+                        expert_used += 1
+                    selected.append(idx_i)
+                    if len(selected) >= batch_size:
+                        break
+
+            if min_expert > 0 and np.any(expert_flags):
+                _append_candidates(pool[expert_flags][:min_expert])
+            if expert_used < min_expert:
+                _append_duplicates(
+                    candidate_indices[self.is_expert[candidate_indices].astype(np.bool_)],
+                    stop_expert_at=min_expert,
+                )
+
+            if bool(getattr(RL_CONFIG, "replay_wave_sampling_enabled", False)):
+                dqn_mask = ~expert_flags
+                rel_progress = np.maximum(0, wave_numbers - start_waves)
+                frontier_peak = int(rel_progress[dqn_mask].max()) if np.any(dqn_mask) else 0
+                min_frontier = max(0, int(getattr(RL_CONFIG, "replay_wave_min_frontier", 0) or 0))
+                frontier_margin = max(0, int(getattr(RL_CONFIG, "replay_wave_frontier_margin", 0) or 0))
+                high_offset = max(0, int(getattr(RL_CONFIG, "replay_wave_high_offset", 0) or 0))
+                frontier_floor = max(min_frontier, frontier_peak - frontier_margin)
+                high_floor = max(min_frontier, frontier_peak - high_offset)
+
+                frontier_quota = max(0, min(batch_size, int(round(batch_size * float(getattr(RL_CONFIG, "replay_wave_frontier_frac", 0.0) or 0.0)))))
+                high_quota = max(0, min(batch_size, int(round(batch_size * float(getattr(RL_CONFIG, "replay_wave_high_frac", 0.0) or 0.0)))))
+
+                frontier_mask = dqn_mask & (rel_progress >= min_frontier) & (rel_progress >= frontier_floor)
+                high_mask = dqn_mask & (rel_progress >= high_floor) & ~frontier_mask
+
+                if frontier_quota > 0 and np.any(frontier_mask):
+                    _append_candidates(pool[frontier_mask][:frontier_quota])
+                if high_quota > 0 and len(selected) < batch_size and np.any(high_mask):
+                    _append_candidates(pool[high_mask][:high_quota])
+
+            if len(selected) < batch_size:
+                _append_candidates(pool[~expert_flags])
+            if len(selected) < batch_size:
+                _append_candidates(pool)
+            if len(selected) < batch_size:
+                _append_candidates(candidate_indices[~self.is_expert[candidate_indices].astype(np.bool_)])
+            if len(selected) < batch_size:
+                _append_candidates(candidate_indices)
+            if len(selected) < batch_size:
+                _append_duplicates(candidate_indices[~self.is_expert[candidate_indices].astype(np.bool_)])
+            if len(selected) < batch_size:
+                _append_duplicates(candidate_indices)
+            if len(selected) < batch_size:
+                _append_duplicates(candidate_indices, ignore_expert_cap=True)
+            if len(selected) < batch_size:
+                return None
+
+            indices = np.asarray(selected[:batch_size], dtype=np.int64)
 
             # Gather priorities in one vectorised read
             eps = max(0.0, float(getattr(RL_CONFIG, "priority_eps", 1e-6) or 0.0))
@@ -314,6 +440,8 @@ class PrioritizedReplayBuffer:
                 self.dones[indices],
                 self.horizons[indices],
                 self.is_expert[indices],
+                self.wave_numbers[indices],
+                self.start_waves[indices],
                 indices,
                 weights.astype(np.float32),
             )
@@ -388,7 +516,8 @@ class PrioritizedReplayBuffer:
         # Only flush the small arrays (actions, rewards, dones, horizons,
         # is_expert) which are negligible in size.
         for arr in (self.actions, self.rewards, self.dones,
-                    self.horizons, self.is_expert):
+                    self.horizons, self.is_expert, self.wave_numbers,
+                    self.start_waves):
             if hasattr(arr, "flush"):
                 arr.flush()
         if verbose:
@@ -433,6 +562,8 @@ class PrioritizedReplayBuffer:
             ("dones",       lambda: self.dones[:n]),
             ("horizons",    lambda: self.horizons[:n]),
             ("is_expert",   lambda: self.is_expert[:n]),
+            ("wave_numbers", lambda: self.wave_numbers[:n]),
+            ("start_waves",  lambda: self.start_waves[:n]),
             ("priorities",  lambda: self.tree.tree[self.tree.capacity:self.tree.capacity + n]),
         ]
 
@@ -497,6 +628,10 @@ class PrioritizedReplayBuffer:
             if verbose:
                 frac = 0.05 + 0.30 * ((i + 1) / len(names))
                 self._progress_bar("  Replay load", frac)
+        for name in ("wave_numbers", "start_waves"):
+            fpath = os.path.join(dirpath, f"{name}.npy")
+            if os.path.isfile(fpath):
+                arch[name] = np.load(fpath, allow_pickle=False)
 
         return self._restore_from_arrays(arch, data_ptr, max_priority, t0, dirpath, verbose)
 
@@ -556,6 +691,14 @@ class PrioritizedReplayBuffer:
             self.dones[:n]       = arch["dones"][offset:offset + n]
             self.horizons[:n]    = arch["horizons"][offset:offset + n]
             self.is_expert[:n]   = arch["is_expert"][offset:offset + n]
+            if "wave_numbers" in arch:
+                self.wave_numbers[:n] = arch["wave_numbers"][offset:offset + n]
+            else:
+                self.wave_numbers[:n] = 1
+            if "start_waves" in arch:
+                self.start_waves[:n] = arch["start_waves"][offset:offset + n]
+            else:
+                self.start_waves[:n] = 1
             if verbose:
                 self._progress_bar("  Replay load", 0.62)
 

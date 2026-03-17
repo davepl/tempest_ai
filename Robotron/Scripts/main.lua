@@ -2,11 +2,11 @@
     Robotron AI Lua script for MAME.
 
     Current scope:
-      - Sends a compact 932-value RL state vector:
+      - Sends a compact 1220-value RL state vector:
         + 9 core/player values
         + 50 ELIST bytes
         + 9 typed entity buckets with nearest-K stable slots
-          storing present, dx, dy, dist, hit_w, hit_h
+          storing present, dx, dy, dist, hit_w, hit_h, vx, vy
       - Still computes richer object features internally for HUD/preview support
       - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
 --]]
@@ -272,7 +272,7 @@ GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
 GLOBAL_FEATURES = 100
 GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
 TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
-LEGACY_SLOT_STATE_FEATURES = 6
+LEGACY_SLOT_STATE_FEATURES = 8
 LEGACY_ENTITY_TOTAL_FEATURES = 0
 for _, cat in ipairs(ENTITY_CATEGORIES) do
     LEGACY_ENTITY_TOTAL_FEATURES = LEGACY_ENTITY_TOTAL_FEATURES + 1 + (cat.slots * LEGACY_SLOT_STATE_FEATURES)
@@ -380,7 +380,7 @@ PREVIEW_FORMAT_RGB565_LZSS = 2
 PREVIEW_FORMAT_RGB565_RLE = 3
 -- Enable preview support; server controls streaming per-client via action source flags.
 PREVIEW_CAPTURE_ENABLED = true
-PREVIEW_FPS = math.max(1, math.floor(env_number("ROBOTRON_PREVIEW_FPS", 15) or 15))
+PREVIEW_FPS = math.max(1, math.floor(env_number("ROBOTRON_PREVIEW_FPS", 30) or 30))
 PREVIEW_MIN_INTERVAL_S = (1.0 / PREVIEW_FPS)
 -- Capture near dashboard size at the source; sending full-resolution snapshots
 -- through Lua was the dominant cost for the preview client.
@@ -1395,7 +1395,11 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
                 legacy_list_features[#legacy_list_features + 1] = obj.dist_norm
                 legacy_list_features[#legacy_list_features + 1] = clamp01((obj.hit_w or obj.width or 0) / 16.0)
                 legacy_list_features[#legacy_list_features + 1] = clamp01((obj.hit_h or obj.height or 0) / 16.0)
+                legacy_list_features[#legacy_list_features + 1] = obj.vx or 0.0
+                legacy_list_features[#legacy_list_features + 1] = obj.vy or 0.0
             else
+                legacy_list_features[#legacy_list_features + 1] = 0.0
+                legacy_list_features[#legacy_list_features + 1] = 0.0
                 legacy_list_features[#legacy_list_features + 1] = 0.0
                 legacy_list_features[#legacy_list_features + 1] = 0.0
                 legacy_list_features[#legacy_list_features + 1] = 0.0
