@@ -5,7 +5,8 @@
 # ||  Rainbow-lite with:                                                                                          ||
 # ||    • Distributional C51 value estimation                                                                     ||
 # ||    • Factored action heads (move dir 8 + fire dir 8 = 64 total)                                             ||
-# ||    • Multi-head self-attention over 7 enemy slots                                                            ||
+# ||    • Unified 64-slot entity pool with learned type embeddings                                                ||
+# ||    • Entity self-attention (2 layers) + 8-direction lane cross-attention                                     ||
 # ||    • Dueling architecture                                                                                     ||
 # ||    • Prioritised experience replay (in replay_buffer.py)                                                     ||
 # ||    • N-step returns                                                                                           ||
@@ -39,11 +40,17 @@ import torch.optim as optim
 
 try:
     from config import SERVER_CONFIG, RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, \
+                        LEGACY_CORE_FEATURES, LEGACY_ELIST_FEATURES, LEGACY_SLOT_STATE_FEATURES, \
+                        UNIFIED_TYPE_NAMES, UNIFIED_NUM_TYPES, \
+                        UNIFIED_HUMAN_TYPE_ID, UNIFIED_ELECTRODE_TYPE_ID, \
                         metrics as config_metrics, RESET_METRICS, IS_INTERACTIVE
     from training import train_step
     from replay_buffer import PrioritizedReplayBuffer
 except ImportError:
     from Scripts.config import SERVER_CONFIG, RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, \
+                               LEGACY_CORE_FEATURES, LEGACY_ELIST_FEATURES, LEGACY_SLOT_STATE_FEATURES, \
+                               UNIFIED_TYPE_NAMES, UNIFIED_NUM_TYPES, \
+                               UNIFIED_HUMAN_TYPE_ID, UNIFIED_ELECTRODE_TYPE_ID, \
                                metrics as config_metrics, RESET_METRICS, IS_INTERACTIVE
     from Scripts.training import train_step
     from Scripts.replay_buffer import PrioritizedReplayBuffer
@@ -167,7 +174,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 7
+MODEL_ARCH_VERSION = 16
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -691,8 +698,8 @@ def _hybrid_base_state_size() -> int:
 
 
 def _legacy_slot_layout() -> tuple[list[tuple[str, int, int, int]], int]:
-    slot_features = int(getattr(RL_CONFIG, "slot_state_features", 4))
-    offset = 59  # 9 core + 50 ELIST
+    slot_features = int(getattr(RL_CONFIG, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
+    offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES)
     info: list[tuple[str, int, int, int]] = []
     for cat_idx, (name, slots) in enumerate(getattr(RL_CONFIG, "entity_categories", ())):
         slots_i = int(slots)
@@ -752,18 +759,13 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
     if base_state_size != legacy_size or latest.size < legacy_size:
         return np.zeros((0, 15), dtype=np.float32)
 
-    slot_features = int(getattr(RL_CONFIG, "slot_state_features", 4))
+    slot_features = int(getattr(RL_CONFIG, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
     rows: list[list[float]] = []
-    cat_den = max(1, len(cat_info) - 1)
+    type_den = max(1, UNIFIED_NUM_TYPES - 1)
 
-    for name, base, slots, cat_idx in cat_info:
+    for _name, base, slots, _cat_idx in cat_info:
         latest_block = latest[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
         prev_block = prev[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
-        fallback_w_px, fallback_h_px = _LEGACY_CATEGORY_BOX_PX.get(name, (8.0, 8.0))
-        threat_w = _LEGACY_THREAT_WEIGHT.get(name, 0.5)
-        is_human = 1.0 if name == "human" else 0.0
-        is_dangerous = 1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
-        cat_norm = float(cat_idx) / float(cat_den)
 
         for slot_idx in range(slots):
             if float(latest_block[slot_idx, 0]) < 0.5:
@@ -771,23 +773,39 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
             dx = float(latest_block[slot_idx, 1])
             dy = float(latest_block[slot_idx, 2])
             dist = float(latest_block[slot_idx, 3])
-            size_x_px = fallback_w_px
-            size_y_px = fallback_h_px
-            if slot_features >= 6:
-                size_x_px = max(1.0, float(latest_block[slot_idx, 4]) * 16.0)
-                size_y_px = max(1.0, float(latest_block[slot_idx, 5]) * 16.0)
             if not np.isfinite(dist):
                 continue
 
-            if slot_features >= 8:
-                vx = float(latest_block[slot_idx, 6])
-                vy = float(latest_block[slot_idx, 7])
+            vx = float(latest_block[slot_idx, 4])
+            vy = float(latest_block[slot_idx, 5])
+            threat = float(latest_block[slot_idx, 6])
+            approach = float(latest_block[slot_idx, 7])
+
+            hit_w_norm = None
+            hit_h_norm = None
+            if slot_features >= 11:
+                hit_w_norm = float(latest_block[slot_idx, 8])
+                hit_h_norm = float(latest_block[slot_idx, 9])
+                type_id_norm = float(latest_block[slot_idx, 10])
             else:
-                prev_present = float(prev_block[slot_idx, 0]) >= 0.5
-                prev_dx = float(prev_block[slot_idx, 1]) if prev_present else dx
-                prev_dy = float(prev_block[slot_idx, 2]) if prev_present else dy
-                vx = dx - prev_dx if prev_present else 0.0
-                vy = dy - prev_dy if prev_present else 0.0
+                type_id_norm = float(latest_block[slot_idx, 8])
+            type_id = int(round(type_id_norm * type_den))
+            type_id = max(0, min(UNIFIED_NUM_TYPES - 1, type_id))
+            type_name = UNIFIED_TYPE_NAMES[type_id]
+
+            is_human = 1.0 if type_id == UNIFIED_HUMAN_TYPE_ID else 0.0
+            is_dangerous = 1.0 if type_name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
+            cat_norm = type_id_norm  # Preserve normalised type for backward compat
+
+            fallback_w_px, fallback_h_px = _LEGACY_CATEGORY_BOX_PX.get(type_name, (8.0, 8.0))
+            if hit_w_norm is None or not np.isfinite(hit_w_norm) or hit_w_norm <= 0.0:
+                hit_w_norm = max(0.0, min(1.0, fallback_w_px / 16.0))
+            else:
+                hit_w_norm = max(0.0, min(1.0, hit_w_norm))
+            if hit_h_norm is None or not np.isfinite(hit_h_norm) or hit_h_norm <= 0.0:
+                hit_h_norm = max(0.0, min(1.0, fallback_h_px / 16.0))
+            else:
+                hit_h_norm = max(0.0, min(1.0, hit_h_norm))
 
             world_dx = dx * _REL_POS_X_RANGE
             world_dy = dy * _REL_POS_Y_RANGE
@@ -799,11 +817,6 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
                 dir_x = 0.0
                 dir_y = 0.0
 
-            proximity = max(0.0, 1.0 - min(1.0, dist))
-            threat = max(0.0, min(1.0, threat_w * (0.55 + (0.45 * proximity))))
-            approach_raw = -((vx * dir_x) + (vy * dir_y))
-            approach = max(0.0, min(1.0, (approach_raw + 1.0) * 0.5))
-
             rows.append([
                 1.0,
                 dx,
@@ -814,8 +827,8 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
                 dir_x,
                 dir_y,
                 threat,
-                max(0.0, min(1.0, size_x_px / 16.0)),
-                max(0.0, min(1.0, size_y_px / 16.0)),
+                hit_w_norm,
+                hit_h_norm,
                 cat_norm,
                 is_human,
                 is_dangerous,
@@ -841,11 +854,17 @@ def _active_tokens_from_state(state: np.ndarray) -> np.ndarray:
 
 
 def _token_category_name(tok: np.ndarray) -> str:
-    if tok.shape[0] < 12 or not _CATEGORY_NAMES:
+    """Decode the entity type name from a legacy slot token's cat_norm field.
+
+    With unified pool, cat_norm (index 11) stores the normalised type_id:
+        type_id = round(cat_norm * (UNIFIED_NUM_TYPES - 1))
+    """
+    if tok.shape[0] < 12:
         return ""
-    idx = int(round(float(tok[11]) * max(1, len(_CATEGORY_NAMES) - 1)))
-    idx = max(0, min(len(_CATEGORY_NAMES) - 1, idx))
-    return _CATEGORY_NAMES[idx]
+    type_den = max(1, UNIFIED_NUM_TYPES - 1)
+    idx = int(round(float(tok[11]) * type_den))
+    idx = max(0, min(UNIFIED_NUM_TYPES - 1, idx))
+    return UNIFIED_TYPE_NAMES[idx]
 
 
 def _nearest_enemy_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -1409,6 +1428,37 @@ def get_cleanup_fire_override(state: np.ndarray, locked_fire: Optional[int] = No
     return _nearest_aligned_fire_direction_from_state(state, categories=_ENDGAME_CLEANUP_CATEGORIES)
 
 
+def _priority_spawn_fire_direction_from_state(
+    state: np.ndarray,
+    nearest_enemy: Optional[Tuple[float, float, float]] = None,
+    nearest_projectile: Optional[Tuple[float, float, float]] = None,
+) -> Optional[int]:
+    """Prefer spawn-class targets (spheroids/tanks), but never over an immediate projectile shot."""
+    if nearest_projectile is not None and nearest_projectile[2] <= _PROJECTILE_DANGER_DIST:
+        projectile_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"projectile"})
+        if projectile_fire_dir is not None:
+            return int(projectile_fire_dir)
+
+    aligned_spawn_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"spawner", "tank"})
+    if aligned_spawn_fire_dir is not None:
+        return int(aligned_spawn_fire_dir)
+
+    nearest_spawn_target = _nearest_category_vector_from_state(state, {"spawner", "tank"})
+    if nearest_spawn_target is None:
+        return None
+
+    close_threat = False
+    if nearest_enemy is not None and nearest_enemy[2] < _ALIGN_SAFE_DIST:
+        close_threat = True
+    if nearest_projectile is not None and nearest_projectile[2] < _PROJECTILE_DANGER_DIST:
+        close_threat = True
+    if close_threat:
+        return None
+
+    sx, sy, _ = nearest_spawn_target
+    return _closest_dir8(sx * _REL_POS_X_RANGE, sy * _REL_POS_Y_RANGE, default_dir=0)
+
+
 def _get_simple_expert_action(
     state: np.ndarray,
     locked_fire: Optional[int] = None,
@@ -1417,9 +1467,11 @@ def _get_simple_expert_action(
     """Simpler, more stable heuristic Robotron expert.
 
     Fire:
-        1) If any enemy/projectile is aligned with one of the 8 fire directions
+        1) If a projectile is dangerously close and aligned, clear it.
+        2) Otherwise prefer spawn-class targets (spheroids/tanks) before they can spawn more danger.
+        3) If any enemy/projectile is aligned with one of the 8 fire directions
            within an 8 px half-window, shoot the closest aligned target.
-        2) Otherwise, fallback to shooting the nearest enemy.
+        4) Otherwise, fallback to shooting the nearest enemy.
      Move priority:
         1) Rescue humans when safe.
         2) Flee close threats (including hulks).
@@ -1435,6 +1487,11 @@ def _get_simple_expert_action(
     nearest_human = _nearest_human_vector_from_state(state)
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
     aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
+    priority_spawn_fire_dir = _priority_spawn_fire_direction_from_state(
+        state,
+        nearest_enemy=nearest_enemy,
+        nearest_projectile=nearest_projectile,
+    )
     humans_remaining, _cleanup_targets = _count_humans_and_cleanup_targets(state)
     humans_for_rescue_mode, destructible_enemies = _count_humans_and_destructible_enemies(state)
     hold_fire_for_last_enemy = bool(getattr(RL_CONFIG, "expert_hold_fire_for_last_enemy_rescue", True))
@@ -1452,7 +1509,9 @@ def _get_simple_expert_action(
         defensive_fire_dir = _defensive_fire_direction_from_state(state)
         fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else 0
     else:
-        if aligned_fire_dir is not None:
+        if priority_spawn_fire_dir is not None:
+            fire_dir = int(priority_spawn_fire_dir)
+        elif aligned_fire_dir is not None:
             fire_dir = int(aligned_fire_dir)
         elif nearest_projectile is not None and (
             nearest_enemy is None or nearest_projectile[2] <= max(nearest_enemy[2], _PROJECTILE_DANGER_DIST)
@@ -1524,12 +1583,17 @@ def _get_strategic_expert_action(
     """Heuristic Robotron expert with strategic late-wave modes."""
     nearest_enemy = _nearest_enemy_vector_from_state(state)
     nearest_projectile = _nearest_projectile_vector_from_state(state)
-    nearest_brain_tank = _nearest_category_vector_from_state(state, {"brain", "tank"})
+    nearest_priority_hunt = _nearest_category_vector_from_state(state, {"brain", "tank", "spawner"})
     nearest_align_robot = _preferred_align_robot_vector_from_state(state)
     nearest_endgame_cleanup = _nearest_endgame_cleanup_vector_from_state(state)
     nearest_human = _nearest_human_vector_from_state(state)
     nearby_avoidance = _nearby_avoidance_vectors_from_state(state)
     aligned_fire_dir = _nearest_aligned_fire_direction_from_state(state)
+    priority_spawn_fire_dir = _priority_spawn_fire_direction_from_state(
+        state,
+        nearest_enemy=nearest_enemy,
+        nearest_projectile=nearest_projectile,
+    )
     humans_remaining, _cleanup_targets = _count_humans_and_cleanup_targets(state)
     humans_for_rescue_mode, destructible_enemies = _count_humans_and_destructible_enemies(state)
     threat_pressure, projectile_count = _strategic_threat_pressure(state)
@@ -1565,14 +1629,16 @@ def _get_strategic_expert_action(
         if protect_humans_wave:
             if nearest_projectile is not None and nearest_projectile[2] <= _PROJECTILE_DANGER_DIST:
                 rescue_projectile_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"projectile"})
-            rescue_hunt_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"brain", "tank"})
+            rescue_hunt_fire_dir = _nearest_aligned_fire_direction_from_state(state, categories={"brain", "tank", "spawner"})
         if rescue_projectile_fire_dir is not None:
             fire_dir = int(rescue_projectile_fire_dir)
         elif rescue_hunt_fire_dir is not None:
             fire_dir = int(rescue_hunt_fire_dir)
-        elif protect_humans_wave and nearest_brain_tank is not None:
-            fx, fy, _ = nearest_brain_tank
+        elif protect_humans_wave and nearest_priority_hunt is not None:
+            fx, fy, _ = nearest_priority_hunt
             fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
+        elif priority_spawn_fire_dir is not None:
+            fire_dir = int(priority_spawn_fire_dir)
         elif aligned_fire_dir is not None:
             fire_dir = int(aligned_fire_dir)
         elif nearest_projectile is not None and (
@@ -1878,6 +1944,219 @@ class EntitySetEncoder(nn.Module):
         return self.out_norm(x[:, 0, :])
 
 
+# ── Directional Lane Encoder ───────────────────────────────────────────────
+# 8-direction lane system inspired by the Tempest lane-cross-attention encoder.
+# Entities are binned into 8 angular wedges (matching fire/move directions)
+# relative to the player.  Each lane token summarises the nearest threats and
+# humans in that direction.  Cross-attention enriches lane tokens with the
+# full entity set, producing an 8-lane spatial summary vector.
+
+_NUM_LANES = 8
+# Unit vectors for the 8 canonical directions (right=0, then CCW in game coords).
+# Game Y axis is inverted (down is positive), so Up = (0, -1).
+_LANE_DIR_X = torch.tensor([1.0, 0.7071, 0.0, -0.7071, -1.0, -0.7071,  0.0,  0.7071])
+_LANE_DIR_Y = torch.tensor([0.0, -0.7071, -1.0, -0.7071,  0.0,  0.7071, 1.0,  0.7071])
+
+# Features per lane token (built from aggregated entity data):
+#   nearest_enemy_dist, nearest_enemy_dx, nearest_enemy_dy,
+#   nearest_enemy_vx, nearest_enemy_vy, nearest_enemy_threat, nearest_enemy_approach,
+#   enemy_count_in_lane,
+#   nearest_human_dist, nearest_human_dx, nearest_human_dy,
+#   human_count_in_lane,
+#   nearest_electrode_dist,
+#   sin_dir, cos_dir
+_LANE_TOKEN_FEATURES = 15
+
+
+class DirectionalLaneEncoder(nn.Module):
+    """Bin entities into 8 directional lanes and cross-attend.
+
+    Lane tokens (8 × 15 features) serve as queries; all entity tokens serve
+    as keys/values.  The resulting enriched lane representation is gated-pooled
+    (learned per-lane importance weights) into a fixed-size summary vector for
+    the MLP trunk.  Empty lanes are masked out of the pooling.
+    """
+
+    def __init__(self, entity_token_features: int, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        # Lane embedding
+        self.lane_embed = nn.Linear(_LANE_TOKEN_FEATURES, embed_dim)
+        self.lane_norm = nn.LayerNorm(embed_dim)
+
+        # Entity embedding (reuses the same token schema as EntitySetEncoder)
+        self.entity_embed = nn.Linear(entity_token_features, embed_dim)
+        self.entity_norm = nn.LayerNorm(embed_dim)
+
+        # Cross-attention: lanes (Q) attend to entities (K, V)
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.cross_norm = nn.LayerNorm(embed_dim)
+
+        # Attention-weighted pooling: learnable gate produces per-lane
+        # importance so empty lanes are down-weighted instead of diluting
+        # the signal via uniform mean-pooling.
+        self.pool_gate = nn.Linear(embed_dim, 1)
+
+        self.out_dim = embed_dim
+
+        # Pre-compute lane direction encodings
+        angles = torch.arange(_NUM_LANES, dtype=torch.float32) * (2.0 * math.pi / _NUM_LANES)
+        self.register_buffer('_lane_sin', torch.sin(angles))
+        self.register_buffer('_lane_cos', torch.cos(angles))
+        self.register_buffer('_lane_dir_x', _LANE_DIR_X.clone())
+        self.register_buffer('_lane_dir_y', _LANE_DIR_Y.clone())
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+    def _build_lane_tokens(
+        self,
+        entity_dx: torch.Tensor,     # (B, S)
+        entity_dy: torch.Tensor,     # (B, S)
+        entity_dist: torch.Tensor,   # (B, S)
+        entity_vx: torch.Tensor,     # (B, S)
+        entity_vy: torch.Tensor,     # (B, S)
+        entity_threat: torch.Tensor, # (B, S)
+        entity_approach: torch.Tensor,  # (B, S)
+        entity_present: torch.Tensor,   # (B, S) bool
+        entity_is_human: torch.Tensor,  # (B, S) bool
+        entity_is_electrode: torch.Tensor,  # (B, S) bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Aggregate per-entity data into 8 directional lane tokens.
+
+        Returns:
+            lane_tokens: (B, 8, 15) directional aggregate features.
+            lane_has_entity: (B, 8) bool mask indicating non-empty lanes.
+        """
+        B, S = entity_dx.shape
+        device = entity_dx.device
+
+        # Compute angle from player to each entity.
+        # Lua normalises dx by POS_X_RANGE and dy by POS_Y_RANGE (different
+        # values), so we must unscale to world units before atan2 to get
+        # true geometric angles.  We also negate dy because Robotron's
+        # screen Y axis is inverted (down = +).
+        world_dx = entity_dx * _REL_POS_X_RANGE
+        world_dy = entity_dy * _REL_POS_Y_RANGE
+        angles = torch.atan2(-world_dy, world_dx)  # (B, S) in [-pi, pi]
+        # Shift to [0, 2pi) then quantise to 0..7 using floor(x + 0.5)
+        # instead of round() to avoid banker's rounding at wedge boundaries.
+        angles_pos = (angles + 2.0 * math.pi) % (2.0 * math.pi)
+        wedge = 2.0 * math.pi / _NUM_LANES
+        lane_idx = torch.floor(angles_pos / wedge + 0.5).long() % _NUM_LANES
+
+        # Masks for entity types
+        is_enemy = entity_present & ~entity_is_human & ~entity_is_electrode
+        is_human = entity_present & entity_is_human
+        is_electrode = entity_present & entity_is_electrode
+
+        # Use very large distance for absent/wrong-type entities so they lose min()
+        BIG = 999.0
+        enemy_dist = torch.where(is_enemy, entity_dist, torch.full_like(entity_dist, BIG))
+        human_dist = torch.where(is_human, entity_dist, torch.full_like(entity_dist, BIG))
+        electrode_dist = torch.where(is_electrode, entity_dist, torch.full_like(entity_dist, BIG))
+
+        # Build per-lane aggregates using scatter
+        lane_tokens = torch.zeros(B, _NUM_LANES, _LANE_TOKEN_FEATURES, device=device, dtype=entity_dx.dtype)
+
+        for lane_i in range(_NUM_LANES):
+            in_lane = (lane_idx == lane_i)  # (B, S)
+
+            # ── Nearest enemy in this lane ──
+            e_mask = in_lane & is_enemy
+            e_dist = torch.where(e_mask, enemy_dist, torch.full_like(enemy_dist, BIG))
+            nearest_e_idx = e_dist.argmin(dim=1)  # (B,)
+            nearest_e_dist = e_dist.gather(1, nearest_e_idx.unsqueeze(1)).squeeze(1)
+            has_enemy = nearest_e_dist < BIG
+
+            b_idx = torch.arange(B, device=device)
+            lane_tokens[:, lane_i, 0] = torch.where(has_enemy, nearest_e_dist, torch.zeros_like(nearest_e_dist))
+            lane_tokens[:, lane_i, 1] = torch.where(has_enemy, entity_dx[b_idx, nearest_e_idx], torch.zeros_like(nearest_e_dist))
+            lane_tokens[:, lane_i, 2] = torch.where(has_enemy, entity_dy[b_idx, nearest_e_idx], torch.zeros_like(nearest_e_dist))
+            lane_tokens[:, lane_i, 3] = torch.where(has_enemy, entity_vx[b_idx, nearest_e_idx], torch.zeros_like(nearest_e_dist))
+            lane_tokens[:, lane_i, 4] = torch.where(has_enemy, entity_vy[b_idx, nearest_e_idx], torch.zeros_like(nearest_e_dist))
+            lane_tokens[:, lane_i, 5] = torch.where(has_enemy, entity_threat[b_idx, nearest_e_idx], torch.zeros_like(nearest_e_dist))
+            lane_tokens[:, lane_i, 6] = torch.where(has_enemy, entity_approach[b_idx, nearest_e_idx], torch.zeros_like(nearest_e_dist))
+            # Enemy count in lane (normalise by 50 — enough to distinguish
+            # "busy" from "overwhelming" even on crowded late waves)
+            lane_tokens[:, lane_i, 7] = e_mask.float().sum(dim=1).clamp(max=50.0) / 50.0
+
+            # ── Nearest human in this lane ──
+            h_mask = in_lane & is_human
+            h_dist = torch.where(h_mask, human_dist, torch.full_like(human_dist, BIG))
+            nearest_h_idx = h_dist.argmin(dim=1)
+            nearest_h_dist = h_dist.gather(1, nearest_h_idx.unsqueeze(1)).squeeze(1)
+            has_human = nearest_h_dist < BIG
+            lane_tokens[:, lane_i, 8] = torch.where(has_human, nearest_h_dist, torch.zeros_like(nearest_h_dist))
+            lane_tokens[:, lane_i, 9] = torch.where(has_human, entity_dx[b_idx, nearest_h_idx], torch.zeros_like(nearest_h_dist))
+            lane_tokens[:, lane_i, 10] = torch.where(has_human, entity_dy[b_idx, nearest_h_idx], torch.zeros_like(nearest_h_dist))
+            lane_tokens[:, lane_i, 11] = h_mask.float().sum(dim=1).clamp(max=16.0) / 16.0
+
+            # ── Nearest electrode in this lane ──
+            el_mask = in_lane & is_electrode
+            el_dist = torch.where(el_mask, electrode_dist, torch.full_like(electrode_dist, BIG))
+            nearest_el_dist = el_dist.min(dim=1).values
+            lane_tokens[:, lane_i, 12] = torch.where(nearest_el_dist < BIG, nearest_el_dist, torch.zeros_like(nearest_el_dist))
+
+            # ── Positional encoding for this lane direction ──
+            lane_tokens[:, lane_i, 13] = self._lane_sin[lane_i]
+            lane_tokens[:, lane_i, 14] = self._lane_cos[lane_i]
+
+        # Per-lane occupancy: True if at least one present entity is in this lane.
+        lane_has_entity = torch.zeros(B, _NUM_LANES, dtype=torch.bool, device=device)
+        for lane_i in range(_NUM_LANES):
+            lane_has_entity[:, lane_i] = ((lane_idx == lane_i) & entity_present).any(dim=1)
+
+        return lane_tokens, lane_has_entity
+
+    def forward(
+        self,
+        lane_tokens: torch.Tensor,      # (B, 8, 15)
+        entity_tokens: torch.Tensor,    # (B, S, entity_features)
+        entity_mask: torch.Tensor,      # (B, S) bool — True = empty/absent
+        lane_mask: torch.Tensor,        # (B, 8) bool — True = lane has entities
+    ) -> torch.Tensor:
+        """Returns (B, embed_dim) gated-pooled lane summary."""
+        lane_emb = self.lane_norm(self.lane_embed(lane_tokens))        # (B, 8, D)
+        entity_emb = self.entity_norm(self.entity_embed(entity_tokens))  # (B, S, D)
+        summary = lane_emb.new_zeros((lane_emb.shape[0], self.embed_dim))
+
+        # Avoid all-masked attention rows: PyTorch MHA emits NaNs when every key
+        # is masked, and masked softmax over all-empty lanes would otherwise
+        # assign a uniform distribution instead of zero weight.
+        active_rows = (~entity_mask).any(dim=1) & lane_mask.any(dim=1)
+        if not torch.any(active_rows):
+            return summary
+
+        active_lane_emb = lane_emb[active_rows]
+        active_entity_emb = entity_emb[active_rows]
+        active_entity_mask = entity_mask[active_rows]
+        active_lane_mask = lane_mask[active_rows]
+
+        enriched, _ = self.cross_attn(
+            active_lane_emb, active_entity_emb, active_entity_emb,
+            key_padding_mask=active_entity_mask,
+        )  # (A, 8, D)
+
+        enriched = self.cross_norm(active_lane_emb + enriched)   # residual + norm
+        # Gated pool: learned per-lane importance, empty lanes hard-masked.
+        gate_logits = self.pool_gate(enriched).squeeze(-1)       # (A, 8)
+        gate_logits = gate_logits.masked_fill(~active_lane_mask, -1e9)
+        gate_weights = torch.softmax(gate_logits, dim=1)         # (A, 8)
+        summary[active_rows] = (enriched * gate_weights.unsqueeze(-1)).sum(dim=1)
+        return summary
+
+
 # ── Distributional Dueling Network ─────────────────────────────────────────
 class RainbowNet(nn.Module):
     """Robotron network with configurable flat-MLP and object-set branches."""
@@ -1907,26 +2186,16 @@ class RainbowNet(nn.Module):
         self.stack_depth = max(1, int(self.state_size // max(1, self.base_state_size)))
         self.attn_all_frames = bool(getattr(cfg, "attn_all_frames", False))
         self.attn_frame_count = self.stack_depth if self.attn_all_frames else 1
-        self.num_object_slots = int(getattr(cfg, "object_slots", 144))
-        self.object_token_features = int(getattr(cfg, "legacy_slot_token_features", 10))
-        self.slot_state_features = int(getattr(cfg, "slot_state_features", 8))
-        self.core_feature_count = 59  # 9 core + 50 ELIST
+        self.num_object_slots = int(getattr(cfg, "object_slots", 64))
+        self.slot_state_features = int(getattr(cfg, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
+        self.core_feature_count = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES)
         self._cat_info = []
         self._category_ranges = []
         self._num_categories = 0
         self._occupancy_offsets = []
 
-        cat_defs = getattr(cfg, "entity_categories", [
-            ("grunt", 40),
-            ("hulk", 16),
-            ("brain", 16),
-            ("tank", 8),
-            ("spawner", 8),
-            ("enforcer", 12),
-            ("projectile", 12),
-            ("human", 16),
-            ("electrode", 16),
-        ])
+        # Unified pool: single ("entity", 64) category with per-slot type_id
+        cat_defs = getattr(cfg, "entity_categories", [("entity", 64)])
         if self.use_attn:
             offset = self.core_feature_count
             slot_cursor = 0
@@ -1938,14 +2207,14 @@ class RainbowNet(nn.Module):
                 slot_cursor += slots_i
             self._num_categories = len(cat_defs)
             self._occupancy_offsets = [base for _name, base, _slots, _cat_id in self._cat_info]
-            slot_meta = []
-            for cat_id, (name, slots) in enumerate(cat_defs):
-                cat_norm = cat_id / max(1, self._num_categories - 1)
-                is_human = 1.0 if name == "human" else 0.0
-                is_dangerous = 1.0 if name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
-                for _ in range(int(slots)):
-                    slot_meta.append([cat_norm, is_human, is_dangerous])
-            self.register_buffer("slot_meta", torch.tensor(slot_meta, dtype=torch.float32), persistent=False)
+
+        # Learned type embedding replaces the old scalar cat_norm / is_human / is_dangerous meta
+        self.type_embedding_dim = int(getattr(cfg, "type_embedding_dim", 16))
+        self.type_embedding = nn.Embedding(UNIFIED_NUM_TYPES, self.type_embedding_dim)
+        # Entity token: 9 raw features + type_emb(16) + is_human(1) + is_dangerous(1) = 27
+        entity_raw_features = 9  # dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
+        self._entity_token_dim = entity_raw_features + self.type_embedding_dim + 2
+        self.object_token_features = self._entity_token_dim
 
         if self.use_pure_mlp:
             mlp_hidden = [int(v) for v in getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512]]
@@ -1953,8 +2222,74 @@ class RainbowNet(nn.Module):
             mlp_out = max(1, int(getattr(cfg, "mlp_output_dim", 256) or 256))
             self.mlp_hidden_layers = list(mlp_hidden)
             self.mlp_output_dim = mlp_out
+
+            # ── Directional lane or legacy EntitySetEncoder ────────────
+            self.use_directional_lanes = (
+                self.use_mlp_with_attention
+                and bool(getattr(cfg, "use_directional_lanes", False))
+            )
+            lane_out_dim = 0
+            entity_pool_dim = 0
+            attn_dim = int(getattr(cfg, "attn_dim", 256))
+            if self.use_directional_lanes:
+                # ── Entity input projection: raw token → attn_dim ──────
+                self.entity_input_proj = nn.Sequential(
+                    nn.Linear(self._entity_token_dim, attn_dim),
+                    nn.LayerNorm(attn_dim),
+                    nn.ReLU(),
+                )
+                # ── Entity self-attention: entities see each other ─────
+                num_sa_layers = int(getattr(cfg, "entity_self_attn_layers", 2))
+                sa_layer = nn.TransformerEncoderLayer(
+                    d_model=attn_dim,
+                    nhead=int(getattr(cfg, "attn_heads", 4)),
+                    dim_feedforward=attn_dim * 4,
+                    dropout=float(cfg.dropout),
+                    batch_first=True,
+                    norm_first=True,
+                )
+                self.entity_self_attn = nn.TransformerEncoder(sa_layer, num_layers=num_sa_layers)
+
+                # ── Lane cross-attention over self-attended entity tokens
+                self.lane_encoder = DirectionalLaneEncoder(
+                    entity_token_features=attn_dim,
+                    embed_dim=attn_dim,
+                    num_heads=int(getattr(cfg, "attn_heads", 4)),
+                )
+                lane_out_dim = self.lane_encoder.out_dim
+
+                # ── Entity pool: mean-pool self-attended tokens → summary
+                entity_pool_dim = attn_dim
+                self.entity_pool_proj = nn.Linear(attn_dim, entity_pool_dim)
+                self.entity_pool_norm = nn.LayerNorm(entity_pool_dim)
+            elif self.use_mlp_with_attention:
+                self.entity_input_proj = nn.Sequential(
+                    nn.Linear(self._entity_token_dim, attn_dim),
+                    nn.LayerNorm(attn_dim),
+                    nn.ReLU(),
+                )
+                entity_hidden = int(getattr(cfg, "entity_hidden", 192))
+                self.object_attn = EntitySetEncoder(
+                    token_features=attn_dim,
+                    embed_dim=attn_dim,
+                    num_heads=int(getattr(cfg, "attn_heads", 4)),
+                    num_layers=int(getattr(cfg, "attn_layers", 1)),
+                )
+                self.entity_proj = nn.Sequential(
+                    nn.Linear(attn_dim * self.attn_frame_count, entity_hidden),
+                    nn.LayerNorm(entity_hidden),
+                    nn.ReLU(),
+                )
+
+            # MLP trunk: stacked flat state + lane summary + entity pool summary
+            # Separate LayerNorm per branch before concatenation so each
+            # branch's features start on equal footing at init.
+            if self.use_directional_lanes:
+                self.state_norm = nn.LayerNorm(int(state_size))
+                self.lane_norm_out = nn.LayerNorm(lane_out_dim)
+            trunk_in = int(state_size) + lane_out_dim + entity_pool_dim
             layers = []
-            in_dim = int(state_size)
+            in_dim = trunk_in
             for width in mlp_hidden:
                 layers.append(nn.Linear(in_dim, width))
                 if cfg.use_layer_norm:
@@ -1971,25 +2306,16 @@ class RainbowNet(nn.Module):
                 layers.append(nn.Dropout(float(cfg.dropout)))
             self.trunk = nn.Sequential(*layers)
             head_in = mlp_out
-            if self.use_mlp_with_attention:
-                attn_dim = int(getattr(cfg, "attn_dim", 96))
+
+            # Legacy EntitySetEncoder fusion (only when NOT using directional lanes)
+            if self.use_mlp_with_attention and not self.use_directional_lanes:
                 entity_hidden = int(getattr(cfg, "entity_hidden", 192))
-                self.object_attn = EntitySetEncoder(
-                    token_features=self.object_token_features,
-                    embed_dim=attn_dim,
-                    num_heads=int(getattr(cfg, "attn_heads", 4)),
-                    num_layers=int(getattr(cfg, "attn_layers", 1)),
-                )
-                self.entity_proj = nn.Sequential(
-                    nn.Linear(attn_dim * self.attn_frame_count, entity_hidden),
-                    nn.LayerNorm(entity_hidden),
-                    nn.ReLU(),
-                )
                 self.mlp_attn_fusion = nn.Sequential(
                     nn.Linear(mlp_out + entity_hidden, mlp_out),
                     nn.LayerNorm(mlp_out) if cfg.use_layer_norm else nn.Identity(),
                     nn.ReLU(),
                 )
+
             head_mid = max(64, head_in // 2)
             self._build_action_heads(head_in, head_mid)
             self._init_weights()
@@ -2122,46 +2448,99 @@ class RainbowNet(nn.Module):
         return torch.cat(parts, dim=1)
 
     def _build_frame_object_tokens(self, state: torch.Tensor, frame_off: int):
-        """Build typed slot tokens and masks for one compact-state frame."""
+        """Build unified pool entity tokens with learned type embeddings.
+
+        Wire format per slot (11 features):
+            present(0), dx(1), dy(2), dist(3), vx(4), vy(5),
+            threat(6), approach(7), hit_w_norm(8), hit_h_norm(9), type_id_norm(10)
+
+        Output token (27 features):
+            dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h,
+            type_emb(16), is_human, is_dangerous
+        """
         B = state.shape[0]
         device = state.device
 
-        all_tokens = []
-        all_masks = []
-        slot_cursor = 0
-        for name, base, slots, cat_id in self._cat_info:
-            block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
-            block = block.reshape(B, slots, self.slot_state_features)
+        # Single unified category — extract the 64×11 block
+        _name, base, slots, _cat_id = self._cat_info[0]
+        block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
+        block = block.reshape(B, slots, self.slot_state_features)  # (B, 64, 11)
 
-            present = block[:, :, 0]
-            dx = block[:, :, 1:2]
-            dy = block[:, :, 2:3]
-            dist = block[:, :, 3:4]
-            width = block[:, :, 4:5] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
-            height = block[:, :, 5:6] if self.slot_state_features >= 6 else torch.full_like(dist, 0.5)
-            vx = block[:, :, 6:7] if self.slot_state_features >= 8 else torch.zeros_like(dist)
-            vy = block[:, :, 7:8] if self.slot_state_features >= 8 else torch.zeros_like(dist)
+        present = block[:, :, 0]                    # (B, 64)
+        raw_feats = block[:, :, 1:10]               # (B, 64, 9) — dx,dy,dist,vx,vy,threat,approach,hit_w,hit_h
+        type_id_norm = block[:, :, 10]              # (B, 64) in [0, 1]
 
-            meta = self.slot_meta[slot_cursor: slot_cursor + slots].to(device=device, dtype=state.dtype)
-            meta = meta.unsqueeze(0).expand(B, -1, -1)
-            slot_cursor += slots
+        # Decode type_id from normalised float back to integer index
+        type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)
+        type_emb = self.type_embedding(type_id_int)  # (B, 64, 16)
 
-            tokens = torch.cat(
-                [dx, dy, vx, vy, dist, width, height, meta],
-                dim=2,
-            )
-            all_tokens.append(tokens)
-            all_masks.append(present < 0.5)
+        # Derive boolean flags from type_id
+        is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)       # (B, 64, 1)
+        is_dangerous = (type_id_int != UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)   # (B, 64, 1)
 
-        tokens = torch.cat(all_tokens, dim=1)
-        mask = torch.cat(all_masks, dim=1)
-        all_empty = mask.all(dim=1, keepdim=True)
-        mask = mask & ~all_empty
+        # Reorder raw features to: dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
+        dx = raw_feats[:, :, 0:1]           # (B, 64, 1)
+        dy = raw_feats[:, :, 1:2]
+        dist = raw_feats[:, :, 2:3]
+        vx = raw_feats[:, :, 3:4]
+        vy = raw_feats[:, :, 4:5]
+        threat = raw_feats[:, :, 5:6]
+        approach = raw_feats[:, :, 6:7]
+        hit_w = raw_feats[:, :, 7:8]
+        hit_h = raw_feats[:, :, 8:9]
+
+        tokens = torch.cat(
+            [dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h, type_emb, is_human, is_dangerous],
+            dim=2,
+        )  # (B, 64, 27)
+
+        mask = present < 0.5
         return tokens, mask
 
     def _build_object_tokens(self, state: torch.Tensor):
         frame_offsets = self._frame_offsets(state)
         return self._build_frame_object_tokens(state, frame_offsets[-1])
+
+    def _build_directional_lane_tokens(self, state: torch.Tensor) -> torch.Tensor:
+        """Extract raw slot fields from the unified pool and build 8-lane tokens.
+
+        Returns: (lane_tokens (B, 8, 15), lane_has_entity (B, 8) bool)
+        """
+        B = state.shape[0]
+        frame_off = self._frame_offsets(state)[-1]
+
+        # Single unified category
+        _name, base, slots, _cat_id = self._cat_info[0]
+        block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
+        block = block.reshape(B, slots, self.slot_state_features)  # (B, 64, 11)
+
+        present = block[:, :, 0] > 0.5       # (B, 64) bool
+        dx = block[:, :, 1]
+        dy = block[:, :, 2]
+        dist = block[:, :, 3]
+        vx = block[:, :, 4]
+        vy = block[:, :, 5]
+        threat = block[:, :, 6]
+        approach = block[:, :, 7]
+        type_id_norm = block[:, :, 10]
+
+        # Decode type_id from normalised float
+        type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)
+        is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID)
+        is_electrode = (type_id_int == UNIFIED_ELECTRODE_TYPE_ID)
+
+        return self.lane_encoder._build_lane_tokens(
+            entity_dx=dx,
+            entity_dy=dy,
+            entity_dist=dist,
+            entity_vx=vx,
+            entity_vy=vy,
+            entity_threat=threat,
+            entity_approach=approach,
+            entity_present=present,
+            entity_is_human=is_human,
+            entity_is_electrode=is_electrode,
+        )
 
     def _build_all_frame_object_tokens(self, state: torch.Tensor):
         frame_offsets = self._frame_offsets(state)
@@ -2178,12 +2557,50 @@ class RainbowNet(nn.Module):
     def forward(self, state: torch.Tensor, log: bool = False):
         B = state.shape[0]
         if self.use_pure_mlp:
-            h = self.trunk(state)
-            if self.use_mlp_with_attention:
+            if self.use_directional_lanes:
+                # Build raw entity tokens for the latest frame → (B, 64, 27)
+                raw_tokens, entity_mask = self._build_frame_object_tokens(
+                    state, self._frame_offsets(state)[-1]
+                )
+                # Project to attn_dim → (B, 64, attn_dim)
+                entity_tokens = self.entity_input_proj(raw_tokens)
+                # Entity self-attention: entities reason about each other
+                # src_key_padding_mask=True means "ignore this position"
+                # Guard: all-masked keys produce NaN in attention softmax
+                any_present = (~entity_mask).any(dim=1)
+                if any_present.all():
+                    entity_tokens = self.entity_self_attn(
+                        entity_tokens, src_key_padding_mask=entity_mask
+                    )
+                elif any_present.any():
+                    attended = self.entity_self_attn(
+                        entity_tokens[any_present],
+                        src_key_padding_mask=entity_mask[any_present],
+                    )
+                    entity_tokens = entity_tokens.clone()
+                    entity_tokens[any_present] = attended
+                # else: all batches empty — skip self-attention entirely
+                # Build 8-directional lane tokens from raw slot data
+                lane_tokens, lane_active = self._build_directional_lane_tokens(state)
+                # Cross-attend lanes to self-attended entity tokens → (B, lane_dim)
+                lane_summary = self.lane_encoder(lane_tokens, entity_tokens, entity_mask, lane_active)
+                # Entity pool: masked mean-pool of self-attended tokens → summary
+                present_mask = ~entity_mask  # True = present
+                present_count = present_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+                entity_pooled = (entity_tokens * present_mask.unsqueeze(-1).float()).sum(dim=1) / present_count
+                entity_pool_summary = self.entity_pool_norm(F.relu(self.entity_pool_proj(entity_pooled)))
+                # Normalise each branch independently, then concatenate → trunk
+                h = self.trunk(torch.cat([self.state_norm(state),
+                                          self.lane_norm_out(lane_summary),
+                                          entity_pool_summary], dim=1))
+            elif self.use_mlp_with_attention:
+                h = self.trunk(state)
                 all_tokens, all_masks = self._build_all_frame_object_tokens(state)
                 frame_summaries = self.object_attn(all_tokens, all_masks).view(B, self.attn_frame_count, -1)
                 entity_out = self.entity_proj(frame_summaries.reshape(B, -1))
                 h = self.mlp_attn_fusion(torch.cat([h, entity_out], dim=1))
+            else:
+                h = self.trunk(state)
             q_atoms = self._action_head_q_atoms(h, B)
             if self.use_dist:
                 q_atoms = q_atoms.float()

@@ -370,19 +370,21 @@ class _DashboardState:
           hidden_layers = list(getattr(net, "mlp_hidden_layers", list(getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512])))
           output_dim = int(getattr(net, "mlp_output_dim", int(getattr(cfg, "mlp_output_dim", 256) or 256)))
           uses_attn = bool(getattr(net, "use_mlp_with_attention", False))
+          uses_dir_lanes = bool(getattr(net, "use_directional_lanes", False))
           slot_count = int(getattr(net, "num_object_slots", int(getattr(cfg, "object_slots", 0) or 0)))
           token_features = int(getattr(net, "object_token_features", int(getattr(cfg, "legacy_slot_token_features", 0) or 0)))
-          attn_dim = int(getattr(getattr(net, "object_attn", None), "out_dim", int(getattr(cfg, "attn_dim", 0) or 0)))
+          lane_enc = getattr(net, "lane_encoder", None)
+          attn_dim = int(getattr(lane_enc, "embed_dim", 0)) if lane_enc is not None else int(getattr(getattr(net, "object_attn", None), "out_dim", int(getattr(cfg, "attn_dim", 0) or 0)))
           attn_layers = int(getattr(cfg, "attn_layers", 1) or 1)
           attn_frame_count = int(getattr(net, "attn_frame_count", 1) or 1)
           attn_scope = "all" if bool(getattr(net, "attn_all_frames", False)) else "latest"
-          head_fc = getattr(net, "val_fc", None) or getattr(net, "q_fc", None)
+          head_fc = getattr(net, "val_fc", None) or getattr(net, "q_fc", None) or getattr(net, "move_adv_fc", None)
           head_mid = int(head_fc.out_features) if (head_fc is not None and hasattr(head_fc, "out_features")) else max(64, output_dim // 2)
           param_count = sum(p.numel() for p in net.parameters())
 
           model_desc_key = (
             id(net),
-            "mlp_with_attn" if uses_attn else "pure_mlp",
+            "mlp_dir_lanes" if uses_dir_lanes else ("mlp_with_attn" if uses_attn else "pure_mlp"),
             base_state,
             stack_depth,
             tuple(hidden_layers),
@@ -402,10 +404,12 @@ class _DashboardState:
           if self._model_desc is not None and self._model_desc_key == model_desc_key:
             return self._model_desc
 
-          layers = [f"{base_state * stack_depth}", *[str(v) for v in hidden_layers]]
-          if uses_attn:
+          layers = [f"{base_state * stack_depth}"]
+          if uses_dir_lanes:
+            layers.append(f"lanes8×{attn_dim}")
+          elif uses_attn:
             layers.extend([f"slot{slot_count}x{token_features}", f"set{attn_dim}x{attn_layers}@{attn_scope}{attn_frame_count}"])
-          layers.extend([str(output_dim), str(head_mid)])
+          layers.extend([*[str(v) for v in hidden_layers], str(output_dim), str(head_mid)])
           head_style = (
             f"mf({int(getattr(cfg, 'num_move_actions', 0) or 0)}+{int(getattr(cfg, 'num_fire_actions', 0) or 0)})"
             if bool(getattr(net, "use_factorized_action_heads", False))
@@ -419,7 +423,7 @@ class _DashboardState:
             p_str = f"{param_count / 1_000:.0f}K"
           else:
             p_str = str(param_count)
-          mode_label = "MLP+Attn" if uses_attn else "MLP"
+          mode_label = "MLP+Lanes" if uses_dir_lanes else ("MLP+Attn" if uses_attn else "MLP")
           desc = f"Model: {mode_label} · {arch_str} · {p_str} params"
           self._model_desc = desc
           self._model_desc_key = model_desc_key

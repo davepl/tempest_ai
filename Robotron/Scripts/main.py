@@ -271,11 +271,17 @@ def print_network_info(agent):
     print(f"   State size:       {agent.state_size} ({RL_CONFIG.frame_stack} × {RL_CONFIG.base_state_size})")
     print(f"   Actions:          {RL_CONFIG.num_move_actions} move dirs × {RL_CONFIG.num_fire_actions} fire dirs = {RL_CONFIG.num_joint_actions}")
     print(f"   Action head:      {'factorized move+fire' if RL_CONFIG.factorized_action_heads else 'joint 72-way'}")
-    print(f"   Trunk:            {RL_CONFIG.trunk_layers} layers × {RL_CONFIG.trunk_hidden} hidden")
+    if RL_CONFIG.pure_mlp:
+        print(f"   MLP trunk:        {' → '.join(str(x) for x in RL_CONFIG.mlp_hidden_layers)} → {RL_CONFIG.mlp_output_dim}")
+    else:
+        print(f"   Trunk:            {RL_CONFIG.trunk_layers} layers × {RL_CONFIG.trunk_hidden} hidden")
     print(f"   Globals/Grid/Tok: {RL_CONFIG.global_feature_count} + "
           f"{RL_CONFIG.grid_width}x{RL_CONFIG.grid_height}x{RL_CONFIG.grid_channels} + "
           f"{RL_CONFIG.object_token_count}x{RL_CONFIG.object_token_features}")
-    print(f"   Entity encoder:   {'ON' if RL_CONFIG.use_enemy_attention else 'OFF'} ({RL_CONFIG.attn_heads} heads, dim={RL_CONFIG.attn_dim})")
+    if getattr(net, 'use_directional_lanes', False):
+        print(f"   Spatial encoder:  directional lanes (8 dirs, dim={RL_CONFIG.attn_dim}, {RL_CONFIG.attn_heads} heads)")
+    else:
+        print(f"   Entity encoder:   {'ON' if RL_CONFIG.use_enemy_attention else 'OFF'} ({RL_CONFIG.attn_heads} heads, dim={RL_CONFIG.attn_dim})")
     print(f"   Distributional:   {'C51 ({} atoms, [{}, {}])'.format(RL_CONFIG.num_atoms, RL_CONFIG.v_min, RL_CONFIG.v_max) if RL_CONFIG.use_distributional else 'OFF'}")
     print(f"   Dueling:          {'ON' if RL_CONFIG.use_dueling else 'OFF'}")
     print(f"   Parameters:       {tp:,} total, {tr:,} trainable")

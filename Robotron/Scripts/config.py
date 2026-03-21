@@ -120,21 +120,19 @@ def _parse_webrtc_ice_servers_env() -> list[dict]:
 WEBRTC_ICE_SERVERS = _parse_webrtc_ice_servers_env()
 
 LEGACY_ENTITY_CATEGORIES: tuple[tuple[str, int], ...] = (
-    ("grunt", 40),
-    ("hulk", 16),
-    ("brain", 16),
-    ("tank", 8),
-    ("spawner", 8),
-    ("enforcer", 12),
-    ("projectile", 12),
-    ("human", 16),
-    ("electrode", 16),
+    ("entity", 64),
 )
-LEGACY_SLOT_STATE_FEATURES = 8
-LEGACY_ELIST_FEATURES = 50
-LEGACY_CORE_FEATURES = 9
+LEGACY_SLOT_STATE_FEATURES = 11
+LEGACY_ELIST_FEATURES = 22
+LEGACY_CORE_FEATURES = 18
 LEGACY_TOTAL_SLOTS = sum(int(slots) for _name, slots in LEGACY_ENTITY_CATEGORIES)
 LEGACY_PARAMS_COUNT = LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + len(LEGACY_ENTITY_CATEGORIES) + (LEGACY_TOTAL_SLOTS * LEGACY_SLOT_STATE_FEATURES)
+
+# Type ID mapping for the unified entity pool (matches Lua UNIFIED_TYPE_ID).
+UNIFIED_TYPE_NAMES = ("grunt", "hulk", "brain", "tank", "spawner", "enforcer", "projectile", "human", "electrode")
+UNIFIED_NUM_TYPES = len(UNIFIED_TYPE_NAMES)
+UNIFIED_HUMAN_TYPE_ID = UNIFIED_TYPE_NAMES.index("human")
+UNIFIED_ELECTRODE_TYPE_ID = UNIFIED_TYPE_NAMES.index("electrode")
 
 # ---------------------------------------------------------------------------
 @dataclass
@@ -146,10 +144,17 @@ class ServerConfigData:
     #   5 core (alive, score, replay, lasers, wave)
     #   + 2 player position
     #   + 2 player velocity
-    #   + 50 ELIST bytes
-    #   + 9 typed entity buckets, each: 1 occupancy + N slots x 8 features
-    #     (present, dx, dy, dist, hit_w, hit_h, vx, vy)
-    #   = 1220 floats total
+    #   + nearest enemy distance
+    #   + nearest human distance
+    #   + nearest enemy relative vector (dx, dy)
+    #   + exact num_humans (normalized count)
+    #   + nearest spheroid distance
+    #   + nearest spheroid relative vector (dx, dy)
+    #   + exact spawner count (normalized count)
+    #   + 22 ELIST bytes (speeds, timers, counts; padding trimmed)
+    #   + 1 unified entity pool: 1 occupancy + 64 slots × 11 features
+    #     (present, dx, dy, dist, vx, vy, threat, approach, hit_w, hit_h, type_id)
+    #   = 745 floats total
     params_count: int = LEGACY_PARAMS_COUNT
 
 SERVER_CONFIG = ServerConfigData()
@@ -160,10 +165,10 @@ class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     # Base per-frame state from Lua wire protocol.
     base_state_size: int = SERVER_CONFIG.params_count
-    # Structured slot encoder: all stacked frames are consumed directly.
-    frame_stack: int = 4
+    # Structured slot encoder: use 2 stacked frames by default.
+    frame_stack: int = 2
     # Effective model input width after stacking.
-    state_size: int = SERVER_CONFIG.params_count * 4
+    state_size: int = SERVER_CONFIG.params_count * 2
 
     # Factored action space for Robotron dual sticks:
     #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
@@ -199,12 +204,17 @@ class RLConfigData:
     # enabled, a parallel object-set branch is fused in before the C51 head.
     pure_mlp: bool = True
     mlp_with_attention: bool = True
-    mlp_hidden_layers: list = field(default_factory=lambda: [1024, 512])
+    mlp_hidden_layers: list = field(default_factory=lambda: [512, 384])
     mlp_output_dim: int = 256
     trunk_hidden: int = 256
     trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
+
+    # Directional lane encoder: bin entities into 8 angular wedges matching
+    # fire/move directions, then cross-attend lanes to entity tokens.
+    # Replaces the EntitySetEncoder when enabled under pure_mlp + mlp_with_attention.
+    use_directional_lanes: bool = True
 
     # Structured learner: compact slot encoding over typed entity buckets.
     use_enemy_attention: bool = True
@@ -212,10 +222,15 @@ class RLConfigData:
     object_slots: int = LEGACY_TOTAL_SLOTS
     slot_state_features: int = LEGACY_SLOT_STATE_FEATURES
     # Per-object set-encoder features for the compact legacy slot state:
-    #   dx, dy, vx, vy, dist, hit_w, hit_h, category_norm, is_human, is_dangerous
-    legacy_slot_token_features: int = 10
+    #   dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h,
+    #   type_emb(16dim), is_human, is_dangerous
+    legacy_slot_token_features: int = 27
+    # Learned type embedding dimension for unified pool.
+    type_embedding_dim: int = 16
+    # Entity self-attention: let entities see each other before lane cross-attention.
+    entity_self_attn_layers: int = 2
     attn_heads: int = 4
-    attn_dim: int = 96
+    attn_dim: int = 256
     attn_layers: int = 1
     # False = attention only on the most recent frame; the flat MLP still sees
     # all stacked frames. This keeps the attention branch focused on "what
@@ -268,8 +283,8 @@ class RLConfigData:
     # Wave-aware replay quotas: preserve frontier/high-wave DQN experience so
     # it does not get drowned by abundant easy-wave traffic.
     replay_wave_sampling_enabled: bool = True
-    replay_wave_frontier_frac: float = 0.35
-    replay_wave_high_frac: float = 0.15
+    replay_wave_frontier_frac: float = 0.20
+    replay_wave_high_frac: float = 0.10
     replay_wave_frontier_margin: int = 1
     replay_wave_high_offset: int = 2
     replay_wave_candidate_multiplier: int = 10
@@ -277,7 +292,7 @@ class RLConfigData:
     # Guaranteed floor for expert transitions in a sampled batch when enough
     # expert candidates exist in replay. These are reserved before the DQN-only
     # wave quotas are filled.
-    replay_expert_min_frac: float = 0.25
+    replay_expert_min_frac: float = 0.20
     # Cap, not floor: expert transitions may be below this fraction only if
     # replay does not contain enough expert candidates.
     replay_expert_max_frac: float = 0.25
@@ -362,11 +377,11 @@ class RLConfigData:
     # Device placement (CUDA only): useful on multi-GPU hosts.
     train_cuda_device_index: int = 0
     inference_cuda_device_index: int = 1
-    inference_sync_steps: int = 100
+    inference_sync_steps: int = 500
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True
     inference_batch_max_size: int = 128
-    inference_batch_wait_ms: float = 1.0
+    inference_batch_wait_ms: float = 3.0
     inference_request_timeout_ms: float = 50.0
 
     # ── background training ─────────────────────────────────────────────
