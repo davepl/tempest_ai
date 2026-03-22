@@ -757,6 +757,7 @@ class _DashboardState:
             "fps": fps,
             "training_steps": total_training_steps,
             "steps_per_sec": steps_per_sec,
+            "batch_size": int(getattr(RL_CONFIG, "batch_size", 1)),
             "rpl_per_frame": replay_per_frame,
             "epsilon": epsilon_effective,
             "epsilon_raw": epsilon_raw,
@@ -2759,7 +2760,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       </article>
       <article class="card gauge-card" style="--card-border:rgba(255,220,40,0.66);--card-glow:rgba(255,200,20,0.26)">
         <div class="gauge-head">
-          <div class="label">STEPS PER SECOND</div>
+          <div class="label">SAMPLES PER SECOND</div>
         </div>
         <canvas id="cStepGauge"></canvas>
       </article>
@@ -3007,7 +3008,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         <h2>Throughput</h2>
         <div class="legend">
           <span><span class="sw" style="background:#22c55e;"></span>FPS</span>
-          <span><span class="sw" style="background:#f59e0b;"></span>Steps/Sec</span>
+          <span><span class="sw" style="background:#f59e0b;"></span>Samples/Sec</span>
           <span><span class="sw" style="background:#22d3ee;"></span>Avg Lvl (100K)</span>
           <span><span class="sw" style="background:#e879f9;"></span>Ep Len (100K)</span>
         </div>
@@ -3095,7 +3096,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
     const GAUGE_FPS_RED_MAX = 3000;
     const GAUGE_FPS_YELLOW_MAX = 6000;
     const GAUGE_MIN_STEPS = 0;
-    const GAUGE_MAX_STEPS = 120;
+    const GAUGE_MAX_STEPS = 80000;
     const AUDIO_PREF_COOKIE = "robotron_dashboard_audio_enabled";
     const PREVIEW_GAME_AUDIO_PREF_COOKIE = "robotron_preview_game_audio_enabled";
     const PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED = __PREVIEW_GAME_AUDIO_TRANSPORT_ENABLED__;
@@ -3539,7 +3540,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
 
       if (needsRedraw) {
         drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
-        drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+        const bs = latestRow ? (Number(latestRow.batch_size) || 1) : 1;
+        drawStepGauge(stepGaugeCanvas, gaugeState.step.current * bs, latestRow ? latestRow.training_steps * bs : null);
       }
 
       requestAnimationFrame(gaugeAnimationLoop);
@@ -4354,9 +4356,9 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
             smooth_alpha: 0.14,
           },
           {
-            key: "steps_per_sec_chart",
+            key: "samples_per_sec_chart",
             color: "#f59e0b",
-            axis: { side: "right", min: 0, max_floor: 50, max_snap: 25, group_keys: ["steps_per_sec_chart"] },
+            axis: { side: "right", min: 0, max_floor: 25000, max_snap: 10000, group_keys: ["samples_per_sec_chart"] },
             smooth_alpha: 0.10,
           },
           {
@@ -5187,21 +5189,21 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       });
     }
 
-    function drawStepGauge(canvas, stepsPerSec, totalSteps) {
-      const stepsText = totalSteps != null ? Number(totalSteps).toLocaleString() : null;
-      drawStyledGauge(canvas, stepsPerSec, {
+    function drawStepGauge(canvas, samplesPerSec, totalSamples) {
+      const samplesText = totalSamples != null ? Number(totalSamples).toLocaleString() : null;
+      drawStyledGauge(canvas, samplesPerSec, {
         min: GAUGE_MIN_STEPS,
         max: GAUGE_MAX_STEPS,
-        red_max: 20,
-        yellow_max: 40,
-        minor_step: 5,
-        major_step: 10,
-        title: "STEPS/s",
+        red_max: 10000,
+        yellow_max: 30000,
+        minor_step: 5000,
+        major_step: 10000,
+        title: "SAMP/s",
         unit: "S/S",
         decimals: 0,
         label_font_scale: 0.088,
         label_radial_offset: -4,
-        sub_text: stepsText,
+        sub_text: samplesText,
         sub_text_color: "orange",
       });
     }
@@ -6109,6 +6111,7 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
         const row = src[i] || {};
         const tsI = Number(row.ts);
         const stI = Number(row.training_steps);
+        const bs = Number(row.batch_size) || 1;
         while (j < i) {
           const tsJ = Number(src[j] && src[j].ts);
           if (!Number.isFinite(tsI) || !Number.isFinite(tsJ) || (tsI - tsJ) <= stepWindowSec) break;
@@ -6126,8 +6129,9 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
           }
         }
         if (!Number.isFinite(rate)) rate = 0.0;
-        ema = (ema === null) ? rate : (ema + ((rate - ema) * emaAlpha));
-        out[i] = { ...row, steps_per_sec_chart: ema };
+        const samplesRate = rate * bs;
+        ema = (ema === null) ? samplesRate : (ema + ((samplesRate - ema) * emaAlpha));
+        out[i] = { ...row, samples_per_sec_chart: ema };
       }
       return out;
     }
@@ -6674,7 +6678,8 @@ def _render_dashboard_html(webrtc_ice_servers: list[dict[str, Any]] | None = Non
       renderCurrent();
       // Force gauge repaint since canvas dimensions changed
       drawFpsGauge(fpsGaugeCanvas, gaugeState.fps.current, latestRow ? latestRow.frame_count : null);
-      drawStepGauge(stepGaugeCanvas, gaugeState.step.current, latestRow ? latestRow.training_steps : null);
+      const bsR = latestRow ? (Number(latestRow.batch_size) || 1) : 1;
+      drawStepGauge(stepGaugeCanvas, gaugeState.step.current * bsR, latestRow ? latestRow.training_steps * bsR : null);
       if (!ENABLE_CLIENT0_PREVIEW) {
         clearPreviewCanvas();
         setPreviewMessage("Preview Disabled");

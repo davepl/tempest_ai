@@ -11,9 +11,7 @@ import torch
 
 from aimodel import RainbowAgent, KeyboardHandler, print_with_terminal_restore
 from config import RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, IS_INTERACTIVE, metrics, SERVER_CONFIG, game_settings
-from metrics_dashboard import MetricsDashboard
 from metrics_display import display_metrics_header, display_metrics_row
-from socket_server import SocketServer
 
 
 def _env_enabled(name: str, default: bool) -> bool:
@@ -293,6 +291,8 @@ def print_network_info(agent):
     print(f"   PER α={RL_CONFIG.priority_alpha}, β={RL_CONFIG.priority_beta_start}→1.0")
     print(f"   Target update:    every {RL_CONFIG.target_update_period} steps (hard)")
     print(f"   Grad clip:        {RL_CONFIG.grad_clip_norm}")
+    print(f"   Infer workers:    {max(1, int(getattr(RL_CONFIG, 'inference_process_workers', 1) or 1))} proc")
+    print(f"   Server shards:    master + {max(0, int(getattr(SERVER_CONFIG, 'shard_workers', 0) or 0))} worker port(s)")
 
     print(f"\n🎓 Exploration:")
     print(f"   ε:    {RL_CONFIG.epsilon_start} → {RL_CONFIG.epsilon_end} over {RL_CONFIG.epsilon_decay_frames:,} frames")
@@ -307,6 +307,10 @@ def print_network_info(agent):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
+    from socket_server import SocketServer
+    from metrics_dashboard import MetricsDashboard
+    from server_shards import ShardedServerCoordinator, clear_shard_env_file
+
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     agent = RainbowAgent(state_size=RL_CONFIG.state_size)
@@ -365,12 +369,23 @@ def main():
             dashboard = None
             print(f"⚠ Dashboard startup failed: {e}")
 
-    server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, metrics)
-    metrics.global_server = server
-    metrics.client_count = 0
-
-    srv_thread = threading.Thread(target=server.start, daemon=True)
-    srv_thread.start()
+    shard_workers = max(0, int(getattr(SERVER_CONFIG, "shard_workers", 0) or 0))
+    master_server = SocketServer(SERVER_CONFIG.host, SERVER_CONFIG.port, agent, metrics)
+    if shard_workers > 0:
+        server_controller = ShardedServerCoordinator(master_server, agent, metrics)
+        metrics.global_server = server_controller
+        metrics.client_count = 0
+        server_controller.start()
+        if getattr(server_controller, "worker_ports", None):
+            ports = ", ".join(str(p) for p in server_controller.worker_ports)
+            print(f"🧩 Sharded socket servers: master={SERVER_CONFIG.port}, workers={ports}")
+    else:
+        clear_shard_env_file()
+        server_controller = master_server
+        metrics.global_server = server_controller
+        metrics.client_count = 0
+        srv_thread = threading.Thread(target=master_server.start, daemon=True)
+        srv_thread.start()
 
     kb = None
     if IS_INTERACTIVE:
@@ -382,7 +397,13 @@ def main():
 
     last_save = time.time()
     try:
-        while srv_thread.is_alive() and not server.shutdown_event.is_set():
+        while True:
+            if shard_workers > 0:
+                keep_running = bool(getattr(server_controller, "running", False)) and bool(server_controller.is_alive())
+            else:
+                keep_running = bool(srv_thread.is_alive()) and not bool(master_server.shutdown_event.is_set())
+            if not keep_running:
+                break
             if time.time() - last_save >= 300:
                 # Quiet periodic autosave to keep metrics rows clean.
                 agent.save(LATEST_MODEL_PATH, show_status=False)
@@ -397,15 +418,11 @@ def main():
         if IS_INTERACTIVE and kb:
             kb.restore_terminal()
         try:
-            server.stop()
+            server_controller.stop()
         except Exception:
             pass
         try:
             agent.stop()
-        except Exception:
-            pass
-        try:
-            srv_thread.join(timeout=2.0)
         except Exception:
             pass
         try:

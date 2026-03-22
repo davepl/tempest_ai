@@ -12,9 +12,29 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from config import RL_CONFIG, metrics
+    from config import (
+        RL_CONFIG,
+        metrics,
+        LEGACY_CORE_FEATURES,
+        LEGACY_ELIST_FEATURES,
+        LEGACY_SLOT_STATE_FEATURES,
+        UNIFIED_TYPE_NAMES,
+        UNIFIED_NUM_TYPES,
+        UNIFIED_HUMAN_TYPE_ID,
+        UNIFIED_ELECTRODE_TYPE_ID,
+    )
 except ImportError:
-    from Scripts.config import RL_CONFIG, metrics
+    from Scripts.config import (
+        RL_CONFIG,
+        metrics,
+        LEGACY_CORE_FEATURES,
+        LEGACY_ELIST_FEATURES,
+        LEGACY_SLOT_STATE_FEATURES,
+        UNIFIED_TYPE_NAMES,
+        UNIFIED_NUM_TYPES,
+        UNIFIED_HUMAN_TYPE_ID,
+        UNIFIED_ELECTRODE_TYPE_ID,
+    )
 
 # Device (mirrors aimodel.py)
 if torch.cuda.is_available():
@@ -42,6 +62,59 @@ def _bc_weight_schedule(frame_count: int) -> float:
         return cfg.expert_bc_weight
     progress = min(1.0, (frame_count - cfg.expert_bc_decay_start) / max(1, cfg.expert_bc_decay_frames))
     return cfg.expert_bc_weight + progress * (cfg.expert_bc_min_weight - cfg.expert_bc_weight)
+
+
+_PROJECTILE_TYPE_ID = UNIFIED_TYPE_NAMES.index("projectile") if "projectile" in UNIFIED_TYPE_NAMES else -1
+
+
+def _latest_frame_danger(states_t: torch.Tensor) -> torch.Tensor:
+    """Estimate tactical danger from the latest frame of the stacked state.
+
+    This is intentionally simple and cheap: move supervision is emphasized when
+    the recent state contains nearby high-threat entities, especially
+    projectiles and electrodes.
+    """
+    batch = int(states_t.shape[0]) if states_t.ndim >= 1 else 0
+    if batch <= 0:
+        return torch.zeros(0, device=states_t.device, dtype=torch.float32)
+
+    base_state_size = int(getattr(RL_CONFIG, "base_state_size", 0) or 0)
+    total_slots = int(getattr(RL_CONFIG, "object_slots", 0) or 0)
+    slot_features = int(getattr(RL_CONFIG, "slot_state_features", LEGACY_SLOT_STATE_FEATURES) or LEGACY_SLOT_STATE_FEATURES)
+    category_count = len(getattr(RL_CONFIG, "entity_categories", ()) or ())
+    if base_state_size <= 0 or total_slots <= 0 or slot_features < 11:
+        return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
+
+    latest = states_t[:, -base_state_size:]
+    slot_offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + category_count)
+    slot_width = total_slots * slot_features
+    if latest.shape[1] < (slot_offset + slot_width):
+        return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
+
+    slots = latest[:, slot_offset:slot_offset + slot_width].reshape(batch, total_slots, slot_features)
+    present = slots[:, :, 0] > 0.5
+    dist = slots[:, :, 3].clamp(min=0.0, max=2.0)
+    threat = slots[:, :, 6].clamp(min=0.0, max=1.0)
+    approach = slots[:, :, 7].clamp(min=-1.0, max=1.0)
+    type_norm = slots[:, :, 10].clamp(min=0.0, max=1.0)
+    type_idx = torch.round(type_norm * float(max(1, UNIFIED_NUM_TYPES - 1))).long()
+    type_idx = type_idx.clamp(0, max(0, UNIFIED_NUM_TYPES - 1))
+
+    is_human = type_idx == int(UNIFIED_HUMAN_TYPE_ID)
+    is_electrode = type_idx == int(UNIFIED_ELECTRODE_TYPE_ID)
+    is_projectile = (type_idx == int(_PROJECTILE_TYPE_ID)) if _PROJECTILE_TYPE_ID >= 0 else torch.zeros_like(is_human)
+    danger_mask = present & (~is_human)
+
+    closeness = (1.0 - dist).clamp(min=0.0, max=1.0)
+    approach_score = approach.clamp(min=0.0, max=1.0)
+    danger_score = (0.45 * closeness) + (0.40 * threat) + (0.15 * approach_score)
+    danger_score = danger_score + (0.25 * is_projectile.float() * closeness)
+    danger_score = danger_score + (0.20 * is_electrode.float() * closeness)
+    danger_score = torch.where(danger_mask, danger_score, torch.zeros_like(danger_score))
+
+    max_score = danger_score.max(dim=1).values
+    nearby_count = (danger_mask & (closeness > 0.35)).float().sum(dim=1).clamp(max=3.0) / 3.0
+    return (max_score + (0.25 * nearby_count)).clamp(min=0.0, max=1.5)
 
 
 def train_step(agent, prefetched_batch=None) -> float | None:
@@ -77,7 +150,22 @@ def train_step(agent, prefetched_batch=None) -> float | None:
     if batch is None:
         return None
 
-    if len(batch) == 11:
+    if len(batch) == 12:
+        (
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            horizons,
+            is_expert,
+            is_self_imitation,
+            _wave_numbers,
+            _start_waves,
+            indices,
+            weights,
+        ) = batch
+    elif len(batch) == 11:
         (
             states,
             actions,
@@ -91,6 +179,7 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             indices,
             weights,
         ) = batch
+        is_self_imitation = np.zeros_like(is_expert, dtype=np.bool_)
     elif len(batch) == 9:
         (
             states,
@@ -105,8 +194,9 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         ) = batch
         _wave_numbers = None
         _start_waves = None
+        is_self_imitation = np.zeros_like(is_expert, dtype=np.bool_)
     else:
-        raise ValueError(f"Unexpected replay batch shape: expected 9 or 11 items, got {len(batch)}")
+        raise ValueError(f"Unexpected replay batch shape: expected 9, 11, or 12 items, got {len(batch)}")
 
     states_t      = torch.from_numpy(states).float().to(device)
     actions_t     = torch.from_numpy(actions).long().to(device)
@@ -116,6 +206,7 @@ def train_step(agent, prefetched_batch=None) -> float | None:
     horizons_t    = torch.from_numpy(horizons.astype(np.float32)).float().to(device)
     weights_t     = torch.from_numpy(weights).float().to(device)
     is_expert_t   = torch.from_numpy(is_expert).bool().to(device)
+    is_self_imitation_t = torch.from_numpy(np.asarray(is_self_imitation, dtype=np.bool_)).bool().to(device)
 
     B = states_t.shape[0]
     cfg = RL_CONFIG
@@ -138,11 +229,13 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         # Current distribution
         log_p = agent.online_net(states_t, log=True)       # (B, A, N)
         log_p_a = log_p[torch.arange(B, device=device), actions_t]  # (B, N)
+        q_all = (log_p.exp() * support.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, A)
 
         # Target distribution (Double-DQN style: online selects, target evaluates)
         with torch.no_grad():
-            # Select actions with online net
-            q_next = agent.online_net.q_values(next_states_t)
+            # Select actions with online net using a single distributional forward.
+            online_next_p = agent.online_net(next_states_t, log=False)
+            q_next = (online_next_p * support.unsqueeze(0).unsqueeze(0)).sum(dim=2)
             best_next = q_next.argmax(dim=1)                # (B,)
 
             # Get target distribution for those actions
@@ -184,20 +277,45 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         ce_loss = -(m * log_p_a_safe).sum(dim=1)        # (B,)
         weighted_loss = (weights_t * ce_loss).mean()
 
-    # ── Optional BC loss on expert transitions ─────────────────────────
+    move_targets = torch.div(actions_t, cfg.num_fire_actions, rounding_mode="floor")
+    fire_targets = torch.remainder(actions_t, cfg.num_fire_actions)
+    q_joint = q_all.view(B, cfg.num_move_actions, cfg.num_fire_actions)
+    move_scores = q_joint.max(dim=2).values
+    fire_scores = q_joint.max(dim=1).values
+
+    # ── Optional BC loss on expert/self-imitation transitions ──────────
     bc_loss_val = 0.0
     bc_w = _bc_weight_schedule(metrics.frame_count)
-    if bc_w > 0.0 and is_expert_t.any():
-        with amp_ctx:
-            expert_idx = is_expert_t.nonzero(as_tuple=True)[0]
-            if expert_idx.numel() > 0:
-                q_expert = agent.online_net.q_values(states_t[expert_idx])
-                bc_loss = F.cross_entropy(q_expert, actions_t[expert_idx])
-                # Scale BC by sampled expert fraction to avoid over-weighting when
-                # expert transitions are sparse but present in most batches.
-                bc_scale = float(expert_idx.numel()) / float(B)
-                weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
-                bc_loss_val = float(bc_loss.detach().item())
+    imitation_mask = is_expert_t | is_self_imitation_t
+    if bc_w > 0.0 and imitation_mask.any():
+        imitation_idx = imitation_mask.nonzero(as_tuple=True)[0]
+        if imitation_idx.numel() > 0:
+            imitation_scale = torch.where(
+                is_expert_t[imitation_idx],
+                torch.ones_like(imitation_idx, dtype=torch.float32, device=device),
+                torch.full_like(imitation_idx, float(getattr(cfg, "factorized_bc_self_imitation_scale", 0.75)), dtype=torch.float32, device=device),
+            )
+
+            if bool(getattr(cfg, "factorized_bc_enabled", False)):
+                move_w = float(getattr(cfg, "factorized_bc_move_weight", 1.0) or 1.0)
+                fire_w = float(getattr(cfg, "factorized_bc_fire_weight", 1.0) or 1.0)
+                danger_scale = float(getattr(cfg, "factorized_bc_danger_scale", 0.0) or 0.0)
+                danger = _latest_frame_danger(states_t)[imitation_idx]
+                move_sample_w = imitation_scale * (1.0 + (danger_scale * danger))
+                fire_sample_w = imitation_scale
+
+                move_ce = F.cross_entropy(move_scores[imitation_idx].float(), move_targets[imitation_idx], reduction="none")
+                fire_ce = F.cross_entropy(fire_scores[imitation_idx].float(), fire_targets[imitation_idx], reduction="none")
+                move_bc = (move_ce * move_sample_w).sum() / move_sample_w.sum().clamp(min=1e-6)
+                fire_bc = (fire_ce * fire_sample_w).sum() / fire_sample_w.sum().clamp(min=1e-6)
+                bc_loss = (move_w * move_bc) + (fire_w * fire_bc)
+            else:
+                bc_ce = F.cross_entropy(q_all[imitation_idx].float(), actions_t[imitation_idx], reduction="none")
+                bc_loss = (bc_ce * imitation_scale).sum() / imitation_scale.sum().clamp(min=1e-6)
+
+            bc_scale = float(imitation_idx.numel()) / float(B)
+            weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
+            bc_loss_val = float(bc_loss.detach().item())
 
     # ── NaN / Inf guard ───────────────────────────────────────────────────
     if not torch.isfinite(weighted_loss):
@@ -274,14 +392,23 @@ def train_step(agent, prefetched_batch=None) -> float | None:
 
         # Agreement metric: exact joint-action match rate.
         with torch.no_grad():
-            q_all = agent.online_net.q_values(states_t)
             pred = q_all.argmax(dim=1)
+            move_pred = move_scores.argmax(dim=1)
+            fire_pred = fire_scores.argmax(dim=1)
             metrics.last_q_mean = float(q_all.mean().item())
             agree = (pred == actions_t).float().mean().item()
+            move_agree = (move_pred == move_targets).float().mean().item()
+            fire_agree = (fire_pred == fire_targets).float().mean().item()
             metrics.last_agreement = agree
+            metrics.last_move_agreement = move_agree
+            metrics.last_fire_agreement = fire_agree
             # Debug: print once every 1000 steps only in verbose mode.
             if getattr(metrics, "verbose_mode", False) and agent.training_steps % 1000 == 0:
-                print(f"[DEBUG] step={agent.training_steps} agree={agree:.4f} pred_sample={pred[:5].tolist()} act_sample={actions_t[:5].tolist()}")
+                print(
+                    f"[DEBUG] step={agent.training_steps} agree={agree:.4f} "
+                    f"move_agree={move_agree:.4f} fire_agree={fire_agree:.4f} "
+                    f"pred_sample={pred[:5].tolist()} act_sample={actions_t[:5].tolist()}"
+                )
 
         if hasattr(metrics, "agree_sum_interval"):
             metrics.agree_sum_interval += agree

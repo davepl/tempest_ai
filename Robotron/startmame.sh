@@ -6,6 +6,7 @@ LUA_SCRIPT="$SCRIPT_DIR/Scripts/main.lua"
 RELAY_SCRIPT="$SCRIPT_DIR/Scripts/audio_relay.py"
 LOG_DIR="$SCRIPT_DIR/logs"
 ROM_DIR="$SCRIPT_DIR/roms"
+SHARD_ENV_FILE="$LOG_DIR/server_shards.env"
 MAME_BIN="${MAME_BIN:-mame}"
 TMP_AUDIO_GLOB="/tmp/robotron_audio_client"*.wav
 TMP_AUDIO_FIFO_GLOB="/tmp/robotron_audio_client"*.fifo
@@ -21,6 +22,44 @@ case "$GAME_AUDIO_ENABLED_NORM" in
         GAME_AUDIO_ENABLED=0
         ;;
 esac
+
+if [[ -f "$SHARD_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$SHARD_ENV_FILE"
+fi
+
+resolve_client_socket() {
+    local client_slot="$1"
+    local default_addr="${ROBOTRON_SOCKET_ADDRESS:-}"
+    local host="${ROBOTRON_SOCKET_HOST:-}"
+    local master_port="${ROBOTRON_MASTER_PORT:-}"
+    local worker_ports_csv="${ROBOTRON_WORKER_PORTS:-}"
+    local preview_slot="${ROBOTRON_PREVIEW_SLOT:-0}"
+    local socket_addr="$default_addr"
+    local preview_flag="1"
+
+    if [[ -n "$host" && -n "$master_port" ]]; then
+        if [[ "$client_slot" -eq "$preview_slot" || -z "$worker_ports_csv" ]]; then
+            socket_addr="${host}:${master_port}"
+            preview_flag="1"
+        else
+            IFS=',' read -r -a worker_ports <<< "$worker_ports_csv"
+            if [[ "${#worker_ports[@]}" -gt 0 ]]; then
+                local reduced_slot="$client_slot"
+                if [[ "$client_slot" -gt "$preview_slot" ]]; then
+                    reduced_slot=$((client_slot - 1))
+                fi
+                local shard_idx=$((reduced_slot % ${#worker_ports[@]}))
+                socket_addr="${host}:${worker_ports[$shard_idx]}"
+            else
+                socket_addr="${host}:${master_port}"
+            fi
+            preview_flag="0"
+        fi
+    fi
+
+    printf '%s|%s\n' "$socket_addr" "$preview_flag"
+}
 
 # Default to project-local ROMs; allow callers to append/override via MAME_ROMPATH.
 if [[ -n "${MAME_ROMPATH:-}" ]]; then
@@ -238,7 +277,10 @@ if [[ "$FOREGROUND" -eq 1 ]]; then
     else
         THROTTLE_FLAG="-nothrottle"
     fi
-    env ROBOTRON_PREVIEW_CLIENT=1 ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
+    socket_info="$(resolve_client_socket 0)"
+    CLIENT_SOCKET_ADDRESS="${socket_info%%|*}"
+    PREVIEW_CLIENT_FLAG="${socket_info##*|}"
+    env ROBOTRON_SOCKET_ADDRESS="$CLIENT_SOCKET_ADDRESS" ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT=0 "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -window -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT"
     status=$?
     cleanup_audio_relays
     cleanup_audio_fifos
@@ -270,12 +312,14 @@ fi
 declare -a PIDS=()
 for i in $(seq 1 "$COUNT"); do
     CLIENT_SLOT=$((i-1))
+    socket_info="$(resolve_client_socket "$CLIENT_SLOT")"
+    CLIENT_SOCKET_ADDRESS="${socket_info%%|*}"
+    PREVIEW_CLIENT_FLAG="${socket_info##*|}"
     SOUND_FLAG=""
     if [[ "$GAME_AUDIO_ENABLED" -eq 1 ]]; then
         AUDIO_FIFO="/tmp/robotron_audio_client${CLIENT_SLOT}.fifo"
         SOUND_FLAG="-wavwrite $AUDIO_FIFO -samplerate 48000 -audio_latency 1"
     fi
-    PREVIEW_CLIENT_FLAG="1"
     if [[ $i -eq 1 && "$THROTTLE_CLIENT0" -eq 1 ]]; then
         THROTTLE_FLAG="-throttle -speed 1.0"
     else
@@ -284,17 +328,17 @@ for i in $(seq 1 "$COUNT"); do
     LOG_FILE="$LOG_DIR/mame_instance_${CLIENT_SLOT}.log"
     if [[ $i -eq 1 ]]; then
         # Keep the first instance attached to the terminal so one clean set of init lines stays visible.
-        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT="$CLIENT_SLOT" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
+        ROBOTRON_SOCKET_ADDRESS="$CLIENT_SOCKET_ADDRESS" ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT="$CLIENT_SLOT" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" &
     else
         # Additional clients stay backgrounded and log to per-instance files.
-        ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT="$CLIENT_SLOT" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" >> "$LOG_FILE" 2>&1 &
+        ROBOTRON_SOCKET_ADDRESS="$CLIENT_SOCKET_ADDRESS" ROBOTRON_PREVIEW_CLIENT="$PREVIEW_CLIENT_FLAG" ROBOTRON_CLIENT_SLOT="$CLIENT_SLOT" "$MAME_BIN" robotron -rompath "$ROMPATH" $THROTTLE_FLAG $SOUND_FLAG $VIDEO_FLAG -skip_gameinfo $WARNING_FLAG -autoboot_script "$LUA_SCRIPT" >> "$LOG_FILE" 2>&1 &
     fi
     pid=$!
     PIDS+=("$pid")
     if [[ $i -eq 1 && "$THROTTLE_CLIENT0" -eq 1 ]]; then
-        echo "  Started instance $i (client $CLIENT_SLOT - $VIDEO_MODE_DESC, throttled) PID $pid  log: $LOG_FILE"
+        echo "  Started instance $i (client $CLIENT_SLOT -> $CLIENT_SOCKET_ADDRESS - $VIDEO_MODE_DESC, throttled) PID $pid  log: $LOG_FILE"
     else
-        echo "  Started instance $i (client $CLIENT_SLOT - $VIDEO_MODE_DESC, unthrottled) PID $pid  log: $LOG_FILE"
+        echo "  Started instance $i (client $CLIENT_SLOT -> $CLIENT_SOCKET_ADDRESS - $VIDEO_MODE_DESC, unthrottled) PID $pid  log: $LOG_FILE"
     fi
 done
 

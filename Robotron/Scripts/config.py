@@ -140,6 +140,12 @@ class ServerConfigData:
     host: str = "0.0.0.0"
     port: int = 9998
     max_clients: int = 36
+    # True multi-process server sharding: the master process keeps training,
+    # metrics, and dashboard, while worker server processes listen on adjacent
+    # ports and handle the bulk of the MAME/Lua client load.
+    shard_workers: int = 4
+    shard_worker_port_base: int = 0   # 0 => auto (port + 1)
+    shard_preview_slot: int = 0
     # State layout:
     #   5 core (alive, score, replay, lasers, wave)
     #   + 2 player position
@@ -204,7 +210,7 @@ class RLConfigData:
     # enabled, a parallel object-set branch is fused in before the C51 head.
     pure_mlp: bool = True
     mlp_with_attention: bool = True
-    mlp_hidden_layers: list = field(default_factory=lambda: [512, 384])
+    mlp_hidden_layers: list = field(default_factory=lambda: [384])
     mlp_output_dim: int = 256
     trunk_hidden: int = 256
     trunk_layers: int = 2
@@ -257,13 +263,13 @@ class RLConfigData:
 
     # ── training ────────────────────────────────────────────────────────
     batch_size: int = 512
-    lr: float = 1e-4
-    lr_min: float = 4e-5
+    lr: float = 2e-4
+    lr_min: float = 1e-5
     lr_warmup_steps: int = 5_000
-    lr_cosine_period: int = 250_000       # Longer period to prevent destructive restarts
+    lr_cosine_period: int = 500_000       # Longer cycles with a softer peak LR
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
-    n_step: int = 12
+    n_step: int = 6
     max_samples_per_frame: float = 16
 
     # Replay (PER with proportional priorities)
@@ -296,6 +302,10 @@ class RLConfigData:
     # Cap, not floor: expert transitions may be below this fraction only if
     # replay does not contain enough expert candidates.
     replay_expert_max_frac: float = 0.25
+    # Reserve a small floor for self-imitation transitions cloned from the
+    # agent's own strongest DQN episodes so they remain visible to the learner.
+    replay_self_imitation_min_frac: float = 0.10
+    replay_self_imitation_max_frac: float = 0.15
 
     # Target network (periodic hard sync; moderate refresh for stable learning)
     target_update_period: int = 2_500
@@ -326,8 +336,8 @@ class RLConfigData:
 
     # Expert guidance
     expert_ratio_start: float = 0.99
-    expert_ratio_end: float = 0.20
-    expert_ratio_decay_frames: int = 30_000_000
+    expert_ratio_end: float = 0.10
+    expert_ratio_decay_frames: int = 10_000_000
     expert_ratio: float = 0.99
 
     # No special zoom handling for Robotron; keep multipliers neutral.
@@ -340,9 +350,24 @@ class RLConfigData:
     # before it can stand on its own.
     expert_bc_weight: float = 0.4
     expert_bc_decay_start: int = 10_000_000
-    # Decays from 10M to 30M frames.
-    expert_bc_decay_frames: int = 50_000_000
-    expert_bc_min_weight: float = 0.05
+    # Decays from 10M to 40M frames.
+    expert_bc_decay_frames: int = 30_000_000
+    expert_bc_min_weight: float = 0.0
+    # Factorized behavioural cloning on expert/self-imitation samples.
+    factorized_bc_enabled: bool = True
+    factorized_bc_move_weight: float = 1.0
+    factorized_bc_fire_weight: float = 0.6
+    # Increase move supervision when the latest-frame state is tactically dangerous.
+    factorized_bc_danger_scale: float = 1.5
+    # Self-imitation samples clone the agent's own best DQN episodes with a
+    # slightly lighter weight than heuristic expert targets.
+    factorized_bc_self_imitation_scale: float = 0.75
+    # Promote strong DQN episodes into a self-imitation partition.
+    self_imitation_enabled: bool = True
+    self_imitation_top_episodes: int = 128
+    self_imitation_min_wave: int = 4
+    self_imitation_min_episode_frames: int = 180
+    self_imitation_priority_boost: float = 1.5
     expert_profile: str = "simple"
     expert_hold_fire_for_last_enemy_rescue: bool = True
 
@@ -381,8 +406,12 @@ class RLConfigData:
     # Micro-batch inference requests across clients to increase GPU work per launch.
     inference_batching_enabled: bool = True
     inference_batch_max_size: int = 128
-    inference_batch_wait_ms: float = 3.0
+    inference_batch_wait_ms: float = 1.0
     inference_request_timeout_ms: float = 50.0
+    # Multiprocess inference fan-out: keeps one master process for training,
+    # metrics, and dashboard while subprocess workers handle policy inference.
+    # Set to 1 to disable and fall back to the in-process batcher.
+    inference_process_workers: int = 4
 
     # ── background training ─────────────────────────────────────────────
     training_steps_per_cycle: int = 16
@@ -591,6 +620,8 @@ class MetricsData:
     hud_enabled: bool = False
     last_priority_mean: float = 0.0
     last_agreement: float = 0.0
+    last_move_agreement: float = 0.0
+    last_fire_agreement: float = 0.0
 
     average_level: float = 0.0
     peak_level: int = 0

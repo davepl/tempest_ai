@@ -23,6 +23,13 @@ from aimodel import (
     SafeMetrics,
 )
 from config import RL_CONFIG, SERVER_CONFIG, metrics, game_settings
+try:
+    from inference_pool import ProcessInferencePool
+except ImportError:
+    try:
+        from Scripts.inference_pool import ProcessInferencePool
+    except ImportError:
+        ProcessInferencePool = None
 
 try:
     from nstep_buffer import NStepReplayBuffer
@@ -113,6 +120,8 @@ class AsyncReplayBuffer:
         # Per-client rolling window of buffer indices for pre-death boosting
         self._lookback = int(getattr(RL_CONFIG, 'pre_death_lookback', 120))
         self._client_indices = {}          # client_id -> deque(maxlen=lookback)
+        self._episode_indices = {}         # (client_id, episode_id) -> [replay_idx, ...]
+        self._episode_stats = {}           # (client_id, episode_id) -> episode summary
         self._thread = threading.Thread(target=self._consume, daemon=True)
         self._thread.start()
 
@@ -129,6 +138,57 @@ class AsyncReplayBuffer:
         except queue.Full:
             pass
 
+    @staticmethod
+    def _episode_key(client_id, episode_id) -> tuple[int, int]:
+        return int(client_id if client_id is not None else -1), int(episode_id or 0)
+
+    def _track_episode_step(
+        self,
+        client_id,
+        episode_id,
+        replay_idx,
+        reward: float,
+        done: bool,
+        actor: str,
+        wave_number: int,
+        start_wave: int,
+    ) -> None:
+        key = self._episode_key(client_id, episode_id)
+        stats = self._episode_stats.get(key)
+        if stats is None:
+            stats = {
+                "dqn_reward": 0.0,
+                "total_reward": 0.0,
+                "length": 0,
+                "max_wave": max(1, int(start_wave or wave_number or 1)),
+                "start_wave": max(1, int(start_wave or 1)),
+            }
+            self._episode_stats[key] = stats
+
+        reward_f = float(reward)
+        stats["total_reward"] += reward_f
+        stats["length"] += 1
+        stats["max_wave"] = max(int(stats["max_wave"]), max(1, int(wave_number or 1)))
+        if actor == "dqn" and replay_idx is not None and int(replay_idx) >= 0:
+            self._episode_indices.setdefault(key, []).append(int(replay_idx))
+            stats["dqn_reward"] += reward_f
+
+        if done:
+            idx_list = self._episode_indices.pop(key, [])
+            final_stats = self._episode_stats.pop(key, None)
+            if final_stats is not None and idx_list:
+                try:
+                    self.agent.consider_self_imitation(
+                        idx_list,
+                        dqn_reward=float(final_stats["dqn_reward"]),
+                        total_reward=float(final_stats["total_reward"]),
+                        length=int(final_stats["length"]),
+                        max_wave=int(final_stats["max_wave"]),
+                        start_wave=int(final_stats["start_wave"]),
+                    )
+                except Exception as e:
+                    print(f"AsyncReplayBuffer self-imitation error: {e}")
+
     def _consume(self):
         while self.running:
             try:
@@ -141,16 +201,84 @@ class AsyncReplayBuffer:
                     batch.append(self.queue.get_nowait())
                 except queue.Empty:
                     break
-            for cmd, cid, a, kw in batch:
+            step_items = [(cid, a, kw) for cmd, cid, a, kw in batch if cmd == "step"]
+            if step_items:
                 try:
-                    if cmd == "step":
-                        idx = self.agent.step(*a, **kw)
-                        if cid is not None and idx is not None and idx >= 0:
-                            if cid not in self._client_indices:
-                                self._client_indices[cid] = deque(maxlen=self._lookback)
-                            self._client_indices[cid].append(idx)
-                    elif cmd == "boost":
-                        self._do_boost(cid)
+                    if hasattr(self.agent, "step_batch"):
+                        transitions = []
+                        episode_meta = []
+                        for cid, a, kw in step_items:
+                            state, action, reward, next_state, done = a[:5]
+                            actor = kw.get("actor", "dqn")
+                            horizon = kw.get("horizon", 1)
+                            priority_reward = kw.get("priority_reward", None)
+                            wave_number = kw.get("wave_number", 1)
+                            start_wave = kw.get("start_wave", 1)
+                            transitions.append((
+                                state,
+                                action,
+                                reward,
+                                next_state,
+                                done,
+                                actor,
+                                horizon,
+                                priority_reward,
+                                wave_number,
+                                start_wave,
+                            ))
+                            episode_meta.append((
+                                cid,
+                                kw.get("episode_id", 0),
+                                float(reward),
+                                bool(done),
+                                str(actor),
+                                int(wave_number),
+                                int(start_wave),
+                            ))
+                        indices = self.agent.step_batch(transitions)
+                        if indices is None:
+                            indices = [-1] * len(episode_meta)
+                        for (cid, ep_id, reward, done, actor, wave_number, start_wave), idx in zip(episode_meta, indices):
+                            if cid is not None and idx is not None and idx >= 0:
+                                if cid not in self._client_indices:
+                                    self._client_indices[cid] = deque(maxlen=self._lookback)
+                                self._client_indices[cid].append(int(idx))
+                            self._track_episode_step(
+                                cid,
+                                ep_id,
+                                idx,
+                                reward,
+                                done,
+                                actor,
+                                wave_number,
+                                start_wave,
+                            )
+                    else:
+                        for cid, a, kw in step_items:
+                            idx = self.agent.step(*a, **kw)
+                            if cid is not None and idx is not None and idx >= 0:
+                                if cid not in self._client_indices:
+                                    self._client_indices[cid] = deque(maxlen=self._lookback)
+                                self._client_indices[cid].append(idx)
+                            state, action, reward, next_state, done = a[:5]
+                            self._track_episode_step(
+                                cid,
+                                kw.get("episode_id", 0),
+                                idx,
+                                float(reward),
+                                bool(done),
+                                str(kw.get("actor", "dqn")),
+                                int(kw.get("wave_number", 1)),
+                                int(kw.get("start_wave", 1)),
+                            )
+                except Exception as e:
+                    print(f"AsyncReplayBuffer error: {e}")
+
+            for cmd, cid, a, kw in batch:
+                if cmd != "boost":
+                    continue
+                try:
+                    self._do_boost(cid)
                 except Exception as e:
                     print(f"AsyncReplayBuffer error: {e}")
 
@@ -172,6 +300,11 @@ class AsyncReplayBuffer:
     def remove_client(self, client_id):
         """Clean up index tracking when a client disconnects."""
         self._client_indices.pop(client_id, None)
+        prefix = int(client_id if client_id is not None else -1)
+        for key in [k for k in self._episode_indices.keys() if k[0] == prefix]:
+            self._episode_indices.pop(key, None)
+        for key in [k for k in self._episode_stats.keys() if k[0] == prefix]:
+            self._episode_stats.pop(key, None)
 
     def stop(self):
         self.running = False
@@ -214,7 +347,7 @@ class AsyncInferenceBatcher:
         self._thread = threading.Thread(target=self._consume, daemon=True, name="InferBatchWorker")
         self._thread.start()
 
-    def infer(self, state, epsilon: float, locked_fire: int | None = None):
+    def infer(self, state, epsilon: float, locked_fire: int | None = None, route_key: int | None = None):
         if not self.running:
             return self.agent.act(state, epsilon, locked_fire=locked_fire)
         req = _InferenceRequest(state, epsilon, locked_fire=locked_fire)
@@ -281,21 +414,48 @@ class SocketServer:
         self.host = host
         self.port = port
         self.agent = agent
-        self.async_buffer = AsyncReplayBuffer(agent) if agent else None
+        allow_async_replay = bool(getattr(agent, "allow_async_replay_buffer", True)) if agent else False
+        self.async_buffer = AsyncReplayBuffer(agent) if agent and allow_async_replay else None
         self.inference_batcher = None
-        if agent and bool(getattr(RL_CONFIG, "inference_batching_enabled", True)):
-            self.inference_batcher = AsyncInferenceBatcher(
-                agent,
-                max_batch_size=int(getattr(RL_CONFIG, "inference_batch_max_size", 32)),
-                max_wait_ms=float(getattr(RL_CONFIG, "inference_batch_wait_ms", 1.0)),
-                request_timeout_ms=float(getattr(RL_CONFIG, "inference_request_timeout_ms", 50.0)),
-            )
-            print(
-                "Async inference batching enabled: "
-                f"max_batch={self.inference_batcher.max_batch_size}, "
-                f"wait_ms={self.inference_batcher.max_wait_s * 1000.0:.2f}"
-            )
+        if agent:
+            allow_proc_pool = bool(getattr(agent, "allow_process_inference_pool", True))
+            allow_async_batcher = bool(getattr(agent, "allow_async_inference_batcher", True))
+            shard_workers = max(0, int(getattr(SERVER_CONFIG, "shard_workers", 0) or 0))
+            is_master_shard_server = shard_workers > 0 and bool(getattr(agent, "publish_global_client_metrics", True))
+            if is_master_shard_server:
+                # In sharded mode, worker servers should carry inference load.
+                # Avoid spawning an extra master-side process pool that competes
+                # for the same GPU while only serving the preview/master path.
+                allow_proc_pool = False
+            proc_workers = max(1, int(getattr(RL_CONFIG, "inference_process_workers", 1) or 1))
+            if proc_workers > 1 and ProcessInferencePool is not None and allow_proc_pool:
+                self.inference_batcher = ProcessInferencePool(
+                    agent,
+                    worker_count=proc_workers,
+                    max_batch_size=int(getattr(RL_CONFIG, "inference_batch_max_size", 32)),
+                    max_wait_ms=float(getattr(RL_CONFIG, "inference_batch_wait_ms", 1.0)),
+                    request_timeout_ms=float(getattr(RL_CONFIG, "inference_request_timeout_ms", 50.0)),
+                )
+                print(
+                    "Multiprocess inference pool enabled: "
+                    f"workers={proc_workers}, "
+                    f"max_batch={int(getattr(RL_CONFIG, 'inference_batch_max_size', 32))}, "
+                    f"wait_ms={float(getattr(RL_CONFIG, 'inference_batch_wait_ms', 1.0)):.2f}"
+                )
+            elif bool(getattr(RL_CONFIG, "inference_batching_enabled", True)) and allow_async_batcher:
+                self.inference_batcher = AsyncInferenceBatcher(
+                    agent,
+                    max_batch_size=int(getattr(RL_CONFIG, "inference_batch_max_size", 32)),
+                    max_wait_ms=float(getattr(RL_CONFIG, "inference_batch_wait_ms", 1.0)),
+                    request_timeout_ms=float(getattr(RL_CONFIG, "inference_request_timeout_ms", 50.0)),
+                )
+                print(
+                    "Async inference batching enabled: "
+                    f"max_batch={self.inference_batcher.max_batch_size}, "
+                    f"wait_ms={self.inference_batcher.max_wait_s * 1000.0:.2f}"
+                )
         self.metrics = SafeMetrics(metrics_wrapper)
+        self.publish_global_client_metrics = bool(getattr(agent, "publish_global_client_metrics", True)) if agent else True
         if _FORCE_RANDOM_ACTIONS:
             print("FORCE RANDOM ACTIONS enabled (ROBOTRON_FORCE_RANDOM_ACTIONS=1)")
 
@@ -307,6 +467,17 @@ class SocketServer:
         self.client_states = {}
         self.client_lock = threading.Lock()
         self.preview_cid = None
+
+    def _submit_experience(self, *args, client_id=None, **kwargs):
+        if self.async_buffer is not None:
+            self.async_buffer.step_async(*args, client_id=client_id, **kwargs)
+            return
+        if self.agent is None:
+            return
+        try:
+            self.agent.step(*args, client_id=client_id, **kwargs)
+        except Exception as e:
+            print(f"SocketServer experience submit error: {e}")
 
     def _alloc_id(self):
         with self.client_lock:
@@ -520,6 +691,7 @@ class SocketServer:
                     score = 0
                 rows.append({
                     "client_id": int(cid),
+                    "client_slot": int(cs.get("client_slot", cid)),
                     "duration_seconds": float(max(0, int(cs.get("game_frames", 0) or 0))) / 60.0,
                     "lives": lives,
                     "level": level,
@@ -622,10 +794,12 @@ class SocketServer:
                 "last_alive_game_score": 0, "prev_game_final_score": 0,
                 "game_frames": 0,
                 "start_wave": 1,
+                "episode_id": 1,
                 "preview_capable": False,
                 "client_slot": int(cid),
             }
-            metrics.client_count = len(self.client_states)
+            if self.publish_global_client_metrics:
+                metrics.client_count = len(self.client_states)
 
     def _recv_exact(self, sock, nbytes: int, timeout_s: float = 0.5):
         """Read exactly nbytes from a non-blocking socket, or return None on timeout/EOF."""
@@ -867,20 +1041,24 @@ class SocketServer:
                             wave = max(1, cs.get("level_number", 1) or 1)
                             for s0, a, Rn, pR, sn, dn, h, act, wave_n, start_wave_n in matured:
                                 move_n, fire_n = split_joint_action(a)
-                                self.async_buffer.step_async(
+                                self._submit_experience(
                                     s0, (move_n, fire_n), Rn, sn, bool(dn),
                                     client_id=cid, actor=act, horizon=int(h),
                                     priority_reward=pR,
                                     wave_number=max(1, int(wave_n or wave)),
-                                    start_wave=max(1, int(start_wave_n or cs.get("start_wave", 1) or 1)))
+                                    start_wave=max(1, int(start_wave_n or cs.get("start_wave", 1) or 1)),
+                                    episode_id=max(1, int(cs.get("episode_id", 1) or 1)),
+                                )
                         else:
                             wave = max(1, cs.get("level_number", 1) or 1)
-                            self.async_buffer.step_async(
+                            self._submit_experience(
                                 cs["last_state"], (move_i, fire_i), total_r,
                                 stacked_state, bool(frame.done), client_id=cid, actor=tag, horizon=1,
                                 priority_reward=total_r,
                                 wave_number=wave,
-                                start_wave=max(1, int(cs.get("start_wave", 1) or 1)))
+                                start_wave=max(1, int(cs.get("start_wave", 1) or 1)),
+                                episode_id=max(1, int(cs.get("episode_id", 1) or 1)),
+                            )
 
                     cs["total_reward"] += total_r
                     cs["ep_subj_reward"] = cs.get("ep_subj_reward", 0) + eff_subj_r
@@ -923,6 +1101,7 @@ class SocketServer:
                     cs["last_state"] = cs["last_action"] = None
                     cs["last_player_alive"] = False
                     cs["last_action_source"] = cs["prev_action_source"] = None
+                    cs["episode_id"] = max(1, int(cs.get("episode_id", 1) or 1) + 1)
                     cs["total_reward"] = cs["ep_dqn_reward"] = cs["ep_expert_reward"] = 0.0
                     cs["ep_subj_reward"] = cs["ep_obj_reward"] = 0.0
                     cs["ep_frames"] = 0
@@ -1000,7 +1179,7 @@ class SocketServer:
                         t0 = time.perf_counter()
                         if self.inference_batcher is not None:
                             move_idx, fire_idx, is_epsilon = self.inference_batcher.infer(
-                                stacked_state, epsilon, locked_fire=locked_fire
+                                stacked_state, epsilon, locked_fire=locked_fire, route_key=cid
                             )
                         else:
                             move_idx, fire_idx, is_epsilon = self.agent.act(
@@ -1139,7 +1318,8 @@ class SocketServer:
                 was_selected = (self.preview_cid is not None and int(self.preview_cid) == int(cid))
                 self.client_states.pop(cid, None)
                 self.clients[cid] = None
-                metrics.client_count = sum(1 for v in self.clients.values() if v is not None)
+                if self.publish_global_client_metrics:
+                    metrics.client_count = sum(1 for v in self.clients.values() if v is not None)
                 if was_selected:
                     self.preview_cid = None
                     changed = True
@@ -1157,9 +1337,12 @@ class SocketServer:
             dead = [k for k, v in self.clients.items() if v is None]
             for k in dead:
                 del self.clients[k]
-            metrics.client_count = len(self.clients)
+            if self.publish_global_client_metrics:
+                metrics.client_count = len(self.clients)
 
     def _calc_avg_level(self):
+        if not self.publish_global_client_metrics:
+            return
         try:
             with self.client_lock:
                 lvls = [
@@ -1236,7 +1419,7 @@ class SocketServer:
         self.running = False
         self.shutdown_event.set()
         if self.inference_batcher:
-            print("Stopping async inference batcher...")
+            print("Stopping inference dispatcher...")
             self.inference_batcher.stop()
             self.inference_batcher = None
         if self.async_buffer:

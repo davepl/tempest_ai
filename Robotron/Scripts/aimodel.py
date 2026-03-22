@@ -27,7 +27,7 @@ def _flushing_print(*args, **kwargs):
     return _original_print(*args, **kwargs)
 builtins.print = _flushing_print
 
-import os, sys, time, struct, random, math, warnings, threading, queue, traceback, shutil
+import os, sys, time, struct, random, math, warnings, threading, queue, traceback, shutil, heapq
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 from collections import deque
@@ -174,7 +174,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 16
+MODEL_ARCH_VERSION = 17
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -2248,7 +2248,13 @@ class RainbowNet(nn.Module):
                     batch_first=True,
                     norm_first=True,
                 )
-                self.entity_self_attn = nn.TransformerEncoder(sa_layer, num_layers=num_sa_layers)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
+                        category=UserWarning,
+                    )
+                    self.entity_self_attn = nn.TransformerEncoder(sa_layer, num_layers=num_sa_layers)
 
                 # ── Lane cross-attention over self-attended entity tokens
                 self.lane_encoder = DirectionalLaneEncoder(
@@ -2790,6 +2796,9 @@ class RainbowAgent:
         self._sync_lock = threading.Lock()
         self.training_enabled = True
         self.running = True
+        self._self_imitation_heap: list[tuple[tuple[int, float, float, int], int]] = []
+        self._self_imitation_counter = 0
+        self._self_imitation_lock = threading.Lock()
 
         # Networks
         self.online_net = RainbowNet(state_size).to(self.device)
@@ -3100,8 +3109,22 @@ class RainbowAgent:
         return actions
 
     # ── Step (add experience) ───────────────────────────────────────────
-    def step(self, state, action, reward, next_state, done, actor="dqn", horizon=1,
-             priority_reward=None, wave_number=1, start_wave=1):
+    def step(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        done,
+        actor="dqn",
+        horizon=1,
+        priority_reward=None,
+        wave_number=1,
+        start_wave=1,
+        client_id=None,
+        episode_id=None,
+        worker_id=None,
+    ):
         if isinstance(action, (tuple, list)) and len(action) >= 2:
             action_idx = combine_action_indices(action[0], action[1])
         else:
@@ -3139,6 +3162,125 @@ class RainbowAgent:
             return int(self.memory.tree.data_ptr - 1) % self.memory.capacity
         except AttributeError:
             return -1
+
+    def consider_self_imitation(
+        self,
+        indices,
+        dqn_reward: float,
+        total_reward: float,
+        length: int,
+        max_wave: int,
+        start_wave: int = 1,
+    ) -> bool:
+        """Promote a strong DQN episode into the self-imitation replay partition."""
+        cfg = RL_CONFIG
+        if not bool(getattr(cfg, "self_imitation_enabled", False)):
+            return False
+
+        idx_list = [int(idx) for idx in indices if idx is not None and int(idx) >= 0]
+        if not idx_list:
+            return False
+
+        ep_len = max(0, int(length))
+        best_wave = max(1, int(max_wave or start_wave or 1))
+        if ep_len < max(1, int(getattr(cfg, "self_imitation_min_episode_frames", 1) or 1)):
+            return False
+        if best_wave < max(1, int(getattr(cfg, "self_imitation_min_wave", 1) or 1)):
+            return False
+
+        dqn_reward_f = float(dqn_reward)
+        total_reward_f = float(total_reward)
+        if (not math.isfinite(dqn_reward_f)) or (not math.isfinite(total_reward_f)):
+            return False
+        if dqn_reward_f <= 0.0 and total_reward_f <= 0.0:
+            return False
+
+        rank = (best_wave, dqn_reward_f, total_reward_f, ep_len)
+        limit = max(1, int(getattr(cfg, "self_imitation_top_episodes", 1) or 1))
+        promote = False
+        with self._self_imitation_lock:
+            entry = (rank, int(self._self_imitation_counter))
+            self._self_imitation_counter += 1
+            if len(self._self_imitation_heap) < limit:
+                heapq.heappush(self._self_imitation_heap, entry)
+                promote = True
+            elif rank > self._self_imitation_heap[0][0]:
+                heapq.heapreplace(self._self_imitation_heap, entry)
+                promote = True
+
+        if not promote:
+            return False
+
+        try:
+            self.memory.mark_self_imitation(idx_list, True)
+            boost = float(getattr(cfg, "self_imitation_priority_boost", 1.0) or 1.0)
+            if boost > 1.0:
+                self.memory.boost_priorities(idx_list, boost)
+            return True
+        except Exception:
+            return False
+
+    def step_batch(self, transitions):
+        """Add a batch of transitions to replay in one locked call."""
+        if not transitions:
+            return []
+
+        n = len(transitions)
+        states = np.empty((n, self.state_size), dtype=np.float32)
+        next_states = np.empty((n, self.state_size), dtype=np.float32)
+        actions = np.empty(n, dtype=np.int64)
+        rewards = np.empty(n, dtype=np.float32)
+        dones = np.empty(n, dtype=np.bool_)
+        horizons = np.empty(n, dtype=np.int32)
+        experts = np.empty(n, dtype=np.uint8)
+        priority_hints = np.empty(n, dtype=np.float32)
+        level_mults = np.empty(n, dtype=np.float32)
+        wave_numbers = np.empty(n, dtype=np.int16)
+        start_waves = np.empty(n, dtype=np.int16)
+
+        level_scale = float(getattr(RL_CONFIG, "level_priority_log_scale", 0.0))
+        death_boost = float(getattr(RL_CONFIG, "death_priority_boost", 0.0))
+
+        for i, (state, action, reward, next_state, done, actor, horizon, priority_reward, wave_number, start_wave) in enumerate(transitions):
+            if isinstance(action, (tuple, list)) and len(action) >= 2:
+                action_idx = combine_action_indices(action[0], action[1])
+            else:
+                action_idx = int(max(0, min(NUM_JOINT - 1, int(action))))
+
+            pri = float(priority_reward) if priority_reward is not None else 0.0
+            if done and death_boost > 0.0:
+                pri = max(abs(pri), death_boost) * (-1.0 if pri < 0 else 1.0)
+
+            wave = max(1, int(wave_number or 1))
+            level_mult = 1.0
+            if level_scale > 0.0:
+                level_mult = max(1.0, math.log10(wave) * level_scale)
+
+            states[i] = np.asarray(state, dtype=np.float32)
+            next_states[i] = np.asarray(next_state, dtype=np.float32)
+            actions[i] = action_idx
+            rewards[i] = float(reward)
+            dones[i] = bool(done)
+            horizons[i] = max(1, int(horizon))
+            experts[i] = 1 if actor == "expert" else 0
+            priority_hints[i] = pri
+            level_mults[i] = level_mult
+            wave_numbers[i] = max(1, min(32767, wave))
+            start_waves[i] = max(1, min(32767, int(start_wave or 1)))
+
+        return self.memory.add_batch(
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            next_states=next_states,
+            dones=dones,
+            horizons=horizons,
+            experts=experts,
+            priority_hints=priority_hints,
+            level_mults=level_mults,
+            wave_numbers=wave_numbers,
+            start_waves=start_waves,
+        )
 
     # ── Background training ─────────────────────────────────────────────
     def _background_train(self):
@@ -3333,7 +3475,7 @@ class RainbowAgent:
                 print("⚠  Old engine checkpoint detected — starting fresh with new architecture.")
                 return False
             if int(ckpt.get("model_arch_version", 0)) != MODEL_ARCH_VERSION:
-                print("⚠  Checkpoint architecture mismatch — starting fresh with structured slot encoder.")
+                print("⚠  Checkpoint architecture mismatch — starting fresh with current architecture.")
                 return False
 
             m1, u1 = self._load_compatible(self.online_net, ckpt.get("online_state_dict", {}))
