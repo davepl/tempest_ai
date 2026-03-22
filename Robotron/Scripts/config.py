@@ -221,6 +221,14 @@ class RLConfigData:
     # fire/move directions, then cross-attend lanes to entity tokens.
     # Replaces the EntitySetEncoder when enabled under pure_mlp + mlp_with_attention.
     use_directional_lanes: bool = True
+    # Token-pointer policy heads over the live unified entity slots. Keeps the
+    # replay/action interface unchanged (still 9 move × 8 fire), but lets the
+    # network reason in terms of selected targets and movement modes before a
+    # controller layer converts those intents back into joystick commands.
+    use_pointer_action_heads: bool = True
+    move_mode_count: int = 4  # hold, approach, flee, orbit
+    pointer_hidden: int = 192
+    move_fire_interaction_rank: int = 8
 
     # Structured learner: compact slot encoding over typed entity buckets.
     use_enemy_attention: bool = True
@@ -244,6 +252,11 @@ class RLConfigData:
     # Changing this alters the entity_proj input width, so it is an
     # architecture change and requires a fresh checkpoint.
     attn_all_frames: bool = False
+    # Frame-summary GRU over the existing stacked state. This adds short-term
+    # temporal memory without changing replay contents or wire format.
+    temporal_memory_enabled: bool = True
+    temporal_memory_hidden: int = 192
+    temporal_memory_layers: int = 1
     grid_hidden_channels: int = 32
     global_hidden: int = 128
     category_summary_dim: int = 48

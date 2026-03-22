@@ -174,7 +174,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 17
+MODEL_ARCH_VERSION = 18
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -1944,6 +1944,45 @@ class EntitySetEncoder(nn.Module):
         return self.out_norm(x[:, 0, :])
 
 
+class TemporalFrameMemory(nn.Module):
+    """Short-horizon GRU memory over stacked frame summaries."""
+
+    def __init__(self, core_dim: int, entity_dim: int, hidden_dim: int, num_layers: int = 1):
+        super().__init__()
+        self.core_proj = nn.Sequential(
+            nn.Linear(core_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+        self.entity_proj = nn.Sequential(
+            nn.Linear(entity_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=max(1, int(num_layers)),
+            batch_first=True,
+        )
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_dim = hidden_dim
+
+    def forward(self, core_seq: torch.Tensor, entity_seq: torch.Tensor) -> torch.Tensor:
+        core_h = self.core_proj(core_seq)
+        entity_h = self.entity_proj(entity_seq)
+        fused = self.fusion(torch.cat([core_h, entity_h], dim=2))
+        out, hidden = self.gru(fused)
+        if hidden.ndim >= 3:
+            return self.out_norm(hidden[-1])
+        return self.out_norm(out[:, -1, :])
+
+
 # ── Directional Lane Encoder ───────────────────────────────────────────────
 # 8-direction lane system inspired by the Tempest lane-cross-attention encoder.
 # Entities are binned into 8 angular wedges (matching fire/move directions)
@@ -1966,6 +2005,10 @@ _LANE_DIR_Y = torch.tensor([0.0, -0.7071, -1.0, -0.7071,  0.0,  0.7071, 1.0,  0.
 #   nearest_electrode_dist,
 #   sin_dir, cos_dir
 _LANE_TOKEN_FEATURES = 15
+_MOVE_MODE_HOLD = 0
+_MOVE_MODE_APPROACH = 1
+_MOVE_MODE_FLEE = 2
+_MOVE_MODE_ORBIT = 3
 
 
 class DirectionalLaneEncoder(nn.Module):
@@ -2215,6 +2258,10 @@ class RainbowNet(nn.Module):
         entity_raw_features = 9  # dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
         self._entity_token_dim = entity_raw_features + self.type_embedding_dim + 2
         self.object_token_features = self._entity_token_dim
+        self.use_pointer_action_heads = False
+        self.use_temporal_memory = False
+        self.temporal_memory_dim = 0
+        self._last_pointer_debug: dict[str, torch.Tensor] = {}
 
         if self.use_pure_mlp:
             mlp_hidden = [int(v) for v in getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512]]
@@ -2230,6 +2277,7 @@ class RainbowNet(nn.Module):
             )
             lane_out_dim = 0
             entity_pool_dim = 0
+            memory_dim = 0
             attn_dim = int(getattr(cfg, "attn_dim", 256))
             if self.use_directional_lanes:
                 # ── Entity input projection: raw token → attn_dim ──────
@@ -2268,6 +2316,16 @@ class RainbowNet(nn.Module):
                 entity_pool_dim = attn_dim
                 self.entity_pool_proj = nn.Linear(attn_dim, entity_pool_dim)
                 self.entity_pool_norm = nn.LayerNorm(entity_pool_dim)
+                self.use_temporal_memory = bool(getattr(cfg, "temporal_memory_enabled", False))
+                if self.use_temporal_memory:
+                    self.temporal_memory = TemporalFrameMemory(
+                        core_dim=self.core_feature_count,
+                        entity_dim=attn_dim,
+                        hidden_dim=int(getattr(cfg, "temporal_memory_hidden", attn_dim)),
+                        num_layers=int(getattr(cfg, "temporal_memory_layers", 1)),
+                    )
+                    self.temporal_memory_dim = int(self.temporal_memory.out_dim)
+                    memory_dim = self.temporal_memory_dim
             elif self.use_mlp_with_attention:
                 self.entity_input_proj = nn.Sequential(
                     nn.Linear(self._entity_token_dim, attn_dim),
@@ -2293,7 +2351,9 @@ class RainbowNet(nn.Module):
             if self.use_directional_lanes:
                 self.state_norm = nn.LayerNorm(int(state_size))
                 self.lane_norm_out = nn.LayerNorm(lane_out_dim)
-            trunk_in = int(state_size) + lane_out_dim + entity_pool_dim
+                if memory_dim > 0:
+                    self.memory_norm_out = nn.LayerNorm(memory_dim)
+            trunk_in = int(state_size) + lane_out_dim + entity_pool_dim + memory_dim
             layers = []
             in_dim = trunk_in
             for width in mlp_hidden:
@@ -2323,7 +2383,11 @@ class RainbowNet(nn.Module):
                 )
 
             head_mid = max(64, head_in // 2)
-            self._build_action_heads(head_in, head_mid)
+            if self.use_directional_lanes and bool(getattr(cfg, "use_pointer_action_heads", False)):
+                self.use_pointer_action_heads = True
+                self._build_pointer_policy_modules(head_in, head_mid, attn_dim)
+            else:
+                self._build_action_heads(head_in, head_mid)
             self._init_weights()
             if self.use_dist:
                 support = torch.linspace(self.v_min, self.v_max, self.num_atoms)
@@ -2375,12 +2439,73 @@ class RainbowNet(nn.Module):
             self.register_buffer("support", support)
             self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
 
+    def _build_pointer_policy_modules(self, head_in: int, head_mid: int, attn_dim: int):
+        pointer_hidden = max(64, int(getattr(RL_CONFIG, "pointer_hidden", head_mid) or head_mid))
+        self.pointer_slot_count = self.num_object_slots + 1  # +1 null target
+        self.move_query_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
+        self.fire_query_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
+        self.pointer_null_encoded = nn.Parameter(torch.zeros(1, 1, attn_dim))
+        self.pointer_null_raw = nn.Parameter(torch.zeros(1, 1, self._entity_token_dim))
+        self.move_query_proj = nn.Linear(head_in, attn_dim)
+        self.fire_query_proj = nn.Linear(head_in, attn_dim)
+        self.pointer_key_proj = nn.Linear(attn_dim, attn_dim)
+
+        self.move_mode_count = max(1, int(getattr(RL_CONFIG, "move_mode_count", 4) or 4))
+        mode_in = head_in + (2 * attn_dim)
+        self.move_mode_fc = nn.Linear(mode_in, pointer_hidden)
+        self.move_mode_out = nn.Linear(pointer_hidden, self.move_mode_count)
+        self.orbit_gate_fc = nn.Linear(mode_in, pointer_hidden // 2)
+        self.orbit_gate_out = nn.Linear(pointer_hidden // 2, 1)
+        self.fire_lead_fc = nn.Linear(head_in + attn_dim, pointer_hidden // 2)
+        self.fire_lead_out = nn.Linear(pointer_hidden // 2, 1)
+
+        move_ctrl_in = head_in + (2 * attn_dim) + self.move_mode_count + self.pointer_slot_count + 9 + 8
+        fire_ctrl_in = head_in + (2 * attn_dim) + self.pointer_slot_count + 8
+        self.move_controller_fc = nn.Linear(move_ctrl_in, pointer_hidden)
+        self.move_controller_out = nn.Linear(pointer_hidden, NUM_MOVE)
+        self.fire_controller_fc = nn.Linear(fire_ctrl_in, pointer_hidden)
+        self.fire_controller_out = nn.Linear(pointer_hidden, NUM_FIRE)
+        self.move_controller_atom_scale = nn.Parameter(torch.zeros(1, 1, self.num_atoms))
+        self.fire_controller_atom_scale = nn.Parameter(torch.zeros(1, 1, self.num_atoms))
+
+        self.move_action_basis = nn.Parameter(torch.zeros(NUM_MOVE, attn_dim))
+        self.fire_action_basis = nn.Parameter(torch.zeros(NUM_FIRE, attn_dim))
+        move_dirs = torch.tensor([_move_dir_vector(i) for i in range(NUM_MOVE)], dtype=torch.float32)
+        fire_dirs = torch.tensor([_move_dir_vector(i) for i in range(NUM_FIRE)], dtype=torch.float32)
+        self.register_buffer("move_dir_vectors", move_dirs)
+        self.register_buffer("fire_dir_vectors", fire_dirs)
+
+        move_head_in = head_in + (2 * attn_dim) + self.move_mode_count + attn_dim + NUM_MOVE
+        fire_head_in = head_in + (2 * attn_dim) + attn_dim + NUM_FIRE
+        self.pointer_val_fc = nn.Linear(head_in, head_mid)
+        self.pointer_val_out = nn.Linear(head_mid, self.num_atoms)
+        self.pointer_move_fc = nn.Linear(move_head_in, head_mid)
+        self.pointer_move_out = nn.Linear(head_mid, NUM_MOVE * self.num_atoms)
+        self.pointer_fire_fc = nn.Linear(fire_head_in, head_mid)
+        self.pointer_fire_out = nn.Linear(head_mid, NUM_FIRE * self.num_atoms)
+
+        rank = max(1, int(getattr(RL_CONFIG, "move_fire_interaction_rank", 8) or 8))
+        self.move_fire_interaction_rank = rank
+        self.pointer_move_interaction = nn.Linear(move_head_in, NUM_MOVE * rank)
+        self.pointer_fire_interaction = nn.Linear(fire_head_in, NUM_FIRE * rank)
+        self.pointer_interaction_atom = nn.Linear(head_in + (2 * attn_dim) + self.move_mode_count, self.num_atoms)
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+        if self.use_pointer_action_heads:
+            nn.init.normal_(self.move_query_token, mean=0.0, std=0.02)
+            nn.init.normal_(self.fire_query_token, mean=0.0, std=0.02)
+            nn.init.normal_(self.pointer_null_encoded, mean=0.0, std=0.02)
+            nn.init.constant_(self.pointer_null_raw, 0.0)
+            nn.init.normal_(self.move_action_basis, mean=0.0, std=0.02)
+            nn.init.normal_(self.fire_action_basis, mean=0.0, std=0.02)
 
     def _build_action_heads(self, head_in: int, head_mid: int):
         self.head_mid = int(head_mid)
@@ -2560,10 +2685,229 @@ class RainbowNet(nn.Module):
             mask_batches.append(mask)
         return torch.cat(token_batches, dim=0), torch.cat(mask_batches, dim=0)
 
+    @staticmethod
+    def _masked_mean_tokens(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        present = (~mask).unsqueeze(-1).float()
+        count = present.sum(dim=1).clamp(min=1.0)
+        return (tokens * present).sum(dim=1) / count
+
+    def _build_temporal_memory(self, state: torch.Tensor) -> torch.Tensor | None:
+        if not getattr(self, "use_temporal_memory", False):
+            return None
+        frame_offsets = self._frame_offsets(state)
+        core_parts = []
+        entity_parts = []
+        for frame_off in frame_offsets:
+            raw_tokens, mask = self._build_frame_object_tokens(state, frame_off)
+            proj_tokens = self.entity_input_proj(raw_tokens)
+            entity_parts.append(self._masked_mean_tokens(proj_tokens, mask))
+            core_parts.append(state[:, frame_off: frame_off + self.core_feature_count])
+        core_seq = torch.stack(core_parts, dim=1)
+        entity_seq = torch.stack(entity_parts, dim=1)
+        return self.temporal_memory(core_seq, entity_seq)
+
+    def _append_pointer_null(
+        self,
+        encoded_tokens: torch.Tensor,
+        raw_tokens: torch.Tensor,
+        entity_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz = encoded_tokens.shape[0]
+        null_encoded = self.pointer_null_encoded.expand(bsz, -1, -1)
+        null_raw = self.pointer_null_raw.expand(bsz, -1, -1)
+        null_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=entity_mask.device)
+        return (
+            torch.cat([encoded_tokens, null_encoded], dim=1),
+            torch.cat([raw_tokens, null_raw], dim=1),
+            torch.cat([entity_mask, null_mask], dim=1),
+        )
+
+    def _pointer_select(
+        self,
+        query: torch.Tensor,
+        encoded_tokens: torch.Tensor,
+        raw_tokens: torch.Tensor,
+        entity_mask: torch.Tensor,
+        dangerous_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        key_tokens = self.pointer_key_proj(encoded_tokens)
+        logits = torch.einsum("bd,bsd->bs", query, key_tokens) / math.sqrt(float(key_tokens.shape[-1]))
+        logits = logits.masked_fill(entity_mask, -1e9)
+        if dangerous_bias is not None:
+            logits = logits + dangerous_bias
+        probs = torch.softmax(logits, dim=1)
+        encoded_ctx = torch.einsum("bs,bsd->bd", probs, encoded_tokens)
+        raw_ctx = torch.einsum("bs,bsd->bd", probs, raw_tokens)
+        slot_idx = probs.argmax(dim=1)
+        return probs, encoded_ctx, raw_ctx, slot_idx
+
+    @staticmethod
+    def _vector_to_direction_logits(
+        vec_x: torch.Tensor,
+        vec_y: torch.Tensor,
+        dir_vectors: torch.Tensor,
+    ) -> torch.Tensor:
+        vec = torch.stack([vec_x, vec_y], dim=1)
+        norm = vec.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        unit = vec / norm
+        return torch.matmul(unit, dir_vectors.t())
+
+    def _compute_pointer_policy(
+        self,
+        h: torch.Tensor,
+        raw_tokens: torch.Tensor,
+        entity_tokens: torch.Tensor,
+        entity_mask: torch.Tensor,
+        memory_ctx: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        tokens_ext, raw_ext, mask_ext = self._append_pointer_null(entity_tokens, raw_tokens, entity_mask)
+
+        move_query = self.move_query_proj(h) + self.move_query_token[:, 0, :]
+        fire_query = self.fire_query_proj(h) + self.fire_query_token[:, 0, :]
+
+        is_dangerous = raw_ext[:, :, -1]
+        is_human = raw_ext[:, :, -2]
+        dangerous_bias = (0.5 * is_dangerous) - (0.25 * is_human)
+
+        move_pointer_probs, move_target_ctx, move_target_raw, move_slot_idx = self._pointer_select(
+            move_query,
+            tokens_ext,
+            raw_ext,
+            mask_ext,
+        )
+        fire_pointer_probs, fire_target_ctx, fire_target_raw, fire_slot_idx = self._pointer_select(
+            fire_query,
+            tokens_ext,
+            raw_ext,
+            mask_ext,
+            dangerous_bias=dangerous_bias,
+        )
+
+        mode_in = torch.cat([h, move_target_ctx, fire_target_ctx], dim=1)
+        move_mode_hidden = F.relu(self.move_mode_fc(mode_in))
+        move_mode_logits = self.move_mode_out(move_mode_hidden)
+        move_mode_probs = torch.softmax(move_mode_logits, dim=1)
+        orbit_gate = torch.sigmoid(self.orbit_gate_out(F.relu(self.orbit_gate_fc(mode_in))))
+
+        move_dx = move_target_raw[:, 0] * _REL_POS_X_RANGE
+        move_dy = move_target_raw[:, 1] * _REL_POS_Y_RANGE
+        fire_dx = fire_target_raw[:, 0] * _REL_POS_X_RANGE
+        fire_dy = fire_target_raw[:, 1] * _REL_POS_Y_RANGE
+        fire_vx = fire_target_raw[:, 2] * _REL_POS_X_RANGE
+        fire_vy = fire_target_raw[:, 3] * _REL_POS_Y_RANGE
+
+        lead_scale = torch.tanh(self.fire_lead_out(F.relu(self.fire_lead_fc(torch.cat([h, fire_target_ctx], dim=1)))))
+        fire_vec_x = fire_dx + (lead_scale[:, 0] * fire_vx)
+        fire_vec_y = fire_dy + (lead_scale[:, 0] * fire_vy)
+
+        fire_geom = self._vector_to_direction_logits(fire_vec_x, fire_vec_y, self.fire_dir_vectors)
+        fire_ctrl_in = torch.cat([h, move_target_ctx, fire_target_ctx, fire_pointer_probs, fire_geom], dim=1)
+        fire_ctrl_hidden = F.relu(self.fire_controller_fc(fire_ctrl_in))
+        fire_dir_logits = fire_geom + self.fire_controller_out(fire_ctrl_hidden)
+
+        approach_x, approach_y = move_dx, move_dy
+        flee_x, flee_y = -move_dx, -move_dy
+        orbit_cw_x, orbit_cw_y = move_dy, -move_dx
+        orbit_ccw_x, orbit_ccw_y = -move_dy, move_dx
+        orbit_x = (orbit_gate[:, 0] * orbit_cw_x) + ((1.0 - orbit_gate[:, 0]) * orbit_ccw_x)
+        orbit_y = (orbit_gate[:, 0] * orbit_cw_y) + ((1.0 - orbit_gate[:, 0]) * orbit_ccw_y)
+
+        mode_hold = move_mode_probs[:, _MOVE_MODE_HOLD]
+        mode_approach = move_mode_probs[:, _MOVE_MODE_APPROACH] if self.move_mode_count > _MOVE_MODE_APPROACH else 0.0
+        mode_flee = move_mode_probs[:, _MOVE_MODE_FLEE] if self.move_mode_count > _MOVE_MODE_FLEE else 0.0
+        mode_orbit = move_mode_probs[:, _MOVE_MODE_ORBIT] if self.move_mode_count > _MOVE_MODE_ORBIT else 0.0
+
+        move_vec_x = (mode_approach * approach_x) + (mode_flee * flee_x) + (mode_orbit * orbit_x)
+        move_vec_y = (mode_approach * approach_y) + (mode_flee * flee_y) + (mode_orbit * orbit_y)
+        move_geom_dirs = self._vector_to_direction_logits(move_vec_x, move_vec_y, self.move_dir_vectors[:8])
+        move_idle_bias = mode_hold.unsqueeze(1)
+        move_geom = torch.cat([move_geom_dirs, move_idle_bias], dim=1)
+        move_ctrl_in = torch.cat([h, move_target_ctx, fire_target_ctx, move_mode_probs, move_pointer_probs, move_geom, fire_geom], dim=1)
+        move_ctrl_hidden = F.relu(self.move_controller_fc(move_ctrl_in))
+        move_dir_logits = move_geom + self.move_controller_out(move_ctrl_hidden)
+
+        move_dir_probs = torch.softmax(move_dir_logits, dim=1)
+        fire_dir_probs = torch.softmax(fire_dir_logits, dim=1)
+        move_embed = torch.matmul(move_dir_probs, self.move_action_basis)
+        fire_embed = torch.matmul(fire_dir_probs, self.fire_action_basis)
+
+        if memory_ctx is None:
+            memory_ctx = h.new_zeros((h.shape[0], 0))
+
+        return {
+            "move_pointer_probs": move_pointer_probs,
+            "fire_pointer_probs": fire_pointer_probs,
+            "move_target_ctx": move_target_ctx,
+            "fire_target_ctx": fire_target_ctx,
+            "move_target_raw": move_target_raw,
+            "fire_target_raw": fire_target_raw,
+            "move_target_slot": move_slot_idx,
+            "fire_target_slot": fire_slot_idx,
+            "move_mode_logits": move_mode_logits,
+            "move_mode_probs": move_mode_probs,
+            "orbit_gate": orbit_gate,
+            "move_dir_logits": move_dir_logits,
+            "fire_dir_logits": fire_dir_logits,
+            "move_dir_probs": move_dir_probs,
+            "fire_dir_probs": fire_dir_probs,
+            "move_embed": move_embed,
+            "fire_embed": fire_embed,
+            "memory_ctx": memory_ctx,
+        }
+
+    def _pointer_policy_q_atoms(
+        self,
+        h: torch.Tensor,
+        raw_tokens: torch.Tensor,
+        entity_tokens: torch.Tensor,
+        entity_mask: torch.Tensor,
+        memory_ctx: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        policy = self._compute_pointer_policy(h, raw_tokens, entity_tokens, entity_mask, memory_ctx=memory_ctx)
+        move_target_ctx = policy["move_target_ctx"]
+        fire_target_ctx = policy["fire_target_ctx"]
+        move_mode_probs = policy["move_mode_probs"]
+        move_dir_logits = policy["move_dir_logits"]
+        fire_dir_logits = policy["fire_dir_logits"]
+        move_embed = policy["move_embed"]
+        fire_embed = policy["fire_embed"]
+
+        move_head_in = torch.cat([h, move_target_ctx, fire_target_ctx, move_mode_probs, move_embed, move_dir_logits], dim=1)
+        fire_head_in = torch.cat([h, move_target_ctx, fire_target_ctx, fire_embed, fire_dir_logits], dim=1)
+
+        val = F.relu(self.pointer_val_fc(h))
+        val = self.pointer_val_out(val).view(h.shape[0], 1, 1, self.num_atoms)
+
+        move_adv = F.relu(self.pointer_move_fc(move_head_in))
+        move_adv = self.pointer_move_out(move_adv).view(h.shape[0], NUM_MOVE, 1, self.num_atoms)
+        move_adv = move_adv + (move_dir_logits.unsqueeze(-1).unsqueeze(-1) * self.move_controller_atom_scale)
+        move_adv = move_adv - move_adv.mean(dim=1, keepdim=True)
+
+        fire_adv = F.relu(self.pointer_fire_fc(fire_head_in))
+        fire_adv = self.pointer_fire_out(fire_adv).view(h.shape[0], 1, NUM_FIRE, self.num_atoms)
+        fire_adv = fire_adv + (fire_dir_logits.unsqueeze(1).unsqueeze(-1) * self.fire_controller_atom_scale)
+        fire_adv = fire_adv - fire_adv.mean(dim=2, keepdim=True)
+
+        move_inter = self.pointer_move_interaction(move_head_in).view(h.shape[0], NUM_MOVE, self.move_fire_interaction_rank)
+        fire_inter = self.pointer_fire_interaction(fire_head_in).view(h.shape[0], NUM_FIRE, self.move_fire_interaction_rank)
+        interaction = torch.einsum("bmr,bfr->bmf", move_inter, fire_inter)
+        interaction = interaction - interaction.mean(dim=1, keepdim=True)
+        interaction = interaction - interaction.mean(dim=2, keepdim=True)
+        interaction = interaction + interaction.mean(dim=(1, 2), keepdim=True)
+        atom_gate = 0.25 * torch.tanh(
+            self.pointer_interaction_atom(torch.cat([h, move_target_ctx, fire_target_ctx, move_mode_probs], dim=1))
+        ).view(h.shape[0], 1, 1, self.num_atoms)
+        interaction_atoms = interaction.unsqueeze(-1) * atom_gate
+
+        q_atoms = val + move_adv + fire_adv + interaction_atoms
+        policy["q_atoms"] = q_atoms.view(h.shape[0], self.num_actions, self.num_atoms)
+        return policy["q_atoms"], policy
+
     def forward(self, state: torch.Tensor, log: bool = False):
         B = state.shape[0]
         if self.use_pure_mlp:
             if self.use_directional_lanes:
+                memory_ctx = self._build_temporal_memory(state)
                 # Build raw entity tokens for the latest frame → (B, 64, 27)
                 raw_tokens, entity_mask = self._build_frame_object_tokens(
                     state, self._frame_offsets(state)[-1]
@@ -2596,18 +2940,35 @@ class RainbowNet(nn.Module):
                 entity_pooled = (entity_tokens * present_mask.unsqueeze(-1).float()).sum(dim=1) / present_count
                 entity_pool_summary = self.entity_pool_norm(F.relu(self.entity_pool_proj(entity_pooled)))
                 # Normalise each branch independently, then concatenate → trunk
-                h = self.trunk(torch.cat([self.state_norm(state),
-                                          self.lane_norm_out(lane_summary),
-                                          entity_pool_summary], dim=1))
+                trunk_parts = [
+                    self.state_norm(state),
+                    self.lane_norm_out(lane_summary),
+                    entity_pool_summary,
+                ]
+                if memory_ctx is not None and memory_ctx.numel() > 0:
+                    trunk_parts.append(self.memory_norm_out(memory_ctx))
+                h = self.trunk(torch.cat(trunk_parts, dim=1))
+                if self.use_pointer_action_heads:
+                    q_atoms, pointer_debug = self._pointer_policy_q_atoms(
+                        h,
+                        raw_tokens,
+                        entity_tokens,
+                        entity_mask,
+                        memory_ctx=memory_ctx,
+                    )
+                    self._last_pointer_debug = pointer_debug
+                else:
+                    q_atoms = self._action_head_q_atoms(h, B)
             elif self.use_mlp_with_attention:
                 h = self.trunk(state)
                 all_tokens, all_masks = self._build_all_frame_object_tokens(state)
                 frame_summaries = self.object_attn(all_tokens, all_masks).view(B, self.attn_frame_count, -1)
                 entity_out = self.entity_proj(frame_summaries.reshape(B, -1))
                 h = self.mlp_attn_fusion(torch.cat([h, entity_out], dim=1))
+                q_atoms = self._action_head_q_atoms(h, B)
             else:
                 h = self.trunk(state)
-            q_atoms = self._action_head_q_atoms(h, B)
+                q_atoms = self._action_head_q_atoms(h, B)
             if self.use_dist:
                 q_atoms = q_atoms.float()
                 if log:
@@ -2637,6 +2998,11 @@ class RainbowNet(nn.Module):
             probs = self.forward(state, log=False)
             return (probs * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2)
         return self.forward(state, log=False)
+
+    def debug_pointer_policy(self, state: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Run a forward pass and expose the latest pointer/controller activations."""
+        _ = self.forward(state, log=False)
+        return {k: v.detach().clone() for k, v in self._last_pointer_debug.items()}
 
 # ── Keyboard handler ────────────────────────────────────────────────────────
 msvcrt = termios = tty = fcntl = None
