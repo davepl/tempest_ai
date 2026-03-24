@@ -174,7 +174,7 @@ else:
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 17
+MODEL_ARCH_VERSION = 18
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -407,6 +407,14 @@ def _latest_frame_state(state: np.ndarray) -> np.ndarray:
     return latest
 
 
+def _compact_globals(state: np.ndarray) -> np.ndarray:
+    latest = _latest_frame_state(state)
+    gcount = int(getattr(RL_CONFIG, "global_feature_count", LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES))
+    if latest.size < gcount:
+        return np.zeros(gcount, dtype=np.float32)
+    return latest[:gcount]
+
+
 # ── Expert system (heuristic) ───────────────────────────────────────────────
 _DIR8_VECTORS: tuple[tuple[float, float], ...] = (
     (0.0, -1.0),                     # up
@@ -482,6 +490,35 @@ _DIR8_COMPONENTS: tuple[tuple[int, int], ...] = (
     (-1,  0),  # 6 left
     (-1, -1),  # 7 up-left
 )
+
+_GF_ALIVE = 0
+_GF_WAVE = 1
+_GF_LASERS = 2
+_GF_PLAYER_X = 3
+_GF_PLAYER_Y = 4
+_GF_PLAYER_VX = 5
+_GF_PLAYER_VY = 6
+_GF_NEAREST_ENEMY_DIST = 7
+_GF_NEAREST_HULK_DIST = 8
+_GF_NEAREST_ELECTRODE_DIST = 9
+_GF_NEAREST_HUMAN_DIST = 10
+_GF_NEAREST_HUMAN_DX = 11
+_GF_NEAREST_HUMAN_DY = 12
+_GF_HUMAN_COUNT = 13
+_GF_THREAT_LEFT = 14
+_GF_THREAT_RIGHT = 15
+_GF_THREAT_UP = 16
+_GF_THREAT_DOWN = 17
+_GF_OPEN_LEFT = 18
+_GF_OPEN_RIGHT = 19
+_GF_OPEN_UP = 20
+_GF_OPEN_DOWN = 21
+_GF_CROWDING = 22
+_GF_PROJECTILE_PRESSURE = 23
+_GF_ESCAPE_X = 24
+_GF_ESCAPE_Y = 25
+_GF_RESCUE_OPPORTUNITY = 26
+_GF_SAFE_FIRE_OPPORTUNITY = 27
 
 
 def _forbid_lava(move_dir: int, px: float, py: float) -> int:
@@ -699,12 +736,12 @@ def _hybrid_base_state_size() -> int:
 
 def _legacy_slot_layout() -> tuple[list[tuple[str, int, int, int]], int]:
     slot_features = int(getattr(RL_CONFIG, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
-    offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES)
+    offset = int(getattr(RL_CONFIG, "global_feature_count", LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES))
     info: list[tuple[str, int, int, int]] = []
     for cat_idx, (name, slots) in enumerate(getattr(RL_CONFIG, "entity_categories", ())):
         slots_i = int(slots)
         info.append((str(name), offset, slots_i, cat_idx))
-        offset += 1 + (slots_i * slot_features)
+        offset += slots_i * slot_features
     return info, offset
 
 
@@ -754,7 +791,7 @@ def _split_latest_sections(state: np.ndarray):
 
 
 def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
-    latest, prev, base_state_size = _latest_prev_frame_state(state)
+    latest, _prev, base_state_size = _latest_prev_frame_state(state)
     cat_info, legacy_size = _legacy_slot_layout()
     if base_state_size != legacy_size or latest.size < legacy_size:
         return np.zeros((0, 15), dtype=np.float32)
@@ -764,31 +801,21 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
     type_den = max(1, UNIFIED_NUM_TYPES - 1)
 
     for _name, base, slots, _cat_idx in cat_info:
-        latest_block = latest[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
-        prev_block = prev[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
+        latest_block = latest[base: base + slots * slot_features].reshape(slots, slot_features)
 
         for slot_idx in range(slots):
             if float(latest_block[slot_idx, 0]) < 0.5:
                 continue
             dx = float(latest_block[slot_idx, 1])
             dy = float(latest_block[slot_idx, 2])
-            dist = float(latest_block[slot_idx, 3])
+            vx = float(latest_block[slot_idx, 3])
+            vy = float(latest_block[slot_idx, 4])
+            dist = float(latest_block[slot_idx, 5])
             if not np.isfinite(dist):
                 continue
 
-            vx = float(latest_block[slot_idx, 4])
-            vy = float(latest_block[slot_idx, 5])
             threat = float(latest_block[slot_idx, 6])
-            approach = float(latest_block[slot_idx, 7])
-
-            hit_w_norm = None
-            hit_h_norm = None
-            if slot_features >= 11:
-                hit_w_norm = float(latest_block[slot_idx, 8])
-                hit_h_norm = float(latest_block[slot_idx, 9])
-                type_id_norm = float(latest_block[slot_idx, 10])
-            else:
-                type_id_norm = float(latest_block[slot_idx, 8])
+            type_id_norm = float(latest_block[slot_idx, 7])
             type_id = int(round(type_id_norm * type_den))
             type_id = max(0, min(UNIFIED_NUM_TYPES - 1, type_id))
             type_name = UNIFIED_TYPE_NAMES[type_id]
@@ -798,14 +825,8 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
             cat_norm = type_id_norm  # Preserve normalised type for backward compat
 
             fallback_w_px, fallback_h_px = _LEGACY_CATEGORY_BOX_PX.get(type_name, (8.0, 8.0))
-            if hit_w_norm is None or not np.isfinite(hit_w_norm) or hit_w_norm <= 0.0:
-                hit_w_norm = max(0.0, min(1.0, fallback_w_px / 16.0))
-            else:
-                hit_w_norm = max(0.0, min(1.0, hit_w_norm))
-            if hit_h_norm is None or not np.isfinite(hit_h_norm) or hit_h_norm <= 0.0:
-                hit_h_norm = max(0.0, min(1.0, fallback_h_px / 16.0))
-            else:
-                hit_h_norm = max(0.0, min(1.0, hit_h_norm))
+            hit_w_norm = max(0.0, min(1.0, fallback_w_px / 16.0))
+            hit_h_norm = max(0.0, min(1.0, fallback_h_px / 16.0))
 
             world_dx = dx * _REL_POS_X_RANGE
             world_dy = dy * _REL_POS_Y_RANGE
@@ -816,6 +837,7 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
             else:
                 dir_x = 0.0
                 dir_y = 0.0
+            approach = float(np.clip(-((vx * dir_x) + (vy * dir_y)), -1.0, 1.0))
 
             rows.append([
                 1.0,
@@ -934,8 +956,6 @@ def _nearest_endgame_cleanup_vector_from_state(state: np.ndarray) -> Optional[Tu
 
 def _count_humans_and_cleanup_targets(state: np.ndarray) -> tuple[int, int]:
     toks = _active_tokens_from_state(state)
-    if toks.shape[0] == 0:
-        return 0, 0
     humans = 0
     cleanup_targets = 0
     for tok in toks:
@@ -944,13 +964,15 @@ def _count_humans_and_cleanup_targets(state: np.ndarray) -> tuple[int, int]:
             continue
         if _token_category_name(tok) in _ENDGAME_CLEANUP_CATEGORIES:
             cleanup_targets += 1
+    if humans <= 0:
+        g = _compact_globals(state)
+        if g.size > _GF_HUMAN_COUNT and float(g[_GF_HUMAN_COUNT]) > 1e-6:
+            humans = max(1, int(round(float(g[_GF_HUMAN_COUNT]) * 16.0)))
     return humans, cleanup_targets
 
 
 def _count_humans_and_destructible_enemies(state: np.ndarray) -> tuple[int, int]:
     toks = _active_tokens_from_state(state)
-    if toks.shape[0] == 0:
-        return 0, 0
     humans = 0
     destructible = 0
     for tok in toks:
@@ -959,6 +981,10 @@ def _count_humans_and_destructible_enemies(state: np.ndarray) -> tuple[int, int]
             continue
         if _token_category_name(tok) in _ALIGN_ROBOT_CATEGORIES:
             destructible += 1
+    if humans <= 0:
+        g = _compact_globals(state)
+        if g.size > _GF_HUMAN_COUNT and float(g[_GF_HUMAN_COUNT]) > 1e-6:
+            humans = max(1, int(round(float(g[_GF_HUMAN_COUNT]) * 16.0)))
     return humans, destructible
 
 
@@ -979,7 +1005,13 @@ def _defensive_fire_direction_from_state(state: np.ndarray) -> Optional[int]:
 def _strategic_threat_pressure(state: np.ndarray) -> tuple[float, int]:
     toks = _active_tokens_from_state(state)
     if toks.shape[0] == 0:
-        return 0.0, 0
+        g = _compact_globals(state)
+        if g.size <= _GF_PROJECTILE_PRESSURE:
+            return 0.0, 0
+        pressure = float(g[_GF_CROWDING]) * 8.0
+        projectile_pressure = float(g[_GF_PROJECTILE_PRESSURE])
+        projectile_count = 1 if projectile_pressure > 0.20 else 0
+        return pressure, projectile_count
     pressure = 0.0
     projectile_count = 0
     for tok in toks:
@@ -1007,8 +1039,8 @@ def _strategic_threat_pressure(state: np.ndarray) -> tuple[float, int]:
 def _perimeter_orbit_move(state: np.ndarray, fire_dir: int) -> int:
     """Bias movement outward first, then tangentially around the arena edge."""
     s = _latest_frame_state(state)
-    px = float(s[5]) if s.size > 6 else 0.5
-    py = float(s[6]) if s.size > 6 else 0.5
+    px = float(s[_GF_PLAYER_X]) if s.size > _GF_PLAYER_Y else 0.5
+    py = float(s[_GF_PLAYER_Y]) if s.size > _GF_PLAYER_Y else 0.5
 
     rel_x = px - 0.5
     rel_y = py - 0.5
@@ -1034,18 +1066,26 @@ def _perimeter_orbit_move(state: np.ndarray, fire_dir: int) -> int:
 
 def _nearest_human_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
     toks = _active_tokens_from_state(state)
-    if toks.shape[0] == 0:
+    if toks.shape[0] > 0:
+        best = None
+        for tok in toks:
+            if tok[12] < 0.5:
+                continue
+            dist = float(tok[5])
+            if not np.isfinite(dist):
+                continue
+            if best is None or dist < best[2]:
+                best = (float(tok[1]), float(tok[2]), dist)
+        if best is not None:
+            return best
+    g = _compact_globals(state)
+    if g.size <= _GF_NEAREST_HUMAN_DY or float(g[_GF_HUMAN_COUNT]) <= 1e-6:
         return None
-    best = None
-    for tok in toks:
-        if tok[12] < 0.5:
-            continue
-        dist = float(tok[5])
-        if not np.isfinite(dist):
-            continue
-        if best is None or dist < best[2]:
-            best = (float(tok[1]), float(tok[2]), dist)
-    return best
+    return (
+        float(g[_GF_NEAREST_HUMAN_DX]),
+        float(g[_GF_NEAREST_HUMAN_DY]),
+        float(g[_GF_NEAREST_HUMAN_DIST]),
+    )
 
 
 def _nearest_projectile_vector_from_state(state: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -1501,8 +1541,8 @@ def _get_simple_expert_action(
         and destructible_enemies <= 1
     )
     s = _latest_frame_state(state)
-    px = float(s[5]) if s.size > 6 else 0.5
-    py = float(s[6]) if s.size > 6 else 0.5
+    px = float(s[_GF_PLAYER_X]) if s.size > _GF_PLAYER_Y else 0.5
+    py = float(s[_GF_PLAYER_Y]) if s.size > _GF_PLAYER_Y else 0.5
 
     # ── Fire direction ───────────────────────────────────────────────
     if last_enemy_rescue_mode:
@@ -1608,8 +1648,8 @@ def _get_strategic_expert_action(
         and destructible_enemies <= 1
     )
     s = _latest_frame_state(state)
-    px = float(s[5]) if s.size > 6 else 0.5
-    py = float(s[6]) if s.size > 6 else 0.5
+    px = float(s[_GF_PLAYER_X]) if s.size > _GF_PLAYER_Y else 0.5
+    py = float(s[_GF_PLAYER_Y]) if s.size > _GF_PLAYER_Y else 0.5
     radial_dist = math.hypot(px - 0.5, py - 0.5)
     near_human_rescue_ok = False
     if nearest_human is not None:
@@ -2188,11 +2228,10 @@ class RainbowNet(nn.Module):
         self.attn_frame_count = self.stack_depth if self.attn_all_frames else 1
         self.num_object_slots = int(getattr(cfg, "object_slots", 64))
         self.slot_state_features = int(getattr(cfg, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
-        self.core_feature_count = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES)
+        self.core_feature_count = int(getattr(cfg, "global_feature_count", LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES))
         self._cat_info = []
         self._category_ranges = []
         self._num_categories = 0
-        self._occupancy_offsets = []
 
         # Unified pool: single ("entity", 64) category with per-slot type_id
         cat_defs = getattr(cfg, "entity_categories", [("entity", 64)])
@@ -2203,16 +2242,15 @@ class RainbowNet(nn.Module):
                 slots_i = int(slots)
                 self._cat_info.append((name, offset, slots_i, cat_id))
                 self._category_ranges.append((name, slot_cursor, slot_cursor + slots_i))
-                offset += 1 + (slots_i * self.slot_state_features)
+                offset += slots_i * self.slot_state_features
                 slot_cursor += slots_i
             self._num_categories = len(cat_defs)
-            self._occupancy_offsets = [base for _name, base, _slots, _cat_id in self._cat_info]
 
         # Learned type embedding replaces the old scalar cat_norm / is_human / is_dangerous meta
         self.type_embedding_dim = int(getattr(cfg, "type_embedding_dim", 16))
         self.type_embedding = nn.Embedding(UNIFIED_NUM_TYPES, self.type_embedding_dim)
-        # Entity token: 9 raw features + type_emb(16) + is_human(1) + is_dangerous(1) = 27
-        entity_raw_features = 9  # dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
+        # Compact entity token: 6 raw features + type_emb(16) + is_human(1) + is_dangerous(1) = 24
+        entity_raw_features = 6  # dx, dy, vx, vy, dist, threat
         self._entity_token_dim = entity_raw_features + self.type_embedding_dim + 2
         self.object_token_features = self._entity_token_dim
 
@@ -2449,56 +2487,34 @@ class RainbowNet(nn.Module):
         parts = []
         for frame_off in self._frame_offsets(state):
             parts.append(state[:, frame_off: frame_off + self.core_feature_count])
-            for base in self._occupancy_offsets:
-                parts.append(state[:, frame_off + base: frame_off + base + 1])
         return torch.cat(parts, dim=1)
 
     def _build_frame_object_tokens(self, state: torch.Tensor, frame_off: int):
-        """Build unified pool entity tokens with learned type embeddings.
-
-        Wire format per slot (11 features):
-            present(0), dx(1), dy(2), dist(3), vx(4), vy(5),
-            threat(6), approach(7), hit_w_norm(8), hit_h_norm(9), type_id_norm(10)
-
-        Output token (27 features):
-            dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h,
-            type_emb(16), is_human, is_dangerous
-        """
+        """Build compact roster tokens with learned type embeddings."""
         B = state.shape[0]
-        device = state.device
-
-        # Single unified category — extract the 64×11 block
         _name, base, slots, _cat_id = self._cat_info[0]
-        block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
-        block = block.reshape(B, slots, self.slot_state_features)  # (B, 64, 11)
+        block = state[:, frame_off + base: frame_off + base + slots * self.slot_state_features]
+        block = block.reshape(B, slots, self.slot_state_features)  # (B, 24, 8)
 
-        present = block[:, :, 0]                    # (B, 64)
-        raw_feats = block[:, :, 1:10]               # (B, 64, 9) — dx,dy,dist,vx,vy,threat,approach,hit_w,hit_h
-        type_id_norm = block[:, :, 10]              # (B, 64) in [0, 1]
+        present = block[:, :, 0]
+        type_id_norm = block[:, :, 7]
 
         # Decode type_id from normalised float back to integer index
         type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)
-        type_emb = self.type_embedding(type_id_int)  # (B, 64, 16)
+        type_emb = self.type_embedding(type_id_int)
 
         # Derive boolean flags from type_id
-        is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)       # (B, 64, 1)
-        is_dangerous = (type_id_int != UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)   # (B, 64, 1)
+        is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)
+        is_dangerous = (type_id_int != UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)
 
-        # Reorder raw features to: dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
-        dx = raw_feats[:, :, 0:1]           # (B, 64, 1)
-        dy = raw_feats[:, :, 1:2]
-        dist = raw_feats[:, :, 2:3]
-        vx = raw_feats[:, :, 3:4]
-        vy = raw_feats[:, :, 4:5]
-        threat = raw_feats[:, :, 5:6]
-        approach = raw_feats[:, :, 6:7]
-        hit_w = raw_feats[:, :, 7:8]
-        hit_h = raw_feats[:, :, 8:9]
+        dx = block[:, :, 1:2]
+        dy = block[:, :, 2:3]
+        vx = block[:, :, 3:4]
+        vy = block[:, :, 4:5]
+        dist = block[:, :, 5:6]
+        threat = block[:, :, 6:7]
 
-        tokens = torch.cat(
-            [dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h, type_emb, is_human, is_dangerous],
-            dim=2,
-        )  # (B, 64, 27)
+        tokens = torch.cat([dx, dy, vx, vy, dist, threat, type_emb, is_human, is_dangerous], dim=2)
 
         mask = present < 0.5
         return tokens, mask
@@ -2515,20 +2531,25 @@ class RainbowNet(nn.Module):
         B = state.shape[0]
         frame_off = self._frame_offsets(state)[-1]
 
-        # Single unified category
+        # Compact roster category
         _name, base, slots, _cat_id = self._cat_info[0]
-        block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
-        block = block.reshape(B, slots, self.slot_state_features)  # (B, 64, 11)
+        block = state[:, frame_off + base: frame_off + base + slots * self.slot_state_features]
+        block = block.reshape(B, slots, self.slot_state_features)
 
-        present = block[:, :, 0] > 0.5       # (B, 64) bool
+        present = block[:, :, 0] > 0.5
         dx = block[:, :, 1]
         dy = block[:, :, 2]
-        dist = block[:, :, 3]
-        vx = block[:, :, 4]
-        vy = block[:, :, 5]
+        vx = block[:, :, 3]
+        vy = block[:, :, 4]
+        dist = block[:, :, 5]
         threat = block[:, :, 6]
-        approach = block[:, :, 7]
-        type_id_norm = block[:, :, 10]
+        type_id_norm = block[:, :, 7]
+        world_dx = dx * _REL_POS_X_RANGE
+        world_dy = dy * _REL_POS_Y_RANGE
+        world_dist = torch.sqrt(torch.clamp((world_dx * world_dx) + (world_dy * world_dy), min=1e-12))
+        dir_x = world_dx / world_dist
+        dir_y = world_dy / world_dist
+        approach = -((vx * dir_x) + (vy * dir_y))
 
         # Decode type_id from normalised float
         type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)

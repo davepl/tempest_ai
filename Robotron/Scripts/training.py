@@ -86,17 +86,16 @@ def _latest_frame_danger(states_t: torch.Tensor) -> torch.Tensor:
         return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
 
     latest = states_t[:, -base_state_size:]
-    slot_offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + category_count)
+    slot_offset = int(getattr(RL_CONFIG, "global_feature_count", LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES))
     slot_width = total_slots * slot_features
-    if latest.shape[1] < (slot_offset + slot_width):
+    if latest.shape[1] < (slot_offset + slot_width) or slot_features < 8:
         return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
 
     slots = latest[:, slot_offset:slot_offset + slot_width].reshape(batch, total_slots, slot_features)
     present = slots[:, :, 0] > 0.5
-    dist = slots[:, :, 3].clamp(min=0.0, max=2.0)
+    dist = slots[:, :, 5].clamp(min=0.0, max=2.0)
     threat = slots[:, :, 6].clamp(min=0.0, max=1.0)
-    approach = slots[:, :, 7].clamp(min=-1.0, max=1.0)
-    type_norm = slots[:, :, 10].clamp(min=0.0, max=1.0)
+    type_norm = slots[:, :, 7].clamp(min=0.0, max=1.0)
     type_idx = torch.round(type_norm * float(max(1, UNIFIED_NUM_TYPES - 1))).long()
     type_idx = type_idx.clamp(0, max(0, UNIFIED_NUM_TYPES - 1))
 
@@ -106,15 +105,16 @@ def _latest_frame_danger(states_t: torch.Tensor) -> torch.Tensor:
     danger_mask = present & (~is_human)
 
     closeness = (1.0 - dist).clamp(min=0.0, max=1.0)
-    approach_score = approach.clamp(min=0.0, max=1.0)
-    danger_score = (0.45 * closeness) + (0.40 * threat) + (0.15 * approach_score)
+    danger_score = (0.55 * closeness) + (0.45 * threat)
     danger_score = danger_score + (0.25 * is_projectile.float() * closeness)
     danger_score = danger_score + (0.20 * is_electrode.float() * closeness)
     danger_score = torch.where(danger_mask, danger_score, torch.zeros_like(danger_score))
 
     max_score = danger_score.max(dim=1).values
     nearby_count = (danger_mask & (closeness > 0.35)).float().sum(dim=1).clamp(max=3.0) / 3.0
-    return (max_score + (0.25 * nearby_count)).clamp(min=0.0, max=1.5)
+    projectile_pressure = latest[:, 23] if latest.shape[1] > 23 else torch.zeros_like(max_score)
+    crowding = latest[:, 22] if latest.shape[1] > 22 else torch.zeros_like(max_score)
+    return (max_score + (0.20 * nearby_count) + (0.20 * projectile_pressure) + (0.15 * crowding)).clamp(min=0.0, max=1.5)
 
 
 def train_step(agent, prefetched_batch=None) -> float | None:

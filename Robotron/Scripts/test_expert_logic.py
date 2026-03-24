@@ -8,12 +8,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aimodel import (  # noqa: E402
-    LEGACY_CORE_FEATURES,
-    LEGACY_ELIST_FEATURES,
     RL_CONFIG,
     UNIFIED_TYPE_NAMES,
     UNIFIED_NUM_TYPES,
-    UNIFIED_HUMAN_TYPE_ID,
     _POS_MAX_DIAG,
     _REL_POS_X_RANGE,
     _REL_POS_Y_RANGE,
@@ -35,38 +32,17 @@ _TYPE_BOX_PX = {
     "human": (5.0, 13.0),
     "electrode": (6.0, 6.0),
 }
-
-def _category_offsets():
-    return {name: idx for idx, (name, _slots) in enumerate(RL_CONFIG.entity_categories)}
-
-
-_OFFSETS = _category_offsets()
 _GLOBAL = int(getattr(RL_CONFIG, "global_feature_count", 98))
-_GRID = int(getattr(RL_CONFIG, "grid_width", 12)) * int(getattr(RL_CONFIG, "grid_height", 12)) * int(getattr(RL_CONFIG, "grid_channels", 8))
-_TOKEN_COUNT = int(getattr(RL_CONFIG, "object_token_count", 64))
-_TOKEN_FEATURES = int(getattr(RL_CONFIG, "object_token_features", 15))
-_HYBRID_BASE = _GLOBAL + _GRID + (_TOKEN_COUNT * _TOKEN_FEATURES)
 _LEGACY_SLOT_FEATURES = int(getattr(RL_CONFIG, "slot_state_features", 11))
-
-
-def _legacy_category_bases() -> dict[str, int]:
-    bases = {}
-    offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES)
-    for name, slots in getattr(RL_CONFIG, "entity_categories", ()):
-        bases[name] = offset
-        offset += 1 + (int(slots) * _LEGACY_SLOT_FEATURES)
-    return bases
-
-
-_LEGACY_BASES = _legacy_category_bases()
-_LEGACY_SLOTS = {name: int(slots) for name, slots in getattr(RL_CONFIG, "entity_categories", ())}
+_SLOT_COUNT = int(getattr(RL_CONFIG, "object_slots", 24))
+_SLOT_BASE = _GLOBAL
 
 
 def _blank_state() -> np.ndarray:
     state = np.zeros(int(RL_CONFIG.base_state_size), dtype=np.float32)
     state[0] = 1.0
-    state[5] = 0.5
-    state[6] = 0.5
+    state[3] = 0.5
+    state[4] = 0.5
     return state
 
 
@@ -80,47 +56,26 @@ def _add_entity(
     dx_world = float(dx_px) * 256.0
     dy_world = float(dy_px) * 256.0
     dist_world = math.hypot(dx_world, dy_world)
-    if int(RL_CONFIG.base_state_size) >= _HYBRID_BASE:
-        assert 0 <= slot_index < _TOKEN_COUNT
-        token_base = _GLOBAL + _GRID + slot_index * _TOKEN_FEATURES
-        type_id = _TYPE_ID[category]
-        type_id_norm = type_id / max(1, UNIFIED_NUM_TYPES - 1)
-
-        state[token_base + 0] = 1.0
-        state[token_base + 1] = dx_world / _REL_POS_X_RANGE
-        state[token_base + 2] = dy_world / _REL_POS_Y_RANGE
-        state[token_base + 5] = dist_world / _POS_MAX_DIAG
-        if dist_world > 1.0:
-            state[token_base + 6] = dx_world / dist_world
-            state[token_base + 7] = dy_world / dist_world
-        state[token_base + 8] = max(0.0, min(1.0, 1.0 - state[token_base + 5]))
-        state[token_base + 9] = 0.5
-        state[token_base + 10] = 0.5
-        state[token_base + 11] = type_id_norm
-        state[token_base + 12] = 1.0 if category == "human" else 0.0
-        state[token_base + 13] = 0.0 if category == "human" else 1.0
+    if category == "human":
+        state[10] = dist_world / _POS_MAX_DIAG
+        state[11] = dx_world / _REL_POS_X_RANGE
+        state[12] = dy_world / _REL_POS_Y_RANGE
+        state[13] = max(state[13], 1.0 / 16.0)
+        state[26] = max(state[26], max(0.0, min(1.0, 1.0 - state[10])))
         return
 
-    # Unified pool: all entities share the single "entity" block
-    entity_base = _LEGACY_BASES["entity"]
-    total_slots = _LEGACY_SLOTS["entity"]
-    assert 0 <= slot_index < total_slots, f"slot_index={slot_index} >= {total_slots}"
-    state[entity_base] = 1.0  # occupancy flag
-    slot_base = entity_base + 1 + slot_index * _LEGACY_SLOT_FEATURES
+    assert 0 <= slot_index < _SLOT_COUNT, f"slot_index={slot_index} >= {_SLOT_COUNT}"
+    slot_base = _SLOT_BASE + slot_index * _LEGACY_SLOT_FEATURES
     type_id = _TYPE_ID[category]
     type_id_norm = type_id / max(1, UNIFIED_NUM_TYPES - 1)
-    box_w_px, box_h_px = _TYPE_BOX_PX[category]
-    state[slot_base + 0] = 1.0                          # present
-    state[slot_base + 1] = dx_world / _REL_POS_X_RANGE  # dx
-    state[slot_base + 2] = dy_world / _REL_POS_Y_RANGE  # dy
-    state[slot_base + 3] = dist_world / _POS_MAX_DIAG   # dist
-    state[slot_base + 4] = 0.0                           # vx
-    state[slot_base + 5] = 0.0                           # vy
-    state[slot_base + 6] = 0.0                           # threat
-    state[slot_base + 7] = 0.0                           # approach
-    state[slot_base + 8] = box_w_px / 16.0               # hit_w (normalised pixels)
-    state[slot_base + 9] = box_h_px / 16.0               # hit_h (normalised pixels)
-    state[slot_base + 10] = type_id_norm                 # type_id (normalised)
+    state[slot_base + 0] = 1.0
+    state[slot_base + 1] = dx_world / _REL_POS_X_RANGE
+    state[slot_base + 2] = dy_world / _REL_POS_Y_RANGE
+    state[slot_base + 3] = 0.0
+    state[slot_base + 4] = 0.0
+    state[slot_base + 5] = dist_world / _POS_MAX_DIAG
+    state[slot_base + 6] = max(0.0, min(1.0, 1.0 - state[slot_base + 5]))
+    state[slot_base + 7] = type_id_norm
 
 
 def test_aligned_fire_keeps_human_rescue_movement():

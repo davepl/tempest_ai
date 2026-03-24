@@ -119,14 +119,18 @@ def _parse_webrtc_ice_servers_env() -> list[dict]:
 # Dashboard WebRTC ICE server list (TURN/STUN). Env override takes precedence.
 WEBRTC_ICE_SERVERS = _parse_webrtc_ice_servers_env()
 
-LEGACY_ENTITY_CATEGORIES: tuple[tuple[str, int], ...] = (
-    ("entity", 64),
-)
-LEGACY_SLOT_STATE_FEATURES = 11
-LEGACY_ELIST_FEATURES = 22
-LEGACY_CORE_FEATURES = 18
-LEGACY_TOTAL_SLOTS = sum(int(slots) for _name, slots in LEGACY_ENTITY_CATEGORIES)
-LEGACY_PARAMS_COUNT = LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + len(LEGACY_ENTITY_CATEGORIES) + (LEGACY_TOTAL_SLOTS * LEGACY_SLOT_STATE_FEATURES)
+COMPACT_GLOBAL_FEATURES = 28
+COMPACT_SLOT_STATE_FEATURES = 8
+COMPACT_SLOT_COUNT = 24
+COMPACT_PARAMS_COUNT = COMPACT_GLOBAL_FEATURES + (COMPACT_SLOT_COUNT * COMPACT_SLOT_STATE_FEATURES)
+
+# Backward-compatible aliases used throughout the Python stack.
+LEGACY_ENTITY_CATEGORIES: tuple[tuple[str, int], ...] = (("entity", COMPACT_SLOT_COUNT),)
+LEGACY_SLOT_STATE_FEATURES = COMPACT_SLOT_STATE_FEATURES
+LEGACY_ELIST_FEATURES = 0
+LEGACY_CORE_FEATURES = COMPACT_GLOBAL_FEATURES
+LEGACY_TOTAL_SLOTS = COMPACT_SLOT_COUNT
+LEGACY_PARAMS_COUNT = COMPACT_PARAMS_COUNT
 
 # Type ID mapping for the unified entity pool (matches Lua UNIFIED_TYPE_ID).
 UNIFIED_TYPE_NAMES = ("grunt", "hulk", "brain", "tank", "spawner", "enforcer", "projectile", "human", "electrode")
@@ -146,21 +150,20 @@ class ServerConfigData:
     shard_workers: int = 4
     shard_worker_port_base: int = 0   # 0 => auto (port + 1)
     shard_preview_slot: int = 0
-    # State layout:
-    #   5 core (alive, score, replay, lasers, wave)
-    #   + 2 player position
-    #   + 2 player velocity
-    #   + nearest enemy distance
-    #   + nearest human distance
-    #   + nearest enemy relative vector (dx, dy)
-    #   + exact num_humans (normalized count)
-    #   + nearest spheroid distance
-    #   + nearest spheroid relative vector (dx, dy)
-    #   + exact spawner count (normalized count)
-    #   + 22 ELIST bytes (speeds, timers, counts; padding trimmed)
-    #   + 1 unified entity pool: 1 occupancy + 64 slots × 11 features
-    #     (present, dx, dy, dist, vx, vy, threat, approach, hit_w, hit_h, type_id)
-    #   = 745 floats total
+    # Compact Robotron state layout:
+    #   28 global features
+    #     alive, wave, lasers,
+    #     player position/velocity,
+    #     nearest distances by class,
+    #     nearest human vector + human count,
+    #     4-way directional threat,
+    #     4-way directional openness,
+    #     crowding, projectile pressure,
+    #     escape vector,
+    #     rescue opportunity, safe-fire opportunity
+    #   + 24 salient object slots × 8 features
+    #     (present, dx, dy, vx, vy, dist, threat, type_id)
+    #   = 220 floats total
     params_count: int = LEGACY_PARAMS_COUNT
 
 SERVER_CONFIG = ServerConfigData()
@@ -171,7 +174,7 @@ class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
     # Base per-frame state from Lua wire protocol.
     base_state_size: int = SERVER_CONFIG.params_count
-    # Structured slot encoder: use 2 stacked frames by default.
+    # Compact slot encoder: use 2 stacked frames by default.
     frame_stack: int = 2
     # Effective model input width after stacking.
     state_size: int = SERVER_CONFIG.params_count * 2
@@ -194,49 +197,40 @@ class RLConfigData:
         return self.num_move_actions * self.num_fire_actions
 
     # ── observation layout / network architecture ──────────────────────
-    # These hybrid-shape fields are retained so expert/test tooling can still
-    # understand the newer 2212-float format when synthetic states use it.
-    global_feature_count: int = 100
-    grid_width: int = 12
-    grid_height: int = 12
-    grid_channels: int = 8
-    object_token_count: int = 64
-    # Token features:
-    #   present, dx, dy, vx, vy, dist, dir_x, dir_y, threat,
-    #   size_x, size_y, category_norm, is_human, is_dangerous, approach
-    object_token_features: int = 15
+    global_feature_count: int = COMPACT_GLOBAL_FEATURES
+    grid_width: int = 0
+    grid_height: int = 0
+    grid_channels: int = 0
+    object_token_count: int = COMPACT_SLOT_COUNT
+    object_token_features: int = COMPACT_SLOT_STATE_FEATURES
 
     # MLP trunk over the full stacked flat state. When mlp_with_attention is
     # enabled, a parallel object-set branch is fused in before the C51 head.
     pure_mlp: bool = True
     mlp_with_attention: bool = True
-    mlp_hidden_layers: list = field(default_factory=lambda: [384])
-    mlp_output_dim: int = 256
+    mlp_hidden_layers: list = field(default_factory=lambda: [256, 256])
+    mlp_output_dim: int = 192
     trunk_hidden: int = 256
     trunk_layers: int = 2
     use_layer_norm: bool = True
     dropout: float = 0.0
 
-    # Directional lane encoder: bin entities into 8 angular wedges matching
-    # fire/move directions, then cross-attend lanes to entity tokens.
-    # Replaces the EntitySetEncoder when enabled under pure_mlp + mlp_with_attention.
-    use_directional_lanes: bool = True
+    # Compact roster uses token attention only; directional summaries are
+    # emitted directly in the global feature block instead of lane tokens.
+    use_directional_lanes: bool = False
 
-    # Structured learner: compact slot encoding over typed entity buckets.
+    # Structured learner: compact salience roster over typed enemy slots.
     use_enemy_attention: bool = True
     entity_categories: list = field(default_factory=lambda: list(LEGACY_ENTITY_CATEGORIES))
     object_slots: int = LEGACY_TOTAL_SLOTS
     slot_state_features: int = LEGACY_SLOT_STATE_FEATURES
-    # Per-object set-encoder features for the compact legacy slot state:
-    #   dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h,
-    #   type_emb(16dim), is_human, is_dangerous
-    legacy_slot_token_features: int = 27
+    # Compact slot token: dx, dy, vx, vy, dist, threat, type_emb(16), is_human, is_dangerous
+    legacy_slot_token_features: int = 24
     # Learned type embedding dimension for unified pool.
     type_embedding_dim: int = 16
-    # Entity self-attention: let entities see each other before lane cross-attention.
-    entity_self_attn_layers: int = 2
+    entity_self_attn_layers: int = 1
     attn_heads: int = 4
-    attn_dim: int = 256
+    attn_dim: int = 128
     attn_layers: int = 1
     # False = attention only on the most recent frame; the flat MLP still sees
     # all stacked frames. This keeps the attention branch focused on "what
@@ -244,10 +238,10 @@ class RLConfigData:
     # Changing this alters the entity_proj input width, so it is an
     # architecture change and requires a fresh checkpoint.
     attn_all_frames: bool = False
-    grid_hidden_channels: int = 32
+    grid_hidden_channels: int = 0
     global_hidden: int = 128
     category_summary_dim: int = 48
-    entity_hidden: int = 192
+    entity_hidden: int = 128
 
     # Distributional C51
     # Robotron per-frame rewards: grunt=100, brain=500, human rescue=1000-5000.

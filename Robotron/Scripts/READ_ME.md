@@ -95,5 +95,18 @@ If unset or invalid, dashboard uses built-in ICE defaults from
   - Start button
   - Coin insert
 - Deeper Robotron feature extraction beyond PLDATA/ELIST mirror bytes.
+- Add an escape vector derived from local threat density so the agent/player can bias movement toward lower-pressure space instead of using a naive enemy centroid.
+- Replace large per-frame enemy tables with a smaller persistent active roster chosen by salience, e.g. nearest/most important non-hulks, hulks, and electrodes, while preserving slot identity with hysteresis to avoid roster churn.
+- Move toward a more Tempest-like compact state: roughly 24 salient object slots with about 8 attributes each, plus a small global summary block (player state, nearest-class distances, 4-way directional threat/openness, crowding/projectile pressure, and escape vector) instead of heavier lane/set/grid representations.
+- Update the frame extractor/state schema to emit the compact global frame block explicitly: alive, wave, laser count, optional score/score delta, player position/velocity, nearest distances by class (enemy/hulk/electrode/human), 4-way threat, 4-way openness, crowding score, local projectile pressure, and escape vector.
+- Add the selection/scoring code needed to support that compact state efficiently: salience scoring for object promotion, hysteresis/stickiness for stable slot identity, and cheap per-frame aggregation for directional threat/openness and escape-pressure summaries without lane/set layers.
+- Stack `N` compact frames for temporal context, with `N=2` initially, and/or add short-horizon deltas where needed so the policy can infer motion and pressure changes without a large spatial history.
+- Include a small action/history context block if needed for stability, such as previous move direction, previous fire direction, recent damage/death indicator, and recent rescue indicator.
+- Add at least one compact opportunity signal alongside danger signals, e.g. human rescue opportunity and/or safe-fire opportunity, so the policy does not collapse into pure evasion.
+- Normalize the compact state consistently across all fields and wave conditions so type, threat, distance, and pressure features stay stationary enough for learning.
+- Build debug visualization for the compact representation: tracked roster slots, per-slot salience, directional threat/openness summaries, and the escape vector, so state extraction can be validated against live gameplay.
+- Add ablation/config hooks to toggle major compact-state components independently, including the active roster, escape vector, directional summaries, projectile pressure, opportunity signals, and frame-stack depth.
+- Add replay/frame inspection tooling to dump selected slots, top rejected candidates, global summary values, and chosen actions for failure analysis on dense waves.
+- Evaluate and tune the compact system specifically on late-wave/high-density scenes so off-roster enemy mass and slot-churn failures are caught early.
 
 The script now uses real RAM extraction for `PlayerAlive`, PLDATA fields, and enemy-state bag bytes.

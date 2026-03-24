@@ -263,22 +263,13 @@ for idx, cat in ipairs(ENTITY_CATEGORIES) do
     ENTITY_CATEGORY_INDEX[cat.name] = idx - 1
 end
 
-OBJECT_TOKEN_LIMIT = 64
-OBJECT_TOKEN_FEATURES = 15
-GRID_W = 12
-GRID_H = 12
-GRID_CHANNELS = 8
-GRID_HALF_RANGE_X = 12288.0   -- +/-48 px in x16 units
-GRID_HALF_RANGE_Y = 12288.0   -- +/-48 px in x16 units
-GLOBAL_FEATURES = 100
-GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
-TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
-LEGACY_SLOT_STATE_FEATURES = 11
-LEGACY_CORE_FEATURES = 18
-UNIFIED_POOL_SLOTS = 64
--- Unified pool: 1 occupancy float + 64 slots × 11 features = 705
-LEGACY_ENTITY_TOTAL_FEATURES = 1 + (UNIFIED_POOL_SLOTS * LEGACY_SLOT_STATE_FEATURES)
-EXPECTED_STATE_VALUES = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + LEGACY_ENTITY_TOTAL_FEATURES
+COMPACT_GLOBAL_FEATURES = 28
+COMPACT_SLOT_STATE_FEATURES = 8
+COMPACT_NON_HULK_SLOTS = 16
+COMPACT_HULK_SLOTS = 4
+COMPACT_ELECTRODE_SLOTS = 4
+COMPACT_TOTAL_SLOTS = COMPACT_NON_HULK_SLOTS + COMPACT_HULK_SLOTS + COMPACT_ELECTRODE_SLOTS
+EXPECTED_STATE_VALUES = COMPACT_GLOBAL_FEATURES + (COMPACT_TOTAL_SLOTS * COMPACT_SLOT_STATE_FEATURES)
 
 -- Type ID mapping for unified pool (0-8, normalized by /8.0 in emission)
 UNIFIED_TYPE_ID = {
@@ -317,29 +308,30 @@ local CATEGORY_IS_STATIC = {
 
 local prev_object_sample_x = {}
 local prev_object_sample_y = {}
-local prev_category_slot_ptrs = {}
+local prev_compact_slot_ptrs = {
+    non_hulk = {},
+    hulk = {},
+    electrode = {},
+}
 
-local prev_unified_slot_ptrs = {}
-for i = 1, UNIFIED_POOL_SLOTS do
-    prev_unified_slot_ptrs[i] = 0
+local function _reset_compact_slot_assignments()
+    prev_compact_slot_ptrs = {
+        non_hulk = {},
+        hulk = {},
+        electrode = {},
+    }
+    for i = 1, COMPACT_NON_HULK_SLOTS do
+        prev_compact_slot_ptrs.non_hulk[i] = 0
+    end
+    for i = 1, COMPACT_HULK_SLOTS do
+        prev_compact_slot_ptrs.hulk[i] = 0
+    end
+    for i = 1, COMPACT_ELECTRODE_SLOTS do
+        prev_compact_slot_ptrs.electrode[i] = 0
+    end
 end
 
-local function _reset_legacy_slot_assignments()
-    prev_category_slot_ptrs = {}
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        local slots = {}
-        for i = 1, cat.slots do
-            slots[i] = 0
-        end
-        prev_category_slot_ptrs[cat.name] = slots
-    end
-    prev_unified_slot_ptrs = {}
-    for i = 1, UNIFIED_POOL_SLOTS do
-        prev_unified_slot_ptrs[i] = 0
-    end
-end
-
-_reset_legacy_slot_assignments()
+_reset_compact_slot_assignments()
 
 local function _stable_assign_bucket_slots(cat_name, bucket, slot_count)
     local assigned = {}
@@ -1370,11 +1362,107 @@ local function _object_threat_score(obj)
     return clamp01(base * (0.55 + 0.45 * proximity) + (0.25 * approach))
 end
 
-local function extract_world_features(memory, player_x16, player_y16, enemy_state)
-    -- Walk object lists, classify entities, compute per-object motion, and emit
-    -- the compact legacy slot state consumed by the current Python model.
-    -- The older rich globals/grid/token observation is no longer serialized, so
-    -- rebuilding it every frame just burns Lua time on crowded waves.
+local function _salience_score(obj, roster_name)
+    local threat = clamp01(tonumber(obj.threat) or 0.0)
+    local proximity = clamp01(1.0 - (tonumber(obj.dist_norm) or 1.0))
+    local approach = clamp01(((tonumber(obj.approach) or 0.0) + 1.0) * 0.5)
+    local score = (0.55 * threat) + (0.30 * proximity) + (0.15 * approach)
+    if roster_name == "non_hulk" then
+        if obj.category == "projectile" then
+            score = score + 0.28
+        elseif obj.category == "brain" then
+            score = score + 0.18
+        elseif obj.category == "tank" or obj.category == "spawner" or obj.category == "enforcer" then
+            score = score + 0.12
+        end
+    elseif roster_name == "hulk" then
+        score = score + 0.22
+    elseif roster_name == "electrode" then
+        score = score + 0.10
+    end
+    return score
+end
+
+local function _assign_persistent_roster(bucket, prev_slots, slot_count, roster_name)
+    local sorted = {}
+    local by_ptr = {}
+    for i = 1, #bucket do
+        local obj = bucket[i]
+        obj._salience = _salience_score(obj, roster_name)
+        sorted[#sorted + 1] = obj
+        by_ptr[obj.ptr] = obj
+    end
+    table.sort(sorted, function(a, b)
+        local sa = tonumber(a._salience) or 0.0
+        local sb = tonumber(b._salience) or 0.0
+        if sa == sb then
+            return (tonumber(a.dist_norm) or 1.0) < (tonumber(b.dist_norm) or 1.0)
+        end
+        return sa > sb
+    end)
+
+    local keep_threshold = 0.18
+    local assigned = {}
+    local used = {}
+    local next_slots = {}
+
+    for slot_idx = 1, slot_count do
+        local prev_ptr = prev_slots[slot_idx] or 0
+        local obj = by_ptr[prev_ptr]
+        if obj ~= nil and (tonumber(obj._salience) or 0.0) >= keep_threshold then
+            assigned[slot_idx] = obj
+            used[prev_ptr] = true
+        end
+    end
+
+    local cursor = 1
+    for slot_idx = 1, slot_count do
+        if assigned[slot_idx] == nil then
+            while cursor <= #sorted do
+                local obj = sorted[cursor]
+                cursor = cursor + 1
+                if obj ~= nil and not used[obj.ptr] then
+                    assigned[slot_idx] = obj
+                    used[obj.ptr] = true
+                    break
+                end
+            end
+        end
+        next_slots[slot_idx] = assigned[slot_idx] and assigned[slot_idx].ptr or 0
+    end
+
+    return assigned, next_slots
+end
+
+local function _pressure_to_unit(v)
+    local x = math.max(0.0, tonumber(v) or 0.0)
+    return clamp01(x / (x + 1.25))
+end
+
+local function _emit_compact_slot_features(out, slots)
+    local type_denom = math.max(1, UNIFIED_NUM_TYPES - 1)
+    for i = 1, #slots do
+        local obj = slots[i]
+        if obj ~= nil then
+            out[#out + 1] = 1.0
+            out[#out + 1] = clamp11(obj.dx or 0.0)
+            out[#out + 1] = clamp11(obj.dy or 0.0)
+            out[#out + 1] = clamp11(obj.vx or 0.0)
+            out[#out + 1] = clamp11(obj.vy or 0.0)
+            out[#out + 1] = clamp01(obj.dist_norm or 1.0)
+            out[#out + 1] = clamp01(obj.threat or 0.0)
+            out[#out + 1] = (UNIFIED_TYPE_ID[obj.category] or 0) / type_denom
+        else
+            for _ = 1, COMPACT_SLOT_STATE_FEATURES do
+                out[#out + 1] = 0.0
+            end
+        end
+    end
+end
+
+local function extract_world_features(memory, player_x16, player_y16, _enemy_state)
+    -- Walk live objects, score a persistent 24-slot salient roster, and emit a
+    -- compact per-frame summary block for the Python learner.
 
     local player_pict_ptr = read_u16_be(memory, PLOBJ_ADDR + OPICT_OFF)
     local player_hit_off_x, player_hit_off_y, player_hit_w, player_hit_h = picture_collision_bounds(memory, player_pict_ptr)
@@ -1490,11 +1578,12 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     local object_count = 0
     local nearest_enemy_dist = nil
     local nearest_human_dist = nil
-    local nearest_spawner_dist = nil
+    local nearest_hulk_dist = nil
+    local nearest_electrode_dist = nil
     local nearest_enemy_x16 = nil
     local nearest_enemy_y16 = nil
-    local nearest_spawner_x16 = nil
-    local nearest_spawner_y16 = nil
+    local nearest_human_x16 = nil
+    local nearest_human_y16 = nil
     for _, cat in ipairs(ENTITY_CATEGORIES) do
         buckets[cat.name] = {}
         counts[cat.name] = 0
@@ -1503,6 +1592,8 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     local dangerous_bucket = {}
     local human_bucket = buckets["human"]
     local electrode_bucket = buckets["electrode"]
+    local non_hulk_bucket = {}
+    local hulk_bucket = buckets["hulk"]
     local current_sample_x = {}
     local current_sample_y = {}
     for _, obj in ipairs(all_objects) do
@@ -1540,6 +1631,11 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             if obj.category ~= "human" and obj.category ~= "electrode" then
                 dangerous_bucket[#dangerous_bucket + 1] = obj
             end
+            if obj.category == "hulk" then
+                hulk_bucket[#hulk_bucket + 1] = obj
+            elseif obj.category ~= "human" and obj.category ~= "electrode" then
+                non_hulk_bucket[#non_hulk_bucket + 1] = obj
+            end
             object_count = object_count + 1
             if hud_enabled then
                 classified_objects[#classified_objects + 1] = obj
@@ -1548,17 +1644,21 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             if obj.category == "human" then
                 if nearest_human_dist == nil or obj.dist_norm < nearest_human_dist then
                     nearest_human_dist = obj.dist_norm
+                    nearest_human_x16 = obj.x16
+                    nearest_human_y16 = obj.y16
                 end
-            elseif obj.category == "spawner" then
-                if nearest_spawner_dist == nil or obj.dist_norm < nearest_spawner_dist then
-                    nearest_spawner_dist = obj.dist_norm
-                    nearest_spawner_x16 = obj.x16
-                    nearest_spawner_y16 = obj.y16
+            elseif obj.category == "hulk" then
+                if nearest_hulk_dist == nil or obj.dist_norm < nearest_hulk_dist then
+                    nearest_hulk_dist = obj.dist_norm
                 end
                 if nearest_enemy_dist == nil or obj.dist_norm < nearest_enemy_dist then
                     nearest_enemy_dist = obj.dist_norm
                     nearest_enemy_x16 = obj.x16
                     nearest_enemy_y16 = obj.y16
+                end
+            elseif obj.category == "electrode" then
+                if nearest_electrode_dist == nil or obj.dist_norm < nearest_electrode_dist then
+                    nearest_electrode_dist = obj.dist_norm
                 end
             elseif CATEGORY_IS_DANGEROUS[obj.category] then
                 if nearest_enemy_dist == nil or obj.dist_norm < nearest_enemy_dist then
@@ -1573,8 +1673,27 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     prev_object_sample_x = current_sample_x
     prev_object_sample_y = current_sample_y
 
-    -- ── Unified pool: stable-assign tiered entity buckets into 64 slots ──
-    local unified_assigned, unified_count = _stable_assign_unified_pool(dangerous_bucket, human_bucket, electrode_bucket)
+    local non_hulk_slots, next_non_hulk = _assign_persistent_roster(
+        non_hulk_bucket,
+        prev_compact_slot_ptrs.non_hulk,
+        COMPACT_NON_HULK_SLOTS,
+        "non_hulk"
+    )
+    local hulk_slots, next_hulk = _assign_persistent_roster(
+        hulk_bucket,
+        prev_compact_slot_ptrs.hulk,
+        COMPACT_HULK_SLOTS,
+        "hulk"
+    )
+    local electrode_slots, next_electrode = _assign_persistent_roster(
+        electrode_bucket,
+        prev_compact_slot_ptrs.electrode,
+        COMPACT_ELECTRODE_SLOTS,
+        "electrode"
+    )
+    prev_compact_slot_ptrs.non_hulk = next_non_hulk
+    prev_compact_slot_ptrs.hulk = next_hulk
+    prev_compact_slot_ptrs.electrode = next_electrode
 
     if hud_enabled then
         for _, cat in ipairs(ENTITY_CATEGORIES) do
@@ -1600,34 +1719,128 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         hud_objects = nil
     end
 
-    -- ── Emit unified pool: 1 occupancy + 64 slots × 11 features ──
-    local legacy_list_features = {}
-    local type_denom = math.max(1, UNIFIED_NUM_TYPES - 1)
-    legacy_list_features[#legacy_list_features + 1] = math.min(1.0, unified_count / UNIFIED_POOL_SLOTS)
-    for i = 1, UNIFIED_POOL_SLOTS do
-        local obj = unified_assigned[i]
-        if obj then
-            local type_id = UNIFIED_TYPE_ID[obj.category] or 0
-            legacy_list_features[#legacy_list_features + 1] = 1.0
-            legacy_list_features[#legacy_list_features + 1] = obj.dx
-            legacy_list_features[#legacy_list_features + 1] = obj.dy
-            legacy_list_features[#legacy_list_features + 1] = obj.dist_norm
-            legacy_list_features[#legacy_list_features + 1] = obj.vx or 0.0
-            legacy_list_features[#legacy_list_features + 1] = obj.vy or 0.0
-            legacy_list_features[#legacy_list_features + 1] = obj.threat or 0.0
-            legacy_list_features[#legacy_list_features + 1] = obj.approach or 0.0
-            legacy_list_features[#legacy_list_features + 1] = clamp01((tonumber(obj.hit_w) or 1.0) / 16.0)
-            legacy_list_features[#legacy_list_features + 1] = clamp01((tonumber(obj.hit_h) or 1.0) / 16.0)
-            legacy_list_features[#legacy_list_features + 1] = type_id / type_denom
-        else
-            for _ = 1, LEGACY_SLOT_STATE_FEATURES do
-                legacy_list_features[#legacy_list_features + 1] = 0.0
-            end
+    local threat_left = 0.0
+    local threat_right = 0.0
+    local threat_up = 0.0
+    local threat_down = 0.0
+    local crowding_score = 0.0
+    local projectile_pressure = 0.0
+    local escape_x = 0.0
+    local escape_y = 0.0
+    local safe_fire_opportunity = 0.0
+
+    for _, obj in ipairs(dangerous_bucket) do
+        local dir_x = tonumber(obj.dir_x) or 0.0
+        local dir_y = tonumber(obj.dir_y) or 0.0
+        local pressure = clamp01((0.45 * (tonumber(obj.threat) or 0.0)) + (0.55 * (1.0 - (tonumber(obj.dist_norm) or 1.0))))
+        threat_left = threat_left + (pressure * math.max(0.0, -dir_x))
+        threat_right = threat_right + (pressure * math.max(0.0, dir_x))
+        threat_up = threat_up + (pressure * math.max(0.0, -dir_y))
+        threat_down = threat_down + (pressure * math.max(0.0, dir_y))
+        crowding_score = crowding_score + pressure
+        escape_x = escape_x - (dir_x * pressure)
+        escape_y = escape_y - (dir_y * pressure)
+        if obj.category == "projectile" then
+            projectile_pressure = projectile_pressure + pressure
         end
+        if obj.category ~= "hulk" then
+            local align = math.max(
+                clamp01(1.0 - (math.abs(obj.dx or 0.0) / 0.12)),
+                clamp01(1.0 - (math.abs(obj.dy or 0.0) / 0.12))
+            )
+            local shot_window = clamp01(((tonumber(obj.dist_norm) or 1.0) - 0.02) / 0.20)
+            safe_fire_opportunity = math.max(
+                safe_fire_opportunity,
+                clamp01(align * shot_window * (1.0 - _pressure_to_unit(projectile_pressure)))
+            )
+        end
+    end
+    for _, obj in ipairs(electrode_bucket) do
+        local dir_x = tonumber(obj.dir_x) or 0.0
+        local dir_y = tonumber(obj.dir_y) or 0.0
+        local pressure = clamp01((0.35 * (tonumber(obj.threat) or 0.0)) + (0.65 * (1.0 - (tonumber(obj.dist_norm) or 1.0))))
+        threat_left = threat_left + (pressure * math.max(0.0, -dir_x))
+        threat_right = threat_right + (pressure * math.max(0.0, dir_x))
+        threat_up = threat_up + (pressure * math.max(0.0, -dir_y))
+        threat_down = threat_down + (pressure * math.max(0.0, dir_y))
+        crowding_score = crowding_score + (pressure * 0.65)
+        escape_x = escape_x - (dir_x * pressure)
+        escape_y = escape_y - (dir_y * pressure)
+    end
+
+    local threat_left_n = _pressure_to_unit(threat_left)
+    local threat_right_n = _pressure_to_unit(threat_right)
+    local threat_up_n = _pressure_to_unit(threat_up)
+    local threat_down_n = _pressure_to_unit(threat_down)
+
+    local px_norm = norm_pos_x(player_x16 or 0)
+    local py_norm = norm_pos_y(player_y16 or 0)
+    local wall_left = clamp01((WALL_MARGIN_NORM_X - px_norm) / math.max(WALL_MARGIN_NORM_X, 1e-6))
+    local wall_right = clamp01((px_norm - (1.0 - WALL_MARGIN_NORM_X)) / math.max(WALL_MARGIN_NORM_X, 1e-6))
+    local wall_up = clamp01((WALL_MARGIN_NORM_Y - py_norm) / math.max(WALL_MARGIN_NORM_Y, 1e-6))
+    local wall_down = clamp01((py_norm - (1.0 - WALL_MARGIN_NORM_Y)) / math.max(WALL_MARGIN_NORM_Y, 1e-6))
+
+    local open_left = clamp01(1.0 - threat_left_n - (0.65 * wall_left))
+    local open_right = clamp01(1.0 - threat_right_n - (0.65 * wall_right))
+    local open_up = clamp01(1.0 - threat_up_n - (0.65 * wall_up))
+    local open_down = clamp01(1.0 - threat_down_n - (0.65 * wall_down))
+
+    local escape_len = math.sqrt((escape_x * escape_x) + (escape_y * escape_y))
+    if escape_len > 1e-6 then
+        escape_x = clamp11(escape_x / escape_len)
+        escape_y = clamp11(escape_y / escape_len)
+    else
+        escape_x = 0.0
+        escape_y = 0.0
+    end
+
+    local human_count_norm = clamp01((counts["human"] or 0) / 16.0)
+    local rescue_opportunity = 0.0
+    if nearest_human_dist ~= nil then
+        rescue_opportunity = clamp01((1.0 - nearest_human_dist) * (1.0 - _pressure_to_unit(crowding_score)))
+    end
+
+    local state_features = {
+        1.0, -- alive flag overwritten in serialize_frame
+        clamp01((tonumber(previous_wave_number or 0) or 0.0) / 40.0), -- overwritten in serialize_frame
+        0.0, -- lasers overwritten in serialize_frame
+        px_norm,
+        py_norm,
+        0.0, -- vel_x overwritten in serialize_frame
+        0.0, -- vel_y overwritten in serialize_frame
+        clamp01(nearest_enemy_dist or 1.0),
+        clamp01(nearest_hulk_dist or 1.0),
+        clamp01(nearest_electrode_dist or 1.0),
+        clamp01(nearest_human_dist or 1.0),
+        clamp11(rel_pos_x(nearest_human_x16 or player_x16, player_x16)),
+        clamp11(rel_pos_y(nearest_human_y16 or player_y16, player_y16)),
+        human_count_norm,
+        threat_left_n,
+        threat_right_n,
+        threat_up_n,
+        threat_down_n,
+        open_left,
+        open_right,
+        open_up,
+        open_down,
+        _pressure_to_unit(crowding_score),
+        _pressure_to_unit(projectile_pressure),
+        escape_x,
+        escape_y,
+        rescue_opportunity,
+        clamp01(safe_fire_opportunity),
+    }
+
+    local slot_features = {}
+    _emit_compact_slot_features(slot_features, non_hulk_slots)
+    _emit_compact_slot_features(slot_features, hulk_slots)
+    _emit_compact_slot_features(slot_features, electrode_slots)
+
+    for i = 1, #slot_features do
+        state_features[#state_features + 1] = slot_features[i]
     end
 
     local num_humans = counts["human"] or 0
-    local num_spawners = counts["spawner"] or 0
 
     hud_player_x16 = memory:read_u8(PLOBJ_ADDR + OBJX_OFF)
     hud_player_y16 = memory:read_u8(PLOBJ_ADDR + OBJY_OFF)
@@ -1637,16 +1850,14 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         object_count = object_count,
         nearest_enemy_dist = nearest_enemy_dist,
         nearest_human_dist = nearest_human_dist,
-        nearest_spawner_dist = nearest_spawner_dist,
         nearest_enemy_x16 = nearest_enemy_x16,
         nearest_enemy_y16 = nearest_enemy_y16,
-        nearest_spawner_x16 = nearest_spawner_x16,
-        nearest_spawner_y16 = nearest_spawner_y16,
+        nearest_human_x16 = nearest_human_x16,
+        nearest_human_y16 = nearest_human_y16,
         player_center_x16 = player_center_x16,
         player_center_y16 = player_center_y16,
         num_humans = num_humans,
-        num_spawners = num_spawners,
-        legacy_list_features = legacy_list_features,
+        state_features = state_features,
     }
 end
 
@@ -2546,11 +2757,7 @@ function Controls:apply_action(move_dir, fire_dir, start_cmd, coin_cmd)
 end
 
 local function serialize_frame(player_alive, score, replay_level, num_lasers, wave_number,
-                               player_x16, player_y16,
-                               nearest_enemy_dist, nearest_human_dist,
-                               nearest_enemy_dx, nearest_enemy_dy, num_humans,
-                               nearest_spawner_dist, nearest_spawner_dx, nearest_spawner_dy, num_spawners,
-                               enemy_state, legacy_list_values,
+                               player_x16, player_y16, state_values,
                                done, subj_reward, obj_reward, save_signal, start_cmd,
                                preview_w, preview_h, preview_fmt, preview_blob)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
@@ -2564,38 +2771,24 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     local lasers_norm = math.min(1.0, lasers_u8 / 9.0)
     local wave_norm = math.min(1.0, wave_u8 / 40.0)
 
-    local state_values = {}
-    state_values[#state_values + 1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
-    state_values[#state_values + 1] = score_u32 / 1000000.0
-    state_values[#state_values + 1] = replay_norm
-    state_values[#state_values + 1] = lasers_norm
-    state_values[#state_values + 1] = wave_norm
-    state_values[#state_values + 1] = norm_pos_x(player_x16 or 0)
-    state_values[#state_values + 1] = norm_pos_y(player_y16 or 0)
+    local values = {}
+    for i = 1, #(state_values or {}) do
+        values[i] = state_values[i]
+    end
+    values[1] = ((player_alive or 0) ~= 0) and 1.0 or 0.0
+    values[2] = wave_norm
+    values[3] = lasers_norm
+    values[4] = norm_pos_x(player_x16 or 0)
+    values[5] = norm_pos_y(player_y16 or 0)
     local vel_x = 0.0
     local vel_y = 0.0
     if prev_player_x16 and prev_player_y16 and player_alive ~= 0 then
         vel_x = clamp11(((player_x16 or 0) - prev_player_x16) / POS_X_RANGE)
         vel_y = clamp11(((player_y16 or 0) - prev_player_y16) / POS_Y_RANGE)
     end
-    state_values[#state_values + 1] = vel_x
-    state_values[#state_values + 1] = vel_y
-    state_values[#state_values + 1] = clamp01(nearest_enemy_dist or 1.0)
-    state_values[#state_values + 1] = clamp01(nearest_human_dist or 1.0)
-    state_values[#state_values + 1] = clamp11(nearest_enemy_dx or 0.0)
-    state_values[#state_values + 1] = clamp11(nearest_enemy_dy or 0.0)
-    state_values[#state_values + 1] = math.max(0.0, math.min(1.0, (math.floor(num_humans or 0) / 255.0)))
-    state_values[#state_values + 1] = clamp01(nearest_spawner_dist or 1.0)
-    state_values[#state_values + 1] = clamp11(nearest_spawner_dx or 0.0)
-    state_values[#state_values + 1] = clamp11(nearest_spawner_dy or 0.0)
-    state_values[#state_values + 1] = math.max(0.0, math.min(1.0, (math.floor(num_spawners or 0) / 16.0)))
-    for i = 1, ZP1ENM_EMIT_COUNT do
-        state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
-    end
-    for i = 1, #(legacy_list_values or {}) do
-        state_values[#state_values + 1] = legacy_list_values[i]
-    end
-    local num_values = #state_values
+    values[6] = vel_x
+    values[7] = vel_y
+    local num_values = #values
     if num_values ~= EXPECTED_STATE_VALUES then
         error(string.format("state size mismatch: got=%d expected=%d", num_values, EXPECTED_STATE_VALUES))
     end
@@ -2617,7 +2810,7 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
 
     local state_payload_parts = {}
     for i = 1, num_values do
-        state_payload_parts[#state_payload_parts + 1] = string.pack(">f", state_values[i])
+        state_payload_parts[#state_payload_parts + 1] = string.pack(">f", values[i])
     end
     local state_payload = table.concat(state_payload_parts)
 
@@ -2797,7 +2990,7 @@ function read_frame_observation()
     end
     local obs = obs_or_err
     trace_log(frame_counter, "extract_world_features",
-        string.format("objects=%d legacy=%d", tonumber(obs.object_count or 0), #(obs.legacy_list_features or {})))
+        string.format("objects=%d compact=%d", tonumber(obs.object_count or 0), #(obs.state_features or {})))
 
     return {
         player_alive = player_alive,
@@ -2915,7 +3108,7 @@ function frame_callback()
         dead_frame_counter = dead_frame_counter + 1
         prev_object_sample_x = {}
         prev_object_sample_y = {}
-        _reset_legacy_slot_assignments()
+        _reset_compact_slot_assignments()
     else
         dead_frame_counter = 0
     end
@@ -2933,16 +3126,7 @@ function frame_callback()
     local ok_payload, payload_or_err = pcall(
         serialize_frame,
         frame.player_alive, frame.score, frame.replay_level, frame.num_lasers, frame.wave_number,
-        frame.player_x16, frame.player_y16,
-        frame.obs.nearest_enemy_dist, frame.obs.nearest_human_dist,
-        rel_pos_x(frame.obs.nearest_enemy_x16 or frame.player_x16, frame.player_x16),
-        rel_pos_y(frame.obs.nearest_enemy_y16 or frame.player_y16, frame.player_y16),
-        frame.obs.num_humans,
-        frame.obs.nearest_spawner_dist,
-        rel_pos_x(frame.obs.nearest_spawner_x16 or frame.player_x16, frame.player_x16),
-        rel_pos_y(frame.obs.nearest_spawner_y16 or frame.player_y16, frame.player_y16),
-        frame.obs.num_spawners,
-        frame.enemy_state, frame.obs.legacy_list_features,
+        frame.player_x16, frame.player_y16, frame.obs.state_features,
         rewards.done, rewards.subj_reward, rewards.obj_reward, save_signal, start_cmd,
         preview.w, preview.h, preview.fmt, preview.blob
     )
@@ -2951,7 +3135,7 @@ function frame_callback()
         return true
     end
     local payload = payload_or_err
-    local payload_count = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + #(frame.obs.legacy_list_features or {})
+    local payload_count = #(frame.obs.state_features or {})
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
     local move_cmd, fire_cmd = -1, -1

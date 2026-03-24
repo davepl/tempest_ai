@@ -24,9 +24,20 @@ for i in range(20):
     joint = combine_action_indices(0, 5)
     matured = nstep.add(s, joint, 1.0, ns, done, actor="dqn", priority_reward=1.0)
     total_emitted += len(matured)
-    for s0, a, Rn, pR, sn, dn, h, act in matured:
+    for s0, a, Rn, pR, sn, dn, h, act, wave, start_wave in matured:
         fz, sp = split_joint_action(a)
-        abuf.step_async(s0, (fz, sp), Rn, sn, bool(dn), actor=act, horizon=int(h), priority_reward=pR)
+        abuf.step_async(
+            s0,
+            (fz, sp),
+            Rn,
+            sn,
+            bool(dn),
+            actor=act,
+            horizon=int(h),
+            priority_reward=pR,
+            wave_number=int(wave),
+            start_wave=int(start_wave),
+        )
     s = ns
 
 print(f"Nstep emitted: {total_emitted}")

@@ -273,13 +273,9 @@ def print_network_info(agent):
         print(f"   MLP trunk:        {' → '.join(str(x) for x in RL_CONFIG.mlp_hidden_layers)} → {RL_CONFIG.mlp_output_dim}")
     else:
         print(f"   Trunk:            {RL_CONFIG.trunk_layers} layers × {RL_CONFIG.trunk_hidden} hidden")
-    print(f"   Globals/Grid/Tok: {RL_CONFIG.global_feature_count} + "
-          f"{RL_CONFIG.grid_width}x{RL_CONFIG.grid_height}x{RL_CONFIG.grid_channels} + "
-          f"{RL_CONFIG.object_token_count}x{RL_CONFIG.object_token_features}")
-    if getattr(net, 'use_directional_lanes', False):
-        print(f"   Spatial encoder:  directional lanes (8 dirs, dim={RL_CONFIG.attn_dim}, {RL_CONFIG.attn_heads} heads)")
-    else:
-        print(f"   Entity encoder:   {'ON' if RL_CONFIG.use_enemy_attention else 'OFF'} ({RL_CONFIG.attn_heads} heads, dim={RL_CONFIG.attn_dim})")
+    print(f"   Globals/Slots:    {RL_CONFIG.global_feature_count} + "
+          f"{RL_CONFIG.object_token_count}x{RL_CONFIG.slot_state_features}")
+    print(f"   Entity encoder:   {'ON' if RL_CONFIG.use_enemy_attention else 'OFF'} ({RL_CONFIG.attn_heads} heads, dim={RL_CONFIG.attn_dim})")
     print(f"   Distributional:   {'C51 ({} atoms, [{}, {}])'.format(RL_CONFIG.num_atoms, RL_CONFIG.v_min, RL_CONFIG.v_max) if RL_CONFIG.use_distributional else 'OFF'}")
     print(f"   Dueling:          {'ON' if RL_CONFIG.use_dueling else 'OFF'}")
     print(f"   Parameters:       {tp:,} total, {tr:,} trainable")
