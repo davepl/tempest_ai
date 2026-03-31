@@ -7,7 +7,13 @@ from aimodel import RainbowAgent, combine_action_indices, split_joint_action
 from nstep_buffer import NStepReplayBuffer
 from socket_server import AsyncReplayBuffer
 
+EXPECTED_FRAME_STACK = 4
+EXPECTED_STATE_DIM = 5832
+
 STATE_DIM = RL_CONFIG.state_size
+assert int(RL_CONFIG.frame_stack) == EXPECTED_FRAME_STACK
+assert bool(RL_CONFIG.attn_all_frames) is True
+assert STATE_DIM == EXPECTED_STATE_DIM, f"Expected {EXPECTED_STATE_DIM}, got {STATE_DIM}"
 agent = RainbowAgent(STATE_DIM)
 abuf = AsyncReplayBuffer(agent)
 nstep = NStepReplayBuffer(n_step=RL_CONFIG.n_step, gamma=RL_CONFIG.gamma)
@@ -24,9 +30,20 @@ for i in range(20):
     joint = combine_action_indices(0, 5)
     matured = nstep.add(s, joint, 1.0, ns, done, actor="dqn", priority_reward=1.0)
     total_emitted += len(matured)
-    for s0, a, Rn, pR, sn, dn, h, act in matured:
+    for s0, a, Rn, pR, sn, dn, h, act, wave_number, start_wave in matured:
         fz, sp = split_joint_action(a)
-        abuf.step_async(s0, (fz, sp), Rn, sn, bool(dn), actor=act, horizon=int(h), priority_reward=pR)
+        abuf.step_async(
+            s0,
+            (fz, sp),
+            Rn,
+            sn,
+            bool(dn),
+            actor=act,
+            horizon=int(h),
+            priority_reward=pR,
+            wave_number=int(wave_number),
+            start_wave=int(start_wave),
+        )
     s = ns
 
 print(f"Nstep emitted: {total_emitted}")

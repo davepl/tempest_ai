@@ -10,9 +10,27 @@ import numpy as np
 import threading
 
 try:
-    from config import RL_CONFIG
+    from config import RL_CONFIG, metrics
 except ImportError:
-    from Scripts.config import RL_CONFIG
+    from Scripts.config import RL_CONFIG, metrics
+
+
+def _scheduled_fraction(start_attr: str, end_attr: str) -> float:
+    """Linearly decay replay-partition quotas over training."""
+    start = float(getattr(RL_CONFIG, start_attr, 0.0))
+    end_raw = getattr(RL_CONFIG, end_attr, None)
+    end = start if end_raw is None else float(end_raw)
+    decay_start = max(0, int(getattr(RL_CONFIG, "replay_imitation_decay_start", 0) or 0))
+    decay_frames = max(1, int(getattr(RL_CONFIG, "replay_imitation_decay_frames", 1) or 1))
+    try:
+        frame_count = max(0, int(getattr(metrics, "frame_count", 0) or 0))
+    except Exception:
+        frame_count = 0
+    if frame_count <= decay_start:
+        return max(0.0, min(1.0, start))
+    progress = min(1.0, float(frame_count - decay_start) / float(decay_frames))
+    value = start + progress * (end - start)
+    return max(0.0, min(1.0, float(value)))
 
 
 class SumTree:
@@ -382,10 +400,10 @@ class PrioritizedReplayBuffer:
                 return None
 
             candidate_count = batch_size
-            max_expert_frac = float(getattr(RL_CONFIG, "replay_expert_max_frac", 1.0))
+            max_expert_frac = _scheduled_fraction("replay_expert_max_frac", "replay_expert_max_frac_end")
             if 0.0 <= max_expert_frac < 1.0:
                 candidate_count = max(candidate_count, batch_size * 4)
-            max_self_frac = float(getattr(RL_CONFIG, "replay_self_imitation_max_frac", 1.0) or 1.0)
+            max_self_frac = _scheduled_fraction("replay_self_imitation_max_frac", "replay_self_imitation_max_frac_end")
             if 0.0 <= max_self_frac < 1.0:
                 candidate_count = max(candidate_count, batch_size * 4)
             if bool(getattr(RL_CONFIG, "replay_wave_sampling_enabled", False)):
@@ -420,7 +438,7 @@ class PrioritizedReplayBuffer:
             wave_numbers = self.wave_numbers[pool].astype(np.int32)
             start_waves = self.start_waves[pool].astype(np.int32)
 
-            min_expert_frac = float(getattr(RL_CONFIG, "replay_expert_min_frac", 0.0))
+            min_expert_frac = _scheduled_fraction("replay_expert_min_frac", "replay_expert_min_frac_end")
             min_expert = 0
             if min_expert_frac > 0.0:
                 min_expert = max(0, min(batch_size, int(round(batch_size * min_expert_frac))))
@@ -428,8 +446,8 @@ class PrioritizedReplayBuffer:
             if 0.0 <= max_expert_frac < 1.0:
                 max_expert = max(0, min(batch_size, int(math.floor(batch_size * max_expert_frac))))
             max_expert = max(max_expert, min_expert)
-            min_self_frac = float(getattr(RL_CONFIG, "replay_self_imitation_min_frac", 0.0) or 0.0)
-            max_self_frac = float(getattr(RL_CONFIG, "replay_self_imitation_max_frac", 1.0) or 1.0)
+            min_self_frac = _scheduled_fraction("replay_self_imitation_min_frac", "replay_self_imitation_min_frac_end")
+            max_self_frac = _scheduled_fraction("replay_self_imitation_max_frac", "replay_self_imitation_max_frac_end")
             min_self = max(0, min(batch_size, int(round(batch_size * min_self_frac)))) if min_self_frac > 0.0 else 0
             max_self = batch_size
             if 0.0 <= max_self_frac < 1.0:

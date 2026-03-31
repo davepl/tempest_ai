@@ -59,10 +59,28 @@ _MAX_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024
 
 # ── Fire-hold (keeps fire direction stable for N frames so game's LSPROC registers a shot)
 FIRE_HOLD_FRAMES = 4     # must be ≥3 (game needs 3 stable frames to fire)
+_DIAG = 0.70710678
+_FIRE_DIR_VECTORS = (
+    (0.0, -1.0),
+    (_DIAG, -_DIAG),
+    (1.0, 0.0),
+    (_DIAG, _DIAG),
+    (0.0, 1.0),
+    (-_DIAG, _DIAG),
+    (-1.0, 0.0),
+    (-_DIAG, -_DIAG),
+)
 FRAME_STACK = max(1, int(getattr(RL_CONFIG, "frame_stack", 1)))
 _START_PULSE_VALID_FRAMES = 240
 _GAMEPLAY_RESET_DEAD_FRAMES = 180
 _GAMEPLAY_PLAUSIBLE_START_STREAK = 8
+
+
+def _fire_idle_action_index() -> int:
+    fire_bins = max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8)))
+    if fire_bins >= 9:
+        return fire_bins - 1
+    return 0
 
 
 def _reset_state_stack(cs: dict):
@@ -88,6 +106,28 @@ def _push_stacked_state(cs: dict, frame_state: np.ndarray) -> np.ndarray:
     if FRAME_STACK == 1:
         return st[-1]
     return np.concatenate(list(st), axis=0).astype(np.float32, copy=False)
+
+
+def _augment_frame_state(cs: dict, frame_state: np.ndarray) -> np.ndarray:
+    """Append Python-side control context missing from the Lua payload."""
+    base = np.asarray(frame_state, dtype=np.float32)
+    held = int(cs.get("fire_hold_dir", -1) or -1)
+    count = max(0, int(cs.get("fire_hold_count", 0) or 0))
+
+    dir_x = 0.0
+    dir_y = 0.0
+    if 0 <= held < len(_FIRE_DIR_VECTORS):
+        dir_x, dir_y = _FIRE_DIR_VECTORS[held]
+
+    remain_denom = max(1, FIRE_HOLD_FRAMES - 1)
+    hold_remaining_norm = min(1.0, float(count) / float(remain_denom))
+    fire_update_open = 1.0 if count <= 0 else 0.0
+
+    context = np.asarray(
+        [dir_x, dir_y, hold_remaining_norm, fire_update_open],
+        dtype=np.float32,
+    )
+    return np.concatenate((base, context), axis=0)
 
 
 def _apply_fire_hold(cs: dict, raw_fire: int) -> int:
@@ -762,7 +802,8 @@ class SocketServer:
     def _init_client(self, cid):
         n = max(1, int(getattr(RL_CONFIG, "n_step", 1)))
         gamma = float(getattr(RL_CONFIG, "gamma", 0.99))
-        nstep = NStepReplayBuffer(n_step=n, gamma=gamma) if n > 1 else None
+        cross_actor = bool(getattr(RL_CONFIG, "nstep_cross_actor", False))
+        nstep = NStepReplayBuffer(n_step=n, gamma=gamma, cross_actor=cross_actor) if n > 1 else None
         move_bins = max(1, int(getattr(RL_CONFIG, "num_move_actions", 8)))
         fire_bins = max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8)))
         pair_bins = move_bins * fire_bins
@@ -1004,7 +1045,11 @@ class SocketServer:
                     self.metrics.update_expert_ratio()
                 self._calc_avg_level()
                 self.metrics.update_game_state(0, False)
-                stacked_state = _push_stacked_state(cs, frame.state)
+                frame_state = _augment_frame_state(cs, frame.state)
+                expected_base = int(getattr(RL_CONFIG, "base_state_size", len(frame_state)) or len(frame_state))
+                if frame_state.shape[0] != expected_base:
+                    raise ValueError(f"augmented state mismatch {frame_state.shape[0]} != {expected_base}")
+                stacked_state = _push_stacked_state(cs, frame_state)
 
                 # ── Process previous step ───────────────────────────────
                 if (
@@ -1151,7 +1196,7 @@ class SocketServer:
                         max_fire = max(1, int(getattr(RL_CONFIG, "num_fire_actions", 8)))
                         locked_fire = max(0, min(max_fire - 1, held))
                     else:
-                        locked_fire = 0
+                        locked_fire = _fire_idle_action_index()
 
                 if _FORCE_RANDOM_ACTIONS:
                     move_idx = random.randrange(max(1, int(getattr(RL_CONFIG, "num_move_actions", 8))))

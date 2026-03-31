@@ -128,6 +128,47 @@ LEGACY_CORE_FEATURES = 18
 LEGACY_TOTAL_SLOTS = sum(int(slots) for _name, slots in LEGACY_ENTITY_CATEGORIES)
 LEGACY_PARAMS_COUNT = LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + len(LEGACY_ENTITY_CATEGORIES) + (LEGACY_TOTAL_SLOTS * LEGACY_SLOT_STATE_FEATURES)
 
+TACTICAL_LANE_BASE_FEATURES = 20
+TACTICAL_LANE_AFFORDANCE_FEATURES = 10
+# Current tactical state layout:
+#   18 core/player values
+#   + 22 ELIST bytes
+#   + 8 serialized directional lane tokens × 30 predictive+affordance features
+#   + 9×9 local egocentric tactical grid × 6 channels
+#   + 4 role-specific pools:
+#       projectile: 1 occupancy + 24 slots × 10 features
+#       danger:     1 occupancy + 32 slots × 10 features
+#       human:      1 occupancy + 12 slots × 7 features
+#       electrode:  1 occupancy + 8 slots × 5 features
+TACTICAL_LANE_COUNT = 8
+TACTICAL_LANE_FEATURES = TACTICAL_LANE_BASE_FEATURES + TACTICAL_LANE_AFFORDANCE_FEATURES
+TACTICAL_LOCAL_GRID_WIDTH = 9
+TACTICAL_LOCAL_GRID_HEIGHT = 9
+TACTICAL_LOCAL_GRID_CHANNELS = 6
+TACTICAL_LOCAL_GRID_FEATURES = (
+    TACTICAL_LOCAL_GRID_WIDTH
+    * TACTICAL_LOCAL_GRID_HEIGHT
+    * TACTICAL_LOCAL_GRID_CHANNELS
+)
+TACTICAL_POOL_DEFS: tuple[tuple[str, int, int], ...] = (
+    ("projectile", 24, 10),
+    ("danger", 32, 10),
+    ("human", 12, 7),
+    ("electrode", 8, 5),
+)
+TACTICAL_TOTAL_SLOTS = sum(int(slots) for _name, slots, _features in TACTICAL_POOL_DEFS)
+TACTICAL_PARAMS_COUNT = (
+    LEGACY_CORE_FEATURES
+    + LEGACY_ELIST_FEATURES
+    + (TACTICAL_LANE_COUNT * TACTICAL_LANE_FEATURES)
+    + TACTICAL_LOCAL_GRID_FEATURES
+    + sum(1 + (int(slots) * int(features)) for _name, slots, features in TACTICAL_POOL_DEFS)
+)
+# Python appends a small per-frame control-context tail after the Lua payload:
+#   held_fire_dir_x, held_fire_dir_y, fire_hold_remaining_norm, fire_update_open
+PY_CONTROL_CONTEXT_FEATURES = 4
+TACTICAL_AUGMENTED_PARAMS_COUNT = TACTICAL_PARAMS_COUNT + PY_CONTROL_CONTEXT_FEATURES
+
 # Type ID mapping for the unified entity pool (matches Lua UNIFIED_TYPE_ID).
 UNIFIED_TYPE_NAMES = ("grunt", "hulk", "brain", "tank", "spawner", "enforcer", "projectile", "human", "electrode")
 UNIFIED_NUM_TYPES = len(UNIFIED_TYPE_NAMES)
@@ -147,21 +188,13 @@ class ServerConfigData:
     shard_worker_port_base: int = 0   # 0 => auto (port + 1)
     shard_preview_slot: int = 0
     # State layout:
-    #   5 core (alive, score, replay, lasers, wave)
-    #   + 2 player position
-    #   + 2 player velocity
-    #   + nearest enemy distance
-    #   + nearest human distance
-    #   + nearest enemy relative vector (dx, dy)
-    #   + exact num_humans (normalized count)
-    #   + nearest spheroid distance
-    #   + nearest spheroid relative vector (dx, dy)
-    #   + exact spawner count (normalized count)
-    #   + 22 ELIST bytes (speeds, timers, counts; padding trimmed)
-    #   + 1 unified entity pool: 1 occupancy + 64 slots × 11 features
-    #     (present, dx, dy, dist, vx, vy, threat, approach, hit_w, hit_h, type_id)
-    #   = 745 floats total
-    params_count: int = LEGACY_PARAMS_COUNT
+    #   18 core/player values
+    #   + 22 ELIST bytes
+    #   + 8 directional predictive lane summaries × 30 features
+    #   + 9×9 local egocentric tactical grid × 6 channels
+    #   + role-specific pools for projectile / danger / humans / electrodes
+    #   = 1454 floats total on the Lua wire protocol
+    params_count: int = TACTICAL_PARAMS_COUNT
 
 SERVER_CONFIG = ServerConfigData()
 
@@ -169,33 +202,40 @@ SERVER_CONFIG = ServerConfigData()
 @dataclass
 class RLConfigData:
     # ── state / action ──────────────────────────────────────────────────
-    # Base per-frame state from Lua wire protocol.
-    base_state_size: int = SERVER_CONFIG.params_count
-    # Structured slot encoder: use 2 stacked frames by default.
-    frame_stack: int = 2
+    # Base per-frame state consumed by the model:
+    #   Lua wire payload + Python-side control context.
+    base_state_size: int = TACTICAL_AUGMENTED_PARAMS_COUNT
+    # Structured slot encoder: use 4 stacked frames by default.
+    frame_stack: int = 4
     # Effective model input width after stacking.
-    state_size: int = SERVER_CONFIG.params_count * 2
+    state_size: int = TACTICAL_AUGMENTED_PARAMS_COUNT * 4
 
     # Factored action space for Robotron dual sticks:
-    #   movement_direction (0..7 directions, 8 = idle/no-move) × firing_direction (0..7)
-    #   = 9 × 8 = 72 joint actions
+    #   movement_direction (0..7 directions, 8 = idle/no-move) ×
+    #   firing_direction (0..7 directions, 8 = idle/no-fire)
+    #   = 9 × 9 = 81 joint actions
     num_move_actions: int = 9
-    num_fire_actions: int = 8
+    num_fire_actions: int = 9
     # Learn separate move/fire action heads and reconstruct the joint table
     # from them. This matches Robotron's dual-stick structure better than a
-    # monolithic 72-way action head.
+    # monolithic joint action head.
     factorized_action_heads: bool = True
-    # With factorized move/fire heads, axis-wise greedy decode matches the
-    # optimized additive action head, so we enable it by default.
-    factored_greedy_action: bool = True
+    # Add a learned joint residual so movement/fire interactions can deviate
+    # from the additive factorized baseline when Robotron-specific coupling
+    # matters.
+    factorized_joint_residual: bool = True
+    factorized_joint_residual_hidden: int = 160
+    # Axis-wise greedy decode is only exact for the purely additive head, so
+    # disable it by default once the joint residual is active.
+    factored_greedy_action: bool = False
 
     @property
     def num_joint_actions(self) -> int:
         return self.num_move_actions * self.num_fire_actions
 
     # ── observation layout / network architecture ──────────────────────
-    # These hybrid-shape fields are retained so expert/test tooling can still
-    # understand the newer 2212-float format when synthetic states use it.
+    # These older hybrid-shape fields are retained so expert/test tooling can
+    # still understand archived synthetic states that use that format.
     global_feature_count: int = 100
     grid_width: int = 12
     grid_height: int = 12
@@ -210,7 +250,7 @@ class RLConfigData:
     # enabled, a parallel object-set branch is fused in before the C51 head.
     pure_mlp: bool = True
     mlp_with_attention: bool = True
-    mlp_hidden_layers: list = field(default_factory=lambda: [384])
+    mlp_hidden_layers: list = field(default_factory=lambda: [512, 512])
     mlp_output_dim: int = 256
     trunk_hidden: int = 256
     trunk_layers: int = 2
@@ -221,16 +261,30 @@ class RLConfigData:
     # fire/move directions, then cross-attend lanes to entity tokens.
     # Replaces the EntitySetEncoder when enabled under pure_mlp + mlp_with_attention.
     use_directional_lanes: bool = True
+    # Add lightweight per-lane priors that bias move/fire logits directly from
+    # the latest directional lane tokens.
+    use_directional_action_priors: bool = True
+    directional_action_prior_hidden: int = 96
 
-    # Structured learner: compact slot encoding over typed entity buckets.
+    # Structured learner: tactical state with exact per-lane coverage plus
+    # role-specific object pools. The legacy uniform slot settings are retained
+    # for backward-compatible decoding of older saved/test states.
     use_enemy_attention: bool = True
     entity_categories: list = field(default_factory=lambda: list(LEGACY_ENTITY_CATEGORIES))
-    object_slots: int = LEGACY_TOTAL_SLOTS
+    state_role_pools: list = field(default_factory=lambda: list(TACTICAL_POOL_DEFS))
+    lane_token_count: int = TACTICAL_LANE_COUNT
+    lane_token_features: int = TACTICAL_LANE_FEATURES
+    tactical_grid_width: int = TACTICAL_LOCAL_GRID_WIDTH
+    tactical_grid_height: int = TACTICAL_LOCAL_GRID_HEIGHT
+    tactical_grid_channels: int = TACTICAL_LOCAL_GRID_CHANNELS
+    use_local_tactical_grid: bool = True
+    python_control_context_features: int = PY_CONTROL_CONTEXT_FEATURES
+    object_slots: int = TACTICAL_TOTAL_SLOTS
     slot_state_features: int = LEGACY_SLOT_STATE_FEATURES
-    # Per-object set-encoder features for the compact legacy slot state:
-    #   dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h,
+    # Per-object set-encoder features after pool decoding:
+    #   dx, dy, vx, vy, dist, threat, approach, ttc, closest_pass, hit_w, hit_h,
     #   type_emb(16dim), is_human, is_dangerous
-    legacy_slot_token_features: int = 27
+    legacy_slot_token_features: int = 29
     # Learned type embedding dimension for unified pool.
     type_embedding_dim: int = 16
     # Entity self-attention: let entities see each other before lane cross-attention.
@@ -238,12 +292,9 @@ class RLConfigData:
     attn_heads: int = 4
     attn_dim: int = 256
     attn_layers: int = 1
-    # False = attention only on the most recent frame; the flat MLP still sees
-    # all stacked frames. This keeps the attention branch focused on "what
-    # matters now" while preserving temporal context in the dense path.
-    # Changing this alters the entity_proj input width, so it is an
+    # True = attention also consumes all stacked frames. This is an
     # architecture change and requires a fresh checkpoint.
-    attn_all_frames: bool = False
+    attn_all_frames: bool = True
     grid_hidden_channels: int = 32
     global_hidden: int = 128
     category_summary_dim: int = 48
@@ -270,7 +321,9 @@ class RLConfigData:
     lr_use_restarts: bool = True           # Periodic warm restarts to escape plateaus
     gamma: float = 0.99
     n_step: int = 6
-    max_samples_per_frame: float = 16
+    # Cap replay reuse more aggressively so late training tracks fresh
+    # experience instead of mostly polishing a saturated full buffer.
+    max_samples_per_frame: float = 8
 
     # Replay (PER with proportional priorities)
     memory_size: int = 10_000_000
@@ -289,12 +342,12 @@ class RLConfigData:
     # Wave-aware replay quotas: preserve frontier/high-wave DQN experience so
     # it does not get drowned by abundant easy-wave traffic.
     replay_wave_sampling_enabled: bool = True
-    replay_wave_frontier_frac: float = 0.20
-    replay_wave_high_frac: float = 0.10
+    replay_wave_frontier_frac: float = 0.35
+    replay_wave_high_frac: float = 0.20
     replay_wave_frontier_margin: int = 1
     replay_wave_high_offset: int = 2
     replay_wave_candidate_multiplier: int = 10
-    replay_wave_min_frontier: int = 8
+    replay_wave_min_frontier: int = 6
     # Guaranteed floor for expert transitions in a sampled batch when enough
     # expert candidates exist in replay. These are reserved before the DQN-only
     # wave quotas are filled.
@@ -306,37 +359,47 @@ class RLConfigData:
     # agent's own strongest DQN episodes so they remain visible to the learner.
     replay_self_imitation_min_frac: float = 0.10
     replay_self_imitation_max_frac: float = 0.15
+    # As exploration decays, reduce forced imitation sampling so late training
+    # can actually optimize the agent's own policy instead of staying anchored
+    # to expert/self-imitation partitions.
+    replay_imitation_decay_start: int = 6_000_000
+    replay_imitation_decay_frames: int = 8_000_000
+    replay_expert_min_frac_end: float = 0.02
+    replay_expert_max_frac_end: float = 0.08
+    replay_self_imitation_min_frac_end: float = 0.00
+    replay_self_imitation_max_frac_end: float = 0.05
 
-    # Target network (periodic hard sync; moderate refresh for stable learning)
-    target_update_period: int = 2_500
-    target_tau: float = 1.0
+    # Target network: soft Polyak averaging every step for smooth value targets.
+    # tau=0.005 means ~63% absorbed after 200 steps, ~97% after 700 steps.
+    target_update_period: int = 1
+    target_tau: float = 0.005
 
     # Gradient
     grad_clip_norm: float = 5.0            # Tighter clipping dampens large updates
 
     # ── exploration ─────────────────────────────────────────────────────
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.00
-    epsilon_decay_frames: int = 10_000_000
+    epsilon_end: float = 0.08
+    epsilon_decay_frames: int = 20_000_000
     # Manual epsilon pulse (fired with P key, runs for N frames then auto-stops).
     manual_pulse_epsilon: float = 0.25
     manual_pulse_duration_frames: int = 750_000
     # Automatic plateau pulser: temporarily raises epsilon and forces
     # frontier starts when DQN reward and reached-wave metrics stop improving.
-    plateau_pulse_enabled: bool = False
-    plateau_pulse_epsilon: float = 0.14
-    plateau_pulse_frames: int = 300_000
-    plateau_confirm_frames: int = 1_000_000
-    plateau_cooldown_frames: int = 1_500_000
+    plateau_pulse_enabled: bool = True
+    plateau_pulse_epsilon: float = 0.10
+    plateau_pulse_frames: int = 600_000
+    plateau_confirm_frames: int = 400_000
+    plateau_cooldown_frames: int = 800_000
     plateau_min_frame: int = 4_000_000
-    plateau_reward_delta: float = 0.75
-    plateau_level_delta: float = 0.25
+    plateau_reward_delta: float = 0.35
+    plateau_level_delta: float = 0.10
     plateau_curriculum_wave_offset: int = 1
     epsilon: float = 1.0
 
     # Expert guidance
     expert_ratio_start: float = 0.99
-    expert_ratio_end: float = 0.10
+    expert_ratio_end: float = 0.05
     expert_ratio_decay_frames: int = 10_000_000
     expert_ratio: float = 0.99
 
@@ -348,10 +411,10 @@ class RLConfigData:
     # Stronger BC anchor from heuristic expert transitions; keep it alive well
     # into training so the learner does not lose competent aiming/movement
     # before it can stand on its own.
-    expert_bc_weight: float = 0.4
-    expert_bc_decay_start: int = 10_000_000
-    # Decays from 10M to 40M frames.
-    expert_bc_decay_frames: int = 30_000_000
+    expert_bc_weight: float = 0.30
+    expert_bc_decay_start: int = 6_000_000
+    # Decays through the handoff from guided play to mostly self-play.
+    expert_bc_decay_frames: int = 8_000_000
     expert_bc_min_weight: float = 0.0
     # Factorized behavioural cloning on expert/self-imitation samples.
     factorized_bc_enabled: bool = True
@@ -362,6 +425,16 @@ class RLConfigData:
     # Self-imitation samples clone the agent's own best DQN episodes with a
     # slightly lighter weight than heuristic expert targets.
     factorized_bc_self_imitation_scale: float = 0.75
+    # Reward-weighted behavioural cloning for DQN discoveries: when the agent
+    # takes an action that earns positive reward, apply a direct policy-
+    # supervision signal proportional to the scaled reward so that useful
+    # behaviours discovered by exploration are reinforced immediately instead
+    # of relying solely on the slow indirect C51 value path.
+    dqn_reward_bc_weight: float = 0.10
+    # Minimum (scaled, clipped) reward for a DQN frame to receive BC credit.
+    dqn_reward_bc_threshold: float = 0.5
+    # Cap per-sample BC weight so a single huge reward can't dominate.
+    dqn_reward_bc_max_weight: float = 3.0
     # Promote strong DQN episodes into a self-imitation partition.
     self_imitation_enabled: bool = True
     self_imitation_top_episodes: int = 128
@@ -370,6 +443,13 @@ class RLConfigData:
     self_imitation_priority_boost: float = 1.5
     expert_profile: str = "simple"
     expert_hold_fire_for_last_enemy_rescue: bool = True
+
+    # ── n-step ──────────────────────────────────────────────────────────
+    # Allow n-step returns to span expert/DQN actor boundaries so that DQN
+    # transitions accumulate the full n-step reward even when neighbouring
+    # frames were chosen by the expert.  Historically these were truncated
+    # at actor switches, which shortened ~74% of DQN returns at 20% expert.
+    nstep_cross_actor: bool = True
 
     # ── reward ──────────────────────────────────────────────────────────
     # Scale objective rewards to fit C51 support while keeping TD targets stable.
@@ -392,7 +472,7 @@ class RLConfigData:
     # At scale=1.0: wave 10 → 1.0×, wave 100 → 2.0×, wave 1000 → 3.0×.
     # At scale=5.0: wave 100 → 10.0×, matching a "10× at level 100" goal.
     # Set to 0.0 to disable.
-    level_priority_log_scale: float = 0.0
+    level_priority_log_scale: float = 1.5
 
     # ── inference ───────────────────────────────────────────────────────
     use_separate_inference_model: bool = True

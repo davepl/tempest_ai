@@ -46,17 +46,17 @@ def case_simple_sequence() -> None:
     # No terminal yet -> expect (len - n + 1) matured items = 5 - 3 + 1 = 3
     assert len(outs) == 3, f"expected 3 matured, got {len(outs)}"
     # First output should aggregate steps [0,1,2]
-    s0, a0, R0, priority0, s3, done0, h0, actor0 = outs[0]
+    s0, a0, R0, priority0, s3, done0, h0, actor0, *_rest = outs[0]
     exp_R0 = compute_expected_rn([1.0, 1.0, 1.0], gamma)
     assert s0 == "s0" and a0 == 0 and approx(R0, exp_R0) and approx(priority0, exp_R0)
     assert s3 == "s3" and not done0 and h0 == 3 and actor0 == "dqn"
     # Second output should aggregate steps [1,2,3]
-    s1, a1, R1, priority1, s4, done1, h1, actor1 = outs[1]
+    s1, a1, R1, priority1, s4, done1, h1, actor1, *_rest = outs[1]
     exp_R1 = compute_expected_rn([1.0, 1.0, 1.0], gamma)
     assert s1 == "s1" and a1 == 1 and approx(R1, exp_R1) and approx(priority1, exp_R1)
     assert s4 == "s4" and not done1 and h1 == 3 and actor1 == "dqn"
     # Third output should aggregate steps [2,3,4]
-    s2, a2, R2, priority2, s5, done2, h2, actor2 = outs[2]
+    s2, a2, R2, priority2, s5, done2, h2, actor2, *_rest = outs[2]
     exp_R2 = compute_expected_rn([1.0, 1.0, 1.0], gamma)
     assert s2 == "s2" and a2 == 2 and approx(R2, exp_R2) and approx(priority2, exp_R2)
     assert s5 == "s5" and not done2 and h2 == 3 and actor2 == "dqn"
@@ -106,16 +106,16 @@ def case_actor_boundary_split() -> None:
     # On boundary at step 1, the first output should have been emitted already for start=0 (only first step due to actor split)
     assert len(outs) >= 1
     # First output corresponds to start at 0 with horizon 1, next_state s1, done False
-    s0, a0, R0, priority0, sn, d0, h0, actor0 = outs[0]
+    s0, a0, R0, priority0, sn, d0, h0, actor0, *_rest = outs[0]
     assert s0 == "s0" and a0 == 0 and h0 == 1 and not d0 and sn == "s1" and approx(R0, 1.0)
     assert approx(priority0, 1.0) and actor0 == "dqn"
 
     # After the sequence, there should be enough EXPERT steps to emit at least one matured of horizon 3
     for tup in outs[1:]:
-        assert tup[-1] == "expert", f"unexpected actor in subsequent outputs: {tup[-1]}"
+        assert tup[7] == "expert", f"unexpected actor in subsequent outputs: {tup[7]}"
 
     # Final check: ensure one matured with horizon>=2 exists for expert
-    horizons = [tup[-2] for tup in outs[1:]]
+    horizons = [tup[6] for tup in outs[1:]]
     assert any(h >= 2 for h in horizons), f"expected at least one expert horizon >=2, got {horizons}"
 
 

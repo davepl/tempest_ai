@@ -18,6 +18,9 @@ try:
         LEGACY_CORE_FEATURES,
         LEGACY_ELIST_FEATURES,
         LEGACY_SLOT_STATE_FEATURES,
+        TACTICAL_LANE_COUNT,
+        TACTICAL_LANE_FEATURES,
+        TACTICAL_POOL_DEFS,
         UNIFIED_TYPE_NAMES,
         UNIFIED_NUM_TYPES,
         UNIFIED_HUMAN_TYPE_ID,
@@ -30,6 +33,9 @@ except ImportError:
         LEGACY_CORE_FEATURES,
         LEGACY_ELIST_FEATURES,
         LEGACY_SLOT_STATE_FEATURES,
+        TACTICAL_LANE_COUNT,
+        TACTICAL_LANE_FEATURES,
+        TACTICAL_POOL_DEFS,
         UNIFIED_TYPE_NAMES,
         UNIFIED_NUM_TYPES,
         UNIFIED_HUMAN_TYPE_ID,
@@ -79,41 +85,93 @@ def _latest_frame_danger(states_t: torch.Tensor) -> torch.Tensor:
         return torch.zeros(0, device=states_t.device, dtype=torch.float32)
 
     base_state_size = int(getattr(RL_CONFIG, "base_state_size", 0) or 0)
-    total_slots = int(getattr(RL_CONFIG, "object_slots", 0) or 0)
-    slot_features = int(getattr(RL_CONFIG, "slot_state_features", LEGACY_SLOT_STATE_FEATURES) or LEGACY_SLOT_STATE_FEATURES)
-    category_count = len(getattr(RL_CONFIG, "entity_categories", ()) or ())
-    if base_state_size <= 0 or total_slots <= 0 or slot_features < 11:
+    lane_count = int(getattr(RL_CONFIG, "lane_token_count", TACTICAL_LANE_COUNT) or TACTICAL_LANE_COUNT)
+    lane_features = int(getattr(RL_CONFIG, "lane_token_features", TACTICAL_LANE_FEATURES) or TACTICAL_LANE_FEATURES)
+    tactical_grid_w = int(getattr(RL_CONFIG, "tactical_grid_width", 0) or 0)
+    tactical_grid_h = int(getattr(RL_CONFIG, "tactical_grid_height", 0) or 0)
+    tactical_grid_c = int(getattr(RL_CONFIG, "tactical_grid_channels", 0) or 0)
+    pool_defs = getattr(RL_CONFIG, "state_role_pools", TACTICAL_POOL_DEFS) or TACTICAL_POOL_DEFS
+    if base_state_size <= 0:
         return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
 
     latest = states_t[:, -base_state_size:]
-    slot_offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + category_count)
-    slot_width = total_slots * slot_features
-    if latest.shape[1] < (slot_offset + slot_width):
+    offset = int(
+        LEGACY_CORE_FEATURES
+        + LEGACY_ELIST_FEATURES
+        + (lane_count * lane_features)
+        + (tactical_grid_w * tactical_grid_h * tactical_grid_c)
+    )
+    if latest.shape[1] < offset:
         return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
 
-    slots = latest[:, slot_offset:slot_offset + slot_width].reshape(batch, total_slots, slot_features)
-    present = slots[:, :, 0] > 0.5
-    dist = slots[:, :, 3].clamp(min=0.0, max=2.0)
-    threat = slots[:, :, 6].clamp(min=0.0, max=1.0)
-    approach = slots[:, :, 7].clamp(min=-1.0, max=1.0)
-    type_norm = slots[:, :, 10].clamp(min=0.0, max=1.0)
-    type_idx = torch.round(type_norm * float(max(1, UNIFIED_NUM_TYPES - 1))).long()
-    type_idx = type_idx.clamp(0, max(0, UNIFIED_NUM_TYPES - 1))
+    score_parts = []
+    mask_parts = []
+    close_parts = []
 
-    is_human = type_idx == int(UNIFIED_HUMAN_TYPE_ID)
-    is_electrode = type_idx == int(UNIFIED_ELECTRODE_TYPE_ID)
-    is_projectile = (type_idx == int(_PROJECTILE_TYPE_ID)) if _PROJECTILE_TYPE_ID >= 0 else torch.zeros_like(is_human)
-    danger_mask = present & (~is_human)
+    for pool_name, slots, slot_features in pool_defs:
+        slots_i = int(slots)
+        feat_i = int(slot_features)
+        width = slots_i * feat_i
+        if latest.shape[1] < (offset + 1 + width):
+            return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
 
-    closeness = (1.0 - dist).clamp(min=0.0, max=1.0)
-    approach_score = approach.clamp(min=0.0, max=1.0)
-    danger_score = (0.45 * closeness) + (0.40 * threat) + (0.15 * approach_score)
-    danger_score = danger_score + (0.25 * is_projectile.float() * closeness)
-    danger_score = danger_score + (0.20 * is_electrode.float() * closeness)
-    danger_score = torch.where(danger_mask, danger_score, torch.zeros_like(danger_score))
+        block = latest[:, offset + 1: offset + 1 + width].reshape(batch, slots_i, feat_i)
+        present = block[:, :, 0] > 0.5
 
-    max_score = danger_score.max(dim=1).values
-    nearby_count = (danger_mask & (closeness > 0.35)).float().sum(dim=1).clamp(max=3.0) / 3.0
+        if pool_name == "projectile":
+            dist = block[:, :, 3].clamp(min=0.0, max=2.0)
+            threat = block[:, :, 6].clamp(min=0.0, max=1.0)
+            ttc = block[:, :, 7].clamp(min=0.0, max=1.0)
+            closest_pass = block[:, :, 8].clamp(min=0.0, max=2.0)
+            approach = block[:, :, 9].clamp(min=-1.0, max=1.0)
+            is_projectile = torch.ones_like(present)
+            is_electrode = torch.zeros_like(present)
+        elif pool_name == "danger":
+            dist = block[:, :, 3].clamp(min=0.0, max=2.0)
+            threat = block[:, :, 6].clamp(min=0.0, max=1.0)
+            approach = block[:, :, 7].clamp(min=-1.0, max=1.0)
+            ttc = block[:, :, 8].clamp(min=0.0, max=1.0)
+            closest_pass = dist
+            type_norm = block[:, :, 9].clamp(min=0.0, max=1.0)
+            type_idx = torch.round(type_norm * float(max(1, UNIFIED_NUM_TYPES - 1))).long()
+            type_idx = type_idx.clamp(0, max(0, UNIFIED_NUM_TYPES - 1))
+            is_projectile = (type_idx == int(_PROJECTILE_TYPE_ID)) if _PROJECTILE_TYPE_ID >= 0 else torch.zeros_like(present)
+            is_electrode = type_idx == int(UNIFIED_ELECTRODE_TYPE_ID)
+        elif pool_name == "electrode":
+            dist = block[:, :, 3].clamp(min=0.0, max=2.0)
+            threat = block[:, :, 4].clamp(min=0.0, max=1.0)
+            approach = torch.zeros_like(dist)
+            ttc = torch.ones_like(dist)
+            closest_pass = dist
+            is_projectile = torch.zeros_like(present)
+            is_electrode = torch.ones_like(present)
+        else:
+            offset += 1 + width
+            continue
+
+        closeness = (1.0 - dist).clamp(min=0.0, max=1.0)
+        approach_score = approach.clamp(min=0.0, max=1.0)
+        imminence = (1.0 - ttc).clamp(min=0.0, max=1.0)
+        pass_score = (1.0 - closest_pass).clamp(min=0.0, max=1.0)
+        danger_score = (0.35 * closeness) + (0.30 * threat) + (0.15 * approach_score) + (0.20 * imminence)
+        danger_score = danger_score + (0.20 * is_projectile.float() * pass_score)
+        danger_score = danger_score + (0.20 * is_electrode.float() * closeness)
+        danger_score = torch.where(present, danger_score, torch.zeros_like(danger_score))
+
+        score_parts.append(danger_score)
+        mask_parts.append(present)
+        close_parts.append(closeness)
+        offset += 1 + width
+
+    if not score_parts:
+        return torch.zeros(batch, device=states_t.device, dtype=torch.float32)
+
+    all_scores = torch.cat(score_parts, dim=1)
+    all_masks = torch.cat(mask_parts, dim=1)
+    all_close = torch.cat(close_parts, dim=1)
+
+    max_score = all_scores.max(dim=1).values
+    nearby_count = (all_masks & (all_close > 0.35)).float().sum(dim=1).clamp(max=3.0) / 3.0
     return (max_score + (0.25 * nearby_count)).clamp(min=0.0, max=1.5)
 
 
@@ -316,6 +374,33 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             bc_scale = float(imitation_idx.numel()) / float(B)
             weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
             bc_loss_val = float(bc_loss.detach().item())
+
+    # ── Reward-weighted BC for DQN discoveries ────────────────────────
+    # Give positive-reward DQN frames a direct "do this action" signal
+    # proportional to reward, so useful behaviours found by exploration
+    # are reinforced immediately rather than only via the slow C51 path.
+    dqn_bc_w = float(getattr(cfg, "dqn_reward_bc_weight", 0.0) or 0.0)
+    if dqn_bc_w > 0.0:
+        dqn_mask = ~is_expert_t & ~is_self_imitation_t
+        dqn_thresh = float(getattr(cfg, "dqn_reward_bc_threshold", 0.5) or 0.5)
+        dqn_positive = dqn_mask & (rewards_t > dqn_thresh)
+        if dqn_positive.any():
+            dqn_idx = dqn_positive.nonzero(as_tuple=True)[0]
+            dqn_max_w = float(getattr(cfg, "dqn_reward_bc_max_weight", 3.0) or 3.0)
+            reward_w = rewards_t[dqn_idx].clamp(min=0.0, max=dqn_max_w)
+            if bool(getattr(cfg, "factorized_bc_enabled", False)):
+                move_w_f = float(getattr(cfg, "factorized_bc_move_weight", 1.0) or 1.0)
+                fire_w_f = float(getattr(cfg, "factorized_bc_fire_weight", 1.0) or 1.0)
+                dqn_move_ce = F.cross_entropy(move_scores[dqn_idx].float(), move_targets[dqn_idx], reduction="none")
+                dqn_fire_ce = F.cross_entropy(fire_scores[dqn_idx].float(), fire_targets[dqn_idx], reduction="none")
+                dqn_move_bc = (dqn_move_ce * reward_w).sum() / reward_w.sum().clamp(min=1e-6)
+                dqn_fire_bc = (dqn_fire_ce * reward_w).sum() / reward_w.sum().clamp(min=1e-6)
+                dqn_bc_loss = (move_w_f * dqn_move_bc) + (fire_w_f * dqn_fire_bc)
+            else:
+                dqn_bc_ce = F.cross_entropy(q_all[dqn_idx].float(), actions_t[dqn_idx], reduction="none")
+                dqn_bc_loss = (dqn_bc_ce * reward_w).sum() / reward_w.sum().clamp(min=1e-6)
+            dqn_bc_scale = float(dqn_idx.numel()) / float(B)
+            weighted_loss = weighted_loss + (dqn_bc_w * dqn_bc_scale) * dqn_bc_loss
 
     # ── NaN / Inf guard ───────────────────────────────────────────────────
     if not torch.isfinite(weighted_loss):

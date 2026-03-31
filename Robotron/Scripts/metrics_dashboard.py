@@ -370,8 +370,15 @@ class _DashboardState:
           hidden_layers = list(getattr(net, "mlp_hidden_layers", list(getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512])))
           output_dim = int(getattr(net, "mlp_output_dim", int(getattr(cfg, "mlp_output_dim", 256) or 256)))
           uses_attn = bool(getattr(net, "use_mlp_with_attention", False))
-          uses_dir_lanes = bool(getattr(net, "use_directional_lanes", False))
+ 
+           uses_dir_lanes = bool(getattr(net, "use_directional_lanes", False))
+          uses_pointer = bool(getattr(net, "use_pointer_action_heads", False))
+          uses_memory = bool(getattr(net, "use_temporal_memory", False))
           slot_count = int(getattr(net, "num_object_slots", int(getattr(cfg, "object_slots", 0) or 0)))
+          pointer_slots = int(getattr(net, "pointer_slot_count", slot_count + 1))
+          move_modes = int(getattr(net, "move_mode_count", int(getattr(cfg, "move_mode_count", 0) or 0)))
+          memory_dim = int(getattr(net, "temporal_memory_dim", int(getattr(cfg, "temporal_memory_hidden", 0) or 0)))
+          interaction_rank = int(getattr(net, "move_fire_interaction_rank", int(getattr(cfg, "move_fire_interaction_rank", 0) or 0)))
           token_features = int(getattr(net, "object_token_features", int(getattr(cfg, "legacy_slot_token_features", 0) or 0)))
           lane_enc = getattr(net, "lane_encoder", None)
           attn_dim = int(getattr(lane_enc, "embed_dim", 0)) if lane_enc is not None else int(getattr(getattr(net, "object_attn", None), "out_dim", int(getattr(cfg, "attn_dim", 0) or 0)))
@@ -396,6 +403,12 @@ class _DashboardState:
             attn_frame_count,
             attn_scope,
             head_mid,
+            uses_pointer,
+            uses_memory,
+            pointer_slots,
+            move_modes,
+            memory_dim,
+            interaction_rank,
             bool(getattr(net, "use_factorized_action_heads", False)),
             int(getattr(cfg, "num_move_actions", 0) or 0),
             int(getattr(cfg, "num_fire_actions", 0) or 0),
@@ -407,11 +420,17 @@ class _DashboardState:
           layers = [f"{base_state * stack_depth}"]
           if uses_dir_lanes:
             layers.append(f"lanes8×{attn_dim}")
+            if uses_pointer:
+              layers.append(f"ptr{pointer_slots}")
+              layers.append(f"mode{move_modes}")
+              layers.append(f"int{interaction_rank}")
+            if uses_memory and memory_dim > 0:
+              layers.append(f"mem{memory_dim}")
           elif uses_attn:
             layers.extend([f"slot{slot_count}x{token_features}", f"set{attn_dim}x{attn_layers}@{attn_scope}{attn_frame_count}"])
           layers.extend([*[str(v) for v in hidden_layers], str(output_dim), str(head_mid)])
           head_style = (
-            f"mf({int(getattr(cfg, 'num_move_actions', 0) or 0)}+{int(getattr(cfg, 'num_fire_actions', 0) or 0)})"
+            f"{'ptr-' if uses_pointer else ''}mf({int(getattr(cfg, 'num_move_actions', 0) or 0)}+{int(getattr(cfg, 'num_fire_actions', 0) or 0)})"
             if bool(getattr(net, "use_factorized_action_heads", False))
             else f"joint{int(getattr(cfg, 'num_joint_actions', 0) or 0)}"
           )
@@ -423,7 +442,7 @@ class _DashboardState:
             p_str = f"{param_count / 1_000:.0f}K"
           else:
             p_str = str(param_count)
-          mode_label = "MLP+Lanes" if uses_dir_lanes else ("MLP+Attn" if uses_attn else "MLP")
+          mode_label = "MLP+PtrLanes" if (uses_dir_lanes and uses_pointer) else ("MLP+Lanes" if uses_dir_lanes else ("MLP+Attn" if uses_attn else "MLP"))
           desc = f"Model: {mode_label} · {arch_str} · {p_str} params"
           self._model_desc = desc
           self._model_desc_key = model_desc_key

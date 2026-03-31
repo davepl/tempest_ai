@@ -46,6 +46,8 @@ _GRID = int(getattr(RL_CONFIG, "grid_width", 12)) * int(getattr(RL_CONFIG, "grid
 _TOKEN_COUNT = int(getattr(RL_CONFIG, "object_token_count", 64))
 _TOKEN_FEATURES = int(getattr(RL_CONFIG, "object_token_features", 15))
 _HYBRID_BASE = _GLOBAL + _GRID + (_TOKEN_COUNT * _TOKEN_FEATURES)
+_LANE_COUNT = int(getattr(RL_CONFIG, "lane_token_count", 0) or 0)
+_LANE_FEATURES = int(getattr(RL_CONFIG, "lane_token_features", 15) or 15)
 _LEGACY_SLOT_FEATURES = int(getattr(RL_CONFIG, "slot_state_features", 11))
 
 
@@ -60,6 +62,31 @@ def _legacy_category_bases() -> dict[str, int]:
 
 _LEGACY_BASES = _legacy_category_bases()
 _LEGACY_SLOTS = {name: int(slots) for name, slots in getattr(RL_CONFIG, "entity_categories", ())}
+
+
+def _tactical_pool_bases() -> tuple[dict[str, int], dict[str, int], dict[str, int], int]:
+    bases: dict[str, int] = {}
+    slots: dict[str, int] = {}
+    feats: dict[str, int] = {}
+    tactical_grid_w = int(getattr(RL_CONFIG, "tactical_grid_width", 0) or 0)
+    tactical_grid_h = int(getattr(RL_CONFIG, "tactical_grid_height", 0) or 0)
+    tactical_grid_c = int(getattr(RL_CONFIG, "tactical_grid_channels", 0) or 0)
+    offset = int(
+        LEGACY_CORE_FEATURES
+        + LEGACY_ELIST_FEATURES
+        + (_LANE_COUNT * _LANE_FEATURES)
+        + (tactical_grid_w * tactical_grid_h * tactical_grid_c)
+    )
+    for name, slot_count, feat_count in getattr(RL_CONFIG, "state_role_pools", ()):
+        name_s = str(name)
+        bases[name_s] = offset
+        slots[name_s] = int(slot_count)
+        feats[name_s] = int(feat_count)
+        offset += 1 + (int(slot_count) * int(feat_count))
+    return bases, slots, feats, offset
+
+
+_TACTICAL_BASES, _TACTICAL_SLOTS, _TACTICAL_FEATURES, _TACTICAL_BASE = _tactical_pool_bases()
 
 
 def _blank_state() -> np.ndarray:
@@ -80,6 +107,52 @@ def _add_entity(
     dx_world = float(dx_px) * 256.0
     dy_world = float(dy_px) * 256.0
     dist_world = math.hypot(dx_world, dy_world)
+    if int(RL_CONFIG.base_state_size) >= _TACTICAL_BASE and _TACTICAL_BASES:
+        type_id = _TYPE_ID[category]
+        type_id_norm = type_id / max(1, UNIFIED_NUM_TYPES - 1)
+
+        if category == "projectile":
+            pool_name = "projectile"
+        elif category == "human":
+            pool_name = "human"
+        elif category == "electrode":
+            pool_name = "electrode"
+        else:
+            pool_name = "danger"
+
+        pool_base = _TACTICAL_BASES[pool_name]
+        pool_slots = _TACTICAL_SLOTS[pool_name]
+        pool_features = _TACTICAL_FEATURES[pool_name]
+        assert 0 <= slot_index < pool_slots, f"slot_index={slot_index} >= {pool_slots} for pool={pool_name}"
+        state[pool_base] = 1.0
+        slot_base = pool_base + 1 + slot_index * pool_features
+        state[slot_base + 0] = 1.0
+        state[slot_base + 1] = dx_world / _REL_POS_X_RANGE
+        state[slot_base + 2] = dy_world / _REL_POS_Y_RANGE
+        state[slot_base + 3] = dist_world / _POS_MAX_DIAG
+
+        if pool_name == "projectile":
+            state[slot_base + 4] = 0.0
+            state[slot_base + 5] = 0.0
+            state[slot_base + 6] = 0.0
+            state[slot_base + 7] = 1.0
+            state[slot_base + 8] = state[slot_base + 3]
+            state[slot_base + 9] = 0.0
+        elif pool_name == "danger":
+            state[slot_base + 4] = 0.0
+            state[slot_base + 5] = 0.0
+            state[slot_base + 6] = 0.0
+            state[slot_base + 7] = 0.0
+            state[slot_base + 8] = 1.0
+            state[slot_base + 9] = type_id_norm
+        elif pool_name == "human":
+            state[slot_base + 4] = 0.0
+            state[slot_base + 5] = 0.0
+            state[slot_base + 6] = 0.0
+        elif pool_name == "electrode":
+            state[slot_base + 4] = 0.0
+        return
+
     if int(RL_CONFIG.base_state_size) >= _HYBRID_BASE:
         assert 0 <= slot_index < _TOKEN_COUNT
         token_base = _GLOBAL + _GRID + slot_index * _TOKEN_FEATURES

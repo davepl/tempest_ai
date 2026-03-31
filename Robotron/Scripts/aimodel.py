@@ -41,6 +41,9 @@ import torch.optim as optim
 try:
     from config import SERVER_CONFIG, RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, \
                         LEGACY_CORE_FEATURES, LEGACY_ELIST_FEATURES, LEGACY_SLOT_STATE_FEATURES, \
+                        TACTICAL_LANE_COUNT, TACTICAL_LANE_FEATURES, \
+                        TACTICAL_LOCAL_GRID_WIDTH, TACTICAL_LOCAL_GRID_HEIGHT, TACTICAL_LOCAL_GRID_CHANNELS, \
+                        TACTICAL_POOL_DEFS, \
                         UNIFIED_TYPE_NAMES, UNIFIED_NUM_TYPES, \
                         UNIFIED_HUMAN_TYPE_ID, UNIFIED_ELECTRODE_TYPE_ID, \
                         metrics as config_metrics, RESET_METRICS, IS_INTERACTIVE
@@ -49,6 +52,9 @@ try:
 except ImportError:
     from Scripts.config import SERVER_CONFIG, RL_CONFIG, MODEL_DIR, LATEST_MODEL_PATH, \
                                LEGACY_CORE_FEATURES, LEGACY_ELIST_FEATURES, LEGACY_SLOT_STATE_FEATURES, \
+                               TACTICAL_LANE_COUNT, TACTICAL_LANE_FEATURES, \
+                               TACTICAL_LOCAL_GRID_WIDTH, TACTICAL_LOCAL_GRID_HEIGHT, TACTICAL_LOCAL_GRID_CHANNELS, \
+                               TACTICAL_POOL_DEFS, \
                                UNIFIED_TYPE_NAMES, UNIFIED_NUM_TYPES, \
                                UNIFIED_HUMAN_TYPE_ID, UNIFIED_ELECTRODE_TYPE_ID, \
                                metrics as config_metrics, RESET_METRICS, IS_INTERACTIVE
@@ -170,11 +176,17 @@ else:
 # ── Action helpers ──────────────────────────────────────────────────────────
 # Direction encoding:
 #   Move: 0..7 are directions, 8 is idle/no-move (when enabled via num_move_actions=9)
-#   Fire: 0..7 are directions (no idle action in policy space)
+#   Fire: 0..7 are directions, 8 is idle/no-fire (when enabled via num_fire_actions=9)
 NUM_MOVE = RL_CONFIG.num_move_actions
 NUM_FIRE = RL_CONFIG.num_fire_actions
 NUM_JOINT = RL_CONFIG.num_joint_actions
-MODEL_ARCH_VERSION = 17
+MODEL_ARCH_VERSION = 22
+
+# Serialized lane tokens are emitted in mathematical angle order starting at
+# +X/right, while Robotron's action ids start at up and rotate clockwise.
+# Keep the wire format stable and remap only where we need action-aligned
+# priors: up, up-right, right, down-right, down, down-left, left, up-left.
+_ACTION_DIR_TO_LANE_INDEX = (2, 1, 0, 7, 6, 5, 4, 3)
 
 
 def _clamp_game_dir(idx: int) -> int:
@@ -192,9 +204,23 @@ def _move_idle_action_index() -> int:
     return 0
 
 
+def _fire_idle_action_index() -> int:
+    # Convention: if an explicit fire-idle action exists, it is the final fire bin.
+    if NUM_FIRE >= 9:
+        return NUM_FIRE - 1
+    return 0
+
+
 def _encode_move_to_game(move_dir: int) -> int:
     i = int(move_dir)
     if NUM_MOVE >= 9 and i == (NUM_MOVE - 1):
+        return -1
+    return _clamp_game_dir(i)
+
+
+def _encode_fire_to_game(fire_dir: int) -> int:
+    i = int(fire_dir)
+    if NUM_FIRE >= 9 and i == (NUM_FIRE - 1):
         return -1
     return _clamp_game_dir(i)
 
@@ -215,7 +241,7 @@ def split_joint_action(idx: int) -> Tuple[int, int]:
 
 
 def encode_action_to_game(move_dir: int, fire_dir: int) -> Tuple[int, int]:
-    return _encode_move_to_game(move_dir), _clamp_game_dir(fire_dir)
+    return _encode_move_to_game(move_dir), _encode_fire_to_game(fire_dir)
 
 # ── Frame data ──────────────────────────────────────────────────────────────
 @dataclass
@@ -708,6 +734,85 @@ def _legacy_slot_layout() -> tuple[list[tuple[str, int, int, int]], int]:
     return info, offset
 
 
+def _tactical_pool_layout() -> tuple[list[tuple[str, int, int, int]], int]:
+    lane_count = int(getattr(RL_CONFIG, "lane_token_count", TACTICAL_LANE_COUNT) or TACTICAL_LANE_COUNT)
+    lane_features = int(getattr(RL_CONFIG, "lane_token_features", TACTICAL_LANE_FEATURES) or TACTICAL_LANE_FEATURES)
+    grid_w, grid_h, grid_c, grid_n = _tactical_grid_layout()
+    offset = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES + (lane_count * lane_features) + grid_n)
+    info: list[tuple[str, int, int, int]] = []
+    for name, slots, slot_features in getattr(RL_CONFIG, "state_role_pools", TACTICAL_POOL_DEFS):
+        slots_i = int(slots)
+        feat_i = int(slot_features)
+        info.append((str(name), offset, slots_i, feat_i))
+        offset += 1 + (slots_i * feat_i)
+    return info, offset
+
+
+def _tactical_grid_layout() -> tuple[int, int, int, int]:
+    cfg = RL_CONFIG
+    gw = int(getattr(cfg, "tactical_grid_width", TACTICAL_LOCAL_GRID_WIDTH) or TACTICAL_LOCAL_GRID_WIDTH)
+    gh = int(getattr(cfg, "tactical_grid_height", TACTICAL_LOCAL_GRID_HEIGHT) or TACTICAL_LOCAL_GRID_HEIGHT)
+    gc = int(getattr(cfg, "tactical_grid_channels", TACTICAL_LOCAL_GRID_CHANNELS) or TACTICAL_LOCAL_GRID_CHANNELS)
+    return gw, gh, gc, gw * gh * gc
+
+
+def _category_box_norm(type_name: str) -> tuple[float, float]:
+    w_px, h_px = _LEGACY_CATEGORY_BOX_PX.get(type_name, (8.0, 8.0))
+    return (
+        max(0.0, min(1.0, float(w_px) / 16.0)),
+        max(0.0, min(1.0, float(h_px) / 16.0)),
+    )
+
+
+def _decoded_slot_row(
+    dx: float,
+    dy: float,
+    vx: float,
+    vy: float,
+    dist: float,
+    threat: float,
+    approach: float,
+    type_id_norm: float,
+) -> list[float] | None:
+    if not np.isfinite(dist):
+        return None
+    type_den = max(1, UNIFIED_NUM_TYPES - 1)
+    type_id = int(round(float(type_id_norm) * type_den))
+    type_id = max(0, min(UNIFIED_NUM_TYPES - 1, type_id))
+    type_name = UNIFIED_TYPE_NAMES[type_id]
+    is_human = 1.0 if type_id == UNIFIED_HUMAN_TYPE_ID else 0.0
+    is_dangerous = 1.0 if type_name in _LEGACY_DANGEROUS_CATEGORIES else 0.0
+    hit_w_norm, hit_h_norm = _category_box_norm(type_name)
+
+    world_dx = dx * _REL_POS_X_RANGE
+    world_dy = dy * _REL_POS_Y_RANGE
+    world_dist = math.hypot(world_dx, world_dy)
+    if world_dist > 1e-6:
+        dir_x = world_dx / world_dist
+        dir_y = world_dy / world_dist
+    else:
+        dir_x = 0.0
+        dir_y = 0.0
+
+    return [
+        1.0,
+        float(dx),
+        float(dy),
+        float(vx),
+        float(vy),
+        float(dist),
+        dir_x,
+        dir_y,
+        float(threat),
+        hit_w_norm,
+        hit_h_norm,
+        float(type_id_norm),
+        is_human,
+        is_dangerous,
+        float(approach),
+    ]
+
+
 def _detect_base_state_size(total_size: int) -> int:
     total = max(0, int(total_size))
     if total <= 0:
@@ -716,6 +821,7 @@ def _detect_base_state_size(total_size: int) -> int:
     for cand in {
         int(getattr(RL_CONFIG, "base_state_size", SERVER_CONFIG.params_count)),
         _hybrid_base_state_size(),
+        _tactical_pool_layout()[1],
         _legacy_slot_layout()[1],
     }:
         if cand > 0 and total >= cand and (total % cand) == 0:
@@ -756,7 +862,7 @@ def _split_latest_sections(state: np.ndarray):
 def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
     latest, prev, base_state_size = _latest_prev_frame_state(state)
     cat_info, legacy_size = _legacy_slot_layout()
-    if base_state_size != legacy_size or latest.size < legacy_size:
+    if base_state_size < legacy_size or latest.size < legacy_size:
         return np.zeros((0, 15), dtype=np.float32)
 
     slot_features = int(getattr(RL_CONFIG, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
@@ -840,9 +946,81 @@ def _legacy_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
     return np.asarray(rows, dtype=np.float32)
 
 
+def _tactical_slot_tokens_from_state(state: np.ndarray) -> np.ndarray:
+    latest, _prev, base_state_size = _latest_prev_frame_state(state)
+    pool_info, tactical_size = _tactical_pool_layout()
+    if base_state_size < tactical_size or latest.size < tactical_size:
+        return np.zeros((0, 15), dtype=np.float32)
+
+    rows: list[list[float]] = []
+    type_den = max(1, UNIFIED_NUM_TYPES - 1)
+    projectile_type_norm = float(UNIFIED_TYPE_NAMES.index("projectile")) / float(type_den)
+    human_type_norm = float(UNIFIED_HUMAN_TYPE_ID) / float(type_den)
+    electrode_type_norm = float(UNIFIED_ELECTRODE_TYPE_ID) / float(type_den)
+
+    for pool_name, base, slots, slot_features in pool_info:
+        block = latest[base + 1: base + 1 + slots * slot_features].reshape(slots, slot_features)
+        for slot_idx in range(slots):
+            if float(block[slot_idx, 0]) < 0.5:
+                continue
+
+            if pool_name == "projectile":
+                dx = float(block[slot_idx, 1])
+                dy = float(block[slot_idx, 2])
+                dist = float(block[slot_idx, 3])
+                vx = float(block[slot_idx, 4]) if slot_features >= 5 else 0.0
+                vy = float(block[slot_idx, 5]) if slot_features >= 6 else 0.0
+                threat = float(block[slot_idx, 6]) if slot_features >= 7 else 0.0
+                approach = float(block[slot_idx, 9]) if slot_features >= 10 else 0.0
+                type_id_norm = projectile_type_norm
+            elif pool_name == "danger":
+                dx = float(block[slot_idx, 1])
+                dy = float(block[slot_idx, 2])
+                dist = float(block[slot_idx, 3])
+                vx = float(block[slot_idx, 4])
+                vy = float(block[slot_idx, 5])
+                threat = float(block[slot_idx, 6])
+                approach = float(block[slot_idx, 7])
+                type_id_norm = float(block[slot_idx, 9]) if slot_features >= 10 else 0.0
+            elif pool_name == "human":
+                dx = float(block[slot_idx, 1])
+                dy = float(block[slot_idx, 2])
+                dist = float(block[slot_idx, 3])
+                vx = float(block[slot_idx, 4]) if slot_features >= 5 else 0.0
+                vy = float(block[slot_idx, 5]) if slot_features >= 6 else 0.0
+                threat = float(block[slot_idx, 6]) if slot_features >= 7 else 0.0
+                approach = 0.0
+                type_id_norm = human_type_norm
+            elif pool_name == "electrode":
+                dx = float(block[slot_idx, 1])
+                dy = float(block[slot_idx, 2])
+                dist = float(block[slot_idx, 3])
+                vx = 0.0
+                vy = 0.0
+                threat = float(block[slot_idx, 4]) if slot_features >= 5 else 0.0
+                approach = 0.0
+                type_id_norm = electrode_type_norm
+            else:
+                continue
+
+            row = _decoded_slot_row(dx, dy, vx, vy, dist, threat, approach, type_id_norm)
+            if row is not None:
+                rows.append(row)
+
+    if not rows:
+        return np.zeros((0, 15), dtype=np.float32)
+    return np.asarray(rows, dtype=np.float32)
+
+
 def _active_tokens_from_state(state: np.ndarray) -> np.ndarray:
-    latest = _latest_frame_state(state)
-    if latest.size == _legacy_slot_layout()[1]:
+    latest, _prev, base_state_size = _latest_prev_frame_state(state)
+    tactical_size = _tactical_pool_layout()[1]
+    legacy_size = _legacy_slot_layout()[1]
+    hybrid_size = _hybrid_base_state_size()
+
+    if tactical_size <= base_state_size < legacy_size:
+        return _tactical_slot_tokens_from_state(state)
+    if legacy_size <= base_state_size < hybrid_size:
         return _legacy_slot_tokens_from_state(state)
     _, _, tokens = _split_latest_sections(state)
     if tokens is None or tokens.size == 0:
@@ -1500,6 +1678,7 @@ def _get_simple_expert_action(
         and humans_for_rescue_mode > 0
         and destructible_enemies <= 1
     )
+    idle_fire_dir = _fire_idle_action_index()
     s = _latest_frame_state(state)
     px = float(s[5]) if s.size > 6 else 0.5
     py = float(s[6]) if s.size > 6 else 0.5
@@ -1507,7 +1686,7 @@ def _get_simple_expert_action(
     # ── Fire direction ───────────────────────────────────────────────
     if last_enemy_rescue_mode:
         defensive_fire_dir = _defensive_fire_direction_from_state(state)
-        fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else 0
+        fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else idle_fire_dir
     else:
         if priority_spawn_fire_dir is not None:
             fire_dir = int(priority_spawn_fire_dir)
@@ -1522,7 +1701,7 @@ def _get_simple_expert_action(
             fx, fy, _ = nearest_enemy
             fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
         else:
-            fire_dir = 0
+            fire_dir = idle_fire_dir
     if locked_fire is not None and int(locked_fire) >= 0:
         fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
 
@@ -1607,6 +1786,7 @@ def _get_strategic_expert_action(
         and humans_for_rescue_mode > 0
         and destructible_enemies <= 1
     )
+    idle_fire_dir = _fire_idle_action_index()
     s = _latest_frame_state(state)
     px = float(s[5]) if s.size > 6 else 0.5
     py = float(s[6]) if s.size > 6 else 0.5
@@ -1624,7 +1804,7 @@ def _get_strategic_expert_action(
     rescue_hunt_fire_dir = None
     if last_enemy_rescue_mode:
         defensive_fire_dir = _defensive_fire_direction_from_state(state)
-        fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else 0
+        fire_dir = int(defensive_fire_dir) if defensive_fire_dir is not None else idle_fire_dir
     else:
         if protect_humans_wave:
             if nearest_projectile is not None and nearest_projectile[2] <= _PROJECTILE_DANGER_DIST:
@@ -1650,7 +1830,7 @@ def _get_strategic_expert_action(
             fx, fy, _ = nearest_enemy
             fire_dir = _closest_dir8(fx * _REL_POS_X_RANGE, fy * _REL_POS_Y_RANGE, default_dir=0)
         else:
-            fire_dir = 0
+            fire_dir = idle_fire_dir
     if locked_fire is not None and int(locked_fire) >= 0:
         fire_dir = max(0, min(NUM_FIRE - 1, int(locked_fire)))
 
@@ -1885,7 +2065,10 @@ class SpatialGridEncoder(nn.Module):
             nn.ReLU(),
             nn.Conv2d(hidden_channels * 2, hidden_channels * 3, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((2, 2)),
+            # The current 9x9 tactical grid deterministically reaches 3x3 after
+            # the strided conv stack, so a fixed 2x2 pool avoids MPS adaptive
+            # pooling limitations on non-divisible shapes.
+            nn.AvgPool2d(kernel_size=2, stride=1),
         )
         flat_dim = (hidden_channels * 3) * 2 * 2
         self.proj = nn.Sequential(
@@ -1951,27 +2134,25 @@ class EntitySetEncoder(nn.Module):
 # humans in that direction.  Cross-attention enriches lane tokens with the
 # full entity set, producing an 8-lane spatial summary vector.
 
-_NUM_LANES = 8
+_NUM_LANES = TACTICAL_LANE_COUNT
 # Unit vectors for the 8 canonical directions (right=0, then CCW in game coords).
 # Game Y axis is inverted (down is positive), so Up = (0, -1).
 _LANE_DIR_X = torch.tensor([1.0, 0.7071, 0.0, -0.7071, -1.0, -0.7071,  0.0,  0.7071])
 _LANE_DIR_Y = torch.tensor([0.0, -0.7071, -1.0, -0.7071,  0.0,  0.7071, 1.0,  0.7071])
 
-# Features per lane token (built from aggregated entity data):
-#   nearest_enemy_dist, nearest_enemy_dx, nearest_enemy_dy,
-#   nearest_enemy_vx, nearest_enemy_vy, nearest_enemy_threat, nearest_enemy_approach,
-#   enemy_count_in_lane,
-#   nearest_human_dist, nearest_human_dx, nearest_human_dy,
-#   human_count_in_lane,
-#   nearest_electrode_dist,
-#   sin_dir, cos_dir
-_LANE_TOKEN_FEATURES = 15
+# Features per serialized lane token:
+#   enemy_dist, enemy_dx, enemy_dy, enemy_vx, enemy_vy, enemy_threat,
+#   enemy_approach, enemy_count,
+#   human_dist, human_dx, human_dy, human_count,
+#   electrode_dist, projectile_dist, projectile_ttc, projectile_closest_pass,
+#   projectile_count, enemy_ttc, sin_dir, cos_dir
+_LANE_TOKEN_FEATURES = TACTICAL_LANE_FEATURES
 
 
 class DirectionalLaneEncoder(nn.Module):
     """Bin entities into 8 directional lanes and cross-attend.
 
-    Lane tokens (8 × 15 features) serve as queries; all entity tokens serve
+    Lane tokens (8 × current-lane-feature-count) serve as queries; all entity tokens serve
     as keys/values.  The resulting enriched lane representation is gated-pooled
     (learned per-lane importance weights) into a fixed-size summary vector for
     the MLP trunk.  Empty lanes are masked out of the pooling.
@@ -2035,7 +2216,7 @@ class DirectionalLaneEncoder(nn.Module):
         """Aggregate per-entity data into 8 directional lane tokens.
 
         Returns:
-            lane_tokens: (B, 8, 15) directional aggregate features.
+            lane_tokens: (B, 8, _LANE_TOKEN_FEATURES) directional aggregate features.
             lane_has_entity: (B, 8) bool mask indicating non-empty lanes.
         """
         B, S = entity_dx.shape
@@ -2121,7 +2302,7 @@ class DirectionalLaneEncoder(nn.Module):
 
     def forward(
         self,
-        lane_tokens: torch.Tensor,      # (B, 8, 15)
+        lane_tokens: torch.Tensor,      # (B, 8, _LANE_TOKEN_FEATURES)
         entity_tokens: torch.Tensor,    # (B, S, entity_features)
         entity_mask: torch.Tensor,      # (B, S) bool — True = empty/absent
         lane_mask: torch.Tensor,        # (B, 8) bool — True = lane has entities
@@ -2186,35 +2367,69 @@ class RainbowNet(nn.Module):
         self.stack_depth = max(1, int(self.state_size // max(1, self.base_state_size)))
         self.attn_all_frames = bool(getattr(cfg, "attn_all_frames", False))
         self.attn_frame_count = self.stack_depth if self.attn_all_frames else 1
-        self.num_object_slots = int(getattr(cfg, "object_slots", 64))
-        self.slot_state_features = int(getattr(cfg, "slot_state_features", LEGACY_SLOT_STATE_FEATURES))
         self.core_feature_count = int(LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES)
-        self._cat_info = []
+        self.lane_token_count = int(getattr(cfg, "lane_token_count", TACTICAL_LANE_COUNT) or TACTICAL_LANE_COUNT)
+        self.lane_token_features = int(getattr(cfg, "lane_token_features", TACTICAL_LANE_FEATURES) or TACTICAL_LANE_FEATURES)
+        self.lane_feature_width = self.lane_token_count * self.lane_token_features
+        self.tactical_grid_width = int(getattr(cfg, "tactical_grid_width", TACTICAL_LOCAL_GRID_WIDTH) or TACTICAL_LOCAL_GRID_WIDTH)
+        self.tactical_grid_height = int(getattr(cfg, "tactical_grid_height", TACTICAL_LOCAL_GRID_HEIGHT) or TACTICAL_LOCAL_GRID_HEIGHT)
+        self.tactical_grid_channels = int(getattr(cfg, "tactical_grid_channels", TACTICAL_LOCAL_GRID_CHANNELS) or TACTICAL_LOCAL_GRID_CHANNELS)
+        self.local_grid_feature_width = self.tactical_grid_width * self.tactical_grid_height * self.tactical_grid_channels
+        self.use_local_tactical_grid = bool(getattr(cfg, "use_local_tactical_grid", True)) and self.local_grid_feature_width > 0
+        self.local_grid_offset = self.core_feature_count + self.lane_feature_width
+        self.local_grid_end = self.local_grid_offset + self.local_grid_feature_width
+        self._pool_info = []
         self._category_ranges = []
         self._num_categories = 0
         self._occupancy_offsets = []
-
-        # Unified pool: single ("entity", 64) category with per-slot type_id
-        cat_defs = getattr(cfg, "entity_categories", [("entity", 64)])
-        if self.use_attn:
-            offset = self.core_feature_count
-            slot_cursor = 0
-            for cat_id, (name, slots) in enumerate(cat_defs):
-                slots_i = int(slots)
-                self._cat_info.append((name, offset, slots_i, cat_id))
-                self._category_ranges.append((name, slot_cursor, slot_cursor + slots_i))
-                offset += 1 + (slots_i * self.slot_state_features)
-                slot_cursor += slots_i
-            self._num_categories = len(cat_defs)
-            self._occupancy_offsets = [base for _name, base, _slots, _cat_id in self._cat_info]
+        pool_defs = getattr(cfg, "state_role_pools", TACTICAL_POOL_DEFS)
+        offset = self.local_grid_end
+        slot_cursor = 0
+        max_slot_features = 0
+        for pool_id, (name, slots, slot_features) in enumerate(pool_defs):
+            slots_i = int(slots)
+            feat_i = int(slot_features)
+            self._pool_info.append((str(name), offset, slots_i, feat_i, pool_id))
+            self._category_ranges.append((str(name), slot_cursor, slot_cursor + slots_i))
+            self._occupancy_offsets.append(offset)
+            offset += 1 + (slots_i * feat_i)
+            slot_cursor += slots_i
+            max_slot_features = max(max_slot_features, feat_i)
+        self.structured_state_width = offset
+        self.extra_context_features = max(0, self.base_state_size - self.structured_state_width)
+        self._num_categories = len(self._pool_info)
+        self.num_object_slots = slot_cursor
+        self.slot_state_features = max_slot_features
+        if self.use_local_tactical_grid:
+            self.dense_state_size = int(self.state_size - (self.local_grid_feature_width * self.stack_depth))
+        else:
+            self.dense_state_size = int(self.state_size)
 
         # Learned type embedding replaces the old scalar cat_norm / is_human / is_dangerous meta
         self.type_embedding_dim = int(getattr(cfg, "type_embedding_dim", 16))
         self.type_embedding = nn.Embedding(UNIFIED_NUM_TYPES, self.type_embedding_dim)
-        # Entity token: 9 raw features + type_emb(16) + is_human(1) + is_dangerous(1) = 27
-        entity_raw_features = 9  # dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
+        self.projectile_type_id = int(UNIFIED_TYPE_NAMES.index("projectile")) if "projectile" in UNIFIED_TYPE_NAMES else 0
+        type_hit_w = []
+        type_hit_h = []
+        for type_name in UNIFIED_TYPE_NAMES:
+            w_norm, h_norm = _category_box_norm(type_name)
+            type_hit_w.append(w_norm)
+            type_hit_h.append(h_norm)
+        self.register_buffer("type_hit_w", torch.tensor(type_hit_w, dtype=torch.float32))
+        self.register_buffer("type_hit_h", torch.tensor(type_hit_h, dtype=torch.float32))
+        # Entity token: predictive geometry + type/meta flags.
+        entity_raw_features = 11  # dx, dy, vx, vy, dist, threat, approach, ttc, closest_pass, hit_w, hit_h
         self._entity_token_dim = entity_raw_features + self.type_embedding_dim + 2
         self.object_token_features = self._entity_token_dim
+        self.use_factorized_joint_residual = bool(getattr(cfg, "factorized_joint_residual", False))
+        self.use_directional_action_priors = bool(getattr(cfg, "use_directional_action_priors", False))
+        self.directional_temporal_fusion = False
+        self.lane_summary_dim = 0
+        self.entity_pool_summary_dim = 0
+        self.grid_summary_dim = 0
+        self.lane_temporal_in_dim = 0
+        self.entity_temporal_in_dim = 0
+        self.grid_temporal_in_dim = 0
 
         if self.use_pure_mlp:
             mlp_hidden = [int(v) for v in getattr(cfg, "mlp_hidden_layers", [1024, 512]) or [1024, 512]]
@@ -2230,6 +2445,7 @@ class RainbowNet(nn.Module):
             )
             lane_out_dim = 0
             entity_pool_dim = 0
+            grid_out_dim = 0
             attn_dim = int(getattr(cfg, "attn_dim", 256))
             if self.use_directional_lanes:
                 # ── Entity input projection: raw token → attn_dim ──────
@@ -2263,11 +2479,65 @@ class RainbowNet(nn.Module):
                     num_heads=int(getattr(cfg, "attn_heads", 4)),
                 )
                 lane_out_dim = self.lane_encoder.out_dim
+                self.lane_summary_dim = lane_out_dim
+                if self.use_directional_action_priors:
+                    prior_hidden = max(32, int(getattr(cfg, "directional_action_prior_hidden", 96) or 96))
+                    self.move_lane_prior = nn.Sequential(
+                        nn.Linear(self.lane_token_features, prior_hidden),
+                        nn.LayerNorm(prior_hidden),
+                        nn.ReLU(),
+                        nn.Linear(prior_hidden, 1),
+                    )
+                    self.fire_lane_prior = nn.Sequential(
+                        nn.Linear(self.lane_token_features, prior_hidden),
+                        nn.LayerNorm(prior_hidden),
+                        nn.ReLU(),
+                        nn.Linear(prior_hidden, 1),
+                    )
+                    self.register_buffer(
+                        "action_dir_to_lane_index",
+                        torch.tensor(_ACTION_DIR_TO_LANE_INDEX, dtype=torch.long),
+                    )
+                else:
+                    self.move_lane_prior = None
+                    self.fire_lane_prior = None
 
                 # ── Entity pool: mean-pool self-attended tokens → summary
                 entity_pool_dim = attn_dim
+                self.entity_pool_summary_dim = entity_pool_dim
                 self.entity_pool_proj = nn.Linear(attn_dim, entity_pool_dim)
                 self.entity_pool_norm = nn.LayerNorm(entity_pool_dim)
+                if self.use_local_tactical_grid:
+                    grid_out_dim = attn_dim
+                    self.grid_summary_dim = grid_out_dim
+                    self.local_grid_encoder = SpatialGridEncoder(
+                        channels=self.tactical_grid_channels,
+                        hidden_channels=int(getattr(cfg, "grid_hidden_channels", 32)),
+                        out_dim=grid_out_dim,
+                    )
+                self.directional_temporal_fusion = self.attn_frame_count > 1
+                self.lane_temporal_in_dim = lane_out_dim * self.attn_frame_count
+                self.entity_temporal_in_dim = entity_pool_dim * self.attn_frame_count
+                if grid_out_dim > 0:
+                    self.grid_temporal_in_dim = grid_out_dim * self.attn_frame_count
+                if self.directional_temporal_fusion:
+                    self.lane_temporal_proj = self._make_temporal_projection(
+                        self.lane_temporal_in_dim,
+                        lane_out_dim,
+                    )
+                    self.entity_temporal_proj = self._make_temporal_projection(
+                        self.entity_temporal_in_dim,
+                        entity_pool_dim,
+                    )
+                    self.grid_temporal_proj = (
+                        self._make_temporal_projection(self.grid_temporal_in_dim, grid_out_dim)
+                        if grid_out_dim > 0
+                        else None
+                    )
+                else:
+                    self.lane_temporal_proj = None
+                    self.entity_temporal_proj = None
+                    self.grid_temporal_proj = None
             elif self.use_mlp_with_attention:
                 self.entity_input_proj = nn.Sequential(
                     nn.Linear(self._entity_token_dim, attn_dim),
@@ -2287,13 +2557,23 @@ class RainbowNet(nn.Module):
                     nn.ReLU(),
                 )
 
-            # MLP trunk: stacked flat state + lane summary + entity pool summary
-            # Separate LayerNorm per branch before concatenation so each
-            # branch's features start on equal footing at init.
+            # MLP trunk: compact global state + lane summary + entity pool summary
+            # When directional-lane attention is active, the attention path
+            # already processes lane tokens, entity pools, and the grid.
+            # Pass only the compact global features (core + ELIST + python
+            # context) through the flat path to avoid overwhelming the trunk
+            # with redundant high-dimensional raw data.
             if self.use_directional_lanes:
-                self.state_norm = nn.LayerNorm(int(state_size))
+                self.compact_dense_features = self.core_feature_count + self.extra_context_features
+                self.compact_dense_size = self.compact_dense_features * self.stack_depth
+                self.state_norm = nn.LayerNorm(self.compact_dense_size)
                 self.lane_norm_out = nn.LayerNorm(lane_out_dim)
-            trunk_in = int(state_size) + lane_out_dim + entity_pool_dim
+                if grid_out_dim > 0:
+                    self.grid_norm_out = nn.LayerNorm(grid_out_dim)
+            if self.use_directional_lanes:
+                trunk_in = self.compact_dense_size + lane_out_dim + entity_pool_dim + grid_out_dim
+            else:
+                trunk_in = int(self.dense_state_size) + lane_out_dim + entity_pool_dim + grid_out_dim
             layers = []
             in_dim = trunk_in
             for width in mlp_hidden:
@@ -2334,7 +2614,13 @@ class RainbowNet(nn.Module):
         attn_dim = int(getattr(cfg, "attn_dim", 96))
         entity_hidden = int(getattr(cfg, "entity_hidden", 192))
         self.global_encoder = GlobalEncoder(
-            in_dim=self.stack_depth * (self.core_feature_count + self._num_categories),
+            in_dim=self.stack_depth * (
+                self.core_feature_count
+                + self.lane_feature_width
+                + (self.local_grid_feature_width if self.use_local_tactical_grid else 0)
+                + self._num_categories
+                + self.extra_context_features
+            ),
             hidden_dim=int(getattr(cfg, "global_hidden", 128)),
         )
         # Encode each frame's visible object set independently, then fuse all
@@ -2382,6 +2668,16 @@ class RainbowNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
+    def _make_temporal_projection(self, in_dim: int, out_dim: int) -> nn.Sequential:
+        hidden = max(int(out_dim), int(in_dim // 2))
+        return nn.Sequential(
+            nn.Linear(int(in_dim), hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, int(out_dim)),
+            nn.LayerNorm(int(out_dim)),
+        )
+
     def _build_action_heads(self, head_in: int, head_mid: int):
         self.head_mid = int(head_mid)
         if self.use_factorized_action_heads:
@@ -2397,6 +2693,10 @@ class RainbowNet(nn.Module):
                 self.move_q_out = nn.Linear(head_mid, NUM_MOVE * self.num_atoms)
                 self.fire_q_fc = nn.Linear(head_in, head_mid)
                 self.fire_q_out = nn.Linear(head_mid, NUM_FIRE * self.num_atoms)
+            if self.use_factorized_joint_residual:
+                joint_hidden = max(64, int(getattr(RL_CONFIG, "factorized_joint_residual_hidden", head_mid) or head_mid))
+                self.joint_res_fc = nn.Linear(head_in, joint_hidden)
+                self.joint_res_out = nn.Linear(joint_hidden, self.num_actions * self.num_atoms)
             return
 
         if self.use_dueling:
@@ -2408,8 +2708,16 @@ class RainbowNet(nn.Module):
             self.q_fc = nn.Linear(head_in, head_mid)
             self.q_out = nn.Linear(head_mid, self.num_actions * self.num_atoms)
 
-    def _action_head_q_atoms(self, h: torch.Tensor, B: int) -> torch.Tensor:
+    def _action_head_q_atoms(
+        self,
+        h: torch.Tensor,
+        B: int,
+        move_prior: Optional[torch.Tensor] = None,
+        fire_prior: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self.use_factorized_action_heads:
+            move_prior_atoms = move_prior.view(B, NUM_MOVE, 1, 1) if move_prior is not None else None
+            fire_prior_atoms = fire_prior.view(B, 1, NUM_FIRE, 1) if fire_prior is not None else None
             if self.use_dueling:
                 val = F.relu(self.val_fc(h))
                 val = self.val_out(val).view(B, 1, 1, self.num_atoms)
@@ -2418,6 +2726,10 @@ class RainbowNet(nn.Module):
                 move_adv = self.move_adv_out(move_adv).view(B, NUM_MOVE, 1, self.num_atoms)
                 fire_adv = F.relu(self.fire_adv_fc(h))
                 fire_adv = self.fire_adv_out(fire_adv).view(B, 1, NUM_FIRE, self.num_atoms)
+                if move_prior_atoms is not None:
+                    move_adv = move_adv + move_prior_atoms
+                if fire_prior_atoms is not None:
+                    fire_adv = fire_adv + fire_prior_atoms
 
                 move_adv = move_adv - move_adv.mean(dim=1, keepdim=True)
                 fire_adv = fire_adv - fire_adv.mean(dim=2, keepdim=True)
@@ -2427,7 +2739,16 @@ class RainbowNet(nn.Module):
                 move_q = self.move_q_out(move_q).view(B, NUM_MOVE, 1, self.num_atoms)
                 fire_q = F.relu(self.fire_q_fc(h))
                 fire_q = self.fire_q_out(fire_q).view(B, 1, NUM_FIRE, self.num_atoms)
+                if move_prior_atoms is not None:
+                    move_q = move_q + move_prior_atoms
+                if fire_prior_atoms is not None:
+                    fire_q = fire_q + fire_prior_atoms
                 q_atoms = move_q + fire_q
+            if self.use_factorized_joint_residual:
+                joint_res = F.relu(self.joint_res_fc(h))
+                joint_res = self.joint_res_out(joint_res).view(B, NUM_MOVE, NUM_FIRE, self.num_atoms)
+                joint_res = joint_res - joint_res.mean(dim=(1, 2), keepdim=True)
+                q_atoms = q_atoms + joint_res
             return q_atoms.view(B, self.num_actions, self.num_atoms)
 
         if self.use_dueling:
@@ -2445,113 +2766,240 @@ class RainbowNet(nn.Module):
         stack_depth = max(1, total_dim // self.base_state_size)
         return [i * self.base_state_size for i in range(stack_depth)]
 
+    def _attention_frame_offsets(self, state: torch.Tensor) -> list[int]:
+        frame_offsets = self._frame_offsets(state)
+        if not self.attn_all_frames and frame_offsets:
+            frame_offsets = frame_offsets[-1:]
+        return frame_offsets
+
     def _build_global_features(self, state: torch.Tensor) -> torch.Tensor:
         parts = []
         for frame_off in self._frame_offsets(state):
-            parts.append(state[:, frame_off: frame_off + self.core_feature_count])
+            parts.append(state[:, frame_off: frame_off + self.core_feature_count + self.lane_feature_width])
+            if self.use_local_tactical_grid and self.local_grid_feature_width > 0:
+                parts.append(state[:, frame_off + self.local_grid_offset: frame_off + self.local_grid_end])
             for base in self._occupancy_offsets:
                 parts.append(state[:, frame_off + base: frame_off + base + 1])
+            if self.extra_context_features > 0:
+                extra_start = frame_off + self.structured_state_width
+                extra_end = extra_start + self.extra_context_features
+                parts.append(state[:, extra_start:extra_end])
         return torch.cat(parts, dim=1)
 
-    def _build_frame_object_tokens(self, state: torch.Tensor, frame_off: int):
-        """Build unified pool entity tokens with learned type embeddings.
+    def _build_dense_state_input(self, state: torch.Tensor) -> torch.Tensor:
+        if not self.use_local_tactical_grid or self.local_grid_feature_width <= 0:
+            return state
+        parts = []
+        for frame_off in self._frame_offsets(state):
+            parts.append(state[:, frame_off: frame_off + self.local_grid_offset])
+            parts.append(state[:, frame_off + self.local_grid_end: frame_off + self.base_state_size])
+        return torch.cat(parts, dim=1)
 
-        Wire format per slot (11 features):
-            present(0), dx(1), dy(2), dist(3), vx(4), vy(5),
-            threat(6), approach(7), hit_w_norm(8), hit_h_norm(9), type_id_norm(10)
+    def _build_compact_dense_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Extract only core + ELIST + python context features per frame.
 
-        Output token (27 features):
-            dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h,
-            type_emb(16), is_human, is_dangerous
+        When the directional-lane attention path already processes lane tokens,
+        entity pools, and the tactical grid, feeding those same raw features
+        through the flat MLP wastes trunk capacity on redundant data.  This
+        method returns only the compact global signals the attention path does
+        NOT directly consume.
         """
+        parts = []
+        for frame_off in self._frame_offsets(state):
+            # Core features (18) + ELIST bytes (22) = core_feature_count
+            parts.append(state[:, frame_off: frame_off + self.core_feature_count])
+            # Python control context tail (if any)
+            if self.extra_context_features > 0:
+                extra_start = frame_off + self.structured_state_width
+                extra_end = extra_start + self.extra_context_features
+                parts.append(state[:, extra_start:extra_end])
+        return torch.cat(parts, dim=1)
+
+    def _build_local_grid_tensor(self, state: torch.Tensor, frame_off: Optional[int] = None) -> torch.Tensor:
+        B = state.shape[0]
+        if frame_off is None:
+            frame_off = self._frame_offsets(state)[-1]
+        start = frame_off + self.local_grid_offset
+        end = start + self.local_grid_feature_width
+        grid = state[:, start:end]
+        return grid.reshape(B, self.tactical_grid_channels, self.tactical_grid_height, self.tactical_grid_width)
+
+    def _apply_entity_self_attention(self, entity_tokens: torch.Tensor, entity_mask: torch.Tensor) -> torch.Tensor:
+        any_present = (~entity_mask).any(dim=1)
+        if any_present.all():
+            return self.entity_self_attn(entity_tokens, src_key_padding_mask=entity_mask)
+        if any_present.any():
+            attended = self.entity_self_attn(
+                entity_tokens[any_present],
+                src_key_padding_mask=entity_mask[any_present],
+            )
+            entity_tokens = entity_tokens.clone()
+            entity_tokens[any_present] = attended
+        return entity_tokens
+
+    def _build_frame_object_tokens(self, state: torch.Tensor, frame_off: int):
+        """Decode role-specific pools into learned object tokens."""
         B = state.shape[0]
         device = state.device
+        token_batches = []
+        mask_batches = []
 
-        # Single unified category — extract the 64×11 block
-        _name, base, slots, _cat_id = self._cat_info[0]
-        block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
-        block = block.reshape(B, slots, self.slot_state_features)  # (B, 64, 11)
+        for pool_name, base, slots, slot_features, _pool_id in self._pool_info:
+            block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * slot_features]
+            block = block.reshape(B, slots, slot_features)
+            present = block[:, :, 0]
 
-        present = block[:, :, 0]                    # (B, 64)
-        raw_feats = block[:, :, 1:10]               # (B, 64, 9) — dx,dy,dist,vx,vy,threat,approach,hit_w,hit_h
-        type_id_norm = block[:, :, 10]              # (B, 64) in [0, 1]
+            if pool_name == "projectile":
+                dx = block[:, :, 1:2]
+                dy = block[:, :, 2:3]
+                dist = block[:, :, 3:4]
+                vx = block[:, :, 4:5]
+                vy = block[:, :, 5:6]
+                threat = block[:, :, 6:7]
+                ttc = block[:, :, 7:8]
+                closest_pass = block[:, :, 8:9]
+                approach = block[:, :, 9:10]
+                type_id_int = torch.full((B, slots), int(self.projectile_type_id), device=device, dtype=torch.long)
+            elif pool_name == "danger":
+                dx = block[:, :, 1:2]
+                dy = block[:, :, 2:3]
+                dist = block[:, :, 3:4]
+                vx = block[:, :, 4:5]
+                vy = block[:, :, 5:6]
+                threat = block[:, :, 6:7]
+                approach = block[:, :, 7:8]
+                ttc = block[:, :, 8:9]
+                closest_pass = dist
+                type_id_norm = block[:, :, 9]
+                type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)
+            elif pool_name == "human":
+                dx = block[:, :, 1:2]
+                dy = block[:, :, 2:3]
+                dist = block[:, :, 3:4]
+                vx = block[:, :, 4:5]
+                vy = block[:, :, 5:6]
+                threat = block[:, :, 6:7]
+                approach = torch.zeros_like(dist)
+                ttc = torch.ones_like(dist)
+                closest_pass = dist
+                type_id_int = torch.full((B, slots), int(UNIFIED_HUMAN_TYPE_ID), device=device, dtype=torch.long)
+            elif pool_name == "electrode":
+                dx = block[:, :, 1:2]
+                dy = block[:, :, 2:3]
+                dist = block[:, :, 3:4]
+                vx = torch.zeros_like(dist)
+                vy = torch.zeros_like(dist)
+                threat = block[:, :, 4:5]
+                approach = torch.zeros_like(dist)
+                ttc = torch.ones_like(dist)
+                closest_pass = dist
+                type_id_int = torch.full((B, slots), int(UNIFIED_ELECTRODE_TYPE_ID), device=device, dtype=torch.long)
+            else:
+                continue
 
-        # Decode type_id from normalised float back to integer index
-        type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)
-        type_emb = self.type_embedding(type_id_int)  # (B, 64, 16)
+            type_emb = self.type_embedding(type_id_int)
+            is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)
+            is_dangerous = (type_id_int != UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)
+            hit_w = self.type_hit_w[type_id_int].unsqueeze(-1)
+            hit_h = self.type_hit_h[type_id_int].unsqueeze(-1)
 
-        # Derive boolean flags from type_id
-        is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)       # (B, 64, 1)
-        is_dangerous = (type_id_int != UNIFIED_HUMAN_TYPE_ID).float().unsqueeze(-1)   # (B, 64, 1)
+            token_batches.append(torch.cat(
+                [dx, dy, vx, vy, dist, threat, approach, ttc, closest_pass, hit_w, hit_h, type_emb, is_human, is_dangerous],
+                dim=2,
+            ))
+            mask_batches.append(present < 0.5)
 
-        # Reorder raw features to: dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h
-        dx = raw_feats[:, :, 0:1]           # (B, 64, 1)
-        dy = raw_feats[:, :, 1:2]
-        dist = raw_feats[:, :, 2:3]
-        vx = raw_feats[:, :, 3:4]
-        vy = raw_feats[:, :, 4:5]
-        threat = raw_feats[:, :, 5:6]
-        approach = raw_feats[:, :, 6:7]
-        hit_w = raw_feats[:, :, 7:8]
-        hit_h = raw_feats[:, :, 8:9]
-
-        tokens = torch.cat(
-            [dx, dy, vx, vy, dist, threat, approach, hit_w, hit_h, type_emb, is_human, is_dangerous],
-            dim=2,
-        )  # (B, 64, 27)
-
-        mask = present < 0.5
-        return tokens, mask
+        if not token_batches:
+            empty_tokens = torch.zeros(B, 0, self._entity_token_dim, device=device, dtype=state.dtype)
+            empty_mask = torch.ones(B, 0, device=device, dtype=torch.bool)
+            return empty_tokens, empty_mask
+        return torch.cat(token_batches, dim=1), torch.cat(mask_batches, dim=1)
 
     def _build_object_tokens(self, state: torch.Tensor):
         frame_offsets = self._frame_offsets(state)
         return self._build_frame_object_tokens(state, frame_offsets[-1])
 
-    def _build_directional_lane_tokens(self, state: torch.Tensor) -> torch.Tensor:
-        """Extract raw slot fields from the unified pool and build 8-lane tokens.
-
-        Returns: (lane_tokens (B, 8, 15), lane_has_entity (B, 8) bool)
-        """
+    def _build_directional_lane_tokens(self, state: torch.Tensor, frame_off: Optional[int] = None) -> torch.Tensor:
+        """Read serialized lane tokens emitted directly from Lua."""
         B = state.shape[0]
-        frame_off = self._frame_offsets(state)[-1]
-
-        # Single unified category
-        _name, base, slots, _cat_id = self._cat_info[0]
-        block = state[:, frame_off + base + 1: frame_off + base + 1 + slots * self.slot_state_features]
-        block = block.reshape(B, slots, self.slot_state_features)  # (B, 64, 11)
-
-        present = block[:, :, 0] > 0.5       # (B, 64) bool
-        dx = block[:, :, 1]
-        dy = block[:, :, 2]
-        dist = block[:, :, 3]
-        vx = block[:, :, 4]
-        vy = block[:, :, 5]
-        threat = block[:, :, 6]
-        approach = block[:, :, 7]
-        type_id_norm = block[:, :, 10]
-
-        # Decode type_id from normalised float
-        type_id_int = (type_id_norm * (UNIFIED_NUM_TYPES - 1)).round().long().clamp(0, UNIFIED_NUM_TYPES - 1)
-        is_human = (type_id_int == UNIFIED_HUMAN_TYPE_ID)
-        is_electrode = (type_id_int == UNIFIED_ELECTRODE_TYPE_ID)
-
-        return self.lane_encoder._build_lane_tokens(
-            entity_dx=dx,
-            entity_dy=dy,
-            entity_dist=dist,
-            entity_vx=vx,
-            entity_vy=vy,
-            entity_threat=threat,
-            entity_approach=approach,
-            entity_present=present,
-            entity_is_human=is_human,
-            entity_is_electrode=is_electrode,
+        if frame_off is None:
+            frame_off = self._frame_offsets(state)[-1]
+        start = frame_off + self.core_feature_count
+        end = start + self.lane_feature_width
+        lane_tokens = state[:, start:end].reshape(B, self.lane_token_count, self.lane_token_features)
+        lane_has_entity = (
+            (lane_tokens[:, :, 7] > 0.0)
+            | (lane_tokens[:, :, 11] > 0.0)
+            | (lane_tokens[:, :, 12] > 0.0)
+            | (lane_tokens[:, :, 16] > 0.0)
         )
+        return lane_tokens, lane_has_entity
+
+    def _build_directional_action_priors(self, lane_tokens: torch.Tensor) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not self.use_directional_lanes or not self.use_directional_action_priors:
+            return None, None
+
+        move_scores = self.move_lane_prior(lane_tokens).squeeze(-1)
+        fire_scores = self.fire_lane_prior(lane_tokens).squeeze(-1)
+        lane_order = self.action_dir_to_lane_index
+
+        move_dir_count = min(int(lane_order.numel()), NUM_MOVE)
+        fire_dir_count = min(int(lane_order.numel()), NUM_FIRE)
+        move_prior = move_scores.index_select(1, lane_order[:move_dir_count])
+        fire_prior = fire_scores.index_select(1, lane_order[:fire_dir_count])
+
+        if NUM_MOVE > move_dir_count:
+            move_prior = torch.cat([move_prior, lane_tokens.new_zeros(lane_tokens.shape[0], NUM_MOVE - move_dir_count)], dim=1)
+        if NUM_FIRE > fire_dir_count:
+            fire_prior = torch.cat([fire_prior, lane_tokens.new_zeros(lane_tokens.shape[0], NUM_FIRE - fire_dir_count)], dim=1)
+        return move_prior, fire_prior
+
+    def _build_directional_frame_summary(self, state: torch.Tensor, frame_off: int):
+        raw_tokens, entity_mask = self._build_frame_object_tokens(state, frame_off)
+        entity_tokens = self.entity_input_proj(raw_tokens)
+        entity_tokens = self._apply_entity_self_attention(entity_tokens, entity_mask)
+        lane_tokens, lane_active = self._build_directional_lane_tokens(state, frame_off)
+        lane_summary = self.lane_encoder(lane_tokens, entity_tokens, entity_mask, lane_active)
+        present_mask = ~entity_mask
+        present_count = present_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+        entity_pooled = (entity_tokens * present_mask.unsqueeze(-1).float()).sum(dim=1) / present_count
+        entity_summary = self.entity_pool_norm(F.relu(self.entity_pool_proj(entity_pooled)))
+        grid_summary = None
+        if self.use_local_tactical_grid:
+            grid_summary = self.local_grid_encoder(self._build_local_grid_tensor(state, frame_off))
+        return lane_summary, entity_summary, grid_summary
+
+    def _fuse_temporal_branch(self, summaries: list[torch.Tensor], temporal_proj: Optional[nn.Module]) -> Optional[torch.Tensor]:
+        if not summaries:
+            return None
+        if len(summaries) == 1:
+            return summaries[0]
+        fused = torch.cat(summaries, dim=1)
+        if temporal_proj is None:
+            return summaries[-1]
+        return temporal_proj(fused)
+
+    def _build_directional_temporal_summaries(self, state: torch.Tensor, return_per_frame: bool = False):
+        frame_offsets = self._attention_frame_offsets(state)
+        lane_frames = []
+        entity_frames = []
+        grid_frames = []
+        for frame_off in frame_offsets:
+            lane_summary, entity_summary, grid_summary = self._build_directional_frame_summary(state, frame_off)
+            lane_frames.append(lane_summary)
+            entity_frames.append(entity_summary)
+            if grid_summary is not None:
+                grid_frames.append(grid_summary)
+
+        lane_summary = self._fuse_temporal_branch(lane_frames, self.lane_temporal_proj)
+        entity_summary = self._fuse_temporal_branch(entity_frames, self.entity_temporal_proj)
+        grid_summary = self._fuse_temporal_branch(grid_frames, self.grid_temporal_proj)
+        if return_per_frame:
+            return lane_summary, entity_summary, grid_summary, frame_offsets, lane_frames, entity_frames, grid_frames
+        return lane_summary, entity_summary, grid_summary
 
     def _build_all_frame_object_tokens(self, state: torch.Tensor):
-        frame_offsets = self._frame_offsets(state)
-        if not self.attn_all_frames and frame_offsets:
-            frame_offsets = frame_offsets[-1:]
+        frame_offsets = self._attention_frame_offsets(state)
         token_batches = []
         mask_batches = []
         for frame_off in frame_offsets:
@@ -2564,50 +3012,32 @@ class RainbowNet(nn.Module):
         B = state.shape[0]
         if self.use_pure_mlp:
             if self.use_directional_lanes:
-                # Build raw entity tokens for the latest frame → (B, 64, 27)
-                raw_tokens, entity_mask = self._build_frame_object_tokens(
-                    state, self._frame_offsets(state)[-1]
-                )
-                # Project to attn_dim → (B, 64, attn_dim)
-                entity_tokens = self.entity_input_proj(raw_tokens)
-                # Entity self-attention: entities reason about each other
-                # src_key_padding_mask=True means "ignore this position"
-                # Guard: all-masked keys produce NaN in attention softmax
-                any_present = (~entity_mask).any(dim=1)
-                if any_present.all():
-                    entity_tokens = self.entity_self_attn(
-                        entity_tokens, src_key_padding_mask=entity_mask
-                    )
-                elif any_present.any():
-                    attended = self.entity_self_attn(
-                        entity_tokens[any_present],
-                        src_key_padding_mask=entity_mask[any_present],
-                    )
-                    entity_tokens = entity_tokens.clone()
-                    entity_tokens[any_present] = attended
-                # else: all batches empty — skip self-attention entirely
-                # Build 8-directional lane tokens from raw slot data
-                lane_tokens, lane_active = self._build_directional_lane_tokens(state)
-                # Cross-attend lanes to self-attended entity tokens → (B, lane_dim)
-                lane_summary = self.lane_encoder(lane_tokens, entity_tokens, entity_mask, lane_active)
-                # Entity pool: masked mean-pool of self-attended tokens → summary
-                present_mask = ~entity_mask  # True = present
-                present_count = present_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
-                entity_pooled = (entity_tokens * present_mask.unsqueeze(-1).float()).sum(dim=1) / present_count
-                entity_pool_summary = self.entity_pool_norm(F.relu(self.entity_pool_proj(entity_pooled)))
+                dense_state = self._build_compact_dense_state(state)
+                lane_summary, entity_pool_summary, grid_summary = self._build_directional_temporal_summaries(state)
+                latest_lane_tokens, _lane_active = self._build_directional_lane_tokens(state)
+                move_prior, fire_prior = self._build_directional_action_priors(latest_lane_tokens)
+                parts = [
+                    self.state_norm(dense_state),
+                    self.lane_norm_out(lane_summary),
+                    entity_pool_summary,
+                ]
+                if self.use_local_tactical_grid and grid_summary is not None:
+                    parts.append(self.grid_norm_out(grid_summary))
                 # Normalise each branch independently, then concatenate → trunk
-                h = self.trunk(torch.cat([self.state_norm(state),
-                                          self.lane_norm_out(lane_summary),
-                                          entity_pool_summary], dim=1))
+                h = self.trunk(torch.cat(parts, dim=1))
             elif self.use_mlp_with_attention:
-                h = self.trunk(state)
+                h = self.trunk(self._build_dense_state_input(state))
                 all_tokens, all_masks = self._build_all_frame_object_tokens(state)
                 frame_summaries = self.object_attn(all_tokens, all_masks).view(B, self.attn_frame_count, -1)
                 entity_out = self.entity_proj(frame_summaries.reshape(B, -1))
                 h = self.mlp_attn_fusion(torch.cat([h, entity_out], dim=1))
+                move_prior = None
+                fire_prior = None
             else:
-                h = self.trunk(state)
-            q_atoms = self._action_head_q_atoms(h, B)
+                h = self.trunk(self._build_dense_state_input(state))
+                move_prior = None
+                fire_prior = None
+            q_atoms = self._action_head_q_atoms(h, B, move_prior=move_prior, fire_prior=fire_prior)
             if self.use_dist:
                 q_atoms = q_atoms.float()
                 if log:
@@ -2787,7 +3217,9 @@ class RainbowAgent:
         self.state_size = state_size
         self.device = device
         cfg = RL_CONFIG
-        self.factored_greedy_action = bool(getattr(cfg, "factored_greedy_action", False))
+        self.factored_greedy_action = bool(getattr(cfg, "factored_greedy_action", False)) and not bool(
+            getattr(cfg, "factorized_joint_residual", False)
+        )
 
         # Counters and locks (must be created before _sync_inference)
         self.training_steps = 0

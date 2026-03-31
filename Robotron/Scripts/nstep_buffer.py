@@ -30,10 +30,11 @@ class NStepReplayBuffer:
     On terminal, flushes the remaining tail so no transitions are lost.
     """
 
-    def __init__(self, n_step: int, gamma: float):
+    def __init__(self, n_step: int, gamma: float, cross_actor: bool = False):
         assert n_step >= 1
         self.n_step = int(n_step)
         self.gamma = float(gamma)
+        self.cross_actor = bool(cross_actor)
         self._deque: Deque[_PendingStep] = deque()
 
     def reset(self):
@@ -51,8 +52,8 @@ class NStepReplayBuffer:
 
         for i in range(min(self.n_step, len(self._deque))):
             step = self._deque[i]
-            # Do not aggregate returns across actor boundaries.
-            if i > 0 and step.actor != actor0:
+            # Optionally truncate returns at actor (expert/DQN) boundaries.
+            if not self.cross_actor and i > 0 and step.actor != actor0:
                 break
             R += (self.gamma ** i) * step.reward
             priority_R += (self.gamma ** i) * step.priority_reward
@@ -70,7 +71,7 @@ class NStepReplayBuffer:
         actor0 = self._deque[0].actor
         for i in range(min(self.n_step, len(self._deque))):
             step = self._deque[i]
-            if i > 0 and step.actor != actor0:
+            if not self.cross_actor and i > 0 and step.actor != actor0:
                 return True
             if step.done:
                 return True

@@ -5,10 +5,14 @@
       - Sends a compact RL state vector:
         + 18 core/player values
         + 22 ELIST bytes (first 22 of 50; rest are reserved padding)
-        + 1 unified entity pool: 1 occupancy + 64 slots × 11 features
-          storing present, dx, dy, dist, vx, vy, threat, approach,
-          hit_w, hit_h, type_id
-      - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (0..7)
+        + 8 directional predictive lane summaries × 30 features computed from all visible objects
+        + 9×9 local egocentric tactical grid × 6 channels
+        + 4 role-specific pools:
+            projectile: 1 occupancy + 24 slots × 10 features
+            danger:     1 occupancy + 32 slots × 10 features
+            human:      1 occupancy + 12 slots × 7 features
+            electrode:  1 occupancy + 8 slots × 5 features
+      - Receives joystick commands: movement_dir (-1 neutral or 0..7) and firing_dir (-1 neutral or 0..7)
 --]]
 
 RAW_SOCKET_ADDRESS = os.getenv("ROBOTRON_SOCKET_ADDRESS") or "ubvmdell:9998"
@@ -275,10 +279,34 @@ GRID_FEATURES = GRID_W * GRID_H * GRID_CHANNELS
 TOKEN_FEATURES = OBJECT_TOKEN_LIMIT * OBJECT_TOKEN_FEATURES
 LEGACY_SLOT_STATE_FEATURES = 11
 LEGACY_CORE_FEATURES = 18
-UNIFIED_POOL_SLOTS = 64
--- Unified pool: 1 occupancy float + 64 slots × 11 features = 705
-LEGACY_ENTITY_TOTAL_FEATURES = 1 + (UNIFIED_POOL_SLOTS * LEGACY_SLOT_STATE_FEATURES)
-EXPECTED_STATE_VALUES = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + LEGACY_ENTITY_TOTAL_FEATURES
+TACTICAL_LANE_COUNT = 8
+TACTICAL_LANE_BASE_FEATURES = 20
+TACTICAL_LANE_AFFORDANCE_FEATURES = 10
+TACTICAL_LANE_FEATURES = TACTICAL_LANE_BASE_FEATURES + TACTICAL_LANE_AFFORDANCE_FEATURES
+TACTICAL_GRID_W = 9
+TACTICAL_GRID_H = 9
+TACTICAL_GRID_CHANNELS = 6
+TACTICAL_GRID_CELL_SIZE = 4096.0       -- 16 px in x16 units
+TACTICAL_GRID_HALF_RANGE_X = (TACTICAL_GRID_W * TACTICAL_GRID_CELL_SIZE) * 0.5
+TACTICAL_GRID_HALF_RANGE_Y = (TACTICAL_GRID_H * TACTICAL_GRID_CELL_SIZE) * 0.5
+TACTICAL_GRID_FEATURES = TACTICAL_GRID_W * TACTICAL_GRID_H * TACTICAL_GRID_CHANNELS
+TACTICAL_GRID_LOOKAHEAD_FRAMES = 4.0
+TACTICAL_TTC_MAX_FRAMES = 24.0
+PROJECTILE_POOL_SLOTS = 24
+PROJECTILE_SLOT_FEATURES = 10
+DANGER_POOL_SLOTS = 32
+DANGER_SLOT_FEATURES = 10
+HUMAN_POOL_SLOTS = 12
+HUMAN_SLOT_FEATURES = 7
+ELECTRODE_POOL_SLOTS = 8
+ELECTRODE_SLOT_FEATURES = 5
+TACTICAL_LANE_TOTAL_FEATURES = TACTICAL_LANE_COUNT * TACTICAL_LANE_FEATURES
+TACTICAL_POOL_TOTAL_FEATURES =
+    (1 + (PROJECTILE_POOL_SLOTS * PROJECTILE_SLOT_FEATURES))
+    + (1 + (DANGER_POOL_SLOTS * DANGER_SLOT_FEATURES))
+    + (1 + (HUMAN_POOL_SLOTS * HUMAN_SLOT_FEATURES))
+    + (1 + (ELECTRODE_POOL_SLOTS * ELECTRODE_SLOT_FEATURES))
+EXPECTED_STATE_VALUES = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + TACTICAL_LANE_TOTAL_FEATURES + TACTICAL_GRID_FEATURES + TACTICAL_POOL_TOTAL_FEATURES
 
 -- Type ID mapping for unified pool (0-8, normalized by /8.0 in emission)
 UNIFIED_TYPE_ID = {
@@ -317,109 +345,32 @@ local CATEGORY_IS_STATIC = {
 
 local prev_object_sample_x = {}
 local prev_object_sample_y = {}
-local prev_category_slot_ptrs = {}
 
-local prev_unified_slot_ptrs = {}
-for i = 1, UNIFIED_POOL_SLOTS do
-    prev_unified_slot_ptrs[i] = 0
+local function _empty_slot_ptrs(slot_count)
+    local out = {}
+    for i = 1, slot_count do
+        out[i] = 0
+    end
+    return out
 end
 
+local prev_pool_slot_ptrs = {
+    projectile = _empty_slot_ptrs(PROJECTILE_POOL_SLOTS),
+    danger = _empty_slot_ptrs(DANGER_POOL_SLOTS),
+    human = _empty_slot_ptrs(HUMAN_POOL_SLOTS),
+    electrode = _empty_slot_ptrs(ELECTRODE_POOL_SLOTS),
+}
+
 local function _reset_legacy_slot_assignments()
-    prev_category_slot_ptrs = {}
-    for _, cat in ipairs(ENTITY_CATEGORIES) do
-        local slots = {}
-        for i = 1, cat.slots do
-            slots[i] = 0
-        end
-        prev_category_slot_ptrs[cat.name] = slots
-    end
-    prev_unified_slot_ptrs = {}
-    for i = 1, UNIFIED_POOL_SLOTS do
-        prev_unified_slot_ptrs[i] = 0
-    end
+    prev_pool_slot_ptrs = {
+        projectile = _empty_slot_ptrs(PROJECTILE_POOL_SLOTS),
+        danger = _empty_slot_ptrs(DANGER_POOL_SLOTS),
+        human = _empty_slot_ptrs(HUMAN_POOL_SLOTS),
+        electrode = _empty_slot_ptrs(ELECTRODE_POOL_SLOTS),
+    }
 end
 
 _reset_legacy_slot_assignments()
-
-local function _stable_assign_bucket_slots(cat_name, bucket, slot_count)
-    local assigned = {}
-    local selected = {}
-    local selected_by_ptr = {}
-    local prev_slots = prev_category_slot_ptrs[cat_name] or {}
-    local next_slots = {}
-    local selected_n = 0
-
-    -- Keep only the nearest-K candidates for slot assignment without sorting the
-    -- full bucket. This avoids an O(n log n) table.sort per category every frame.
-    for i = 1, #bucket do
-        local obj = bucket[i]
-        local dist = obj.dist_norm or 1.0
-        local keep_candidate = true
-        if selected_n < slot_count then
-            selected_n = selected_n + 1
-        else
-            local worst = selected[selected_n]
-            if worst ~= nil and dist >= (worst.dist_norm or 1.0) then
-                keep_candidate = false
-            end
-        end
-
-        if keep_candidate then
-            local insert_pos = math.min(selected_n, slot_count)
-            while insert_pos > 1 do
-                local prev_obj = selected[insert_pos - 1]
-                local prev_dist = prev_obj and (prev_obj.dist_norm or 1.0) or 1.0
-                if dist >= prev_dist then
-                    break
-                end
-                selected[insert_pos] = prev_obj
-                insert_pos = insert_pos - 1
-            end
-            selected[insert_pos] = obj
-        end
-    end
-
-    for i = 1, selected_n do
-        local obj = selected[i]
-        selected_by_ptr[obj.ptr] = obj
-    end
-
-    -- Preserve any previously assigned slot whose object is still in the
-    -- nearest-K candidate set, then fill remaining holes by proximity.
-    for slot_idx = 1, slot_count do
-        local prev_ptr = prev_slots[slot_idx]
-        local obj = prev_ptr and selected_by_ptr[prev_ptr] or nil
-        if obj ~= nil then
-            assigned[slot_idx] = obj
-            selected_by_ptr[prev_ptr] = nil
-        end
-    end
-
-    local fill_idx = 1
-    for slot_idx = 1, slot_count do
-        if assigned[slot_idx] == nil then
-            while fill_idx <= selected_n do
-                local obj = selected[fill_idx]
-                fill_idx = fill_idx + 1
-                if obj ~= nil and selected_by_ptr[obj.ptr] ~= nil then
-                    assigned[slot_idx] = obj
-                    selected_by_ptr[obj.ptr] = nil
-                    break
-                end
-            end
-        end
-        next_slots[slot_idx] = assigned[slot_idx] and assigned[slot_idx].ptr or 0
-    end
-
-    return assigned, next_slots, selected_n
-end
-
--- Stable-assign a flat list of entities into the unified pool.
--- Partition into dangerous / human / electrode tiers, keep only the top-K
--- entities needed from each tier, then merge with guaranteed minimum quotas so
--- humans and electrodes are never starved on crowded waves.
-local MIN_HUMAN_RESERVE    = 10    -- guaranteed human slots (if that many exist)
-local MIN_ELECTRODE_RESERVE = 6    -- guaranteed electrode slots (if that many exist)
 
 local function _select_top_k_sorted(bucket, limit, better_fn)
     local selected = {}
@@ -469,53 +420,30 @@ local function _nearest_distance_better(a, b)
     return (tonumber(a.dist_norm) or 1.0) < (tonumber(b.dist_norm) or 1.0)
 end
 
-local function _stable_assign_unified_pool(dangerous, humans, electrodes)
-    -- Allocate slots with guaranteed minimums for humans/electrodes
-    local slot_count      = UNIFIED_POOL_SLOTS
-    local human_quota     = math.min(#humans, MIN_HUMAN_RESERVE)
-    local electrode_quota = math.min(#electrodes, MIN_ELECTRODE_RESERVE)
-    local dangerous_quota = 0
-    local remaining = slot_count - human_quota - electrode_quota
-
-    local extra_d = math.min(math.max(#dangerous - dangerous_quota, 0), remaining)
-    dangerous_quota = dangerous_quota + extra_d
-    remaining = remaining - extra_d
-
-    local extra_h = math.min(math.max(#humans - human_quota, 0), remaining)
-    human_quota = human_quota + extra_h
-    remaining = remaining - extra_h
-
-    local extra_e = math.min(math.max(#electrodes - electrode_quota, 0), remaining)
-    electrode_quota = electrode_quota + extra_e
-
-    local selected_dangerous, selected_dangerous_n = _select_top_k_sorted(dangerous, dangerous_quota, _dangerous_priority_better)
-    local selected_humans, selected_humans_n = _select_top_k_sorted(humans, human_quota, _nearest_distance_better)
-    local selected_electrodes, selected_electrodes_n = _select_top_k_sorted(electrodes, electrode_quota, _nearest_distance_better)
-
-    -- Build selected list: dangerous first, then humans, then electrodes
-    local selected = {}
-    local selected_n = 0
-    for i = 1, selected_dangerous_n do
-        selected_n = selected_n + 1
-        selected[selected_n] = selected_dangerous[i]
+local function _projectile_priority_better(a, b)
+    if b == nil then return true end
+    local tta = tonumber(a.ttc_norm) or 1.0
+    local ttb = tonumber(b.ttc_norm) or 1.0
+    if tta ~= ttb then
+        return tta < ttb
     end
-    for i = 1, selected_humans_n do
-        selected_n = selected_n + 1
-        selected[selected_n] = selected_humans[i]
+    local ca = tonumber(a.closest_pass_norm) or 1.0
+    local cb = tonumber(b.closest_pass_norm) or 1.0
+    if ca ~= cb then
+        return ca < cb
     end
-    for i = 1, selected_electrodes_n do
-        selected_n = selected_n + 1
-        selected[selected_n] = selected_electrodes[i]
-    end
+    return (tonumber(a.dist_norm) or 1.0) < (tonumber(b.dist_norm) or 1.0)
+end
 
-    -- Stable pointer matching — preserve slot assignments across frames
+local function _stable_assign_pool_slots(pool_name, bucket, slot_count, better_fn)
+    local selected, selected_n = _select_top_k_sorted(bucket, slot_count, better_fn)
     local assigned = {}
     local selected_by_ptr = {}
     for i = 1, selected_n do
         selected_by_ptr[selected[i].ptr] = selected[i]
     end
 
-    local prev_slots = prev_unified_slot_ptrs
+    local prev_slots = prev_pool_slot_ptrs[pool_name] or _empty_slot_ptrs(slot_count)
     for slot_idx = 1, slot_count do
         local prev_ptr = prev_slots[slot_idx]
         local obj = prev_ptr and prev_ptr ~= 0 and selected_by_ptr[prev_ptr] or nil
@@ -541,12 +469,11 @@ local function _stable_assign_unified_pool(dangerous, humans, electrodes)
         end
     end
 
-    -- Update slot pointers for next frame
     local next_slots = {}
     for i = 1, slot_count do
         next_slots[i] = assigned[i] and assigned[i].ptr or 0
     end
-    prev_unified_slot_ptrs = next_slots
+    prev_pool_slot_ptrs[pool_name] = next_slots
 
     return assigned, selected_n
 end
@@ -892,6 +819,434 @@ local function dist_norm(x1, y1, x2, y2)
     return clamp01(math.sqrt(d2) / POS_MAX_DIAG)
 end
 
+local LANE_SIN = {}
+local LANE_COS = {}
+for lane_idx = 0, TACTICAL_LANE_COUNT - 1 do
+    local ang = (2.0 * math.pi * lane_idx) / TACTICAL_LANE_COUNT
+    LANE_SIN[lane_idx + 1] = math.sin(ang)
+    LANE_COS[lane_idx + 1] = math.cos(ang)
+end
+
+local function lane_index_for_object(rel_dx16, rel_dy16)
+    local angle = math.atan(-(rel_dy16 or 0.0), rel_dx16 or 0.0)
+    local full_turn = 2.0 * math.pi
+    local angle_pos = angle % full_turn
+    local wedge = full_turn / TACTICAL_LANE_COUNT
+    return (math.floor((angle_pos / wedge) + 0.5) % TACTICAL_LANE_COUNT) + 1
+end
+
+local function _predictive_motion_features(rel_dx16, rel_dy16, vel_x16, vel_y16)
+    local rx = rel_dx16 or 0.0
+    local ry = rel_dy16 or 0.0
+    local vx = vel_x16 or 0.0
+    local vy = vel_y16 or 0.0
+    local curr_dist = math.sqrt((rx * rx) + (ry * ry))
+    local v2 = (vx * vx) + (vy * vy)
+    if v2 <= 1.0 then
+        return 1.0, clamp01(curr_dist / POS_MAX_DIAG), rx, ry
+    end
+    local raw_t = -((rx * vx) + (ry * vy)) / v2
+    if raw_t <= 0.0 then
+        return 1.0, clamp01(curr_dist / POS_MAX_DIAG), rx, ry
+    end
+    local t_frames = math.min(TACTICAL_TTC_MAX_FRAMES, raw_t)
+    local closest_x = rx + (vx * t_frames)
+    local closest_y = ry + (vy * t_frames)
+    local closest_dist = math.sqrt((closest_x * closest_x) + (closest_y * closest_y))
+    return clamp01(t_frames / TACTICAL_TTC_MAX_FRAMES), clamp01(closest_dist / POS_MAX_DIAG), closest_x, closest_y
+end
+
+local TACTICAL_GRID_CH_ROBOT = 0
+local TACTICAL_GRID_CH_ROBOT_FUTURE = 1
+local TACTICAL_GRID_CH_PROJECTILE = 2
+local TACTICAL_GRID_CH_PROJECTILE_FUTURE = 3
+local TACTICAL_GRID_CH_ELECTRODE = 4
+local TACTICAL_GRID_CH_HUMAN = 5
+
+local function _tactical_grid_index(ix, iy, ch)
+    return ((ch * TACTICAL_GRID_H + iy) * TACTICAL_GRID_W + ix) + 1
+end
+
+local function _accumulate_tactical_grid_value(grid, rel_dx16, rel_dy16, ch, value)
+    local score = clamp01(value or 0.0)
+    if score <= 0.0 then
+        return
+    end
+    local ix = math.floor(((rel_dx16 or 0.0) + TACTICAL_GRID_HALF_RANGE_X) / TACTICAL_GRID_CELL_SIZE)
+    local iy = math.floor(((rel_dy16 or 0.0) + TACTICAL_GRID_HALF_RANGE_Y) / TACTICAL_GRID_CELL_SIZE)
+    if ix < 0 or ix >= TACTICAL_GRID_W or iy < 0 or iy >= TACTICAL_GRID_H then
+        return
+    end
+    local idx = _tactical_grid_index(ix, iy, ch)
+    if score > (grid[idx] or 0.0) then
+        grid[idx] = score
+    end
+end
+
+local function _build_local_tactical_grid(dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+    local grid = {}
+    for i = 1, TACTICAL_GRID_FEATURES do
+        grid[i] = 0.0
+    end
+
+    local function place_now_and_future(obj, now_ch, future_ch, value)
+        _accumulate_tactical_grid_value(grid, obj.rel_dx16 or 0.0, obj.rel_dy16 or 0.0, now_ch, value)
+        local future_x = (obj.rel_dx16 or 0.0) + ((obj.vx16 or 0.0) * TACTICAL_GRID_LOOKAHEAD_FRAMES)
+        local future_y = (obj.rel_dy16 or 0.0) + ((obj.vy16 or 0.0) * TACTICAL_GRID_LOOKAHEAD_FRAMES)
+        _accumulate_tactical_grid_value(grid, future_x, future_y, future_ch, value)
+    end
+
+    for _, obj in ipairs(dangerous_bucket) do
+        local closeness = 1.0 - clamp01(obj.dist_norm or 1.0)
+        local value = clamp01((obj.threat or 0.0) * (0.55 + (0.45 * closeness)))
+        place_now_and_future(obj, TACTICAL_GRID_CH_ROBOT, TACTICAL_GRID_CH_ROBOT_FUTURE, value)
+    end
+
+    for _, obj in ipairs(projectile_bucket) do
+        local closeness = 1.0 - clamp01(obj.dist_norm or 1.0)
+        local imminence = 1.0 - clamp01(obj.ttc_norm or 1.0)
+        local value = clamp01(math.max(obj.threat or 0.0, 0.35 + (0.65 * imminence)) * (0.45 + (0.55 * closeness)))
+        place_now_and_future(obj, TACTICAL_GRID_CH_PROJECTILE, TACTICAL_GRID_CH_PROJECTILE_FUTURE, value)
+    end
+
+    for _, obj in ipairs(electrode_bucket) do
+        local closeness = 1.0 - clamp01(obj.dist_norm or 1.0)
+        local value = clamp01((obj.threat or 0.0) * (0.35 + (0.65 * closeness)))
+        _accumulate_tactical_grid_value(grid, obj.rel_dx16 or 0.0, obj.rel_dy16 or 0.0, TACTICAL_GRID_CH_ELECTRODE, value)
+    end
+
+    for _, obj in ipairs(human_bucket) do
+        local value = clamp01(1.0 - clamp01(obj.dist_norm or 1.0))
+        _accumulate_tactical_grid_value(grid, obj.rel_dx16 or 0.0, obj.rel_dy16 or 0.0, TACTICAL_GRID_CH_HUMAN, value)
+    end
+
+    return grid
+end
+
+local function _lane_screen_dir(lane_i)
+    return LANE_COS[lane_i], -LANE_SIN[lane_i]
+end
+
+local function _direction_alignment(rel_dx16, rel_dy16, dir_x, dir_y)
+    local dx = rel_dx16 or 0.0
+    local dy = rel_dy16 or 0.0
+    local d2 = (dx * dx) + (dy * dy)
+    if d2 <= 1.0 then
+        return 0.0
+    end
+    return clamp11(((dx * dir_x) + (dy * dir_y)) / math.sqrt(d2))
+end
+
+local function _direction_forward_distance(rel_dx16, rel_dy16, dir_x, dir_y)
+    return ((rel_dx16 or 0.0) * dir_x) + ((rel_dy16 or 0.0) * dir_y)
+end
+
+local function _direction_cross_distance(rel_dx16, rel_dy16, dir_x, dir_y)
+    return math.abs(((rel_dx16 or 0.0) * dir_y) - ((rel_dy16 or 0.0) * dir_x))
+end
+
+local function _directional_wall_clearance_score(player_x16, player_y16, dir_x, dir_y)
+    local px = player_x16 or POS_X_MIN
+    local py = player_y16 or POS_Y_MIN
+    local clearance = POS_MAX_DIAG
+
+    if dir_x > 1e-6 then
+        clearance = math.min(clearance, ((POS_X_MIN + POS_X_RANGE) - px) / dir_x)
+    elseif dir_x < -1e-6 then
+        clearance = math.min(clearance, (px - POS_X_MIN) / (-dir_x))
+    end
+
+    if dir_y > 1e-6 then
+        clearance = math.min(clearance, ((POS_Y_MIN + POS_Y_RANGE) - py) / dir_y)
+    elseif dir_y < -1e-6 then
+        clearance = math.min(clearance, (py - POS_Y_MIN) / (-dir_y))
+    end
+
+    if clearance == POS_MAX_DIAG then
+        clearance = 0.0
+    end
+
+    return clamp01(clearance / (TACTICAL_GRID_CELL_SIZE * 6.0)), clearance
+end
+
+local function _build_directional_affordances(player_x16, player_y16, dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+    local lanes = {}
+    local humans_alive = (#human_bucket > 0)
+
+    for lane_i = 1, TACTICAL_LANE_COUNT do
+        local dir_x, dir_y = _lane_screen_dir(lane_i)
+        local wall_clearance, _wall_clearance_raw = _directional_wall_clearance_score(player_x16, player_y16, dir_x, dir_y)
+        lanes[lane_i] = {
+            dir_x = dir_x,
+            dir_y = dir_y,
+            move_clearance = wall_clearance,
+            move_danger_pressure = 0.0,
+            move_projectile_pressure = 0.0,
+            move_blocker_pressure = 0.0,
+            move_human_pull = 0.0,
+            move_escape_score = 0.0,
+            fire_best_target = 0.0,
+            fire_projectile_intercept = 0.0,
+            fire_priority_target = 0.0,
+            fire_target_density = 0.0,
+        }
+    end
+
+    local function reduce_clearance(lane, forward_dist)
+        if forward_dist == nil or forward_dist <= 0.0 then
+            return
+        end
+        lane.move_clearance = math.min(
+            lane.move_clearance,
+            clamp01(forward_dist / (TACTICAL_GRID_CELL_SIZE * 6.0))
+        )
+    end
+
+    for _, obj in ipairs(dangerous_bucket) do
+        local cat = obj.category
+        local priority_bonus = ADVANCED_SHAPING.priority_aim_bonus[cat] or 1.0
+        local close = 1.0 - clamp01(obj.dist_norm or 1.0)
+        local imminence = math.max(
+            1.0 - clamp01(obj.ttc_norm or 1.0),
+            1.0 - clamp01(obj.closest_pass_norm or obj.dist_norm or 1.0)
+        )
+        local threat = clamp01(obj.threat or 0.0)
+        for lane_i = 1, TACTICAL_LANE_COUNT do
+            local lane = lanes[lane_i]
+            local forward = _direction_forward_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+            if forward > 0.0 then
+                local align = clamp01(_direction_alignment(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y))
+                if align > 0.0 then
+                    local cross = _direction_cross_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+                    local cross_gate = clamp01(1.0 - (cross / (AIM_CROSS_THRESHOLD * 2.0)))
+                    local move_pressure = threat
+                        * (0.20 + (0.80 * align))
+                        * (0.35 + (0.65 * close))
+                        * (0.55 + (0.45 * imminence))
+                    lane.move_danger_pressure = lane.move_danger_pressure + move_pressure
+
+                    local fire_score = clamp01(
+                        (0.15 + (0.85 * align))
+                        * (0.25 + (0.75 * cross_gate))
+                        * (0.35 + (0.65 * close))
+                        * priority_bonus
+                    )
+                    if fire_score > lane.fire_best_target then
+                        lane.fire_best_target = fire_score
+                    end
+                    if cat == "brain" or cat == "tank" or cat == "spawner" or cat == "enforcer" then
+                        local rescue_bonus = 1.0
+                        if humans_alive and cat == "brain" then
+                            rescue_bonus = 1.10
+                        end
+                        lane.fire_priority_target = math.max(
+                            lane.fire_priority_target,
+                            clamp01(fire_score * rescue_bonus)
+                        )
+                    end
+                    lane.fire_target_density = lane.fire_target_density + (cross_gate * align * close)
+
+                    if cat == "hulk" then
+                        local blocker = clamp01((0.35 + (0.65 * close)) * (0.30 + (0.70 * align)))
+                        if blocker > lane.move_blocker_pressure then
+                            lane.move_blocker_pressure = blocker
+                        end
+                        reduce_clearance(lane, forward)
+                    end
+                end
+            end
+        end
+    end
+
+    for _, obj in ipairs(projectile_bucket) do
+        local close = 1.0 - clamp01(obj.dist_norm or 1.0)
+        local imminence = math.max(
+            1.0 - clamp01(obj.ttc_norm or 1.0),
+            1.0 - clamp01(obj.closest_pass_norm or obj.dist_norm or 1.0)
+        )
+        local threat = clamp01(obj.threat or 0.0)
+        for lane_i = 1, TACTICAL_LANE_COUNT do
+            local lane = lanes[lane_i]
+            local forward = _direction_forward_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+            if forward > 0.0 then
+                local align = clamp01(_direction_alignment(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y))
+                if align > 0.0 then
+                    local cross = _direction_cross_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+                    local cross_gate = clamp01(1.0 - (cross / (AIM_CROSS_THRESHOLD * 2.0)))
+                    local move_pressure = threat
+                        * (0.20 + (0.80 * align))
+                        * (0.25 + (0.75 * close))
+                        * (0.25 + (0.75 * imminence))
+                    lane.move_projectile_pressure = lane.move_projectile_pressure + move_pressure
+
+                    local intercept = clamp01(
+                        (0.15 + (0.85 * align))
+                        * (0.25 + (0.75 * cross_gate))
+                        * (0.30 + (0.70 * imminence))
+                        * (0.25 + (0.75 * close))
+                    )
+                    if intercept > lane.fire_projectile_intercept then
+                        lane.fire_projectile_intercept = intercept
+                    end
+                    if intercept > lane.fire_best_target then
+                        lane.fire_best_target = intercept
+                    end
+                    lane.fire_target_density = lane.fire_target_density + (0.75 * intercept)
+                end
+            end
+        end
+    end
+
+    for _, obj in ipairs(human_bucket) do
+        local close = 1.0 - clamp01(obj.dist_norm or 1.0)
+        for lane_i = 1, TACTICAL_LANE_COUNT do
+            local lane = lanes[lane_i]
+            local forward = _direction_forward_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+            if forward > 0.0 then
+                local align = clamp01(_direction_alignment(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y))
+                local pull = clamp01((0.20 + (0.80 * align)) * (0.35 + (0.65 * close)))
+                if pull > lane.move_human_pull then
+                    lane.move_human_pull = pull
+                end
+            end
+        end
+    end
+
+    for _, obj in ipairs(electrode_bucket) do
+        local close = 1.0 - clamp01(obj.dist_norm or 1.0)
+        local threat = clamp01(obj.threat or 0.0)
+        for lane_i = 1, TACTICAL_LANE_COUNT do
+            local lane = lanes[lane_i]
+            local forward = _direction_forward_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+            if forward > 0.0 then
+                local align = clamp01(_direction_alignment(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y))
+                if align > 0.0 then
+                    local cross = _direction_cross_distance(obj.rel_dx16, obj.rel_dy16, lane.dir_x, lane.dir_y)
+                    local cross_gate = clamp01(1.0 - (cross / (AIM_CROSS_THRESHOLD * 2.0)))
+                    local blocker = clamp01(threat * (0.20 + (0.80 * align)) * (0.20 + (0.80 * cross_gate)) * (0.35 + (0.65 * close)))
+                    if blocker > lane.move_blocker_pressure then
+                        lane.move_blocker_pressure = blocker
+                    end
+                    reduce_clearance(lane, forward)
+                end
+            end
+        end
+    end
+
+    for lane_i = 1, TACTICAL_LANE_COUNT do
+        local lane = lanes[lane_i]
+        lane.move_danger_pressure = clamp01(lane.move_danger_pressure)
+        lane.move_projectile_pressure = clamp01(lane.move_projectile_pressure)
+        lane.move_blocker_pressure = clamp01(lane.move_blocker_pressure)
+        lane.move_human_pull = clamp01(lane.move_human_pull)
+        lane.fire_best_target = clamp01(lane.fire_best_target)
+        lane.fire_projectile_intercept = clamp01(lane.fire_projectile_intercept)
+        lane.fire_priority_target = clamp01(lane.fire_priority_target)
+        lane.fire_target_density = clamp01(lane.fire_target_density / 2.5)
+
+        local combined_threat = math.max(lane.move_danger_pressure, lane.move_projectile_pressure)
+        lane.move_escape_score = clamp01(
+            (lane.move_clearance * (1.0 - combined_threat) * (1.0 - (0.65 * lane.move_blocker_pressure)))
+            + (0.20 * lane.move_human_pull)
+        )
+    end
+
+    return lanes
+end
+
+local function _build_lane_summary_features(player_x16, player_y16, dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+    local lanes = {}
+    for lane_i = 1, TACTICAL_LANE_COUNT do
+        lanes[lane_i] = {
+            enemy_count = 0,
+            human_count = 0,
+            projectile_count = 0,
+            nearest_enemy = nil,
+            nearest_projectile = nil,
+            nearest_human = nil,
+            nearest_electrode = nil,
+        }
+    end
+
+    local function visit_bucket(bucket, kind)
+        for _, obj in ipairs(bucket) do
+            local lane_i = lane_index_for_object(obj.rel_dx16 or 0.0, obj.rel_dy16 or 0.0)
+            local lane = lanes[lane_i]
+            if kind == "enemy" then
+                lane.enemy_count = lane.enemy_count + 1
+                if lane.nearest_enemy == nil or (obj.dist_norm or 1.0) < (lane.nearest_enemy.dist_norm or 1.0) then
+                    lane.nearest_enemy = obj
+                end
+            elseif kind == "projectile" then
+                lane.projectile_count = lane.projectile_count + 1
+                if lane.nearest_projectile == nil or (obj.dist_norm or 1.0) < (lane.nearest_projectile.dist_norm or 1.0) then
+                    lane.nearest_projectile = obj
+                end
+            elseif kind == "human" then
+                lane.human_count = lane.human_count + 1
+                if lane.nearest_human == nil or (obj.dist_norm or 1.0) < (lane.nearest_human.dist_norm or 1.0) then
+                    lane.nearest_human = obj
+                end
+            elseif kind == "electrode" then
+                if lane.nearest_electrode == nil or (obj.dist_norm or 1.0) < (lane.nearest_electrode.dist_norm or 1.0) then
+                    lane.nearest_electrode = obj
+                end
+            end
+        end
+    end
+
+    visit_bucket(dangerous_bucket, "enemy")
+    visit_bucket(projectile_bucket, "projectile")
+    visit_bucket(human_bucket, "human")
+    visit_bucket(electrode_bucket, "electrode")
+    local lane_affordances = _build_directional_affordances(player_x16, player_y16, dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+
+    local out = {}
+    for lane_i = 1, TACTICAL_LANE_COUNT do
+        local lane = lanes[lane_i]
+        local afford = lane_affordances[lane_i]
+        local enemy = lane.nearest_enemy
+        local projectile = lane.nearest_projectile
+        local human = lane.nearest_human
+        local electrode = lane.nearest_electrode
+
+        out[#out + 1] = enemy and clamp01(enemy.dist_norm or 0.0) or 0.0
+        out[#out + 1] = enemy and clamp11(enemy.dx or 0.0) or 0.0
+        out[#out + 1] = enemy and clamp11(enemy.dy or 0.0) or 0.0
+        out[#out + 1] = enemy and clamp11(enemy.vx or 0.0) or 0.0
+        out[#out + 1] = enemy and clamp11(enemy.vy or 0.0) or 0.0
+        out[#out + 1] = enemy and clamp01(enemy.threat or 0.0) or 0.0
+        out[#out + 1] = enemy and clamp11(enemy.approach or 0.0) or 0.0
+        out[#out + 1] = clamp01(lane.enemy_count / 50.0)
+
+        out[#out + 1] = human and clamp01(human.dist_norm or 0.0) or 0.0
+        out[#out + 1] = human and clamp11(human.dx or 0.0) or 0.0
+        out[#out + 1] = human and clamp11(human.dy or 0.0) or 0.0
+        out[#out + 1] = clamp01(lane.human_count / 16.0)
+
+        out[#out + 1] = electrode and clamp01(electrode.dist_norm or 0.0) or 0.0
+        out[#out + 1] = projectile and clamp01(projectile.dist_norm or 0.0) or 0.0
+        out[#out + 1] = projectile and clamp01(projectile.ttc_norm or 1.0) or 0.0
+        out[#out + 1] = projectile and clamp01(projectile.closest_pass_norm or projectile.dist_norm or 0.0) or 0.0
+        out[#out + 1] = clamp01(lane.projectile_count / 24.0)
+        out[#out + 1] = enemy and clamp01(enemy.ttc_norm or 1.0) or 0.0
+        out[#out + 1] = LANE_SIN[lane_i]
+        out[#out + 1] = LANE_COS[lane_i]
+
+        out[#out + 1] = afford and clamp01(afford.move_clearance or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.move_danger_pressure or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.move_projectile_pressure or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.move_blocker_pressure or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.move_human_pull or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.move_escape_score or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.fire_best_target or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.fire_projectile_intercept or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.fire_priority_target or 0.0) or 0.0
+        out[#out + 1] = afford and clamp01(afford.fire_target_density or 0.0) or 0.0
+    end
+    return out
+end
+
 local function enemy_spacing_score(nearest_dist_norm)
     if nearest_dist_norm == nil then
         return 1.0
@@ -1162,14 +1517,22 @@ function picture_collision_bounds(memory, pict_ptr)
 
     local width = memory:read_u8(pict_ptr) or 0
     local height = memory:read_u8(pict_ptr + 1) or 0
+
+    -- Robotron sprites are at most ~10 bytes wide (20 screen px) and ~16 rows
+    -- tall. Values beyond that indicate a transient/corrupt picture pointer
+    -- caught mid-animation — return safe defaults without caching.
+    if width > 16 or height > 32 then
+        return 0, 0, 1, 1
+    end
+
     local data_ptr = read_u16_be(memory, pict_ptr + 2)
     local off_x = 0
     local off_y = 0
     local box_w = math.max(1, width * HUD_SCREEN_X_SCALE)
     local box_h = math.max(1, height)
+    local found = false
 
     if width > 0 and height > 0 and data_ptr and data_ptr > 0 then
-        local found = false
         local min_col = width * HUD_SCREEN_X_SCALE
         local max_col = -1
         local min_row = height
@@ -1204,7 +1567,12 @@ function picture_collision_bounds(memory, pict_ptr)
         end
     end
 
-    picture_bounds_cache[pict_ptr] = {off_x, off_y, box_w, box_h}
+    -- Only cache when the bitmap scan found actual pixels.  Sprites caught
+    -- during animation transitions may have valid headers but empty data;
+    -- caching those would lock in wrong (header-derived) dimensions.
+    if found then
+        picture_bounds_cache[pict_ptr] = {off_x, off_y, box_w, box_h}
+    end
     return off_x, off_y, box_w, box_h
 end
 
@@ -1372,9 +1740,9 @@ end
 
 local function extract_world_features(memory, player_x16, player_y16, enemy_state)
     -- Walk object lists, classify entities, compute per-object motion, and emit
-    -- the compact legacy slot state consumed by the current Python model.
-    -- The older rich globals/grid/token observation is no longer serialized, so
-    -- rebuilding it every frame just burns Lua time on crowded waves.
+    -- the tactical observation consumed by the current Python model.
+    -- Lane summaries are computed from all visible objects, while the role-
+    -- specific pools keep raw details for the most important nearby entities.
 
     local player_pict_ptr = read_u16_be(memory, PLOBJ_ADDR + OPICT_OFF)
     local player_hit_off_x, player_hit_off_y, player_hit_w, player_hit_h = picture_collision_bounds(memory, player_pict_ptr)
@@ -1433,13 +1801,19 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
                 if cat == nil then
                     cat = classify_by_heuristic(list_def.name, width, height)
                     if cat ~= nil then
-                        ocvect_category_cache[ocvect] = cat
-                        if cat == "tank" and width ~= 7 then
-                            discovered_tank_ocvect = ocvect
-                        end
-                        if cat ~= "skip" and DEBUG_LOG_DISCOVERY then
-                            print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
-                                ocvect, cat, list_def.name, width, height))
+                        -- Don't cache "skip" for OPTR objects: small sprites
+                        -- may be spawners (spheroids/quarks) caught mid-growth.
+                        -- Re-evaluate next frame so the real category gets
+                        -- cached once the sprite reaches a recognizable size.
+                        if not (cat == "skip" and list_def.name == "optr") then
+                            ocvect_category_cache[ocvect] = cat
+                            if cat == "tank" and width ~= 7 then
+                                discovered_tank_ocvect = ocvect
+                            end
+                            if cat ~= "skip" and DEBUG_LOG_DISCOVERY then
+                                print(string.format("[DISCOVERY] OCVECT 0x%04X → %s (list=%s dim=%dx%d)",
+                                    ocvect, cat, list_def.name, width, height))
+                            end
                         end
                     else
                         unresolved_7x16[ocvect] = true
@@ -1500,6 +1874,7 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         counts[cat.name] = 0
     end
 
+    local projectile_bucket = buckets["projectile"]
     local dangerous_bucket = {}
     local human_bucket = buckets["human"]
     local electrode_bucket = buckets["electrode"]
@@ -1512,13 +1887,19 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         if obj.category and obj.category ~= "skip" and buckets[obj.category] then
             local vx = 0.0
             local vy = 0.0
+            local vx16 = 0.0
+            local vy16 = 0.0
             local prev_x = prev_object_sample_x[obj.ptr]
             if prev_x ~= nil then
-                vx = clamp11((obj.x16 - prev_x) / POS_X_RANGE)
-                vy = clamp11((obj.y16 - (prev_object_sample_y[obj.ptr] or obj.y16)) / POS_Y_RANGE)
+                vx16 = (obj.x16 - prev_x)
+                vy16 = (obj.y16 - (prev_object_sample_y[obj.ptr] or obj.y16))
+                vx = clamp11(vx16 / POS_X_RANGE)
+                vy = clamp11(vy16 / POS_Y_RANGE)
             end
             obj.vx = vx
             obj.vy = vy
+            obj.vx16 = vx16
+            obj.vy16 = vy16
             obj.dx = clamp11((obj.rel_dx16 or 0.0) / POS_X_RANGE)
             obj.dy = clamp11((obj.rel_dy16 or 0.0) / POS_Y_RANGE)
             local dist_world = obj.dist_world or 0.0
@@ -1532,12 +1913,22 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             local radial = -((obj.vx * obj.dir_x) + (obj.vy * obj.dir_y))
             obj.approach = clamp11(radial * 2.0)
             obj.threat = _object_threat_score(obj)
+            local ttc_norm, closest_pass_norm = _predictive_motion_features(
+                obj.rel_dx16 or 0.0,
+                obj.rel_dy16 or 0.0,
+                obj.vx16 or 0.0,
+                obj.vy16 or 0.0
+            )
+            obj.ttc_norm = ttc_norm
+            obj.closest_pass_norm = closest_pass_norm
 
             counts[obj.category] = counts[obj.category] + 1
             current_sample_x[obj.ptr] = obj.x16
             current_sample_y[obj.ptr] = obj.y16
             buckets[obj.category][#buckets[obj.category] + 1] = obj
-            if obj.category ~= "human" and obj.category ~= "electrode" then
+            if obj.category == "projectile" then
+                -- projectile_bucket already aliases buckets["projectile"]
+            elseif obj.category ~= "human" and obj.category ~= "electrode" then
                 dangerous_bucket[#dangerous_bucket + 1] = obj
             end
             object_count = object_count + 1
@@ -1573,8 +1964,19 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     prev_object_sample_x = current_sample_x
     prev_object_sample_y = current_sample_y
 
-    -- ── Unified pool: stable-assign tiered entity buckets into 64 slots ──
-    local unified_assigned, unified_count = _stable_assign_unified_pool(dangerous_bucket, human_bucket, electrode_bucket)
+    local lane_summary_features = _build_lane_summary_features(
+        player_center_x16,
+        player_center_y16,
+        dangerous_bucket,
+        projectile_bucket,
+        human_bucket,
+        electrode_bucket
+    )
+    local local_grid_features = _build_local_tactical_grid(dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+    local projectile_assigned, projectile_count = _stable_assign_pool_slots("projectile", projectile_bucket, PROJECTILE_POOL_SLOTS, _projectile_priority_better)
+    local danger_assigned, danger_count = _stable_assign_pool_slots("danger", dangerous_bucket, DANGER_POOL_SLOTS, _dangerous_priority_better)
+    local human_assigned, human_count = _stable_assign_pool_slots("human", human_bucket, HUMAN_POOL_SLOTS, _nearest_distance_better)
+    local electrode_assigned, electrode_count = _stable_assign_pool_slots("electrode", electrode_bucket, ELECTRODE_POOL_SLOTS, _nearest_distance_better)
 
     if hud_enabled then
         for _, cat in ipairs(ENTITY_CATEGORIES) do
@@ -1600,28 +2002,82 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         hud_objects = nil
     end
 
-    -- ── Emit unified pool: 1 occupancy + 64 slots × 11 features ──
-    local legacy_list_features = {}
+    -- ── Emit tactical pools ───────────────────────────────────────────
+    local pool_features = {}
     local type_denom = math.max(1, UNIFIED_NUM_TYPES - 1)
-    legacy_list_features[#legacy_list_features + 1] = math.min(1.0, unified_count / UNIFIED_POOL_SLOTS)
-    for i = 1, UNIFIED_POOL_SLOTS do
-        local obj = unified_assigned[i]
+    pool_features[#pool_features + 1] = math.min(1.0, projectile_count / PROJECTILE_POOL_SLOTS)
+    for i = 1, PROJECTILE_POOL_SLOTS do
+        local obj = projectile_assigned[i]
+        if obj then
+            pool_features[#pool_features + 1] = 1.0
+            pool_features[#pool_features + 1] = obj.dx
+            pool_features[#pool_features + 1] = obj.dy
+            pool_features[#pool_features + 1] = obj.dist_norm
+            pool_features[#pool_features + 1] = obj.vx or 0.0
+            pool_features[#pool_features + 1] = obj.vy or 0.0
+            pool_features[#pool_features + 1] = obj.threat or 0.0
+            pool_features[#pool_features + 1] = obj.ttc_norm or 1.0
+            pool_features[#pool_features + 1] = obj.closest_pass_norm or obj.dist_norm or 1.0
+            pool_features[#pool_features + 1] = obj.approach or 0.0
+        else
+            for _ = 1, PROJECTILE_SLOT_FEATURES do
+                pool_features[#pool_features + 1] = 0.0
+            end
+        end
+    end
+
+    pool_features[#pool_features + 1] = math.min(1.0, danger_count / DANGER_POOL_SLOTS)
+    for i = 1, DANGER_POOL_SLOTS do
+        local obj = danger_assigned[i]
         if obj then
             local type_id = UNIFIED_TYPE_ID[obj.category] or 0
-            legacy_list_features[#legacy_list_features + 1] = 1.0
-            legacy_list_features[#legacy_list_features + 1] = obj.dx
-            legacy_list_features[#legacy_list_features + 1] = obj.dy
-            legacy_list_features[#legacy_list_features + 1] = obj.dist_norm
-            legacy_list_features[#legacy_list_features + 1] = obj.vx or 0.0
-            legacy_list_features[#legacy_list_features + 1] = obj.vy or 0.0
-            legacy_list_features[#legacy_list_features + 1] = obj.threat or 0.0
-            legacy_list_features[#legacy_list_features + 1] = obj.approach or 0.0
-            legacy_list_features[#legacy_list_features + 1] = clamp01((tonumber(obj.hit_w) or 1.0) / 16.0)
-            legacy_list_features[#legacy_list_features + 1] = clamp01((tonumber(obj.hit_h) or 1.0) / 16.0)
-            legacy_list_features[#legacy_list_features + 1] = type_id / type_denom
+            pool_features[#pool_features + 1] = 1.0
+            pool_features[#pool_features + 1] = obj.dx
+            pool_features[#pool_features + 1] = obj.dy
+            pool_features[#pool_features + 1] = obj.dist_norm
+            pool_features[#pool_features + 1] = obj.vx or 0.0
+            pool_features[#pool_features + 1] = obj.vy or 0.0
+            pool_features[#pool_features + 1] = obj.threat or 0.0
+            pool_features[#pool_features + 1] = obj.approach or 0.0
+            pool_features[#pool_features + 1] = obj.ttc_norm or 1.0
+            pool_features[#pool_features + 1] = type_id / type_denom
         else
-            for _ = 1, LEGACY_SLOT_STATE_FEATURES do
-                legacy_list_features[#legacy_list_features + 1] = 0.0
+            for _ = 1, DANGER_SLOT_FEATURES do
+                pool_features[#pool_features + 1] = 0.0
+            end
+        end
+    end
+
+    pool_features[#pool_features + 1] = math.min(1.0, human_count / HUMAN_POOL_SLOTS)
+    for i = 1, HUMAN_POOL_SLOTS do
+        local obj = human_assigned[i]
+        if obj then
+            pool_features[#pool_features + 1] = 1.0
+            pool_features[#pool_features + 1] = obj.dx
+            pool_features[#pool_features + 1] = obj.dy
+            pool_features[#pool_features + 1] = obj.dist_norm
+            pool_features[#pool_features + 1] = obj.vx or 0.0
+            pool_features[#pool_features + 1] = obj.vy or 0.0
+            pool_features[#pool_features + 1] = obj.threat or 0.0
+        else
+            for _ = 1, HUMAN_SLOT_FEATURES do
+                pool_features[#pool_features + 1] = 0.0
+            end
+        end
+    end
+
+    pool_features[#pool_features + 1] = math.min(1.0, electrode_count / ELECTRODE_POOL_SLOTS)
+    for i = 1, ELECTRODE_POOL_SLOTS do
+        local obj = electrode_assigned[i]
+        if obj then
+            pool_features[#pool_features + 1] = 1.0
+            pool_features[#pool_features + 1] = obj.dx
+            pool_features[#pool_features + 1] = obj.dy
+            pool_features[#pool_features + 1] = obj.dist_norm
+            pool_features[#pool_features + 1] = obj.threat or 0.0
+        else
+            for _ = 1, ELECTRODE_SLOT_FEATURES do
+                pool_features[#pool_features + 1] = 0.0
             end
         end
     end
@@ -1646,7 +2102,9 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
         player_center_y16 = player_center_y16,
         num_humans = num_humans,
         num_spawners = num_spawners,
-        legacy_list_features = legacy_list_features,
+        lane_summary_features = lane_summary_features,
+        local_grid_features = local_grid_features,
+        pool_features = pool_features,
     }
 end
 
@@ -2550,7 +3008,7 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
                                nearest_enemy_dist, nearest_human_dist,
                                nearest_enemy_dx, nearest_enemy_dy, num_humans,
                                nearest_spawner_dist, nearest_spawner_dx, nearest_spawner_dy, num_spawners,
-                               enemy_state, legacy_list_values,
+                               enemy_state, lane_values, grid_values, pool_values,
                                done, subj_reward, obj_reward, save_signal, start_cmd,
                                preview_w, preview_h, preview_fmt, preview_blob)
     local score_u32 = math.max(0, math.min(4294967295, math.floor(score or 0)))
@@ -2592,8 +3050,14 @@ local function serialize_frame(player_alive, score, replay_level, num_lasers, wa
     for i = 1, ZP1ENM_EMIT_COUNT do
         state_values[#state_values + 1] = (enemy_state.raw[i] or 0) / 255.0
     end
-    for i = 1, #(legacy_list_values or {}) do
-        state_values[#state_values + 1] = legacy_list_values[i]
+    for i = 1, #(lane_values or {}) do
+        state_values[#state_values + 1] = lane_values[i]
+    end
+    for i = 1, #(grid_values or {}) do
+        state_values[#state_values + 1] = grid_values[i]
+    end
+    for i = 1, #(pool_values or {}) do
+        state_values[#state_values + 1] = pool_values[i]
     end
     local num_values = #state_values
     if num_values ~= EXPECTED_STATE_VALUES then
@@ -2797,7 +3261,13 @@ function read_frame_observation()
     end
     local obs = obs_or_err
     trace_log(frame_counter, "extract_world_features",
-        string.format("objects=%d legacy=%d", tonumber(obs.object_count or 0), #(obs.legacy_list_features or {})))
+        string.format(
+            "objects=%d lanes=%d grid=%d pools=%d",
+            tonumber(obs.object_count or 0),
+            #(obs.lane_summary_features or {}),
+            #(obs.local_grid_features or {}),
+            #(obs.pool_features or {})
+        ))
 
     return {
         player_alive = player_alive,
@@ -2942,7 +3412,7 @@ function frame_callback()
         rel_pos_x(frame.obs.nearest_spawner_x16 or frame.player_x16, frame.player_x16),
         rel_pos_y(frame.obs.nearest_spawner_y16 or frame.player_y16, frame.player_y16),
         frame.obs.num_spawners,
-        frame.enemy_state, frame.obs.legacy_list_features,
+        frame.enemy_state, frame.obs.lane_summary_features, frame.obs.local_grid_features, frame.obs.pool_features,
         rewards.done, rewards.subj_reward, rewards.obj_reward, save_signal, start_cmd,
         preview.w, preview.h, preview.fmt, preview.blob
     )
@@ -2951,7 +3421,7 @@ function frame_callback()
         return true
     end
     local payload = payload_or_err
-    local payload_count = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + #(frame.obs.legacy_list_features or {})
+    local payload_count = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + #(frame.obs.lane_summary_features or {}) + #(frame.obs.local_grid_features or {}) + #(frame.obs.pool_features or {})
     trace_log(frame_counter, "serialize_frame", "num_values=" .. tostring(payload_count) .. " bytes=" .. tostring(#payload))
 
     local move_cmd, fire_cmd = -1, -1
