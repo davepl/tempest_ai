@@ -70,6 +70,27 @@ def _bc_weight_schedule(frame_count: int) -> float:
     return cfg.expert_bc_weight + progress * (cfg.expert_bc_min_weight - cfg.expert_bc_weight)
 
 
+def _bc_metric_contribution(raw_bc_loss, bc_weight: float, batch_fraction: float) -> float:
+    """Return the BC term actually added into the total loss.
+
+    This keeps the console/dashboard BC metric aligned with the schedule.
+    Reporting raw imitation CE here is misleading once BC has decayed out.
+    """
+    try:
+        if isinstance(raw_bc_loss, torch.Tensor):
+            raw_val = float(raw_bc_loss.detach().item())
+        else:
+            raw_val = float(raw_bc_loss)
+    except Exception:
+        return 0.0
+
+    weight = max(0.0, float(bc_weight))
+    frac = max(0.0, float(batch_fraction))
+    if raw_val <= 0.0 or weight <= 0.0 or frac <= 0.0:
+        return 0.0
+    return raw_val * weight * frac
+
+
 _PROJECTILE_TYPE_ID = UNIFIED_TYPE_NAMES.index("projectile") if "projectile" in UNIFIED_TYPE_NAMES else -1
 
 
@@ -343,6 +364,8 @@ def train_step(agent, prefetched_batch=None) -> float | None:
 
     # ── Optional BC loss on expert/self-imitation transitions ──────────
     bc_loss_val = 0.0
+    bc_metric_val = 0.0
+    bc_weight_effective = 0.0
     bc_w = _bc_weight_schedule(metrics.frame_count)
     imitation_mask = is_expert_t | is_self_imitation_t
     if bc_w > 0.0 and imitation_mask.any():
@@ -374,6 +397,8 @@ def train_step(agent, prefetched_batch=None) -> float | None:
             bc_scale = float(imitation_idx.numel()) / float(B)
             weighted_loss = weighted_loss + (bc_w * bc_scale) * bc_loss
             bc_loss_val = float(bc_loss.detach().item())
+            bc_weight_effective = float(bc_w * bc_scale)
+            bc_metric_val = _bc_metric_contribution(bc_loss, bc_w, bc_scale)
 
     # ── Reward-weighted BC for DQN discoveries ────────────────────────
     # Give positive-reward DQN frames a direct "do this action" signal
@@ -472,7 +497,11 @@ def train_step(agent, prefetched_batch=None) -> float | None:
         metrics.losses.append(loss_val)
         metrics.last_loss = loss_val
         metrics.last_grad_norm = gn
-        metrics.last_bc_loss = bc_loss_val
+        metrics.last_bc_loss = bc_metric_val
+        if hasattr(metrics, "last_bc_raw_loss"):
+            metrics.last_bc_raw_loss = bc_loss_val
+        if hasattr(metrics, "last_bc_weight"):
+            metrics.last_bc_weight = bc_weight_effective
         metrics.last_priority_mean = float(np.mean(td_errors))
 
         # Agreement metric: exact joint-action match rate.

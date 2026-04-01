@@ -573,20 +573,41 @@ class PrioritizedReplayBuffer:
             weights = (self.size * probs) ** (-beta)
             weights /= weights.max()
 
-            return (
-                self.states[indices],
-                self.actions[indices],
-                self.rewards[indices],
-                self.next_states[indices],
-                self.dones[indices],
-                self.horizons[indices],
-                self.is_expert[indices],
-                self.is_self_imitation[indices],
-                self.wave_numbers[indices],
-                self.start_waves[indices],
-                indices,
-                weights.astype(np.float32),
-            )
+            # Snapshot small per-index metadata under the lock (cheap).
+            # Release the lock BEFORE reading the large memmap state arrays
+            # so add_batch() and other writers are not blocked by page faults.
+            s_actions     = self.actions[indices].copy()
+            s_rewards     = self.rewards[indices].copy()
+            s_dones       = self.dones[indices].copy()
+            s_horizons    = self.horizons[indices].copy()
+            s_is_expert   = self.is_expert[indices].copy()
+            s_is_self_im  = self.is_self_imitation[indices].copy()
+            s_wave_nums   = self.wave_numbers[indices].copy()
+            s_start_waves = self.start_waves[indices].copy()
+            s_weights     = weights.astype(np.float32)
+
+        # ── Memmap reads outside the lock ───────────────────────────────
+        # states and next_states are the two largest arrays (~23 KB per
+        # transition).  When backed by memmap, random-access reads trigger
+        # OS page faults that can stall for milliseconds each.  Doing this
+        # outside the lock lets add_batch() proceed concurrently.
+        s_states      = self.states[indices].copy()
+        s_next_states = self.next_states[indices].copy()
+
+        return (
+            s_states,
+            s_actions,
+            s_rewards,
+            s_next_states,
+            s_dones,
+            s_horizons,
+            s_is_expert,
+            s_is_self_im,
+            s_wave_nums,
+            s_start_waves,
+            indices,
+            s_weights,
+        )
 
     def update_priorities(self, indices, td_errors):
         """Update priorities based on TD errors (fully vectorised)."""

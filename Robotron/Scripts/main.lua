@@ -2463,6 +2463,14 @@ local function capture_game_preview()
 end
 
 local function frame_done_callback()
+    -- Only draw HUD / capture screen when this client is the active preview
+    -- source.  The server toggles preview_stream_enabled per-frame via bit 0x40
+    -- in the action source byte, so non-active clients skip the expensive
+    -- snapshot_pixels() call and all HUD draw_line/draw_text work entirely.
+    if not preview_stream_enabled then
+        clear_pending_preview()
+        return
+    end
     draw_debug_hud()
     if PREVIEW_CAPTURE_ENABLED then
         capture_game_preview()
