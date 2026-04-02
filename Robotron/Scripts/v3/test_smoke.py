@@ -30,10 +30,12 @@ def test_state_processor():
     assert frame["global_context"].shape == (40,)
     assert frame["num_entities"] > 0
 
-    frames = [proc.process_frame(np.random.randn(WIRE_PARAMS_COUNT).astype(np.float32)) for _ in range(4)]
+    from v3.config import CONFIG
+    T = CONFIG.model.frame_stack
+    frames = [proc.process_frame(np.random.randn(WIRE_PARAMS_COUNT).astype(np.float32)) for _ in range(T)]
     stacked = proc.stack_frames(frames)
-    assert stacked["entity_features"].shape == (4, 128, 18)
-    assert stacked["global_context"].shape == (4, 40)
+    assert stacked["entity_features"].shape == (T, 128, 18)
+    assert stacked["global_context"].shape == (T, 40)
     print("  state_processor: OK")
 
 def test_model():
@@ -44,7 +46,9 @@ def test_model():
     params = sum(p.numel() for p in net.parameters())
     assert params > 0
 
-    B, T, N, F, G = 4, 4, 128, 18, 40
+    from v3.config import CONFIG
+    T = CONFIG.model.frame_stack
+    B, N, F, G = 4, 128, 18, 40
     ent = torch.randn(B, T, N, F)
     mask = torch.ones(B, T, N, dtype=torch.bool)
     mask[:, :, :20] = False
@@ -105,18 +109,21 @@ def test_rollout_buffer():
     import torch
     from v3.rollout_buffer import RolloutBuffer
 
+    from v3.config import CONFIG
+    T = CONFIG.model.frame_stack
     buf = RolloutBuffer(rollout_length=8, num_actors=2, device=torch.device("cpu"))
     for step in range(8):
         for actor in range(2):
             buf.add(
                 actor_id=actor,
-                entity_features=torch.randn(4, 128, 18),
-                entity_mask=torch.ones(4, 128, dtype=torch.bool),
-                global_context=torch.randn(4, 40),
+                entity_features=torch.randn(T, 128, 18),
+                entity_mask=torch.ones(T, 128, dtype=torch.bool),
+                global_context=torch.randn(T, 40),
                 move_action=np.random.randint(0, 9),
                 fire_action=np.random.randint(0, 9),
                 log_prob=-0.5,
                 value=1.0,
+                has_value=True,
                 reward=0.1,
                 done=False,
             )

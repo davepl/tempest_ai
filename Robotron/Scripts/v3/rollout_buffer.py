@@ -69,6 +69,7 @@ class RolloutBuffer:
         # PPO data
         self.log_probs = torch.zeros(T, A, device=self.device)
         self.values = torch.zeros(T, A, device=self.device)
+        self.has_value = torch.zeros(T, A, dtype=torch.bool, device=self.device)
         self.rewards = torch.zeros(T, A, device=self.device)
         self.dones = torch.zeros(T, A, dtype=torch.bool, device=self.device)
 
@@ -80,6 +81,8 @@ class RolloutBuffer:
         self.expert_move = torch.zeros(T, A, dtype=torch.long, device=self.device)
         self.expert_fire = torch.zeros(T, A, dtype=torch.long, device=self.device)
         self.is_expert = torch.zeros(T, A, dtype=torch.bool, device=self.device)
+        self.policy_sampled = torch.zeros(T, A, dtype=torch.bool, device=self.device)
+        self.fire_locked = torch.zeros(T, A, dtype=torch.bool, device=self.device)
 
         self.step = 0
         self.ready = False
@@ -99,11 +102,14 @@ class RolloutBuffer:
         fire_action: int,
         log_prob: float,
         value: float,
+        has_value: bool,
         reward: float,
         done: bool,
         expert_move: int = 8,
         expert_fire: int = 8,
         is_expert: bool = False,
+        policy_sampled: bool = False,
+        fire_locked: bool = False,
     ):
         """Add a single step for one actor."""
         t = self.step
@@ -116,11 +122,14 @@ class RolloutBuffer:
         self.fire_actions[t, a] = fire_action
         self.log_probs[t, a] = log_prob
         self.values[t, a] = value
+        self.has_value[t, a] = has_value
         self.rewards[t, a] = reward
         self.dones[t, a] = done
         self.expert_move[t, a] = expert_move
         self.expert_fire[t, a] = expert_fire
         self.is_expert[t, a] = is_expert
+        self.policy_sampled[t, a] = policy_sampled
+        self.fire_locked[t, a] = fire_locked
 
     def advance(self):
         """Advance the step counter after all actors have added their step."""
@@ -163,11 +172,14 @@ class RolloutBuffer:
             "fire_actions": self.fire_actions.reshape(N),
             "log_probs": self.log_probs.reshape(N),
             "values": self.values.reshape(N),
+            "has_value": self.has_value.reshape(N),
             "advantages": self.advantages.reshape(N),
             "returns": self.returns.reshape(N),
             "expert_move": self.expert_move.reshape(N),
             "expert_fire": self.expert_fire.reshape(N),
             "is_expert": self.is_expert.reshape(N),
+            "policy_sampled": self.policy_sampled.reshape(N),
+            "fire_locked": self.fire_locked.reshape(N),
         }
 
     def iterate_minibatches(

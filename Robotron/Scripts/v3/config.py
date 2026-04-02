@@ -77,13 +77,13 @@ class ModelConfig:
 
     # Set Transformer encoder
     embed_dim: int = 256
-    num_isab_layers: int = 3
+    num_isab_layers: int = 1       # 1 ISAB layer (was 3) — sufficient for early training
     num_heads: int = 8
     num_inducing_points: int = 32  # M for ISAB: reduces O(N²)→O(NM)
     dropout: float = 0.0
 
     # Temporal context
-    frame_stack: int = 4           # concat z_{t-3}..z_t
+    frame_stack: int = 2           # concat z_{t-1}..z_t (was 4) — halves GPU cost
 
     # Global context (core features + ELIST directly injected)
     global_context_dim: int = LEGACY_CORE_FEATURES + LEGACY_ELIST_FEATURES  # 40

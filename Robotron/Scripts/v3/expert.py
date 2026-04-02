@@ -9,9 +9,11 @@ summation over the entity set. Used for:
 
 Movement: force vector from repulsive (enemy) and attractive (human) fields.
 Firing: priority queue — missiles > spawners > brains near humans > density.
+
+Performance: all operations are fully vectorized with NumPy — no Python loops
+over entities. Accepts pre-extracted entity arrays to avoid redundant extraction.
 """
 
-import math
 import numpy as np
 from typing import Optional
 from .config import CONFIG, ExpertConfig
@@ -48,43 +50,47 @@ _DIR_VECTORS = np.array([
     [-0.7071, -0.7071],  # 7: NW
 ], dtype=np.float32)
 
+# Fire-priority lookup: type_id → priority (lower = higher priority).
+# Types not in this table are ignored for firing.
+_FIRE_PRIORITY = np.full(NUM_ENTITY_CLASSES, 99, dtype=np.int32)
+_FIRE_PRIORITY[TYPE_MISSILE] = 0
+_FIRE_PRIORITY[TYPE_SPARK] = 0
+_FIRE_PRIORITY[TYPE_PROJECTILE] = 0
+_FIRE_PRIORITY[TYPE_SPAWNER] = 1
+_FIRE_PRIORITY[TYPE_BRAIN] = 2
+_FIRE_PRIORITY[TYPE_TANK] = 3
+_FIRE_PRIORITY[TYPE_ENFORCER] = 4
+_FIRE_PRIORITY[TYPE_GRUNT] = 5
+_FIRE_PRIORITY[TYPE_PROG] = 5
+
+# Missile-class types (for critical-radius approach check)
+_MISSILE_TYPES = np.zeros(NUM_ENTITY_CLASSES, dtype=bool)
+_MISSILE_TYPES[TYPE_MISSILE] = True
+_MISSILE_TYPES[TYPE_SPARK] = True
+_MISSILE_TYPES[TYPE_PROJECTILE] = True
+
 
 def _vec_to_dir(vec: np.ndarray) -> int:
     """Convert a 2D force vector to nearest 8-way direction index (0-7) or 8 (idle)."""
-    if np.linalg.norm(vec) < 1e-6:
+    mag = np.linalg.norm(vec)
+    if mag < 1e-6:
         return 8  # idle
-    # Compute angle and snap to nearest direction
-    angle = math.atan2(vec[1], vec[0])
-    # Normalize to [0, 2π]
-    if angle < 0:
-        angle += 2 * math.pi
-    # Map to direction index (0=N at -π/2, rotated to game coords)
-    # Game uses: 0=N(up), 1=NE, 2=E, ..., 7=NW
-    # atan2 uses: 0=E, positive=S
-    # Convert: game_angle = atan2(y, x), but N=-y in screen coords
-    # So negate y for the angle calculation
-    game_angle = math.atan2(-vec[1], vec[0])  # negate y because screen y is down
-    if game_angle < 0:
-        game_angle += 2 * math.pi
-    # 0=E in atan2, game 0=N → rotate by π/2
-    game_angle = (game_angle + math.pi / 2) % (2 * math.pi)
-    # Quantize to 8 directions
-    idx = int(round(game_angle / (math.pi / 4))) % 8
-    return idx
+    unit = vec / mag
+    return int(np.argmax(_DIR_VECTORS @ unit))
 
 
 class PotentialFieldExpert:
     """Potential field expert for Robotron.
 
     Computes movement via force vector summation and firing via
-    priority-based target selection.
+    priority-based target selection. All inner loops are vectorized.
     """
 
     def __init__(self, cfg: Optional[ExpertConfig] = None):
         self.cfg = cfg or CONFIG.expert
 
         # Weight lookup by type index
-        self._weights = np.zeros(NUM_ENTITY_CLASSES, dtype=np.float32)
+        self._weights = np.zeros(NUM_ENTITY_CLASSES, dtype=np.float64)
         self._weights[TYPE_GRUNT] = self.cfg.weight_grunt
         self._weights[TYPE_HULK] = self.cfg.weight_hulk
         self._weights[TYPE_BRAIN] = self.cfg.weight_brain
@@ -110,10 +116,17 @@ class PotentialFieldExpert:
         entity_features, entity_mask, num_entities = extract_entities(
             wire_state, max_entities
         )
+        return self.get_action_from_entities(entity_features, entity_mask, num_entities)
 
+    def get_action_from_entities(
+        self,
+        entity_features: np.ndarray,
+        entity_mask: np.ndarray,
+        num_entities: int,
+    ) -> tuple[int, int]:
+        """Compute expert move and fire from pre-extracted entities (no re-extraction)."""
         move_dir = self._compute_move(entity_features, entity_mask, num_entities)
         fire_dir = self._compute_fire(entity_features, entity_mask, num_entities)
-
         return move_dir, fire_dir
 
     def _compute_move(
@@ -122,38 +135,37 @@ class PotentialFieldExpert:
         entity_mask: np.ndarray,
         num_entities: int,
     ) -> int:
-        """Compute movement direction via force vector summation."""
+        """Compute movement direction via vectorized force summation."""
+        if num_entities == 0:
+            return 8
+
+        # Slice to active region and filter out masked (padding) entries
+        active = ~entity_mask[:num_entities]
+        if not active.any():
+            return 8
+
+        ents = entity_features[:num_entities][active]
+        pos = ents[:, 0:2].astype(np.float64)                    # (K, 2)
+        type_ids = np.argmax(ents[:, 6:6 + NUM_ENTITY_CLASSES], axis=1)  # (K,)
+        weights = self._weights[type_ids]                         # (K,)
+        dist = np.linalg.norm(pos, axis=1) + 1e-5                # (K,)
+
+        # Attractive (weight > 0, e.g. humans): w * pos / dist²
+        attractive = weights > 0
+        # Repulsive (weight < 0, e.g. enemies): |w| * (-pos) / dist³
+        repulsive = weights < 0
+
         force = np.zeros(2, dtype=np.float64)
-
-        for i in range(num_entities):
-            if entity_mask[i]:
-                continue
-
-            ent = entity_features[i]
-            pos = ent[0:2]  # dx, dy relative to player
-            type_onehot = ent[6:6 + NUM_ENTITY_CLASSES]
-            type_id = int(np.argmax(type_onehot))
-
-            dist = np.linalg.norm(pos) + 1e-5
-            weight = self._weights[type_id]
-
-            if weight > 0:
-                # Attractive force (toward humans)
-                # Use 1/dist² for nearby humans (urgent rescue)
-                force += weight * pos / (dist ** 2)
-            else:
-                # Repulsive force (away from enemies)
-                # Use -weight * direction / dist³ (cubic falloff for strong nearby repulsion)
-                direction = -pos  # away from entity
-                force += abs(weight) * direction / (dist ** 3)
-
-        # Wall avoidance: soft repulsion from boundaries
-        # Player position is in core features (indices 5,6 of the global context)
-        # But since entity positions are relative, we approximate wall distance
-        # by checking if we're near edges (absolute pos not directly available
-        # in entity features, but core features have it)
-        # For simplicity, add mild center-seeking force when near walls
-        # This will be refined when we integrate with the global context
+        if attractive.any():
+            w_a = weights[attractive, np.newaxis]           # (Ka, 1)
+            p_a = pos[attractive]                           # (Ka, 2)
+            d_a = dist[attractive, np.newaxis]              # (Ka, 1)
+            force += (w_a * p_a / (d_a ** 2)).sum(axis=0)
+        if repulsive.any():
+            w_r = np.abs(weights[repulsive, np.newaxis])    # (Kr, 1)
+            p_r = pos[repulsive]                            # (Kr, 2)
+            d_r = dist[repulsive, np.newaxis]               # (Kr, 1)
+            force += (w_r * (-p_r) / (d_r ** 3)).sum(axis=0)
 
         return _vec_to_dir(force.astype(np.float32))
 
@@ -163,72 +175,49 @@ class PotentialFieldExpert:
         entity_mask: np.ndarray,
         num_entities: int,
     ) -> int:
-        """Compute firing direction via priority target selection.
+        """Compute firing direction via vectorized priority target selection."""
+        if num_entities == 0:
+            return 8
 
-        Priority:
-          1. Incoming missiles/sparks within critical radius
-          2. Spawners (spheroids/quarks)
-          3. Brains near humans
-          4. Highest density of grunts
-        """
-        cfg = self.cfg
+        active = ~entity_mask[:num_entities]
+        if not active.any():
+            return 8
 
-        # Collect entities by type with distances
-        threats = []       # (priority, distance, position, type_id)
+        ents = entity_features[:num_entities][active]
+        pos = ents[:, 0:2]                                        # (K, 2)
+        vel = ents[:, 4:6]                                        # (K, 2)
+        type_ids = np.argmax(ents[:, 6:6 + NUM_ENTITY_CLASSES], axis=1)  # (K,)
+        dist = np.linalg.norm(pos, axis=1) + 1e-5                # (K,)
+        priorities = _FIRE_PRIORITY[type_ids].copy()              # (K,)
 
-        for i in range(num_entities):
-            if entity_mask[i]:
-                continue
-            ent = entity_features[i]
-            pos = ent[0:2]
-            vel = ent[4:6]
-            type_onehot = ent[6:6 + NUM_ENTITY_CLASSES]
-            type_id = int(np.argmax(type_onehot))
-            dist = np.linalg.norm(pos) + 1e-5
+        # Priority 0 missiles: only if close AND approaching
+        is_missile = _MISSILE_TYPES[type_ids]
+        if is_missile.any():
+            in_range = dist < self.cfg.missile_critical_radius
+            # approach = -dot(pos, vel) / dist — positive means approaching
+            approach = -(pos[:, 0] * vel[:, 0] + pos[:, 1] * vel[:, 1]) / (dist + 1e-5)
+            # Demote missiles that are out of range or not approaching
+            demote = is_missile & (~in_range | (approach <= 0))
+            priorities[demote] = 99
 
-            # Priority 1: incoming missiles/sparks
-            if type_id in (TYPE_MISSILE, TYPE_SPARK, TYPE_PROJECTILE):
-                if dist < cfg.missile_critical_radius:
-                    # Check if approaching (velocity toward player)
-                    approach = -np.dot(pos, vel) / (dist + 1e-5)
-                    if approach > 0:
-                        threats.append((0, dist, pos, type_id))
-                        continue
+        # Filter out entities with no firing relevance
+        shootable = priorities < 99
+        if not shootable.any():
+            return 8
 
-            # Priority 2: spawners
-            if type_id == TYPE_SPAWNER:
-                threats.append((1, dist, pos, type_id))
-                continue
+        # Select best target: min priority, then min distance
+        s_pri = priorities[shootable]
+        s_dist = dist[shootable]
+        s_pos = pos[shootable]
 
-            # Priority 3: brains (always high priority)
-            if type_id == TYPE_BRAIN:
-                threats.append((2, dist, pos, type_id))
-                continue
+        # Lexicographic argmin over (priority, distance)
+        best_pri = s_pri.min()
+        top_mask = s_pri == best_pri
+        top_dist = s_dist.copy()
+        top_dist[~top_mask] = np.inf
+        best_idx = np.argmin(top_dist)
 
-            # Priority 4: tanks
-            if type_id == TYPE_TANK:
-                threats.append((3, dist, pos, type_id))
-                continue
-
-            # Priority 5: enforcers
-            if type_id == TYPE_ENFORCER:
-                threats.append((4, dist, pos, type_id))
-                continue
-
-            # Priority 6: grunts/progs
-            if type_id in (TYPE_GRUNT, TYPE_PROG):
-                threats.append((5, dist, pos, type_id))
-                continue
-
-        if not threats:
-            return 8  # idle: nothing to shoot at
-
-        # Sort by (priority, distance) — lowest priority number first, then nearest
-        threats.sort(key=lambda t: (t[0], t[1]))
-
-        # Fire at highest priority target
-        target_pos = threats[0][2]
-        return _vec_to_dir(target_pos)
+        return _vec_to_dir(s_pos[best_idx])
 
     def get_action_with_context(
         self,
@@ -236,24 +225,39 @@ class PotentialFieldExpert:
         wave_number: int = 1,
         max_entities: int = 128,
     ) -> tuple[int, int]:
-        """Wave-aware expert action. Adjusts behavior for specific wave types.
-
-        Brain waves (5, 10, 15, ...): extra weight on brain avoidance/targeting.
-        Grunt mob waves (9, 19, 29, ...): favor perimeter movement.
-        """
+        """Wave-aware expert action. Adjusts behavior for specific wave types."""
         # Temporarily adjust weights based on wave
         original_weights = self._weights.copy()
 
         if wave_number % 5 == 0:
-            # Brain wave: boost brain priority
             self._weights[TYPE_BRAIN] *= 2.0
         if wave_number % 10 == 9:
-            # Grunt mob: boost grunt avoidance
             self._weights[TYPE_GRUNT] *= 1.5
 
         move_dir, fire_dir = self.get_action(wire_state, max_entities)
 
-        # Restore weights
+        self._weights = original_weights
+        return move_dir, fire_dir
+
+    def get_action_with_context_from_entities(
+        self,
+        entity_features: np.ndarray,
+        entity_mask: np.ndarray,
+        num_entities: int,
+        wave_number: int = 1,
+    ) -> tuple[int, int]:
+        """Wave-aware expert from pre-extracted entities (no re-extraction)."""
+        original_weights = self._weights.copy()
+
+        if wave_number % 5 == 0:
+            self._weights[TYPE_BRAIN] *= 2.0
+        if wave_number % 10 == 9:
+            self._weights[TYPE_GRUNT] *= 1.5
+
+        move_dir, fire_dir = self.get_action_from_entities(
+            entity_features, entity_mask, num_entities
+        )
+
         self._weights = original_weights
         return move_dir, fire_dir
 
@@ -271,3 +275,18 @@ def get_expert_action(
     if _expert is None:
         _expert = PotentialFieldExpert()
     return _expert.get_action_with_context(wire_state, wave_number, max_entities)
+
+
+def get_expert_action_from_entities(
+    entity_features: np.ndarray,
+    entity_mask: np.ndarray,
+    num_entities: int,
+    wave_number: int = 1,
+) -> tuple[int, int]:
+    """Get expert action from pre-extracted entities (no re-extraction)."""
+    global _expert
+    if _expert is None:
+        _expert = PotentialFieldExpert()
+    return _expert.get_action_with_context_from_entities(
+        entity_features, entity_mask, num_entities, wave_number
+    )

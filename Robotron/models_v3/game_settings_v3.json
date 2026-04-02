@@ -1,0 +1,7 @@
+{
+  "start_advanced": true,
+  "start_level_min": 1,
+  "epsilon": 0.1,
+  "expert_ratio": 0.99,
+  "total_frames": 2370797
+}

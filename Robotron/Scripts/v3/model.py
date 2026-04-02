@@ -51,7 +51,7 @@ class MultiheadAttention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, N, S)
         if mask is not None:
-            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), -1e9)
         attn = self.dropout(F.softmax(attn, dim=-1))
 
         out = (attn @ v).transpose(1, 2).reshape(B, N, D)  # (B, N, D)
@@ -101,7 +101,8 @@ class CrossAttention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         if mask is not None:
-            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            # Use a large finite negative value so all-masked rows stay stable.
+            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), -1e9)
         attn = self.dropout(F.softmax(attn, dim=-1))
 
         out = (attn @ v).transpose(1, 2).reshape(B, N, D)
@@ -226,12 +227,23 @@ class SetTransformerEncoder(nn.Module):
             (B, embed_dim) global set representation
         """
         h = self.input_proj(x)  # (B, N, embed_dim)
+        all_masked = None
+        if mask is not None:
+            mask_exp = mask.unsqueeze(-1)
+            h = h.masked_fill(mask_exp, 0.0)
+            all_masked = mask.all(dim=1)
 
         for isab in self.isab_layers:
             h = isab(h, mask=mask)
+            if mask is not None:
+                h = h.masked_fill(mask_exp, 0.0)
 
         pooled = self.pool(h, mask=mask)  # (B, 1, embed_dim)
-        return pooled.squeeze(1)          # (B, embed_dim)
+        pooled = pooled.squeeze(1)        # (B, embed_dim)
+        if all_masked is not None and bool(all_masked.any()):
+            pooled = pooled.clone()
+            pooled[all_masked] = 0.0
+        return pooled
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -255,11 +267,11 @@ class RobotronPPONet(nn.Module):
         entity_feature_dim: int = 18,
         max_entities: int = 128,
         embed_dim: int = 256,
-        num_isab_layers: int = 3,
+        num_isab_layers: int = 1,
         num_heads: int = 8,
         num_inducing: int = 32,
         global_context_dim: int = 40,
-        frame_stack: int = 4,
+        frame_stack: int = 2,
         fusion_hidden: int = 512,
         fusion_layers: int = 2,
         num_move_actions: int = 9,
@@ -442,8 +454,17 @@ class RobotronPPONet(nn.Module):
         """
         out = self.forward(entity_features, entity_mask, global_context)
 
-        move_dist = torch.distributions.Categorical(logits=out["move_logits"])
-        fire_dist = torch.distributions.Categorical(logits=out["fire_logits"])
+        # Clamp logits and replace NaN/Inf with uniform fallback to prevent
+        # Categorical from crashing (weights can produce NaN early in training).
+        move_logits = out["move_logits"].clamp(-50.0, 50.0)
+        fire_logits = out["fire_logits"].clamp(-50.0, 50.0)
+        if torch.isnan(move_logits).any() or torch.isinf(move_logits).any():
+            move_logits = torch.zeros_like(move_logits)
+        if torch.isnan(fire_logits).any() or torch.isinf(fire_logits).any():
+            fire_logits = torch.zeros_like(fire_logits)
+
+        move_dist = torch.distributions.Categorical(logits=move_logits)
+        fire_dist = torch.distributions.Categorical(logits=fire_logits)
 
         if move_action is None:
             move_action = move_dist.sample()
@@ -463,4 +484,7 @@ class RobotronPPONet(nn.Module):
     ) -> torch.Tensor:
         """Just the value estimate, for GAE bootstrapping."""
         out = self.forward(entity_features, entity_mask, global_context)
-        return out["value"]
+        v = out["value"]
+        if torch.isnan(v).any():
+            v = torch.zeros_like(v)
+        return v

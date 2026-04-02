@@ -49,6 +49,7 @@ function env_flag(name, default)
 end
 
 RRCHRIS_PATCH_ENABLED = env_flag("ROBOTRON_ENABLE_RRCHRIS_PATCH", false)
+SKIP_UNUSED_TACTICAL_FEATURES = env_flag("ROBOTRON_SKIP_UNUSED_TACTICAL_FEATURES", false)
 RRCHRIS_PATCH_REGION = ":maincpu"
 ROMTAB_BASE_ADDR = 0xFFB5
 RRCHRIS_PATCH_CHUNKS = {
@@ -307,6 +308,17 @@ TACTICAL_POOL_TOTAL_FEATURES =
     + (1 + (HUMAN_POOL_SLOTS * HUMAN_SLOT_FEATURES))
     + (1 + (ELECTRODE_POOL_SLOTS * ELECTRODE_SLOT_FEATURES))
 EXPECTED_STATE_VALUES = LEGACY_CORE_FEATURES + ZP1ENM_EMIT_COUNT + TACTICAL_LANE_TOTAL_FEATURES + TACTICAL_GRID_FEATURES + TACTICAL_POOL_TOTAL_FEATURES
+
+local function _make_zero_feature_block(count)
+    local out = {}
+    for i = 1, count do
+        out[i] = 0.0
+    end
+    return out
+end
+
+ZERO_TACTICAL_LANE_FEATURES = _make_zero_feature_block(TACTICAL_LANE_TOTAL_FEATURES)
+ZERO_TACTICAL_GRID_FEATURES = _make_zero_feature_block(TACTICAL_GRID_FEATURES)
 
 -- Type ID mapping for unified pool (0-8, normalized by /8.0 in emission)
 UNIFIED_TYPE_ID = {
@@ -1878,6 +1890,7 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     local dangerous_bucket = {}
     local human_bucket = buckets["human"]
     local electrode_bucket = buckets["electrode"]
+    local compute_full_tactical_features = not SKIP_UNUSED_TACTICAL_FEATURES
     local current_sample_x = {}
     local current_sample_y = {}
     for _, obj in ipairs(all_objects) do
@@ -1902,25 +1915,32 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
             obj.vy16 = vy16
             obj.dx = clamp11((obj.rel_dx16 or 0.0) / POS_X_RANGE)
             obj.dy = clamp11((obj.rel_dy16 or 0.0) / POS_Y_RANGE)
-            local dist_world = obj.dist_world or 0.0
-            if dist_world > 1.0 then
-                obj.dir_x = clamp11((obj.rel_dx16 or 0.0) / dist_world)
-                obj.dir_y = clamp11((obj.rel_dy16 or 0.0) / dist_world)
+            if compute_full_tactical_features then
+                local dist_world = obj.dist_world or 0.0
+                if dist_world > 1.0 then
+                    obj.dir_x = clamp11((obj.rel_dx16 or 0.0) / dist_world)
+                    obj.dir_y = clamp11((obj.rel_dy16 or 0.0) / dist_world)
+                else
+                    obj.dir_x = 0.0
+                    obj.dir_y = 0.0
+                end
+                local radial = -((obj.vx * obj.dir_x) + (obj.vy * obj.dir_y))
+                obj.approach = clamp11(radial * 2.0)
+                obj.threat = _object_threat_score(obj)
+                local ttc_norm, closest_pass_norm = _predictive_motion_features(
+                    obj.rel_dx16 or 0.0,
+                    obj.rel_dy16 or 0.0,
+                    obj.vx16 or 0.0,
+                    obj.vy16 or 0.0
+                )
+                obj.ttc_norm = ttc_norm
+                obj.closest_pass_norm = closest_pass_norm
             else
-                obj.dir_x = 0.0
-                obj.dir_y = 0.0
+                obj.approach = 0.0
+                obj.threat = 0.0
+                obj.ttc_norm = 1.0
+                obj.closest_pass_norm = 1.0
             end
-            local radial = -((obj.vx * obj.dir_x) + (obj.vy * obj.dir_y))
-            obj.approach = clamp11(radial * 2.0)
-            obj.threat = _object_threat_score(obj)
-            local ttc_norm, closest_pass_norm = _predictive_motion_features(
-                obj.rel_dx16 or 0.0,
-                obj.rel_dy16 or 0.0,
-                obj.vx16 or 0.0,
-                obj.vy16 or 0.0
-            )
-            obj.ttc_norm = ttc_norm
-            obj.closest_pass_norm = closest_pass_norm
 
             counts[obj.category] = counts[obj.category] + 1
             current_sample_x[obj.ptr] = obj.x16
@@ -1964,15 +1984,19 @@ local function extract_world_features(memory, player_x16, player_y16, enemy_stat
     prev_object_sample_x = current_sample_x
     prev_object_sample_y = current_sample_y
 
-    local lane_summary_features = _build_lane_summary_features(
-        player_center_x16,
-        player_center_y16,
-        dangerous_bucket,
-        projectile_bucket,
-        human_bucket,
-        electrode_bucket
-    )
-    local local_grid_features = _build_local_tactical_grid(dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+    local lane_summary_features = ZERO_TACTICAL_LANE_FEATURES
+    local local_grid_features = ZERO_TACTICAL_GRID_FEATURES
+    if compute_full_tactical_features then
+        lane_summary_features = _build_lane_summary_features(
+            player_center_x16,
+            player_center_y16,
+            dangerous_bucket,
+            projectile_bucket,
+            human_bucket,
+            electrode_bucket
+        )
+        local_grid_features = _build_local_tactical_grid(dangerous_bucket, projectile_bucket, human_bucket, electrode_bucket)
+    end
     local projectile_assigned, projectile_count = _stable_assign_pool_slots("projectile", projectile_bucket, PROJECTILE_POOL_SLOTS, _projectile_priority_better)
     local danger_assigned, danger_count = _stable_assign_pool_slots("danger", dangerous_bucket, DANGER_POOL_SLOTS, _dangerous_priority_better)
     local human_assigned, human_count = _stable_assign_pool_slots("human", human_bucket, HUMAN_POOL_SLOTS, _nearest_distance_better)
@@ -3555,6 +3579,9 @@ if not apply_rrchris_patch() then
 end
 
 print("Robotron socket target: " .. SOCKET_ADDRESS)
+if SKIP_UNUSED_TACTICAL_FEATURES then
+    print("Robotron tactical lanes/grid: skipped for fast V3 observations")
+end
 controls = Controls:new(manager)
 if not controls then
     print("Robotron AI Lua script aborted due to missing control mappings.")
